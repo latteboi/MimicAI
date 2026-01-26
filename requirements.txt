@@ -1,0 +1,11 @@
+discord.py
+google-genai
+google-generativeai
+websockets
+orjson
+cryptography
+aiohttp
+httpx
+numpy
+python-dotenv
+Pillow

@@ -1,0 +1,17 @@
+# Security & Config
+.env
+*.lock
+mimicai.service
+
+# Virtual Environment
+.venv/
+__pycache__/
+*.pyc
+
+# Local Data
+cogs/data/
+cogs/mixins/data/
+
+# OS Specific
+.DS_Store
+__MACOSX/
