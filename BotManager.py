@@ -9,6 +9,7 @@ import sys
 from cryptography.fernet import Fernet
 import websockets
 import signal
+import platform
 from dotenv import load_dotenv
 
 # Load variables from .env file if it exists
@@ -179,8 +180,9 @@ async def main():
 
     # Initial launch of child bots
     print("Launching Hive process...")
-    # No tokens passed in CLI anymore. Just the URI.
-    proc = subprocess.Popen([sys.executable, 'child_bot.py', f"ws://{IPC_HOST}:{IPC_PORT}"])
+    # Use absolute path for Windows compatibility
+    script_path = os.path.join(os.path.dirname(__file__), 'child_bot.py')
+    proc = subprocess.Popen([sys.executable, script_path, f"ws://{IPC_HOST}:{IPC_PORT}"])
     active_child_processes['hive'] = proc
 
     # Start the main bot
@@ -189,9 +191,10 @@ async def main():
             await bot.start(defaultConfig.DISCORD_SDK)
 
     # Handle graceful shutdown on signals
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.close()))
+    if platform.system() != "Windows":
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.close()))
 
     try:
         print("Starting main bot...")
@@ -225,5 +228,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nKeyboard interrupt received. Initiating shutdown.")
-    except Exception as e:
-        print(f"An error occurred during bot operation: {e}")
+    except Exception:
+        import traceback
+        print(f"An error occurred during bot operation:")
+        traceback.print_exc()

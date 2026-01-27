@@ -118,7 +118,7 @@ def setup_mimic():
             f"ALL_USERS_PREMIUM=True\n"
         )
         
-        with open(".env", "w") as f:
+        with open(".env", "w", encoding="utf-8") as f:
             f.write(env_content)
         print("\nSUCCESS: .env file created.")
     else:
@@ -192,8 +192,12 @@ WantedBy=multi-user.target
         print(" - Start bot:  sudo systemctl start mimicai")
     else:
         print(f"To run your bot, you MUST use the virtual environment:")
-        print(f"\n1. Activate it:   {activate_cmd}")
-        print(f"2. Start the bot: python3 BotManager.py")
+        if platform.system() == "Windows":
+            print(f"\n1. Activate:    {activate_cmd}")
+            print(f"2. Start Bot:   .venv\\Scripts\\python.exe BotManager.py")
+        else:
+            print(f"\n1. Activate:    {activate_cmd}")
+            print(f"2. Start Bot:   python3 BotManager.py")
     
     print("\nNOTE: To uninstall, run 'python3 remove.py'")
     print("="*48)

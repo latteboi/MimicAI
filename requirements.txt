@@ -7,5 +7,6 @@ cryptography
 aiohttp
 httpx
 numpy
-python-dotenv
+dotenv
+fernet
 Pillow

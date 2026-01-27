@@ -56,48 +56,83 @@ This is the most powerful tool for shaping character voice and ensuring consiste
 
 ---
 
-# Quick Start (Linux, MacOS & Windows)
-MimicAI is designed to be multi-platform and easy to host.
+## Quick Start Guide
 
-1.  Clone the Repository:
-    
-    > git clone https://github.com/latteboi/MimicAI.git
-    > cd MimicAI
-    
-2.  Run the Setup Utility:
-    
-    > python3 setup.py
-    
-    This script creates your virtual environment, installs dependencies, and configures your Linux systemd service if requested.
+### 1. Create your Discord Bot
+1.  Go to the [Discord Developer Portal](https://discord.com/developers/applications).
+2.  Click **New Application** and give it a name.
+3.  Navigate to the **Bot** tab:
+    *   Click **Reset Token** to acquire your **Bot Token**.
+    *   **CRITICAL:** Scroll down to "Privileged Gateway Intents" and toggle **ON** the following:
+        *   `PRESENCE INTENT`
+        *   `SERVER MEMBERS INTENT`
+        *   `MESSAGE CONTENT INTENT`
+4.  Navigate to the **OAuth2** tab -> **URL Generator**:
+    *   Select scopes: `bot`, `applications.commands`.
+    *   Select permissions: `Administrator` OR `Attach Files`, `Send Messages`, `Manage Messages`, `Embed Links`, `Read Message History`, `Embed Links`, `Bypass Slowmode`, `Send Messages in Threads`, `Use External Emojis`, `View Channels`, and `Manage Webhooks`.
+    *   Use the generated link to invite the bot to your server.
 
-3.  Configure API Keys:
-    Use the `/settings` command in the bot's DM to provide your Google Gemini or OpenRouter API keys.
+### 2. Install and Run Setup
+1.  **Clone the Repository:**
+    ```bash
+    git clone https://github.com/latteboi/MimicAI.git
+    cd MimicAI
+    ```
+2.  **Run the Setup Utility:**
+    *   **Linux/macOS Terminal:** `python3 setup.py`
+    *   **Windows CMD:** `python3 setup.py`
+3.  Follow the prompts to enter your **Discord Bot Token** and your **Discord User ID**.
+    *   *Note: On Linux, the script will offer to install MimicAI as a system service for 24/7 uptime.*
 
-    IMPORTANT: It is hightly recommended that you use paid tier API keys for Google Gemini as most functions such as LTMs, Training Examples, Grounding, and Image Generation rely on it and are not heavily restricted by imposed rate-limits.
+### 3. Configure API Keys
+MimicAI is an interface; it requires a "Brain" to function.
+1.  **Start the Bot:**
+    *   **Windows:** `.venv\Scripts\python.exe BotManager.py`
+    *   **Linux/macOS:** `source .venv/bin/activate && python3 BotManager.py`
+2.  **Submit Keys:** 
+    *   Open a **Direct Message** with your bot in Discord.
+    *   Use the command `/settings`.
+    *   Select your server and click **Edit Primary Key**.
+    *   Paste your **Google AI Studio (Gemini)** or **OpenRouter** API key.
+    *   IMPORTANT: It is highly recommended that you use paid-tier API keys for Google Gemini, as most functions, such as LTMs, Training Examples, Grounding, and Image Generation, rely on them and are not heavily restricted by imposed rate limits. While free-tier API keys work, they will degrade the overall experience and cause issues.
+
+### 4. Create and Talk to a Character
+1.  **Create a Profile:** In your server, run `/profile create profile_name:detective`.
+2.  **Shape the Identity:** Run `/profile manage profile_name:detective`.
+    *   Use **Edit Persona** to define their backstory, personality traits, likes, dislikes, and appearance.
+    *   Use **Edit Instructions** to define their speech patterns, formatting, and other behaviours.
+    *   Use **Edit Appearance** to give them an avatar (via URL) and display name.
+    *   TIP: You can send an image inside a Discord channel and copy its URL to use as an avatar for your profile.
+3.  **Start a Session:** Run `/session config mode:Regular`.
+    *   Select your "detective" profile from the dropdown.
+    *   Click **Start / Update Session**.
+4.  **Interact:** Simply send a message in the channel to begin the conversation!
+    *   `Detective, what do you make of this crime scene?`
 
 ---
 
 # Beta Disclaimers & Outdated Info
 As an Open Beta, certain components are still catching up to the rapid structural changes:
 
-   Help Command: The `/help` command currently displays documentation that may be outdated. It is being rewritten to reflect the latest changes.
-   SDK Migration: We are currently in a "hybrid" state between the legacy Google Generative AI SDK and the new Unified Gen AI SDK (v2).
-   Experimental Features: Features like the "Anti-Repetition Critic" add latency and are still being tuned for optimal performance.
+*   Help Command: The `/help` command currently displays documentation that may be outdated. It will be rewritten to reflect the latest changes at a later time.
+*   SDK Migration: This project is currently in a mixed state between the legacy Google Generative AI SDK and the new Unified Gen AI SDK (v2).
+*   Experimental Features: Features like the `Anti-Repetition Critic` add latency and are still being tuned for optimal performance.
+*   Due to the AI-Generated nature of this project, there may be bugs and inconsistencies. However, I am actively working to improve the codebase and address any issues.
 
 ---
 
 # Future Outlooks
-   Parallel Responses: Adding a new feature where you can switch from sequential turns to chaotic "Real-time" Discord conversations where multiple profiles can speak simultaneously.
-   Voice Integration: Allowing profiles to send audio files & participate in Voice Channels using TTS models.
-   SDK v2 Full Migration: Completing the transition to the latest AI infrastructure for better compatibility.
+*   Parallel Responses: Adding a new feature where you can switch from sequential turns to chaotic "Real-time" Discord conversations where multiple profiles can speak simultaneously.
+*   Voice Integration: Allowing profiles to send audio files & participate in Voice Channels using TTS models.
+*   SDK v2 Full Migration: Completing the transition to the latest AI infrastructure for better compatibility.
 
 ---
 
 # Licensing
 This project is released under the Prosperity Public License 3.0.0. 
 
-   Non-Commercial Use: Free for individuals and non-profits.
-   Commercial Use: Requires a separate license agreement. See the `LICENSE` file for details.
+*   Non-Commercial Use: Free for individuals and non-profits.
+*   Commercial Use: Requires a separate license agreement. See the `LICENSE` file for details.
 
 ---
 
