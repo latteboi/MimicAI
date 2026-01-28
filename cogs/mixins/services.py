@@ -1263,6 +1263,8 @@ class ServicesMixin:
                             generator_display_name = gen_effective_profile_name
 
                 responses_this_round = []
+                # [NEW] Track round-specific audio segments for stitching
+                round_audio_segments = []
                 initial_round_context = ""
                 
                 # [NEW] Batch Intent Tracking
@@ -1779,14 +1781,14 @@ class ServicesMixin:
 
                         # Check if the last turn was from this model itself
                         if contents_for_api_call and contents_for_api_call[-1].role == 'model':
-                            pseudo_user_turn = content_types.to_content({'role': 'user', 'parts': ["[SYSTEM NOTE: No response from anyone.]"]})
+                            pseudo_user_turn = content_types.to_content({'role': 'user', 'parts': ["<internal_note>No response from anyone.</internal_note>"]})
                             contents_for_api_call.append(pseudo_user_turn)
 
                         pending_whispers = session.get("pending_whispers", {}).pop(participant_key, None)
                         if pending_whispers:
                             whisper_context = (
                                 "<private_context>\n"
-                                "[Knowledge received since your last turn:]\n"
+                                "Knowledge received since your last turn:\n"
                                 "By default, do NOT reveal the content of this knowledge publicly. "
                                 "Instead, let it subtly influence your tone, actions, or decisions. "
                                 "Only reveal this if specifically requested by the sender.\n"
@@ -2062,8 +2064,6 @@ class ServicesMixin:
                                 formatted_lines.append(f"> -# {'  '.join(chunk)}")
                         
                         sources_text = "\n".join(formatted_lines)
-
-                    responses_this_round.append(response_text) 
                     
                     t2_end_mono = time.monotonic()
                     duration = t2_end_mono - t1_start_mono
@@ -2095,9 +2095,56 @@ class ServicesMixin:
 
                     is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
 
-                    file_to_send = None
-                    if is_generator and generated_image_bytes_for_round:
-                        file_to_send = discord.File(io.BytesIO(generated_image_bytes_for_round), filename="generated_image.png")
+                    # [NEW] Unified Synthesis Logic for all Audio Modes
+                    audio_mode = session.get("audio_mode", "text-only")
+                    audio_file_for_send = None
+                    
+                    if audio_mode in ["audio+text", "audio-only", "multi-audio"]:
+                        # 1. Build Contextual Round Transcript using safe index iteration
+                        round_transcript = ""
+                        for idx, prev_resp in enumerate(responses_this_round[:-1]):
+                            prev_p = profile_order[idx]
+                            prev_app = self.user_appearances.get(str(prev_p['owner_id']), {}).get(prev_p['profile_name'], {})
+                            prev_name = prev_app.get("custom_display_name") or prev_p['profile_name']
+                            round_transcript += f"{prev_name}:\n{prev_resp}\n\n"
+
+                        # 2. Resolve Profile Speech Settings
+                        s_voice = p_settings.get("speech_voice", "Aoede")
+                        s_model = p_settings.get("speech_model", "gemini-2.5-flash-preview-tts")
+                        s_temp = float(p_settings.get("speech_temperature", 1.0))
+                        s_instr = p_settings.get("speech_instructions", "")
+
+                        # 3. Construct Unified Priming Prompt
+                        tts_priming_prompt = (
+                            f"You are {speaker_display_name}.\n"
+                            f"{s_instr}\n\n"
+                            f"Based on the following transcript, respond as \"{speaker_display_name}\":\n"
+                            f"{round_transcript}\n"
+                            f"Text given:\n\n"
+                            f"{speaker_display_name}: {response_text}"
+                        )
+                        
+                        # 4. Synthesise Audio
+                        turn_audio_stream = await self._generate_google_tts(
+                            tts_priming_prompt, 
+                            channel.guild.id, 
+                            model_id=s_model, 
+                            voice_name=s_voice, 
+                            temperature=s_temp
+                        )
+                        
+                        if turn_audio_stream:
+                            if audio_mode == "multi-audio":
+                                # Store for round-end stitching
+                                round_audio_segments.append(turn_audio_stream)
+                            else:
+                                # Prepare for immediate delivery with this turn
+                                audio_file_for_send = discord.File(turn_audio_stream, filename=f"voice_{turn_id[:4]}.wav")
+                                if audio_mode == "audio-only":
+                                    # Use zero-width space to hide text while keeping message valid
+                                    display_text = ""
+
+                    file_to_send = audio_file_for_send if audio_file_for_send else None
 
                     if participant.get('method') == 'child_bot':
                         correlation_id = str(uuid.uuid4())
@@ -2122,12 +2169,25 @@ class ServicesMixin:
                             "realistic_typing": is_realistic_typing, "correlation_id": correlation_id,
                             "reply_to_id": reply_id, "ping": should_ping
                         }
+                        
                         if file_to_send:
-                            # [FIXED] Removed local import statement
-                            payload["attachment"] = {
-                                "filename": "generated_image.png",
-                                "data_base64": base64.b64encode(generated_image_bytes_for_round).decode('utf-8')
-                            }
+                            # [FIXED] Corrected variable name to turn_audio_stream
+                            attachment_data = None
+                            if is_generator and generated_image_bytes_for_round:
+                                attachment_data = {
+                                    "filename": "generated_image.png",
+                                    "data_base64": base64.b64encode(generated_image_bytes_for_round).decode('utf-8')
+                                }
+                            elif audio_file_for_send:
+                                # Ensure the stream is at the start and read the bytes
+                                turn_audio_stream.seek(0)
+                                attachment_data = {
+                                    "filename": f"voice_{turn_id[:4]}.wav",
+                                    "data_base64": base64.b64encode(turn_audio_stream.read()).decode('utf-8')
+                                }
+                            
+                            if attachment_data:
+                                payload["attachment"] = attachment_data
 
                         await self.manager_queue.put({"action": "send_to_child", "bot_id": participant['bot_id'], "payload": payload})
                         del payload
@@ -2289,7 +2349,7 @@ class ServicesMixin:
                                         
                                         final_parts = [user_line]
                                         if url_text_batch and p_settings.get("url_fetching_enabled", True):
-                                            final_parts.append(f"\n[System: Context from Link]\n{url_text_batch}")
+                                            final_parts.append(f"\n<document_context>\n{url_text_batch}\n</document_context>")
                                         
                                         final_parts.extend(url_media_batch)
                                         final_parts.extend(batch_msg_media)
@@ -2345,6 +2405,25 @@ class ServicesMixin:
                 for trigger in all_triggers_for_round:
                     if trigger is not None:
                         session['task_queue'].task_done()
+
+                # [NEW] Multi-Audio Final Delivery
+                if session.get("audio_mode") == "multi-audio" and round_audio_segments:
+                    placeholders = await self._send_channel_message(channel, f"{PLACEHOLDER_EMOJI}")
+                    master_placeholder = placeholders[0] if placeholders else None
+
+                    master_stream = self._stitch_wav_segments(round_audio_segments)
+                    
+                    if master_stream.getbuffer().nbytes > 0:
+                        master_file = discord.File(master_stream, filename="round_master.wav")
+                        await self._send_channel_message(
+                            channel, 
+                            "-# **Round Audio Summary**", 
+                            target_message_to_edit=master_placeholder,
+                            file=master_file,
+                            bypass_typing=True
+                        )
+                    elif master_placeholder:
+                        await master_placeholder.delete()
 
                 # [NEW] Aggressive Round-End Memory Cleanup
                 if 'new_round_turn_data' in locals():
@@ -2428,10 +2507,10 @@ class ServicesMixin:
                             # [UPDATED] Standardized Headers
                             parts = [turn.get("content")]
                             if role == 'user' and turn.get("url_context") and p_profile_settings.get("url_fetching_enabled", True):
-                                parts.append(f"\n[SYSTEM - URL Context Results]:\n{turn.get('url_context')}")
+                                parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
                             
                             if role == 'user' and turn.get("grounding_context") and p_profile_settings.get("grounding_mode", "off") != "off":
-                                parts.append(f"\n[SYSTEM - Google Search Results]:\n{turn.get('grounding_context')}")
+                                parts.append(f"\n<external_context>\n{turn.get('grounding_context')}\n</external_context>")
 
                             content_obj = content_types.to_content({'role': role, 'parts': parts})
                             participant_history.append(content_obj)
@@ -3062,7 +3141,7 @@ class ServicesMixin:
                 system_instruction=instructions,
                 safety_settings=DEFAULT_SAFETY_SETTINGS
             )
-            r = await m.generate_content_async(f"Transcript to summarize:\n{convo}", generation_config=cfg)
+            r = await m.generate_content_async(f"<target_transcript>\n{convo}\n</target_transcript>", generation_config=cfg)
             status = "blocked_by_safety" if not r.candidates else "success"
             
             response_text = ""
@@ -4793,13 +4872,13 @@ class ServicesMixin:
         
         examples_block = "\n---\n".join(formatted_examples)
         
-        # [UPDATED] Request formatless plain text
+        # [UPDATED] Standardized XML tagging for the Analysis Prompt
         prompt = (
             f"You are a character analyst. Analyze the provided conversation examples and create a behavioral style guide for this character.\n\n"
             f"Focus on linguistic style, emotional tone, and character nuance.\n\n"
             f"Target Length: Approximately {verbosity} characters.\n\n"
             f"CRITICAL: Respond with PLAIN TEXT ONLY. Do not use Markdown (no bolding with asterisks, no italics, no hashtags for headers, no bullet point symbols). Use only simple line breaks for structure.\n\n"
-            f"EXAMPLES:\n{examples_block}\n\n"
+            f"<training_examples>\n{examples_block}\n</training_examples>\n\n"
             f"STYLE GUIDE:"
         )
 
@@ -5366,3 +5445,79 @@ class ServicesMixin:
         except Exception as e:
             await message.reply(f"An error occurred while queueing your request: {e}", delete_after=10)
             traceback.print_exc()
+
+    async def _generate_google_tts(self, text: str, guild_id: int, model_id: str = "gemini-2.5-flash-preview-tts", voice_name: str = "Aoede", temperature: float = 1.0) -> Optional[io.BytesIO]:
+        """Generates a playable WAV audio stream utilising Google Gemini Speech Generation models."""
+        import wave
+        api_key = self._get_api_key_for_guild(guild_id)
+        if not api_key:
+            return None
+
+        try:
+            client = google_genai.Client(
+                api_key=api_key, 
+                http_options=google_genai_types.HttpOptions(api_version='v1beta')
+            )
+            
+            # Utilise specific voice identities for single-speaker contextual priming
+            speech_cfg = google_genai_types.SpeechConfig(
+                voice_config=google_genai_types.VoiceConfig(
+                    prebuilt_voice_config=google_genai_types.PrebuiltVoiceConfig(voice_name=voice_name)
+                )
+            )
+
+            config = google_genai_types.GenerateContentConfig(
+                response_modalities=['AUDIO'],
+                temperature=temperature,
+                speech_config=speech_cfg
+            )
+
+            response = await client.aio.models.generate_content(
+                model=model_id,
+                contents=text,
+                config=config
+            )
+
+            if response.candidates and response.candidates[0].content.parts:
+                raw_audio_bytes = None
+                for part in response.candidates[0].content.parts:
+                    if part.inline_data and part.inline_data.data:
+                        raw_audio_bytes = part.inline_data.data
+                        break
+                
+                if raw_audio_bytes:
+                    wav_io = io.BytesIO()
+                    with wave.open(wav_io, 'wb') as wav_file:
+                        wav_file.setnchannels(1)      # Mono
+                        wav_file.setsampwidth(2)      # 16-bit
+                        wav_file.setframerate(24000)  # 24kHz
+                        wav_file.writeframes(raw_audio_bytes)
+                    wav_io.seek(0)
+                    return wav_io
+            return None
+        except Exception as e:
+            print(f"Google TTS Error: {e}")
+            return None
+
+    def _stitch_wav_segments(self, segments: List[io.BytesIO]) -> io.BytesIO:
+        """Concatenates multiple WAV Byte streams into a single Master stream without re-encoding."""
+        import wave
+        output = io.BytesIO()
+        if not segments: return output
+
+        with wave.open(output, 'wb') as master:
+            # Initialise master parameters from the first segment
+            segments[0].seek(0)
+            with wave.open(segments[0], 'rb') as first:
+                master.setparams(first.getparams())
+            
+            for seg in segments:
+                seg.seek(0)
+                try:
+                    with wave.open(seg, 'rb') as reader:
+                        master.writeframes(reader.readframes(reader.getnframes()))
+                except Exception as e:
+                    print(f"Skipping corrupted audio segment: {e}")
+        
+        output.seek(0)
+        return output

@@ -717,18 +717,19 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             current_profiles = []
             current_prompt = None
             current_mode = 'sequential'
+            current_audio_mode = 'text-only'
             
             if ch_id in self.multi_profile_channels:
                 session = self.multi_profile_channels[ch_id]
-                if session.get("type") != "freewill":
+                if session.get("type") in ["multi", None]:
                     current_profiles = list(session.get("profiles", []))
                     current_prompt = session.get("session_prompt")
                     current_mode = session.get("session_mode", "sequential")
+                    current_audio_mode = session.get("audio_mode", "text-only")
 
-            view = MultiProfileSelectView(self, interaction.user.id, as_admin_scope=True, current_profiles=current_profiles, current_prompt=current_prompt, current_mode=current_mode)
+            view = MultiProfileSelectView(self, interaction.user.id, as_admin_scope=True, current_profiles=current_profiles, current_prompt=current_prompt, current_mode=current_mode, current_audio_mode=current_audio_mode)
             self.active_session_config_views[interaction.user.id] = view
             
-            # Initial message state
             await interaction.response.send_message(view.get_ordered_list_message(), view=view, ephemeral=True)
 
     @session_group.command(name="swap", description="Swaps, adds, or removes a profile from the current session.")
@@ -2070,6 +2071,33 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         view = WhisperHistoryView(self, interaction, paired_whispers)
         await interaction.followup.send(embed=view._get_current_embed(), view=view, ephemeral=True)
+
+    @app_commands.command(name="test_google_tts", description="Test Google Gemini speech generation output (Developer Only).")
+    @app_commands.describe(text="The text to convert to speech.", model="The Gemini TTS model to utilise.")
+    @app_commands.choices(model=[
+        app_commands.Choice(name="Gemini 2.5 Flash TTS (Fast)", value="gemini-2.5-flash-preview-tts"),
+        app_commands.Choice(name="Gemini 2.5 Pro TTS (High Quality)", value="gemini-2.5-pro-preview-tts")
+    ])
+    @is_owner_in_dm_check()
+    async def test_google_tts_command(self, interaction: discord.Interaction, text: str, model: str = "gemini-2.5-flash-preview-tts"):
+        await interaction.response.defer(ephemeral=True)
+        
+        # Resolve a guild context to retrieve an authorised API key
+        guild_id = interaction.guild_id or 0
+        if not guild_id:
+             for guild in self.bot.guilds:
+                 if self._get_api_key_for_guild(guild.id):
+                     guild_id = guild.id
+                     break
+
+        audio_stream = await self._generate_google_tts(text, guild_id, model)
+        
+        if not audio_stream:
+            await interaction.followup.send("❌ Failed to generate Google TTS audio.", ephemeral=True)
+            return
+
+        file = discord.File(audio_stream, filename="google_tts_test.wav")
+        await interaction.followup.send(f"✅ Google TTS Test complete (Model: `{model}`):", file=file, ephemeral=True)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(GeminiAgent(bot))

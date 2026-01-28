@@ -670,7 +670,7 @@ class StorageMixin:
                         self.multi_profile_channels[channel_id] = {
                             "profiles": profiles_data,
                             "chat_sessions": chat_sessions,
-                            "is_hydrated": False, # Mark as not loaded from disk
+                            "is_hydrated": False, 
                             "last_bot_message_id": None,
                             "owner_id": owner_id,
                             "is_running": False,
@@ -679,6 +679,7 @@ class StorageMixin:
                             "turns_since_last_ltm": 0,
                             "session_prompt": session_data.get("session_prompt"),
                             "session_mode": session_data.get("session_mode", "sequential"),
+                            "audio_mode": session_data.get("audio_mode", "text-only"),
                             "type": session_data.get("type"),
                             "freewill_mode": session_data.get("freewill_mode")
                         }
@@ -702,6 +703,7 @@ class StorageMixin:
                         "profiles": session_data["profiles"],
                         "session_prompt": session_data.get("session_prompt"),
                         "session_mode": session_data.get("session_mode", "sequential"),
+                        "audio_mode": session_data.get("audio_mode", "text-only"),
                         "type": session_data.get("type", "multi"),
                         "freewill_mode": session_data.get("freewill_mode")
                     }
@@ -998,6 +1000,10 @@ class StorageMixin:
             pdata.setdefault("wakewords", [])
             pdata.setdefault("safety_level", "low")
             pdata.setdefault("ltm_creation_enabled", False)
+            pdata.setdefault("speech_voice", "Aoede")
+            pdata.setdefault("speech_model", "gemini-2.5-flash-preview-tts")
+            pdata.setdefault("speech_temperature", 1.0)
+            pdata.setdefault("speech_instructions", "")
 
         for pname, pdata in user_data.get("borrowed_profiles", {}).items():
             pdata.setdefault("ltm_creation_enabled", False)
@@ -1101,6 +1107,10 @@ class StorageMixin:
             profile.setdefault("thinking_summary_visible", "off")
             profile.setdefault("thinking_level", "medium")
             profile.setdefault("thinking_budget", -1)
+            profile.setdefault("speech_voice", "Aoede")
+            profile.setdefault("speech_model", "gemini-2.5-flash-preview-tts")
+            profile.setdefault("speech_temperature", 1.0)
+            profile.setdefault("speech_instructions", "")
         return user_data["profiles"][profile_name]
     
     def _get_active_user_profile_name_for_channel(self, user_id: int, channel_id: int) -> str:

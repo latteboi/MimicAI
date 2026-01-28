@@ -916,7 +916,7 @@ class CoreMixin:
             chat = session_data['chat_session']
             self.session_last_accessed[model_cache_key] = time.time()
 
-            # [UPDATED] Standardized Headers
+            # [UPDATED] Standardized XML Headers
             from google.generativeai.types import content_types
             rebuilt_history = []
             for t in session_data['unified_log']:
@@ -925,9 +925,9 @@ class CoreMixin:
                 
                 if t_role == 'user':
                     if t.get('url_context') and profile_data.get('url_fetching_enabled', True):
-                        parts.append(f"\n[SYSTEM - URL Context Results]:\n{t.get('url_context')}")
+                        parts.append(f"\n<document_context>\n{t.get('url_context')}\n</document_context>")
                     if t.get('grounding_context') and profile_data.get('grounding_mode', 'off') != 'off':
-                        parts.append(f"\n[SYSTEM - Google Search Results]:\n{t.get('grounding_context')}")
+                        parts.append(f"\n<external_context>\n{t.get('grounding_context')}\n</external_context>")
                 
                 rebuilt_history.append(content_types.to_content({'role': t_role, 'parts': parts}))
             
@@ -1489,21 +1489,19 @@ class CoreMixin:
         
         return True # Not unrestricted, so it's allowed.
     
-    async def setup_multi_profile_session(self, interaction: discord.Interaction, participants: List[Dict], session_prompt: Optional[str], session_mode: str, as_admin_scope: bool = False):
+    async def setup_multi_profile_session(self, interaction: discord.Interaction, participants: List[Dict], session_prompt: Optional[str], session_mode: str, as_admin_scope: bool = False, audio_mode: str = "text-only"):
         user_id = interaction.user.id
         is_update = interaction.channel_id in self.multi_profile_channels
         from google.generativeai.types import content_types
 
         if is_update:
             session = self.multi_profile_channels[interaction.channel_id]
-            # Ensure session is hydrated before modification
             if not session.get("is_hydrated"):
                 session = self._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi"))
 
             existing_keys = set(session.get("chat_sessions", {}).keys())
             new_keys = { (p['owner_id'], p['profile_name']) for p in participants }
             
-            # Add new participants
             for key_to_add in new_keys - existing_keys:
                 dummy_model = genai.GenerativeModel('gemini-flash-latest')
                 participant_history = []
@@ -1514,23 +1512,17 @@ class CoreMixin:
                     participant_history.append(content_obj)
                 session["chat_sessions"][key_to_add] = dummy_model.start_chat(history=participant_history)
 
-            # Remove old participants from in-memory session
             for key_to_remove in existing_keys - new_keys:
                 session["chat_sessions"].pop(key_to_remove, None)
         else:
-            # For a new session, initialize an empty unified log and placeholders for chat sessions.
             chat_sessions = { (p['owner_id'], p['profile_name']): None for p in participants }
-            unified_log = []
-
-            # Initialize counters for new profiles
-            for p in participants:
-                p['ltm_counter'] = 0
+            for p in participants: p['ltm_counter'] = 0
 
             session = {
                 "type": "multi",
                 "chat_sessions": chat_sessions,
-                "unified_log": unified_log,
-                "is_hydrated": False, # Will be hydrated on first use
+                "unified_log": [],
+                "is_hydrated": False,
                 "last_bot_message_id": None,
                 "owner_id": interaction.user.id,
                 "is_running": False,
@@ -1540,13 +1532,16 @@ class CoreMixin:
                 "session_prompt": None,
                 "session_mode": "sequential",
                 "pending_image_gen_data": None,
-                "pending_whispers": {}
+                "pending_whispers": {},
+                "audio_mode": "text-only"
             }
             self.multi_profile_channels[interaction.channel_id] = session
 
+        session["type"] = "multi"
         session["session_prompt"] = session_prompt
         session["profiles"] = participants
         session["session_mode"] = session_mode
+        session["audio_mode"] = audio_mode
         
         for p_data in participants:
             if p_data.get('method') == 'child_bot':
@@ -1568,8 +1563,7 @@ class CoreMixin:
         action_str = "updated" if is_update else "activated"
         msg = f"Regular session {action_str} with participants: {', '.join(profile_list_str)}."
         if as_admin_scope:
-            scope_action_str = "updated" if is_update else "set"
-            msg = f"Regular session is now active for all users with profiles: {profile_list_str}."
+            msg = f"Regular session is now active for all users with profiles: {', '.join(profile_list_str)}."
         
         await interaction.edit_original_response(content=msg, view=None)
 
@@ -1971,8 +1965,17 @@ class CoreMixin:
         )
         embed.add_field(name="Thinking/Reasoning", value=thinking_val, inline=True)
 
-        # Invisible Separator to push the next row down
-        embed.add_field(name="\u200b", value="\u200b", inline=False)
+        s_voice = source_profile_data.get("speech_voice", "Aoede")
+        s_model = source_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts")
+        s_temp = source_profile_data.get("speech_temperature", 1.0)
+        s_model_disp = s_model.replace("gemini-", "").replace("-preview-tts", "").title()
+        
+        speech_val = (
+            f"Voice: `{s_voice}`\n"
+            f"Model: `{s_model_disp}`\n"
+            f"Prosody: `{s_temp}`"
+        )
+        embed.add_field(name="Speech TTS", value=speech_val, inline=True)
 
         # 5. Training & Memory Section (Same Row)
         train_val = (

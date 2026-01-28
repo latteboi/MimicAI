@@ -21,7 +21,7 @@ While the internal structure utilises a modular Mixin architecture, it remains a
 *   Freewill Sessions: Opt-in profiles to start their own conversations, respond by set chance, or respond to keywords.
 *   Data Portability: Seamlessly move your profiles between instances using the built-in plaintext Export and Import system.
 *   Grounding (Web Search): Integrated Google Search support allows your profiles to access real-time information and cite sources.
-*   Multimodal: Built-in image generation via Gemini 2.5 Flash Image.
+*   Multimodal: Built-in image generation and text-to-speech with Google Gemini models.
 *   Advanced Parameters: Fine-tune AI behavior with control over Temperature, Top P, Top K, and OpenRouter-specific penalties.
 
 ---
@@ -123,7 +123,6 @@ As an Open Beta, certain components are still catching up to the rapid structura
 
 # Future Outlooks
 *   Parallel Responses: Adding a new feature where you can switch from sequential turns to chaotic "Real-time" Discord conversations where multiple profiles can speak simultaneously.
-*   Voice Integration: Allowing profiles to send audio files & participate in Voice Channels using TTS models.
 *   SDK v2 Full Migration: Completing the transition to the latest AI infrastructure for better compatibility.
 
 ---

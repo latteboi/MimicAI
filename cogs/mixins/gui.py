@@ -543,6 +543,106 @@ class WhisperActionView(ui.View):
 
         await interaction.edit_original_response(content="Whisper has been deleted from the profile's memory.", view=None, embed=None)
 
+class CustomSpeechParamModal(ui.Modal, title="Enter Custom ID"):
+    param_input = ui.TextInput(label="ID Value", placeholder="e.g. Fenrir or specific-model-id", required=True)
+
+    def __init__(self, parent_modal: 'ProfileSpeechSettingsModal', param_type: str):
+        super().__init__()
+        self.parent_modal = parent_modal
+        self.param_type = param_type
+
+    async def on_submit(self, interaction: discord.Interaction):
+        val = self.param_input.value.strip()
+        if self.param_type == 'voice': self.parent_modal.custom_voice = val
+        else: self.parent_modal.custom_model = val
+        await interaction.response.send_message(f"Custom {self.param_type} set to `{val}`. Please finish the main form.", ephemeral=True, delete_after=5)
+
+class ProfileSpeechSettingsModal(ui.Modal, title="Speech & Voice Settings"):
+    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+        super().__init__()
+        self.cog = cog
+        self.profile_name = profile_name
+        self.is_borrowed = is_borrowed
+        self.callback = callback
+
+        self.voice_input = ui.TextInput(
+            label="Voice Name (Aoede, Charon, Puck, Kore, etc)", 
+            default=str(current_params.get("speech_voice", "Aoede")), 
+            placeholder="Identity for synthesis (e.g. Aoede)",
+            required=False,
+            max_length=40
+        )
+        self.model_input = ui.TextInput(
+            label="Speech Model ID", 
+            default=str(current_params.get("speech_model", "gemini-2.5-flash-preview-tts")), 
+            placeholder="Model used for synthesis",
+            required=False,
+            max_length=80
+        )
+        self.temp_input = ui.TextInput(
+            label="Speech Temp / Prosody (0.0 - 2.0)", 
+            default=str(current_params.get("speech_temperature", 1.0)), 
+            placeholder="1.0 = Default, 2.0 = High Expression",
+            required=False,
+            max_length=5
+        )
+        self.instr_input = ui.TextInput(
+            label="Speech Style Instructions",
+            style=discord.TextStyle.paragraph,
+            default=str(current_params.get("speech_instructions", "")),
+            placeholder="e.g. Speak with a stutter, whisper, or sound exhausted.",
+            required=False,
+            max_length=1000
+        )
+        
+        self.add_item(self.voice_input)
+        self.add_item(self.model_input)
+        self.add_item(self.temp_input)
+        self.add_item(self.instr_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        voice = self.voice_input.value.strip() or "Aoede"
+        model = self.model_input.value.strip() or "gemini-2.5-flash-preview-tts"
+        instr = self.instr_input.value.strip()
+        
+        try:
+            temp_raw = self.temp_input.value.strip()
+            temp = float(temp_raw) if temp_raw else 1.0
+            if not (0.0 <= temp <= 2.0): raise ValueError()
+        except ValueError:
+            await interaction.followup.send("❌ **Invalid Temperature.** Enter a number between 0.0 and 2.0.", ephemeral=True)
+            return
+
+        new_params = {
+            "speech_voice": voice,
+            "speech_model": model,
+            "speech_temperature": temp,
+            "speech_instructions": instr
+        }
+
+        user_id = interaction.user.id
+        user_data = self.cog._get_user_data_entry(user_id)
+        target_dict = user_data.get("borrowed_profiles" if self.is_borrowed else "profiles", {})
+        profile = target_dict.get(self.profile_name)
+        
+        if profile:
+            profile.update(new_params)
+            self.cog._save_user_data_entry(user_id, user_data)
+            
+            keys_to_clear = [
+                k for k in self.cog.channel_models.keys() 
+                if isinstance(k, tuple) and len(k) == 3 and k[1] == user_id and k[2] == self.profile_name
+            ]
+            for k in keys_to_clear:
+                self.cog.channel_models.pop(k, None)
+                self.cog.chat_sessions.pop(k, None)
+                self.cog.channel_model_last_profile_key.pop(k, None)
+
+            await interaction.followup.send(f"✅ Speech settings updated for '{self.profile_name}'.", ephemeral=True)
+            if self.callback: await self.callback(interaction)
+
 class PaginatedEmbedView(ui.View):
     def __init__(self, embeds: List[discord.Embed], page_titles: List[str]):
         super().__init__(timeout=300)
@@ -629,6 +729,7 @@ class ProfileManageView(ui.View):
             options.append(discord.SelectOption(label="Set Generation Parameters & STM", value="gen_params", description="Set Temp, Top P, Top K, and STM Length."))
             options.append(discord.SelectOption(label="Set Advanced Parameters (OPENROUTER)", value="adv_params", description="Set penalties, Min P, and Top A."))
             options.append(discord.SelectOption(label="Set Thinking Parameters", value="thinking_params", description="Set thinking persistence, level, and budget."))
+            options.append(discord.SelectOption(label="Set Speech & Voice Settings", value="speech_settings", description="Set TTS voice, model, and prosody."))
 
         elif self.current_tab == "tools":
             options.append(discord.SelectOption(label="Toggle Image Generation", value="image_toggle", description="Allow this profile to generate images via !image/!imagine."))
@@ -736,6 +837,14 @@ class ProfileManageView(ui.View):
             
             # [UPDATED] Pass self.is_borrowed to the modal
             modal = ProfileThinkingParamsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb)
+            await interaction.response.send_modal(modal)
+
+        elif choice == "speech_settings":
+            async def refresh_cb(modal_interaction: discord.Interaction):
+                new_embed = await self.cog._build_profile_manage_embed(modal_interaction, profile_name)
+                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
+            
+            modal = ProfileSpeechSettingsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb)
             await interaction.response.send_modal(modal)
 
         # --- Tools Tab Logic ---
@@ -2407,13 +2516,14 @@ class SessionPromptModal(ui.Modal, title="Set Multi-Profile Session Prompt"):
         await interaction.response.send_message("Session prompt has been updated.", ephemeral=True, delete_after=5)
 
 class MultiProfileSelectView(ui.View):
-    def __init__(self, cog: 'GeminiAgent', user_id: int, as_admin_scope: bool, current_profiles: List[Dict] = [], current_prompt: Optional[str] = None, current_mode: str = 'sequential'):
+    def __init__(self, cog: 'GeminiAgent', user_id: int, as_admin_scope: bool, current_profiles: List[Dict] = [], current_prompt: Optional[str] = None, current_mode: str = 'sequential', current_audio_mode: str = 'text-only'):
         super().__init__(timeout=600)
         self.cog = cog
         self.user_id = user_id
         self.as_admin_scope = as_admin_scope
         self.session_prompt = current_prompt
         self.session_mode = current_mode
+        self.session_audio_mode = current_audio_mode
         
         self.selection_order = OrderedDict()
         for p_data in current_profiles:
@@ -2513,6 +2623,16 @@ class MultiProfileSelectView(ui.View):
         btn_mode.callback = self.toggle_mode
         self.add_item(btn_mode)
 
+        audio_labels = {
+            "text-only": "Audio: Text-Only",
+            "audio+text": "Audio: Audio + Text",
+            "audio-only": "Audio: Audio-Only",
+            "multi-audio": "Audio: Multi-Audio"
+        }
+        btn_audio = ui.Button(label=audio_labels.get(self.session_audio_mode, "Audio: Text-Only"), style=discord.ButtonStyle.secondary, row=2)
+        btn_audio.callback = self.toggle_audio_mode
+        self.add_item(btn_audio)
+
         btn_prompt = ui.Button(label="Set Director's Note", style=discord.ButtonStyle.secondary, row=2)
         btn_prompt.callback = self.set_prompt
         self.add_item(btn_prompt)
@@ -2548,6 +2668,13 @@ class MultiProfileSelectView(ui.View):
 
     async def toggle_mode(self, i: discord.Interaction):
         self.session_mode = 'random' if self.session_mode == 'sequential' else 'sequential'
+        self._build_view()
+        await i.response.edit_message(view=self)
+
+    async def toggle_audio_mode(self, i: discord.Interaction):
+        modes = ["text-only", "audio+text", "audio-only", "multi-audio"]
+        curr_idx = modes.index(self.session_audio_mode)
+        self.session_audio_mode = modes[(curr_idx + 1) % len(modes)]
         self._build_view()
         await i.response.edit_message(view=self)
 
@@ -2658,7 +2785,14 @@ class MultiProfileSelectView(ui.View):
             )
             return
 
-        await self.cog.setup_multi_profile_session(interaction, ordered_participants, self.session_prompt, self.session_mode, as_admin_scope=self.as_admin_scope)
+        await self.cog.setup_multi_profile_session(
+            interaction, 
+            ordered_participants, 
+            self.session_prompt, 
+            self.session_mode, 
+            as_admin_scope=self.as_admin_scope,
+            audio_mode=self.session_audio_mode
+        )
 
 class SingleProfileModelView(ui.View):
     def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, profile_name: str):
