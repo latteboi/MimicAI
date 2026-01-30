@@ -25,6 +25,17 @@ While the internal structure utilises a modular Mixin architecture, it remains a
 *   Advanced Parameters: Fine-tune AI behavior with control over Temperature, Top P, Top K, and OpenRouter-specific penalties.
 
 ---
+# Gallery
+<img width="487" height="801" alt="ScreenshotProfileManage" src="https://github.com/user-attachments/assets/c1213350-4292-482a-9293-b1ffef3f31eb" />
+<img width="651" height="341" alt="ScreenshotSessionConfig" src="https://github.com/user-attachments/assets/0ab3d1aa-28f6-4154-b48b-c82356a13037" />
+<img width="1305" height="799" alt="Screenshot 2026-01-31 at 12 38 53 am" src="https://github.com/user-attachments/assets/a570e772-a1bc-47f1-93ca-f5ca558b0800" />
+
+
+
+
+
+
+---
 
 # Deep Dives
 
