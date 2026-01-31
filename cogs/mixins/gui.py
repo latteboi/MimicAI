@@ -543,19 +543,70 @@ class WhisperActionView(ui.View):
 
         await interaction.edit_original_response(content="Whisper has been deleted from the profile's memory.", view=None, embed=None)
 
-class CustomSpeechParamModal(ui.Modal, title="Enter Custom ID"):
-    param_input = ui.TextInput(label="ID Value", placeholder="e.g. Fenrir or specific-model-id", required=True)
-
-    def __init__(self, parent_modal: 'ProfileSpeechSettingsModal', param_type: str):
+class ProfileDirectorDeskModal(ui.Modal, title="Director's Desk: TTS Instructions"):
+    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], callback=None):
         super().__init__()
-        self.parent_modal = parent_modal
-        self.param_type = param_type
+        self.cog = cog
+        self.profile_name = profile_name
+        self.callback = callback
+
+        self.archetype_input = ui.TextInput(
+            label="Archetype (Who)", 
+            default=str(current_params.get("speech_archetype", "")), 
+            placeholder="e.g. A cynical noir detective, a bubbly influencer.",
+            required=False, max_length=200
+        )
+        self.accent_input = ui.TextInput(
+            label="Accent", 
+            default=str(current_params.get("speech_accent", "")), 
+            placeholder="e.g. Australian (Melbourne), British (Brixton).",
+            required=False, max_length=200
+        )
+        self.dynamics_input = ui.TextInput(
+            label="Dynamics (Where / Acoustics)", 
+            default=str(current_params.get("speech_dynamics", "")), 
+            placeholder="e.g. Speaking in a whisper, cavernous echoing hall.",
+            required=False, max_length=200
+        )
+        self.style_input = ui.TextInput(
+            label="Vocal Style (How)", 
+            default=str(current_params.get("speech_style", "")), 
+            placeholder="e.g. A vocal smile, breathy, gritty and gravelly.",
+            required=False, max_length=200
+        )
+        self.pacing_input = ui.TextInput(
+            label="Pacing (Tempo)", 
+            default=str(current_params.get("speech_pacing", "")), 
+            placeholder="e.g. Rapid-fire delivery, slow deliberate drawl.",
+            required=False, max_length=200
+        )
+        
+        self.add_item(self.archetype_input)
+        self.add_item(self.accent_input)
+        self.add_item(self.dynamics_input)
+        self.add_item(self.style_input)
+        self.add_item(self.pacing_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        val = self.param_input.value.strip()
-        if self.param_type == 'voice': self.parent_modal.custom_voice = val
-        else: self.parent_modal.custom_model = val
-        await interaction.response.send_message(f"Custom {self.param_type} set to `{val}`. Please finish the main form.", ephemeral=True, delete_after=5)
+        await interaction.response.defer(ephemeral=True)
+        
+        new_params = {
+            "speech_archetype": self.archetype_input.value.strip(),
+            "speech_accent": self.accent_input.value.strip(),
+            "speech_dynamics": self.dynamics_input.value.strip(),
+            "speech_style": self.style_input.value.strip(),
+            "speech_pacing": self.pacing_input.value.strip()
+        }
+
+        user_id = interaction.user.id
+        user_data = self.cog._get_user_data_entry(user_id)
+        profile = user_data.get("profiles", {}).get(self.profile_name)
+        
+        if profile:
+            profile.update(new_params)
+            self.cog._save_user_data_entry(user_id, user_data)
+            await interaction.followup.send(f"✅ TTS Instructions updated for '{self.profile_name}'.", ephemeral=True)
+            if self.callback: await self.callback(interaction)
 
 class ProfileSpeechSettingsModal(ui.Modal, title="Speech & Voice Settings"):
     def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
@@ -586,26 +637,16 @@ class ProfileSpeechSettingsModal(ui.Modal, title="Speech & Voice Settings"):
             required=False,
             max_length=5
         )
-        self.instr_input = ui.TextInput(
-            label="Speech Style Instructions",
-            style=discord.TextStyle.paragraph,
-            default=str(current_params.get("speech_instructions", "")),
-            placeholder="e.g. Speak with a stutter, whisper, or sound exhausted.",
-            required=False,
-            max_length=1000
-        )
         
         self.add_item(self.voice_input)
         self.add_item(self.model_input)
         self.add_item(self.temp_input)
-        self.add_item(self.instr_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         
         voice = self.voice_input.value.strip() or "Aoede"
         model = self.model_input.value.strip() or "gemini-2.5-flash-preview-tts"
-        instr = self.instr_input.value.strip()
         
         try:
             temp_raw = self.temp_input.value.strip()
@@ -619,7 +660,6 @@ class ProfileSpeechSettingsModal(ui.Modal, title="Speech & Voice Settings"):
             "speech_voice": voice,
             "speech_model": model,
             "speech_temperature": temp,
-            "speech_instructions": instr
         }
 
         user_id = interaction.user.id
@@ -722,6 +762,7 @@ class ProfileManageView(ui.View):
             # Tab hidden for borrowed, but kept for logic safety
             options.append(discord.SelectOption(label="Edit Persona", value="edit_persona", description="Edit backstory, traits, likes, dislikes, and appearance."))
             options.append(discord.SelectOption(label="Edit Instructions", value="edit_instructions", description="Edit specific AI behavioral instructions."))
+            options.append(discord.SelectOption(label="TTS Instructions", value="tts_instructions", description="Configure the 'Director's Desk' for vocal performance."))
             options.append(discord.SelectOption(label="Edit Appearance", value="edit_appearance", description="Edit the custom Webhook name and avatar."))
 
         elif self.current_tab == "params":
@@ -806,6 +847,12 @@ class ProfileManageView(ui.View):
             await interaction.response.send_modal(modal)
         elif choice == "edit_instructions":
             modal = EditUserProfileAIInstructionsModal(self.cog, profile_name, profile.get("ai_instructions", ""), user_id)
+            await interaction.response.send_modal(modal)
+        elif choice == "tts_instructions":
+            async def refresh_cb(modal_interaction: discord.Interaction):
+                new_embed = await self.cog._build_profile_manage_embed(modal_interaction, profile_name)
+                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
+            modal = ProfileDirectorDeskModal(self.cog, profile_name, profile, callback=refresh_cb)
             await interaction.response.send_modal(modal)
         elif choice == "edit_appearance":
             await self._handle_appearance(interaction)

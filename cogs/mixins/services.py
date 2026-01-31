@@ -2100,29 +2100,54 @@ class ServicesMixin:
                     audio_file_for_send = None
                     
                     if audio_mode in ["audio+text", "audio-only", "multi-audio"]:
-                        # 1. Build Contextual Round Transcript using safe index iteration
+                        # 1. Build Contextual Round Transcript
                         round_transcript = ""
                         for idx, prev_resp in enumerate(responses_this_round[:-1]):
                             prev_p = profile_order[idx]
                             prev_app = self.user_appearances.get(str(prev_p['owner_id']), {}).get(prev_p['profile_name'], {})
                             prev_name = prev_app.get("custom_display_name") or prev_p['profile_name']
-                            round_transcript += f"{prev_name}:\n{prev_resp}\n\n"
+                            round_transcript += f"{prev_name}: {prev_resp}\n\n"
 
-                        # 2. Resolve Profile Speech Settings
+                        # 2. Resolve Profile Speech Settings and Director's Desk
                         s_voice = p_settings.get("speech_voice", "Aoede")
                         s_model = p_settings.get("speech_model", "gemini-2.5-flash-preview-tts")
                         s_temp = float(p_settings.get("speech_temperature", 1.0))
-                        s_instr = p_settings.get("speech_instructions", "")
+                        
+                        s_arch = p_settings.get("speech_archetype", "")
+                        s_acc = p_settings.get("speech_accent", "")
+                        s_dyn = p_settings.get("speech_dynamics", "")
+                        s_styl = p_settings.get("speech_style", "")
+                        s_pace = p_settings.get("speech_pacing", "")
 
-                        # 3. Construct Unified Priming Prompt
-                        tts_priming_prompt = (
-                            f"You are {speaker_display_name}.\n"
-                            f"{s_instr}\n\n"
-                            f"Based on the following transcript, respond as \"{speaker_display_name}\":\n"
-                            f"{round_transcript}\n"
-                            f"Text given:\n\n"
-                            f"{speaker_display_name}: {response_text}"
-                        )
+                        # 3. Construct Conditional Markdown Prompt
+                        prompt_parts = []
+                        
+                        # Section: Audio Profile
+                        if s_arch or s_acc:
+                            part = f"# AUDIO PROFILE: {speaker_display_name}\n"
+                            if s_arch: part += f"Archetype: {s_arch}\n"
+                            if s_acc: part += f"Accent: {s_acc}\n"
+                            prompt_parts.append(part.strip())
+
+                        # Section: The Scene
+                        if s_dyn:
+                            part = f"## THE SCENE\nDynamics: {s_dyn}\nAction: Fluid conversation."
+                            prompt_parts.append(part.strip())
+
+                        # Section: Director's Notes
+                        if s_styl or s_pace:
+                            part = "### DIRECTOR'S NOTES\n"
+                            if s_styl: part += f"Style: {s_styl}\n"
+                            if s_pace: part += f"Pacing: {s_pace}\n"
+                            prompt_parts.append(part.strip())
+
+                        # Section: Context & Transcript
+                        if round_transcript:
+                            prompt_parts.append(f"#### SAMPLE CONTEXT\nPrevious turn flow:\n{round_transcript.strip()}")
+                        
+                        prompt_parts.append(f"#### TRANSCRIPT\n{speaker_display_name}: {response_text}")
+
+                        tts_priming_prompt = "\n\n".join(prompt_parts)
                         
                         # 4. Synthesise Audio
                         turn_audio_stream = await self._generate_google_tts(
