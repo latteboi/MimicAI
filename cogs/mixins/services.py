@@ -310,7 +310,7 @@ class GoogleGenAIModel:
                 self.prompt_feedback = getattr(raw_resp, 'prompt_feedback', None)
                 self.usage_metadata = getattr(raw_resp, 'usage_metadata', None)
                 
-                if raw_resp.candidates:
+                if raw_resp.candidates and raw_resp.candidates[0].content and raw_resp.candidates[0].content.parts:
                     for part in raw_resp.candidates[0].content.parts:
                         is_thought = getattr(part, 'thought', False)
                         if is_thought:
@@ -2169,7 +2169,15 @@ class ServicesMixin:
                                     # Use zero-width space to hide text while keeping message valid
                                     display_text = ""
 
-                    file_to_send = audio_file_for_send if audio_file_for_send else None
+                    # [FIXED] Non-exclusive media selection: prioritize image as primary, audio as follow-up
+                    file_to_send = None
+                    extra_audio_file = None
+                    if is_generator and generated_image_bytes_for_round:
+                        file_to_send = discord.File(io.BytesIO(generated_image_bytes_for_round), filename="generated_image.png")
+                        if audio_file_for_send:
+                            extra_audio_file = audio_file_for_send
+                    elif audio_file_for_send:
+                        file_to_send = audio_file_for_send
 
                     if participant.get('method') == 'child_bot':
                         correlation_id = str(uuid.uuid4())
@@ -2196,7 +2204,6 @@ class ServicesMixin:
                         }
                         
                         if file_to_send:
-                            # [FIXED] Corrected variable name to turn_audio_stream
                             attachment_data = None
                             if is_generator and generated_image_bytes_for_round:
                                 attachment_data = {
@@ -2204,13 +2211,11 @@ class ServicesMixin:
                                     "data_base64": base64.b64encode(generated_image_bytes_for_round).decode('utf-8')
                                 }
                             elif audio_file_for_send:
-                                # Ensure the stream is at the start and read the bytes
                                 turn_audio_stream.seek(0)
                                 attachment_data = {
                                     "filename": f"voice_{turn_id[:4]}.wav",
                                     "data_base64": base64.b64encode(turn_audio_stream.read()).decode('utf-8')
                                 }
-                            
                             if attachment_data:
                                 payload["attachment"] = attachment_data
 
@@ -2220,7 +2225,30 @@ class ServicesMixin:
                         try: await asyncio.wait_for(confirmation_event.wait(), timeout=45.0)
                         except asyncio.TimeoutError: self.pending_child_confirmations.pop(correlation_id, None)
 
-                        # Send thought summary as a separate file attachment
+                        # [NEW] Dispatch extra audio follow-up for Child Bot
+                        if extra_audio_file:
+                            a_corr_id = str(uuid.uuid4())
+                            a_conf_event = asyncio.Event()
+                            self.pending_child_confirmations[a_corr_id] = {
+                                "event": a_conf_event, "type": "multi_profile", "participant": participant,
+                                "history_line": history_line, "channel_id": channel.id, "turn_id": turn_id
+                            }
+                            turn_audio_stream.seek(0)
+                            audio_base64 = base64.b64encode(turn_audio_stream.read()).decode('utf-8')
+                            await self.manager_queue.put({
+                                "action": "send_to_child", "bot_id": participant['bot_id'],
+                                "payload": {
+                                    "action": "send_message", "channel_id": channel.id, 
+                                    "content": "", "realistic_typing": False, "correlation_id": a_corr_id,
+                                    "attachment": {
+                                        "filename": f"voice_{turn_id[:4]}.wav",
+                                        "data_base64": audio_base64
+                                    }
+                                }
+                            })
+                            try: await asyncio.wait_for(a_conf_event.wait(), timeout=45.0)
+                            except asyncio.TimeoutError: self.pending_child_confirmations.pop(a_corr_id, None)
+
                         if thought_file_to_send:
                             t_corr_id = str(uuid.uuid4())
                             t_conf_event = asyncio.Event()
@@ -2235,7 +2263,7 @@ class ServicesMixin:
                                 "action": "send_to_child", "bot_id": participant['bot_id'],
                                 "payload": {
                                     "action": "send_message", "channel_id": channel.id, 
-                                    "content": "", # [UPDATED] Removed text label
+                                    "content": "",
                                     "realistic_typing": False, "correlation_id": t_corr_id,
                                     "attachment": {
                                         "filename": "thinking_summary.txt",
@@ -2253,12 +2281,17 @@ class ServicesMixin:
                             file=file_to_send, reply_to=(anchor_message if i == 0 else None)
                         )
                         
-                        # Send thought summary as a separate file attachment
+                        # [NEW] Dispatch extra audio follow-up for Webhook
+                        if extra_audio_file:
+                            await self._send_channel_message(
+                                channel, "", file=extra_audio_file,
+                                profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name,
+                                bypass_typing=True
+                            )
+
                         if thought_file_to_send:
                             t_msgs = await self._send_channel_message(
-                                channel, 
-                                "", # [UPDATED] Removed text label
-                                file=thought_file_to_send,
+                                channel, "", file=thought_file_to_send,
                                 profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name,
                                 bypass_typing=True
                             )
