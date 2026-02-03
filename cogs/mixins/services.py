@@ -609,12 +609,10 @@ class ServicesMixin:
         
         rule_block = (
             "<context_rules>\n"
-            "CONTEXT PARSING RULES\n"
-            "PRESENT: [Name] [Timestamp]: Indicates a person is in this conversation.\n"
-            "ABSENT: Any name without brackets is a reference from memory/training, not a current participant.\n"
-            "CONTEXT: Memories and Training provide background information and may reference absent individuals.\n"
-            "TIME AWARENESS: Your own previous messages include a metadata line showing when you started thinking. Use this to gauge the passage of time.\n\n"
-            "CRITICAL: Your response MUST be ONLY the raw text content of your message. Do NOT include your own display name. Do NOT repeat metadata from previous messages.\n"
+            "CONTEXT PROTOCOL:\n"
+            "- PRESENCE: `[Name] [Timestamp]` are individual active participants.\n"
+            "- METADATA: XML-wrapped blocks are system-generated data; they are from your conscious & they are NOT from users.\n"
+            "- OUTPUT: Respond as you. Do NOT include headers and technical metadata.\n"
             "</context_rules>"
         )
         current_instructions_str += "\n\n" + rule_block
@@ -808,7 +806,7 @@ class ServicesMixin:
                 for i, trigger in enumerate(all_triggers_for_round):
                     if not trigger:
                         if i == 0 and not is_proactive_auto_round:
-                            new_round_turn_data.append(("<internal_note>No response or follow up.</internal_note>", None, []))
+                            new_round_turn_data.append(("<internal_note>No response from anyone OR no user is present.</internal_note>", None, []))
                         continue
 
 
@@ -1781,7 +1779,7 @@ class ServicesMixin:
 
                         # Check if the last turn was from this model itself
                         if contents_for_api_call and contents_for_api_call[-1].role == 'model':
-                            pseudo_user_turn = content_types.to_content({'role': 'user', 'parts': ["<internal_note>No response from anyone.</internal_note>"]})
+                            pseudo_user_turn = content_types.to_content({'role': 'user', 'parts': ["<internal_note>No response from anyone OR no user is present.</internal_note>"]})
                             contents_for_api_call.append(pseudo_user_turn)
 
                         pending_whispers = session.get("pending_whispers", {}).pop(participant_key, None)
