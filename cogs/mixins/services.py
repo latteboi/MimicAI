@@ -974,9 +974,16 @@ class ServicesMixin:
                                                 new_message_parts.append({"mime_type": ref_media.content_type, "data": media_data})
                             except Exception as e:
                                 print(f"Error fetching replied media: {e}")
-                        # ----------------------------------------------------
 
-                        attachments = trigger_obj['attachments'] if is_child_mention else [a for a in trigger_obj.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))]
+                        attachments = trigger_obj['attachments'] if is_child_mention else [
+                            a for a in trigger_obj.attachments 
+                            if a.content_type and (
+                                a.content_type.startswith("image/") or 
+                                a.content_type.startswith("audio/") or 
+                                a.content_type.startswith("video/")
+                            )
+                        ]
+
                         if attachments:
                             async with httpx.AsyncClient() as client:
                                 for attachment in attachments:
@@ -986,36 +993,11 @@ class ServicesMixin:
                                         response.raise_for_status()
                                         media_data = await response.aread()
                                         
-                                        # Infer mime type from headers if not explicitly available object
                                         ctype = response.headers.get("Content-Type", "image/png")
-                                        if hasattr(attachment, 'content_type') and attachment.content_type:
+                                        if not is_child_mention and attachment.content_type:
                                             ctype = attachment.content_type
-                                        elif isinstance(attachment, dict) and 'content_type' in attachment: # Handle payload dict
-                                            ctype = attachment['content_type']
-                                        
-                                        new_message_parts.append({"mime_type": ctype, "data": media_data})
-                                        del media_data
-                                    except Exception as e:
-                                        print(f"Failed to process media attachment in multi-profile trigger: {e}")
-                        # ----------------------------------------------------
-
-                        # [UPDATED] Include audio/ MIME types
-                        attachments = trigger_obj['attachments'] if is_child_mention else [a for a in trigger_obj.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/"))]
-                        if attachments:
-                            async with httpx.AsyncClient() as client:
-                                for attachment in attachments:
-                                    try:
-                                        attachment_url = attachment['url'] if is_child_mention else attachment.url
-                                        response = await client.get(attachment_url)
-                                        response.raise_for_status()
-                                        media_data = await response.aread()
-                                        
-                                        # Infer mime type
-                                        ctype = response.headers.get("Content-Type", "image/png")
-                                        if hasattr(attachment, 'content_type') and attachment.content_type:
-                                            ctype = attachment.content_type
-                                        elif isinstance(attachment, dict) and 'content_type' in attachment:
-                                            ctype = attachment['content_type']
+                                        elif is_child_mention and isinstance(attachment, dict):
+                                            ctype = attachment.get('content_type', "image/png")
                                         
                                         new_message_parts.append({"mime_type": ctype, "data": media_data})
                                         del media_data
@@ -1046,22 +1028,17 @@ class ServicesMixin:
                     elif reaction_trigger and i == 0:
                         triggering_user_id = reaction_trigger.user_id
 
-                # [UPDATED] Apply new turns to all chat sessions with gating
+                # [FIXED] Standardised XML formatting for link context in history
                 for base_text, url_ctx, media in new_round_turn_data:
                     for p_key, chat_session in session['chat_sessions'].items():
-                        # Determine if this specific profile allows URL context
                         p_owner_id, p_name = p_key
                         p_udata = self._get_user_data_entry(p_owner_id)
                         p_is_b = p_name in p_udata.get("borrowed_profiles", {})
                         p_settings = p_udata.get("borrowed_profiles" if p_is_b else "profiles", {}).get(p_name, {})
                         
                         final_parts = [base_text]
-                        
                         if url_ctx and p_settings.get("url_fetching_enabled", True):
-                            final_parts.append(f"\n[System: Context from Link]\n{url_ctx}")
-                        
-                        # Attachments (including URL media) are added for everyone if present
-                        final_parts.extend(media)
+                            final_parts.append(f"\n<document_context>\n{url_ctx}\n</document_context>")
                         
                         content_obj = content_types.to_content({'role': 'user', 'parts': final_parts})
                         chat_session.history.append(content_obj)
@@ -1803,9 +1780,14 @@ class ServicesMixin:
                             url_instr = "<document_context>\n" + "\n".join(round_url_text_contexts) + "\n</document_context>"
                             contents_for_api_call.append(content_types.to_content({'role': 'user', 'parts': [url_instr]}))
 
-                        # [NEW] Ephemeral URL Media Injection (Current Round Only)
-                        if url_media_parts:
-                             contents_for_api_call.append(content_types.to_content({'role': 'user', 'parts': url_media_parts}))
+                        # [FIXED] Ephemeral Media Injection: Manually add all current round media to the API call
+                        # This allows participants to see images this round without them persisting in RAM history.
+                        all_current_media = []
+                        for _, _, turn_media in new_round_turn_data:
+                            all_current_media.extend(turn_media)
+                        
+                        if all_current_media:
+                            contents_for_api_call.append(content_types.to_content({'role': 'user', 'parts': all_current_media}))
 
                         ltm_recall_text = await self._get_relevant_ltm_for_prompt(session_key, chat_session.history, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id)
                         if ltm_recall_text:
@@ -2330,12 +2312,16 @@ class ServicesMixin:
                         if key != participant_key:
                             other_chat_session.history.append(user_content_obj)
                     
-                    # [NEW] Explicitly clear media parts from local scope to allow GC to claim them
+                    # [FIXED] Turn cleanup: release turn-specific buffers without purging the round's generated image
                     if 'contents_for_api_call' in locals():
+                        contents_for_api_call.clear()
                         del contents_for_api_call
                     if 'response' in locals():
                         del response
                     
+                    # Collect short-lived turn objects
+                    gc.collect(0)
+
                     is_last_participant = (participant == profile_order[-1])
                     if not is_last_participant:
                         await asyncio.sleep(1.0)
@@ -2449,11 +2435,6 @@ class ServicesMixin:
                                         self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
                                     self.mapping_caches[mapping_key][str(trigger.id)] = turn_data
                             all_triggers_for_round.extend(batched_triggers)
-
-                    # --- Explicit Memory Cleanup ---
-                    if generated_image_bytes_for_round:
-                        del generated_image_bytes_for_round
-                        generated_image_bytes_for_round = None
                     
                     # Force garbage collection to clear image buffers from this turn
                     gc.collect()
@@ -2481,19 +2462,24 @@ class ServicesMixin:
                     elif master_placeholder:
                         await master_placeholder.delete()
 
-                # [NEW] Aggressive Round-End Memory Cleanup
+                # [FIXED] Round-End Memory Purge: Purge all generated and context data after all participants finish
                 if 'new_round_turn_data' in locals():
-                    # Deep clear the binary data inside the turn data tuples
                     for i in range(len(new_round_turn_data)):
                         base, url, media = new_round_turn_data[i]
-                        media.clear() # Empty the lists of bytes
+                        media.clear()
                     del new_round_turn_data
                 
                 if 'url_media_parts' in locals():
                     url_media_parts.clear()
                     del url_media_parts
 
-                # Force a collection of generation 0 and 1 objects immediately
+                if 'shared_media_content_obj' in locals():
+                    del shared_media_content_obj
+
+                if 'generated_image_bytes_for_round' in locals():
+                    del generated_image_bytes_for_round
+
+                # Force full garbage collection for large byte arrays
                 gc.collect()
 
                 guild_id = self.bot.get_channel(channel_id).guild.id
