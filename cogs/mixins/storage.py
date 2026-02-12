@@ -1085,10 +1085,12 @@ class StorageMixin:
                 "response_mode": "regular",
                 "thinking_summary_visible": "off",
                 "thinking_level": "high",
-                "thinking_budget": -1
+                "thinking_budget": -1,
+                "error_response": "An error has occurred."
             }
         else: 
             profile = user_data["profiles"][profile_name]
+            profile.setdefault("error_response", "An error has occurred.")
             profile.setdefault("grounding_enabled", False)
             profile.setdefault("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
             profile.setdefault("temperature", defaultConfig.GEMINI_TEMPERATURE)

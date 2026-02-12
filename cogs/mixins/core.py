@@ -994,18 +994,14 @@ class CoreMixin:
                 if not response or not response.candidates:
                     raise ValueError("Response blocked or empty")
                 status = "success"
-            except (api_exceptions.ResourceExhausted, api_exceptions.InternalServerError, api_exceptions.ServiceUnavailable, api_exceptions.Aborted, Exception) as e:
-                # [FIXED] Log actual error to console for troubleshooting
-                print(f"Global chat generation error for user {user_id}: {e}")
-                traceback.print_exc()
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str: blocked_reason_override = "Rate Limited"
+                elif "404" in error_str: blocked_reason_override = "Model Not Found"
+                elif "402" in error_str: blocked_reason_override = "Insufficient Credits"
+                else: blocked_reason_override = error_str[:100]
 
-                is_rate_limit = isinstance(e, api_exceptions.ResourceExhausted) or "429" in str(e) or "rate limit" in str(e).lower()
-                if is_rate_limit: blocked_reason_override = "Rate Limit"
-
-                is_google_error = isinstance(e, (api_exceptions.ResourceExhausted, api_exceptions.InternalServerError, api_exceptions.ServiceUnavailable, api_exceptions.Aborted))
-                is_openrouter_error = isinstance(e, Exception) and ("OpenRouter" in str(e) or "402" in str(e) or "Response blocked" in str(e))
-
-                if (is_google_error or is_openrouter_error) and fallback_model_name:
+                if fallback_model_name:
                     try:
                         sys_instr, _, _, _, _, _, _, _ = self._construct_system_instructions(user_id, profile_name, 0)
                         
@@ -1073,11 +1069,13 @@ class CoreMixin:
                 # Always log the primary model's final status
                 self._log_api_call(user_id=user_id, guild_id=None, context="global_chat", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
 
-            if not response:
-                if blocked_reason_override == "Rate Limit":
-                    await interaction.followup.send("My response was blocked due to: **API Rate Limit**. Please try again later or use paid tier API.", ephemeral=True)
-                else:
-                    await interaction.followup.send("An unknown API error occurred.", ephemeral=True)
+            if not response or not response.candidates:
+                reason = blocked_reason_override or "Unknown"
+                if response and response.prompt_feedback and response.prompt_feedback.block_reason:
+                    reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
+                
+                custom_main = profile_data.get("error_response", "An error has occurred.")
+                await interaction.followup.send(f"{custom_main}\n\n-# Blocked due to: **{reason}**.", ephemeral=False)
                 return
 
             model_content_obj_for_turn = content_types.to_content({'role': 'model', 'parts': [response.text]})
@@ -1113,7 +1111,7 @@ class CoreMixin:
 
             text_for_embed = response_text
             if fallback_used and profile_data.get("show_fallback_indicator", True):
-                text_for_embed += "\n\n-# Fallback Model Used"
+                text_for_embed += f"\n\n-# Fallback Model Used ({blocked_reason_override})"
 
             embed = discord.Embed(description=text_for_embed, color=discord.Color.blue())
             embed.set_author(name=display_name, icon_url=avatar_url)
@@ -1216,7 +1214,17 @@ class CoreMixin:
             self._log_api_call(user_id=interaction.user.id, guild_id=interaction.guild.id, context="whisper", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
         
         response_text = "..."
-        if response and response.candidates:
+        if not response or not response.candidates:
+            reason = "Safety Filter"
+            if response and response.prompt_feedback and response.prompt_feedback.block_reason:
+                reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
+            
+            p_settings = self._get_user_data_entry(owner_id).get("profiles", {}).get(profile_name, {})
+            if not p_settings: p_settings = self._get_user_data_entry(owner_id).get("borrowed_profiles", {}).get(profile_name, {})
+            
+            custom_main = p_settings.get("error_response", "An error has occurred.")
+            response_text = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
+        elif response.candidates:
             response_text = getattr(response, 'text', "...").strip()
 
         user_data = self._get_user_data_entry(owner_id)

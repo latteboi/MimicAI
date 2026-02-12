@@ -1031,6 +1031,7 @@ class ServicesMixin:
                 # [FIXED] Standardised XML formatting for link context in history
                 for base_text, url_ctx, media in new_round_turn_data:
                     for p_key, chat_session in session['chat_sessions'].items():
+                        if chat_session is None: continue
                         p_owner_id, p_name = p_key
                         p_udata = self._get_user_data_entry(p_owner_id)
                         p_is_b = p_name in p_udata.get("borrowed_profiles", {})
@@ -1839,14 +1840,15 @@ class ServicesMixin:
                                 if not response or not response.candidates:
                                     raise ValueError("Response blocked or empty")
                                 status = "success"
-                            except (api_exceptions.ResourceExhausted, api_exceptions.InternalServerError, api_exceptions.ServiceUnavailable, api_exceptions.Aborted, Exception) as e:
-                                is_rate_limit = isinstance(e, api_exceptions.ResourceExhausted) or "429" in str(e) or "rate limit" in str(e).lower()
-                                if is_rate_limit: blocked_reason_override = "Rate Limit"
+                            except Exception as e:
+                                error_str = str(e)
+                                if "429" in error_str: blocked_reason_override = "Rate Limited"
+                                elif "404" in error_str: blocked_reason_override = "Model Not Found"
+                                elif "402" in error_str: blocked_reason_override = "Insufficient Credits"
+                                elif "401" in error_str: blocked_reason_override = "Invalid API Key"
+                                else: blocked_reason_override = error_str[:100]
 
-                                is_google_error = isinstance(e, (api_exceptions.ResourceExhausted, api_exceptions.InternalServerError, api_exceptions.ServiceUnavailable, api_exceptions.Aborted))
-                                is_openrouter_error = isinstance(e, Exception) and ("OpenRouter" in str(e) or "402" in str(e) or "Response blocked" in str(e))
-                                
-                                if (is_google_error or is_openrouter_error) and fallback_model_name:
+                                if fallback_model_name:
                                     try:
                                         fb_name = fallback_model_name
                                         fb_is_or = False
@@ -1872,23 +1874,16 @@ class ServicesMixin:
                                         # Pass list directly
                                         response = await fallback_instance.generate_content_async(contents_for_api_call, generation_config=gen_config)
                                         if not response or not response.candidates:
-                                            # Fallback also blocked/failed, do not change status to success
                                             pass
                                         else:
-                                            # Fallback succeeded
                                             fallback_used = True
                                             self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile_fallback", model_used=fb_name, status="success")
                                     except Exception as retry_e:
                                         print(f"Fallback retry failed: {retry_e}")
                                         status = "api_error"
                                 else:
-                                    print(f"Critical API Error in Multi-Profile: {e}")
                                     status = "api_error"
-                            except (api_exceptions.PermissionDenied) as e:
-                                print(f"Permission Denied: {e}")
-                                status = "api_error"
                             finally:
-                                # Always log the primary model's final status (success or api_error)
                                 self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
                         else:
                             # [NEW] Handle model initialization failure by simulating a blocked response
@@ -1900,10 +1895,8 @@ class ServicesMixin:
                             if response and response.prompt_feedback and response.prompt_feedback.block_reason: 
                                 reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
                             
-                            if reason == "Rate Limit":
-                                response_text = f"My response was blocked due to: **API Rate Limit**. Please try again later or use paid tier API."
-                            else:
-                                response_text = f"My response was blocked due to: **{reason}**. Please rephrase or try a different topic."
+                            custom_main = p_settings.get("error_response", "An error has occurred.")
+                            response_text = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
                             was_blocked = True
                         else:
                             try:
@@ -2015,7 +2008,7 @@ class ServicesMixin:
                         thought_file_to_send = discord.File(io.BytesIO(thought_text.encode('utf-8')), filename="thinking_summary.txt")
 
                     if fallback_used and p_settings.get("show_fallback_indicator", True):
-                        display_text += "\n\n-# Fallback Model Used"
+                        display_text += f"\n\n-# Fallback Model Used ({blocked_reason_override})"
 
                     sources_text = None
                     if participant_key == grounding_profile_key and grounding_mode_for_citator == "on+" and grounding_sources:
@@ -2309,7 +2302,7 @@ class ServicesMixin:
                                 )
                     
                     for key, other_chat_session in session['chat_sessions'].items():
-                        if key != participant_key:
+                        if key != participant_key and other_chat_session is not None:
                             other_chat_session.history.append(user_content_obj)
                     
                     # [FIXED] Turn cleanup: release turn-specific buffers without purging the round's generated image
@@ -2384,6 +2377,7 @@ class ServicesMixin:
 
                                     # [NEW] Conditional Injection into Chat Sessions
                                     for p_key, inner_chat_session in session['chat_sessions'].items():
+                                        if inner_chat_session is None: continue
                                         p_owner_id, p_name = p_key
                                         p_udata = self._get_user_data_entry(p_owner_id)
                                         p_is_b = p_name in p_udata.get("borrowed_profiles", {})
@@ -2690,7 +2684,14 @@ class ServicesMixin:
                         text_response = await text_model.generate_content_async(contents_for_api_call, generation_config=gen_config)
                         
                         response_text = "Here is the image you requested."
-                        if text_response.candidates and text_response.candidates[0].finish_reason.name == 'STOP':
+                        if not text_response or not text_response.candidates:
+                            reason = "Safety Filter"
+                            if text_response and text_response.prompt_feedback and text_response.prompt_feedback.block_reason:
+                                reason = text_response.prompt_feedback.block_reason.name.replace('_', ' ').title()
+                            
+                            custom_main = profile_settings.get("error_response", "An error has occurred.")
+                            response_text = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
+                        elif text_response.candidates[0].finish_reason.name == 'STOP':
                             raw_text = "".join(p.text for p in text_response.candidates[0].content.parts if hasattr(p, 'text'))
                             response_text = self._deduplicate_response(self._scrub_response_text(raw_text.strip(), participant_names=[package['bot_display_name']]))
                         model_turn = content_types.to_content({'role': 'model', 'parts': [response_text]}); chat.history.extend([user_turn, model_turn])
@@ -3521,23 +3522,35 @@ class ServicesMixin:
                 scrubbed_text = text.strip()
                 scrubbed_text = scrubbed_text.replace("&#x20;", " ")
 
-                # Universal XML Tag Scrubber (Internal thoughts, metadata, and context)
-                scrubbed_text = re.sub(r'<[^>]+>.*?</[^>]+>', '', scrubbed_text, flags=re.DOTALL)
-                scrubbed_text = re.sub(r'<[^>]+>', '', scrubbed_text) # Catch unclosed tags
+                # 1. Global XML Tag Scrubber (Internal thoughts, metadata, and context)
+                # Removes paired tags and everything in between globally
+                scrubbed_text = re.sub(r'<([^>]+)>.*?</\1>', '', scrubbed_text, flags=re.DOTALL)
+                # Removes any remaining single or unclosed tags globally
+                scrubbed_text = re.sub(r'<[^>]+>', '', scrubbed_text)
 
-                # Pattern to remove "DISPLAY_NAME [TIMESTAMP]:\n" format.
-                pattern_timestamp_global = r'[^\[\n]+ \[[^\]]+\]:\s*\n?'
-                scrubbed_text = re.sub(pattern_timestamp_global, '', scrubbed_text).strip()
+                # 2. Broad Global Header Scrubber (Name [Timestamp]:)
+                # Matches Name [Timestamp] with an optional colon, anywhere in the text
+                pattern_header_global = r'[^\[\n\r]+ \[[^\]\r\n]+\]:?\s*'
+                scrubbed_text = re.sub(pattern_header_global, '', scrubbed_text)
 
+                # 3. Global Technical Metadata Scrubber
+                # Catches (Thought Initiated: ... | Duration: ...) even if partially stripped
+                pattern_metadata = r'\(?\s*(?:Thought Initiated:)?\s*[^|\n\r]*?\|?\s*Duration: \d+\.\d+s\s*\)?'
+                scrubbed_text = re.sub(pattern_metadata, '', scrubbed_text, flags=re.IGNORECASE)
+
+                # 4. Global Participant Prefix Scrubber (Character Name:)
                 if participant_names:
                     escaped_names = [re.escape(name) for name in participant_names]
                     names_pattern_part = "|".join(escaped_names)
-                    pattern_multiline_prefix = rf'^\s*(?:{names_pattern_part}):\s*'
-                    scrubbed_text = re.sub(pattern_multiline_prefix, '', scrubbed_text, flags=re.MULTILINE | re.IGNORECASE).strip()
+                    # Searches for "Name:" prefixes anywhere in the text
+                    pattern_name_prefix = rf'(?:^|\s)(?:{names_pattern_part}):\s*'
+                    scrubbed_text = re.sub(pattern_name_prefix, ' ', scrubbed_text, flags=re.IGNORECASE).strip()
 
                 scrubbed_text = re.sub(r'Message\s*#[\w-]+', '', scrubbed_text).strip()
-                scrubbed_text = re.sub(r'\(\s*Thought Initiated:.*?\)\s*\n?', '', scrubbed_text).strip()
-
+                
+                # Cleanup excess whitespace left by removals
+                scrubbed_text = re.sub(r'\n{3,}', '\n\n', scrubbed_text)
+                
                 return scrubbed_text
         except TimeoutError as e:
             print(f"Warning: {e}. Returning original text.")
@@ -4719,14 +4732,14 @@ class ServicesMixin:
                     if not response or not response.candidates:
                         raise ValueError("Response blocked or empty")
                     status = "success"
-                except (api_exceptions.ResourceExhausted, api_exceptions.InternalServerError, api_exceptions.ServiceUnavailable, api_exceptions.Aborted, Exception) as e:
-                    is_rate_limit = isinstance(e, api_exceptions.ResourceExhausted) or "429" in str(e) or "rate limit" in str(e).lower()
-                    if is_rate_limit: blocked_reason_override = "Rate Limit"
+                except Exception as e:
+                    error_str = str(e)
+                    if "429" in error_str: blocked_reason_override = "Rate Limit (429)"
+                    elif "404" in error_str: blocked_reason_override = "Model Not Found (404)"
+                    elif "402" in error_str: blocked_reason_override = "Insufficient Credits (402)"
+                    else: blocked_reason_override = error_str[:100]
 
-                    is_google_error = isinstance(e, (api_exceptions.ResourceExhausted, api_exceptions.InternalServerError, api_exceptions.ServiceUnavailable, api_exceptions.Aborted))
-                    is_openrouter_error = isinstance(e, Exception) and ("OpenRouter" in str(e) or "402" in str(e) or "Response blocked" in str(e))
-
-                    if (is_google_error or is_openrouter_error) and fallback_model_name:
+                    if fallback_model_name:
                         try:
                             # Re-construct instructions for the fallback model
                             sys_instr, _, _, _, _, _, _, _ = self._construct_system_instructions(
@@ -4763,20 +4776,15 @@ class ServicesMixin:
                                 else:
                                     raise ValueError("No OR key for fallback")
                             else:
-                                # [FIX] Resolve API key for the current guild context
                                 guild_api_key = self._get_api_key_for_guild(channel.guild.id)
                                 if not guild_api_key:
                                     raise ValueError("No Google key for fallback")
-                                
-                                # [NEW] Use GoogleGenAIModel wrapper for SDK v2
                                 fallback_instance = GoogleGenAIModel(api_key=guild_api_key, model_name=fb_name, system_instruction=sys_instr, safety_settings=dyn_safe)
 
-                            # Note: GoogleGenAIModel wrapper handles the list(final_prompt_parts) conversion
                             response = await fallback_instance.generate_content_async(list(final_prompt_parts), generation_config=gen_config)
                             if not response or not response.candidates:
-                                pass # Fallback blocked
+                                pass
                             else:
-                                # Fallback succeeded
                                 fallback_used = True
                                 self._log_api_call(user_id=triggering_user_id or 0, guild_id=channel.guild.id, context="freewill_fallback", model_used=fb_name, status="success")
 
@@ -4823,7 +4831,7 @@ class ServicesMixin:
             if not p_settings: p_settings = self._get_user_data_entry(profile_owner_id).get("borrowed_profiles", {}).get(profile_name, {})
             
             if fallback_used and p_settings.get("show_fallback_indicator", True):
-                text_to_send += "\n\n-# Fallback Model Used"
+                text_to_send += f"\n\n-# Fallback Model Used ({blocked_reason_override})"
 
             if method == 'child_bot' and bot_id:
                 correlation_id = str(uuid.uuid4())

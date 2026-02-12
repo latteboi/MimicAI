@@ -119,7 +119,7 @@ class HiveMind:
                 "user_id": interaction.user.id
             }
             await self.ws.send(json.dumps(toggle_data))
-            await interaction.response.send_message("Toggle request sent to Main Bot.", ephemeral=True)
+            await interaction.response.send_message("Added to this session.", ephemeral=True)
 
         async def runner():
             try:

@@ -751,6 +751,7 @@ class ProfileManageView(ui.View):
             if not self.is_borrowed:
                 options.append(discord.SelectOption(label="Duplicate Profile", value="duplicate", description="Create a new profile from a copy of this one."))
                 options.append(discord.SelectOption(label="Share Profile", value="share", description="Share this profile with others or publish it."))
+                options.append(discord.SelectOption(label="Custom Error Message", value="error_response", description="Set the message shown when generation fails."))
             
             options.append(discord.SelectOption(label="Cycle Content Safety Level", value="safety_level", description="Cycle: Low -> Medium -> High -> Unrestricted 18+."))
             
@@ -840,6 +841,38 @@ class ProfileManageView(ui.View):
             await self._handle_delete(interaction)
         elif choice == "safety_level":
             await self._handle_safety_cycle(interaction, user_data, profile)
+        elif choice == "error_response":
+            user_data = self.cog._get_user_data_entry(interaction.user.id)
+            is_b = getattr(self, "is_borrowed", False)
+            target_profile = user_data.get("borrowed_profiles", {}).get(self.profile_name) if is_b else user_data.get("profiles", {}).get(self.profile_name)
+
+            if not target_profile:
+                await interaction.response.send_message("❌ Error: Profile not found.", ephemeral=True)
+                return
+
+            async def modal_callback(modal_interaction: discord.Interaction, new_val: str):
+                await modal_interaction.response.defer(ephemeral=True)
+                val_to_save = new_val.strip() or "An error has occurred."
+                
+                u_data = self.cog._get_user_data_entry(modal_interaction.user.id)
+                target = u_data.get("borrowed_profiles", {}).get(self.profile_name) if is_b else u_data.get("profiles", {}).get(self.profile_name)
+                
+                if target:
+                    target["error_response"] = val_to_save
+                    self.cog._save_user_data_entry(modal_interaction.user.id, u_data)
+                    await modal_interaction.followup.send(f"✅ Custom error message updated for '{self.profile_name}'.", ephemeral=True)
+                else:
+                    await modal_interaction.followup.send("❌ Error: Profile not found.", ephemeral=True)
+
+            modal = ActionTextInputModal(
+                title="Set Custom Error Message",
+                label="Error Message",
+                placeholder="Enter the message to show on API/Safety errors...",
+                default=target_profile.get("error_response", "An error has occurred."),
+                required=False,
+                on_submit_callback=modal_callback
+            )
+            await interaction.response.send_modal(modal)
 
         # --- Persona Tab Logic ---
         elif choice == "edit_persona":
@@ -4815,20 +4848,20 @@ class BorrowNameModal(ui.Modal, title="Name Your Borrowed Profile"):
         await interaction.followup.send(f"✅ Successfully borrowed profile **{self.profile_to_borrow}** and named it **{desired_name}**. You can now use it with `/profile swap`.", ephemeral=True)
 
 class ActionTextInputModal(ui.Modal):
-    def __init__(self, title: str, label: str, placeholder: str, on_submit_callback: callable):
+    def __init__(self, title: str, label: str, placeholder: str, on_submit_callback, default: Optional[str] = None, required: bool = True):
         super().__init__(title=title)
         self.on_submit_callback = on_submit_callback
-        self.message_input = ui.TextInput(
+        self.input = ui.TextInput(
             label=label,
+            placeholder=placeholder,
+            default=default,
             style=discord.TextStyle.paragraph,
-            required=True,
-            max_length=1800,
-            placeholder=placeholder
+            required=required
         )
-        self.add_item(self.message_input)
+        self.add_item(self.input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await self.on_submit_callback(interaction, self.message_input.value)
+        await self.on_submit_callback(interaction, self.input.value)
 
 class WakewordsModal(ui.Modal, title="Manage Wakewords"):
     wakewords_input = ui.TextInput(label="Wakewords (comma-separated)", style=discord.TextStyle.paragraph, required=False, max_length=1000)
