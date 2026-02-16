@@ -102,7 +102,11 @@ class CoreMixin:
 
                             reply_trigger = ('reply', message, replied_to_participant, eager_placeholder)
                             await session['task_queue'].put(reply_trigger)
+                            
                             if not session.get('is_running'):
+                                # [NEW] Safeguard: If a stale task object exists, clear it before creating new
+                                if session.get('worker_task'):
+                                    self._safe_cancel_task(session['worker_task'])
                                 session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
                             return
 
@@ -253,7 +257,11 @@ class CoreMixin:
                             # Pass placeholder in the tuple (4 elements)
                             reply_trigger = ('reply', message, replied_to_participant, eager_placeholder)
                             await session['task_queue'].put(reply_trigger)
+                            
                             if not session.get('is_running'):
+                                # [NEW] Safeguard: If a stale task object exists, clear it before creating new
+                                if session.get('worker_task'):
+                                    self._safe_cancel_task(session['worker_task'])
                                 session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
                             return
 
@@ -438,7 +446,16 @@ class CoreMixin:
         if not self.has_lock or payload.user_id == self.bot.user.id:
             return
 
-        # --- New Robust Logic ---
+        emoji_str = str(payload.emoji)
+        is_regen = (emoji_str == REGENERATE_EMOJI)
+        is_next = (emoji_str == NEXT_SPEAKER_EMOJI)
+        is_continue = (emoji_str == CONTINUE_ROUND_EMOJI)
+        is_mute = (emoji_str in MUTE_TURN_EMOJI)
+        is_skip = (emoji_str in SKIP_PARTICIPANT_EMOJI)
+        
+        if not any([is_regen, is_next, is_continue, is_mute, is_skip]):
+            return
+
         turn_info = self.message_to_history_turn.get(payload.message_id)
         
         # Cold path: if not in hot cache, check on-disk mapping
@@ -463,12 +480,29 @@ class CoreMixin:
         if session_type not in ['multi', 'freewill']:
             return
 
-        session = self._ensure_session_hydrated(channel_id, session_type)
+        # [NEW] Re-hydrate/Reset Timer
+        session = self.multi_profile_channels.get(channel_id)
+        if not session or not session.get("is_hydrated"):
+            session = self._ensure_session_hydrated(channel_id, session_type)
+        
         if not session:
             return
+            
+        # [NEW] Concurrency Safeguard
+        if session.get('is_running') or session.get('is_regenerating'):
+            return
+
+        self.session_last_accessed[channel_id] = time.time()
 
         # Find the turn in the unified log
-        turn_object = next((turn for turn in session.get("unified_log", []) if turn.get("turn_id") == turn_id_to_find), None)
+        turn_index = -1
+        turn_object = None
+        for i, turn in enumerate(session.get("unified_log", [])):
+            if turn.get("turn_id") == turn_id_to_find:
+                turn_index = i
+                turn_object = turn
+                break
+
         if turn_object:
             speaker_key = tuple(turn_object.get("speaker_key", []))
             
@@ -480,53 +514,122 @@ class CoreMixin:
                     break
             
             if reacted_to_participant:
+                if is_regen:
+                    # [NEW] Immediate reaction cleanup
+                    try:
+                        channel = self.bot.get_channel(payload.channel_id)
+                        if channel:
+                            msg = await channel.fetch_message(payload.message_id)
+                            # Attempt to remove the user's reaction
+                            await msg.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
+                    except: pass
+
+                    asyncio.create_task(self._execute_regeneration(payload, session, turn_object, turn_index, reacted_to_participant))
+                    return
+                
+                if is_mute:
+                    turn_object["is_hidden"] = True
+                    self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                    session["is_hydrated"] = False
+                    self._ensure_session_hydrated(channel_id, session_type)
+                    return
+                
+                if is_skip:
+                    reacted_to_participant["is_skipped"] = True
+                    self._save_multi_profile_sessions()
+                    return
+
                 try:
                     next_participant = None
                     last_speaker_key = session.get('last_speaker_key')
                     reacted_to_key = (reacted_to_participant['owner_id'], reacted_to_participant['profile_name'])
 
-                    if reacted_to_key == last_speaker_key:
-                        # Last speaker was reacted to, determine the next speaker based on mode.
-                        session_mode = session.get("session_mode", "sequential")
-                        if session_mode == 'sequential':
+                    if is_continue:
+                        # Original logic: popcorn continues the round
+                        if reacted_to_key == last_speaker_key:
+                            session_mode = session.get("session_mode", "sequential")
+                            if session_mode == 'sequential':
+                                try:
+                                    last_speaker_index = next(i for i, p in enumerate(session['profiles']) if (p['owner_id'], p['profile_name']) == last_speaker_key)
+                                    next_speaker_index = (last_speaker_index + 1) % len(session['profiles'])
+                                    next_participant = session['profiles'][next_speaker_index]
+                                except (ValueError, StopIteration):
+                                    if session['profiles']:
+                                        next_participant = session['profiles'][0]
+                            else: # Random mode
+                                potential_responders = [p for p in session['profiles'] if (p['owner_id'], p['profile_name']) != last_speaker_key]
+                                if potential_responders:
+                                    next_participant = random.choice(potential_responders)
+                        else:
+                            reacted_to_index = session['profiles'].index(reacted_to_participant)
+                            next_speaker_index = (reacted_to_index + 1) % len(session['profiles'])
+                            next_participant = session['profiles'][next_speaker_index]
+                    
+                    elif is_next:
+                        if reacted_to_key == last_speaker_key:
                             try:
                                 last_speaker_index = next(i for i, p in enumerate(session['profiles']) if (p['owner_id'], p['profile_name']) == last_speaker_key)
                                 next_speaker_index = (last_speaker_index + 1) % len(session['profiles'])
                                 next_participant = session['profiles'][next_speaker_index]
-                            except (ValueError, StopIteration):
-                                # Fallback if last speaker isn't in the list for some reason
-                                if session['profiles']:
-                                    next_participant = session['profiles'][0]
-                        else: # Random mode
-                            potential_responders = [p for p in session['profiles'] if (p['owner_id'], p['profile_name']) != last_speaker_key]
-                            if potential_responders:
-                                next_participant = random.choice(potential_responders)
-                    else:
-                        # Not the last speaker, so the next in sequence is fine
-                        reacted_to_index = session['profiles'].index(reacted_to_participant)
-                        next_speaker_index = (reacted_to_index + 1) % len(session['profiles'])
-                        next_participant = session['profiles'][next_speaker_index]
+                            except: pass
+                        else:
+                            reacted_to_index = session['profiles'].index(reacted_to_participant)
+                            next_speaker_index = (reacted_to_index + 1) % len(session['profiles'])
+                            next_participant = session['profiles'][next_speaker_index]
 
                     if next_participant:
-                        # If the session is sequential, permanently re-order the participant list
                         session_mode = session.get("session_mode", "sequential")
                         if session_mode == 'sequential':
                             try:
-                                # Find the index of the next participant and rotate the list
                                 start_idx = session['profiles'].index(next_participant)
                                 new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
                                 session['profiles'] = new_order
-                                self._save_multi_profile_sessions() # Persist the new order
+                                self._save_multi_profile_sessions()
                             except ValueError:
-                                # Fallback in case the participant isn't found, though this shouldn't happen
                                 pass
 
-                        reaction_trigger = ('reaction', payload, next_participant)
+                        trigger_type = 'reaction_single' if is_next else 'reaction'
+                        reaction_trigger = (trigger_type, payload, next_participant)
                         await session['task_queue'].put(reaction_trigger)
                         if not session.get('is_running'):
                             session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(payload.channel_id))
                 except (ValueError, IndexError):
                     pass
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        if not self.has_lock: return
+        
+        emoji_str = str(payload.emoji)
+        is_mute = (emoji_str in MUTE_TURN_EMOJI)
+        is_skip = (emoji_str in SKIP_PARTICIPANT_EMOJI)
+        
+        if not is_mute and not is_skip: return
+
+        turn_info = self.message_to_history_turn.get(payload.message_id)
+        if not turn_info: return
+        
+        channel_id, session_type, turn_id_to_find = turn_info
+        session = self.multi_profile_channels.get(channel_id)
+        if not session or not session.get("is_hydrated"):
+            session = self._ensure_session_hydrated(channel_id, session_type)
+        
+        if not session or session.get('is_running') or session.get('is_regenerating'): return
+
+        turn_object = next((turn for turn in session.get("unified_log", []) if turn.get("turn_id") == turn_id_to_find), None)
+        if turn_object:
+            if is_mute:
+                turn_object["is_hidden"] = False
+                self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                session["is_hydrated"] = False
+                self._ensure_session_hydrated(channel_id, session_type)
+            
+            elif is_skip:
+                speaker_key = tuple(turn_object.get("speaker_key", []))
+                participant = next((p for p in session['profiles'] if (p['owner_id'], p['profile_name']) == speaker_key), None)
+                if participant:
+                    participant["is_skipped"] = False
+                    self._save_multi_profile_sessions()
             
     @commands.Cog.listener()
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
@@ -995,11 +1098,7 @@ class CoreMixin:
                     raise ValueError("Response blocked or empty")
                 status = "success"
             except Exception as e:
-                error_str = str(e)
-                if "429" in error_str: blocked_reason_override = "Rate Limited"
-                elif "404" in error_str: blocked_reason_override = "Model Not Found"
-                elif "402" in error_str: blocked_reason_override = "Insufficient Credits"
-                else: blocked_reason_override = error_str[:100]
+                blocked_reason_override = self._format_api_error(e)
 
                 if fallback_model_name:
                     try:
@@ -1627,6 +1726,10 @@ class CoreMixin:
 
             participant_history = []
             for turn in history_slice:
+                # [NEW] Ignore turns hidden via reaction
+                if turn.get("is_hidden", False):
+                    continue
+                    
                 turn_type = turn.get("type")
                 if not turn_type: # Handle old logs
                     speaker_key = tuple(turn.get("speaker_key", []))
@@ -2670,7 +2773,8 @@ class CoreMixin:
         # [FIX] Explicitly cancel all active session worker tasks to prevent "Task pending" warnings
         for session_data in self.multi_profile_channels.values():
             if session_data.get('worker_task'):
-                session_data['worker_task'].cancel()
+                self._safe_cancel_task(session_data['worker_task'])
+                session_data['worker_task'] = None
         
         # Final flush of any remaining data
         asyncio.run_coroutine_threadsafe(self._flush_api_stats_to_db(), self.bot.loop)

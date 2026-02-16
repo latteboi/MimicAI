@@ -323,6 +323,28 @@ class HiveMind:
         except Exception as e:
             print(f"[Hive] Appearance update error for {bot_id}: {e}")
 
+    async def execute_regenerate(self, bot_id, payload):
+        bot = self.clients.get(bot_id)
+        if not bot or not bot.is_ready(): return
+        
+        channel_id = payload.get("channel_id")
+        message_id = payload.get("message_id")
+        content = payload.get("content")
+        
+        try:
+            channel = await bot.fetch_channel(channel_id)
+            if not channel: return
+            message = await channel.fetch_message(message_id)
+            if not message: return
+            
+            # Filter attachments: Keep images only
+            kept_attachments = [a for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
+            
+            # Note: Discord requires the original Attachment objects to be passed back to keep them
+            await message.edit(content=content, attachments=kept_attachments)
+        except Exception as e:
+            print(f"[Hive] Regeneration edit error for {bot_id}: {e}")
+
     async def connect(self):
         while True:
             try:
@@ -349,6 +371,8 @@ class HiveMind:
                             
                             if child_action == "send_message":
                                 asyncio.create_task(self.execute_send(target_id, child_payload))
+                            elif child_action == "regenerate_message":
+                                asyncio.create_task(self.execute_regenerate(target_id, child_payload))
                             elif child_action == "start_typing":
                                 asyncio.create_task(self.execute_typing(target_id, child_payload))
                             elif child_action == "stop_typing":

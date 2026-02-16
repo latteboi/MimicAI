@@ -64,6 +64,12 @@ SHARE_CODE_EXPIRATION_SECONDS = 300
 MAX_URL_CONTEXT_CHARACTERS = 16000 # Approx 4000 tokens
 MAX_GROUNDING_SUMMARY_CHARACTERS = 2000 # Approx 500 tokens
 
+REGENERATE_EMOJI = "🔁"
+NEXT_SPEAKER_EMOJI = "⏯️"
+CONTINUE_ROUND_EMOJI = "🍿"
+MUTE_TURN_EMOJI = ["🔇", "🔕"]
+SKIP_PARTICIPANT_EMOJI = ["❌", "✖️"]
+
 DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS = (
     "You are a memory consolidation AI. Your task is to analyze a conversation excerpt and create a concise, third-person summary of the most important information to be stored as a long-term memory.\n\n"
     "Focus on capturing the following:\n"

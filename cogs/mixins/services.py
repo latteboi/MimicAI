@@ -685,7 +685,8 @@ class ServicesMixin:
             return
 
         from google.generativeai.types import content_types
-        session['is_running'] = True
+        # Flag starts as False; it will be toggled within the loop
+        session['is_running'] = False
         
         # Local cache to prevent processing the same message ID multiple times in a short loop
         recent_processed_ids = collections.deque(maxlen=20)
@@ -731,7 +732,6 @@ class ServicesMixin:
                             session.get('initial_turn_taken', set()).discard(key)
 
                 initial_trigger = None
-                # Define flag early to avoid NameError
                 is_proactive_auto_round = False
                 
                 timeout = None
@@ -740,6 +740,8 @@ class ServicesMixin:
                 
                 try:
                     initial_trigger = await asyncio.wait_for(session['task_queue'].get(), timeout=timeout)
+                    # Round has officially started
+                    session['is_running'] = True
                     if initial_trigger is None and session.get("freewill_mode") == "proactive":
                         is_proactive_auto_round = True
 
@@ -820,7 +822,7 @@ class ServicesMixin:
                                 else:
                                     _, message_trigger, starting_profile_override = trigger
                             elif trigger[0] == 'reaction': _, reaction_trigger, starting_profile_override = trigger
-                            elif trigger[0] == 'initial_reactive_turn': _, message_trigger, starting_profile_override = trigger
+                            elif trigger[0] == 'reaction' or trigger[0] == 'reaction_single': _, reaction_trigger, starting_profile_override = trigger
                             elif trigger[0] == 'child_mention': _, message_payload, starting_profile_override = trigger
                             elif trigger[0] == 'ad_hoc_mention': _, message_trigger, starting_profile_override = trigger
                         elif isinstance(trigger, discord.RawReactionActionEvent): reaction_trigger = trigger
@@ -1053,6 +1055,10 @@ class ServicesMixin:
                 session_mode = session.get("session_mode", "sequential")
                 channel = self.bot.get_channel(channel_id)
 
+                is_single_turn_only = False
+                if isinstance(initial_trigger, tuple) and initial_trigger[0] == 'reaction_single':
+                    is_single_turn_only = True
+
                 if freewill_mode == 'reactive':
                     if starting_profile_override:
                         profile_order = [starting_profile_override]
@@ -1124,41 +1130,55 @@ class ServicesMixin:
                                 # The starting profile wasn't in the list, this shouldn't happen but handle gracefully
                                 pass
 
-                        # The temporary profile_order for this round is now based on the (potentially new) session order
-                        profile_order = list(session['profiles'])
-                        if session_mode == 'random':
-                            # For random, we still respect the override for the first turn, then shuffle the rest
-                            if start_p in profile_order:
-                                profile_order.remove(start_p)
-                            random.shuffle(profile_order)
-                            profile_order.insert(0, start_p)
+                     # Filter profiles that are marked as skipped via reaction
+                    active_participants = [p for p in session['profiles'] if not p.get('is_skipped', False)]
+                    
+                    if not active_participants:
+                        # If everyone is skipped, mark triggers as done and wait for next input
+                        for trigger in all_triggers_for_round:
+                            if trigger is not None: session['task_queue'].task_done()
+                        continue
 
-                    else:
-                        # No override, determine next speaker based on last speaker
+                    if starting_profile_override:
+                        # Ensure the override profile isn't skipped; if it is, fall back to first active
+                        if starting_profile_override.get('is_skipped'):
+                            start_p = active_participants[0]
+                        else:
+                            start_p = starting_profile_override
+                        
                         session_mode = session.get("session_mode", "sequential")
-                        if session_mode == 'sequential' and session.get('last_speaker_key'):
+                        if session_mode == 'sequential':
                             try:
-                                last_speaker_index = next(i for i, p in enumerate(session['profiles']) if (p['owner_id'], p['profile_name']) == session['last_speaker_key'])
-                                start_index = (last_speaker_index + 1) % len(session['profiles'])
-                                # Permanently rotate the session's profile list
-                                new_order = session['profiles'][start_index:] + session['profiles'][:start_index]
+                                start_idx = session['profiles'].index(start_p)
+                                new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
                                 session['profiles'] = new_order
                                 self._save_multi_profile_sessions()
-                            except (ValueError, StopIteration):
-                                pass # Last speaker not found, use default order
+                            except ValueError: pass
+
+                        if is_single_turn_only:
+                            profile_order = [start_p]
+                        else:
+                            profile_order = [p for p in session['profiles'] if p in active_participants]
+                            if session_mode == 'random':
+                                if start_p in profile_order: profile_order.remove(start_p)
+                                random.shuffle(profile_order)
+                                profile_order.insert(0, start_p)
+
+                    else:
+                        session_mode = session.get("session_mode", "sequential")
+                        profile_order = [p for p in session['profiles'] if p in active_participants]
                         
-                        # The temporary profile_order for this round is now based on the (potentially new) session order
-                        profile_order = list(session['profiles'])
                         if session_mode == 'random':
                             random.shuffle(profile_order)
                         elif session.get('last_speaker_key'):
-                            # In sequential mode, start after the last speaker
                             try:
-                                last_speaker_index = next(i for i, p in enumerate(profile_order) if (p['owner_id'], p['profile_name']) == session['last_speaker_key'])
-                                start_index = (last_speaker_index + 1) % len(profile_order)
-                                profile_order = profile_order[start_index:] + profile_order[:start_index]
-                            except (ValueError, StopIteration):
-                                pass # Last speaker not found, use default order
+                                # Rotate based on the full list to maintain sequence logic
+                                last_speaker_index = next(i for i, p in enumerate(session['profiles']) if (p['owner_id'], p['profile_name']) == session['last_speaker_key'])
+                                start_index = (last_speaker_index + 1) % len(session['profiles'])
+                                rotated = session['profiles'][start_index:] + session['profiles'][:start_index]
+                                # But only include those not skipped
+                                profile_order = [p for p in rotated if p in active_participants]
+                            except (ValueError, StopIteration): pass
 
                 # --- Ephemeral Participant Injection ---
                 ephemeral_participant = None
@@ -1841,12 +1861,7 @@ class ServicesMixin:
                                     raise ValueError("Response blocked or empty")
                                 status = "success"
                             except Exception as e:
-                                error_str = str(e)
-                                if "429" in error_str: blocked_reason_override = "Rate Limited"
-                                elif "404" in error_str: blocked_reason_override = "Model Not Found"
-                                elif "402" in error_str: blocked_reason_override = "Insufficient Credits"
-                                elif "401" in error_str: blocked_reason_override = "Invalid API Key"
-                                else: blocked_reason_override = error_str[:100]
+                                blocked_reason_override = self._format_api_error(e)
 
                                 if fallback_model_name:
                                     try:
@@ -1925,8 +1940,11 @@ class ServicesMixin:
 
                                 scrubbed_text = self._scrub_response_text(raw_text, participant_names=all_participant_names)
                                 response_text = self._deduplicate_response(scrubbed_text)
+                                
                                 if not response_text:
-                                    response_text = "An API error has occurred. Please try again."
+                                    reason = "Empty Response (AI produced no text content)"
+                                    custom_main = p_settings.get("error_response", "An error has occurred.")
+                                    response_text = f"{custom_main}\n\n-# Blocked due to: {reason}"
                                     was_blocked = True # Treat as a block to prevent LTM creation
                             except ValueError:
                                 reason = response.candidates[0].finish_reason.name
@@ -2579,8 +2597,13 @@ class ServicesMixin:
             except Exception as e:
                 print(f"Error in multi-profile worker for channel {channel_id}: {e}")
                 traceback.print_exc()
+            finally:
+                # Round has concluded, AI is no longer active
+                session['is_running'] = False
         
-        session['is_running'] = False
+        # [NEW] Clear reference when task naturally exits to prevent stale objects
+        if session.get('worker_task') == asyncio.current_task():
+            session['worker_task'] = None
 
     async def _image_finisher_worker(self):
         """Consumes generated images, generates text, and sends the final message."""
@@ -3824,8 +3847,10 @@ class ServicesMixin:
                         dummy_session_key = (key, None, None)
                         self._save_session_to_disk(dummy_session_key, session_type, unified_log)
 
-                    if session_to_evict.get('worker_task') and not session_to_evict['worker_task'].done():
-                        session_to_evict['worker_task'].cancel()
+                    # [FIXED] Use safe cancel to prevent "Task destroyed but pending"
+                    if session_to_evict.get('worker_task'):
+                        self._safe_cancel_task(session_to_evict['worker_task'])
+                        session_to_evict['worker_task'] = None
                     
                     mapping_key = (session_type, key)
                     if mapping_key in self.mapping_caches:
@@ -4733,11 +4758,7 @@ class ServicesMixin:
                         raise ValueError("Response blocked or empty")
                     status = "success"
                 except Exception as e:
-                    error_str = str(e)
-                    if "429" in error_str: blocked_reason_override = "Rate Limit (429)"
-                    elif "404" in error_str: blocked_reason_override = "Model Not Found (404)"
-                    elif "402" in error_str: blocked_reason_override = "Insufficient Credits (402)"
-                    else: blocked_reason_override = error_str[:100]
+                    blocked_reason_override = self._format_api_error(e)
 
                     if fallback_model_name:
                         try:
@@ -5571,3 +5592,175 @@ class ServicesMixin:
         
         output.seek(0)
         return output
+
+    async def _execute_regeneration(self, payload: discord.RawReactionActionEvent, session: Dict, turn_object: Dict, turn_index: int, participant: Dict):
+        channel = self.bot.get_channel(payload.channel_id)
+        if not channel: return
+        
+        # 1. State Locking & Pre-emptive Persistence
+        session['is_regenerating'] = True
+        turn_id = turn_object.get("turn_id")
+        session_type = session.get("type", "multi")
+        dummy_key = (channel.id, None, None)
+        mapping_key = (session_type, channel.id)
+        
+        # Ensure session state is flushed to disk immediately (Crucial for first-message ad-hoc sessions)
+        self._save_multi_profile_sessions()
+        self._save_session_to_disk(dummy_key, session_type, session["unified_log"])
+        
+        try:
+            if mapping_key not in self.mapping_caches:
+                self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
+            
+            mapping_data = self.mapping_caches[mapping_key]
+            message_ids_to_check = [int(mid) for mid, tinfo in mapping_data.items() if isinstance(tinfo, (list, tuple)) and len(tinfo) > 2 and tinfo[2] == turn_id]
+            
+            # Initial Edit to Placeholder
+            if participant.get('method') == 'child_bot':
+                await self.manager_queue.put({
+                    "action": "send_to_child", "bot_id": participant['bot_id'],
+                    "payload": {
+                        "action": "regenerate_message", "channel_id": channel.id,
+                        "message_id": payload.message_id, "content": PLACEHOLDER_EMOJI
+                    }
+                })
+            else:
+                wh = await self._get_or_create_webhook(channel)
+                if wh:
+                    try:
+                        msg = await channel.fetch_message(payload.message_id)
+                        kept_atts = [a for a in msg.attachments if a.content_type and a.content_type.startswith("image/")]
+                        await wh.edit_message(payload.message_id, content=PLACEHOLDER_EMOJI, attachments=kept_atts)
+                    except: pass
+
+            # 2. Cleanup follow-up messages
+            for msg_id in message_ids_to_check:
+                if msg_id == payload.message_id: continue
+                try:
+                    msg = await channel.fetch_message(msg_id)
+                    if not msg: continue
+                    is_sources = "Sources:" in msg.content
+                    has_image = any(a.content_type and a.content_type.startswith("image/") for a in msg.attachments)
+                    if not is_sources and not has_image:
+                        await msg.delete()
+                        self.message_to_history_turn.pop(msg_id, None)
+                        mapping_data.pop(str(msg_id), None)
+                except: pass
+
+            # 3. History Slicing (Time Travel)
+            sliced_unified_log = session["unified_log"][:turn_index]
+            p_owner_id = participant['owner_id']
+            p_name = participant['profile_name']
+            p_key = (p_owner_id, p_name)
+            
+            from google.generativeai.types import content_types
+            participant_history = []
+            for turn in sliced_unified_log:
+                # [NEW] Respect Mute Reactions in history slice
+                if turn.get("is_hidden", False):
+                    continue
+                    
+                speaker_key = tuple(turn.get("speaker_key", []))
+                role = 'model' if speaker_key == p_key else 'user'
+                participant_history.append(content_types.to_content({'role': role, 'parts': [turn.get("content")]}))
+            
+            # 4. Re-run Generation
+            model, _, temp, top_p, top_k, _, fallback_model_name = await self._get_or_create_model_for_channel(
+                channel.id, payload.user_id, channel.guild.id,
+                profile_owner_override=p_owner_id, profile_name_override=p_name
+            )
+            if not model: return
+
+            last_user_turn = next((t for t in reversed(sliced_unified_log) if tuple(t.get("speaker_key", [])) != p_key), None)
+            trigger_content = last_user_turn.get("content", "") if last_user_turn else ""
+            
+            training_examples = await self._get_relevant_training_examples(p_owner_id, p_name, trigger_content, channel.guild.id)
+            full_system_instruction, _, _, _, _, _, _, _ = self._construct_system_instructions(
+                p_owner_id, p_name, channel.id, is_multi_profile=True, training_examples_list=training_examples
+            )
+            
+            if hasattr(model, 'system_instruction'):
+                model.system_instruction = full_system_instruction
+            
+            gen_config = genai.types.GenerationConfig(temperature=temp, top_p=top_p, top_k=top_k)
+            response = await model.generate_content_async(participant_history, generation_config=gen_config)
+            
+            if not response or not response.candidates:
+                new_text = "I'm sorry, I encountered an issue while trying to regenerate that response."
+            else:
+                raw_text = getattr(response, 'text', "").strip()
+                new_text = self._deduplicate_response(self._scrub_response_text(raw_text))
+            
+            # 5. Apply Changes
+            sent_timestamp = datetime.datetime.now(datetime.timezone.utc)
+            u_data = self._get_user_data_entry(p_owner_id)
+            p_profile = u_data.get("profiles", {}).get(p_name) or u_data.get("borrowed_profiles", {}).get(p_name, {})
+            tz_str = p_profile.get("timezone", "UTC")
+            
+            sp_name = p_name
+            app_data = self.user_appearances.get(str(p_owner_id), {}).get(p_name, {})
+            if app_data.get("custom_display_name"): sp_name = app_data["custom_display_name"]
+            
+            new_history_line = self._format_history_entry(sp_name, sent_timestamp, new_text, tz_str)
+            turn_object["content"] = new_history_line
+            turn_object["timestamp"] = sent_timestamp.isoformat()
+            
+            if participant.get('method') == 'child_bot':
+                await self.manager_queue.put({
+                    "action": "send_to_child", "bot_id": participant['bot_id'],
+                    "payload": {
+                        "action": "regenerate_message", "channel_id": channel.id,
+                        "message_id": payload.message_id, "content": new_text
+                    }
+                })
+            else:
+                wh = await self._get_or_create_webhook(channel)
+                if wh:
+                    try:
+                        msg = await channel.fetch_message(payload.message_id)
+                        kept_atts = [a for a in msg.attachments if a.content_type and a.content_type.startswith("image/")]
+                        await wh.edit_message(payload.message_id, content=new_text, attachments=kept_atts)
+                    except: pass
+
+            # Re-sync memory and save final state
+            self._save_session_to_disk(dummy_key, session_type, session["unified_log"])
+            self._save_mapping_to_disk(mapping_key, mapping_data)
+            
+            # Re-hydrate histories for all participants to reflect the edit
+            session["is_hydrated"] = False
+            self._ensure_session_hydrated(channel.id, session_type)
+
+        except Exception as e:
+            print(f"Regeneration failed: {e}")
+        finally:
+            session['is_regenerating'] = False
+
+    def _format_api_error(self, error: Exception) -> str:
+        """Analyses API exceptions to provide specific, user-friendly diagnostic strings."""
+        error_str = str(error)
+        
+        # 0. Custom Internal Triggers
+        if "empty response" in error_str.lower():
+            return "Empty Response (AI failed to output text content)"
+        
+        # 1. Modality/Capability Errors (Specific to OpenRouter & Google)
+        if "image input" in error_str.lower() or "support image" in error_str.lower():
+            return "Unsupported File Format (Model lacks Vision support)"
+        if "audio input" in error_str.lower() or "support audio" in error_str.lower():
+            return "Unsupported File Format (Model lacks Audio support)"
+        if "video input" in error_str.lower() or "support video" in error_str.lower():
+            return "Unsupported File Format (Model lacks Video support)"
+        
+        # 2. Standard HTTP Status Codes
+        if "429" in error_str: return "Rate Limit (429)"
+        if "402" in error_str: return "Insufficient Credits (402)"
+        if "401" in error_str: return "Invalid API Key (401)"
+        if "404" in error_str: 
+            if "no endpoints found" in error_str.lower():
+                return "Capability Mismatch (404 - Check model features)"
+            return "Model Not Found (404)"
+        if "403" in error_str: return "Access Forbidden/Moderated (403)"
+        if "413" in error_str: return "File Too Large (413)"
+        
+        # 3. Fallback to truncated raw error
+        return error_str[:100]
