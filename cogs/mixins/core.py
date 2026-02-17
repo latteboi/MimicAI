@@ -102,12 +102,10 @@ class CoreMixin:
 
                             reply_trigger = ('reply', message, replied_to_participant, eager_placeholder)
                             await session['task_queue'].put(reply_trigger)
-                            
-                            if not session.get('is_running'):
-                                # [NEW] Safeguard: If a stale task object exists, clear it before creating new
-                                if session.get('worker_task'):
-                                    self._safe_cancel_task(session['worker_task'])
-                                session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
+                            if not session.get('worker_task') or session['worker_task'].done():
+                                task = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
+                                session['worker_task'] = task
+                                self.background_tasks.add(task)
                             return
 
         # --- 2. Standalone Child Bot Detection ---
@@ -254,15 +252,12 @@ class CoreMixin:
                                 # If cold, just show generic typing to acknowledge receipt
                                 await message.channel.typing()
 
-                            # Pass placeholder in the tuple (4 elements)
                             reply_trigger = ('reply', message, replied_to_participant, eager_placeholder)
                             await session['task_queue'].put(reply_trigger)
-                            
-                            if not session.get('is_running'):
-                                # [NEW] Safeguard: If a stale task object exists, clear it before creating new
-                                if session.get('worker_task'):
-                                    self._safe_cancel_task(session['worker_task'])
-                                session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
+                            if not session.get('worker_task') or session['worker_task'].done():
+                                task = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
+                                session['worker_task'] = task
+                                self.background_tasks.add(task)
                             return
 
         # --- Freewill Trigger Logic ---
@@ -396,13 +391,17 @@ class CoreMixin:
                     }
                     trigger = ('ad_hoc_mention', message, participant)
                     await session['task_queue'].put(trigger)
-                    if not session.get('is_running'):
-                        session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
+                    if not session.get('worker_task') or session['worker_task'].done():
+                        task = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
+                        session['worker_task'] = task
+                        self.background_tasks.add(task)
                     return
 
             await session['task_queue'].put(message)
-            if not session.get('is_running'):
-                session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
+            if not session.get('worker_task') or session['worker_task'].done():
+                task = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
+                session['worker_task'] = task
+                self.background_tasks.add(task)
             return
         
         # Check for Freewill configuration to prevent overriding with a new manual session
@@ -435,8 +434,10 @@ class CoreMixin:
             self._save_multi_profile_sessions()
             
             await new_session['task_queue'].put(message)
-            if not new_session.get('is_running'):
-                new_session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
+            if not new_session.get('worker_task') or new_session['worker_task'].done():
+                task = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
+                new_session['worker_task'] = task
+                self.background_tasks.add(task)
             return
         
     @commands.Cog.listener()
@@ -504,6 +505,14 @@ class CoreMixin:
                 break
 
         if turn_object:
+            # [FIXED] Move mute logic outside of participant check to support human messages
+            if is_mute:
+                turn_object["is_hidden"] = True
+                self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                session["is_hydrated"] = False
+                self._ensure_session_hydrated(channel_id, session_type)
+                return
+
             speaker_key = tuple(turn_object.get("speaker_key", []))
             
             reacted_to_participant = None
@@ -520,18 +529,10 @@ class CoreMixin:
                         channel = self.bot.get_channel(payload.channel_id)
                         if channel:
                             msg = await channel.fetch_message(payload.message_id)
-                            # Attempt to remove the user's reaction
                             await msg.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
                     except: pass
 
                     asyncio.create_task(self._execute_regeneration(payload, session, turn_object, turn_index, reacted_to_participant))
-                    return
-                
-                if is_mute:
-                    turn_object["is_hidden"] = True
-                    self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
-                    session["is_hydrated"] = False
-                    self._ensure_session_hydrated(channel_id, session_type)
                     return
                 
                 if is_skip:
@@ -591,8 +592,10 @@ class CoreMixin:
                         trigger_type = 'reaction_single' if is_next else 'reaction'
                         reaction_trigger = (trigger_type, payload, next_participant)
                         await session['task_queue'].put(reaction_trigger)
-                        if not session.get('is_running'):
-                            session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(payload.channel_id))
+                        if not session.get('worker_task') or session['worker_task'].done():
+                            task = self.bot.loop.create_task(self._multi_profile_worker(payload.channel_id))
+                            session['worker_task'] = task
+                            self.background_tasks.add(task)
                 except (ValueError, IndexError):
                     pass
 
@@ -618,11 +621,13 @@ class CoreMixin:
 
         turn_object = next((turn for turn in session.get("unified_log", []) if turn.get("turn_id") == turn_id_to_find), None)
         if turn_object:
+            # [FIXED] Move mute restoration outside of participant check
             if is_mute:
                 turn_object["is_hidden"] = False
                 self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
                 session["is_hydrated"] = False
                 self._ensure_session_hydrated(channel_id, session_type)
+                return
             
             elif is_skip:
                 speaker_key = tuple(turn_object.get("speaker_key", []))
@@ -1680,37 +1685,76 @@ class CoreMixin:
         if session and session.get("is_hydrated"):
             return session
 
-        # If the session object exists but isn't hydrated, we can use its participant list.
-        # Otherwise, we need to load the blueprint from disk.
-        if not session:
-            channel = self.bot.get_channel(channel_id)
-            if not channel or not hasattr(channel, 'guild'): return None
-            server_id_str = str(channel.guild.id)
-            sessions_file = os.path.join(self.FREEWILL_SERVERS_DIR, server_id_str, "sessions.json.gz")
-            if not os.path.exists(sessions_file): return None
-            all_sessions_config = self._load_json_gzip(sessions_file)
-            if not all_sessions_config: return None
-            session_config = all_sessions_config.get(str(channel_id))
-            if not session_config: return None
-            
-            # This is a partial session object, the worker will fill in the rest
-            profiles = session_config.get("profiles", [])
-            for p in profiles:
-                p.setdefault('ltm_counter', 0)
-                
-            session = {"profiles": profiles}
-            self.multi_profile_channels[channel_id] = session
+        # Resolve Guild ID for pathing
+        guild_id_str = None
+        channel = self.bot.get_channel(channel_id)
+        if channel and hasattr(channel, 'guild'):
+            guild_id_str = str(channel.guild.id)
+        else:
+            for guild in self.bot.guilds:
+                if guild.get_channel(channel_id):
+                    guild_id_str = str(guild.id); break
         
+        if not guild_id_str: return None
+
+        # [FIXED] Load Blueprint if session entry is missing OR profiles list is empty
+        if not session or not session.get("profiles"):
+            sessions_file = os.path.join(self.FREEWILL_SERVERS_DIR, guild_id_str, "sessions.json.gz")
+            if os.path.exists(sessions_file):
+                all_sessions_config = self._load_json_gzip(sessions_file)
+                if all_sessions_config and str(channel_id) in all_sessions_config:
+                    session_config = all_sessions_config.get(str(channel_id))
+                    profiles = session_config.get("profiles", [])
+                    for p in profiles: p.setdefault('ltm_counter', 0)
+                    
+                    if not session:
+                        session = {
+                            "profiles": profiles,
+                            "owner_id": session_config.get("owner_id"),
+                            "session_prompt": session_config.get("session_prompt"),
+                            "session_mode": session_config.get("session_mode", "sequential"),
+                            "audio_mode": session_config.get("audio_mode", "text-only"),
+                            "type": session_config.get("type", "multi"),
+                            "freewill_mode": session_config.get("freewill_mode"),
+                            "task_queue": asyncio.Queue(),
+                            "is_running": False
+                        }
+                        self.multi_profile_channels[channel_id] = session
+                    else:
+                        # Update the existing dehydrated shell with disk data
+                        session["profiles"] = profiles
+                        session["owner_id"] = session_config.get("owner_id")
+                        session["session_prompt"] = session_config.get("session_prompt")
+                        session["session_mode"] = session_config.get("session_mode", "sequential")
+                        session["audio_mode"] = session_config.get("audio_mode", "text-only")
+                        session["type"] = session_config.get("type", "multi")
+                        session["freewill_mode"] = session_config.get("freewill_mode")
+
+        if not session: return None
+
+        # 2. Load History Log
         from google.generativeai.types import content_types
         dummy_model = genai.GenerativeModel('gemini-flash-latest')
         dummy_session_key = (channel_id, None, None)
-        unified_log = self._load_session_from_disk(dummy_session_key, session_type, dummy_model) or []
+        disk_log = self._load_session_from_disk(dummy_session_key, session_type, dummy_model) or []
+        
+        # [FIXED] Integrity Check: Do not overwrite populated memory with empty disk data
+        current_mem_log = session.get("unified_log", [])
+        if not disk_log and current_mem_log:
+            # Memory has data, disk is empty. Keep memory and flush it to disk to fix the gap.
+            self._save_session_to_disk(dummy_session_key, session_type, current_mem_log)
+            unified_log = current_mem_log
+        elif len(disk_log) < len(current_mem_log):
+            # Disk is stale compared to memory. Use memory.
+            unified_log = current_mem_log
+        else:
+            unified_log = disk_log
         
         session["unified_log"] = unified_log
         session["chat_sessions"] = {}
 
+        # 3. Synchronise Memory for all current participants
         num_participants = len(session.get("profiles", []))
-
         for p_data in session["profiles"]:
             p_key = (p_data['owner_id'], p_data['profile_name'])
             
@@ -1721,39 +1765,34 @@ class CoreMixin:
 
             history_slice = []
             if stm_length > 0:
+                # Ensure we have enough context relative to the cast size
                 effective_stm = max(stm_length, num_participants)
                 history_slice = unified_log[-(effective_stm * 2):]
 
             participant_history = []
             for turn in history_slice:
-                # [NEW] Ignore turns hidden via reaction
-                if turn.get("is_hidden", False):
-                    continue
-                    
+                if turn.get("is_hidden", False): continue
+                
                 turn_type = turn.get("type")
-                if not turn_type: # Handle old logs
+                if not turn_type: 
                     speaker_key = tuple(turn.get("speaker_key", []))
                     role = 'model' if speaker_key == p_key else 'user'
                     
                     parts = [turn.get("content")]
-                    if role == 'user' and turn.get("url_context") and p_profile_settings.get("url_fetching_enabled", True):
-                        parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
-                    
-                    if role == 'user' and turn.get("grounding_context") and p_profile_settings.get("grounding_mode", "off") != "off":
-                        parts.append(f"\n<external_context>\n{turn.get('grounding_context')}\n</external_context>")
+                    if role == 'user':
+                        if turn.get("url_context") and p_profile_settings.get("url_fetching_enabled", True):
+                            parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
+                        if turn.get("grounding_context") and p_profile_settings.get("grounding_mode", "off") != "off":
+                            parts.append(f"\n<external_context>\n{turn.get('grounding_context')}\n</external_context>")
 
                     content_obj = content_types.to_content({'role': role, 'parts': parts})
                     participant_history.append(content_obj)
                 elif turn_type == "whisper":
-                    target_key = tuple(turn.get("target_key", []))
-                    if p_key == target_key:
-                        content_obj = content_types.to_content({'role': 'user', 'parts': [turn.get("content")]})
-                        participant_history.append(content_obj)
+                    if p_key == tuple(turn.get("target_key", [])):
+                        participant_history.append(content_types.to_content({'role': 'user', 'parts': [turn.get("content")]}))
                 elif turn_type == "private_response":
-                    speaker_key = tuple(turn.get("speaker_key", []))
-                    if p_key == speaker_key:
-                        content_obj = content_types.to_content({'role': 'model', 'parts': [turn.get("content")]})
-                        participant_history.append(content_obj)
+                    if p_key == tuple(turn.get("speaker_key", [])):
+                        participant_history.append(content_types.to_content({'role': 'model', 'parts': [turn.get("content")]}))
             
             session["chat_sessions"][p_key] = dummy_model.start_chat(history=participant_history)
 

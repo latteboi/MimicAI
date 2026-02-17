@@ -979,8 +979,10 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         # Trigger logic: push a null trigger to simulate automated continuation
         await session['task_queue'].put(None)
-        if not session.get('is_running'):
-            session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(interaction.channel_id))
+        if not session.get('worker_task') or session['worker_task'].done():
+            task = self.bot.loop.create_task(self._multi_profile_worker(interaction.channel_id))
+            session['worker_task'] = task
+            self.background_tasks.add(task)
 
         await interaction.followup.send("Round triggered.", ephemeral=True)
 

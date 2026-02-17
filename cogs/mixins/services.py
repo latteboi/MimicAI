@@ -761,6 +761,32 @@ class ServicesMixin:
                     try: all_triggers_for_round.append(session['task_queue'].get_nowait())
                     except asyncio.QueueEmpty: break
                 
+                # [NEW] Pre-Round Hydration: Ensure all participant sessions are ready BEFORE processing triggers
+                from google.generativeai.types import content_types
+                dummy_model = genai.GenerativeModel('gemini-flash-latest')
+                
+                # We re-verify hydration here to catch sessions that were dehydrated during the await queue.get()
+                if not session.get("is_hydrated"):
+                    session = self._ensure_session_hydrated(channel_id, session_type)
+
+                for p_data in session.get('profiles', []):
+                    p_key = (p_data['owner_id'], p_data['profile_name'])
+                    if p_key not in session['chat_sessions'] or session['chat_sessions'][p_key] is None:
+                        # Rebuild history from the currently loaded log
+                        p_user_data = self._get_user_data_entry(p_data['owner_id'])
+                        p_is_b = p_data['profile_name'] in p_user_data.get("borrowed_profiles", {})
+                        p_settings = p_user_data.get("borrowed_profiles" if p_is_b else "profiles", {}).get(p_data['profile_name'], {})
+                        
+                        participant_history = []
+                        for turn in session.get("unified_log", []):
+                            if turn.get("is_hidden"): continue
+                            speaker_key = tuple(turn.get("speaker_key", []))
+                            role = 'model' if speaker_key == p_key else 'user'
+                            participant_history.append(content_types.to_content({'role': role, 'parts': [turn.get("content")]}))
+                        
+                        session["chat_sessions"][p_key] = dummy_model.start_chat(history=participant_history)
+
+                # Now process triggers into new_round_turn_data and unified_log...
                 primary_eager_placeholder = None
                 is_image_gen_round = False
                 image_gen_prompt = ""
@@ -1200,21 +1226,6 @@ class ServicesMixin:
                     else:
                         profile_order.insert(0, ephemeral_participant)
 
-                # --- Ensure all participants for this round have a chat session ---
-                from google.generativeai.types import content_types
-                dummy_model = genai.GenerativeModel('gemini-flash-latest')
-                for p_data in profile_order:
-                    p_key = (p_data['owner_id'], p_data['profile_name'])
-                    if p_key not in session['chat_sessions'] or session['chat_sessions'][p_key] is None:
-                        participant_history = []
-                        for turn in session.get("unified_log", []):
-                            speaker_key = tuple(turn.get("speaker_key", []))
-                            role = 'model' if speaker_key == p_key else 'user'
-                            content_obj = content_types.to_content({'role': role, 'parts': [turn.get("content")]})
-                            participant_history.append(content_obj)
-                        session["chat_sessions"][p_key] = dummy_model.start_chat(history=participant_history)
-                
-                # [UPDATED] Pre-Check API Keys before ANY visual feedback
                 channel = self.bot.get_channel(channel_id)
                 has_gemini = self._get_api_key_for_guild(channel.guild.id, "gemini")
                 has_openrouter = self._get_api_key_for_guild(channel.guild.id, "openrouter")
@@ -2451,6 +2462,8 @@ class ServicesMixin:
                     # Force garbage collection to clear image buffers from this turn
                     gc.collect()
 
+                self._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
+
                 for trigger in all_triggers_for_round:
                     if trigger is not None:
                         session['task_queue'].task_done()
@@ -2536,6 +2549,13 @@ class ServicesMixin:
                 if len(session.get("unified_log", [])) > self.max_history_items * 2:
                     session["unified_log"] = session["unified_log"][-(self.max_history_items * 2):]
 
+                # [NEW] Mandatory Round-End Persistence
+                # Ensures the transcript is saved immediately after the last participant speaks.
+                dummy_session_key = (channel_id, None, None)
+                self._save_session_to_disk(dummy_session_key, session_type, session.get("unified_log", []))
+                if (session_type, channel_id) in self.mapping_caches:
+                    self._save_mapping_to_disk((session_type, channel_id), self.mapping_caches[(session_type, channel_id)])
+
                 # Rebuild all participant histories from the trimmed unified log to ensure consistency.
                 from google.generativeai.types import content_types
                 dummy_model = genai.GenerativeModel('gemini-flash-latest')
@@ -2592,7 +2612,6 @@ class ServicesMixin:
                         await session['task_queue'].put(None) # None trigger = "Continue conversation"
 
             except asyncio.CancelledError:
-                print(f"Worker for channel {channel_id} cancelled.")
                 break
             except Exception as e:
                 print(f"Error in multi-profile worker for channel {channel_id}: {e}")
@@ -2601,8 +2620,10 @@ class ServicesMixin:
                 # Round has concluded, AI is no longer active
                 session['is_running'] = False
         
-        # [NEW] Clear reference when task naturally exits to prevent stale objects
-        if session.get('worker_task') == asyncio.current_task():
+        # [NEW] Lifecycle protection: Remove from background set and clear reference
+        ctask = asyncio.current_task()
+        self.background_tasks.discard(ctask)
+        if session.get('worker_task') == ctask:
             session['worker_task'] = None
 
     async def _image_finisher_worker(self):
@@ -5663,6 +5684,12 @@ class ServicesMixin:
                 speaker_key = tuple(turn.get("speaker_key", []))
                 role = 'model' if speaker_key == p_key else 'user'
                 participant_history.append(content_types.to_content({'role': role, 'parts': [turn.get("content")]}))
+
+            # [NEW] Pseudo-turn injection to ensure history ends with a 'user' role
+            if participant_history and participant_history[-1].role == 'model':
+                participant_history.append(content_types.to_content({'role': 'user', 'parts': ["<internal_note>No response from anyone OR no user is present.</internal_note>"]}))
+            elif not participant_history:
+                participant_history.append(content_types.to_content({'role': 'user', 'parts': ["<internal_note>Begin conversation.</internal_note>"]}))
             
             # 4. Re-run Generation
             model, _, temp, top_p, top_k, _, fallback_model_name = await self._get_or_create_model_for_channel(
