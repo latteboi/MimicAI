@@ -2371,28 +2371,28 @@ class ProfileThinkingParamsModal(ui.Modal, title="Thinking & Reasoning Parameter
         super().__init__()
         self.cog = cog
         self.profile_name = profile_name
-        self.is_borrowed = is_borrowed # [NEW]
+        self.is_borrowed = is_borrowed
         self.callback = callback
 
         self.add_item(ui.TextInput(
             label="Thinking Summary (on/off)", 
             custom_id="thinking_summary_visible", 
             default=current_params.get("thinking_summary_visible", "off"), 
-            placeholder="Display reasoning to users below your message.",
+            placeholder="Display reasoning tokens below your message.",
             required=False
         ))
         self.add_item(ui.TextInput(
             label="Reasoning Effort / Level", 
             custom_id="thinking_level", 
             default=current_params.get("thinking_level", "high"), 
-            placeholder="minimal, low, medium, high (Applied to Gemini 3 / Grok / o1)",
+            placeholder="xhigh, high, medium, low, minimal, none",
             required=False
         ))
         self.add_item(ui.TextInput(
-            label="Reasoning Token Budget", 
+            label="Reasoning Token Budget (Gemini 2.5 Only)", 
             custom_id="thinking_budget", 
             default=str(current_params.get("thinking_budget", -1)), 
-            placeholder="-1 = dynamic, 1+ = token limit (Applied to Gemini 2.5 / Claude / R1)",
+            placeholder="-1 = dynamic, 128+ = token limit",
             required=False
         ))
 
@@ -2407,7 +2407,9 @@ class ProfileThinkingParamsModal(ui.Modal, title="Thinking & Reasoning Parameter
             new_params["thinking_summary_visible"] = s_val
             
             l_val = get_v("thinking_level")
-            if l_val not in ["minimal", "low", "medium", "high"]: l_val = "high"
+            # [UPDATED] Validation for all 6 standardized effort levels
+            if l_val not in ["xhigh", "high", "medium", "low", "minimal", "none"]:
+                l_val = "high"
             new_params["thinking_level"] = l_val
             
             b_val = int(get_v("thinking_budget"))
@@ -5660,7 +5662,6 @@ class BulkManageView(ui.View):
             await interaction.response.send_modal(modal)
 
         elif choice == "thinking_params":
-            # [FIXED] Added False as the 4th argument (is_borrowed) for bulk initialization
             modal = ProfileThinkingParamsModal(self.cog, "BULK_APPLY", {}, False)
             async def modal_callback(i: discord.Interaction):
                 await i.response.defer(ephemeral=True)
@@ -5668,7 +5669,11 @@ class BulkManageView(ui.View):
                 try:
                     def gv(cid): return next(c.value for c in modal.children if c.custom_id == cid).strip().lower()
                     params["thinking_summary_visible"] = gv("thinking_summary_visible") if gv("thinking_summary_visible") in ["on", "off"] else "off"
-                    params["thinking_level"] = gv("thinking_level") if gv("thinking_level") in ["minimal", "low", "medium", "high"] else "high"
+                    # [UPDATED] Validating against the 6 standardized effort levels in bulk mode
+                    lvl = gv("thinking_level")
+                    if lvl not in ["xhigh", "high", "medium", "low", "minimal", "none"]:
+                        lvl = "high"
+                    params["thinking_level"] = lvl
                     params["thinking_budget"] = int(gv("thinking_budget"))
                 except ValueError:
                     await i.followup.send("❌ **Invalid Input**", ephemeral=True); return

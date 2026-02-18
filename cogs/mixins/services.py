@@ -147,20 +147,25 @@ class OpenRouterModel:
             "top_p": getattr(generation_config, 'top_p', 1.0) if generation_config else 1.0,
         }
 
-        # Unified Reasoning Support with Mutual Exclusivity Guard
+        # [UPDATED] Unified Reasoning Support with Config Override and Clamping Logic
         include_thoughts = self.thinking_params.get("thinking_summary_visible") == "on"
+        
+        # Override thoughts status if config specifically requests it (e.g. Whispers or Global Chat UI)
         if generation_config and hasattr(generation_config, 'thinking_config') and generation_config.thinking_config:
             include_thoughts = generation_config.thinking_config.include_thoughts
 
         budget = int(self.thinking_params.get("thinking_budget", -1))
+        level = self.thinking_params.get("thinking_level", "high").lower()
         
-        if include_thoughts or budget > 0:
+        if include_thoughts or budget > 0 or level != "none":
             payload["reasoning"] = {"exclude": not include_thoughts}
-            # OpenRouter requires max_tokens OR effort to be specified, but never both.
+            
+            # If a budget is explicitly set (>0), prioritize it for token-based models
             if budget > 0:
                 payload["reasoning"]["max_tokens"] = budget
-            else:
-                payload["reasoning"]["effort"] = self.thinking_params.get("thinking_level", "high")
+            elif level != "none":
+                # Otherwise use the standardized string (OpenRouter handles provider-specific clamping)
+                payload["reasoning"]["effort"] = level
         
         if hasattr(generation_config, '_advanced_params') and generation_config._advanced_params:
             payload.update(generation_config._advanced_params)
@@ -229,7 +234,6 @@ class GoogleGenAIModel:
                 formatted_contents.append(google_genai_types.Part.from_text(text=item))
             elif isinstance(item, dict):
                 if 'data' in item and 'mime_type' in item:
-                    # Pass bytes directly without creating temporary variables
                     formatted_contents.append(google_genai_types.Part.from_bytes(data=item['data'], mime_type=item['mime_type']))
             elif hasattr(item, 'role') and hasattr(item, 'parts'):
                 new_parts = []
@@ -250,31 +254,44 @@ class GoogleGenAIModel:
                     threshold=thresh.name if hasattr(thresh, 'name') else str(thresh)
                 ))
 
-        # Thinking Config Logic
+        # [NEW] Unified Thinking Config with Level Clamping (Gemini 3) vs Budget (Gemini 2.5)
         thinking_cfg = None
         model_lower = self.model_name.lower()
         include_thoughts = self.thinking_params.get("thinking_summary_visible") == "on"
         
-        # Override thoughts status if config specifically requests it (Whispers/Global Chat)
         if generation_config and hasattr(generation_config, 'thinking_config') and generation_config.thinking_config:
             include_thoughts = generation_config.thinking_config.include_thoughts
 
         if "gemini-3" in model_lower:
-            t_level = self.thinking_params.get("thinking_level", "high")
-            # Normalize: 3-Pro does not support 'medium' in the SDK enum
-            if "pro" in model_lower and t_level == "medium":
-                t_level = "high"
+            lvl = self.thinking_params.get("thinking_level", "high").lower()
+            # Automatic Clamping for Gemini 3 Hardware constraints
+            is_pro = "pro" in model_lower
+            
+            if is_pro:
+                # Pro supports only HIGH and LOW
+                mapped_lvl = "LOW" if lvl in ["low", "minimal", "none"] else "HIGH"
+            else:
+                # Flash supports HIGH, MEDIUM, LOW, MINIMAL
+                mapped_lvl = {
+                    "xhigh": "HIGH", "high": "HIGH", "medium": "MEDIUM", 
+                    "low": "LOW", "minimal": "MINIMAL", "none": "MINIMAL"
+                }.get(lvl, "HIGH")
 
             thinking_cfg = google_genai_types.ThinkingConfig(
                 include_thoughts=include_thoughts,
-                thinking_level=t_level
+                thinking_level=mapped_lvl
             )
         elif "gemini-2.5" in model_lower:
-            budget = self.thinking_params.get("thinking_budget", -1)
+            # [USER NOTE] Gemini 2.5 uses finely customisable token budget only (no mapping)
+            budget = int(self.thinking_params.get("thinking_budget", -1))
             if "lite" not in model_lower:
+                # Clamp Pro to its minimum of 128 if 0 or low is entered
+                if "pro" in model_lower and 0 <= budget < 128:
+                    budget = 128
+                
                 thinking_cfg = google_genai_types.ThinkingConfig(
                     include_thoughts=include_thoughts,
-                    thinking_budget=int(budget)
+                    thinking_budget=budget
                 )
 
         config = google_genai_types.GenerateContentConfig(
@@ -837,18 +854,14 @@ class ServicesMixin:
                             new_round_turn_data.append(("<internal_note>No response from anyone OR no user is present.</internal_note>", None, []))
                         continue
 
-
                     message_trigger, reaction_trigger, message_payload = None, None, None
                     
                     if i == 0:
                         if isinstance(trigger, tuple):
                             if trigger[0] == 'reply':
-                                if len(trigger) == 4:
-                                    _, message_trigger, starting_profile_override, primary_eager_placeholder = trigger
-                                else:
-                                    _, message_trigger, starting_profile_override = trigger
+                                _, message_trigger, starting_profile_override = trigger
                             elif trigger[0] == 'reaction': _, reaction_trigger, starting_profile_override = trigger
-                            elif trigger[0] == 'reaction' or trigger[0] == 'reaction_single': _, reaction_trigger, starting_profile_override = trigger
+                            elif trigger[0] == 'reaction_single': _, reaction_trigger, starting_profile_override = trigger
                             elif trigger[0] == 'child_mention': _, message_payload, starting_profile_override = trigger
                             elif trigger[0] == 'ad_hoc_mention': _, message_trigger, starting_profile_override = trigger
                         elif isinstance(trigger, discord.RawReactionActionEvent): reaction_trigger = trigger
@@ -871,7 +884,14 @@ class ServicesMixin:
                             message_trigger = None
                         else: message_trigger = trigger
                     else:
-                        message_trigger = trigger if isinstance(trigger, discord.Message) else None
+                        # [UPDATED] Unpack structured tuples in batches to prevent lost replies/mentions/child bots
+                        if isinstance(trigger, discord.Message):
+                            message_trigger = trigger
+                        elif isinstance(trigger, tuple) and len(trigger) > 1:
+                            if isinstance(trigger[1], discord.Message):
+                                message_trigger = trigger[1]
+                            elif isinstance(trigger[1], dict):
+                                message_payload = trigger[1]
 
                     # --- Deduplication Check ---
                     check_id = None
@@ -911,7 +931,8 @@ class ServicesMixin:
                             reply_context = await self._resolve_reply_context(message_trigger)
 
                         content = trigger_obj['content'] if is_child_mention else trigger_obj.clean_content
-                        content = f"{reply_context} {content}" if reply_context else content
+                        # [UPDATED] Standardised XML context with newline separator for cleaner transcript integration
+                        content = f"{reply_context}\n{content}" if reply_context else content
                         
                         # [NEW] URL Context Logic: Enforce Profile Setting & Separation
                         any_url_enabled = False
@@ -968,6 +989,10 @@ class ServicesMixin:
                         if mapping_key not in self.mapping_caches:
                             self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
                         self.mapping_caches[mapping_key][str(trigger_id)] = turn_data
+
+                        # [NEW] Immediate persistence for user turns
+                        self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                        self._save_mapping_to_disk(mapping_key, self.mapping_caches[mapping_key])
                         
                         # Initialize list for standard message attachments/reply images
                         new_message_parts = []
@@ -1291,7 +1316,7 @@ class ServicesMixin:
                         if last_mid: anchor_message = await channel.fetch_message(last_mid)
                     except: pass
 
-                # --- Immediate Feedback Step ---
+                # --- Synchronised Feedback Step ---
                 first_participant = profile_order[0] if profile_order else None
                 first_placeholder_message = None
                 if first_participant:
@@ -1301,15 +1326,12 @@ class ServicesMixin:
                             "payload": {"action": "start_typing", "channel_id": channel_id}
                         })
                     else: # Webhook
-                        if primary_eager_placeholder:
-                            first_placeholder_message = primary_eager_placeholder
-                        else:
-                            thinking_messages = await self._send_channel_message(
-                                channel, f"{PLACEHOLDER_EMOJI}",
-                                profile_owner_id_for_appearance=first_participant['owner_id'], 
-                                profile_name_for_appearance=first_participant['profile_name']
-                            )
-                            if thinking_messages: first_placeholder_message = thinking_messages[0]
+                        thinking_messages = await self._send_channel_message(
+                            channel, f"{PLACEHOLDER_EMOJI}",
+                            profile_owner_id_for_appearance=first_participant['owner_id'], 
+                            profile_name_for_appearance=first_participant['profile_name']
+                        )
+                        if thinking_messages: first_placeholder_message = thinking_messages[0]
 
                 grounding_context, grounding_sources = None, []
                 grounding_profile_key = None
@@ -1763,7 +1785,8 @@ class ServicesMixin:
                         if is_openrouter:
                             or_key = self._get_api_key_for_guild(channel.guild.id, provider="openrouter")
                             if or_key:
-                                model = OpenRouterModel(actual_name, api_key=or_key, system_instruction=full_system_instruction)
+                                # [FIXED] Passing thinking_params to OpenRouter constructor
+                                model = OpenRouterModel(actual_name, api_key=or_key, system_instruction=full_system_instruction, thinking_params=t_params_worker)
                             else:
                                 warning_message = f"API Configuration Error: OpenRouter API Key missing for this server. Cannot load model '{primary_model}'."
                         else:
@@ -1791,16 +1814,16 @@ class ServicesMixin:
                             pseudo_user_turn = content_types.to_content({'role': 'user', 'parts': ["<internal_note>No response from anyone OR no user is present.</internal_note>"]})
                             contents_for_api_call.append(pseudo_user_turn)
 
+                        # [UPDATED] Standardised XML injection for pending whispers with improved behavioral instructions
                         pending_whispers = session.get("pending_whispers", {}).pop(participant_key, None)
                         if pending_whispers:
                             whisper_context = (
-                                "<private_context>\n"
-                                "Knowledge received since your last turn:\n"
-                                "By default, do NOT reveal the content of this knowledge publicly. "
-                                "Instead, let it subtly influence your tone, actions, or decisions. "
-                                "Only reveal this if specifically requested by the sender.\n"
+                                "<incoming_whispers>\n"
+                                "SYSTEM: The following private interactions occurred since your last public turn. "
+                                "Do NOT reveal the existence or content of this information unless explicitly requested. "
+                                "Instead, let it subtly influence your personality and future actions.\n"
                             )
-                            whisper_context += "\n---\n" + "\n---\n".join(pending_whispers) + "\n</private_context>"
+                            whisper_context += "\n---\n" + "\n---\n".join(pending_whispers) + "\n</incoming_whispers>"
                             whisper_content_obj = content_types.to_content({'role': 'user', 'parts': [whisper_context]})
                             contents_for_api_call.append(whisper_content_obj)
 
@@ -1866,10 +1889,16 @@ class ServicesMixin:
                         
                         if model:
                             try:
-                                # Pass list directly (shallow copy) to prevent memory spike
-                                response = await model.generate_content_async(contents_for_api_call, generation_config=gen_config)
+                                # [UPDATED] Applied 120-second timeout and integrated collapse detection into the fallback trigger
+                                response = await asyncio.wait_for(model.generate_content_async(contents_for_api_call, generation_config=gen_config), timeout=120.0)
                                 if not response or not response.candidates:
                                     raise ValueError("Response blocked or empty")
+                                
+                                # [NEW] Model Collapse Detection (Repetition) triggers fallback immediately
+                                raw_text_check = getattr(response, 'text', "").strip()
+                                if re.search(r'(.)\1{999,}', raw_text_check):
+                                    raise ValueError("[REPETITIVE_CONTENT_ERROR]")
+                                    
                                 status = "success"
                             except Exception as e:
                                 blocked_reason_override = self._format_api_error(e)
@@ -1897,8 +1926,8 @@ class ServicesMixin:
                                         else:
                                             fallback_instance = genai.GenerativeModel(fb_name, system_instruction=full_system_instruction, safety_settings=dynamic_safety_settings)
                                         
-                                        # Pass list directly
-                                        response = await fallback_instance.generate_content_async(contents_for_api_call, generation_config=gen_config)
+                                        # Timeout also applied to fallback attempts
+                                        response = await asyncio.wait_for(fallback_instance.generate_content_async(contents_for_api_call, generation_config=gen_config), timeout=120.0)
                                         if not response or not response.candidates:
                                             pass
                                         else:
@@ -1952,11 +1981,17 @@ class ServicesMixin:
                                 scrubbed_text = self._scrub_response_text(raw_text, participant_names=all_participant_names)
                                 response_text = self._deduplicate_response(scrubbed_text)
                                 
-                                if not response_text:
+                                # [UPDATED] Differentiated error messaging for spammed vs empty content
+                                if response_text == "[REPETITIVE_CONTENT_ERROR]":
+                                    reason = "Repetitive Content Filter (Model Collapse)"
+                                    custom_main = p_settings.get("error_response", "An error has occurred.")
+                                    response_text = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
+                                    was_blocked = True
+                                elif not response_text:
                                     reason = "Empty Response (AI produced no text content)"
                                     custom_main = p_settings.get("error_response", "An error has occurred.")
-                                    response_text = f"{custom_main}\n\n-# Blocked due to: {reason}"
-                                    was_blocked = True # Treat as a block to prevent LTM creation
+                                    response_text = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
+                                    was_blocked = True
                             except ValueError:
                                 reason = response.candidates[0].finish_reason.name
                                 response_text = f"My response was blocked due to: **{reason.replace('_', ' ').title()}**. Please rephrase or try a different topic."
@@ -2090,10 +2125,9 @@ class ServicesMixin:
                     session.get("unified_log", []).append(turn_object)
                     session['last_speaker_key'] = participant_key
 
-                    model_content_obj = content_types.to_content({'role': 'model', 'parts': [history_line]})
-                    user_content_obj = content_types.to_content({'role': 'user', 'parts': [history_line]})
-
-                    chat_session.history.append(model_content_obj)
+                    # [UPDATED] Persist log immediately; Mapping save is now handled after message delivery
+                    session_type = session.get("type", "multi")
+                    self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
 
                     is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
 
@@ -2311,6 +2345,9 @@ class ServicesMixin:
                             for msg in sent_messages:
                                 self.message_to_history_turn[msg.id] = turn_data
                                 self.mapping_caches[mapping_key][str(msg.id)] = turn_data
+                            
+                            # [FIXED] Persist mappings to disk AFTER message IDs are added to the cache
+                            self._save_mapping_to_disk(mapping_key, self.mapping_caches[mapping_key])
                     
                     if sources_text:
                         for line in sources_text.split('\n'):
@@ -2355,6 +2392,10 @@ class ServicesMixin:
                         
                         if batched_triggers:
                             for trigger in batched_triggers:
+                                # [UPDATED] Unpack structured tuples in mid-round batches to ensure all messages are read
+                                if isinstance(trigger, tuple) and len(trigger) > 1 and isinstance(trigger[1], discord.Message):
+                                    trigger = trigger[1]
+
                                 if isinstance(trigger, discord.Message):
                                     content_lower = trigger.clean_content.lower()
                                     image_prefixes = ("!image", "!imagine")
@@ -2367,7 +2408,8 @@ class ServicesMixin:
 
                                     author_name = trigger.author.display_name
                                     reply_context = await self._resolve_reply_context(trigger)
-                                    content = f"{reply_context} {trigger.clean_content}" if reply_context else trigger.clean_content
+                                    # [UPDATED] Apply newline separator to mid-round batch content
+                                    content = f"{reply_context}\n{trigger.clean_content}" if reply_context else trigger.clean_content
                                     
                                     # [NEW] Batch URL Context Logic
                                     any_url_enabled_batch = False
@@ -3678,8 +3720,8 @@ class ServicesMixin:
                 # Check for massive repetition that wasn't caught by other methods
                 match = re.search(r'(.)\1{999,}', final_text)
                 if match:
-                    # If found, it indicates a model failure. Return empty to trigger the generic error.
-                    return ""
+                    # If found, it indicates a model failure. Return specific sentinel for the worker.
+                    return "[REPETITIVE_CONTENT_ERROR]"
 
                 # Final sanitization to remove trailing, unclosed code block markers and whitespace
                 final_text = re.sub(r'[`\s]*$', '', final_text)
@@ -4536,8 +4578,6 @@ class ServicesMixin:
 
                 session = self.multi_profile_channels.get(channel_id)
                 if session and message_ids:
-                    # History is already updated in the worker loop or speak_as logic.
-                    # We only need to map the Discord message IDs here for reactions/purge.
                     session['last_bot_message_id'] = message_ids[-1]
                     session_type = session.get("type", "multi")
                     turn_data = (channel_id, session_type, turn_id)
@@ -4549,6 +4589,9 @@ class ServicesMixin:
                     for msg_id in message_ids:
                         self.message_to_history_turn[msg_id] = turn_data
                         self.mapping_caches[mapping_key][str(msg_id)] = turn_data
+                    
+                    # [NEW] Persist new mappings to disk after Child Bot confirmation
+                    self._save_mapping_to_disk(mapping_key, self.mapping_caches[mapping_key])
         
         except Exception as e:
             print(f"Error during child bot confirmation ({correlation_id}): {e}")
@@ -4773,8 +4816,8 @@ class ServicesMixin:
                 gen_config = genai.types.GenerationConfig(temperature=temp, top_p=top_p, top_k=top_k)
                 
                 try:
-                    # Pass shallow list copy
-                    response = await model.generate_content_async(list(final_prompt_parts), generation_config=gen_config)
+                    # [UPDATED] Applied 120-second fail-safe timeout
+                    response = await asyncio.wait_for(model.generate_content_async(list(final_prompt_parts), generation_config=gen_config), timeout=120.0)
                     if not response or not response.candidates:
                         raise ValueError("Response blocked or empty")
                     status = "success"
@@ -4903,6 +4946,10 @@ class ServicesMixin:
                 turn_info = (('freewill', channel.id), user_content_obj, model_content_obj, profile_owner_id, profile_name)
                 for msg in sent_messages:
                     self.message_to_history_turn[msg.id] = turn_info
+            
+            # [NEW] Persistence for standalone freewill turns
+            model_cache_key_fw = (channel.id, profile_owner_id, profile_name)
+            self._save_session_to_disk(model_cache_key_fw, 'single', chat.history)
             
             await self._maybe_create_ltm(
                 sent_messages[0] if sent_messages else channel, 
@@ -5764,6 +5811,9 @@ class ServicesMixin:
 
     def _format_api_error(self, error: Exception) -> str:
         """Analyses API exceptions to provide specific, user-friendly diagnostic strings."""
+        if isinstance(error, asyncio.TimeoutError):
+            return "Request Timed Out (Gateway)"
+        
         error_str = str(error)
         
         # 0. Custom Internal Triggers

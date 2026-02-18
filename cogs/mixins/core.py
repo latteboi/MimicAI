@@ -62,6 +62,7 @@ class CoreMixin:
 
         # --- 1. Session Reply Logic (Priority) ---
         if message.reference and message.reference.message_id:
+            # Check if this message is a reply to one of our bots
             if message.reference.resolved and isinstance(message.reference.resolved, discord.Message) and message.reference.resolved.author.id in self.all_bot_ids:
                 if message.reference.resolved.author.id != self.bot.user.id and message.channel.id not in self.multi_profile_channels:
                     return
@@ -83,25 +84,10 @@ class CoreMixin:
                         speaker_key = tuple(turn_object.get("speaker_key", []))
                         replied_to_participant = next((p for p in session['profiles'] if (p['owner_id'], p['profile_name']) == speaker_key), None)
                         if replied_to_participant:
-                            eager_placeholder = None
-                            if replied_to_participant.get('method') == 'child_bot':
-                                asyncio.create_task(self.manager_queue.put({
-                                    "action": "send_to_child", "bot_id": replied_to_participant['bot_id'],
-                                    "payload": {"action": "start_typing", "channel_id": message.channel.id}
-                                }))
-                            elif session.get("is_hydrated"):
-                                placeholders = await self._send_channel_message(
-                                    message.channel, f"{PLACEHOLDER_EMOJI}",
-                                    profile_owner_id_for_appearance=replied_to_participant['owner_id'],
-                                    profile_name_for_appearance=replied_to_participant['profile_name'],
-                                    reply_to=message
-                                )
-                                if placeholders: eager_placeholder = placeholders[0]
-                            else:
-                                await message.channel.typing()
-
-                            reply_trigger = ('reply', message, replied_to_participant, eager_placeholder)
+                            # [UPDATED] Eager feedback removed to respect the queue/batching flow
+                            reply_trigger = ('reply', message, replied_to_participant)
                             await session['task_queue'].put(reply_trigger)
+                            
                             if not session.get('worker_task') or session['worker_task'].done():
                                 task = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
                                 session['worker_task'] = task
@@ -182,83 +168,24 @@ class CoreMixin:
 
         # --- 3. Normal Session Triggering (Main Bot Mention / React / Freewill) ---
         is_main_bot_mention = self.bot.user and self.bot.user.mentioned_in(message)
-        
-        # Resolve Active Profile Settings for Gating
-        eff_uid = message.author.id
-        eff_pname = self._get_active_user_profile_name_for_channel(eff_uid, message.channel.id)
-        eff_udata = self._get_user_data_entry(eff_uid)
-        eff_is_b = eff_pname in eff_udata.get("borrowed_profiles", {})
-        eff_profile = eff_udata.get("borrowed_profiles" if eff_is_b else "profiles", {}).get(eff_pname, {})
+        session = self.multi_profile_channels.get(message.channel.id)
 
+        # Handle Stateless Image Generation (Mentioned when no session exists)
         if is_main_bot_mention and not session:
             content_to_process = message.clean_content.replace(f"<@{self.bot.user.id}>", "").strip()
-            
-            # Stateless Image Gen Gate
             content_lower = content_to_process.lower()
             image_prefixes = ("!image", "!imagine")
             if any(content_lower.startswith(p) for p in image_prefixes):
-                if not eff_profile.get("image_generation_enabled", True):
-                    # Proceed to session creation and treat it as text later
-                    pass
-                else:
+                # Check active profile settings for the user
+                eff_uid = message.author.id
+                eff_pname = self._get_active_user_profile_name_for_channel(eff_uid, message.channel.id)
+                eff_udata = self._get_user_data_entry(eff_uid)
+                eff_is_b = eff_pname in eff_udata.get("borrowed_profiles", {})
+                eff_profile = eff_udata.get("borrowed_profiles" if eff_is_b else "profiles", {}).get(eff_pname, {})
+                
+                if eff_profile.get("image_generation_enabled", True):
                     await self._handle_image_generation_request(message, content_to_process)
                     return
-
-            # Note: URL context is researched by the worker in the "Research Once" phase.
-            # No prepending needed here.
-            
-            owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-            
-            # Re-order/Logic for new session...
-        if message.reference and message.reference.message_id:
-            if message.reference.resolved and message.reference.resolved.author.id in self.all_bot_ids:
-                if message.reference.resolved.author.id != self.bot.user.id and message.channel.id not in self.multi_profile_channels:
-                    return
-
-            turn_info = self.message_to_history_turn.get(message.reference.message_id)
-            if not turn_info:
-                session_type = self.multi_profile_channels.get(message.channel.id, {}).get("type", "multi")
-                mapping_key = (session_type, message.channel.id)
-                if mapping_key not in self.mapping_caches:
-                    self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
-                turn_info = self.mapping_caches[mapping_key].get(str(message.reference.message_id))
-
-            if turn_info and isinstance(turn_info, (list, tuple)) and len(turn_info) == 3:
-                channel_id, session_type, turn_id_to_find = turn_info
-                session = self._ensure_session_hydrated(channel_id, session_type)
-                if session:
-                    turn_object = next((turn for turn in session.get("unified_log", []) if turn.get("turn_id") == turn_id_to_find), None)
-                    if turn_object:
-                        speaker_key = tuple(turn_object.get("speaker_key", []))
-                        replied_to_participant = next((p for p in session['profiles'] if (p['owner_id'], p['profile_name']) == speaker_key), None)
-                        if replied_to_participant:
-                            eager_placeholder = None
-                            # [NEW] Eager Feedback
-                            if replied_to_participant.get('method') == 'child_bot':
-                                asyncio.create_task(self.manager_queue.put({
-                                    "action": "send_to_child", "bot_id": replied_to_participant['bot_id'],
-                                    "payload": {"action": "start_typing", "channel_id": message.channel.id}
-                                }))
-                            elif session.get("is_hydrated"):
-                                # If session is hot, we can fetch appearance and send placeholder immediately
-                                placeholders = await self._send_channel_message(
-                                    message.channel, f"{PLACEHOLDER_EMOJI}",
-                                    profile_owner_id_for_appearance=replied_to_participant['owner_id'],
-                                    profile_name_for_appearance=replied_to_participant['profile_name'],
-                                    reply_to=message
-                                )
-                                if placeholders: eager_placeholder = placeholders[0]
-                            else:
-                                # If cold, just show generic typing to acknowledge receipt
-                                await message.channel.typing()
-
-                            reply_trigger = ('reply', message, replied_to_participant, eager_placeholder)
-                            await session['task_queue'].put(reply_trigger)
-                            if not session.get('worker_task') or session['worker_task'].done():
-                                task = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
-                                session['worker_task'] = task
-                                self.background_tasks.add(task)
-                            return
 
         # --- Freewill Trigger Logic ---
         guild_id_str = str(message.guild.id)
@@ -361,8 +288,6 @@ class CoreMixin:
             return
 
         # --- Generic Session Interaction Logic ---
-        is_main_bot_mention = self.bot.user and self.bot.user.mentioned_in(message)
-
         if session:
             # If Freewill session is active, block mentions of the parent bot
             if session.get("type") == "freewill":
@@ -375,20 +300,11 @@ class CoreMixin:
                 profile_name = DEFAULT_PROFILE_NAME
                 
                 # Check if parent bot is already a participant
-                is_participant = False
-                for p in session['profiles']:
-                    if p['owner_id'] == owner_id and p['profile_name'] == profile_name:
-                        is_participant = True
-                        break
+                is_participant = any(p['owner_id'] == owner_id and p['profile_name'] == profile_name for p in session['profiles'])
                 
                 if not is_participant:
                     # Ad-hoc injection
-                    participant = {
-                        "owner_id": owner_id,
-                        "profile_name": profile_name,
-                        "method": "webhook",
-                        "ephemeral": True
-                    }
+                    participant = {"owner_id": owner_id, "profile_name": profile_name, "method": "webhook", "ephemeral": True}
                     trigger = ('ad_hoc_mention', message, participant)
                     await session['task_queue'].put(trigger)
                     if not session.get('worker_task') or session['worker_task'].done():
@@ -413,20 +329,13 @@ class CoreMixin:
         if is_main_bot_mention:
             owner_id = int(defaultConfig.DISCORD_OWNER_ID)
             profile_name = DEFAULT_PROFILE_NAME
-            
-            participant = {
-                "owner_id": owner_id,
-                "profile_name": profile_name,
-                "method": "webhook",
-                "ephemeral": True # Changed to True for ad-hoc behavior
-            }
+            participant = {"owner_id": owner_id, "profile_name": profile_name, "method": "webhook", "ephemeral": True}
             
             chat_sessions = {(owner_id, profile_name): None}
             new_session = {
                 "type": "multi", "profiles": [participant], "chat_sessions": chat_sessions,
                 "unified_log": [], "is_hydrated": False, "last_bot_message_id": None,
-                "owner_id": message.author.id, "is_running": False, "auto_continue": False,
-                "auto_delay": None, "timer_handle": None, "task_queue": asyncio.Queue(),
+                "owner_id": message.author.id, "is_running": False, "task_queue": asyncio.Queue(),
                 "worker_task": None, "turns_since_last_ltm": 0, "session_prompt": None,
                 "session_mode": "sequential"
             }
@@ -899,6 +808,9 @@ class CoreMixin:
             turn_info = (channel.id, session_type, turn_id)
             mapping_key = (session_type, channel.id)
             self.session_last_accessed[channel.id] = time.time()
+            
+            # [NEW] Persist log immediately for multi-sessions
+            self._save_session_to_disk((channel.id, None, None), session_type, session["unified_log"])
         else:
             model_cache_key = (channel.id, user_id, profile_name)
             chat_session = self.chat_sessions.get(model_cache_key)
@@ -917,6 +829,9 @@ class CoreMixin:
             turn_info = (model_cache_key, 'single', turn_index)
             mapping_key = self._get_mapping_key_for_session(model_cache_key, 'single')
             self.session_last_accessed[model_cache_key] = time.time()
+
+            # [NEW] Persist log immediately for single-sessions
+            self._save_session_to_disk(model_cache_key, 'single', chat_session.history)
 
         sent_messages = []
         if delivery_method == 'child_bot' and child_bot_id:
@@ -958,6 +873,9 @@ class CoreMixin:
             for msg in sent_messages:
                 self.message_to_history_turn[msg.id] = turn_info
                 self.mapping_caches[mapping_key][str(msg.id)] = turn_info
+            
+            # [NEW] Update mappings on disk for webhook delivery
+            self._save_mapping_to_disk(mapping_key, self.mapping_caches[mapping_key])
 
         await interaction_to_respond.followup.send("Message sent.", ephemeral=True)
 
@@ -1098,7 +1016,8 @@ class CoreMixin:
             fallback_used = False
             blocked_reason_override = None
             try:
-                response = await model.generate_content_async(contents_for_api_call, generation_config=gen_config)
+                # [UPDATED] Applied 120-second fail-safe timeout
+                response = await asyncio.wait_for(model.generate_content_async(contents_for_api_call, generation_config=gen_config), timeout=120.0)
                 if not response or not response.candidates:
                     raise ValueError("Response blocked or empty")
                 status = "success"
@@ -1249,6 +1168,10 @@ class CoreMixin:
             
             self.message_to_history_turn[response_message.id] = turn_data
             self.mapping_caches[mapping_key][str(response_message.id)] = turn_data
+            
+            # [NEW] Also map the original user input message for purge consistency
+            self.message_to_history_turn[interaction.id] = (model_cache_key, 'global_chat', user_turn_id)
+            self.mapping_caches[mapping_key][str(interaction.id)] = (model_cache_key, 'global_chat', user_turn_id)
 
             # Persist immediately to disk for safety and UI consistency
             self._save_session_to_disk(model_cache_key, 'global_chat', session_data)
@@ -1348,9 +1271,9 @@ class CoreMixin:
         scrubbed_text = self._scrub_response_text(response_text, participant_names=[display_name])
         response_text = self._deduplicate_response(scrubbed_text)
 
-        # Log the whisper and the private response to the unified log
+        # [UPDATED] Standardised XML wrapping for whisper turns to prevent context leakage
         whisper_turn_id = str(uuid.uuid4())
-        whisper_content = self._format_history_entry(f"Whisper from {interaction.user.name}", interaction.created_at, whisper_message)
+        whisper_content = self._format_history_entry(interaction.user.name, interaction.created_at, f"<private_whisper>\n{whisper_message}\n</private_whisper>")
         session["unified_log"].append({
             "turn_id": whisper_turn_id, "type": "whisper",
             "whisperer_id": interaction.user.id, "target_key": list(participant_key),
@@ -1358,7 +1281,7 @@ class CoreMixin:
         })
 
         response_turn_id = str(uuid.uuid4())
-        response_content = self._format_history_entry(profile_name, datetime.datetime.now(datetime.timezone.utc), response_text)
+        response_content = self._format_history_entry(profile_name, datetime.datetime.now(datetime.timezone.utc), f"<private_response>\n{response_text}\n</private_response>")
         session["unified_log"].append({
             "turn_id": response_turn_id, "type": "private_response",
             "speaker_key": list(participant_key), "target_id": interaction.user.id,
@@ -1371,6 +1294,10 @@ class CoreMixin:
 
         # Add to pending whispers to be injected into the next public turn
         session.setdefault("pending_whispers", {}).setdefault(participant_key, []).append(whisper_content)
+
+        # [NEW] Immediate persistence for private whisper turns
+        session_type = session.get("type", "multi")
+        self._save_session_to_disk((interaction.channel_id, None, None), session_type, session["unified_log"])
 
         # Send the private response to the user
         user_data = self._get_user_data_entry(owner_id)
@@ -2716,9 +2643,9 @@ class CoreMixin:
             content = referenced_message.clean_content
             if len(content) > 150:
                 content = content[:150] + "..."
-            return f"[Replying to {author_name}: '{content}']"
+            return f"<reply_context author='{author_name}'>\n{content}\n</reply_context>"
         except (discord.NotFound, discord.Forbidden):
-            return "[Replying to a message that could not be loaded]"
+            return "<reply_context author='Unknown'>\n[Message could not be loaded]\n</reply_context>"
         except Exception as e:
             print(f"Error resolving reply context: {e}")
             return None

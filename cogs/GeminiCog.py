@@ -584,7 +584,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     @app_commands.describe(mode="The type of session interface to open.")
     @app_commands.choices(mode=[
         app_commands.Choice(name="Regular", value="regular"),
-        app_commands.Choice(name="Freewill (Premium)", value="freewill")
+        app_commands.Choice(name="Freewill", value="freewill")
     ])
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     async def session_config_slash(self, interaction: discord.Interaction, mode: str):
