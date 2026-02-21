@@ -394,47 +394,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         view = BulkManageView(self, interaction)
         await interaction.response.send_message("Choose a bulk action to perform from the dropdown below.", view=view, ephemeral=True)
 
-    @app_commands.command(name="speak", description="Anonymously speak as one of your profiles (Admin Only).")
-    @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
-    @app_commands.guild_only()
-    @is_admin_or_owner_check()
-    @app_commands.autocomplete(profile_name=CoreMixin.profile_autocomplete, method=CoreMixin.speak_method_autocomplete)
-    @app_commands.describe(
-        profile_name="Your personal or borrowed profile to speak as.",
-        message="The message to send. If omitted, a multi-line input box will appear.",
-        method="The method to send the message with. Defaults to 'auto'."
-    )
-    async def speak_slash(self, interaction: discord.Interaction, profile_name: str, method: Literal['auto', 'webhook', 'child_bot'] = 'auto', message: Optional[str] = None):
-        if message:
-            await interaction.response.defer(ephemeral=True)
-            await self._execute_speak_as(
-                interaction_to_respond=interaction,
-                channel=interaction.channel,
-                author=interaction.user,
-                profile_name=profile_name,
-                message=message,
-                method=method
-            )
-        else:
-            async def modal_callback(modal_interaction: discord.Interaction, message_text: str):
-                await modal_interaction.response.defer(ephemeral=True)
-                await self._execute_speak_as(
-                    interaction_to_respond=interaction,
-                    channel=interaction.channel,
-                    author=interaction.user,
-                    profile_name=profile_name,
-                    message=message_text,
-                    method=method
-                )
-            
-            modal = ActionTextInputModal(
-                title=f"Speak as '{profile_name}'",
-                label="Message Content",
-                placeholder="Enter the message to send...",
-                on_submit_callback=modal_callback
-            )
-            await interaction.response.send_modal(modal)
-
     @profile_group.command(name="list", description="Lists all of your saved profile names.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     async def list_profiles_slash(self, interaction: discord.Interaction): 
@@ -1204,16 +1163,21 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             await interaction.followup.send("I lack 'Manage Messages' permission.", ephemeral=True); return
 
         check_fn = (lambda m: m.author == user) if user else (lambda m: True)
+        
+        # [FIXED] Intercept message IDs during the filter check to prevent on_raw_message_delete race condition
+        def check_and_track(m):
+            valid = check_fn(m)
+            if valid:
+                self.purged_message_ids.add(m.id)
+            return valid
+
         try:
-            messages_to_delete = await interaction.channel.purge(limit=amount, check=check_fn, before=interaction.created_at, reason=f"Purge by {interaction.user}")
-            for msg in messages_to_delete:
-                self.purged_message_ids.add(msg.id)
+            messages_to_delete = await interaction.channel.purge(limit=amount, check=check_and_track, before=interaction.created_at, reason=f"Purge by {interaction.user}")
             
             progress_message = await interaction.followup.send(f"Deleted {len(messages_to_delete)} message(s). Now cleaning them from my memory...", ephemeral=True)
 
-            # Group turns by session to modify each session only once
-            single_turns_to_remove = {} # { (session_key, session_type): {turn_indices} }
-            multi_turns_to_remove = {}  # { (channel_id, session_type): {history_lines} }
+            # [UPDATED] Removed legacy 'single' session data structures
+            multi_turns_to_remove = {}  # { (channel_id, session_type): {turn_ids} }
             
             session_type_multi = self.multi_profile_channels.get(interaction.channel_id, {}).get("type", "multi")
             mapping_key_multi = (session_type_multi, interaction.channel_id)
@@ -1229,34 +1193,18 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 if turn_info:
                     if isinstance(turn_info[0], list): turn_info[0] = tuple(turn_info[0])
 
-                    if isinstance(turn_info[0], tuple): # Single/Global session
-                        session_key, session_type, turn_index = turn_info
-                        session_id = (session_key, session_type)
-                        if session_id not in single_turns_to_remove:
-                            single_turns_to_remove[session_id] = set()
-                        single_turns_to_remove[session_id].add(turn_index)
-                    elif isinstance(turn_info[0], int): # Multi/Freewill session
+                    # Modern Multi/Freewill Session Mapping
+                    if isinstance(turn_info[0], int):
                         try:
-                            channel_id, session_type, history_line = turn_info
+                            channel_id, session_type, turn_id = turn_info
                             session_id = (channel_id, session_type)
                             if session_id not in multi_turns_to_remove:
                                 multi_turns_to_remove[session_id] = set()
-                            multi_turns_to_remove[session_id].add(history_line)
+                            multi_turns_to_remove[session_id].add(turn_id)
                         except ValueError:
-                            # Ignore malformed/old turn_info data
                             continue
 
-            # --- New block: Clean mapping files before cleaning history ---
-            for (session_key, session_type), indices in single_turns_to_remove.items():
-                mapping_key = self._get_mapping_key_for_session(session_key, session_type)
-                if mapping_key in self.mapping_caches:
-                    keys_to_delete = [
-                        msg_id for msg_id, t_info in self.mapping_caches[mapping_key].items()
-                        if isinstance(t_info, (list, tuple)) and len(t_info) > 2 and t_info[2] in indices
-                    ]
-                    for msg_id in keys_to_delete:
-                        self.mapping_caches[mapping_key].pop(msg_id, None)
-
+            # --- Clean mapping files before cleaning history ---
             for (channel_id, session_type), lines_to_delete in multi_turns_to_remove.items():
                 mapping_key = (session_type, channel_id)
                 if mapping_key in self.mapping_caches:
@@ -1266,49 +1214,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                     ]
                     for msg_id in keys_to_delete:
                         self.mapping_caches[mapping_key].pop(msg_id, None)
-            # --- End of new block ---
 
             cleaned_turns_count = 0
-            # Process single/global sessions
-            for (session_key, session_type), turn_ids_to_delete in single_turns_to_remove.items():
-                # Decrement Counters
-                owner_id, profile_name = session_key[1], session_key[2]
-                ltm_counter_key = (owner_id, profile_name, "guild")
-                if ltm_counter_key in self.message_counters_for_ltm:
-                    self.message_counters_for_ltm[ltm_counter_key] = max(0, self.message_counters_for_ltm[ltm_counter_key] - len(turn_ids_to_delete))
-
-                mapping_key = self._get_mapping_key_for_session(session_key, session_type)
-                if mapping_key in self.mapping_caches:
-                    self.mapping_caches[mapping_key].pop('grounding_checkpoint', None)
-
-                hot_cache = self.chat_sessions if session_type == 'single' else self.global_chat_sessions
-                chat = hot_cache.get(session_key)
-                if not chat:
-                    dummy_model = genai.GenerativeModel('gemini-flash-latest')
-                    chat = self._load_session_from_disk(session_key, session_type, dummy_model)
-                    if chat: hot_cache[session_key] = chat
-                
-                if chat:
-                    indices_to_delete = []
-                    for i, turn in enumerate(chat.history):
-                        if turn.role == 'user' and turn.parts and hasattr(turn.parts[0], 'text'):
-                            for turn_id in turn_ids_to_delete:
-                                if f"[TURN_ID:{turn_id}]" in turn.parts[0].text:
-                                    indices_to_delete.append(i)
-                                    break
-                    
-                    for index in sorted(indices_to_delete, reverse=True):
-                        if len(chat.history) > index + 1:
-                            del chat.history[index : index + 2]
-                            cleaned_turns_count += 1
-                    if not chat.history:
-                        hot_cache.pop(session_key, None)
-                        self.session_last_accessed.pop(session_key, None)
-                        self._delete_session_from_disk(session_key, session_type)
-                        self.ltm_recall_history.pop(session_key, None)
-                    else:
-                        self.session_last_accessed[session_key] = time.time()
-
+            
             # Process multi/freewill sessions
             for (channel_id, session_type), turn_ids_to_delete in multi_turns_to_remove.items():
                 mapping_key = (session_type, channel_id)
@@ -1381,7 +1289,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
     @profile_group.command(name="global_chat", description="Have a persistent, private conversation with a profile.")
     @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)
-    @app_commands.autocomplete(profile_name=CoreMixin.profile_autocomplete)
+    @app_commands.autocomplete(profile_name=CoreMixin.global_chat_profile_autocomplete)
     @app_commands.describe(
         profile_name="The profile to chat with. Leave blank to view history of recent chats.",
         message="The message to send. If omitted, shows history or input modal.",
@@ -1967,7 +1875,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             if not is_google:
                 self._record_model_usage(model_used, "openrouter")
 
-    async def whisper_profile_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    async def session_participant_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
         session = self.multi_profile_channels.get(interaction.channel_id)
         if not session:
             return []
@@ -1977,7 +1885,11 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             owner_id = participant.get("owner_id")
             profile_name = participant.get("profile_name")
             
-            # Determine the display name
+            # If it's the speak command, only show profiles owned by the command user (unless bot owner)
+            if interaction.command.name == "speak":
+                if owner_id != interaction.user.id and interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
+                    continue
+            
             user_data = self._get_user_data_entry(owner_id)
             is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
             effective_owner_id = owner_id
@@ -1992,16 +1904,83 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             if appearance_data and appearance_data.get("custom_display_name"):
                 display_name = appearance_data.get("custom_display_name")
 
-            # The value must be the internal profile_name, not the display name
-            if current.lower() in display_name.lower():
-                choices.append(app_commands.Choice(name=display_name, value=profile_name))
+            owner_user = self.bot.get_user(effective_owner_id)
+            owner_name = owner_user.name if owner_user else f"User {effective_owner_id}"
+
+            label = f"{display_name} ({profile_name}) by ({owner_name})"
+            value = f"{owner_id}:{profile_name}"
+
+            if current.lower() in label.lower():
+                choices.append(app_commands.Choice(name=label[:100], value=value))
         
         return choices[:25]
+    
+    @app_commands.command(name="speak", description="Anonymously speak as one of your profiles (Admin Only).")
+    @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
+    @app_commands.guild_only()
+    @is_admin_or_owner_check()
+    @app_commands.autocomplete(profile_name=session_participant_autocomplete, method=CoreMixin.speak_method_autocomplete)
+    @app_commands.describe(
+        profile_name="Your active session profile to speak as.",
+        message="The message to send. If omitted, a multi-line input box will appear.",
+        method="The method to send the message with. Defaults to 'auto'."
+    )
+    async def speak_slash(self, interaction: discord.Interaction, profile_name: str, method: Literal['auto', 'webhook', 'child_bot'] = 'auto', message: Optional[str] = None):
+        session = self.multi_profile_channels.get(interaction.channel_id)
+        if not session:
+            await interaction.response.send_message("There is no active session in this channel. The profile must be active in a session.", ephemeral=True)
+            return
+
+        try:
+            p_owner_id_str, p_name = profile_name.split(":", 1)
+            p_owner_id = int(p_owner_id_str)
+        except ValueError:
+            p_owner_id = interaction.user.id
+            p_name = profile_name
+
+        participant = next((p for p in session.get("profiles", []) if p.get("profile_name") == p_name and p.get("owner_id") == p_owner_id), None)
+        if not participant:
+            await interaction.response.send_message(f"The profile '{p_name}' is not active in this session. It must be added first.", ephemeral=True)
+            return
+
+        if p_owner_id != interaction.user.id and interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
+            await interaction.response.send_message("You can only speak as your own personal or borrowed profiles.", ephemeral=True)
+            return
+
+        if message:
+            await interaction.response.defer(ephemeral=True)
+            await self._execute_speak_as(
+                interaction_to_respond=interaction,
+                channel=interaction.channel,
+                author=interaction.user,
+                profile_name=p_name,
+                message=message,
+                method=method
+            )
+        else:
+            async def modal_callback(modal_interaction: discord.Interaction, message_text: str):
+                await modal_interaction.response.defer(ephemeral=True)
+                await self._execute_speak_as(
+                    interaction_to_respond=interaction,
+                    channel=interaction.channel,
+                    author=interaction.user,
+                    profile_name=p_name,
+                    message=message_text,
+                    method=method
+                )
+            
+            modal = ActionTextInputModal(
+                title=f"Speak as '{p_name}'",
+                label="Message Content",
+                placeholder="Enter the message to send...",
+                on_submit_callback=modal_callback
+            )
+            await interaction.response.send_modal(modal)
 
     @app_commands.command(name="whisper", description="Send a private message to a profile in an active multi-profile session.")
     @app_commands.checks.cooldown(3, 30.0, key=lambda i: i.user.id)
     @app_commands.guild_only()
-    @app_commands.autocomplete(profile=whisper_profile_autocomplete)
+    @app_commands.autocomplete(profile=session_participant_autocomplete)
     @app_commands.describe(
         profile="The participant to whisper to. Leave blank to view history.",
         message="The private message to send. Leave blank to view history."
@@ -2012,25 +1991,31 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             await interaction.response.send_message("This command can only be used in an active multi-profile or freewill session.", ephemeral=True)
             return
 
-        if profile and message:
-            target_participant = next((p for p in session.get("profiles", []) if p.get("profile_name") == profile), None)
+        target_participant = None
+        if profile:
+            try:
+                p_owner_id_str, p_name = profile.split(":", 1)
+                p_owner_id = int(p_owner_id_str)
+            except ValueError:
+                p_owner_id = None
+                p_name = profile
+
+            target_participant = next((p for p in session.get("profiles", []) if p.get("profile_name") == p_name and (p_owner_id is None or p.get("owner_id") == p_owner_id)), None)
+
             if not target_participant:
-                await interaction.response.send_message(f"Could not find a participant named '{profile}' in the current session.", ephemeral=True)
+                await interaction.response.send_message(f"The profile '{p_name}' is not an active participant in this session.", ephemeral=True)
                 return
+
+        if profile and message:
             await interaction.response.defer(ephemeral=True, thinking=True)
             await self._execute_whisper(interaction, target_participant, message)
         elif profile and not message:
-            target_participant = next((p for p in session.get("profiles", []) if p.get("profile_name") == profile), None)
-            if not target_participant:
-                await interaction.response.send_message(f"Could not find a participant named '{profile}' in the current session.", ephemeral=True)
-                return
-
             async def modal_callback(modal_interaction: discord.Interaction, message_text: str):
                 await modal_interaction.response.defer(ephemeral=True, thinking=True)
                 await self._execute_whisper(modal_interaction, target_participant, message_text)
 
             modal = ActionTextInputModal(
-                title=f"Whisper to {profile}",
+                title=f"Whisper to {target_participant['profile_name']}",
                 label="Whisper Message",
                 placeholder="Enter your private message...",
                 on_submit_callback=modal_callback
@@ -2064,7 +2049,11 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 # Find the next turn that is a private_response from the same profile
                 if i + 1 < len(log):
                     next_turn = log[i+1]
-                    if next_turn.get("type") == "private_response" and tuple(next_turn.get("speaker_key")) == tuple(turn.get("target_key")):
+                    t_key = turn.get("target_key")
+                    s_key = next_turn.get("speaker_key")
+                    
+                    # [FIXED] Ensure keys exist before casting to tuple to prevent silent crashes
+                    if next_turn.get("type") == "private_response" and t_key and s_key and tuple(s_key) == tuple(t_key):
                         paired_whispers.append((turn, next_turn))
 
         if not paired_whispers:

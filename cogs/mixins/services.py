@@ -2072,7 +2072,7 @@ class ServicesMixin:
                         thought_file_to_send = discord.File(io.BytesIO(thought_text.encode('utf-8')), filename="thinking_summary.txt")
 
                     if fallback_used and p_settings.get("show_fallback_indicator", True):
-                        display_text += f"\n\n-# Fallback Model Used ({blocked_reason_override})"
+                        display_text += f"\n\n-# Fallback Model Used **({blocked_reason_override})**."
 
                     sources_text = None
                     if participant_key == grounding_profile_key and grounding_mode_for_citator == "on+" and grounding_sources:
@@ -2620,7 +2620,7 @@ class ServicesMixin:
                             speaker_key = tuple(turn.get("speaker_key", []))
                             role = 'model' if speaker_key == p_key else 'user'
                             
-                            # [UPDATED] Standardized Headers
+                            # [UPDATED] Standardised Headers
                             parts = [turn.get("content")]
                             if role == 'user' and turn.get("url_context") and p_profile_settings.get("url_fetching_enabled", True):
                                 parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
@@ -2634,13 +2634,19 @@ class ServicesMixin:
                         elif turn_type == "whisper":
                             target_key = tuple(turn.get("target_key", []))
                             if p_key == target_key:
-                                content_obj = content_types.to_content({'role': 'user', 'parts': [turn.get("content")]})
-                                participant_history.append(content_obj)
+                                # [NEW] Apply dynamic XML wrapping during re-hydration
+                                clean_content = turn.get("content")
+                                header, body = clean_content.split('\n', 1)
+                                wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
+                                participant_history.append(content_types.to_content({'role': 'user', 'parts': [wrapped]}))
                         elif turn_type == "private_response":
                             speaker_key = tuple(turn.get("speaker_key", []))
                             if p_key == speaker_key:
-                                content_obj = content_types.to_content({'role': 'model', 'parts': [turn.get("content")]})
-                                participant_history.append(content_obj)
+                                # [NEW] Apply dynamic XML wrapping during re-hydration
+                                clean_content = turn.get("content")
+                                header, body = clean_content.split('\n', 1)
+                                wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
+                                participant_history.append(content_types.to_content({'role': 'model', 'parts': [wrapped]}))
                     session["chat_sessions"][p_key] = dummy_model.start_chat(history=participant_history)
 
                 # Handle Proactive Freewill Continuation
@@ -4916,7 +4922,7 @@ class ServicesMixin:
             if not p_settings: p_settings = self._get_user_data_entry(profile_owner_id).get("borrowed_profiles", {}).get(profile_name, {})
             
             if fallback_used and p_settings.get("show_fallback_indicator", True):
-                text_to_send += f"\n\n-# Fallback Model Used ({blocked_reason_override})"
+                text_to_send += f"\n\n-# Fallback Model Used **({blocked_reason_override})**."
 
             if method == 'child_bot' and bot_id:
                 correlation_id = str(uuid.uuid4())

@@ -317,7 +317,19 @@ class HiveMind:
                             if resp.status == 200:
                                 data = await resp.read()
                                 if len(data) < MAX_AVATAR_SIZE_BYTES:
-                                    await bot.user.edit(avatar=data)
+                                    try:
+                                        # [FIXED] Force image to RGBA and strict PNG format to preserve transparency
+                                        with Image.open(io.BytesIO(data)) as img:
+                                            if img.mode != 'RGBA':
+                                                img = img.convert('RGBA')
+                                            with io.BytesIO() as out_buffer:
+                                                img.save(out_buffer, format='PNG')
+                                                png_data = out_buffer.getvalue()
+                                        await bot.user.edit(avatar=png_data)
+                                    except Exception as img_e:
+                                        print(f"[Hive] Failed to process avatar image transparency: {img_e}")
+                                        # Fallback to raw data if processing fails
+                                        await bot.user.edit(avatar=data)
                 else:
                     await bot.user.edit(avatar=None)
         except Exception as e:

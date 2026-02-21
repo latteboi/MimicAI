@@ -11,7 +11,7 @@ DEFAULT_PROFILE_NAME = "mimic"
 # Define the allowed models for the new command
 ALLOWED_MODELS = Literal[
     'gemini-pro-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest',
-    'gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-flash-preview-09-2025', 'gemini-2.5-flash-lite-preview-09-2025',
+    'gemini-3.1-pro-preview', 'gemini-3-pro-preview', 'gemini-3-flash-preview', 'gemini-2.5-flash-preview-09-2025', 'gemini-2.5-flash-lite-preview-09-2025',
     'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite',
     'gemini-2.0-flash', 'gemini-2.0-flash-lite'
 ]

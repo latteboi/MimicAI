@@ -809,29 +809,12 @@ class CoreMixin:
             mapping_key = (session_type, channel.id)
             self.session_last_accessed[channel.id] = time.time()
             
-            # [NEW] Persist log immediately for multi-sessions
+            # Persist log immediately for multi-sessions
             self._save_session_to_disk((channel.id, None, None), session_type, session["unified_log"])
         else:
-            model_cache_key = (channel.id, user_id, profile_name)
-            chat_session = self.chat_sessions.get(model_cache_key)
-            dummy_model = genai.GenerativeModel('gemini-flash-latest')
-            if not chat_session:
-                chat_session = self._load_session_from_disk(model_cache_key, 'single', dummy_model)
-            if not chat_session:
-                chat_session = dummy_model.start_chat(history=[])
-            self.chat_sessions[model_cache_key] = chat_session
-
-            fake_user_turn = content_types.to_content({'role': 'user', 'parts': ["<internal_note>Admin initiated message via /speak</internal_note>"]})
-            model_turn = content_types.to_content({'role': 'model', 'parts': [history_line]})
-            chat_session.history.extend([fake_user_turn, model_turn])
-            
-            turn_index = len(chat_session.history) - 2
-            turn_info = (model_cache_key, 'single', turn_index)
-            mapping_key = self._get_mapping_key_for_session(model_cache_key, 'single')
-            self.session_last_accessed[model_cache_key] = time.time()
-
-            # [NEW] Persist log immediately for single-sessions
-            self._save_session_to_disk(model_cache_key, 'single', chat_session.history)
+            # [UPDATED] Removed legacy 'single' session creation for stateless speak_as responses
+            turn_info = None
+            mapping_key = None
 
         sent_messages = []
         if delivery_method == 'child_bot' and child_bot_id:
@@ -839,17 +822,11 @@ class CoreMixin:
             
             if session:
                 participant_data = next((p for p in session.get("profiles", []) if p.get("owner_id") == user_id and p.get("profile_name") == profile_name), None)
-                _, _, turn_id = turn_info # Unpack the turn_id created earlier
+                _, _, turn_id = turn_info
                 self.pending_child_confirmations[correlation_id] = {
                     "type": "multi_profile", "participant": participant_data,
                     "history_line": history_line, "channel_id": channel.id, "turn_id": turn_id,
-                    "is_speak_as": True # Add the flag here
-                }
-            else:
-                _, _, turn_index = turn_info
-                self.pending_child_confirmations[correlation_id] = {
-                    "type": "single_profile", "user_turn": fake_user_turn, "model_turn": model_turn,
-                    "bot_id": child_bot_id, "channel_id": channel.id, "turn_index": turn_index
+                    "is_speak_as": True 
                 }
 
             await self.manager_queue.put({
@@ -874,7 +851,7 @@ class CoreMixin:
                 self.message_to_history_turn[msg.id] = turn_info
                 self.mapping_caches[mapping_key][str(msg.id)] = turn_info
             
-            # [NEW] Update mappings on disk for webhook delivery
+            # Update mappings on disk for webhook delivery
             self._save_mapping_to_disk(mapping_key, self.mapping_caches[mapping_key])
 
         await interaction_to_respond.followup.send("Message sent.", ephemeral=True)
@@ -1134,7 +1111,7 @@ class CoreMixin:
 
             text_for_embed = response_text
             if fallback_used and profile_data.get("show_fallback_indicator", True):
-                text_for_embed += f"\n\n-# Fallback Model Used ({blocked_reason_override})"
+                text_for_embed += f"\n\n-# Fallback Model Used **({blocked_reason_override})**."
 
             embed = discord.Embed(description=text_for_embed, color=discord.Color.blue())
             embed.set_author(name=display_name, icon_url=avatar_url)
@@ -1160,24 +1137,10 @@ class CoreMixin:
                 from google.generativeai.types import content_types
                 chat.history[-1] = content_types.to_content({'role': 'model', 'parts': [bot_response_formatted]})
 
-            # Mapping Logic using model_turn_id
-            turn_data = (model_cache_key, 'global_chat', model_turn_id)
-            mapping_key = self._get_mapping_key_for_session(model_cache_key, 'global_chat')
-            if mapping_key not in self.mapping_caches:
-                self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
-            
-            self.message_to_history_turn[response_message.id] = turn_data
-            self.mapping_caches[mapping_key][str(response_message.id)] = turn_data
-            
-            # [NEW] Also map the original user input message for purge consistency
-            self.message_to_history_turn[interaction.id] = (model_cache_key, 'global_chat', user_turn_id)
-            self.mapping_caches[mapping_key][str(interaction.id)] = (model_cache_key, 'global_chat', user_turn_id)
+            # [REMOVED] Redundant mapping logic for Global Chat has been stripped to save disk I/O
 
             # Persist immediately to disk for safety and UI consistency
             self._save_session_to_disk(model_cache_key, 'global_chat', session_data)
-            
-            # Also save mapping
-            self._save_mapping_to_disk(mapping_key, self.mapping_caches[mapping_key])
 
             await self._maybe_create_ltm(
                 interaction.channel, interaction.user.display_name, chat.history, user_id, profile_name,
@@ -1271,9 +1234,9 @@ class CoreMixin:
         scrubbed_text = self._scrub_response_text(response_text, participant_names=[display_name])
         response_text = self._deduplicate_response(scrubbed_text)
 
-        # [UPDATED] Standardised XML wrapping for whisper turns to prevent context leakage
+        # [FIXED] Storing only clean text in the log; XML is now added dynamically during AI hydration
         whisper_turn_id = str(uuid.uuid4())
-        whisper_content = self._format_history_entry(interaction.user.name, interaction.created_at, f"<private_whisper>\n{whisper_message}\n</private_whisper>")
+        whisper_content = self._format_history_entry(interaction.user.name, interaction.created_at, whisper_message)
         session["unified_log"].append({
             "turn_id": whisper_turn_id, "type": "whisper",
             "whisperer_id": interaction.user.id, "target_key": list(participant_key),
@@ -1281,7 +1244,7 @@ class CoreMixin:
         })
 
         response_turn_id = str(uuid.uuid4())
-        response_content = self._format_history_entry(profile_name, datetime.datetime.now(datetime.timezone.utc), f"<private_response>\n{response_text}\n</private_response>")
+        response_content = self._format_history_entry(profile_name, datetime.datetime.now(datetime.timezone.utc), response_text)
         session["unified_log"].append({
             "turn_id": response_turn_id, "type": "private_response",
             "speaker_key": list(participant_key), "target_id": interaction.user.id,
@@ -1682,6 +1645,8 @@ class CoreMixin:
 
         # 3. Synchronise Memory for all current participants
         num_participants = len(session.get("profiles", []))
+        session["pending_whispers"] = {}
+        
         for p_data in session["profiles"]:
             p_key = (p_data['owner_id'], p_data['profile_name'])
             
@@ -1689,6 +1654,24 @@ class CoreMixin:
             p_is_borrowed = p_data['profile_name'] in p_user_data.get("borrowed_profiles", {})
             p_profile_settings = p_user_data.get("borrowed_profiles" if p_is_borrowed else "profiles", {}).get(p_data['profile_name'], {})
             stm_length = int(p_profile_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
+
+            # [NEW] Reconstruct pending whispers from the full log to prevent reboot amnesia
+            pending_for_this_profile = []
+            for turn in unified_log:
+                if turn.get("is_hidden", False): continue
+                turn_type = turn.get("type")
+                
+                if not turn_type:
+                    # A public turn from this profile clears its pending whispers
+                    if tuple(turn.get("speaker_key", [])) == p_key:
+                        pending_for_this_profile.clear()
+                elif turn_type == "whisper":
+                    # A whisper targeted at this profile is added to the pending queue
+                    if tuple(turn.get("target_key", [])) == p_key:
+                        pending_for_this_profile.append(turn.get("content"))
+            
+            if pending_for_this_profile:
+                session["pending_whispers"][p_key] = pending_for_this_profile
 
             history_slice = []
             if stm_length > 0:
@@ -1716,10 +1699,18 @@ class CoreMixin:
                     participant_history.append(content_obj)
                 elif turn_type == "whisper":
                     if p_key == tuple(turn.get("target_key", [])):
-                        participant_history.append(content_types.to_content({'role': 'user', 'parts': [turn.get("content")]}))
+                        # [NEW] Wrap clean text in XML tags only when feeding to the AI
+                        clean_content = turn.get("content")
+                        header, body = clean_content.split('\n', 1)
+                        wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
+                        participant_history.append(content_types.to_content({'role': 'user', 'parts': [wrapped]}))
                 elif turn_type == "private_response":
                     if p_key == tuple(turn.get("speaker_key", [])):
-                        participant_history.append(content_types.to_content({'role': 'model', 'parts': [turn.get("content")]}))
+                        # [NEW] Wrap clean text in XML tags only when feeding to the AI
+                        clean_content = turn.get("content")
+                        header, body = clean_content.split('\n', 1)
+                        wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
+                        participant_history.append(content_types.to_content({'role': 'model', 'parts': [wrapped]}))
             
             session["chat_sessions"][p_key] = dummy_model.start_chat(history=participant_history)
 
@@ -2194,8 +2185,16 @@ class CoreMixin:
         # Personal Public Profiles
         for name in user_data.get("profiles", {}):
             if (str(user_id), name) in public_pointers:
-                if current_lower in name.lower():
-                    choices.append(app_commands.Choice(name=name, value=name))
+                display_name = name
+                appearance_data = self.user_appearances.get(str(user_id), {}).get(name, {})
+                if appearance_data and appearance_data.get("custom_display_name"):
+                    display_name = appearance_data.get("custom_display_name")
+                
+                owner_name = interaction.user.name
+                label = f"{display_name} ({name}) by ({owner_name})"
+                
+                if current_lower in label.lower():
+                    choices.append(app_commands.Choice(name=label[:100], value=name))
         
         # Borrowed Public Profiles
         for local_name, data in user_data.get("borrowed_profiles", {}).items():
@@ -2203,11 +2202,18 @@ class CoreMixin:
             orig_name = data.get("original_profile_name")
             
             if (orig_oid, orig_name) in public_pointers:
-                if current_lower in local_name.lower():
-                    owner = self.bot.get_user(int(orig_oid))
-                    owner_name = owner.name if owner else "Unknown"
-                    display = f"{local_name} (from {owner_name})"
-                    choices.append(app_commands.Choice(name=display, value=local_name))
+                display_name = orig_name
+                appearance_data = self.user_appearances.get(orig_oid, {}).get(orig_name, {})
+                if appearance_data and appearance_data.get("custom_display_name"):
+                    display_name = appearance_data.get("custom_display_name")
+                    
+                owner = self.bot.get_user(int(orig_oid))
+                owner_name = owner.name if owner else f"User {orig_oid}"
+                
+                label = f"{display_name} ({local_name}) by ({owner_name})"
+                
+                if current_lower in label.lower():
+                    choices.append(app_commands.Choice(name=label[:100], value=local_name))
         
         return choices[:25]
 
