@@ -15,12 +15,11 @@ import re
 import traceback
 import orjson as json
 from zoneinfo import ZoneInfo, available_timezones
-import google.generativeai as genai
-from google.genai import types as google_genai_types
-from google.api_core import exceptions as api_exceptions
 from typing import List, Dict, Tuple, Set, Literal, Any, Optional, Union, get_args
 from .constants import *
 from .storage import _delete_file_shard, _atomic_json_save, _quantize_embedding, _dequantize_embedding
+from .services import GoogleGenAIChatSession
+from google import genai
 
 class CoreMixin:
 
@@ -597,8 +596,7 @@ class CoreMixin:
 
             session_data = self.global_chat_sessions.get(session_key)
             if not session_data:
-                dummy_model = genai.GenerativeModel('gemini-flash-latest')
-                session_data = self._load_session_from_disk(session_key, session_type, dummy_model)
+                session_data = self._load_session_from_disk(session_key, session_type)
                 if session_data: self.global_chat_sessions[session_key] = session_data
             
             if session_data:
@@ -607,13 +605,11 @@ class CoreMixin:
 
                 if len(session_data['unified_log']) < original_len:
                     # Rebuild history
-                    from google.generativeai.types import content_types
-                    dummy_model = genai.GenerativeModel('gemini-flash-latest')
                     new_history = []
                     for t in session_data['unified_log']:
                         role = 'model' if t.get('role') == 'model' else 'user'
-                        new_history.append(content_types.to_content({'role': role, 'parts': [t.get('content')]}))
-                    session_data['chat_session'] = dummy_model.start_chat(history=new_history)
+                        new_history.append({'role': role, 'parts': [t.get('content')]})
+                    session_data['chat_session'] = GoogleGenAIChatSession(history=new_history)
 
                 if not session_data['unified_log']:
                     self.global_chat_sessions.pop(session_key, None)
@@ -663,17 +659,14 @@ class CoreMixin:
                 ]
                 
                 if len(session["unified_log"]) < original_log_len:
-                    from google.generativeai.types import content_types
-                    dummy_model = genai.GenerativeModel('gemini-flash-latest')
                     for p_data in session["profiles"]:
                         p_key = (p_data['owner_id'], p_data['profile_name'])
                         participant_history = []
                         for turn in session["unified_log"]:
                             speaker_key = tuple(turn.get("speaker_key", []))
                             role = 'model' if speaker_key == p_key else 'user'
-                            content_obj = content_types.to_content({'role': role, 'parts': [turn.get("content")]})
-                            participant_history.append(content_obj)
-                        session["chat_sessions"][p_key] = dummy_model.start_chat(history=participant_history)
+                            participant_history.append({'role': role, 'parts': [turn.get("content")]})
+                        session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 
                 is_effectively_empty = not session.get("unified_log") or all(
                     turn.get("type") in ["whisper", "private_response"] for turn in session.get("unified_log", [])
@@ -777,15 +770,14 @@ class CoreMixin:
         if appearance_data.get("custom_display_name"):
             speaker_display_name = appearance_data["custom_display_name"]
 
-        from google.generativeai.types import content_types
         history_line = self._format_history_entry(speaker_display_name, interaction_to_respond.created_at, message)
         turn_info = None
         mapping_key = None
         
         if session:
             participant_key = (user_id, profile_name)
-            model_content_obj = content_types.to_content({'role': 'model', 'parts': [history_line]})
-            user_content_obj = content_types.to_content({'role': 'user', 'parts': [history_line]})
+            model_content_obj = {'role': 'model', 'parts': [history_line]}
+            user_content_obj = {'role': 'user', 'parts': [history_line]}
 
             # Add the turn to the unified log
             turn_id = str(uuid.uuid4())
@@ -891,7 +883,6 @@ class CoreMixin:
         if not user_api_key:
             await interaction.followup.send("This feature requires you to have your own personal API key. Please use the `/settings` command in a DM with me to submit one.", ephemeral=True)
             return
-        genai.configure(api_key=user_api_key)
 
         model_cache_key = ('global', user_id, profile_name)
         
@@ -909,10 +900,10 @@ class CoreMixin:
 
             session_data = self.global_chat_sessions.get(model_cache_key)
             if not session_data:
-                session_data = self._load_session_from_disk(model_cache_key, 'global_chat', model)
+                session_data = self._load_session_from_disk(model_cache_key, 'global_chat')
             
             if not session_data:
-                chat = model.start_chat(history=[])
+                chat = GoogleGenAIChatSession(history=[])
                 session_data = {'chat_session': chat, 'unified_log': []}
             
             self.global_chat_sessions[model_cache_key] = session_data
@@ -920,7 +911,6 @@ class CoreMixin:
             self.session_last_accessed[model_cache_key] = time.time()
 
             # [UPDATED] Standardized XML Headers
-            from google.generativeai.types import content_types
             rebuilt_history = []
             for t in session_data['unified_log']:
                 t_role = t.get('role')
@@ -932,7 +922,7 @@ class CoreMixin:
                     if t.get('grounding_context') and profile_data.get('grounding_mode', 'off') != 'off':
                         parts.append(f"\n<external_context>\n{t.get('grounding_context')}\n</external_context>")
                 
-                rebuilt_history.append(content_types.to_content({'role': t_role, 'parts': parts}))
+                rebuilt_history.append({'role': t_role, 'parts': parts})
             
             chat.history = rebuilt_history
 
@@ -956,7 +946,6 @@ class CoreMixin:
             if appearance and appearance.get("custom_display_name"):
                 bot_display_name = appearance.get("custom_display_name")
 
-            from google.generativeai.types import content_types
             contents_for_api_call = []
             
             # [NEW] Localized User Timestamp Logic
@@ -974,7 +963,7 @@ class CoreMixin:
 
             final_user_parts.append(user_line)
 
-            user_content_obj_for_turn = content_types.to_content({'role': 'user', 'parts': final_user_parts})
+            user_content_obj_for_turn = {'role': 'user', 'parts': final_user_parts}
             
             stm_length = int(profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
             if stm_length > 0:
@@ -983,11 +972,11 @@ class CoreMixin:
 
             contents_for_api_call.append(user_content_obj_for_turn)
             
-            # Enable internal thoughts but keep summary display off (UI ignores it)
-            gen_config = google_genai_types.GenerateContentConfig(
-                temperature=temp, top_p=top_p, top_k=top_k,
-                thinking_config=google_genai_types.ThinkingConfig(include_thoughts=True)
-            )
+            gen_config = {
+                "temperature": temp, "top_p": top_p, "top_k": top_k,
+                "thinking_config": {"include_thoughts": True}
+            }
+
             status = "api_error"
             response = None
             fallback_used = False
@@ -1051,18 +1040,18 @@ class CoreMixin:
                             else:
                                 raise ValueError("No Google key for fallback")
 
-                        response = await fallback_instance.generate_content_async(contents_for_api_call, generation_config=gen_config)
-                        status = "blocked_by_safety" if not response.candidates else "success"
-                        if status == "success":
-                            fallback_used = True
-                            self._log_api_call(user_id=user_id, guild_id=None, context="global_chat_fallback", model_used=fb_name, status="success")
+                            response = await fallback_instance.generate_content_async(contents_for_api_call, generation_config=gen_config)
+                            status = "blocked_by_safety" if not response.candidates else "success"
+                            if status == "success":
+                                fallback_used = True
+                                self._log_api_call(user_id=user_id, guild_id=None, context="global_chat_fallback", model_used=fb_name, status="success")
                     except Exception as retry_e:
                         print(f"Global Chat fallback retry failed: {retry_e}")
                         status = "api_error"
                 else:
                     status = "api_error"
 
-            except api_exceptions.PermissionDenied as e:
+            except genai.errors.APIError as e:
                 await interaction.followup.send("An error has occurred. Your personal API key appears to be invalid or disabled.", ephemeral=True)
                 return
             finally:
@@ -1071,21 +1060,21 @@ class CoreMixin:
 
             if not response or not response.candidates:
                 reason = blocked_reason_override or "Unknown"
-                if response and response.prompt_feedback and response.prompt_feedback.block_reason:
+                if response and hasattr(response, 'prompt_feedback') and response.prompt_feedback and response.prompt_feedback.block_reason:
                     reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
                 
                 custom_main = profile_data.get("error_response", "An error has occurred.")
                 await interaction.followup.send(f"{custom_main}\n\n-# Blocked due to: **{reason}**.", ephemeral=False)
                 return
 
-            model_content_obj_for_turn = content_types.to_content({'role': 'model', 'parts': [response.text]})
+            raw_text = getattr(response, 'text', "").strip()
+
+            model_content_obj_for_turn = {'role': 'model', 'parts': [raw_text]}
             chat.history.extend([user_content_obj_for_turn, model_content_obj_for_turn])
 
             if len(chat.history) > STM_LIMIT_MAX * 2:
                 chat.history = chat.history[-(STM_LIMIT_MAX * 2):]
                 session_data['unified_log'] = session_data['unified_log'][-(STM_LIMIT_MAX * 2):]
-            
-            raw_text = response.text.strip() if hasattr(response, 'text') else "I could not generate a response."
             
             # Apply filters
             display_name = source_profile_name
@@ -1133,11 +1122,8 @@ class CoreMixin:
             bot_response_formatted = f"{main_history_line.strip()}\n{metadata_line}\n"
             
             # Replace the last model turn in history with the one containing metadata for context
-            if chat.history and chat.history[-1].role == 'model':
-                from google.generativeai.types import content_types
-                chat.history[-1] = content_types.to_content({'role': 'model', 'parts': [bot_response_formatted]})
-
-            # [REMOVED] Redundant mapping logic for Global Chat has been stripped to save disk I/O
+            if chat.history and chat.history[-1].get('role', 'user') == 'model':
+                chat.history[-1] = {'role': 'model', 'parts': [bot_response_formatted]}
 
             # Persist immediately to disk for safety and UI consistency
             self._save_session_to_disk(model_cache_key, 'global_chat', session_data)
@@ -1153,7 +1139,6 @@ class CoreMixin:
             traceback.print_exc()
 
     async def _execute_whisper(self, interaction: discord.Interaction, target_participant: Dict, whisper_message: str):
-        from google.generativeai.types import content_types
         session = self.multi_profile_channels.get(interaction.channel_id)
         if not session: return
 
@@ -1184,13 +1169,13 @@ class CoreMixin:
         
         # Use shallow copy of history list
         contents_for_api_call = list(chat_session.history)
-        contents_for_api_call.append(content_types.to_content({'role': 'user', 'parts': [whisper_prompt]}))
+        contents_for_api_call.append({'role': 'user', 'parts': [whisper_prompt]})
         
         # Enable internal thoughts but keep summary display off (UI ignores it)
-        gen_config = google_genai_types.GenerateContentConfig(
-            temperature=temp, top_p=top_p, top_k=top_k,
-            thinking_config=google_genai_types.ThinkingConfig(include_thoughts=True)
-        )
+        gen_config = {
+            "temperature": temp, "top_p": top_p, "top_k": top_k,
+            "thinking_config": {"include_thoughts": True}
+        }
         
         status = "api_error"
         response = None
@@ -1252,8 +1237,8 @@ class CoreMixin:
         })
 
         # Add to the target's in-memory history
-        chat_session.history.append(content_types.to_content({'role': 'user', 'parts': [whisper_content]}))
-        chat_session.history.append(content_types.to_content({'role': 'model', 'parts': [response_content]}))
+        chat_session.history.append({'role': 'user', 'parts': [whisper_content]})
+        chat_session.history.append({'role': 'model', 'parts': [response_content]})
 
         # Add to pending whispers to be injected into the next public turn
         session.setdefault("pending_whispers", {}).setdefault(participant_key, []).append(whisper_content)
@@ -1494,7 +1479,6 @@ class CoreMixin:
     async def setup_multi_profile_session(self, interaction: discord.Interaction, participants: List[Dict], session_prompt: Optional[str], session_mode: str, as_admin_scope: bool = False, audio_mode: str = "text-only"):
         user_id = interaction.user.id
         is_update = interaction.channel_id in self.multi_profile_channels
-        from google.generativeai.types import content_types
 
         if is_update:
             session = self.multi_profile_channels[interaction.channel_id]
@@ -1505,14 +1489,12 @@ class CoreMixin:
             new_keys = { (p['owner_id'], p['profile_name']) for p in participants }
             
             for key_to_add in new_keys - existing_keys:
-                dummy_model = genai.GenerativeModel('gemini-flash-latest')
                 participant_history = []
                 for turn in session.get("unified_log", []):
                     speaker_key = tuple(turn.get("speaker_key", []))
                     role = 'model' if speaker_key == key_to_add else 'user'
-                    content_obj = content_types.to_content({'role': role, 'parts': [turn.get("content")]})
-                    participant_history.append(content_obj)
-                session["chat_sessions"][key_to_add] = dummy_model.start_chat(history=participant_history)
+                    participant_history.append({'role': role, 'parts': [turn.get("content")]})
+                session["chat_sessions"][key_to_add] = GoogleGenAIChatSession(history=participant_history)
 
             for key_to_remove in existing_keys - new_keys:
                 session["chat_sessions"].pop(key_to_remove, None)
@@ -1623,10 +1605,8 @@ class CoreMixin:
         if not session: return None
 
         # 2. Load History Log
-        from google.generativeai.types import content_types
-        dummy_model = genai.GenerativeModel('gemini-flash-latest')
         dummy_session_key = (channel_id, None, None)
-        disk_log = self._load_session_from_disk(dummy_session_key, session_type, dummy_model) or []
+        disk_log = self._load_session_from_disk(dummy_session_key, session_type) or []
         
         # [FIXED] Integrity Check: Do not overwrite populated memory with empty disk data
         current_mem_log = session.get("unified_log", [])
@@ -1695,24 +1675,23 @@ class CoreMixin:
                         if turn.get("grounding_context") and p_profile_settings.get("grounding_mode", "off") != "off":
                             parts.append(f"\n<external_context>\n{turn.get('grounding_context')}\n</external_context>")
 
-                    content_obj = content_types.to_content({'role': role, 'parts': parts})
-                    participant_history.append(content_obj)
+                    participant_history.append({'role': role, 'parts': parts})
                 elif turn_type == "whisper":
                     if p_key == tuple(turn.get("target_key", [])):
                         # [NEW] Wrap clean text in XML tags only when feeding to the AI
                         clean_content = turn.get("content")
                         header, body = clean_content.split('\n', 1)
                         wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
-                        participant_history.append(content_types.to_content({'role': 'user', 'parts': [wrapped]}))
+                        participant_history.append({'role': 'user', 'parts': [wrapped]})
                 elif turn_type == "private_response":
                     if p_key == tuple(turn.get("speaker_key", [])):
                         # [NEW] Wrap clean text in XML tags only when feeding to the AI
                         clean_content = turn.get("content")
                         header, body = clean_content.split('\n', 1)
                         wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                        participant_history.append(content_types.to_content({'role': 'model', 'parts': [wrapped]}))
+                        participant_history.append({'role': 'model', 'parts': [wrapped]})
             
-            session["chat_sessions"][p_key] = dummy_model.start_chat(history=participant_history)
+            session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 
         session["is_hydrated"] = True
         return session
@@ -2667,7 +2646,7 @@ class CoreMixin:
         # System notes and director prompts are injected as 'user' turns.
         # Real conversation requires a 'model' response. If none exist, no real conversation is left.
         for turn in history:
-            if turn.role == 'model':
+            if isinstance(turn, dict) and turn.get('role') == 'model':
                 return False
         return True
 

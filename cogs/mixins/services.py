@@ -18,7 +18,6 @@ import collections
 import orjson as json
 import functools
 from PIL import Image
-import google.generativeai.types as genai_types
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple, Optional, Any, Literal, Set, Union, get_args
@@ -30,11 +29,9 @@ from .storage import (
     cosine_similarity, 
 )
 
-# [LEGAL/SDK IMPORTS]
-import google.generativeai as genai
-from google import genai as google_genai
-from google.genai import types as google_genai_types
-from google.api_core import exceptions as api_exceptions
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
 
 class Timeout:
     def __init__(self, seconds=2, error_message='Function call timed out'):
@@ -118,17 +115,17 @@ class OpenRouterModel:
             messages.append({"role": "system", "content": self.system_instruction})
         
         for content in contents:
-            role = "assistant" if content.role == "model" else "user"
+            role = "assistant" if content.get('role', 'user') == "model" else "user"
             message_parts = []
             
-            for p in content.parts:
-                if hasattr(p, 'text') and p.text and p.text.strip():
-                    message_parts.append({"type": "text", "text": p.text})
-                elif hasattr(p, 'inline_data') and p.inline_data:
-                    mime_type = p.inline_data.mime_type
+            for p in content.get('parts', []):
+                if isinstance(p, str) and p.strip():
+                    message_parts.append({"type": "text", "text": p})
+                elif isinstance(p, dict) and p.get('inline_data'):
+                    mime_type = p['inline_data'].get('mime_type', '')
                     if mime_type.startswith("image/"):
                         try:
-                            b64_data = base64.b64encode(p.inline_data.data).decode('utf-8')
+                            b64_data = base64.b64encode(p['inline_data']['data']).decode('utf-8')
                             data_uri = f"data:{mime_type};base64,{b64_data}"
                             message_parts.append({"type": "image_url", "image_url": {"url": data_uri, "detail": "auto"}})
                         except Exception as e:
@@ -140,35 +137,44 @@ class OpenRouterModel:
                 else:
                     messages.append({"role": role, "content": message_parts})
 
+        temp = 1.0
+        top_p = 1.0
+        advanced = {}
+        include_thoughts = self.thinking_params.get("thinking_summary_visible") == "on"
+
+        if isinstance(generation_config, dict):
+            temp = generation_config.get("temperature", 1.0)
+            top_p = generation_config.get("top_p", 1.0)
+            advanced = generation_config.get("_advanced_params", {})
+            if generation_config.get("thinking_config"):
+                include_thoughts = generation_config["thinking_config"].get("include_thoughts", include_thoughts)
+        elif generation_config:
+            temp = getattr(generation_config, 'temperature', 1.0)
+            top_p = getattr(generation_config, 'top_p', 1.0)
+            if hasattr(generation_config, '_advanced_params') and generation_config._advanced_params:
+                advanced = generation_config._advanced_params
+            if hasattr(generation_config, 'thinking_config') and generation_config.thinking_config:
+                include_thoughts = generation_config.thinking_config.include_thoughts
+
         payload = {
             "model": self.model_name,
             "messages": messages,
-            "temperature": getattr(generation_config, 'temperature', 1.0) if generation_config else 1.0,
-            "top_p": getattr(generation_config, 'top_p', 1.0) if generation_config else 1.0,
+            "temperature": temp,
+            "top_p": top_p,
         }
-
-        # [UPDATED] Unified Reasoning Support with Config Override and Clamping Logic
-        include_thoughts = self.thinking_params.get("thinking_summary_visible") == "on"
-        
-        # Override thoughts status if config specifically requests it (e.g. Whispers or Global Chat UI)
-        if generation_config and hasattr(generation_config, 'thinking_config') and generation_config.thinking_config:
-            include_thoughts = generation_config.thinking_config.include_thoughts
 
         budget = int(self.thinking_params.get("thinking_budget", -1))
         level = self.thinking_params.get("thinking_level", "high").lower()
         
         if include_thoughts or budget > 0 or level != "none":
             payload["reasoning"] = {"exclude": not include_thoughts}
-            
-            # If a budget is explicitly set (>0), prioritize it for token-based models
             if budget > 0:
                 payload["reasoning"]["max_tokens"] = budget
             elif level != "none":
-                # Otherwise use the standardized string (OpenRouter handles provider-specific clamping)
                 payload["reasoning"]["effort"] = level
         
-        if hasattr(generation_config, '_advanced_params') and generation_config._advanced_params:
-            payload.update(generation_config._advanced_params)
+        if advanced:
+            payload.update(advanced)
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -208,16 +214,15 @@ class OpenRouterModel:
             return OpenRouterThoughtResponse(msg_obj.get('content', ''), msg_obj.get('reasoning', ''), choice.get('finish_reason', 'STOP').upper())
 
 class GoogleGenAIChatSession:
-    def __init__(self, model, history=None):
-        self.model = model
+    def __init__(self, history=None):
         self.history = history or []
 
 class GoogleGenAIModel:
     def __init__(self, api_key, model_name, system_instruction=None, safety_settings=None, thinking_params=None):
         # Force v1beta for stable "Thinking" part delivery
-        self.client = google_genai.Client(
+        self.client = genai.Client(
             api_key=api_key, 
-            http_options=google_genai_types.HttpOptions(api_version='v1beta')
+            http_options=types.HttpOptions(api_version='v1beta')
         )
         self.model_name = model_name
         self.system_instruction = system_instruction
@@ -225,86 +230,102 @@ class GoogleGenAIModel:
         self.thinking_params = thinking_params or {}
 
     def start_chat(self, history=None):
-        return GoogleGenAIChatSession(self, history=history)
+        return GoogleGenAIChatSession(history=history)
 
     async def generate_content_async(self, contents, generation_config=None):
         formatted_contents = []
         for item in contents:
             if isinstance(item, str):
-                formatted_contents.append(google_genai_types.Part.from_text(text=item))
+                formatted_contents.append(item)
             elif isinstance(item, dict):
-                if 'data' in item and 'mime_type' in item:
-                    formatted_contents.append(google_genai_types.Part.from_bytes(data=item['data'], mime_type=item['mime_type']))
+                role = item.get('role', 'user')
+                parts = []
+                for p in item.get('parts', []):
+                    if isinstance(p, str):
+                        parts.append(types.Part.from_text(text=p))
+                    elif isinstance(p, dict) and 'mime_type' in p and 'data' in p:
+                        parts.append(types.Part.from_bytes(data=p['data'], mime_type=p['mime_type']))
+                formatted_contents.append(types.Content(role=role, parts=parts))
             elif hasattr(item, 'role') and hasattr(item, 'parts'):
+                # Fallback for legacy objects
                 new_parts = []
                 for p in item.parts:
                     if hasattr(p, 'text') and p.text:
-                        new_parts.append(google_genai_types.Part.from_text(text=p.text))
+                        new_parts.append(types.Part.from_text(text=p.text))
                     elif hasattr(p, 'inline_data') and p.inline_data:
-                        new_parts.append(google_genai_types.Part.from_bytes(data=p.inline_data.data, mime_type=p.inline_data.mime_type))
-                formatted_contents.append(google_genai_types.Content(role=item.role, parts=new_parts))
+                        new_parts.append(types.Part.from_bytes(data=p.inline_data.data, mime_type=p.inline_data.mime_type))
+                formatted_contents.append(types.Content(role=item.role, parts=new_parts))
             else:
                 formatted_contents.append(item)
 
         v2_safety = []
         if self.safety_settings:
             for cat, thresh in self.safety_settings.items():
-                v2_safety.append(google_genai_types.SafetySetting(
+                v2_safety.append(types.SafetySetting(
                     category=cat.name if hasattr(cat, 'name') else str(cat),
                     threshold=thresh.name if hasattr(thresh, 'name') else str(thresh)
                 ))
 
-        # [NEW] Unified Thinking Config with Level Clamping (Gemini 3) vs Budget (Gemini 2.5)
         thinking_cfg = None
         model_lower = self.model_name.lower()
         include_thoughts = self.thinking_params.get("thinking_summary_visible") == "on"
         
-        if generation_config and hasattr(generation_config, 'thinking_config') and generation_config.thinking_config:
-            include_thoughts = generation_config.thinking_config.include_thoughts
+        temp = None
+        top_p = None
+        top_k = None
+        advanced = {}
+
+        if isinstance(generation_config, dict):
+            temp = generation_config.get("temperature")
+            top_p = generation_config.get("top_p")
+            top_k = generation_config.get("top_k")
+            advanced = generation_config.get("_advanced_params", {})
+            if generation_config.get("thinking_config"):
+                include_thoughts = generation_config["thinking_config"].get("include_thoughts", include_thoughts)
+        else:
+            temp = generation_config.temperature if generation_config else None
+            top_p = generation_config.top_p if generation_config else None
+            top_k = generation_config.top_k if generation_config else None
+            advanced = generation_config._advanced_params if generation_config and hasattr(generation_config, '_advanced_params') else {}
+            if generation_config and hasattr(generation_config, 'thinking_config') and generation_config.thinking_config:
+                include_thoughts = generation_config.thinking_config.include_thoughts
 
         if "gemini-3" in model_lower:
             lvl = self.thinking_params.get("thinking_level", "high").lower()
-            # Automatic Clamping for Gemini 3 Hardware constraints
             is_pro = "pro" in model_lower
-            
             if is_pro:
-                # Pro supports only HIGH and LOW
                 mapped_lvl = "LOW" if lvl in ["low", "minimal", "none"] else "HIGH"
             else:
-                # Flash supports HIGH, MEDIUM, LOW, MINIMAL
                 mapped_lvl = {
                     "xhigh": "HIGH", "high": "HIGH", "medium": "MEDIUM", 
                     "low": "LOW", "minimal": "MINIMAL", "none": "MINIMAL"
                 }.get(lvl, "HIGH")
 
-            thinking_cfg = google_genai_types.ThinkingConfig(
+            thinking_cfg = types.ThinkingConfig(
                 include_thoughts=include_thoughts,
                 thinking_level=mapped_lvl
             )
         elif "gemini-2.5" in model_lower:
-            # [USER NOTE] Gemini 2.5 uses finely customisable token budget only (no mapping)
             budget = int(self.thinking_params.get("thinking_budget", -1))
             if "lite" not in model_lower:
-                # Clamp Pro to its minimum of 128 if 0 or low is entered
                 if "pro" in model_lower and 0 <= budget < 128:
                     budget = 128
-                
-                thinking_cfg = google_genai_types.ThinkingConfig(
+                thinking_cfg = types.ThinkingConfig(
                     include_thoughts=include_thoughts,
                     thinking_budget=budget
                 )
 
-        config = google_genai_types.GenerateContentConfig(
+        config = types.GenerateContentConfig(
             system_instruction=self.system_instruction,
-            temperature=generation_config.temperature if generation_config else None,
-            top_p=generation_config.top_p if generation_config else None,
-            top_k=generation_config.top_k if generation_config else None,
+            temperature=temp,
+            top_p=top_p,
+            top_k=top_k,
             safety_settings=v2_safety if v2_safety else None,
             thinking_config=thinking_cfg
         )
 
-        if hasattr(generation_config, '_advanced_params') and generation_config._advanced_params:
-            for k, v in generation_config._advanced_params.items():
+        if advanced:
+            for k, v in advanced.items():
                 if hasattr(config, k):
                     setattr(config, k, v)
 
@@ -314,7 +335,6 @@ class GoogleGenAIModel:
             config=config
         )
         
-        # [NEW] Clear the formatted_contents list immediately after call
         formatted_contents.clear()
         del formatted_contents
 
@@ -644,16 +664,16 @@ class ServicesMixin:
         if gemini_key:
             try:
                 # Initialize new SDK client
-                test_client = google_genai.Client(
+                test_client = genai.Client(
                     api_key=gemini_key, 
-                    http_options=google_genai_types.HttpOptions(api_version='v1alpha')
+                    http_options=types.HttpOptions(api_version='v1alpha')
                 )
                 
                 # Step 1: Authentication Check (Is the key valid?)
                 await test_client.aio.models.generate_content(
                     model='gemini-flash-lite-latest', 
                     contents="ping",
-                    config=google_genai_types.GenerateContentConfig(max_output_tokens=1)
+                    config=types.GenerateContentConfig(max_output_tokens=1)
                 )
 
                 # Step 2: Tier Detection (Does it have access to premium-only models?)
@@ -661,7 +681,7 @@ class ServicesMixin:
                     await test_client.aio.models.generate_content(
                         model='gemini-2.5-flash-image', 
                         contents="ping",
-                        config=google_genai_types.GenerateContentConfig(max_output_tokens=1)
+                        config=types.GenerateContentConfig(max_output_tokens=1)
                     )
                     detected_tier = "paid"
                 except Exception:
@@ -701,7 +721,6 @@ class ServicesMixin:
             print(f"Worker for channel {channel_id} could not hydrate session. Aborting.")
             return
 
-        from google.generativeai.types import content_types
         # Flag starts as False; it will be toggled within the loop
         session['is_running'] = False
         
@@ -779,8 +798,6 @@ class ServicesMixin:
                     except asyncio.QueueEmpty: break
                 
                 # [NEW] Pre-Round Hydration: Ensure all participant sessions are ready BEFORE processing triggers
-                from google.generativeai.types import content_types
-                dummy_model = genai.GenerativeModel('gemini-flash-latest')
                 
                 # We re-verify hydration here to catch sessions that were dehydrated during the await queue.get()
                 if not session.get("is_hydrated"):
@@ -799,9 +816,9 @@ class ServicesMixin:
                             if turn.get("is_hidden"): continue
                             speaker_key = tuple(turn.get("speaker_key", []))
                             role = 'model' if speaker_key == p_key else 'user'
-                            participant_history.append(content_types.to_content({'role': role, 'parts': [turn.get("content")]}))
+                            participant_history.append({'role': role, 'parts': [turn.get("content")]})
                         
-                        session["chat_sessions"][p_key] = dummy_model.start_chat(history=participant_history)
+                        session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 
                 # Now process triggers into new_round_turn_data and unified_log...
                 primary_eager_placeholder = None
@@ -1071,7 +1088,7 @@ class ServicesMixin:
                                     debug_parts = [user_line]
                                     if url_text_content: debug_parts.append(url_text_content)
                                     debug_parts.extend(trigger_media_parts)
-                                    debug_obj = content_types.to_content({'role': 'user', 'parts': debug_parts})
+                                    debug_obj = {'role': 'user', 'parts': debug_parts}
                                     
                                     debug_message = self._format_debug_prompt([debug_obj])
                                     await user_to_dm.send(debug_message)
@@ -1094,7 +1111,7 @@ class ServicesMixin:
                         if url_ctx and p_settings.get("url_fetching_enabled", True):
                             final_parts.append(f"\n<document_context>\n{url_ctx}\n</document_context>")
                         
-                        content_obj = content_types.to_content({'role': 'user', 'parts': final_parts})
+                        content_obj = {'role': 'user', 'parts': final_parts}
                         chat_session.history.append(content_obj)
 
                 for content_obj in new_round_turn_data:
@@ -1509,6 +1526,7 @@ class ServicesMixin:
                     channel = self.bot.get_channel(channel_id)
 
                     # [FIX] Initialize these before the try block to prevent UnboundLocalError
+                    response = None
                     fallback_used = False
                     response_text = ""
                     was_blocked = False
@@ -1597,7 +1615,6 @@ class ServicesMixin:
                     try:
                         api_key = self._get_api_key_for_guild(channel.guild.id)
                         if not api_key: raise ValueError("Server API key is not configured.")
-                        genai.configure(api_key=api_key)
                         
                         if i == 0 and first_placeholder_message:
                             placeholder_message = first_placeholder_message
@@ -1802,7 +1819,6 @@ class ServicesMixin:
                             except Exception as e:
                                 warning_message = f"Model Initialization Error: Failed to instantiate Google model '{actual_name}'. {e}"
                         
-                        from google.generativeai.types import content_types
                         contents_for_api_call = []
                         session_key = (channel.id, owner_id, profile_name)
 
@@ -1810,8 +1826,8 @@ class ServicesMixin:
                         contents_for_api_call.extend(chat_session.history)
 
                         # Check if the last turn was from this model itself
-                        if contents_for_api_call and contents_for_api_call[-1].role == 'model':
-                            pseudo_user_turn = content_types.to_content({'role': 'user', 'parts': ["<internal_note>No response from anyone OR no user is present.</internal_note>"]})
+                        if contents_for_api_call and contents_for_api_call[-1].get('role', contents_for_api_call[-1].role if hasattr(contents_for_api_call[-1], 'role') else 'user') == 'model':
+                            pseudo_user_turn = {'role': 'user', 'parts': ["<internal_note>No response from anyone OR no user is present.</internal_note>"]}
                             contents_for_api_call.append(pseudo_user_turn)
 
                         # [UPDATED] Standardised XML injection for pending whispers with improved behavioral instructions
@@ -1824,16 +1840,16 @@ class ServicesMixin:
                                 "Instead, let it subtly influence your personality and future actions.\n"
                             )
                             whisper_context += "\n---\n" + "\n---\n".join(pending_whispers) + "\n</incoming_whispers>"
-                            whisper_content_obj = content_types.to_content({'role': 'user', 'parts': [whisper_context]})
+                            whisper_content_obj = {'role': 'user', 'parts': [whisper_context]}
                             contents_for_api_call.append(whisper_content_obj)
 
                         if grounding_context and p_settings.get("grounding_mode", "off") != "off":
                             g_instr = f"<external_context>\n{grounding_context}\n</external_context>"
-                            contents_for_api_call.append(content_types.to_content({'role': 'user', 'parts': [g_instr]}))
+                            contents_for_api_call.append({'role': 'user', 'parts': [g_instr]})
 
                         if p_settings.get("url_fetching_enabled", True) and round_url_text_contexts:
                             url_instr = "<document_context>\n" + "\n".join(round_url_text_contexts) + "\n</document_context>"
-                            contents_for_api_call.append(content_types.to_content({'role': 'user', 'parts': [url_instr]}))
+                            contents_for_api_call.append({'role': 'user', 'parts': [url_instr]})
 
                         # [FIXED] Ephemeral Media Injection: Manually add all current round media to the API call
                         # This allows participants to see images this round without them persisting in RAM history.
@@ -1842,11 +1858,11 @@ class ServicesMixin:
                             all_current_media.extend(turn_media)
                         
                         if all_current_media:
-                            contents_for_api_call.append(content_types.to_content({'role': 'user', 'parts': all_current_media}))
+                            contents_for_api_call.append({'role': 'user', 'parts': all_current_media})
 
                         ltm_recall_text = await self._get_relevant_ltm_for_prompt(session_key, chat_session.history, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id)
                         if ltm_recall_text:
-                            ltm_content_obj = content_types.to_content({'role': 'user', 'parts': [ltm_recall_text]})
+                            ltm_content_obj = {'role': 'user', 'parts': [ltm_recall_text]}
                             contents_for_api_call.append(ltm_content_obj)
                         
                         # The history is now managed by the deep copy and pseudo-turn logic above.
@@ -1860,14 +1876,14 @@ class ServicesMixin:
                                     system_note, 
                                     {"mime_type": "image/jpeg", "data": generated_image_bytes_for_round}
                                 ]
-                                contents_for_api_call.append(content_types.to_content({'role': 'user', 'parts': text_gen_parts}))
+                                contents_for_api_call.append({'role': 'user', 'parts': text_gen_parts})
                             else:
                                 if is_generator:
                                     system_note = f"<image_context>Your attempt to generate an image based on the prompt '{image_gen_prompt}' failed. Comment on it.</image_context>"
-                                    contents_for_api_call.append(content_types.to_content({'role': 'user', 'parts': [system_note]}))
+                                    contents_for_api_call.append({'role': 'user', 'parts': [system_note]})
 
                         if not contents_for_api_call:
-                            contents_for_api_call.append(content_types.to_content({'role': 'user', 'parts': ["<internal_note>Begin conversation.</internal_note>"]}))
+                            contents_for_api_call.append({'role': 'user', 'parts': ["<internal_note>Begin conversation.</internal_note>"]})
 
                         # [NEW] Advanced Params Injection
                         adv_params = {
@@ -1879,8 +1895,7 @@ class ServicesMixin:
                         }
                         adv_params = {k: v for k, v in adv_params.items() if v is not None}
 
-                        gen_config = genai.types.GenerationConfig(temperature=temp, top_p=top_p, top_k=top_k)
-                        gen_config._advanced_params = adv_params
+                        gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "_advanced_params": adv_params}
 
                         status = "api_error"
                         response = None
@@ -1924,7 +1939,7 @@ class ServicesMixin:
                                             else:
                                                 raise ValueError("No OpenRouter key for fallback")
                                         else:
-                                            fallback_instance = genai.GenerativeModel(fb_name, system_instruction=full_system_instruction, safety_settings=dynamic_safety_settings)
+                                            fallback_instance = GoogleGenAIModel(api_key=api_key, model_name=fb_name, system_instruction=full_system_instruction, safety_settings=dynamic_safety_settings)
                                         
                                         # Timeout also applied to fallback attempts
                                         response = await asyncio.wait_for(fallback_instance.generate_content_async(contents_for_api_call, generation_config=gen_config), timeout=120.0)
@@ -2010,8 +2025,8 @@ class ServicesMixin:
                         metadata_line = f"(Thought Initiated: {t1_formatted} | Duration: {duration:.2f}s)"
                         history_line = f"{main_history_line.strip()}\n{metadata_line}\n"
 
-                        model_content_obj = content_types.to_content({'role': 'model', 'parts': [history_line]})
-                        user_content_obj = content_types.to_content({'role': 'user', 'parts': [history_line]})
+                        model_content_obj = {'role': 'model', 'parts': [history_line]}
+                        user_content_obj = {'role': 'user', 'parts': [history_line]}
 
                         if owner_id in self.debug_users:
                             try:
@@ -2019,9 +2034,9 @@ class ServicesMixin:
                                 if user_to_dm:
                                     turns_for_debug = []
                                     if grounding_context and participant_key == grounding_profile_key:
-                                        turns_for_debug.append(content_types.to_content({'role': 'user', 'parts': [grounding_context, "\n"]}))
+                                        turns_for_debug.append({'role': 'user', 'parts': [grounding_context, "\n"]})
                                     if ltm_recall_text:
-                                        turns_for_debug.append(content_types.to_content({'role': 'user', 'parts': [ltm_recall_text, "\n"]}))
+                                        turns_for_debug.append({'role': 'user', 'parts': [ltm_recall_text, "\n"]})
                                     
                                     turns_for_debug.append(model_content_obj)
 
@@ -2461,7 +2476,7 @@ class ServicesMixin:
                                         final_parts.extend(url_media_batch)
                                         final_parts.extend(batch_msg_media)
                                         
-                                        new_content_obj = content_types.to_content({'role': 'user', 'parts': final_parts})
+                                        new_content_obj = {'role': 'user', 'parts': final_parts}
                                         inner_chat_session.history.append(new_content_obj)
 
                                     if trigger.author.id in self.debug_users:
@@ -2473,7 +2488,7 @@ class ServicesMixin:
                                                 if url_text_batch: debug_parts.append(url_text_batch)
                                                 debug_parts.extend(url_media_batch)
                                                 debug_parts.extend(batch_msg_media)
-                                                debug_obj = content_types.to_content({'role': 'user', 'parts': debug_parts})
+                                                debug_obj = {'role': 'user', 'parts': debug_parts}
                                                 
                                                 debug_message = self._format_debug_prompt([debug_obj])
                                                 await user_to_dm.send(debug_message)
@@ -2571,7 +2586,12 @@ class ServicesMixin:
                             history_source_obj = next(iter(session['chat_sessions'].values()), None)
                             if history_source_obj and len(history_source_obj.history) >= 4:
                                 # Context size * 2 because turn history includes both user and bot
-                                events_for_summary = [turn.parts[0].text for turn in history_source_obj.history[-(context_size * 2):] if turn.parts and hasattr(turn.parts[0], 'text')]
+                                events_for_summary = []
+                                for turn in history_source_obj.history[-(context_size * 2):]:
+                                    parts = turn.get('parts', [])
+                                    if parts:
+                                        text_val = parts[0] if isinstance(parts[0], str) else parts[0].get('text', '')
+                                        events_for_summary.append(text_val)
                                 
                                 _, _, _, temp, top_p, top_k, primary_model, _ = self._construct_system_instructions(owner_id, profile_name, channel_id, is_multi_profile=True)
                                 ltm_d = await self._generate_ltm_data_from_history(events_for_summary, round_author_name, {"temperature": temp, "top_p": top_p, "top_k": top_k}, primary_model, guild_id, profile_owner_id=owner_id, profile_name=profile_name)
@@ -2599,8 +2619,6 @@ class ServicesMixin:
                     self._save_mapping_to_disk((session_type, channel_id), self.mapping_caches[(session_type, channel_id)])
 
                 # Rebuild all participant histories from the trimmed unified log to ensure consistency.
-                from google.generativeai.types import content_types
-                dummy_model = genai.GenerativeModel('gemini-flash-latest')
                 trimmed_unified_log = session.get("unified_log", [])
 
                 for p_data in session["profiles"]:
@@ -2628,7 +2646,7 @@ class ServicesMixin:
                             if role == 'user' and turn.get("grounding_context") and p_profile_settings.get("grounding_mode", "off") != "off":
                                 parts.append(f"\n<external_context>\n{turn.get('grounding_context')}\n</external_context>")
 
-                            content_obj = content_types.to_content({'role': role, 'parts': parts})
+                            content_obj = {'role': role, 'parts': parts}
                             participant_history.append(content_obj)
 
                         elif turn_type == "whisper":
@@ -2638,7 +2656,7 @@ class ServicesMixin:
                                 clean_content = turn.get("content")
                                 header, body = clean_content.split('\n', 1)
                                 wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
-                                participant_history.append(content_types.to_content({'role': 'user', 'parts': [wrapped]}))
+                                participant_history.append({'role': 'user', 'parts': [wrapped]})
                         elif turn_type == "private_response":
                             speaker_key = tuple(turn.get("speaker_key", []))
                             if p_key == speaker_key:
@@ -2646,8 +2664,8 @@ class ServicesMixin:
                                 clean_content = turn.get("content")
                                 header, body = clean_content.split('\n', 1)
                                 wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                                participant_history.append(content_types.to_content({'role': 'model', 'parts': [wrapped]}))
-                    session["chat_sessions"][p_key] = dummy_model.start_chat(history=participant_history)
+                                participant_history.append({'role': 'model', 'parts': [wrapped]})
+                    session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 
                 # Handle Proactive Freewill Continuation
                 if session.get("type") == "freewill" and session.get("freewill_mode") == "proactive":
@@ -2710,10 +2728,15 @@ class ServicesMixin:
                         if package.get("reference_image_urls"):
                             image_bytes, failure_reason = None, None
                             try:
-                                api_key = self._get_api_key_for_guild(package['guild_id']);
+                                api_key = self._get_api_key_for_guild(package['guild_id'])
                                 if not api_key: raise ValueError("Server API key not configured.")
-                                genai.configure(api_key=api_key)
-                                image_model = genai.GenerativeModel('gemini-2.5-flash-image', system_instruction=package['system_instruction'], safety_settings=package['safety_settings'])
+                                
+                                image_model = GoogleGenAIModel(
+                                    api_key=api_key,
+                                    model_name='gemini-2.5-flash-image', 
+                                    system_instruction=package['system_instruction'], 
+                                    safety_settings=package['safety_settings']
+                                )
                                 parts = [package['prompt_text']]
                                 async with httpx.AsyncClient() as client:
                                     for url in package.get("reference_image_urls", []):
@@ -2751,10 +2774,9 @@ class ServicesMixin:
                         # --- Text Generation ---
                         text_model, _, temp, top_p, top_k, _, _ = await self._get_or_create_model_for_channel(package['channel_id'], package['author_id'], package['guild_id'], profile_owner_override=package['effective_profile_owner_id'], profile_name_override=package['effective_profile_name'])
                         
-                        from google.generativeai.types import content_types
                         model_cache_key = (package['channel_id'], package['effective_profile_owner_id'], package['effective_profile_name'])
-                        chat = self.chat_sessions.get(model_cache_key);
-                        if not chat: chat = text_model.start_chat(history=[])
+                        chat = self.chat_sessions.get(model_cache_key)
+                        if not chat: chat = GoogleGenAIChatSession(history=[])
                         self.chat_sessions[model_cache_key] = chat; contents_for_api_call = list(chat.history)
                         
                         turn_id = str(uuid.uuid4())
@@ -2767,11 +2789,12 @@ class ServicesMixin:
                                 {"mime_type": "image/jpeg", "data": package['generated_image_bytes']}
                             ]
                             
-                            user_turn = content_types.to_content({'role': 'user', 'parts': final_user_parts})
+                            user_turn = {'role': 'user', 'parts': final_user_parts}
+                        else:
+                            user_turn = {'role': 'user', 'parts': [package['prompt_text']]}
                         
-                        user_turn = content_types.to_content({'role': 'user', 'parts': final_user_parts})
                         contents_for_api_call.append(user_turn)
-                        gen_config = genai.types.GenerationConfig(temperature=temp, top_p=top_p, top_k=top_k)
+                        gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
                         
                         text_response = await text_model.generate_content_async(contents_for_api_call, generation_config=gen_config)
                         
@@ -2784,9 +2807,10 @@ class ServicesMixin:
                             custom_main = profile_settings.get("error_response", "An error has occurred.")
                             response_text = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
                         elif text_response.candidates[0].finish_reason.name == 'STOP':
-                            raw_text = "".join(p.text for p in text_response.candidates[0].content.parts if hasattr(p, 'text'))
+                            raw_text = getattr(text_response, 'text', "")
                             response_text = self._deduplicate_response(self._scrub_response_text(raw_text.strip(), participant_names=[package['bot_display_name']]))
-                        model_turn = content_types.to_content({'role': 'model', 'parts': [response_text]}); chat.history.extend([user_turn, model_turn])
+                        
+                        model_turn = {'role': 'model', 'parts': [response_text]}; chat.history.extend([user_turn, model_turn])
 
                         # --- Final Message Sending ---
                         if package['generated_image_bytes'] and not package['failure_reason']:
@@ -2959,13 +2983,17 @@ class ServicesMixin:
                 try:
                     api_key = self._get_api_key_for_guild(request_data['guild_id'])
                     if not api_key: raise ValueError("Server API key is not configured.")
-                    genai.configure(api_key=api_key)
                     
-                    image_model = genai.GenerativeModel('gemini-2.5-flash-image', system_instruction=request_data['system_instruction'], safety_settings=request_data['safety_settings'])
+                    image_model = GoogleGenAIModel(
+                        api_key=api_key,
+                        model_name='gemini-2.5-flash-image', 
+                        system_instruction=request_data['system_instruction'], 
+                        safety_settings=request_data['safety_settings']
+                    )
                     
                     status = "api_error"
                     try:
-                        response = await image_model.generate_content_async(request_data['prompt_text'])
+                        response = await image_model.generate_content_async([request_data['prompt_text']])
                         status = "blocked_by_safety" if not response.candidates else "success"
                     finally:
                         self._log_api_call(user_id=request_data['author_id'], guild_id=request_data['guild_id'], context="image_generation_prefetch", model_used=image_model.model_name, status=status)
@@ -3173,14 +3201,14 @@ class ServicesMixin:
             return None
 
         # [NEW] Use the Google Gen AI SDK (v2) Client
-        client = google_genai.Client(api_key=api_key)
+        client = genai.Client(api_key=api_key)
 
         try:
             # Request truncated 256-dimensional embedding to save space (Matryoshka)
             result = await client.aio.models.embed_content(
                 model='gemini-embedding-001',
                 contents=text,
-                config=google_genai_types.EmbedContentConfig(
+                config=types.EmbedContentConfig(
                     task_type=task_type,
                     output_dimensionality=256
                 )
@@ -3198,11 +3226,11 @@ class ServicesMixin:
         # Provides Name [Timestamp] and Content only, stripping metadata and summaries.
         convo_parts = []
         for turn in hist:
-            # Handle Content objects from single-profile or list of strings
-            if hasattr(turn, 'role'):
-                display_name = user_dn if turn.role == 'user' else bot_dn
-                if not turn.parts: continue
-                raw_text = "".join(p.text for p in turn.parts if hasattr(p, 'text'))
+            if isinstance(turn, dict) and 'role' in turn:
+                display_name = user_dn if turn['role'] == 'user' else bot_dn
+                parts = turn.get('parts', [])
+                if not parts: continue
+                raw_text = "".join(p if isinstance(p, str) else p.get('text', '') for p in parts)
             else:
                 raw_text = str(turn)
                 display_name = "Unknown" # String-only fallback
@@ -3266,17 +3294,21 @@ class ServicesMixin:
             encrypted_instructions = profile_data.get("ltm_summarization_instructions", self._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS))
             instructions = self._decrypt_data(encrypted_instructions)
 
-        cfg = genai_types.GenerationConfig(temperature=0.2)
+        cfg = {"temperature": 0.2}
         ltm_model_name = 'gemini-flash-lite-latest'
         
+        api_key = self._get_api_key_for_guild(guild_id) if guild_id else self._get_api_key_for_user(profile_owner_id)
+        if not api_key: return None
+
         status = "api_error"
         try:
-            m = genai.GenerativeModel(
+            m = GoogleGenAIModel(
+                api_key=api_key,
                 model_name=ltm_model_name,
                 system_instruction=instructions,
                 safety_settings=DEFAULT_SAFETY_SETTINGS
             )
-            r = await m.generate_content_async(f"<target_transcript>\n{convo}\n</target_transcript>", generation_config=cfg)
+            r = await m.generate_content_async([f"<target_transcript>\n{convo}\n</target_transcript>"], generation_config=cfg)
             status = "blocked_by_safety" if not r.candidates else "success"
             
             response_text = ""
@@ -3826,8 +3858,7 @@ class ServicesMixin:
                 if not session:
                     chat_sessions = {}
                     for p in cast:
-                        model = genai.GenerativeModel('gemini-flash-latest')
-                        chat_sessions[(p['owner_id'], p['profile_name'])] = model.start_chat(history=[])
+                        chat_sessions[(p['owner_id'], p['profile_name'])] = GoogleGenAIChatSession(history=[])
 
                     session = {
                         "type": "freewill", "freewill_mode": "proactive",
@@ -3849,14 +3880,13 @@ class ServicesMixin:
                     session['initial_channel_history'] = await self._build_freewill_history(channel)
                     session['initial_turn_taken'] = set()
                     
-                    dummy_model = genai.GenerativeModel('gemini-flash-latest')
                     if 'chat_sessions' not in session: session['chat_sessions'] = {}
                     chat_sessions = session['chat_sessions']
                     
                     for p in cast:
                         p_key = (p['owner_id'], p['profile_name'])
                         if p_key not in chat_sessions or chat_sessions[p_key] is None:
-                            chat_sessions[p_key] = dummy_model.start_chat(history=[])
+                            chat_sessions[p_key] = GoogleGenAIChatSession(history=[])
 
                 self._save_multi_profile_sessions()
                 
@@ -4645,13 +4675,13 @@ class ServicesMixin:
             api_key = self._get_api_key_for_guild(guild_id)
             if not api_key:
                 return False, "Server API key is not available for moderation."
-            genai.configure(api_key=api_key)
             
             model_name = 'gemini-flash-lite-latest'
             status = "api_error"
             try:
                 # [FIXED] Move rules to system_instruction to prevent jailbreaking
-                model = genai.GenerativeModel(
+                model = GoogleGenAIModel(
+                    api_key=api_key,
                     model_name=model_name, 
                     system_instruction=prompt_text,
                     safety_settings=DEFAULT_SAFETY_SETTINGS
@@ -4697,8 +4727,8 @@ class ServicesMixin:
         recent_turns = []
         count = 0
         for turn in reversed(history):
-            if turn.role == 'model':
-                parts = [p.text for p in turn.parts if hasattr(p, 'text')]
+            if isinstance(turn, dict) and turn.get('role') == 'model':
+                parts = [p if isinstance(p, str) else p.get('text', '') for p in turn.get('parts', [])]
                 if parts:
                     recent_turns.append(" ".join(parts))
                     count += 1
@@ -4727,10 +4757,9 @@ class ServicesMixin:
         if not api_key: return None
         
         try:
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel('gemini-2.0-flash', system_instruction=system_instruction)
-            critic_cfg = genai.types.GenerationConfig(temperature=0.05, top_p=0.9)
-            resp = await model.generate_content_async(f"Transcript:\n{transcript}", generation_config=critic_cfg)
+            model = GoogleGenAIModel(api_key=api_key, model_name='gemini-2.0-flash', system_instruction=system_instruction)
+            critic_cfg = {"temperature": 0.05, "top_p": 0.9}
+            resp = await model.generate_content_async([f"Transcript:\n{transcript}"], generation_config=critic_cfg)
             if resp.text:
                 if "PASS" not in resp.text.upper():
                     return resp.text.strip()
@@ -4763,12 +4792,9 @@ class ServicesMixin:
             blocked_reason_override = None
 
             history_lines = await self._build_freewill_history(channel, anchor_message)
-            from google.generativeai.types import content_types
-            history_for_turn = [content_types.to_content({'role': 'user', 'parts': [line]}) for line in history_lines]
+            history_for_turn = [{'role': 'user', 'parts': [line]} for line in history_lines]
             
-            # Note: We need a dummy chat session if model is None to proceed with formatting
-            dummy_model = genai.GenerativeModel('gemini-flash-latest')
-            chat = (model or dummy_model).start_chat(history=history_for_turn)
+            chat = GoogleGenAIChatSession(history=history_for_turn)
 
             if len(chat.history) > self.max_history_items * 2:
                 chat.history = chat.history[-(self.max_history_items * 2):]
@@ -4793,13 +4819,19 @@ class ServicesMixin:
                 if appearance_data.get("custom_display_name"):
                     bot_display_name = appearance_data["custom_display_name"]
 
-                history_for_prompt = "".join(
-                    self._format_history_entry(
-                        "A user" if turn.role == 'user' else bot_display_name,
-                        datetime.datetime.now(datetime.timezone.utc), # Approximation
-                        turn.parts[0].text
-                    ) for turn in chat.history
-                )
+                history_for_prompt_parts = []
+                for turn in chat.history:
+                    role = turn.get('role', 'user')
+                    parts = turn.get('parts', [])
+                    text = parts[0] if parts and isinstance(parts[0], str) else (parts[0].get('text', '') if parts else "")
+                    history_for_prompt_parts.append(
+                        self._format_history_entry(
+                            "A user" if role == 'user' else bot_display_name,
+                            datetime.datetime.now(datetime.timezone.utc),
+                            text
+                        )
+                    )
+                history_for_prompt = "".join(history_for_prompt_parts)
                 
                 user_message_formatted = self._format_history_entry(author_display_name, datetime.datetime.now(datetime.timezone.utc), prompt_content)
                 
@@ -4818,12 +4850,11 @@ class ServicesMixin:
 
                 final_prompt_parts.append(user_message_formatted)
                 
-                from google.generativeai.types import content_types
-                gen_config = genai.types.GenerationConfig(temperature=temp, top_p=top_p, top_k=top_k)
+                gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
                 
                 try:
                     # [UPDATED] Applied 120-second fail-safe timeout
-                    response = await asyncio.wait_for(model.generate_content_async(list(final_prompt_parts), generation_config=gen_config), timeout=120.0)
+                    response = await asyncio.wait_for(model.generate_content_async([{'role': 'user', 'parts': final_prompt_parts}], generation_config=gen_config), timeout=120.0)
                     if not response or not response.candidates:
                         raise ValueError("Response blocked or empty")
                     status = "success"
@@ -4872,7 +4903,7 @@ class ServicesMixin:
                                     raise ValueError("No Google key for fallback")
                                 fallback_instance = GoogleGenAIModel(api_key=guild_api_key, model_name=fb_name, system_instruction=sys_instr, safety_settings=dyn_safe)
 
-                            response = await fallback_instance.generate_content_async(list(final_prompt_parts), generation_config=gen_config)
+                            response = await fallback_instance.generate_content_async([{'role': 'user', 'parts': final_prompt_parts}], generation_config=gen_config)
                             if not response or not response.candidates:
                                 pass
                             else:
@@ -4884,7 +4915,7 @@ class ServicesMixin:
                             status = "api_error"
                     else:
                         status = "api_error"
-                except (api_exceptions.PermissionDenied) as e:
+                except (genai.errors.APIError) as e:
                     status = "api_error"
                 finally:
                     # Always log the primary model's final status
@@ -4910,9 +4941,8 @@ class ServicesMixin:
 
             response_text = self._deduplicate_response(response_text)
 
-            from google.generativeai.types import content_types
-            user_content_obj = content_types.to_content({'role': 'user', 'parts': [prompt_content]})
-            model_content_obj = content_types.to_content({'role': 'model', 'parts': [response_text]})
+            user_content_obj = {'role': 'user', 'parts': [prompt_content]}
+            model_content_obj = {'role': 'model', 'parts': [response_text]}
             chat.history.extend([user_content_obj, model_content_obj])
 
             text_to_send = response_text
@@ -5037,14 +5067,13 @@ class ServicesMixin:
                 key = self._get_api_key_for_user(user_id, "openrouter") or self._get_api_key_for_guild(interaction.guild_id, "openrouter")
                 if not key: raise ValueError("No OpenRouter API key found.")
                 model = OpenRouterModel(actual_model, api_key=key)
-                resp = await model.generate_content_async([MockContent(prompt)])
+                resp = await model.generate_content_async([{"role": "user", "parts": [prompt]}])
                 response_text = resp.text
             else:
                 key = self._get_api_key_for_user(user_id, "gemini") or self._get_api_key_for_guild(interaction.guild_id, "gemini")
                 if not key: raise ValueError("No Google API key found.")
-                genai.configure(api_key=key)
-                model = genai.GenerativeModel(actual_model)
-                resp = await model.generate_content_async(prompt)
+                model = GoogleGenAIModel(api_key=key, model_name=actual_model)
+                resp = await model.generate_content_async([prompt])
                 response_text = resp.text
 
             if not response_text: raise ValueError("Model returned an empty response.")
@@ -5148,7 +5177,7 @@ class ServicesMixin:
                 # For multi-profile, checkpoint is a turn_id string
                 if isinstance(checkpoint, str):
                     try:
-                        start_index = next(i for i, turn in enumerate(conversation_history) if turn.parts and hasattr(turn.parts[0], 'text') and checkpoint in turn.parts[0].text) + 1
+                        start_index = next(i for i, turn in enumerate(conversation_history) if turn.get('parts') and isinstance(turn['parts'][0], str) and checkpoint in turn['parts'][0]) + 1
                         history_for_decision = conversation_history[start_index:]
                     except (StopIteration, IndexError):
                         pass # Checkpoint not found, use full history
@@ -5161,9 +5190,10 @@ class ServicesMixin:
             # Omit technical metadata and recalled memories, but ALLOW previous search summaries
             clean_history_lines = []
             for turn in history_for_decision:
-                if not turn.parts: continue
+                parts = turn.get('parts', [])
+                if not parts: continue
                 
-                raw_text = "".join(p.text for p in turn.parts if hasattr(p, 'text'))
+                raw_text = "".join(p if isinstance(p, str) else p.get('text', '') for p in parts)
                 if not raw_text: continue
 
                 # 1. Strip technical metadata line
@@ -5221,20 +5251,20 @@ class ServicesMixin:
                 f"<user_query>\n{user_query}\n</user_query>"
             )
 
-            client = google_genai.Client(api_key=api_key)
-            grounding_tool = google_genai_types.Tool(
-                google_search=google_genai_types.GoogleSearch()
+            client = genai.Client(api_key=api_key)
+            grounding_tool = types.Tool(
+                google_search=types.GoogleSearch()
             )
             
             g_safety_settings = []
             if safety_settings:
                 for cat, thresh in safety_settings.items():
-                    g_safety_settings.append(google_genai_types.SafetySetting(
+                    g_safety_settings.append(types.SafetySetting(
                         category=cat.name,
                         threshold=thresh.name
                     ))
 
-            config = google_genai_types.GenerateContentConfig(
+            config = types.GenerateContentConfig(
                 tools=[grounding_tool],
                 temperature=0.1,
                 top_p=0.9,
@@ -5599,19 +5629,19 @@ class ServicesMixin:
             return None
 
         try:
-            client = google_genai.Client(
+            client = genai.Client(
                 api_key=api_key, 
-                http_options=google_genai_types.HttpOptions(api_version='v1beta')
+                http_options=types.HttpOptions(api_version='v1beta')
             )
             
             # Utilise specific voice identities for single-speaker contextual priming
-            speech_cfg = google_genai_types.SpeechConfig(
-                voice_config=google_genai_types.VoiceConfig(
-                    prebuilt_voice_config=google_genai_types.PrebuiltVoiceConfig(voice_name=voice_name)
+            speech_cfg = types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
                 )
             )
 
-            config = google_genai_types.GenerateContentConfig(
+            config = types.GenerateContentConfig(
                 response_modalities=['AUDIO'],
                 temperature=temperature,
                 speech_config=speech_cfg
@@ -5727,7 +5757,6 @@ class ServicesMixin:
             p_name = participant['profile_name']
             p_key = (p_owner_id, p_name)
             
-            from google.generativeai.types import content_types
             participant_history = []
             for turn in sliced_unified_log:
                 # [NEW] Respect Mute Reactions in history slice
@@ -5736,13 +5765,13 @@ class ServicesMixin:
                     
                 speaker_key = tuple(turn.get("speaker_key", []))
                 role = 'model' if speaker_key == p_key else 'user'
-                participant_history.append(content_types.to_content({'role': role, 'parts': [turn.get("content")]}))
+                participant_history.append({'role': role, 'parts': [turn.get("content")]})
 
             # [NEW] Pseudo-turn injection to ensure history ends with a 'user' role
-            if participant_history and participant_history[-1].role == 'model':
-                participant_history.append(content_types.to_content({'role': 'user', 'parts': ["<internal_note>No response from anyone OR no user is present.</internal_note>"]}))
+            if participant_history and participant_history[-1].get('role', 'user') == 'model':
+                participant_history.append({'role': 'user', 'parts': ["<internal_note>No response from anyone OR no user is present.</internal_note>"]})
             elif not participant_history:
-                participant_history.append(content_types.to_content({'role': 'user', 'parts': ["<internal_note>Begin conversation.</internal_note>"]}))
+                participant_history.append({'role': 'user', 'parts': ["<internal_note>Begin conversation.</internal_note>"]})
             
             # 4. Re-run Generation
             model, _, temp, top_p, top_k, _, fallback_model_name = await self._get_or_create_model_for_channel(
@@ -5754,6 +5783,48 @@ class ServicesMixin:
             last_user_turn = next((t for t in reversed(sliced_unified_log) if tuple(t.get("speaker_key", [])) != p_key), None)
             trigger_content = last_user_turn.get("content", "") if last_user_turn else ""
             
+            # [NEW] Media Recovery Logic for Regeneration
+            recovered_media_parts = []
+            if last_user_turn:
+                last_turn_id = last_user_turn.get("turn_id")
+                if last_turn_id:
+                    # Reverse lookup the original Discord message ID for this turn
+                    target_msg_id = next((int(mid) for mid, tinfo in mapping_data.items() if isinstance(tinfo, (list, tuple)) and len(tinfo) > 2 and tinfo[2] == last_turn_id), None)
+                    if target_msg_id:
+                        try:
+                            target_msg = await channel.fetch_message(target_msg_id)
+                            # Recover standard attachments
+                            attachments = [a for a in target_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))]
+                            if attachments:
+                                async with httpx.AsyncClient() as client:
+                                    for attachment in attachments:
+                                        response = await client.get(attachment.url)
+                                        response.raise_for_status()
+                                        recovered_media_parts.append({"mime_type": attachment.content_type, "data": await response.aread()})
+                            
+                            # Recover replied-to media
+                            if target_msg.reference and target_msg.reference.message_id:
+                                ref_msg = target_msg.reference.resolved
+                                if not ref_msg:
+                                    r_ch = self.bot.get_channel(target_msg.reference.channel_id)
+                                    if r_ch: ref_msg = await r_ch.fetch_message(target_msg.reference.message_id)
+                                if ref_msg and ref_msg.attachments:
+                                    ref_media = next((a for a in ref_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))), None)
+                                    if ref_media:
+                                        async with httpx.AsyncClient() as client:
+                                            resp = await client.get(ref_media.url)
+                                            if resp.status_code == 200:
+                                                recovered_media_parts.append({"mime_type": ref_media.content_type, "data": await resp.aread()})
+                        except Exception as e:
+                            print(f"Failed to recover media for regeneration: {e}")
+
+            # Inject recovered media into the history right before generation
+            if recovered_media_parts and participant_history:
+                for h_turn in reversed(participant_history):
+                    if h_turn.get('role') == 'user':
+                        h_turn['parts'].extend(recovered_media_parts)
+                        break
+
             training_examples = await self._get_relevant_training_examples(p_owner_id, p_name, trigger_content, channel.guild.id)
             full_system_instruction, _, _, _, _, _, _, _ = self._construct_system_instructions(
                 p_owner_id, p_name, channel.id, is_multi_profile=True, training_examples_list=training_examples
@@ -5762,7 +5833,7 @@ class ServicesMixin:
             if hasattr(model, 'system_instruction'):
                 model.system_instruction = full_system_instruction
             
-            gen_config = genai.types.GenerationConfig(temperature=temp, top_p=top_p, top_k=top_k)
+            gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
             response = await model.generate_content_async(participant_history, generation_config=gen_config)
             
             if not response or not response.candidates:

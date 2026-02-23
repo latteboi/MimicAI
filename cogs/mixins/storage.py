@@ -8,7 +8,6 @@ import datetime
 import orjson as json
 from typing import Dict, List, Any, Optional, Literal, Union, Tuple
 from cryptography.fernet import Fernet, InvalidToken
-import google.generativeai as genai
 import asyncio
 import traceback
 import time
@@ -264,7 +263,7 @@ class StorageMixin:
         # All other session types use a unified log
         return dir_path / "session_log.json.gz"
     
-    def _save_session_to_disk(self, session_key: Any, session_type: str, session_data: Union[genai.ChatSession, List[Dict], Dict]):
+    def _save_session_to_disk(self, session_key: Any, session_type: str, session_data: Union[GoogleGenAIChatSession, List[Dict], Dict]):
         if not session_data:
             self._delete_session_from_disk(session_key, session_type)
             return
@@ -278,19 +277,18 @@ class StorageMixin:
                     self._delete_session_from_disk(session_key, session_type)
                     return
                 data_to_save = session_data['unified_log']
-            # Fallback for potential legacy/transition states (shouldn't happen with new load logic)
-            elif isinstance(session_data, genai.ChatSession):
+            elif hasattr(session_data, 'history'):
                  # Convert chat session to log format on save if needed (fallback)
                  log = []
                  for content in session_data.history:
-                     parts_text = "".join(p.text for p in content.parts if hasattr(p, 'text'))
+                     parts_text = "".join(p if isinstance(p, str) else p.get('text', '') for p in content.get('parts', []))
                      log.append({
-                         "turn_id": str(uuid.uuid4()), "role": content.role, "content": parts_text,
+                         "turn_id": str(uuid.uuid4()), "role": content.get('role', 'user'), "content": parts_text,
                          "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
                      })
                  data_to_save = log
 
-        if isinstance(data_to_save, genai.ChatSession) and not data_to_save.history:
+        if hasattr(data_to_save, 'history') and not data_to_save.history:
              self._delete_session_from_disk(session_key, session_type)
              return
 
@@ -311,7 +309,7 @@ class StorageMixin:
         except Exception as e:
             print(f"Error saving session for key {session_key}: {e}")
 
-    def _load_session_from_disk(self, session_key: Any, session_type: str, model: genai.GenerativeModel) -> Optional[Union[genai.ChatSession, List[Dict], Dict]]:
+    def _load_session_from_disk(self, session_key: Any, session_type: str) -> Optional[Union[GoogleGenAIChatSession, List[Dict], Dict]]:
         try:
             path = self._get_session_path(session_key, session_type)
             if not path.exists():
@@ -330,8 +328,6 @@ class StorageMixin:
             data = json.loads(json_bytes)
 
             if session_type == 'global_chat':
-                # Migration Logic: Old format is list of ChatSession parts (list of dicts with 'role' and 'parts')
-                # New format is list of turn objects (dicts with 'turn_id', 'role', 'content', 'timestamp')
                 if data and isinstance(data, list) and 'parts' in data[0]:
                     # Convert old format to new unified_log format
                     unified_log = []
@@ -343,21 +339,17 @@ class StorageMixin:
                             "turn_id": str(uuid.uuid4()),
                             "role": role,
                             "content": content,
-                            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat() # Approx time
+                            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
                         })
                     
-                    # Hydrate ChatSession from new log
-                    from google.generativeai.types import content_types
-                    history = [content_types.to_content({'role': t['role'], 'parts': [t['content']]}) for t in unified_log]
-                    chat_session = model.start_chat(history=history)
+                    history = [{'role': t['role'], 'parts': [t['content']]} for t in unified_log]
+                    chat_session = GoogleGenAIChatSession(history=history)
                     
                     return {'chat_session': chat_session, 'unified_log': unified_log}
                 
-                # New format is just the unified_log list
                 elif data and isinstance(data, list) and 'turn_id' in data[0]:
-                    from google.generativeai.types import content_types
-                    history = [content_types.to_content({'role': t['role'], 'parts': [t['content']]}) for t in data]
-                    chat_session = model.start_chat(history=history)
+                    history = [{'role': t['role'], 'parts': [t['content']]} for t in data]
+                    chat_session = GoogleGenAIChatSession(history=history)
                     return {'chat_session': chat_session, 'unified_log': data}
                 
                 return None
@@ -1245,24 +1237,6 @@ class StorageMixin:
             removed_count = len(ids_to_remove)
             
         return removed_count
-    
-    def _serialize_chat_session(self, chat_session: genai.ChatSession) -> bytes:
-        serialized = []
-        for content in chat_session.history:
-            parts_list = []
-            for part in content.parts:
-                # For now, we only serialize text parts to avoid complexity with images/other data.
-                if hasattr(part, 'text'):
-                    parts_list.append({'text': part.text})
-            if parts_list:
-                serialized.append({'role': content.role, 'parts': parts_list})
-        return json.dumps(serialized)
-
-    def _deserialize_chat_session(self, data_bytes: bytes, model: genai.GenerativeModel) -> genai.ChatSession:
-        from google.generativeai.types import content_types
-        data = json.loads(data_bytes)
-        history = [content_types.to_content(item) for item in data]
-        return model.start_chat(history=history)
     
     def _get_mapping_key_for_session(self, session_key: Any, session_type: str) -> Any:
         if session_type == 'global_chat':

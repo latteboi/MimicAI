@@ -10,15 +10,6 @@ from discord.ext import commands, tasks
 import discord
 from discord import Interaction, app_commands, ui
 
-# [LEGACY]
-import google.generativeai as genai
-import google.generativeai.types as genai_types
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
-from google.api_core import exceptions as api_exceptions
-# [NEW]
-from google import genai as google_genai
-from google.genai import types as google_genai_types
-
 from cryptography.fernet import Fernet, InvalidToken
 import asyncio
 import os
@@ -36,7 +27,6 @@ import collections
 import re
 import httpx
 import sqlite3
-import datetime
 from zoneinfo import ZoneInfo, available_timezones
 import functools
 import gzip
@@ -279,7 +269,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         if not api_key:
             await interaction.followup.send("This server's API key is not configured, so I cannot generate a profile.", ephemeral=True)
             return
-        genai.configure(api_key=api_key)
 
         generation_prompt = (
             "You are a creative assistant specializing in character design for roleplaying.\n"
@@ -308,14 +297,14 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         model_name = 'gemini-flash-lite-latest'
         status = "api_error"
         try:
-            model = genai.GenerativeModel(model_name, safety_settings=DEFAULT_SAFETY_SETTINGS)
-            gen_config = genai.types.GenerationConfig(temperature=0.3)
-            response = await model.generate_content_async(generation_prompt, generation_config=gen_config)
+            model = GoogleGenAIModel(api_key=api_key, model_name=model_name, safety_settings=DEFAULT_SAFETY_SETTINGS)
+            gen_config = {"temperature": 0.3}
+            response = await model.generate_content_async([generation_prompt], generation_config=gen_config)
             
-            if not response.text:
+            if not response or not response.candidates:
                 raise ValueError("AI returned an empty response, possibly due to a safety filter.")
 
-            response_text = response.text.strip()
+            response_text = getattr(response, 'text', "").strip()
             
             # Parse the text using the custom delimiters
             sections = re.split(r'\[SECTION:([\w_]+)\]', response_text)
@@ -825,9 +814,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 self.multi_profile_channels[interaction.channel_id] = session
                 
                 # Hydrate immediately for the single participant logic below
-                from google.generativeai.types import content_types
-                dummy_model = genai.GenerativeModel('gemini-flash-latest')
-                session["chat_sessions"][(interaction.user.id, profile_name)] = dummy_model.start_chat(history=[])
+                session["chat_sessions"][(interaction.user.id, profile_name)] = GoogleGenAIChatSession(history=[])
                 session["is_hydrated"] = True
                 
                 if method == "child_bot":
@@ -897,8 +884,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                         })
 
             # Initialize chat session for new participant
-            from google.generativeai.types import content_types
-            dummy_model = genai.GenerativeModel('gemini-flash-latest')
             new_participant_key = (new_participant['owner_id'], new_participant['profile_name'])
             
             # Rebuild history from unified log for the new participant
@@ -907,10 +892,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 for turn in session.get("unified_log", []):
                     speaker_key = tuple(turn.get("speaker_key", []))
                     role = 'model' if speaker_key == new_participant_key else 'user'
-                    content_obj = content_types.to_content({'role': role, 'parts': [turn.get("content")]})
-                    participant_history.append(content_obj)
+                    participant_history.append({'role': role, 'parts': [turn.get("content")]})
             
-            session["chat_sessions"][new_participant_key] = dummy_model.start_chat(history=participant_history)
+            session["chat_sessions"][new_participant_key] = GoogleGenAIChatSession(history=participant_history)
 
             self._save_multi_profile_sessions()
             await interaction.followup.send(action_description, ephemeral=True)
@@ -1035,9 +1019,8 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         path = self._get_mapping_path(mapping_key)
         _delete_file_shard(str(path))
 
-        dummy_model = genai.GenerativeModel('gemini-flash-latest')
         for p_key in session["chat_sessions"].keys():
-            session["chat_sessions"][p_key] = dummy_model.start_chat(history=[])
+            session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=[])
         
         # [NEW] Reset counters for all participants
         for p in session.get('profiles', []):
@@ -1248,17 +1231,14 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
                     # If the log was modified, we must rebuild all in-memory chat histories
                     if len(session["unified_log"]) < original_log_len:
-                        from google.generativeai.types import content_types
-                        dummy_model = genai.GenerativeModel('gemini-flash-latest')
                         for p_data in session["profiles"]:
                             p_key = (p_data['owner_id'], p_data['profile_name'])
                             participant_history = []
                             for turn in session["unified_log"]:
                                 speaker_key = tuple(turn.get("speaker_key", []))
                                 role = 'model' if speaker_key == p_key else 'user'
-                                content_obj = content_types.to_content({'role': role, 'parts': [turn.get("content")]})
-                                participant_history.append(content_obj)
-                            session["chat_sessions"][p_key] = dummy_model.start_chat(history=participant_history)
+                                participant_history.append({'role': role, 'parts': [turn.get("content")]})
+                            session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 
                     # Check if the session is now effectively empty (contains no public turns)
                     is_effectively_empty = not session.get("unified_log") or all(
@@ -1364,9 +1344,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             session_data = self.global_chat_sessions.get(model_cache_key)
             
             if not session_data:
-                # Need a dummy model to load session from disk
-                dummy_model = genai.GenerativeModel('gemini-flash-latest') 
-                session_data = self._load_session_from_disk(model_cache_key, 'global_chat', dummy_model)
+                session_data = self._load_session_from_disk(model_cache_key, 'global_chat')
                 if session_data: 
                     self.global_chat_sessions[model_cache_key] = session_data
             
@@ -1531,227 +1509,226 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         await interaction.response.defer(ephemeral=True)
 
         admin_setup_content = (
-            "Admin Setup Required!",
-            "Welcome! To use MimicAI on this server, an API key must be configured.\n\n"
-            "**Option A: Google Gemini (Recommended)**\n"
-            "1. Go to Google AI Studio (`aistudio.google.com`).\n"
-            "2. Create a free API key.\n\n"
-            "**Option B: OpenRouter (Optional)**\n"
-            "1. Go to `openrouter.ai` to get a key for models like Claude or Llama.\n\n"
-            "**Step 2: Submit via Direct Message**\n"
-            "For security, API keys are managed in a private DM with the bot.\n"
-            "• Send the command ` ``/settings`` ` to me in a DM.\n"
-            "• Select the server you want to configure.\n"
-            "• Click **Edit Primary Key**.\n\n"
-            "**New: Key Pools**\n"
-            "Users can also contribute their own keys to a server's 'Pool'. The bot will use the Primary Key if available, and fall back to the Pool if needed.\n\n"
-            "*Once a key is set, this help message will be replaced with the full user guide.*"
+            "Authentication Requirements",
+            "This system requires API authentication to function. All generation tasks are passed to external inference endpoints.\n\n"
+            "**Primary Authentication (Google Gemini):**\n"
+            "1. Acquire a standard API key via Google AI Studio.\n"
+            "2. Execute the `/settings` command via Direct Message to access the configuration panel.\n\n"
+            "**Secondary Authentication (OpenRouter):**\n"
+            "1. Acquire an API key via OpenRouter to utilise alternative models (e.g., Anthropic, Meta).\n\n"
+            "**Key Pool Mechanism:**\n"
+            "Administrators may set a 'Primary Key' for server-wide execution. Users may also contribute personal keys to the 'Pool'. The system will cycle through valid keys in the pool if the Primary Key is exhausted."
         )
 
         user_docs_content = [
-            ("Table of Contents",
-             "Welcome to MimicAI! This guide explains everything from creating your first character to advanced server administration. Use the dropdown menu below to jump to a section.\n\n"
-             "**Core Concepts:**\n"
-             "• Quickstart Guide\n"
-             "• Core Concepts: Profiles\n"
-             "• The Three Layers of Memory\n"
-             "• Understanding Sessions\n\n"
-             "**Features & Deep Dives:**\n"
-             "• Deep Dive: Long-Term Memory (LTM)\n"
-             "• Deep Dive: Training Examples\n"
-             "• Deep Dive: Grounding (Web Search)\n"
-             "• Deep Dive: Image Generation\n"
-             "• Deep Dive: Advanced Parameters\n"
-             "• Deep Dive: Anti-Repetition Critic\n"
-             "• Appearances\n"
-             "• Profile Hub (Sharing & Publishing)\n"
-             "• Freewill System\n"
-             "• Child Bots (Advanced)\n\n"
-             "**Technical & Admin:**\n"
-             "• Understanding Costs & Models\n"
-             "• Command Reference (All Users)\n"
-             "• Command Reference (Admins)\n"
-             "• Permissions & Setup Guide\n"
-             "• Disclaimers & Policy\n\n"
-             "For more help, join our support server: https://discord.gg/yaM9Q53wGG"),
-            ("Quickstart Guide: Your First Profile",
-             "Follow these steps to create and activate your first AI character in under 5 minutes.\n\n"
-             "**Step 1: Create the Profile**\n"
-             "This command creates a new, blank character sheet.\n"
-             "• `` `/profile create profile_name:<unique_name>` ``\n\n"
-             "**Step 2: Open the Editor**\n"
-             "This is your all-in-one dashboard for editing everything about your character.\n"
-             "• `` `/profile manage profile_name:<your_profile_name>` ``\n\n"
-             "**Step 3: Define the Character**\n"
-             "In the dashboard, use the buttons to shape your AI:\n"
-             "• **Edit Persona:** Give your character a backstory, personality, likes, and dislikes. This is their soul.\n"
-             "• **Edit Instructions:** Give the AI specific rules on how to speak and behave. This is their rulebook.\n\n"
-             "**Step 4: Activate in this Channel**\n"
-             "To start talking to your new profile, you need to make it active here.\n"
-             "• `` `/profile swap profile_name:<your_profile_name>` ``\n\n"
-             "**Step 5: Start the Conversation!**\n"
-             "Mention the bot to begin.\n"
-             "• `@MimicAI Hello, it's nice to meet you!`"),
-            ("Core Concepts: Profiles",
-             "Profiles are the heart of the bot. Each profile is a unique 'character sheet' that defines an AI's personality, knowledge, and behavior.\n\n"
+            ("System Architecture Overview",
+             "MimicAI operates as a multimodal orchestration layer. It manages character state, session history, and external API requests.\n\n"
+             "The system is built upon a 'Profile' architecture. A Profile acts as a container for system instructions, inference parameters, and persistent memory. These profiles are executed within 'Sessions'—isolated conversational contexts tied to specific channels or direct messages.\n\n"
+             "Use the dropdown menu below to navigate the technical documentation."),
+            
+            ("Profile Classes",
+             "The system distinguishes between two classes of Profiles:\n\n"
              "**Personal Profiles:**\n"
-             "These are the profiles you create and own. You have full control over their persona, instructions, and all parameters.\n"
-             "• **Free Tier:** Up to 5 personal profiles.\n"
-             "• **Premium Tier:** Up to 50 personal profiles.\n\n"
+             "These are primary entities owned and maintained by the user. The owner possesses full read/write privileges over generation parameters, memory vectors, and systemic instructions.\n\n"
              "**Borrowed Profiles:**\n"
-             "When you borrow a profile from another user (via the Hub), you get a live link to its core identity. You can customize local settings (like realistic typing or memory scope) without affecting the original.\n"
-             "• **Free Tier:** Up to 5 borrowed profiles.\n"
-             "• **Premium Tier:** Up to 50 borrowed profiles.\n\n"
-             "**Self-Healing:** If the original creator deletes a profile you have borrowed, it will automatically be removed from your list to keep your inventory clean."),
-            ("The Three Layers of Memory",
-             "The bot uses a sophisticated three-layer memory system to create believable and consistent characters.\n\n"
-             "**1. Short-Term Memory (The Conversation)**\n"
-             "• **What it is:** The bot's active memory of recent messages. This is adjustable for each of your personal profiles from **0 to 50** conversational exchanges.\n"
-             "• **Function:** Provides immediate conversational context.\n"
-             "• **Control:** Adjusted via `` `/profile manage` `` -> `Set Generation Parameters & STM`. Cleared with the `` `/refresh` `` command.\n\n"
-             "**2. Long-Term Memory (The Notebook)**\n"
-             "• **What it is:** AI-generated summaries of key facts and events from past conversations.\n"
-             "• **Function:** Allows a profile to remember important details (like names, relationships, or past events) over weeks or months.\n"
-             "• **Control:** Managed via `` `/profile data manage` ``.\n\n"
-             "**3. Training Examples (The Rulebook)**\n"
-             "• **What it is:** Your hand-written, explicit instructions on *how* a profile should speak and behave.\n"
-             "• **Function:** The most powerful tool for defining a character's unique voice, personality, and style.\n"
-             "• **Control:** Managed via `` `/profile data manage` ``."),
-            ("Understanding Sessions",
-             "**1. Regular Sessions (Manual)**\n"
-             "• **What it is:** A standard chat mode where you pick a cast of characters (profiles) to participate.\n"
-             "• **How to Start:** Use `` `/session config mode:Regular` ``. This opens a setup menu where you can select participants.\n"
-             "• **Features:** Multi-profile conversation, image generation, and manual control via `/session swap`.\n\n"
-             "**2. Freewill Sessions (Premium)**\n"
-             "• **What it is:** A dynamic mode where characters can speak on their own (Proactive) or respond based on chance or keywords (Reactive).\n"
-             "• **How to Start:** Use `` `/session config mode:Freewill` ``.\n"
-             "• **Features:** Characters act autonomously based on their personality settings ('Introverted' vs 'Outgoing'). Great for creating a 'living' server environment.\n\n"
-             "**Default Behavior:**\n"
-             "If no session is active, the bot will simply not respond, unless you mention it directly."),
-            ("Deep Dive: Long-Term Memory (LTM)",
-             "**What is it?**\nLTM allows your profile to remember key facts from past conversations by having an AI create summaries of important interactions.\n\n"
-             "**How does it work?**\nAfter a certain number of messages in a channel, the bot can automatically summarize the recent conversation and save it as a memory. When you talk to the profile later, it searches these memories for relevant information to provide better context.\n\n"
-             "**What should I know?**\n"
-             "• **Custom Prompts:** You can edit the exact instructions the AI uses to summarize conversations for each of your personal profiles via the `` `/profile manage` `` dashboard.\n"
-             "• **Privacy (LTM Scope):** You can control who can access a profile's memories using the LTM Scope setting in `` `/profile manage` ``. The default is 'Server-Exclusive', meaning memories are only recalled in the server they were made in.\n"
-             "• **Cost:** LTM creation involves an extra API call to a fast model (`flash-lite`)."),
-            ("Deep Dive: Training Examples",
-             "**What is it?**\nTraining Examples are specific `User Input` -> `Bot Response` pairs you provide to teach your profile *how* to speak.\n\n"
-             "**How it works?**\nWhen you send a message, the bot finds the most similar Training Examples you've provided and includes them in its prompt.\n\n"
-             "**Best Practices:**\nFocus on **style and personality**, not just facts.\n"
-             "• **Bad:** `User: What color is the sky?` -> `Bot: The sky is blue.`\n"
-             "• **Good:** `User: What a beautiful day!` -> `Bot: It's tolerable, I suppose. The sun is a bit loud.`\n\n"
-             "**Cost:**\nThis feature uses the embedding API to find matches. While extremely cheap ($0.10 per 1M tokens), it is **not free** and does generate API usage."),
-            ("Deep Dive: Grounding (Web Search)",
-             "**What is it?**\nGrounding allows a profile to perform a Google Search to answer questions about recent events.\n\n"
-             "**Requirements:**\n"
-             "• **Google API Key:** You MUST provide a Google AI Studio key in `/settings`. OpenRouter keys cannot be used for this feature.\n\n"
-             "**How it works?**\nThe bot uses a smart model to decide *if* your question requires a search. If 'yes', it performs the search and summarizes the results.\n\n"
-             "**Reliability (Fail-Open):**\nIf the search API fails (e.g., Google is down), the bot will **fail open**: it will skip the search and answer from its own knowledge rather than crashing.\n\n"
-             "**What should I know?**\n"
-             "• **Cost:** A grounded response requires **one extra API call** to a specialized model (`gemini-2.0-flash`) before the final response is generated."),
-            ("Deep Dive: Image Generation",
-             "**What is it?**\nThis feature allows the bot's active profile to generate an image based on your text prompt, and then present it to you in-character.\n\n"
-             "**Requirements:**\n"
-             "• **Google API Key (Paid Tier):** This feature requires a Google API key on a project with billing enabled. It **cannot** be used with Free Tier keys or OpenRouter keys.\n\n"
-             "**How it works?**\n"
-             "1. Use the `!image` or `!imagine` prefix (e.g., `!image a majestic castle`).\n"
-             "2. The bot first generates the image using the **Gemini 2.5 Flash Image** model.\n"
-             "3. It then shows this image to the active text profile, asking it to comment on the image it 'created'.\n"
-             "4. The final message includes both the in-character text and the generated image.\n\n"
-             "**Generating Self-Portraits:**\n"
-             "You can add a description to the **Appearance** section of a profile's Persona (via `` `/profile manage` ``). If your image prompt contains second-person pronouns (like 'you', 'your') or the profile's name, this appearance data will be automatically included in the prompt to guide the AI in creating a self-portrait.\n\n"
-             "**Editing & Combining Images:**\nTo edit or combine images, simply **reply** to a message containing an image and use the `!image` command. You can also attach a second image to your reply. The bot will use up to two images (one from the reply, one from the new attachment) as references for the new generation.\n\n"
-             "**COST WARNING:**\nEach use requires **two API calls**: one to the image model and one to the text model."),
-            ("Deep Dive: Advanced Parameters",
-             "**What is it?**\nFine-tuning controls for how the AI selects words. These settings are primarily for **OpenRouter** models but may affect some Google models.\n\n"
-             "**Parameters:**\n"
-             "• **Frequency Penalty (-2.0 to 2.0):** Penalizes words based on how many times they have appeared in the text so far. High values decrease repetition.\n"
-             "• **Presence Penalty (-2.0 to 2.0):** Penalizes words based on *if* they have appeared at least once. Encourages introducing new topics.\n"
-             "• **Repetition Penalty (0.0 to 2.0):** A multiplicative penalty for repeated tokens.\n"
-             "• **Min P (0.0 to 1.0):** Discards possible tokens if their probability is less than a percentage of the most likely token's probability. Good for balancing logic and creativity.\n"
-             "• **Top A (0.0 to 1.0):** Limits the token pool based on the probability of the top token. If the top token is very likely, the pool shrinks."),
-            ("Deep Dive: Anti-Repetition Critic",
-             "**What is it?**\nAn automated quality-control system that reads the conversation history before the bot speaks to detect repetitive loops.\n\n"
-             "**How it works?**\n1. It analyzes the last few turns of conversation using a fast, cheap AI model.\n2. It looks for verbatim phrases or sentence structures that have been repeated by the character.\n3. If a loop is found, it injects a strict 'Negative Constraint' into the system prompt for the next turn (e.g., 'Do not start sentences with *Well...*').\n\n"
-             "**Trade-offs:**\n"
-             "• **Pros:** Drastically reduces 'broken record' behavior where a character gets stuck repeating the same phrase.\n"
-             "• **Cons:** Adds **latency** (time to reply) and **cost** (one extra API call per message)."),
-            ("Appearances",
-             "Appearances allow you to give your profiles a custom name and avatar, separate from the main bot's identity.\n\n"
-             "**How it Works:**\n"
-             "1. Open the profile dashboard with `` `/profile manage` ``.\n"
-             "2. Use the **'Edit Appearance'** button. This will let you create or edit an appearance linked to that profile.\n"
-             "3. When that profile is active, the bot will automatically use the custom name and avatar you set.\n\n"
-             "> **Permission Needed:** For this feature to work, the bot's role must have the **`Manage Webhooks`** permission in the channel.\n\n"
-             "**Management:**\n"
-             "• Appearances are managed directly from the `` `/profile manage` `` dashboard."),
-            ("Profile Hub (Sharing & Publishing)",
-             "The **Profile Hub** is your central destination for sharing and discovering characters.\n\n"
-             "**Private Sharing (Free)**\n"
-             "Share profiles directly with friends or generate single-use Share Codes via `Manage My Shares` -> `Private Mode`.\n\n"
-             "**Public Library**\n"
-             "Premium users can **publish** their profiles to the global library. Published profiles appear in the **Public Library** tab for anyone to browse and borrow.\n"
-             "• **Safety First:** All published profiles undergo an automated AI safety check. Explicit content is strictly prohibited in the public library.\n"
-             "• **Ownership:** You retain full control. Unpublishing a profile removes it from the library immediately."),
-            ("Freewill System",
-             "The Freewill system allows profiles to become active participants in a server, either by starting conversations on their own or reacting to keywords.\n\n"
-             "**Living vs. Lurking Channels**\n"
-             "• **Living:** In these channels, the bot can proactively start scenes between two or more opted-in profiles at random intervals.\n"
-             "• **Lurking:** In these channels, profiles will only speak if they are directly replied to or if a user says one of their 'wakewords'.\n\n"
-             "**How to Participate**\n"
-             "1. An admin must first enable the system and designate channels using `` `/session config mode:Freewill` ``.\n"
-             "2. Admins can then opt-in their profiles using the `Participants` tab in the Freewill dashboard.\n"
-             "3. For each profile, you can set its **Personality** (which determines its chance to speak) and its **Wakewords**.\n\n"
-             "**Interacting with Freewill:**\nProfiles in a reactive (Lurking) freewill session can be prompted to generate images using the `!image` or `!imagine` command. The bot will randomly select one of the opted-in profiles to fulfill the request."),
-            ("Child Bots (Premium)",
-             "Child Bots are separate Discord bot applications that you own and control, which act as dedicated 'puppets' for your profiles.\n\n"
-             "**Why Use a Child Bot?**\n"
-             "• **Unique Identity:** It gets its own name, avatar, and presence in the server member list.\n"
-             "• **Multi-Server Presence:** A single child bot can be active on multiple servers at once.\n"
-             "• **Autonomous Participation:** Child Bots can be opted into the Freewill system to act as autonomous characters in your server.\n\n"
-             "**Setup Guide:**\n"
-             "1. Go to the Discord Developer Portal, create a new Application, and add a 'Bot' to it. Copy the bot's **Token**.\n"
-             "2. In a **DM with this bot**, use the `` `/settings` `` command.\n"
-             "3. Navigate to `Child Bots` -> `Create New Child Bot` and follow the prompts.\n"
-             "4. **Invite Your Bot:** Use the OAuth2 URL Generator in the Developer Portal to create an invite link with the following permissions: **`Send Messages`**, **`Read Message History`**, and **`Embed Links`**."),
-            ("Command Reference (All Users)",
-             "**Profile Management**\n"
-             "• `` `/profile manage <name>` ``: The main dashboard for editing a profile.\n"
-             "• `` `/profile swap <name>` ``: Swaps your active profile in the current channel.\n"
-             "• `` `/session view` ``: Shows details about the current session and its participants.\n"
-             "• `` `/profile list` ``: Lists all your personal and borrowed profiles.\n"
-             "• `` `/profile hub` ``: Browse the public library and manage shares.\n\n"
-             "**Data Management**\n"
-             "• `` `/profile data manage <name>` ``: Add, edit, view, and delete LTM and Training Examples.\n\n"
-             "**Chat Commands**\n"
-             "• `` `/profile global_chat [profile] [message]` ``: Opens the Global Chat History UI. If a message is provided, sends it immediately.\n"
-             "• `` `/whisper [profile] [message]` ``: Sends a private message to a session participant.\n"
-             "• `` `/terms` ``: Displays a direct link to our Terms of Service and Privacy Policy."),
-            ("Command Reference (Admins)",
-             "**Server & Session**\n"
-             "• `` `/session config` ``: Start or configure a Regular or Freewill session.\n"
-             "• `` `/session swap` ``: Quickly swap, add, or remove a profile from the active session.\n"
-             "• `` `/suspend` ``: Clear the active session in the current channel.\n"
-             "• `` `/refresh` ``: Clear the participating profiles' short-term memory context for the channel.\n"
-             "• `` `/purge` ``: Delete messages and scrub them from the session's memory.\n"
-             "• `` `/profile speak` ``: Speak as any profile in the server."),
-            ("Permissions & Setup Guide",
-             "**Required Permissions:**\n"
-             "• `Send Messages`, `Read Message History`\n\n"
-             "**Optional Permissions:**\n"
-             "• `Manage Webhooks` (Required for Appearances)\n"
-             "• `Manage Messages` (Required for `/purge`)\n\n"
-             "**Setup Steps:**\n"
-             "1. DM the bot `` `/settings` `` to add API keys (Google or OpenRouter).\n"
-             "2. Use `` `/session config` `` to configure your first conversation."),
-            ("Disclaimers & Policy",
-             "**API USAGE**\n"
-             "By providing an API key, you agree to the terms of the respective provider (Google Gemini or OpenRouter). Data is processed to generate responses and is not used by the bot developer for training.\n\n"
-             "**SESSION HISTORY**\n"
-             "To support context, a rolling history of the last 50 exchanges is stored securely on disk. You can delete this history at any time via `/refresh` or the Global Chat UI.\n\n"
-             "**COST RESPONSIBILITY**\n"
-             "Using Pro models or high-end OpenRouter models (like Opus) can be expensive. The bot developer is not responsible for costs incurred on your API keys."),
+             "These are read-only symbolic links to another user's Personal Profile, acquired via the Public Library or direct share code. Local configuration (such as temporal awareness and formatting) may be overridden, but core identity variables remain synchronised with the origin."),
+            
+            ("Persona Definition",
+             "The core identity of a Profile is constructed using modular text fields that are compiled into XML-tagged system instructions during inference.\n\n"
+             "The Persona module comprises:\n"
+             "- **Backstory:** Historical and contextual data.\n"
+             "- **Personality Traits:** Core psychological characteristics.\n"
+             "- **Likes/Dislikes:** Positive and negative biases.\n"
+             "- **Appearance:** Physical description (utilised heavily by the Visual Generation module for self-portraits)."),
+            
+            ("AI Instruction Protocol",
+             "AI Instructions dictate operational behaviour and formatting constraints. These bypass the Persona module and instruct the underlying model on strict structural adherence.\n\n"
+             "The interface provides four distinct data blocks to prevent context truncation. It is recommended to utilise standard declarative constraints (e.g., 'Do not output markdown', 'Keep responses under two sentences'). These instructions take priority over persona biases during generation."),
+            
+            ("Generation Parameters",
+             "Users may manipulate the statistical variance of the output via standard sampling parameters:\n\n"
+             "- **Temperature:** Controls the randomness of token selection. Lower values yield deterministic outputs; higher values yield diverse outputs.\n"
+             "- **Top P (Nucleus Sampling):** The model considers only the tokens comprising the top probability mass. Set to 1.0 to disable.\n"
+             "- **Top K:** Limits the token selection pool to the K most probable tokens.\n"
+             "- **STM Length:** Short-Term Memory. Defines how many previous conversational turns are appended to the context window."),
+             
+            ("Advanced Heuristics (OpenRouter)",
+             "For endpoints supporting OpenRouter specifications, additional penalisation parameters are available:\n\n"
+             "- **Frequency Penalty (-2.0 to 2.0):** Applies an additive penalty to tokens based on their existing frequency in the text, reducing verbatim repetition.\n"
+             "- **Presence Penalty (-2.0 to 2.0):** Applies an absolute penalty if a token exists at all, encouraging topic divergence.\n"
+             "- **Repetition Penalty:** Multiplicative penalty against recently generated tokens.\n"
+             "- **Min P / Top A:** Advanced thresholding metrics to dynamically cull low-probability tokens."),
+             
+            ("Reasoning Configuration",
+             "Specific models (e.g., Gemini 2.0 Flash Thinking, Gemini 3.0) support overt reasoning phases prior to text generation.\n\n"
+             "- **Thinking Level:** Determines the computational effort allocated to reasoning (None, Minimal, Low, Medium, High, XHigh).\n"
+             "- **Token Budget:** For models that accept explicit limits (e.g., Gemini 2.5), dictates the exact token cap allocated to internal thought.\n"
+             "- **Summary Visibility:** Toggles whether the raw reasoning tokens are exported and delivered as an attachment alongside the response."),
+             
+            ("Vocal Synthesis (Director's Desk)",
+             "The Director's Desk provides semantic priming for the Text-to-Speech (TTS) module.\n\n"
+             "Instead of raw audio manipulation, the TTS engine is a generative model capable of inferring tone from contextual metadata. Users may define:\n"
+             "- **Archetype:** E.g., 'A grizzled detective.'\n"
+             "- **Accent:** E.g., 'Standard British.'\n"
+             "- **Dynamics:** E.g., 'Speaking in a whisper in a cavern.'\n"
+             "- **Pacing & Style:** E.g., 'Rapid delivery with a subtle smile.'"),
+             
+            ("Vocal Synthesis (Hardware Settings)",
+             "Beyond semantic instruction, explicit TTS hardware configurations include:\n\n"
+             "- **Voice Name:** The designated prebuilt voice identity (e.g., 'Aoede', 'Kore', 'Charon').\n"
+             "- **Speech Model:** The backend endpoint (defaults to `gemini-2.5-flash-preview-tts`).\n"
+             "- **Prosody (Temperature):** Dictates the expressive variance in the audio generation. Values outside standard 1.0 may result in erratic audio artefacts."),
+             
+            ("Multimodal Audio Output",
+             "Audio delivery modes modify how the bot processes standard text generation:\n\n"
+             "- **Text-Only:** Default behaviour.\n"
+             "- **Audio + Text:** Delivers the primary text payload alongside a synthesised `.wav` attachment.\n"
+             "- **Audio-Only:** Suppresses the text output, delivering solely the audio file.\n"
+             "- **Multi-Audio:** In multi-profile sessions, delays audio transmission until the conclusion of the round, stitching all segments into a continuous master file."),
+
+            ("Short-Term Memory (STM)",
+             "The STM acts as the immediate conversational buffer. The system maintains a synchronised cache (`unified_log`) representing the chronological sequence of recent interactions.\n\n"
+             "This data is hydrated into specific `ChatSession` arrays prior to inference. The depth of this buffer is determined by the profile's STM Length parameter. Exceeding context limits may degrade the model's adherence to systemic instructions. The `/refresh` command flushes this buffer for the current channel."),
+
+            ("Long-Term Memory (LTM) Architecture",
+             "The LTM subsystem provides persistent data retention via an automated summarisation pipeline.\n\n"
+             "**Auto-Creation Pipeline:**\n"
+             "When a user communicates with a profile, an internal counter tracks the exchange volume. Once the `Creation Interval` threshold is met, the system extracts the last `Summarization Context` turns and submits them to an auxiliary model (`gemini-flash-lite`). The model condenses the excerpt into a strict, third-person factual summary."),
+             
+            ("LTM Retrieval Logistics",
+             "Memories are encoded using Matryoshka Representation Learning (256-dimensional embeddings) and stored locally.\n\n"
+             "During active chat, the user's prompt is embedded and cross-referenced against the profile's memory vault via cosine similarity. If the metric exceeds the profile's `Relevance Threshold`, the top results are injected into the system prompt as `<archive_context>`.\n\n"
+             "**LTM Scopes:**\n"
+             "- User: Recalled exclusively for the original author.\n"
+             "- Server: Recalled for any user within the originating guild.\n"
+             "- Global: Recalled universally."),
+
+            ("Contextual Training Examples",
+             "Training Examples are explicit, user-defined input/output pairs that dictate specific stylistic behaviour.\n\n"
+             "Like LTMs, they are embedded and retrieved via vector search. Upon matching the `Relevance Threshold`, the pairs are injected into the system instructions. This ensures the model dynamically alters its vernacular, sentence structure, and formatting based on semantic similarities to the user's current prompt. Manage these via `/profile data manage`."),
+
+            ("Redundancy (Model Fallback)",
+             "The system features a fault-tolerant generation loop. If the primary inference request fails due to rate limits, server timeouts, or strict safety blocks, the system automatically redirects the payload to the defined Fallback Model.\n\n"
+             "It is highly recommended to designate an efficient, low-cost model (e.g., `gemini-flash-lite-latest`) as the fallback to maintain uptime during primary endpoint degradation."),
+
+            ("Web Grounding (Search Indexing)",
+             "Grounding enables real-time information retrieval via Google Search.\n\n"
+             "If the Grounding Mode is active (`On` or `On+`), the system routes the query through a secondary decision-model to determine if external facts are required. If verified, a Google Search tool is executed, and the resultant chunks are parsed into `<external_context>` for the primary generation phase.\n\n"
+             "The `On+` mode forces the AI to append citation links beneath the final message."),
+
+            ("Web Grounding (URL Parsing)",
+             "If URL Fetching is enabled, the system intercepts HTTP/HTTPS links present in the user's prompt.\n\n"
+             "A headless asynchronous request extracts the raw HTML, stripping structural noise, scripts, and styling. The decoded text is injected into the payload as `<document_context>`. This process bypasses Google Search and relies strictly on direct endpoint resolution. Media objects (images) located at the endpoint are also appended for multimodal analysis."),
+
+            ("Visual Generation & Processing",
+             "Profiles may generate `.png` visuals using the `!image` or `!imagine` prefix.\n\n"
+             "This requires a paid-tier Google API key routing to the `gemini-2.5-flash-image` endpoint. The generation prompt automatically appends the profile's `Appearance` data if second-person pronouns are detected. Once the image is generated, it is fed back into the text model to produce an in-character comment attached to the resulting file.\n\n"
+             "To execute style transfers or iterative edits, reply to an existing image with the `!image` command."),
+
+            ("Output Modification: Anti-Repetition Critic",
+             "The Critic module acts as an automated linguistic quality assurance layer.\n\n"
+             "When enabled, the system reviews the last three model outputs prior to execution. If structural repetition is detected (e.g., reusing identical opening phrases or structural loops common in auto-regressive models), it formulates a negative constraint. This constraint is injected into the prompt, explicitly banning the repetitive pattern for the impending turn."),
+
+            ("Output Modification: Typing Simulation",
+             "Realistic Typing simulates human interface delays.\n\n"
+             "The output string is parsed via regex to identify sentence boundaries (accounting for standard abbreviations). The execution loop calculates a reading/typing delay based on character volume. Sentences are sequentially transmitted to the Discord Webhook API, creating a fragmented, continuous stream of text rather than a single monolithic block."),
+
+            ("Temporal Awareness Integration",
+             "If Time Tracking is enabled, the execution loop parses the profile's designated IANA Timezone (e.g., `Europe/London`).\n\n"
+             "A UTC datetime object is shifted to the local equivalent and formatted into a human-readable string. This data is injected as `<time_context>` into the system prompt, ensuring the model maintains continuity regarding the time of day, day of the week, and date."),
+
+            ("Standard Session Management",
+             "All conversational interactions occur within Sessions.\n\n"
+             "**Regular Mode (`/session config`):**\n"
+             "Initiates a manual session requiring an administrator to define the participating profiles. The operational mode determines execution flow:\n"
+             "- Sequential: Participants execute in the exact order established during configuration.\n"
+             "- Random: Execution order is shuffled per round.\n\n"
+             "Standard `/session swap` operations allow dynamic manipulation of the active cast during runtime."),
+
+            ("Session Management: Response Modes",
+             "Profiles may be configured to format their network payload differently depending on use-case requirements:\n\n"
+             "- **Regular:** Standard webhook message execution.\n"
+             "- **Mention:** Prepends the user's Discord ID to the message payload.\n"
+             "- **Reply:** Triggers the Discord API message reference parameter to visually connect the response to the user's prompt.\n"
+             "- **Mention + Reply:** A hybrid execution of both methodologies."),
+
+            ("Session Control via Reactions",
+             "Users may dynamically influence session state and execution flow by applying specific emoji reactions to messages.\n\n"
+             "- **Regenerate (🔁):** Regenerates a profile's message using the same context that lead to that response.\n"
+             "- **Next Speaker (⏯️):** Triggers the next profile participant to respond.\n"
+             "- **Continue Round (🍿):** Triggers a new round for all profile participants to respond.\n"
+             "- **Mute Turn (🔇):** Hides the targeted message from the session's transcript. The message remains in the channel but becomes invisible to the profiles when they respond.\n"
+             "- **Skip Participant (❌):** Suspends a specific profile from responding in the session."),
+
+            ("Automated Event Scheduling (Freewill)",
+             "The Freewill system enables autonomous bot execution without direct user invocation.\n\n"
+             "Administrators classify channels as either 'Living' (fully autonomous) or 'Lurking' (reactive only). Active users must opt their profiles into the system via the configuration dashboard. The system evaluates participation based on the defined 'Personality' percentages (Introverted, Regular, Outgoing), which determine the probability of intervention."),
+
+            ("Freewill Mode: Proactive Generation",
+             "In 'Living' channels, an asynchronous loop executes at one-minute intervals.\n\n"
+             "If the channel's `Event Cooldown` timer has expired, the system calculates a probability check based on the `Event Chance`. Upon success, it gathers an ad-hoc cast of opted-in profiles and forces a 'Director's Prompt' (e.g., 'You see X walk into the room. React.'). The profiles converse autonomously until the defined proactive round counter depletes."),
+
+            ("Freewill Mode: Reactive Triggers",
+             "In both 'Living' and 'Lurking' channels, the system evaluates all standard user messages against the active profiles.\n\n"
+             "If a user's text string contains an exact match to a profile's defined 'Wakeword', the profile immediately bypasses standard turn logic to interject. In the absence of wakewords, a probabilistic roll is made against the profile's personality metric to determine random interjection."),
+
+            ("Inter-Process Communication (Child Bots)",
+             "Child Bots are discrete Discord Application binaries orchestrated by the primary instance (Hivemind).\n\n"
+             "The system establishes a WebSocket Inter-Process Communication (IPC) layer on `ws://127.0.0.1:8765`. A background subprocess handles the asynchronous execution of `discord.py` clients. These child instances possess no internal logic; they blindly execute payloads formatted and routed by the primary engine. This allows profiles to exist as independent server members with dedicated online presence."),
+
+            ("Child Bot Registration & Sync",
+             "To instantiate a Child Bot:\n"
+             "1. Register a new Application within the Discord Developer Portal.\n"
+             "2. Extract the bot token and submit it via `/settings`.\n"
+             "3. The primary instance encrypts the token, establishes the IPC socket, and dispatches an initialization command.\n\n"
+             "The parent instance automatically synchronises the profile's display name and avatar URL to the child application via API calls upon creation or modification."),
+
+            ("Public Distribution Index (Hub)",
+             "The Hub (`/profile hub`) operates as a global metadata index for Profile distribution.\n\n"
+             "Premium users may publish profiles to the index. Upon request, the system executes an automated moderation check using `gemini-flash-lite` to evaluate the profile name, display name, and avatar for graphic or explicit violations. Upon clearance, the profile is appended to the `index.json` structure, allowing global read access for borrowing operations."),
+
+            ("Private Distribution (Share Codes)",
+             "For targeted distribution, users may generate temporary cryptographic Share Codes via the Hub interface.\n\n"
+             "These codes encode the original owner's ID and the profile string. The generated hex key is retained in a volatile dictionary with a 300-second (5 minute) Time-To-Live (TTL). When a recipient redeems the code, the system validates the TTL, reads the encoded source, and duplicates a symbolic link to their local directory."),
+
+            ("Data Import and Export Validation",
+             "Profiles and associated persistent memory (LTM/Training) may be exported to standard `.mimic` JSON files.\n\n"
+             "The export function decrypts local storage and packages the dictionaries into plaintext formatting. During import, the system validates the JSON schema, handles namespace collisions via UUID appending, re-encrypts the text blobs, and shunts the data to the appropriate `user_data` and `storage` shards."),
+
+            ("Command Reference: Administration",
+             "- `/session config`: Opens the interface to initialise standard or Freewill sessions.\n"
+             "- `/suspend`: Terminates the active session and flushes the buffer.\n"
+             "- `/purge`: Executes a bulk message deletion operation and recursively scrubs associated internal memory indices.\n"
+             "- `/profile speak`: Forces an anonymous execution of a designated profile payload. (Requires Webhook/Child Bot delivery)."),
+
+            ("Command Reference: Configuration",
+             "- `/settings`: Private interface for API key authentication and Child Bot provisioning.\n"
+             "- `/profile manage`: Central interface for profile manipulation.\n"
+             "- `/profile bulk manage`: Executes batch manipulation across multiple profiles simultaneously.\n"
+             "- `/profile data manage`: Interface for manual CRUD operations on vector-embedded databases (LTM/Training)."),
+
+            ("Command Reference: Interaction",
+             "- `/profile swap`: Changes the active profile context for the current channel.\n"
+             "- `/profile list`: Enumerates valid user indices.\n"
+             "- `/session view`: Dumps session variables and participant statuses to chat.\n"
+             "- `/refresh`: Performs a targeted wipe of the channel's Short-Term Memory buffer without destroying the session structure.\n"
+             "- `/whisper`: Transmits hidden variables directly to a profile's context window, eliciting an ephemeral response."),
+             
+             ("System Content Moderation Framework",
+             "The system strictly adheres to external provider usage guidelines regarding illicit content.\n\n"
+             "Users may classify profiles under specific safety tiers (Low, Medium, High). The 'Unrestricted 18+' tier disables standard filters; however, execution of these profiles is mathematically restricted by the core engine to channels designated as NSFW via Discord API flags. Attempts to execute unrestricted profiles in standard channels will abort with a silent failure or system error log."),
+
+            ("Contextual Metadata & Token Overhead",
+             "To maintain coherent multi-participant communication, the system forcefully injects hardcoded metadata into the prompt payload.\n\n"
+             "Every user and profile response within the history buffer is strictly prefixed with a designated `[Name] [Timestamp]:` string. While this incurs a nominal token overhead per conversational turn, it establishes a foundational chronological and spatial awareness for the model. This guarantees the AI can differentiate between multiple actors and comprehend the passage of time without confusing internal dialogue with external user prompts."),
+
+            ("Extensible Markup Language (XML) Standards",
+             "The orchestration layer heavily utilises XML formatting (e.g., `<document_context>`, `<archive_context>`) when appending system-generated data to the context window.\n\n"
+             "Large Language Models possess a high mechanical affinity for XML boundary demarcation. By segregating raw conversational text from background technical operations using explicit tags, the system establishes a hard partition. This significantly mitigates prompt injection vectors, reduces contextual hallucination, and ensures the model accurately separates 'what the user said' from 'what the system is instructing it to know'."),
+
+            ("Data Residency and End User Agreement",
+             "All user-generated strings, including memory sequences and API keys, are subjected to symmetric Fernet encryption prior to disc residency.\n\n"
+             "By configuring external inference endpoints, you acknowledge the terms of service of the respective API provider (Google LLC, OpenRouter, etc.).")
         ]
 
         final_docs_content = []

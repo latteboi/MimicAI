@@ -1,7 +1,7 @@
 import os
 from typing import Literal
 import configs.DefaultConfig as defaultConfig
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from google.genai.types import HarmCategory, HarmBlockThreshold
 
 PRIMARY_MODEL_NAME = 'gemini-flash-latest'
 FALLBACK_MODEL_NAME = 'gemini-flash-lite-latest'
@@ -93,3 +93,7 @@ DEFAULT_SAFETY_SETTINGS = {
     HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
 }
+
+class GoogleGenAIChatSession:
+    def __init__(self, history=None):
+        self.history = history or []

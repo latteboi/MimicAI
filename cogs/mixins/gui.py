@@ -8,7 +8,6 @@ import uuid
 import io
 import re
 import pathlib
-import google.generativeai as genai
 import traceback
 import time
 import copy
@@ -20,6 +19,7 @@ from typing import TYPE_CHECKING, List, Dict, Tuple, Set, Literal, Any, Optional
 from .storage import (
     _quantize_embedding, 
 )
+from .services import GoogleGenAIChatSession
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -100,8 +100,7 @@ class GlobalChatHistoryView(ui.View):
         
         session_data = self.cog.global_chat_sessions.get(self.session_key)
         if not session_data:
-            dummy_model = genai.GenerativeModel('gemini-flash-latest')
-            session_data = self.cog._load_session_from_disk(self.session_key, 'global_chat', dummy_model)
+            session_data = self.cog._load_session_from_disk(self.session_key, 'global_chat')
             if session_data:
                 self.cog.global_chat_sessions[self.session_key] = session_data
         
@@ -248,15 +247,11 @@ class GlobalChatHistoryView(ui.View):
         
         if len(session_data['unified_log']) < original_len:
             # Rebuild ChatSession
-            from google.generativeai.types import content_types
-            dummy_model = genai.GenerativeModel('gemini-flash-latest')
             new_history = []
             for t in session_data['unified_log']:
                 role = 'model' if t.get('role') == 'model' else 'user'
-                # For global chat history rebuilding, we don't have metadata injection here,
-                # just raw content preservation for context.
-                new_history.append(content_types.to_content({'role': role, 'parts': [t.get('content')]}))
-            session_data['chat_session'] = dummy_model.start_chat(history=new_history)
+                new_history.append({'role': role, 'parts': [t.get('content')]})
+            session_data['chat_session'] = GoogleGenAIChatSession(history=new_history)
             
             # Cleanup mapping
             mapping_key = self.cog._get_mapping_key_for_session(self.session_key, 'global_chat')
@@ -516,29 +511,23 @@ class WhisperActionView(ui.View):
         ]
 
         if len(session["unified_log"]) < original_log_len and target_profile_key:
-            from google.generativeai.types import content_types
-            dummy_model = genai.GenerativeModel('gemini-flash-latest')
-            
             participant_history = []
             for turn in session["unified_log"]:
                 turn_type = turn.get("type")
                 if not turn_type:
                     speaker_key = tuple(turn.get("speaker_key", []))
                     role = 'model' if speaker_key == target_profile_key else 'user'
-                    content_obj = content_types.to_content({'role': role, 'parts': [turn.get("content")]})
-                    participant_history.append(content_obj)
+                    participant_history.append({'role': role, 'parts': [turn.get("content")]})
                 elif turn_type == "whisper":
                     t_key = tuple(turn.get("target_key", []))
                     if target_profile_key == t_key:
-                        content_obj = content_types.to_content({'role': 'user', 'parts': [turn.get("content")]})
-                        participant_history.append(content_obj)
+                        participant_history.append({'role': 'user', 'parts': [turn.get("content")]})
                 elif turn_type == "private_response":
                     s_key = tuple(turn.get("speaker_key", []))
                     if target_profile_key == s_key:
-                        content_obj = content_types.to_content({'role': 'model', 'parts': [turn.get("content")]})
-                        participant_history.append(content_obj)
+                        participant_history.append({'role': 'model', 'parts': [turn.get("content")]})
 
-            session["chat_sessions"][target_profile_key] = dummy_model.start_chat(history=participant_history)
+            session["chat_sessions"][target_profile_key] = GoogleGenAIChatSession(history=participant_history)
             session.get("pending_whispers", {}).pop(target_profile_key, None)
 
         await interaction.edit_original_response(content="Whisper has been deleted from the profile's memory.", view=None, embed=None)
@@ -687,46 +676,58 @@ class PaginatedEmbedView(ui.View):
     def __init__(self, embeds: List[discord.Embed], page_titles: List[str]):
         super().__init__(timeout=300)
         self.embeds = embeds
+        self.page_titles = page_titles
         self.current_page = 0
+        self._build_view()
 
-        options = [
-            discord.SelectOption(label=f"{i+1}. {title[:80]}", value=str(i))
-            for i, title in enumerate(page_titles)
-        ]
-        self.page_select = ui.Select(placeholder="Jump to a section...", options=options, row=0)
-        self.page_select.callback = self.select_callback
-        self.add_item(self.page_select)
+    def _build_view(self):
+        self.clear_items()
+        
+        # Row 0: Dropdown (Chunked to 25 items max)
+        chunk_index = self.current_page // 25
+        start_idx = chunk_index * 25
+        end_idx = min(start_idx + 25, len(self.embeds))
 
-        self._update_buttons()
+        options = []
+        for i in range(start_idx, end_idx):
+            title = self.page_titles[i]
+            options.append(discord.SelectOption(
+                label=f"{i+1}. {title[:80]}",
+                value=str(i),
+                default=(i == self.current_page)
+            ))
+        
+        placeholder = f"Index Sections {start_idx + 1}-{end_idx}..." if len(self.embeds) > 25 else "Jump to a section..."
+        select = ui.Select(placeholder=placeholder, options=options, row=0)
+        select.callback = self.select_callback
+        self.add_item(select)
 
-    def _update_buttons(self):
-        # Find buttons by their label to avoid index issues
-        for item in self.children:
-            if isinstance(item, ui.Button):
-                if item.label == "Previous":
-                    item.disabled = self.current_page == 0
-                elif item.label == "Next":
-                    item.disabled = self.current_page == len(self.embeds) - 1
+        # Row 1: Pagination Navigation
+        prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page == 0), row=1)
+        prev_btn.callback = self.prev_callback
+        self.add_item(prev_btn)
 
-    async def update_message(self, interaction: discord.Interaction):
-        self._update_buttons()
-        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
+        page_lbl = ui.Button(label=f"Page {self.current_page + 1}/{len(self.embeds)}", style=discord.ButtonStyle.grey, disabled=True, row=1)
+        self.add_item(page_lbl)
+
+        next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page >= len(self.embeds) - 1), row=1)
+        next_btn.callback = self.next_callback
+        self.add_item(next_btn)
 
     async def select_callback(self, interaction: discord.Interaction):
-        self.current_page = int(self.page_select.values[0])
-        await self.update_message(interaction)
+        self.current_page = int(interaction.data['values'][0])
+        self._build_view()
+        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
 
-    @ui.button(label="Previous", style=discord.ButtonStyle.blurple, row=1)
-    async def previous_button(self, interaction: discord.Interaction, button: ui.Button):
-        if self.current_page > 0:
-            self.current_page -= 1
-            await self.update_message(interaction)
+    async def prev_callback(self, interaction: discord.Interaction):
+        self.current_page -= 1
+        self._build_view()
+        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
 
-    @ui.button(label="Next", style=discord.ButtonStyle.blurple, row=1)
-    async def next_button(self, interaction: discord.Interaction, button: ui.Button):
-        if self.current_page < len(self.embeds) - 1:
-            self.current_page += 1
-            await self.update_message(interaction)
+    async def next_callback(self, interaction: discord.Interaction):
+        self.current_page += 1
+        self._build_view()
+        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
 
 class ProfileManageView(ui.View):
     def __init__(self, cog: 'GeminiAgent', original_interaction: discord.Interaction, profile_name: str, is_borrowed: bool):
