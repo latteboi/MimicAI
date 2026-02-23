@@ -112,8 +112,6 @@ MimicAI is an interface; it requires a "Brain" to function.
 # Beta Disclaimers & Outdated Info
 As an Open Beta, certain components are still catching up to the rapid structural changes:
 
-*   Help Command: The `/help` command currently displays documentation that may be outdated. It will be rewritten to reflect the latest changes at a later time.
-*   SDK Migration: This project is currently in a mixed state between the legacy Google Generative AI SDK and the new Unified Gen AI SDK (v2).
 *   Experimental Features: Features like the `Anti-Repetition Critic` add latency and are still being tuned for optimal performance.
 *   Due to the AI-Generated nature of this project, there may be bugs and inconsistencies. However, I am actively working to improve the codebase and address any issues.
 
