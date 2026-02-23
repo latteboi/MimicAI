@@ -121,15 +121,24 @@ class OpenRouterModel:
             for p in content.get('parts', []):
                 if isinstance(p, str) and p.strip():
                     message_parts.append({"type": "text", "text": p})
-                elif isinstance(p, dict) and p.get('inline_data'):
-                    mime_type = p['inline_data'].get('mime_type', '')
+                elif isinstance(p, dict) and 'mime_type' in p and 'data' in p:
+                    mime_type = p['mime_type']
                     if mime_type.startswith("image/"):
                         try:
-                            b64_data = base64.b64encode(p['inline_data']['data']).decode('utf-8')
+                            b64_data = base64.b64encode(p['data']).decode('utf-8')
                             data_uri = f"data:{mime_type};base64,{b64_data}"
-                            message_parts.append({"type": "image_url", "image_url": {"url": data_uri, "detail": "auto"}})
+                            message_parts.append({"type": "image_url", "image_url": {"url": data_uri}})
                         except Exception as e:
                             print(f"Error encoding image for OpenRouter: {e}")
+                elif hasattr(p, 'inline_data') and p.inline_data:
+                    mime_type = p.inline_data.mime_type
+                    if mime_type.startswith("image/"):
+                        try:
+                            b64_data = base64.b64encode(p.inline_data.data).decode('utf-8')
+                            data_uri = f"data:{mime_type};base64,{b64_data}"
+                            message_parts.append({"type": "image_url", "image_url": {"url": data_uri}})
+                        except Exception as e:
+                            print(f"Error encoding legacy image for OpenRouter: {e}")
 
             if message_parts:
                 if len(message_parts) == 1 and message_parts[0]["type"] == "text":
@@ -268,6 +277,10 @@ class GoogleGenAIModel:
 
         thinking_cfg = None
         model_lower = self.model_name.lower()
+        
+        # [NEW] Exclude utility models that do not support reasoning tokens/thinking config
+        is_utility_model = any(suffix in model_lower for suffix in ["-image", "-tts", "-embedding"])
+        
         include_thoughts = self.thinking_params.get("thinking_summary_visible") == "on"
         
         temp = None
@@ -290,30 +303,31 @@ class GoogleGenAIModel:
             if generation_config and hasattr(generation_config, 'thinking_config') and generation_config.thinking_config:
                 include_thoughts = generation_config.thinking_config.include_thoughts
 
-        if "gemini-3" in model_lower:
-            lvl = self.thinking_params.get("thinking_level", "high").lower()
-            is_pro = "pro" in model_lower
-            if is_pro:
-                mapped_lvl = "LOW" if lvl in ["low", "minimal", "none"] else "HIGH"
-            else:
-                mapped_lvl = {
-                    "xhigh": "HIGH", "high": "HIGH", "medium": "MEDIUM", 
-                    "low": "LOW", "minimal": "MINIMAL", "none": "MINIMAL"
-                }.get(lvl, "HIGH")
+        if not is_utility_model:
+            if "gemini-3" in model_lower:
+                lvl = self.thinking_params.get("thinking_level", "high").lower()
+                is_pro = "pro" in model_lower
+                if is_pro:
+                    mapped_lvl = "LOW" if lvl in ["low", "minimal", "none"] else "HIGH"
+                else:
+                    mapped_lvl = {
+                        "xhigh": "HIGH", "high": "HIGH", "medium": "MEDIUM", 
+                        "low": "LOW", "minimal": "MINIMAL", "none": "MINIMAL"
+                    }.get(lvl, "HIGH")
 
-            thinking_cfg = types.ThinkingConfig(
-                include_thoughts=include_thoughts,
-                thinking_level=mapped_lvl
-            )
-        elif "gemini-2.5" in model_lower:
-            budget = int(self.thinking_params.get("thinking_budget", -1))
-            if "lite" not in model_lower:
-                if "pro" in model_lower and 0 <= budget < 128:
-                    budget = 128
                 thinking_cfg = types.ThinkingConfig(
                     include_thoughts=include_thoughts,
-                    thinking_budget=budget
+                    thinking_level=mapped_lvl
                 )
+            elif "gemini-2.5" in model_lower:
+                budget = int(self.thinking_params.get("thinking_budget", -1))
+                if "lite" not in model_lower:
+                    if "pro" in model_lower and 0 <= budget < 128:
+                        budget = 128
+                    thinking_cfg = types.ThinkingConfig(
+                        include_thoughts=include_thoughts,
+                        thinking_budget=budget
+                    )
 
         config = types.GenerateContentConfig(
             system_instruction=self.system_instruction,
@@ -1671,7 +1685,12 @@ class ServicesMixin:
                                 threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
                                 dynamic_safety_settings = { cat: threshold for cat in get_args(HarmCategory) }
 
-                                image_model = genai.GenerativeModel('gemini-2.5-flash-image', system_instruction=system_instruction, safety_settings=dynamic_safety_settings)
+                                image_model = GoogleGenAIModel(
+                                    api_key=api_key, 
+                                    model_name='gemini-2.5-flash-image', 
+                                    system_instruction=system_instruction, 
+                                    safety_settings=dynamic_safety_settings
+                                )
                                 
                                 parts = [final_prompt_text]
                                 if image_gen_anchor_message:
@@ -1746,7 +1765,7 @@ class ServicesMixin:
 
                                 if response.candidates and response.candidates[0].finish_reason.name == 'STOP':
                                     for part in response.candidates[0].content.parts:
-                                        if hasattr(part, 'inline_data') and part.inline_data.mime_type.startswith('image/'):
+                                        if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/'):
                                             generated_image_bytes_for_round = part.inline_data.data
                                             break
                         
@@ -2382,6 +2401,7 @@ class ServicesMixin:
                                     bypass_typing=True # Skip delay
                                 )
                     
+                    user_content_obj = {'role': 'user', 'parts': [history_line]}
                     for key, other_chat_session in session['chat_sessions'].items():
                         if key != participant_key and other_chat_session is not None:
                             other_chat_session.history.append(user_content_obj)
@@ -2765,7 +2785,7 @@ class ServicesMixin:
                                     candidate = response.candidates[0]
                                     if candidate.finish_reason.name != 'STOP': failure_reason = f"the process being stopped for reason: **{candidate.finish_reason.name.replace('_', ' ').title()}**"
                                     else:
-                                        image_bytes = next((part.inline_data.data for part in candidate.content.parts if hasattr(part, 'inline_data') and part.inline_data.mime_type.startswith('image/')), None)
+                                        image_bytes = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
                                         if not image_bytes: failure_reason = "an unknown issue (the model returned no image data)"
                             except Exception as e: failure_reason = f"an unexpected error: `{e}`"
                             package['generated_image_bytes'] = image_bytes
@@ -3007,7 +3027,7 @@ class ServicesMixin:
                         if candidate.finish_reason.name != 'STOP':
                             failure_reason = f"the process being stopped for reason: **{candidate.finish_reason.name.replace('_', ' ').title()}**"
                         else:
-                            image_bytes = next((part.inline_data.data for part in candidate.content.parts if hasattr(part, 'inline_data') and part.inline_data.mime_type.startswith('image/')), None)
+                            image_bytes = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
                             if not image_bytes: failure_reason = "an unknown issue (the model returned no image data)"
                 except Exception as e:
                     failure_reason = f"an unexpected error: `{e}`"
@@ -5656,7 +5676,7 @@ class ServicesMixin:
             if response.candidates and response.candidates[0].content.parts:
                 raw_audio_bytes = None
                 for part in response.candidates[0].content.parts:
-                    if part.inline_data and part.inline_data.data:
+                    if getattr(part, 'inline_data', None) and part.inline_data.data:
                         raw_audio_bytes = part.inline_data.data
                         break
                 
@@ -5904,6 +5924,19 @@ class ServicesMixin:
             return "Unsupported File Format (Model lacks Audio support)"
         if "video input" in error_str.lower() or "support video" in error_str.lower():
             return "Unsupported File Format (Model lacks Video support)"
+            
+        # [NEW] Parse OpenRouter JSON errors gracefully
+        if "OpenRouter API Error" in error_str:
+            try:
+                json_part = error_str[error_str.find("{"):]
+                err_data = json.loads(json_part)
+                if "error" in err_data and "message" in err_data["error"]:
+                    msg = err_data["error"]["message"]
+                    if msg == "Provider returned error":
+                        return "Provider Error"
+                    return f"OpenRouter: {msg}"
+            except Exception:
+                pass
         
         # 2. Standard HTTP Status Codes
         if "429" in error_str: return "Rate Limit (429)"
@@ -5916,5 +5949,6 @@ class ServicesMixin:
         if "403" in error_str: return "Access Forbidden/Moderated (403)"
         if "413" in error_str: return "File Too Large (413)"
         
-        # 3. Fallback to truncated raw error
-        return error_str[:100]
+        # 3. Fallback to truncated raw error with brackets stripped for aesthetic safety
+        clean_err = error_str.replace('"', "'").replace('{', '').replace('}', '').replace('\n', ' ')
+        return clean_err[:80] + "..." if len(clean_err) > 80 else clean_err

@@ -396,10 +396,6 @@ class CoreMixin:
         
         if not session:
             return
-            
-        # [NEW] Concurrency Safeguard
-        if session.get('is_running') or session.get('is_regenerating'):
-            return
 
         self.session_last_accessed[channel_id] = time.time()
 
@@ -440,7 +436,17 @@ class CoreMixin:
                             await msg.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
                     except: pass
 
-                    asyncio.create_task(self._execute_regeneration(payload, session, turn_object, turn_index, reacted_to_participant))
+                    # [NEW] Queue Mechanism for Regeneration
+                    async def queue_regeneration():
+                        while session.get('is_running') or session.get('is_regenerating'):
+                            await asyncio.sleep(1)
+                        
+                        # Verify the turn hasn't been deleted while waiting
+                        still_exists = any(t.get("turn_id") == turn_id_to_find for t in session.get("unified_log", []))
+                        if still_exists:
+                            await self._execute_regeneration(payload, session, turn_object, turn_index, reacted_to_participant)
+
+                    asyncio.create_task(queue_regeneration())
                     return
                 
                 if is_skip:
@@ -525,7 +531,7 @@ class CoreMixin:
         if not session or not session.get("is_hydrated"):
             session = self._ensure_session_hydrated(channel_id, session_type)
         
-        if not session or session.get('is_running') or session.get('is_regenerating'): return
+        if not session: return
 
         turn_object = next((turn for turn in session.get("unified_log", []) if turn.get("turn_id") == turn_id_to_find), None)
         if turn_object:
