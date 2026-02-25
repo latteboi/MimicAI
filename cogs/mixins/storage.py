@@ -335,20 +335,33 @@ class StorageMixin:
                         role = item.get('role')
                         parts = item.get('parts', [])
                         content = "".join(p.get('text', '') for p in parts)
-                        unified_log.append({
+                        log_item = {
                             "turn_id": str(uuid.uuid4()),
                             "role": role,
                             "content": content,
                             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
-                        })
+                        }
+                        if item.get('thought_signature'):
+                            log_item['thought_signature'] = item.get('thought_signature')
+                        unified_log.append(log_item)
                     
-                    history = [{'role': t['role'], 'parts': [t['content']]} for t in unified_log]
+                    history = []
+                    for t in unified_log:
+                        obj = {'role': t['role'], 'parts': [t['content']]}
+                        if t.get('thought_signature'):
+                            obj['thought_signature'] = t.get('thought_signature')
+                        history.append(obj)
                     chat_session = GoogleGenAIChatSession(history=history)
                     
                     return {'chat_session': chat_session, 'unified_log': unified_log}
                 
                 elif data and isinstance(data, list) and 'turn_id' in data[0]:
-                    history = [{'role': t['role'], 'parts': [t['content']]} for t in data]
+                    history = []
+                    for t in data:
+                        obj = {'role': t['role'], 'parts': [t['content']]}
+                        if t.get('thought_signature'):
+                            obj['thought_signature'] = t.get('thought_signature')
+                        history.append(obj)
                     chat_session = GoogleGenAIChatSession(history=history)
                     return {'chat_session': chat_session, 'unified_log': data}
                 
@@ -1070,6 +1083,7 @@ class StorageMixin:
                 "fallback_model": FALLBACK_MODEL_NAME,
                 "time_tracking_enabled": True,
                 "timezone": "UTC",
+                "generation_metadata_enabled": False,
                 "realistic_typing_enabled": False,
                 "ltm_creation_enabled": False,
                 "image_generation_enabled": False,
@@ -1078,6 +1092,7 @@ class StorageMixin:
                 "thinking_summary_visible": "off",
                 "thinking_level": "high",
                 "thinking_budget": -1,
+                "thinking_signatures_enabled": "off",
                 "error_response": "An error has occurred."
             }
         else: 
@@ -1099,12 +1114,14 @@ class StorageMixin:
             profile.setdefault("fallback_model", FALLBACK_MODEL_NAME)
             profile.setdefault("time_tracking_enabled", True)
             profile.setdefault("timezone", "UTC")
+            profile.setdefault("generation_metadata_enabled", False)
             profile.setdefault("realistic_typing_enabled", False)
             profile.setdefault("ltm_creation_enabled", False)
             profile.setdefault("image_generation_prompt", None)
             profile.setdefault("thinking_summary_visible", "off")
             profile.setdefault("thinking_level", "medium")
             profile.setdefault("thinking_budget", -1)
+            profile.setdefault("thinking_signatures_enabled", "off")
             profile.setdefault("speech_voice", "Aoede")
             profile.setdefault("speech_model", "gemini-2.5-flash-preview-tts")
             profile.setdefault("speech_temperature", 1.0)

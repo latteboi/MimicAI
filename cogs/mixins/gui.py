@@ -293,9 +293,9 @@ class ProfileAdvancedParamsModal(ui.Modal, title="Advanced Parameters (OpenRoute
             v = current_params.get(key)
             return str(v) if v is not None else ""
 
-        self.add_item(ui.TextInput(label="Frequency Penalty (-2.0 to 2.0)", custom_id="frequency_penalty", default=get_val("frequency_penalty"), required=False, placeholder="Default: 0.0"))
-        self.add_item(ui.TextInput(label="Presence Penalty (-2.0 to 2.0)", custom_id="presence_penalty", default=get_val("presence_penalty"), required=False, placeholder="Default: 0.0"))
-        self.add_item(ui.TextInput(label="Repetition Penalty (0.0 to 2.0)", custom_id="repetition_penalty", default=get_val("repetition_penalty"), required=False, placeholder="Default: 1.0"))
+        self.add_item(ui.TextInput(label="Frequency Penalty (-2.0 to 2.0)", custom_id="frequency_penalty", default=get_val("frequency_penalty"), required=False, placeholder="Default: 0.0 (Disabled)"))
+        self.add_item(ui.TextInput(label="Presence Penalty (-2.0 to 2.0)", custom_id="presence_penalty", default=get_val("presence_penalty"), required=False, placeholder="Default: 0.0 (Disabled)"))
+        self.add_item(ui.TextInput(label="Repetition Penalty (0.0 to 2.0)", custom_id="repetition_penalty", default=get_val("repetition_penalty"), required=False, placeholder="Default: 0.0 (Disabled)"))
         self.add_item(ui.TextInput(label="Min P (0.0 to 1.0)", custom_id="min_p", default=get_val("min_p"), required=False, placeholder="Default: 0.0 (Disabled)"))
         self.add_item(ui.TextInput(label="Top A (0.0 to 1.0)", custom_id="top_a", default=get_val("top_a"), required=False, placeholder="Default: 0.0 (Disabled)"))
 
@@ -780,6 +780,7 @@ class ProfileManageView(ui.View):
             options.append(discord.SelectOption(label="Toggle URL Context Fetching", value="url_toggle", description="Allow this profile to fetch content from links in messages."))
             options.append(discord.SelectOption(label="Cycle Response Mode", value="cycle_response", description="Cycle: Regular -> Mention -> Reply -> Mention Reply."))
             options.append(discord.SelectOption(label="Set Time & Timezone", value="time", description="Enable time awareness and set the profile's timezone."))
+            options.append(discord.SelectOption(label="Toggle Generation Metadata", value="metadata_toggle", description="Show/hide generation time in context."))
             options.append(discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable a human-like delay when the bot sends messages."))
             options.append(discord.SelectOption(label="Toggle Anti-Repetition Critic", value="critic", description="Enable semantic repetition analysis (Adds latency)."))
 
@@ -951,6 +952,9 @@ class ProfileManageView(ui.View):
             await self._save_and_refresh(interaction, user_data, profile_name)
         elif choice == "time":
             await self._handle_timezone(interaction, user_data, profile)
+        elif choice == "metadata_toggle":
+            profile["generation_metadata_enabled"] = not profile.get("generation_metadata_enabled", False)
+            await self._save_and_refresh(interaction, user_data, profile_name)
         elif choice == "critic":
             profile["critic_enabled"] = not profile.get("critic_enabled", False)
             await self._save_and_refresh(interaction, user_data, profile_name)
@@ -2396,6 +2400,13 @@ class ProfileThinkingParamsModal(ui.Modal, title="Thinking & Reasoning Parameter
             placeholder="-1 = dynamic, 128+ = token limit",
             required=False
         ))
+        self.add_item(ui.TextInput(
+            label="Enable Thought Signatures (on/off)", 
+            custom_id="thinking_signatures_enabled", 
+            default=current_params.get("thinking_signatures_enabled", "off"), 
+            placeholder="on or off",
+            required=False
+        ))
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -2416,6 +2427,10 @@ class ProfileThinkingParamsModal(ui.Modal, title="Thinking & Reasoning Parameter
             b_val = int(get_v("thinking_budget"))
             if b_val < -1: b_val = -1
             new_params["thinking_budget"] = min(b_val, 32768)
+
+            sig_val = get_v("thinking_signatures_enabled")
+            if sig_val not in ["on", "off"]: sig_val = "off"
+            new_params["thinking_signatures_enabled"] = sig_val
 
         except ValueError as e:
             await interaction.followup.send(f"❌ **Invalid Input:** {e}", ephemeral=True); return
@@ -3689,6 +3704,54 @@ class BulkTimezoneView(BaseBulkProfileView):
                 self.cog.chat_sessions.pop(k, None)
 
         await interaction.edit_original_response(content=f"Timezone set to **{self.selected_tz}** for {updated_count} profiles.", view=None)
+
+class BulkMetadataView(BaseBulkProfileView):
+    def __init__(self, cog: 'GeminiAgent', user_id: int):
+        super().__init__(cog, user_id, include_borrowed=True)
+        self.toggle_choice = None
+        self._build_view()
+
+    def _build_view(self):
+        self.clear_items()
+        
+        toggle_options = [
+            discord.SelectOption(label="Enable Generation Metadata", value="enable", default=(self.toggle_choice is True)),
+            discord.SelectOption(label="Disable Generation Metadata", value="disable", default=(self.toggle_choice is False))
+        ]
+        toggle_select = ui.Select(placeholder="Choose an action...", options=toggle_options, row=0)
+        toggle_select.callback = self.toggle_callback
+        self.add_item(toggle_select)
+
+        self._build_profile_select_ui(row=1)
+        
+        apply_btn = ui.Button(label="Apply Action", style=discord.ButtonStyle.green, row=3)
+        apply_btn.callback = self.apply_action
+        self.add_item(apply_btn)
+
+    async def toggle_callback(self, interaction: discord.Interaction):
+        self.toggle_choice = interaction.data['values'][0] == "enable"
+        self._build_view()
+        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+
+    async def apply_action(self, interaction: discord.Interaction, button: ui.Button = None):
+        await interaction.response.defer()
+        target_profiles = list(self.selected_profiles)
+        if self.toggle_choice is None or not target_profiles:
+            await interaction.edit_original_response(content="Please select an action and at least one profile.", view=None); return
+
+        updated_count = 0
+        user_data = self.cog._get_user_data_entry(self.user_id)
+        for profile_name in target_profiles:
+            is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
+            profile = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name)
+            if profile:
+                profile["generation_metadata_enabled"] = self.toggle_choice
+                updated_count += 1
+        
+        if updated_count > 0: self.cog._save_user_data_entry(self.user_id, user_data)
+        
+        status = "ENABLED" if self.toggle_choice else "DISABLED"
+        await interaction.edit_original_response(content=f"Generation metadata has been set to **{status}** for {updated_count} profile(s).", view=None)
 
 class BulkResetView(BaseBulkProfileView):
     def __init__(self, cog: 'GeminiAgent', user_id: int):
@@ -5590,6 +5653,7 @@ class BulkManageView(ui.View):
             discord.SelectOption(label="Toggle Image Generation", value="image_gen", description="Enable or disable image generation for multiple profiles."),
             discord.SelectOption(label="Toggle URL Context Fetching", value="url_context", description="Enable or disable link scraping for multiple profiles."),
             discord.SelectOption(label="Set Time & Timezone", value="timezone", description="Enable time-awareness and set a specific timezone."),
+            discord.SelectOption(label="Toggle Generation Metadata", value="metadata_toggle", description="Show/hide generation time and duration."),
             discord.SelectOption(label="Toggle Critic (Anti-Repetition)", value="critic", description="Enable or disable the critic for multiple profiles."),
             discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable or disable realistic typing for multiple profiles."),
             discord.SelectOption(label="Set Safety Level", value="safety_level", description="Apply a content safety level to multiple profiles."),
@@ -5676,6 +5740,8 @@ class BulkManageView(ui.View):
                         lvl = "high"
                     params["thinking_level"] = lvl
                     params["thinking_budget"] = int(gv("thinking_budget"))
+                    sig_val = gv("thinking_signatures_enabled")
+                    params["thinking_signatures_enabled"] = sig_val if sig_val in ["on", "off"] else "off"
                 except ValueError:
                     await i.followup.send("❌ **Invalid Input**", ephemeral=True); return
 
@@ -5760,6 +5826,11 @@ class BulkManageView(ui.View):
             await interaction.response.defer()
             view = BulkTimezoneView(self.cog, self.user_id)
             await self.original_interaction.edit_original_response(content="Select a timezone and the profiles to apply it to:", view=view)
+            
+        elif choice == "metadata_toggle":
+            await interaction.response.defer()
+            view = BulkMetadataView(self.cog, self.user_id)
+            await self.original_interaction.edit_original_response(content="Select metadata toggle action and profiles:", view=view)
         
         elif choice == "critic":
             await interaction.response.defer()

@@ -916,7 +916,6 @@ class CoreMixin:
             chat = session_data['chat_session']
             self.session_last_accessed[model_cache_key] = time.time()
 
-            # [UPDATED] Standardized XML Headers
             rebuilt_history = []
             for t in session_data['unified_log']:
                 t_role = t.get('role')
@@ -928,7 +927,10 @@ class CoreMixin:
                     if t.get('grounding_context') and profile_data.get('grounding_mode', 'off') != 'off':
                         parts.append(f"\n<external_context>\n{t.get('grounding_context')}\n</external_context>")
                 
-                rebuilt_history.append({'role': t_role, 'parts': parts})
+                content_obj = {'role': t_role, 'parts': parts}
+                if t_role == 'model' and t.get('thought_signature'):
+                    content_obj['thought_signature'] = t.get('thought_signature')
+                rebuilt_history.append(content_obj)
             
             chat.history = rebuilt_history
 
@@ -1100,9 +1102,17 @@ class CoreMixin:
             session_data['unified_log'].append({
                 "turn_id": user_turn_id, "role": "user", "content": message, "timestamp": timestamp
             })
-            session_data['unified_log'].append({
+            
+            model_log = {
                 "turn_id": model_turn_id, "role": "model", "content": response_text, "timestamp": timestamp
-            })
+            }
+            if profile_data.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
+                sig = response.thought_signature
+                if isinstance(sig, bytes):
+                    import base64
+                    sig = base64.b64encode(sig).decode('utf-8')
+                model_log['thought_signature'] = sig
+            session_data['unified_log'].append(model_log)
 
             text_for_embed = response_text
             if fallback_used and profile_data.get("show_fallback_indicator", True):
@@ -1120,16 +1130,24 @@ class CoreMixin:
             # Update the history object with the metadata (Bot Only)
             timezone_str = profile_data.get("timezone", "UTC")
             main_history_line = self._format_history_entry(display_name, response_message.created_at, response_text, timezone_str)
-            try:
-                t1_formatted = t1_start_utc.astimezone(ZoneInfo(timezone_str)).strftime('%I:%M:%S %p %Z')
-            except Exception:
-                t1_formatted = t1_start_utc.strftime('%I:%M:%S %p UTC')
-            metadata_line = f"(Thought Initiated: {t1_formatted} | Duration: {duration:.2f}s)"
-            bot_response_formatted = f"{main_history_line.strip()}\n{metadata_line}\n"
+            
+            if profile_data.get("generation_metadata_enabled", False):
+                try:
+                    t1_formatted = t1_start_utc.astimezone(ZoneInfo(timezone_str)).strftime('%I:%M:%S %p %Z')
+                except Exception:
+                    t1_formatted = t1_start_utc.strftime('%I:%M:%S %p UTC')
+                metadata_line = f"(Thought Initiated: {t1_formatted} | Duration: {duration:.2f}s)"
+                bot_response_formatted = f"{main_history_line.strip()}\n{metadata_line}\n"
+            else:
+                bot_response_formatted = main_history_line
             
             # Replace the last model turn in history with the one containing metadata for context
             if chat.history and chat.history[-1].get('role', 'user') == 'model':
-                chat.history[-1] = {'role': 'model', 'parts': [bot_response_formatted]}
+                old_turn = chat.history[-1]
+                new_turn = {'role': 'model', 'parts': [bot_response_formatted]}
+                if 'thought_signature' in old_turn:
+                    new_turn['thought_signature'] = old_turn['thought_signature']
+                chat.history[-1] = new_turn
 
             # Persist immediately to disk for safety and UI consistency
             self._save_session_to_disk(model_cache_key, 'global_chat', session_data)
@@ -1236,15 +1254,31 @@ class CoreMixin:
 
         response_turn_id = str(uuid.uuid4())
         response_content = self._format_history_entry(profile_name, datetime.datetime.now(datetime.timezone.utc), response_text)
-        session["unified_log"].append({
+        
+        p_settings = self._get_user_data_entry(owner_id).get("profiles", {}).get(profile_name, {})
+        if not p_settings: p_settings = self._get_user_data_entry(owner_id).get("borrowed_profiles", {}).get(profile_name, {})
+        
+        resp_log = {
             "turn_id": response_turn_id, "type": "private_response",
             "speaker_key": list(participant_key), "target_id": interaction.user.id,
             "content": response_content, "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
-        })
+        }
+        if p_settings.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
+            sig = response.thought_signature
+            if isinstance(sig, bytes):
+                import base64
+                sig = base64.b64encode(sig).decode('utf-8')
+            resp_log['thought_signature'] = sig
+            
+        session["unified_log"].append(resp_log)
 
         # Add to the target's in-memory history
         chat_session.history.append({'role': 'user', 'parts': [whisper_content]})
-        chat_session.history.append({'role': 'model', 'parts': [response_content]})
+        
+        model_obj = {'role': 'model', 'parts': [response_content]}
+        if 'thought_signature' in resp_log:
+            model_obj['thought_signature'] = resp_log['thought_signature']
+        chat_session.history.append(model_obj)
 
         # Add to pending whispers to be injected into the next public turn
         session.setdefault("pending_whispers", {}).setdefault(participant_key, []).append(whisper_content)
@@ -1691,11 +1725,14 @@ class CoreMixin:
                         participant_history.append({'role': 'user', 'parts': [wrapped]})
                 elif turn_type == "private_response":
                     if p_key == tuple(turn.get("speaker_key", [])):
-                        # [NEW] Wrap clean text in XML tags only when feeding to the AI
+                        # [NEW] Apply dynamic XML wrapping during re-hydration
                         clean_content = turn.get("content")
                         header, body = clean_content.split('\n', 1)
                         wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                        participant_history.append({'role': 'model', 'parts': [wrapped]})
+                        obj = {'role': 'model', 'parts': [wrapped]}
+                        if turn.get('thought_signature'):
+                            obj['thought_signature'] = turn.get('thought_signature')
+                        participant_history.append(obj)
             
             session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 
@@ -1964,7 +2001,7 @@ class CoreMixin:
         # 3. Advanced Parameters Section
         freq_p = source_profile_data.get("frequency_penalty", 0.0)
         pres_p = source_profile_data.get("presence_penalty", 0.0)
-        rep_p = source_profile_data.get("repetition_penalty", 1.0)
+        rep_p = source_profile_data.get("repetition_penalty", 0.0)
         min_p = source_profile_data.get("min_p", 0.0)
         top_a = source_profile_data.get("top_a", 0.0)
 
@@ -1988,6 +2025,8 @@ class CoreMixin:
         timezone = source_profile_data.get("timezone", "UTC")
         typing = "**`ON`**" if source_profile_data.get("realistic_typing_enabled", False) else "`OFF`"
         critic = "**`ON`**" if source_profile_data.get("critic_enabled", False) else "`OFF`"
+        critic = "**`ON`**" if source_profile_data.get("critic_enabled", False) else "`OFF`"
+        metadata_vis = "**`ON`**" if source_profile_data.get("generation_metadata_enabled", False) else "`OFF`"
         resp_mode = source_profile_data.get("response_mode", "regular").replace('_', ' ').title()
 
         # Invisible Separator to push the next row down
@@ -2000,6 +2039,7 @@ class CoreMixin:
             f"URL Context: {url_ctx}\n"
             f"Response Mode: `{resp_mode}`\n"
             f"Timezone: `{timezone}`\n"
+            f"Gen Metadata: {metadata_vis}\n"
             f"Realistic Typing: {typing}\n"
             f"Critic: {critic}"
         )

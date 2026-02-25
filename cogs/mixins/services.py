@@ -254,6 +254,16 @@ class GoogleGenAIModel:
                         parts.append(types.Part.from_text(text=p))
                     elif isinstance(p, dict) and 'mime_type' in p and 'data' in p:
                         parts.append(types.Part.from_bytes(data=p['data'], mime_type=p['mime_type']))
+                
+                if item.get('thought_signature') and parts:
+                    sig = item['thought_signature']
+                    if isinstance(sig, str):
+                        try:
+                            import base64
+                            sig = base64.b64decode(sig)
+                        except Exception: pass
+                    parts[-1].thought_signature = sig
+
                 formatted_contents.append(types.Content(role=role, parts=parts))
             elif hasattr(item, 'role') and hasattr(item, 'parts'):
                 # Fallback for legacy objects
@@ -286,20 +296,17 @@ class GoogleGenAIModel:
         temp = None
         top_p = None
         top_k = None
-        advanced = {}
 
         if isinstance(generation_config, dict):
             temp = generation_config.get("temperature")
             top_p = generation_config.get("top_p")
             top_k = generation_config.get("top_k")
-            advanced = generation_config.get("_advanced_params", {})
             if generation_config.get("thinking_config"):
                 include_thoughts = generation_config["thinking_config"].get("include_thoughts", include_thoughts)
         else:
             temp = generation_config.temperature if generation_config else None
             top_p = generation_config.top_p if generation_config else None
             top_k = generation_config.top_k if generation_config else None
-            advanced = generation_config._advanced_params if generation_config and hasattr(generation_config, '_advanced_params') else {}
             if generation_config and hasattr(generation_config, 'thinking_config') and generation_config.thinking_config:
                 include_thoughts = generation_config.thinking_config.include_thoughts
 
@@ -338,11 +345,6 @@ class GoogleGenAIModel:
             thinking_config=thinking_cfg
         )
 
-        if advanced:
-            for k, v in advanced.items():
-                if hasattr(config, k):
-                    setattr(config, k, v)
-
         response = await self.client.aio.models.generate_content(
             model=self.model_name,
             contents=formatted_contents,
@@ -357,6 +359,7 @@ class GoogleGenAIModel:
                 self.raw = raw_resp
                 self.text = ""
                 self.thought = ""
+                self.thought_signature = None
                 self.candidates = raw_resp.candidates
                 self.prompt_feedback = getattr(raw_resp, 'prompt_feedback', None)
                 self.usage_metadata = getattr(raw_resp, 'usage_metadata', None)
@@ -368,6 +371,9 @@ class GoogleGenAIModel:
                             self.thought += part.text or ""
                         elif part.text:
                             self.text += part.text
+                        
+                        if hasattr(part, 'thought_signature') and part.thought_signature:
+                            self.thought_signature = part.thought_signature
             def __bool__(self): return bool(self.candidates)
 
         return ThoughtResponse(response)
@@ -660,10 +666,10 @@ class ServicesMixin:
         
         rule_block = (
             "<context_rules>\n"
-            "CONTEXT PROTOCOL:\n"
-            "- PRESENCE: `[Name] [Timestamp]` are individual active participants.\n"
-            "- METADATA: XML-wrapped blocks are system-generated data; they are from your conscious & they are NOT from users.\n"
-            "- OUTPUT: Respond as you. Do NOT include headers and technical metadata.\n"
+            "ESSENTIAL CONTEXT:\n"
+            "- '[Name] [Timestamp]' are individual active participants.\n"
+            "- XML-wrapped text are data from YOU, NOT users.\n"
+            "- Respond as yourself. Do NOT include headers and technical metadata.\n"
             "</context_rules>"
         )
         current_instructions_str += "\n\n" + rule_block
@@ -1758,7 +1764,7 @@ class ServicesMixin:
                                 
                                 status = "api_error"
                                 try:
-                                    response = await image_model.generate_content_async(parts)
+                                    response = await image_model.generate_content_async([{'role': 'user', 'parts': parts}])
                                     status = "blocked_by_safety" if not response.candidates else "success"
                                 finally:
                                     self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="image_generation_multi", model_used=image_model.model_name, status=status)
@@ -2142,12 +2148,16 @@ class ServicesMixin:
 
                     timezone_str = profile_settings.get("timezone", "UTC")
                     main_history_line = self._format_history_entry(speaker_display_name, sent_timestamp, response_text, timezone_str)
-                    try:
-                        t1_formatted = t1_start_utc.astimezone(ZoneInfo(timezone_str)).strftime('%I:%M:%S %p %Z')
-                    except Exception:
-                        t1_formatted = t1_start_utc.strftime('%I:%M:%S %p UTC')
-                    metadata_line = f"(Thought Initiated: {t1_formatted} | Duration: {duration:.2f}s)"
-                    history_line = f"{main_history_line.strip()}\n{metadata_line}\n"
+                    
+                    if profile_settings.get("generation_metadata_enabled", False):
+                        try:
+                            t1_formatted = t1_start_utc.astimezone(ZoneInfo(timezone_str)).strftime('%I:%M:%S %p %Z')
+                        except Exception:
+                            t1_formatted = t1_start_utc.strftime('%I:%M:%S %p UTC')
+                        metadata_line = f"(Thought Initiated: {t1_formatted} | Duration: {duration:.2f}s)"
+                        history_line = f"{main_history_line.strip()}\n{metadata_line}\n"
+                    else:
+                        history_line = main_history_line
 
                     turn_id = str(uuid.uuid4())
                     turn_object = {
@@ -2156,6 +2166,12 @@ class ServicesMixin:
                         "content": history_line,
                         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
                     }
+                    if profile_settings.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
+                        sig = response.thought_signature
+                        if isinstance(sig, bytes):
+                            import base64
+                            sig = base64.b64encode(sig).decode('utf-8')
+                        turn_object['thought_signature'] = sig
                     session.get("unified_log", []).append(turn_object)
                     session['last_speaker_key'] = participant_key
 
@@ -2667,6 +2683,8 @@ class ServicesMixin:
                                 parts.append(f"\n<external_context>\n{turn.get('grounding_context')}\n</external_context>")
 
                             content_obj = {'role': role, 'parts': parts}
+                            if role == 'model' and turn.get('thought_signature'):
+                                content_obj['thought_signature'] = turn.get('thought_signature')
                             participant_history.append(content_obj)
 
                         elif turn_type == "whisper":
@@ -2684,7 +2702,10 @@ class ServicesMixin:
                                 clean_content = turn.get("content")
                                 header, body = clean_content.split('\n', 1)
                                 wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                                participant_history.append({'role': 'model', 'parts': [wrapped]})
+                                obj = {'role': 'model', 'parts': [wrapped]}
+                                if turn.get('thought_signature'):
+                                    obj['thought_signature'] = turn.get('thought_signature')
+                                participant_history.append(obj)
                     session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 
                 # Handle Proactive Freewill Continuation
@@ -2769,7 +2790,7 @@ class ServicesMixin:
 
                                 status = "api_error"
                                 try:
-                                    response = await image_model.generate_content_async(parts)
+                                    response = await image_model.generate_content_async([{'role': 'user', 'parts': parts}])
                                     status = "blocked_by_safety" if not response.candidates else "success"
                                 finally:
                                     self._log_api_call(user_id=package['author_id'], guild_id=package['guild_id'], context="image_generation_jit", model_used=image_model.model_name, status=status)
@@ -3013,7 +3034,7 @@ class ServicesMixin:
                     
                     status = "api_error"
                     try:
-                        response = await image_model.generate_content_async([request_data['prompt_text']])
+                        response = await image_model.generate_content_async([{'role': 'user', 'parts': [request_data['prompt_text']]}])
                         status = "blocked_by_safety" if not response.candidates else "success"
                     finally:
                         self._log_api_call(user_id=request_data['author_id'], guild_id=request_data['guild_id'], context="image_generation_prefetch", model_used=image_model.model_name, status=status)
@@ -4961,16 +4982,22 @@ class ServicesMixin:
 
             response_text = self._deduplicate_response(response_text)
 
+            p_settings = self._get_user_data_entry(profile_owner_id).get("profiles", {}).get(profile_name, {})
+            if not p_settings: p_settings = self._get_user_data_entry(profile_owner_id).get("borrowed_profiles", {}).get(profile_name, {})
+
             user_content_obj = {'role': 'user', 'parts': [prompt_content]}
             model_content_obj = {'role': 'model', 'parts': [response_text]}
+            if p_settings.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
+                sig = response.thought_signature
+                if isinstance(sig, bytes):
+                    import base64
+                    sig = base64.b64encode(sig).decode('utf-8')
+                model_content_obj['thought_signature'] = sig
             chat.history.extend([user_content_obj, model_content_obj])
 
             text_to_send = response_text
             
             # Check profile setting for fallback indicator
-            p_settings = self._get_user_data_entry(profile_owner_id).get("profiles", {}).get(profile_name, {})
-            if not p_settings: p_settings = self._get_user_data_entry(profile_owner_id).get("borrowed_profiles", {}).get(profile_name, {})
-            
             if fallback_used and p_settings.get("show_fallback_indicator", True):
                 text_to_send += f"\n\n-# Fallback Model Used **({blocked_reason_override})**."
 
@@ -5582,12 +5609,18 @@ class ServicesMixin:
             if appearance_data and appearance_data.get("custom_display_name"): bot_display_name = appearance_data.get("custom_display_name")
 
             reference_image_urls = []
-            if message.reference and message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
+            if message.reference and message.reference.message_id:
                 ref_msg = message.reference.resolved
-                for attachment in ref_msg.attachments:
-                    if attachment.content_type and attachment.content_type.startswith("image/"):
-                        reference_image_urls.append(attachment.url)
-                        if len(reference_image_urls) >= 2: break
+                if not ref_msg or not isinstance(ref_msg, discord.Message):
+                    try:
+                        ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                    except Exception: pass
+                
+                if ref_msg and isinstance(ref_msg, discord.Message):
+                    for attachment in ref_msg.attachments:
+                        if attachment.content_type and attachment.content_type.startswith("image/"):
+                            reference_image_urls.append(attachment.url)
+                            if len(reference_image_urls) >= 2: break
             
             if len(reference_image_urls) < 2 and message.attachments:
                 for attachment in message.attachments:
@@ -5853,7 +5886,20 @@ class ServicesMixin:
             if hasattr(model, 'system_instruction'):
                 model.system_instruction = full_system_instruction
             
-            gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
+            # [NEW] Advanced Params Injection for Regeneration
+            u_data = self._get_user_data_entry(p_owner_id)
+            p_profile = u_data.get("profiles", {}).get(p_name) or u_data.get("borrowed_profiles", {}).get(p_name, {})
+            
+            adv_params = {
+                "frequency_penalty": p_profile.get("frequency_penalty"),
+                "presence_penalty": p_profile.get("presence_penalty"),
+                "repetition_penalty": p_profile.get("repetition_penalty"),
+                "min_p": p_profile.get("min_p"),
+                "top_a": p_profile.get("top_a")
+            }
+            adv_params = {k: v for k, v in adv_params.items() if v is not None}
+
+            gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "_advanced_params": adv_params}
             response = await model.generate_content_async(participant_history, generation_config=gen_config)
             
             if not response or not response.candidates:
@@ -5875,6 +5921,15 @@ class ServicesMixin:
             new_history_line = self._format_history_entry(sp_name, sent_timestamp, new_text, tz_str)
             turn_object["content"] = new_history_line
             turn_object["timestamp"] = sent_timestamp.isoformat()
+            
+            if p_profile.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
+                sig = response.thought_signature
+                if isinstance(sig, bytes):
+                    import base64
+                    sig = base64.b64encode(sig).decode('utf-8')
+                turn_object['thought_signature'] = sig
+            else:
+                turn_object.pop('thought_signature', None)
             
             if participant.get('method') == 'child_bot':
                 await self.manager_queue.put({
