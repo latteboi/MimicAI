@@ -538,6 +538,11 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     async def session_config_slash(self, interaction: discord.Interaction, mode: str):
         if not self.has_lock: return
         
+        # [NEW] Global Admin Check for all session config modes
+        if not (interaction.user.guild_permissions.administrator or interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)):
+            await interaction.response.send_message("You must be a server administrator to configure sessions.", ephemeral=True)
+            return
+
         # Invalidate previous session configuration view for this user
         if interaction.user.id in self.active_session_config_views:
             try:
@@ -609,10 +614,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             return
         
         if mode == "regular":
-            if not (interaction.user.guild_permissions.administrator or interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)):
-                await interaction.response.send_message("You must be an administrator to configure a Regular session.", ephemeral=True)
-                return
-
             try:
                 import shutil
                 dummy_key = (interaction.channel_id, None, None)

@@ -786,14 +786,13 @@ class ProfileManageView(ui.View):
 
         elif self.current_tab == "memory":
             options.append(discord.SelectOption(label="Manage Data (LTM & Training)", value="data", description="Add, list, edit, or delete memories and examples."))
-            options.append(discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training context size and relevance threshold."))
             if not self.is_borrowed:
-                options.append(discord.SelectOption(label="Toggle LTM Auto-Creation", value="ltm_creation", description="Automatically create memories from conversations."))
-                options.append(discord.SelectOption(label="Set LTM Parameters", value="ltm_params", description="Set frequency, context, and recall settings."))
+                options.append(discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training context size and relevance threshold."))
+            options.append(discord.SelectOption(label="Toggle LTM Auto-Creation", value="ltm_creation", description="Automatically create memories from conversations."))
+            options.append(discord.SelectOption(label="Set LTM Parameters", value="ltm_params", description="Set frequency, context, and recall settings."))
             options.append(discord.SelectOption(label="Cycle LTM Scope", value="ltm_scope", description="Cycle visibility: Global -> Server -> User."))
             if not self.is_borrowed:
                 options.append(discord.SelectOption(label="Set LTM Summarization Prompt", value="ltm_summarization", description="Customize how the AI creates memories."))
-                options.append(discord.SelectOption(label="Set Image Generation Prompt", value="image_gen_prompt", description="Instruction for image creation style."))
 
         if options:
             select = ui.Select(placeholder=f"Select an action for {self.current_tab.title()}...", options=options, row=0)
@@ -935,6 +934,12 @@ class ProfileManageView(ui.View):
             curr = profile.get("response_mode", "regular")
             profile["response_mode"] = modes[(modes.index(curr) + 1) % len(modes)]
             await self._save_and_refresh(interaction, user_data, profile_name)
+        elif choice in ["image_settings", "image_toggle"]:
+            async def refresh_cb(modal_interaction: discord.Interaction):
+                new_embed = await self.cog._build_profile_manage_embed(modal_interaction, profile_name)
+                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
+            modal = ProfileImageGenSettingsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb)
+            await interaction.response.send_modal(modal)
         elif choice == "typing":
             profile["realistic_typing_enabled"] = not profile.get("realistic_typing_enabled", False)
             await self._save_and_refresh(interaction, user_data, profile_name)
@@ -943,9 +948,6 @@ class ProfileManageView(ui.View):
             if isinstance(current_mode, bool): current_mode = "on" if current_mode else "off"
             cycle_map = {"off": "on", "on": "on+", "on+": "off"}
             profile["grounding_mode"] = cycle_map.get(current_mode, "off")
-            await self._save_and_refresh(interaction, user_data, profile_name)
-        elif choice == "image_toggle":
-            profile["image_generation_enabled"] = not profile.get("image_generation_enabled", False)
             await self._save_and_refresh(interaction, user_data, profile_name)
         elif choice == "url_toggle":
             profile["url_fetching_enabled"] = not profile.get("url_fetching_enabled", False)
@@ -993,10 +995,6 @@ class ProfileManageView(ui.View):
         elif choice == "ltm_summarization":
             instr = profile.get("ltm_summarization_instructions", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
             modal = ProfileLTMSummarizationModal(self.cog, profile_name, instr)
-            await interaction.response.send_modal(modal)
-        elif choice == "image_gen_prompt":
-            curr = profile.get("image_generation_prompt")
-            modal = ProfileImageGenPromptModal(self.cog, profile_name, curr)
             await interaction.response.send_modal(modal)
 
     # --- Internal Helpers for UI Flow ---
@@ -1108,6 +1106,7 @@ class ProfileManageView(ui.View):
                 if not self.is_borrowed:
                     self.cog._delete_ltm_shard(str(self.user_id), self.profile_name)
                     self.cog._delete_training_shard(str(self.user_id), self.profile_name)
+                    self.cog._cascade_delete_borrowed_profiles(self.user_id, self.profile_name)
                 self.cog._save_user_data_entry(self.user_id, user_data)
                 await self.original_interaction.edit_original_response(content=f"Profile '{self.profile_name}' deleted.", view=None, embed=None)
         confirm_btn = ui.Button(label="Confirm Deletion", style=discord.ButtonStyle.danger)
@@ -1226,8 +1225,29 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
                 "timezone": owner_profile_data.get("timezone", "UTC"),
                 "ltm_creation_enabled": False, 
                 "ltm_scope": "server", 
-                "safety_level": "low"
+                "safety_level": "low",
+                "thinking_summary_visible": owner_profile_data.get("thinking_summary_visible", "off"),
+                "thinking_level": owner_profile_data.get("thinking_level", "high"),
+                "thinking_budget": owner_profile_data.get("thinking_budget", -1),
+                "thinking_signatures_enabled": owner_profile_data.get("thinking_signatures_enabled", "off"),
+                "stm_length": owner_profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH),
+                "image_generation_enabled": owner_profile_data.get("image_generation_enabled", False),
+                "image_generation_model": owner_profile_data.get("image_generation_model", "gemini-2.5-flash-image"),
+                "url_fetching_enabled": owner_profile_data.get("url_fetching_enabled", False),
+                "critic_enabled": owner_profile_data.get("critic_enabled", False),
+                "generation_metadata_enabled": owner_profile_data.get("generation_metadata_enabled", False),
+                "speech_voice": owner_profile_data.get("speech_voice", "Aoede"),
+                "speech_model": owner_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts"),
+                "speech_temperature": owner_profile_data.get("speech_temperature", 1.0),
+                "ltm_creation_interval": owner_profile_data.get("ltm_creation_interval", 10),
+                "ltm_summarization_context": owner_profile_data.get("ltm_summarization_context", 10),
+                "ltm_context_size": owner_profile_data.get("ltm_context_size", 3),
+                "ltm_relevance_threshold": owner_profile_data.get("ltm_relevance_threshold", 0.75),
             }
+            for adv_k in ["frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a"]:
+                if adv_k in owner_profile_data:
+                    snapshot_data[adv_k] = owner_profile_data[adv_k]
+
             user_data.setdefault("borrowed_profiles", {})[desired_name] = snapshot_data
             accepted_profiles.append(f"`{profile_name}` (as `{desired_name}`)")
 
@@ -2401,10 +2421,10 @@ class ProfileThinkingParamsModal(ui.Modal, title="Thinking & Reasoning Parameter
             required=False
         ))
         self.add_item(ui.TextInput(
-            label="Enable Thought Signatures (on/off)", 
+            label="Thought Signatures (on/off)", 
             custom_id="thinking_signatures_enabled", 
             default=current_params.get("thinking_signatures_enabled", "off"), 
-            placeholder="on or off",
+            placeholder="Preserve reasoning context across turns.",
             required=False
         ))
 
@@ -2485,13 +2505,13 @@ class ProfileLTMParamsModal(ui.Modal, title="LTM Parameters"):
         except ValueError as e:
             await interaction.followup.send(f"❌ **Invalid Input:** {e}.", ephemeral=True); return
 
-        user_data = self.cog._get_user_data_entry(interaction.user.id)
-        profile = user_data.get("profiles", {}).get(self.profile_name)
-        if profile:
-            profile.update(new_params)
-            self.cog._save_user_data_entry(interaction.user.id, user_data)
-            await interaction.followup.send(f"✅ LTM parameters updated for '{self.profile_name}'.", ephemeral=True)
-            if self.callback: await self.callback(interaction)
+        if self.profile_name == "BULK_APPLY":
+            pass
+        else:
+            success = await self.cog.update_profile_ltm_params(interaction.user.id, self.profile_name, new_params)
+            if success:
+                await interaction.followup.send(f"✅ LTM parameters updated for '{self.profile_name}'.", ephemeral=True)
+                if self.callback: await self.callback(interaction)
             else:
                 await interaction.followup.send(f"❌ Failed to update LTM parameters for '{self.profile_name}'.", ephemeral=True)
 
@@ -2561,38 +2581,57 @@ class ProfileLTMTriggerModal(ui.Modal, title="Set LTM Frequency & Context"):
             await interaction.followup.send(f"✅ LTM frequency settings updated for '{self.profile_name}'.", ephemeral=True)
             if self.callback: await self.callback(interaction)
 
-class ProfileImageGenPromptModal(ui.Modal, title="Set Image Generation System Prompt"):
-    def __init__(self, cog, profile_name: str, current_prompt: Optional[str]):
+class ProfileImageGenSettingsModal(ui.Modal, title="Image Generation Settings"):
+    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
         super().__init__()
-        self.cog: GeminiAgent = cog
+        self.cog = cog
         self.profile_name = profile_name
-        decrypted_prompt = self.cog._decrypt_data(current_prompt) if current_prompt else ""
-        self.prompt_input = ui.TextInput(
-            label="System Instructions for Image AI",
-            style=discord.TextStyle.paragraph,
-            default=decrypted_prompt,
-            required=False,
-            max_length=2000,
-            placeholder="e.g., All images must be in a gritty, photorealistic, noir style with dramatic shadows."
-        )
-        self.add_item(self.prompt_input)
-
+        self.is_borrowed = is_borrowed
+        self.callback = callback
+        
+        status_val = "on" if current_params.get("image_generation_enabled", False) else "off"
+        self.add_item(ui.TextInput(label="Enable Image Gen (on/off)", custom_id="enabled", default=status_val, required=True))
+        
+        model_val = current_params.get("image_generation_model", "gemini-2.5-flash-image")
+        self.add_item(ui.TextInput(label="Model (Google Gemini Only)", custom_id="model", default=model_val, required=True))
+        
+        if not self.is_borrowed:
+            enc_prompt = current_params.get("image_generation_prompt")
+            prompt_val = self.cog._decrypt_data(enc_prompt) if enc_prompt else ""
+            self.add_item(ui.TextInput(label="Image Generation Prompt", custom_id="prompt", style=discord.TextStyle.paragraph, default=prompt_val, required=False, max_length=2000))
+    
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        new_prompt = self.prompt_input.value.strip() or None
+        new_params = {}
+        try:
+            def gv(cid): return next((c.value for c in self.children if c.custom_id == cid), None)
+            en_val = gv("enabled").strip().lower()
+            new_params["image_generation_enabled"] = (en_val == "on")
+            
+            mod_val = gv("model").strip()
+            if not mod_val: mod_val = "gemini-2.5-flash-image"
+            new_params["image_generation_model"] = mod_val
+            
+            if not self.is_borrowed:
+                pr_val = gv("prompt")
+                if pr_val is not None:
+                    new_params["image_generation_prompt"] = self.cog._encrypt_data(pr_val.strip()) if pr_val.strip() else None
+        except Exception:
+            await interaction.followup.send("Error parsing input.", ephemeral=True); return
         
-        user_id = interaction.user.id
-        user_data = self.cog.user_profiles.get(str(user_id))
-        profile = user_data.get("profiles", {}).get(self.profile_name)
-        
-        if not profile:
-            await interaction.followup.send("Profile not found.", ephemeral=True)
+        if self.profile_name == "BULK_APPLY":
+            if self.callback: await self.callback(interaction, new_params)
             return
-
-        profile["image_generation_prompt"] = new_prompt
-        self.cog._save_user_data_entry(user_id, user_data)
-        
-        await interaction.followup.send(f"Image generation prompt updated for profile '{self.profile_name}'.", ephemeral=True)
+            
+        user_data = self.cog._get_user_data_entry(interaction.user.id)
+        target = user_data.get("borrowed_profiles" if self.is_borrowed else "profiles", {}).get(self.profile_name)
+        if target:
+            target.update(new_params)
+            self.cog._save_user_data_entry(interaction.user.id, user_data)
+            await interaction.followup.send("✅ Image generation settings updated.", ephemeral=True)
+            if self.callback: await self.callback(interaction)
+        else:
+            await interaction.followup.send("❌ Profile not found.", ephemeral=True)
 
 class SessionPromptModal(ui.Modal, title="Set Multi-Profile Session Prompt"):
     prompt_input = ui.TextInput(
@@ -3434,6 +3473,8 @@ class BulkActionView(BaseBulkProfileView):
             final_message = await self.cog.bulk_apply_ltm_params(self.user_id, target_profiles_list, self.params)
         elif self.action == "apply_ltm_summarization":
             final_message = await self.cog.bulk_apply_ltm_summarization_instructions(self.user_id, target_profiles_list, self.params)
+        elif self.action == "apply_image_settings":
+            final_message = await self.cog.bulk_apply_image_settings(self.user_id, target_profiles_list, self.params)
         
         await interaction.edit_original_response(content=final_message, view=None)
 
@@ -3574,50 +3615,6 @@ class BulkURLContextView(BaseBulkProfileView):
 
         status = "ENABLED" if self.toggle_choice else "DISABLED"
         await interaction.edit_original_response(content=f"URL Context Fetching has been **{status}** for {updated_count} profiles.", view=None)
-
-class BulkImageGenView(BaseBulkProfileView):
-    def __init__(self, cog: 'GeminiAgent', user_id: int):
-        super().__init__(cog, user_id, include_borrowed=True)
-        self.toggle_choice = None
-        self._build_view()
-
-    def _build_view(self):
-        self.clear_items()
-        opts = [
-            discord.SelectOption(label="Enable Image Gen", value="enable", default=(self.toggle_choice is True)),
-            discord.SelectOption(label="Disable Image Gen", value="disable", default=(self.toggle_choice is False))
-        ]
-        select = ui.Select(placeholder="Choose an action...", options=opts, row=0)
-        select.callback = self.choice_callback
-        self.add_item(select)
-        self._build_profile_select_ui(row=1)
-        apply_btn = ui.Button(label="Apply Action", style=discord.ButtonStyle.green, row=3)
-        apply_btn.callback = self.apply_action
-        self.add_item(apply_btn)
-
-    async def choice_callback(self, interaction: discord.Interaction):
-        self.toggle_choice = (interaction.data['values'][0] == "enable")
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def apply_action(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        if self.toggle_choice is None or not self.selected_profiles:
-            await interaction.edit_original_response(content="Select an action and at least one profile.", view=None); return
-
-        user_data = self.cog._get_user_data_entry(self.user_id)
-        updated_count = 0
-        for name in self.selected_profiles:
-            p = user_data.get("profiles", {}).get(name) or user_data.get("borrowed_profiles", {}).get(name)
-            if p: p["image_generation_enabled"] = self.toggle_choice; updated_count += 1
-        
-        if updated_count > 0:
-            self.cog._save_user_data_entry(self.user_id, user_data)
-            keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.user_id]
-            for k in keys: self.cog.channel_models.pop(k, None); self.cog.chat_sessions.pop(k, None)
-
-        status = "ENABLED" if self.toggle_choice else "DISABLED"
-        await interaction.edit_original_response(content=f"Image Generation has been **{status}** for {updated_count} profiles.", view=None)
 
 class BulkTimezoneModal(ui.Modal, title="Enter Custom Timezone"):
     tz_input = ui.TextInput(label="IANA Timezone ID", placeholder="e.g. Asia/Tokyo or America/New_York", required=True)
@@ -3948,6 +3945,7 @@ class BulkDeleteView(BaseBulkProfileView):
                 del user_data["profiles"][name]
                 self.cog._delete_ltm_shard(user_id_str, name)
                 self.cog._delete_training_shard(user_id_str, name)
+                self.cog._cascade_delete_borrowed_profiles(self.user_id, name)
                 deleted_count += 1
         
         if deleted_count > 0: self.cog._save_user_data_entry(self.user_id, user_data)
@@ -5650,7 +5648,7 @@ class BulkManageView(ui.View):
             discord.SelectOption(label="Set Thinking Parameters", value="thinking_params", description="Apply thinking settings to multiple profiles."),
             discord.SelectOption(label="Set Response Mode", value="response_mode", description="Apply Mention/Reply behavior to multiple profiles."),
             discord.SelectOption(label="Toggle Grounding", value="grounding", description="Enable or disable grounding for multiple profiles."),
-            discord.SelectOption(label="Toggle Image Generation", value="image_gen", description="Enable or disable image generation for multiple profiles."),
+            discord.SelectOption(label="Configure Image Generation", value="image_gen", description="Setup models, prompts, and toggles for multiple profiles."),
             discord.SelectOption(label="Toggle URL Context Fetching", value="url_context", description="Enable or disable link scraping for multiple profiles."),
             discord.SelectOption(label="Set Time & Timezone", value="timezone", description="Enable time-awareness and set a specific timezone."),
             discord.SelectOption(label="Toggle Generation Metadata", value="metadata_toggle", description="Show/hide generation time and duration."),
@@ -5777,9 +5775,14 @@ class BulkManageView(ui.View):
                     if ctx: params["ltm_context_size"] = int(ctx)
                     rel = next((c.value for c in modal.children if c.custom_id == "ltm_relevance_threshold"), None)
                     if rel: params["ltm_relevance_threshold"] = float(rel)
+                    
+                    inv = next((c.value for c in modal.children if c.custom_id == "ltm_creation_interval"), None)
+                    if inv: params["ltm_creation_interval"] = int(inv)
+                    sctx = next((c.value for c in modal.children if c.custom_id == "ltm_summarization_context"), None)
+                    if sctx: params["ltm_summarization_context"] = int(sctx)
                 except ValueError: await i.followup.send("Invalid Input", ephemeral=True); return
 
-                view = BulkActionView(self.cog, self.user_id, "apply_ltm_params", "Select personal profiles to apply LTM settings to...", params=params, include_borrowed=False)
+                view = BulkActionView(self.cog, self.user_id, "apply_ltm_params", "Select profiles to apply LTM settings to...", params=params, include_borrowed=True)
                 await self.original_interaction.edit_original_response(content="Parameters validated. Select the profiles to apply them to:", view=view)
             modal.on_submit = modal_callback
             await interaction.response.send_modal(modal)
@@ -5818,9 +5821,12 @@ class BulkManageView(ui.View):
             await self.original_interaction.edit_original_response(content="Select URL context action and profiles:", view=view)
 
         elif choice == "image_gen":
-            await interaction.response.defer()
-            view = BulkImageGenView(self.cog, self.user_id)
-            await self.original_interaction.edit_original_response(content="Select image generation action and profiles:", view=view)
+            modal = ProfileImageGenSettingsModal(self.cog, "BULK_APPLY", {}, False)
+            async def modal_callback(i: discord.Interaction, params: Dict):
+                view = BulkActionView(self.cog, self.user_id, "apply_image_settings", "Select profiles to apply image settings to...", params=params, include_borrowed=True)
+                await self.original_interaction.edit_original_response(content="Image settings validated. Select the profiles to apply them to:", view=view)
+            modal.callback = modal_callback
+            await interaction.response.send_modal(modal)
             
         elif choice == "timezone":
             await interaction.response.defer()
@@ -5977,6 +5983,11 @@ class BulkExportView(BaseBulkProfileView):
         filter_options = [
             discord.SelectOption(label="Persona", value="persona", description="Backstory, traits, likes/dislikes.", default="persona" in self.export_filters),
             discord.SelectOption(label="AI Instructions", value="instructions", description="Core behavioral guidelines.", default="instructions" in self.export_filters),
+            discord.SelectOption(label="Core Settings", value="core", description="Models, STM, Gen Params, Advanced Params.", default="core" in self.export_filters),
+            discord.SelectOption(label="Thinking & Reasoning", value="thinking", description="Effort levels, budget, and signatures.", default="thinking" in self.export_filters),
+            discord.SelectOption(label="Tools & Modes", value="tools", description="Toggles, Image Gen, Timezone, Grounding.", default="tools" in self.export_filters),
+            discord.SelectOption(label="Voice & Speech", value="voice", description="TTS models, voice identities, and Director's Desk.", default="voice" in self.export_filters),
+            discord.SelectOption(label="Memory Tuning", value="memory_params", description="Context sizes and relevance thresholds.", default="memory_params" in self.export_filters),
             discord.SelectOption(label="Long-Term Memories", value="ltm", description="AI-generated conversation summaries.", default="ltm" in self.export_filters),
             discord.SelectOption(label="Training Examples", value="training", description="User-written input/output pairs.", default="training" in self.export_filters),
             discord.SelectOption(label="Appearance", value="appearance", description="Custom name and avatar URL.", default="appearance" in self.export_filters)

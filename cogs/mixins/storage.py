@@ -1087,6 +1087,7 @@ class StorageMixin:
                 "realistic_typing_enabled": False,
                 "ltm_creation_enabled": False,
                 "image_generation_enabled": False,
+                "image_generation_model": "gemini-2.5-flash-image",
                 "url_fetching_enabled": False,
                 "response_mode": "regular",
                 "thinking_summary_visible": "off",
@@ -1118,6 +1119,7 @@ class StorageMixin:
             profile.setdefault("realistic_typing_enabled", False)
             profile.setdefault("ltm_creation_enabled", False)
             profile.setdefault("image_generation_prompt", None)
+            profile.setdefault("image_generation_model", "gemini-2.5-flash-image")
             profile.setdefault("thinking_summary_visible", "off")
             profile.setdefault("thinking_level", "medium")
             profile.setdefault("thinking_budget", -1)
@@ -1254,6 +1256,30 @@ class StorageMixin:
             removed_count = len(ids_to_remove)
             
         return removed_count
+
+    def _cascade_delete_borrowed_profiles(self, original_owner_id: int, original_profile_name: str):
+        """Instantly removes all borrowed variants linked to a deleted personal profile across the entire system."""
+        owner_str = str(original_owner_id)
+        if not os.path.isdir(self.PROFILES_DIR): return
+        
+        for filename in os.listdir(self.PROFILES_DIR):
+            if not filename.endswith(".json.gz"): continue
+            user_id_str = filename[:-len(".json.gz")]
+            try:
+                user_data = self._get_user_data_entry(int(user_id_str))
+                borrowed = user_data.get("borrowed_profiles", {})
+                
+                to_delete = []
+                for b_name, b_data in borrowed.items():
+                    if str(b_data.get("original_owner_id")) == owner_str and b_data.get("original_profile_name") == original_profile_name:
+                        to_delete.append(b_name)
+                
+                if to_delete:
+                    for b_name in to_delete:
+                        del user_data["borrowed_profiles"][b_name]
+                    self._save_user_data_entry(int(user_id_str), user_data)
+            except Exception as e:
+                print(f"Error in cascade delete for user {user_id_str}: {e}")
     
     def _get_mapping_key_for_session(self, session_key: Any, session_type: str) -> Any:
         if session_type == 'global_chat':

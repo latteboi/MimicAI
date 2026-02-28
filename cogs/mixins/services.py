@@ -259,7 +259,6 @@ class GoogleGenAIModel:
                     sig = item['thought_signature']
                     if isinstance(sig, str):
                         try:
-                            import base64
                             sig = base64.b64decode(sig)
                         except Exception: pass
                     parts[-1].thought_signature = sig
@@ -1144,7 +1143,7 @@ class ServicesMixin:
                 channel = self.bot.get_channel(channel_id)
 
                 is_single_turn_only = False
-                if isinstance(initial_trigger, tuple) and initial_trigger[0] == 'reaction_single':
+                if isinstance(initial_trigger, tuple) and initial_trigger[0] in ['reaction_single', 'child_mention', 'ad_hoc_mention', 'reply']:
                     is_single_turn_only = True
 
                 if freewill_mode == 'reactive':
@@ -1202,26 +1201,10 @@ class ServicesMixin:
                             profile_order = [initial_turn_profile]
                 
                 else: # Standard multi-profile or proactive freewill
-                    if starting_profile_override:
-                        start_p = starting_profile_override
-                        
-                        session_mode = session.get("session_mode", "sequential")
-                        if session_mode == 'sequential':
-                            try:
-                                # Find the index of the profile we are starting with
-                                start_idx = session['profiles'].index(start_p)
-                                # Rotate the list to make that profile the first element
-                                new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
-                                session['profiles'] = new_order
-                                self._save_multi_profile_sessions()
-                            except ValueError:
-                                # The starting profile wasn't in the list, this shouldn't happen but handle gracefully
-                                pass
-
                      # Filter profiles that are marked as skipped via reaction
                     active_participants = [p for p in session['profiles'] if not p.get('is_skipped', False)]
                     
-                    if not active_participants:
+                    if not active_participants and not is_single_turn_only:
                         # If everyone is skipped, mark triggers as done and wait for next input
                         for trigger in all_triggers_for_round:
                             if trigger is not None: session['task_queue'].task_done()
@@ -1229,25 +1212,25 @@ class ServicesMixin:
 
                     if starting_profile_override:
                         # Ensure the override profile isn't skipped; if it is, fall back to first active
-                        if starting_profile_override.get('is_skipped'):
+                        if starting_profile_override.get('is_skipped') and active_participants:
                             start_p = active_participants[0]
                         else:
                             start_p = starting_profile_override
-                        
-                        session_mode = session.get("session_mode", "sequential")
-                        if session_mode == 'sequential':
-                            try:
-                                start_idx = session['profiles'].index(start_p)
-                                new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
-                                session['profiles'] = new_order
-                                self._save_multi_profile_sessions()
-                            except ValueError: pass
 
                         if is_single_turn_only:
                             profile_order = [start_p]
                         else:
                             profile_order = [p for p in session['profiles'] if p in active_participants]
-                            if session_mode == 'random':
+                            
+                            session_mode = session.get("session_mode", "sequential")
+                            if session_mode == 'sequential':
+                                try:
+                                    start_idx = profile_order.index(start_p)
+                                    profile_order = profile_order[start_idx:] + profile_order[:start_idx]
+                                except ValueError:
+                                    if start_p not in profile_order:
+                                        profile_order.insert(0, start_p)
+                            elif session_mode == 'random':
                                 if start_p in profile_order: profile_order.remove(start_p)
                                 random.shuffle(profile_order)
                                 profile_order.insert(0, start_p)
@@ -1267,26 +1250,6 @@ class ServicesMixin:
                                 # But only include those not skipped
                                 profile_order = [p for p in rotated if p in active_participants]
                             except (ValueError, StopIteration): pass
-
-                # --- Ephemeral Participant Injection ---
-                ephemeral_participant = None
-                if isinstance(initial_trigger, tuple):
-                    if initial_trigger[0] == 'child_mention' or initial_trigger[0] == 'ad_hoc_mention':
-                        _, _, ephemeral_participant = initial_trigger
-
-                if ephemeral_participant:
-                    # For child bots, bot_id is the key. For parent bot (webhook), profile_name/owner_id is the key.
-                    existing_permanent = None
-                    if ephemeral_participant.get('method') == 'child_bot':
-                        existing_permanent = next((p for p in profile_order if p.get('bot_id') == ephemeral_participant.get('bot_id')), None)
-                    else:
-                        existing_permanent = next((p for p in profile_order if p['owner_id'] == ephemeral_participant['owner_id'] and p['profile_name'] == ephemeral_participant['profile_name']), None)
-
-                    if existing_permanent:
-                        profile_order.remove(existing_permanent)
-                        profile_order.insert(0, existing_permanent)
-                    else:
-                        profile_order.insert(0, ephemeral_participant)
 
                 channel = self.bot.get_channel(channel_id)
                 has_gemini = self._get_api_key_for_guild(channel.guild.id, "gemini")
@@ -1502,6 +1465,17 @@ class ServicesMixin:
                     t1_start_utc = datetime.datetime.now(datetime.timezone.utc)
                     self.session_last_accessed[channel_id] = time.time()
                     participant_key = (participant['owner_id'], participant['profile_name'])
+                    
+                    # [FIX] Dynamically inject missing ChatSession for ephemeral participants
+                    if participant_key not in session['chat_sessions'] or session['chat_sessions'][participant_key] is None:
+                        p_history = []
+                        for turn in session.get("unified_log", []):
+                            if turn.get("is_hidden"): continue
+                            speaker_key = tuple(turn.get("speaker_key", []))
+                            role = 'model' if speaker_key == participant_key else 'user'
+                            p_history.append({'role': role, 'parts': [turn.get("content")]})
+                        session['chat_sessions'][participant_key] = GoogleGenAIChatSession(history=p_history)
+
                     chat_session = session['chat_sessions'].get(participant_key)
 
                     # Safety Check: If session state is corrupted (contains list instead of ChatSession), force re-hydration
@@ -1693,7 +1667,7 @@ class ServicesMixin:
 
                                 image_model = GoogleGenAIModel(
                                     api_key=api_key, 
-                                    model_name='gemini-2.5-flash-image', 
+                                    model_name=p_settings.get("image_generation_model", "gemini-2.5-flash-image"), 
                                     system_instruction=system_instruction, 
                                     safety_settings=dynamic_safety_settings
                                 )
@@ -2169,7 +2143,6 @@ class ServicesMixin:
                     if profile_settings.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
                         sig = response.thought_signature
                         if isinstance(sig, bytes):
-                            import base64
                             sig = base64.b64encode(sig).decode('utf-8')
                         turn_object['thought_signature'] = sig
                     session.get("unified_log", []).append(turn_object)
@@ -2774,7 +2747,7 @@ class ServicesMixin:
                                 
                                 image_model = GoogleGenAIModel(
                                     api_key=api_key,
-                                    model_name='gemini-2.5-flash-image', 
+                                    model_name=package.get("image_generation_model", "gemini-2.5-flash-image"), 
                                     system_instruction=package['system_instruction'], 
                                     safety_settings=package['safety_settings']
                                 )
@@ -2897,7 +2870,6 @@ class ServicesMixin:
                             "reply_to_id": reply_id, "ping": should_ping
                         }
                         if image_file_to_send:
-                            import base64
                             payload["attachment"] = { "filename": "generated_image.png", "data_base64": base64.b64encode(package['generated_image_bytes']).decode('utf-8') }
                         await self.manager_queue.put({"action": "send_to_child", "bot_id": package['bot_id'], "payload": payload})
                     else:
@@ -3027,7 +2999,7 @@ class ServicesMixin:
                     
                     image_model = GoogleGenAIModel(
                         api_key=api_key,
-                        model_name='gemini-2.5-flash-image', 
+                        model_name=request_data.get("image_generation_model", "gemini-2.5-flash-image"), 
                         system_instruction=request_data['system_instruction'], 
                         safety_settings=request_data['safety_settings']
                     )
@@ -3961,9 +3933,11 @@ class ServicesMixin:
 
                 await session['task_queue'].put(director_prompt)
                 
-                if not session.get('is_running'):
+                if not session.get('worker_task') or session['worker_task'].done():
                     session['is_running'] = True 
-                    session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(channel.id))
+                    task = self.bot.loop.create_task(self._multi_profile_worker(channel.id))
+                    session['worker_task'] = task
+                    self.background_tasks.add(task)
 
     @tasks.loop(seconds=60.0)
     async def evict_inactive_sessions_task(self):
@@ -4005,6 +3979,10 @@ class ServicesMixin:
                     if 'chat_sessions' in session_to_evict:
                         session_to_evict['chat_sessions'].clear()
                     
+                    # If it's a completely empty dormant session, pop it entirely to save memory.
+                    if not session_to_evict.get("profiles"):
+                        self.multi_profile_channels.pop(key, None)
+
                     # Give the garbage collector a hint to clean up now.
                     gc.collect()
 
@@ -4332,14 +4310,54 @@ class ServicesMixin:
             if not self.is_user_premium(bot_config['owner_id']):
                 return
 
-            owner_id = bot_config['owner_id']
-            profile_name = bot_config['profile_name']
+            original_owner_id = bot_config['owner_id']
+            original_profile_name = bot_config['profile_name']
             
+            effective_owner_id = original_owner_id
+            effective_profile_name = original_profile_name
+            
+            guild = self.bot.get_guild(guild_id) if guild_id else None
+            if guild and not guild.get_member(original_owner_id):
+                author_id = message_payload.get("author_id")
+                author_data = self._get_user_data_entry(author_id)
+                borrowed_name = None
+                for b_name, b_data in author_data.get("borrowed_profiles", {}).items():
+                    if int(b_data["original_owner_id"]) == original_owner_id and b_data["original_profile_name"] == original_profile_name:
+                        borrowed_name = b_name
+                        break
+                
+                if borrowed_name:
+                    effective_owner_id = author_id
+                    effective_profile_name = borrowed_name
+                else:
+                    session = self.multi_profile_channels.get(channel_id)
+                    found_in_session = False
+                    if session:
+                        for p in session.get("profiles", []):
+                            p_data = self._get_user_data_entry(p['owner_id'])
+                            if p['profile_name'] in p_data.get("borrowed_profiles", {}):
+                                b_data = p_data["borrowed_profiles"][p['profile_name']]
+                                if int(b_data["original_owner_id"]) == original_owner_id and b_data["original_profile_name"] == original_profile_name:
+                                    effective_owner_id = p['owner_id']
+                                    effective_profile_name = p['profile_name']
+                                    found_in_session = True
+                                    break
+                    
+                    if not found_in_session:
+                        await self.manager_queue.put({
+                            "action": "send_to_child", "bot_id": bot_id,
+                            "payload": {
+                                "action": "send_message", "channel_id": channel_id,
+                                "content": "My original owner is not in this server, and you have not borrowed my profile. Use `/profile hub` to find and borrow me first!"
+                            }
+                        })
+                        return
+
             session = self.multi_profile_channels.get(channel_id)
             
             ephemeral_participant = {
-                "owner_id": owner_id,
-                "profile_name": profile_name,
+                "owner_id": effective_owner_id,
+                "profile_name": effective_profile_name,
                 "method": "child_bot",
                 "bot_id": bot_id,
                 "ephemeral": True # Mark as a guest star
@@ -4347,13 +4365,11 @@ class ServicesMixin:
 
             if not session:
                 # Create a new session on the fly
-                chat_sessions = { (p['owner_id'], p['profile_name']): None for p in [ephemeral_participant] }
                 session = {
-                    "type": "multi", "chat_sessions": chat_sessions, "unified_log": [], "is_hydrated": False,
+                    "type": "multi", "chat_sessions": {}, "unified_log": [], "is_hydrated": False,
                     "last_bot_message_id": None, "owner_id": message_payload.get("author_id"), "is_running": False,
-                    "auto_continue": False, "auto_delay": None, "timer_handle": None,
                     "task_queue": asyncio.Queue(), "worker_task": None, "turns_since_last_ltm": 0,
-                    "session_prompt": None, "session_mode": "sequential", "profiles": [ephemeral_participant]
+                    "session_prompt": None, "session_mode": "sequential", "profiles": []
                 }
                 self.multi_profile_channels[channel_id] = session
 
@@ -4362,8 +4378,10 @@ class ServicesMixin:
             await session['task_queue'].put(trigger)
             
             # Start the worker if it's not running
-            if not session.get('is_running'):
-                session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
+            if not session.get('worker_task') or session['worker_task'].done():
+                task = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
+                session['worker_task'] = task
+                self.background_tasks.add(task)
 
     async def handle_child_bot_image_request(self, event_data: Dict):
         bot_id = event_data.get("bot_id")
@@ -4402,13 +4420,34 @@ class ServicesMixin:
                 return
 
             guild_id = message_data.get("guild_id")
+            original_owner_id = bot_config['owner_id']
+            original_profile_name = bot_config['profile_name']
+            
+            owner_id = original_owner_id
+            profile_name = original_profile_name
+            
+            guild = self.bot.get_guild(guild_id) if guild_id else None
+            if guild and not guild.get_member(original_owner_id):
+                author_id = message_data.get("author_id")
+                author_data = self._get_user_data_entry(author_id)
+                borrowed_name = None
+                for b_name, b_data in author_data.get("borrowed_profiles", {}).items():
+                    if int(b_data["original_owner_id"]) == original_owner_id and b_data["original_profile_name"] == original_profile_name:
+                        borrowed_name = b_name
+                        break
+                
+                if borrowed_name:
+                    owner_id = author_id
+                    profile_name = borrowed_name
+                else:
+                    await send_notification_to_child("My original owner is not in this server, and you have not borrowed my profile. Use `/profile hub` to find and borrow me first!")
+                    return
 
             image_prefixes = ("!image", "!imagine")
             used_prefix = next((p for p in image_prefixes if message_data.get("content", "").lower().startswith(p)), "!image")
             prompt_text = message_data.get("content", "")[len(used_prefix):].strip()
             if not prompt_text: return
             
-            owner_id, profile_name = bot_config['owner_id'], bot_config['profile_name']
             user_data = self._get_user_data_entry(owner_id)
             is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
             profile_data = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name, {})
@@ -4486,7 +4525,8 @@ class ServicesMixin:
                 "effective_profile_owner_id": owner_id, "effective_profile_name": profile_name,
                 "bot_display_name": bot_display_name, "safety_settings": dynamic_safety_settings,
                 "system_instruction": system_instruction, "reference_image_urls": reference_image_urls, "placeholder_message": None, 
-                "grounding_sources": grounding_sources, "grounding_mode": grounding_mode
+                "grounding_sources": grounding_sources, "grounding_mode": grounding_mode,
+                "image_generation_model": profile_data.get("image_generation_model", "gemini-2.5-flash-image")
             }
             
             # [NEW] Priority Logic
@@ -4990,7 +5030,6 @@ class ServicesMixin:
             if p_settings.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
                 sig = response.thought_signature
                 if isinstance(sig, bytes):
-                    import base64
                     sig = base64.b64encode(sig).decode('utf-8')
                 model_content_obj['thought_signature'] = sig
             chat.history.extend([user_content_obj, model_content_obj])
@@ -5660,7 +5699,8 @@ class ServicesMixin:
                 "effective_profile_owner_id": effective_profile_owner_id, "effective_profile_name": effective_profile_name, 
                 "bot_display_name": bot_display_name, "safety_settings": dynamic_safety_settings,
                 "system_instruction": system_instruction, "reference_image_urls": reference_image_urls, "placeholder_message": placeholder_message,
-                "grounding_sources": grounding_sources, "grounding_mode": grounding_mode
+                "grounding_sources": grounding_sources, "grounding_mode": grounding_mode,
+                "image_generation_model": profile_data.get("image_generation_model", "gemini-2.5-flash-image")
             }
             
             # [NEW] Priority Logic
@@ -5925,7 +5965,6 @@ class ServicesMixin:
             if p_profile.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
                 sig = response.thought_signature
                 if isinstance(sig, bytes):
-                    import base64
                     sig = base64.b64encode(sig).decode('utf-8')
                 turn_object['thought_signature'] = sig
             else:

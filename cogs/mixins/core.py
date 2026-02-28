@@ -81,7 +81,23 @@ class CoreMixin:
                     turn_object = next((turn for turn in session.get("unified_log", []) if turn.get("turn_id") == turn_id_to_find), None)
                     if turn_object:
                         speaker_key = tuple(turn_object.get("speaker_key", []))
-                        replied_to_participant = next((p for p in session['profiles'] if (p['owner_id'], p['profile_name']) == speaker_key), None)
+                        replied_to_participant = next((p for p in session.get('profiles', []) if (p['owner_id'], p['profile_name']) == speaker_key), None)
+                        
+                        if not replied_to_participant:
+                            # Reconstruct ephemeral participant
+                            p_owner_id, p_name = speaker_key
+                            method = 'webhook'
+                            bot_id = None
+                            linked_bot_id = next((bid for bid, data in self.child_bots.items() if data.get("owner_id") == p_owner_id and data.get("profile_name") == p_name), None)
+                            if linked_bot_id and message.guild and message.guild.get_member(int(linked_bot_id)):
+                                method = 'child_bot'
+                                bot_id = linked_bot_id
+                            
+                            replied_to_participant = {
+                                "owner_id": p_owner_id, "profile_name": p_name,
+                                "method": method, "bot_id": bot_id, "ephemeral": True
+                            }
+
                         if replied_to_participant:
                             # [UPDATED] Eager feedback removed to respect the queue/batching flow
                             reply_trigger = ('reply', message, replied_to_participant)
@@ -282,8 +298,10 @@ class CoreMixin:
             trigger_tuple = ('initial_reactive_turn', message, triggered_profile)
             await session['task_queue'].put(trigger_tuple)
             
-            if not session.get('is_running'):
-                session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
+            if not session.get('worker_task') or session['worker_task'].done():
+                task = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
+                session['worker_task'] = task
+                self.background_tasks.add(task)
             return
 
         # --- Generic Session Interaction Logic ---
@@ -299,18 +317,21 @@ class CoreMixin:
                 profile_name = DEFAULT_PROFILE_NAME
                 
                 # Check if parent bot is already a participant
-                is_participant = any(p['owner_id'] == owner_id and p['profile_name'] == profile_name for p in session['profiles'])
+                participant = next((p for p in session['profiles'] if p['owner_id'] == owner_id and p['profile_name'] == profile_name), None)
                 
-                if not is_participant:
-                    # Ad-hoc injection
+                if not participant:
                     participant = {"owner_id": owner_id, "profile_name": profile_name, "method": "webhook", "ephemeral": True}
-                    trigger = ('ad_hoc_mention', message, participant)
-                    await session['task_queue'].put(trigger)
-                    if not session.get('worker_task') or session['worker_task'].done():
-                        task = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
-                        session['worker_task'] = task
-                        self.background_tasks.add(task)
-                    return
+                else:
+                    participant = participant.copy()
+                    participant['ephemeral'] = True
+                    
+                trigger = ('ad_hoc_mention', message, participant)
+                await session['task_queue'].put(trigger)
+                if not session.get('worker_task') or session['worker_task'].done():
+                    task = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
+                    session['worker_task'] = task
+                    self.background_tasks.add(task)
+                return
 
             await session['task_queue'].put(message)
             if not session.get('worker_task') or session['worker_task'].done():
@@ -330,21 +351,21 @@ class CoreMixin:
             profile_name = DEFAULT_PROFILE_NAME
             participant = {"owner_id": owner_id, "profile_name": profile_name, "method": "webhook", "ephemeral": True}
             
-            chat_sessions = {(owner_id, profile_name): None}
-            new_session = {
-                "type": "multi", "profiles": [participant], "chat_sessions": chat_sessions,
-                "unified_log": [], "is_hydrated": False, "last_bot_message_id": None,
-                "owner_id": message.author.id, "is_running": False, "task_queue": asyncio.Queue(),
-                "worker_task": None, "turns_since_last_ltm": 0, "session_prompt": None,
-                "session_mode": "sequential"
-            }
-            self.multi_profile_channels[message.channel.id] = new_session
-            self._save_multi_profile_sessions()
+            if not session:
+                session = {
+                    "type": "multi", "profiles": [], "chat_sessions": {},
+                    "unified_log": [], "is_hydrated": False, "last_bot_message_id": None,
+                    "owner_id": message.author.id, "is_running": False, "task_queue": asyncio.Queue(),
+                    "worker_task": None, "turns_since_last_ltm": 0, "session_prompt": None,
+                    "session_mode": "sequential"
+                }
+                self.multi_profile_channels[message.channel.id] = session
             
-            await new_session['task_queue'].put(message)
-            if not new_session.get('worker_task') or new_session['worker_task'].done():
+            trigger = ('ad_hoc_mention', message, participant)
+            await session['task_queue'].put(trigger)
+            if not session.get('worker_task') or session['worker_task'].done():
                 task = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
-                new_session['worker_task'] = task
+                session['worker_task'] = task
                 self.background_tasks.add(task)
             return
         
@@ -1109,7 +1130,6 @@ class CoreMixin:
             if profile_data.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
                 sig = response.thought_signature
                 if isinstance(sig, bytes):
-                    import base64
                     sig = base64.b64encode(sig).decode('utf-8')
                 model_log['thought_signature'] = sig
             session_data['unified_log'].append(model_log)
@@ -1266,7 +1286,6 @@ class CoreMixin:
         if p_settings.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
             sig = response.thought_signature
             if isinstance(sig, bytes):
-                import base64
                 sig = base64.b64encode(sig).decode('utf-8')
             resp_log['thought_signature'] = sig
             
@@ -1326,8 +1345,23 @@ class CoreMixin:
             p_config = user_data.get("profiles", {}).get(name)
             if not p_config: continue
 
+            keys_by_filter = {
+                "core": ["primary_model", "fallback_model", "show_fallback_indicator", "temperature", "top_p", "top_k", "stm_length", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a"],
+                "thinking": ["thinking_summary_visible", "thinking_level", "thinking_budget", "thinking_signatures_enabled"],
+                "tools": ["grounding_enabled", "grounding_mode", "image_generation_enabled", "url_fetching_enabled", "critic_enabled", "generation_metadata_enabled", "time_tracking_enabled", "timezone", "realistic_typing_enabled", "response_mode"],
+                "voice": ["speech_voice", "speech_model", "speech_temperature", "speech_archetype", "speech_accent", "speech_dynamics", "speech_style", "speech_pacing"],
+                "memory_params": ["training_context_size", "training_relevance_threshold", "ltm_context_size", "ltm_relevance_threshold", "ltm_creation_interval", "ltm_summarization_context", "ltm_summarization_instructions", "image_generation_prompt"]
+            }
+            
+            p_config_out = {}
+            for filter_key, conf_keys in keys_by_filter.items():
+                if filter_key in filters:
+                    for k in conf_keys:
+                        if k in p_config:
+                            p_config_out[k] = p_config[k]
+
             p_entry = {
-                "config": {k: v for k, v in p_config.items() if k not in ["persona", "ai_instructions"]},
+                "config": p_config_out,
                 "persona": {},
                 "ai_instructions": [] if isinstance(p_config.get("ai_instructions"), list) else "",
                 "appearance": None,
@@ -1405,10 +1439,15 @@ class CoreMixin:
                 instr_raw = p_data.get("ai_instructions", "")
                 clean_instr = [self._encrypt_data(p) for p in instr_raw] if isinstance(instr_raw, list) else self._encrypt_data(instr_raw)
                 
-                new_profile = p_data["config"]
-                new_profile["persona"] = clean_persona
-                new_profile["ai_instructions"] = clean_instr
-                user_data["profiles"][local_name] = new_profile
+                new_profile_base = self._get_or_create_user_profile(user_id, local_name)
+                if not new_profile_base:
+                    import_log.append(f"❌ `{local_name}` (Failed to create)")
+                    continue
+                
+                new_profile_base.update(p_data.get("config", {}))
+                new_profile_base["persona"] = clean_persona
+                new_profile_base["ai_instructions"] = clean_instr
+                user_data["profiles"][local_name] = new_profile_base
 
                 # 2. Encrypt and save LTM
                 if p_data.get("ltm"):
@@ -2358,7 +2397,8 @@ class CoreMixin:
         user_data = self._get_user_data_entry(user_id)
         updated_count = 0
         for name in profile_names:
-            profile = user_data.get("profiles", {}).get(name)
+            is_borrowed = name in user_data.get("borrowed_profiles", {})
+            profile = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(name)
             if profile:
                 profile.update(params)
                 updated_count += 1
@@ -2366,7 +2406,7 @@ class CoreMixin:
         if updated_count > 0:
             self._save_user_data_entry(user_id, user_data)
         
-        return f"Updated LTM parameters for {updated_count} personal profile(s)."
+        return f"Updated LTM parameters for {updated_count} profile(s)."
 
     async def bulk_apply_ltm_summarization_instructions(self, user_id: int, profile_names: List[str], params: Dict) -> str:
         user_data = self._get_user_data_entry(user_id)
@@ -2386,6 +2426,24 @@ class CoreMixin:
             self._save_user_data_entry(user_id, user_data)
         
         return f"Updated LTM summarization instructions for {updated_count} personal profile(s)."
+
+    async def bulk_apply_image_settings(self, user_id: int, profile_names: List[str], params: Dict) -> str:
+        user_data = self._get_user_data_entry(user_id)
+        updated_count = 0
+        for name in profile_names:
+            is_borrowed = name in user_data.get("borrowed_profiles", {})
+            profile = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(name)
+            if profile:
+                profile["image_generation_enabled"] = params.get("image_generation_enabled", False)
+                profile["image_generation_model"] = params.get("image_generation_model", "gemini-2.5-flash-image")
+                if not is_borrowed and "image_generation_prompt" in params:
+                    profile["image_generation_prompt"] = params["image_generation_prompt"]
+                updated_count += 1
+        
+        if updated_count > 0:
+            self._save_user_data_entry(user_id, user_data)
+        
+        return f"Updated image generation settings for {updated_count} profile(s)."
 
     async def bulk_toggle_grounding(self, user_id: int, profile_names: List[str], enable: bool) -> str:
         user_data = self._get_user_data_entry(user_id)
@@ -2514,22 +2572,28 @@ class CoreMixin:
 
     async def update_profile_training_params(self, user_id: int, profile_name: str, params: Dict[str, Any]) -> bool:
         if not self.has_lock: return False
-        profile = self._get_or_create_user_profile(user_id, profile_name)
+        user_data = self._get_user_data_entry(user_id)
+        profile = user_data.get("profiles", {}).get(profile_name)
         if not profile: return False
 
         if "training_context_size" in params: profile["training_context_size"] = params["training_context_size"]
         if "training_relevance_threshold" in params: profile["training_relevance_threshold"] = params["training_relevance_threshold"]
-        self._save_user_data_entry(user_id, self._get_user_data_entry(user_id))
+        self._save_user_data_entry(user_id, user_data)
         return True
     
     async def update_profile_ltm_params(self, user_id: int, profile_name: str, params: Dict[str, Any]) -> bool:
         if not self.has_lock: return False
-        profile = self._get_or_create_user_profile(user_id, profile_name)
+        user_data = self._get_user_data_entry(user_id)
+        is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
+        profile = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name)
         if not profile: return False
 
         if "ltm_context_size" in params: profile["ltm_context_size"] = params["ltm_context_size"]
         if "ltm_relevance_threshold" in params: profile["ltm_relevance_threshold"] = params["ltm_relevance_threshold"]
-        self._save_user_data_entry(user_id, self._get_user_data_entry(user_id))
+        if "ltm_creation_interval" in params: profile["ltm_creation_interval"] = params["ltm_creation_interval"]
+        if "ltm_summarization_context" in params: profile["ltm_summarization_context"] = params["ltm_summarization_context"]
+        
+        self._save_user_data_entry(user_id, user_data)
         return True
     
     async def update_profile_models(self, user_id: int, profile_name: str, primary_model: Optional[str], fallback_model: Optional[str], is_borrowed: bool, channel_id_context: int, show_fallback_indicator: Optional[bool] = None) -> bool:
@@ -2610,10 +2674,28 @@ class CoreMixin:
             "ltm_creation_enabled": False, # Borrowers start with LTM creation off
             "ltm_scope": "server", # Borrowers start with the safest default
             "safety_level": "low",
-            "thinking_summary_visible": "off",
-            "thinking_level": "high",
-            "thinking_budget": -1
+            "thinking_summary_visible": owner_profile_data.get("thinking_summary_visible", "off"),
+            "thinking_level": owner_profile_data.get("thinking_level", "high"),
+            "thinking_budget": owner_profile_data.get("thinking_budget", -1),
+            "thinking_signatures_enabled": owner_profile_data.get("thinking_signatures_enabled", "off"),
+            "stm_length": owner_profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH),
+            "image_generation_enabled": owner_profile_data.get("image_generation_enabled", False),
+            "image_generation_model": owner_profile_data.get("image_generation_model", "gemini-2.5-flash-image"),
+            "url_fetching_enabled": owner_profile_data.get("url_fetching_enabled", False),
+            "critic_enabled": owner_profile_data.get("critic_enabled", False),
+            "generation_metadata_enabled": owner_profile_data.get("generation_metadata_enabled", False),
+            "speech_voice": owner_profile_data.get("speech_voice", "Aoede"),
+            "speech_model": owner_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts"),
+            "speech_temperature": owner_profile_data.get("speech_temperature", 1.0),
+            "ltm_creation_interval": owner_profile_data.get("ltm_creation_interval", 10),
+            "ltm_summarization_context": owner_profile_data.get("ltm_summarization_context", 10),
+            "ltm_context_size": owner_profile_data.get("ltm_context_size", 3),
+            "ltm_relevance_threshold": owner_profile_data.get("ltm_relevance_threshold", 0.75),
         }
+        
+        for adv_k in ["frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a"]:
+            if adv_k in owner_profile_data:
+                snapshot_data[adv_k] = owner_profile_data[adv_k]
         
         user_data = self._get_user_data_entry(interaction.user.id)
         user_data.setdefault("borrowed_profiles", {})[desired_name] = snapshot_data
