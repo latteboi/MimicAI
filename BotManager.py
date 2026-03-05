@@ -151,19 +151,25 @@ async def main():
 
     # Load child bot configurations
     print("Loading child bot configurations...")
-    child_bots_dir = os.path.join(os.path.dirname(__file__), "cogs", "data", "child_bots")
+    users_dir = os.path.join(os.path.dirname(__file__), "cogs", "data", "users")
     bot.child_bot_config = {}
-    if os.path.isdir(child_bots_dir):
+    if os.path.isdir(users_dir):
         import gzip
-        for filename in os.listdir(child_bots_dir):
-            if filename.endswith(".json.gz"):
-                file_path = os.path.join(child_bots_dir, filename)
-                owner_id = filename[:-len(".json.gz")]
-                with gzip.open(file_path, 'rb') as f:
-                    user_bot_data = json.loads(f.read())
-                for bot_id, data in user_bot_data.items():
-                    data['owner_id'] = int(owner_id)
-                    bot.child_bot_config[bot_id] = data
+        for user_id_str in os.listdir(users_dir):
+            if not user_id_str.isdigit(): continue
+            profiles_dir = os.path.join(users_dir, user_id_str, "profiles")
+            if not os.path.isdir(profiles_dir): continue
+            for profile_name in os.listdir(profiles_dir):
+                bot_file = os.path.join(profiles_dir, profile_name, "child_bot.json.gz")
+                if os.path.exists(bot_file):
+                    try:
+                        with gzip.open(bot_file, 'rb') as f:
+                            bot_data = json.loads(f.read())
+                        if "bot_id" in bot_data:
+                            bot_data["owner_id"] = int(user_id_str)
+                            bot.child_bot_config[bot_data["bot_id"]] = bot_data
+                    except Exception as e:
+                        print(f"Failed to load child bot for {profile_name}: {e}")
     
     # Attach manager queue to bot object for cog access
     bot.manager_queue = manager_queue

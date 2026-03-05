@@ -1,4 +1,5 @@
 import os
+import re
 import gzip
 import pathlib
 import shutil
@@ -53,7 +54,105 @@ def _dequantize_embedding(quantized_embedding: List[float]) -> List[float]:
     if not quantized_embedding: return []
     return np.array(quantized_embedding, dtype=np.float16).astype(np.float32).tolist()
 
+class IOManager:
+    """Centralised I/O Helper Block for MimicAI Data Ops."""
+    
+    @staticmethod
+    def read_json(file_path: str) -> Optional[Any]:
+        if not os.path.exists(file_path): return None
+        try:
+            with open(file_path, 'rb') as f:
+                return json.loads(f.read())
+        except Exception as e:
+            print(f"IOManager read_json Error ({file_path}): {e}")
+            return None
+
+    @staticmethod
+    def write_json(data: Any, file_path: str):
+        temp = file_path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            with open(temp, 'wb') as f:
+                f.write(json.dumps(data, option=json.OPT_INDENT_2))
+            os.replace(temp, file_path)
+        except Exception as e:
+            print(f"IOManager write_json Error ({file_path}): {e}")
+            if os.path.exists(temp): os.remove(temp)
+            raise
+
+    @staticmethod
+    def read_json_gzip(file_path: str, fernet: Optional[Fernet] = None, encrypted: bool = True) -> Optional[Any]:
+        if not os.path.exists(file_path):
+            return None
+        try:
+            with open(file_path, 'rb') as f:
+                file_bytes = f.read()
+
+            if encrypted and fernet:
+                decrypted_bytes = fernet.decrypt(file_bytes)
+                decompressed_bytes = gzip.decompress(decrypted_bytes)
+            else: 
+                decompressed_bytes = gzip.decompress(file_bytes)
+            
+            return json.loads(decompressed_bytes)
+        except (IOError, json.JSONDecodeError, gzip.BadGzipFile, InvalidToken) as e:
+            print(f"IOManager Read Error ({file_path}): {e}")
+            return None
+            
+    @staticmethod
+    def write_json_gzip(data: Any, file_path: str, fernet: Optional[Fernet] = None, encrypted: bool = True):
+        temp_file_path = file_path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            json_bytes = json.dumps(data, option=json.OPT_INDENT_2)
+            compressed_bytes = gzip.compress(json_bytes)
+            
+            bytes_to_write = compressed_bytes
+            if encrypted and fernet:
+                bytes_to_write = fernet.encrypt(compressed_bytes)
+
+            with open(temp_file_path, 'wb') as f:
+                f.write(bytes_to_write)
+            os.replace(temp_file_path, file_path)
+        except Exception as e:
+            print(f"IOManager Write Error ({file_path}): {e}")
+            if os.path.exists(temp_file_path):
+                try: os.remove(temp_file_path)
+                except OSError: pass
+            raise
+
 class StorageMixin:
+
+    def _is_valid_profile_name(self, name: str) -> tuple[bool, str]:
+        if not name or not name.strip():
+            return False, "Profile name cannot be empty."
+        if len(name) > 30:
+            return False, "Profile name must be 30 characters or fewer."
+        if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+            return False, "Profile name can only contain letters, numbers, underscores, and hyphens (no spaces)."
+        if name.lower() in ["mimic", "clyde", "system", "user", "none", "all"]:
+            return False, "This name is a reserved system keyword and cannot be used."
+        return True, ""
+
+    def _get_user_hash(self, user_id: int) -> str:
+        import hashlib
+        return hashlib.sha256(str(user_id).encode()).hexdigest()[:8].upper()
+
+    def _get_profile_id(self, user_id: int, profile_name: str) -> str:
+        index = self._get_user_index(user_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
+        if is_borrowed:
+            config = self._get_profile_config(user_id, profile_name, True) or {}
+            orig_id = config.get("original_profile_id")
+            if orig_id: return orig_id
+            
+            orig_owner = config.get("original_owner_id", user_id)
+            orig_name = config.get("original_profile_name", profile_name)
+            src_config = self._get_profile_config(int(orig_owner), orig_name, False) or {}
+            return src_config.get("profile_id", "00000000")
+        else:
+            config = self._get_profile_config(user_id, profile_name, False) or {}
+            return config.get("profile_id", "00000000")
 
     def _encrypt_data(self, plaintext: str) -> str:
         if not self.fernet or not plaintext:
@@ -74,67 +173,34 @@ class StorageMixin:
             return encrypted_text
 
     def _atomic_json_save_gzip(self, data: Any, file_path: str, encrypted: bool = True):
-        temp_file_path = file_path + ".tmp"
-        try:
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            json_bytes = json.dumps(data, option=json.OPT_INDENT_2)
-            compressed_bytes = gzip.compress(json_bytes)
-            
-            bytes_to_write = compressed_bytes
-            if encrypted and self.fernet:
-                bytes_to_write = self.fernet.encrypt(compressed_bytes)
-
-            with open(temp_file_path, 'wb') as f:
-                f.write(bytes_to_write)
-            os.replace(temp_file_path, file_path)
-        except Exception as e:
-            print(f"Error saving gzipped data to {file_path}: {e}")
-            if os.path.exists(temp_file_path):
-                try: os.remove(temp_file_path)
-                except OSError: pass
-            raise
+        IOManager.write_json_gzip(data, file_path, self.fernet, encrypted)
 
     def _load_json_gzip(self, file_path: str, encrypted: bool = True) -> Optional[Any]:
-        if not os.path.exists(file_path):
-            return None
-        try:
-            with open(file_path, 'rb') as f:
-                file_bytes = f.read()
-
-            if encrypted and self.fernet:
-                decrypted_bytes = self.fernet.decrypt(file_bytes)
-                decompressed_bytes = gzip.decompress(decrypted_bytes)
-            else: # Not encrypted, just compressed
-                decompressed_bytes = gzip.decompress(file_bytes)
-            
-            return json.loads(decompressed_bytes)
-        except (IOError, json.JSONDecodeError, gzip.BadGzipFile, InvalidToken) as e:
-            print(f"Error loading gzipped data from {file_path}: {e}")
-            return None
+        return IOManager.read_json_gzip(file_path, self.fernet, encrypted)
         
     def _load_ltm_shard(self, user_id: str, profile_name: str) -> Optional[Dict[str, List[Dict]]]:
-        file_path = os.path.join(self.LTM_DIR, user_id, f"{profile_name}.json.gz")
+        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "ltm.json.gz")
         return self._load_json_gzip(file_path)
 
     def _save_ltm_shard(self, user_id: str, profile_name: str, data: Dict[str, List[Dict]]):
-        file_path = os.path.join(self.LTM_DIR, user_id, f"{profile_name}.json.gz")
+        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "ltm.json.gz")
         self._atomic_json_save_gzip(data, file_path)
 
     def _delete_ltm_shard(self, user_id: str, profile_name: str):
-        file_path = os.path.join(self.LTM_DIR, user_id, f"{profile_name}.json.gz")
+        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "ltm.json.gz")
         _delete_file_shard(file_path)
 
     def _rename_ltm_shards(self, user_id: str, old_profile_name: str, new_profile_name: str):
-        old_path = os.path.join(self.LTM_DIR, user_id, f"{old_profile_name}.json.gz")
+        old_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", old_profile_name, "ltm.json.gz")
         if os.path.exists(old_path):
-            new_path = os.path.join(self.LTM_DIR, user_id, f"{new_profile_name}.json.gz")
+            new_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", new_profile_name, "ltm.json.gz")
             os.makedirs(os.path.dirname(new_path), exist_ok=True)
             os.rename(old_path, new_path)
 
     def _copy_ltm_shard(self, user_id: str, source_profile_name: str, new_profile_name: str):
-        source_path = os.path.join(self.LTM_DIR, user_id, f"{source_profile_name}.json.gz")
+        source_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", source_profile_name, "ltm.json.gz")
         if os.path.exists(source_path):
-            new_path = os.path.join(self.LTM_DIR, user_id, f"{new_profile_name}.json.gz")
+            new_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", new_profile_name, "ltm.json.gz")
             os.makedirs(os.path.dirname(new_path), exist_ok=True)
             import shutil
             shutil.copy2(source_path, new_path)
@@ -142,9 +208,9 @@ class StorageMixin:
     def _add_ltm(self, profile_owner_id: int, profile_name: str, summary: str, summary_embedding: List[float], guild_id: Optional[int], triggering_user_id: int, user_dn: Optional[str] = None, force_user_scope: bool = False):
         owner_id_str = str(profile_owner_id)
         
-        user_data = self._get_user_data_entry(profile_owner_id)
-        is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
-        profile_settings = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name, {})
+        index = self._get_user_index(profile_owner_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
+        profile_settings = self._get_profile_config(profile_owner_id, profile_name, is_borrowed) or {}
         
         ltm_scope = profile_settings.get('ltm_scope', 'server')
         
@@ -217,28 +283,28 @@ class StorageMixin:
         return False
     
     def _load_training_shard(self, user_id: str, profile_name: str) -> Optional[List[Dict]]:
-        file_path = os.path.join(self.TRAINING_DIR, user_id, f"{profile_name}.json.gz")
+        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "training.json.gz")
         return self._load_json_gzip(file_path)
 
     def _save_training_shard(self, user_id: str, profile_name: str, data: List[Dict]):
-        file_path = os.path.join(self.TRAINING_DIR, user_id, f"{profile_name}.json.gz")
+        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "training.json.gz")
         self._atomic_json_save_gzip(data, file_path)
 
     def _delete_training_shard(self, user_id: str, profile_name: str):
-        file_path = os.path.join(self.TRAINING_DIR, user_id, f"{profile_name}.json.gz")
+        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "training.json.gz")
         _delete_file_shard(file_path)
 
     def _rename_training_shards(self, user_id: str, old_profile_name: str, new_profile_name: str):
-        old_path = os.path.join(self.TRAINING_DIR, user_id, f"{old_profile_name}.json.gz")
+        old_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", old_profile_name, "training.json.gz")
         if os.path.exists(old_path):
-            new_path = os.path.join(self.TRAINING_DIR, user_id, f"{new_profile_name}.json.gz")
+            new_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", new_profile_name, "training.json.gz")
             os.makedirs(os.path.dirname(new_path), exist_ok=True)
             os.rename(old_path, new_path)
 
     def _copy_training_shard(self, user_id: str, source_profile_name: str, new_profile_name: str):
-        source_path = os.path.join(self.TRAINING_DIR, user_id, f"{source_profile_name}.json.gz")
+        source_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", source_profile_name, "training.json.gz")
         if os.path.exists(source_path):
-            new_path = os.path.join(self.TRAINING_DIR, user_id, f"{new_profile_name}.json.gz")
+            new_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", new_profile_name, "training.json.gz")
             os.makedirs(os.path.dirname(new_path), exist_ok=True)
             import shutil
             shutil.copy2(source_path, new_path)
@@ -248,18 +314,172 @@ class StorageMixin:
             _, user_id, _ = session_key
             return pathlib.Path(SESSIONS_GLOBAL_DIR) / str(user_id)
         
-        # All other session types are now guild-based and use the same structure
+        # Phase 1: Consolidated Server Directory
         channel_id, _, _ = session_key
         channel = self.bot.get_channel(channel_id)
         server_id = channel.guild.id if channel and channel.guild else "dm"
-        return pathlib.Path(SESSIONS_SERVERS_DIR) / str(server_id) / str(channel_id) / session_type
+        return pathlib.Path(SERVERS_DIR) / str(server_id) / "sessions" / str(channel_id) / session_type
+
+    def _migrate_servers_directory(self):
+        old_sessions_dir = pathlib.Path(SESSIONS_SERVERS_DIR)
+        new_servers_dir = pathlib.Path(SERVERS_DIR)
+        
+        if not old_sessions_dir.exists():
+            return
+            
+        print("Phase 1 Migration: Consolidating Server Sessions...")
+        try:
+            for server_dir in old_sessions_dir.iterdir():
+                if not server_dir.is_dir():
+                    continue
+                    
+                target_sessions_dir = new_servers_dir / server_dir.name / "sessions"
+                target_sessions_dir.mkdir(parents=True, exist_ok=True)
+                
+                for channel_dir in server_dir.iterdir():
+                    if channel_dir.is_dir():
+                        target_channel_dir = target_sessions_dir / channel_dir.name
+                        if not target_channel_dir.exists():
+                            import shutil
+                            shutil.move(str(channel_dir), str(target_channel_dir))
+            
+            import shutil
+            shutil.rmtree(str(old_sessions_dir), ignore_errors=True)
+            print("Phase 1 Migration complete. Old sessions directory removed.")
+        except Exception as e:
+            print(f"Error during Phase 1 Migration: {e}")
+
+    def _migrate_users_root_directory(self):
+        legacy_shares = pathlib.Path(LEGACY_SHARES_DIR)
+        legacy_keys = pathlib.Path(LEGACY_PERSONAL_KEYS_DIR)
+        users_dir = pathlib.Path(self.USERS_DIR)
+        
+        migrated_anything = False
+        
+        if legacy_keys.exists():
+            print("Phase 2 Migration: Consolidating Personal API Keys...")
+            for file_path in legacy_keys.iterdir():
+                if file_path.name.endswith(".json.gz"):
+                    user_id_str = file_path.name[:-len(".json.gz")]
+                    target_dir = users_dir / user_id_str
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    import shutil
+                    shutil.move(str(file_path), str(target_dir / "keys.json.gz"))
+            import shutil
+            shutil.rmtree(str(legacy_keys), ignore_errors=True)
+            migrated_anything = True
+
+        if legacy_shares.exists():
+            print("Phase 2 Migration: Consolidating Profile Shares...")
+            for file_path in legacy_shares.iterdir():
+                if file_path.name.endswith(".json.gz"):
+                    user_id_str = file_path.name[:-len(".json.gz")]
+                    target_dir = users_dir / user_id_str
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    import shutil
+                    shutil.move(str(file_path), str(target_dir / "shares.json.gz"))
+            import shutil
+            shutil.rmtree(str(legacy_shares), ignore_errors=True)
+            migrated_anything = True
+            
+        if migrated_anything:
+                print("Phase 2 Migration complete.")
+
+    def _migrate_profiles_directory(self):
+        legacy_profiles = pathlib.Path(LEGACY_PROFILES_DIR)
+        if not legacy_profiles.exists(): return
+        
+        print("Phase 3 Migration: Splitting Monolithic Profiles & Consolidating Data...")
+        users_dir = pathlib.Path(self.USERS_DIR)
+        
+        try:
+            for profile_file in legacy_profiles.iterdir():
+                if not profile_file.name.endswith(".json.gz"): continue
+                user_id_str = profile_file.name[:-len(".json.gz")]
+                user_target_dir = users_dir / user_id_str
+                user_target_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Load monoliths
+                user_data = self._load_json_gzip(str(profile_file))
+                if not user_data: continue
+                
+                app_data = IOManager.read_json_gzip(os.path.join(self.APPEARANCES_DIR, f"{user_id_str}.json.gz"), self.fernet) or {}
+                bot_data = IOManager.read_json_gzip(os.path.join(LEGACY_CHILD_BOTS_DIR, f"{user_id_str}.json.gz"), encrypted=False) or {}
+                
+                # 1. Create Lightweight Index
+                index_data = {
+                    "personal": list(user_data.get("profiles", {}).keys()),
+                    "borrowed": list(user_data.get("borrowed_profiles", {}).keys()),
+                    "channel_active_profiles": user_data.get("channel_active_profiles", {})
+                }
+                IOManager.write_json(index_data, str(user_target_dir / "index.json"))
+                
+                # 2. Split Personal Profiles
+                for pname, pdata in user_data.get("profiles", {}).items():
+                    p_dir = user_target_dir / "profiles" / pname
+                    p_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Separate Prompts
+                    prompts = {
+                        "persona": pdata.pop("persona", {}),
+                        "ai_instructions": pdata.pop("ai_instructions", ["", "", "", ""]),
+                        "image_generation_prompt": pdata.pop("image_generation_prompt", None),
+                        "ltm_summarization_instructions": pdata.pop("ltm_summarization_instructions", self._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS))
+                    }
+                    IOManager.write_json_gzip(prompts, str(p_dir / "prompts.json.gz"), self.fernet)
+                    
+                    # Merge Appearance into Config
+                    if pname in app_data: pdata.update(app_data[pname])
+                    IOManager.write_json_gzip(pdata, str(p_dir / "config.json.gz"), self.fernet)
+                    
+                    # Move LTM, Training, Global Chat
+                    import shutil
+                    ltm_path = pathlib.Path(LEGACY_LTM_DIR) / user_id_str / f"{pname}.json.gz"
+                    if ltm_path.exists(): shutil.move(str(ltm_path), str(p_dir / "ltm.json.gz"))
+                    
+                    train_path = pathlib.Path(LEGACY_TRAINING_DIR) / user_id_str / f"{pname}.json.gz"
+                    if train_path.exists(): shutil.move(str(train_path), str(p_dir / "training.json.gz"))
+                    
+                    gc_path = pathlib.Path(LEGACY_GLOBAL_CHAT_DIR) / user_id_str / f"{pname}.json.gz"
+                    if gc_path.exists(): shutil.move(str(gc_path), str(p_dir / "global_chat.json.gz"))
+                    
+                    # Move Child Bot Token
+                    for bid, bconfig in bot_data.items():
+                        if bconfig.get("profile_name") == pname:
+                            bconfig["bot_id"] = bid
+                            IOManager.write_json_gzip(bconfig, str(p_dir / "child_bot.json.gz"), encrypted=False)
+                            break
+
+                # 3. Split Borrowed Profiles
+                for bname, bdata in user_data.get("borrowed_profiles", {}).items():
+                    p_dir = user_target_dir / "profiles" / bname
+                    p_dir.mkdir(parents=True, exist_ok=True)
+                    IOManager.write_json_gzip(bdata, str(p_dir / "borrowed_config.json.gz"), self.fernet)
+                    
+                    gc_path = pathlib.Path(LEGACY_GLOBAL_CHAT_DIR) / user_id_str / f"{bname}.json.gz"
+                    if gc_path.exists(): 
+                        import shutil
+                        shutil.move(str(gc_path), str(p_dir / "global_chat.json.gz"))
+
+            # 4. Clean up legacy roots
+            import shutil
+            shutil.rmtree(str(legacy_profiles), ignore_errors=True)
+            shutil.rmtree(self.APPEARANCES_DIR, ignore_errors=True)
+            shutil.rmtree(LEGACY_LTM_DIR, ignore_errors=True)
+            shutil.rmtree(LEGACY_TRAINING_DIR, ignore_errors=True)
+            shutil.rmtree(LEGACY_CHILD_BOTS_DIR, ignore_errors=True)
+            shutil.rmtree(LEGACY_GLOBAL_CHAT_DIR, ignore_errors=True)
+            
+            print("Phase 3 Migration complete. Profiles successfully split and consolidated into entity folders.")
+        except Exception as e:
+            print(f"Error during Phase 3 Migration: {e}")
 
     def _get_session_path(self, session_key: Any, session_type: str) -> pathlib.Path:
-        dir_path = self._get_session_dir_path(session_key, session_type)
         if session_type == 'global_chat':
-            _, _, profile_name = session_key
-            return dir_path / f"{profile_name}.json.gz"
+            _, user_id, profile_name = session_key
+            return pathlib.Path(self.USERS_DIR) / str(user_id) / "profiles" / profile_name / "global_chat.json.gz"
         
+        dir_path = self._get_session_dir_path(session_key, session_type)
         # All other session types use a unified log
         return dir_path / "session_log.json.gz"
     
@@ -420,22 +640,24 @@ class StorageMixin:
 
     def _load_user_appearances(self):
         self.user_appearances = {}
-        if not os.path.isdir(self.APPEARANCES_DIR):
+        if not os.path.isdir(self.USERS_DIR):
             return
-        for filename in os.listdir(self.APPEARANCES_DIR):
-            if filename.endswith(".json.gz"):
-                user_id_str = filename[:-len(".json.gz")]
-                file_path = os.path.join(self.APPEARANCES_DIR, filename)
-                data = self._load_json_gzip(file_path)
-                if data:
-                    self.user_appearances[user_id_str] = data
+        for user_id_str in os.listdir(self.USERS_DIR):
+            if not user_id_str.isdigit(): continue
+            profiles_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles")
+            if not os.path.isdir(profiles_dir): continue
+            for profile_name in os.listdir(profiles_dir):
+                config_path = os.path.join(profiles_dir, profile_name, "config.json.gz")
+                if os.path.exists(config_path):
+                    data = self._load_json_gzip(config_path)
+                    if data and (data.get("custom_display_name") or data.get("custom_avatar_url")):
+                        self.user_appearances.setdefault(user_id_str, {})[profile_name] = {
+                            "custom_display_name": data.get("custom_display_name"),
+                            "custom_avatar_url": data.get("custom_avatar_url")
+                        }
 
     def _save_user_appearance_shard(self, user_id_str: str, data: Dict):
-        file_path = os.path.join(self.APPEARANCES_DIR, f"{user_id_str}.json.gz")
-        if not data:
-            _delete_file_shard(file_path)
-        else:
-            self._atomic_json_save_gzip(data, file_path)
+        pass # Deprecated in Phase 3. Handled directly via _save_profile_config.
 
     def _load_channel_webhooks(self):
         self.channel_webhooks = {}
@@ -511,42 +733,29 @@ class StorageMixin:
 
     def _load_child_bots(self):
         self.child_bots = {}
-        if not os.path.isdir(self.CHILD_BOTS_DIR):
+        if not os.path.isdir(self.USERS_DIR):
             return
-        for filename in os.listdir(self.CHILD_BOTS_DIR):
-            if filename.endswith(".json.gz"):
-                owner_id = filename[:-len(".json.gz")]
-                file_path = os.path.join(self.CHILD_BOTS_DIR, filename)
-                user_bot_data = self._load_json_gzip(file_path, encrypted=False)
-                if user_bot_data:
-                    for bot_id, bot_config in user_bot_data.items():
-                        # Add owner_id for easier access later
-                        bot_config['owner_id'] = int(owner_id)
-                        self.child_bots[bot_id] = bot_config
+        
+        for user_id_str in os.listdir(self.USERS_DIR):
+            if not user_id_str.isdigit(): continue
+            profiles_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles")
+            if not os.path.isdir(profiles_dir): continue
+            
+            for profile_name in os.listdir(profiles_dir):
+                bot_file = os.path.join(profiles_dir, profile_name, "child_bot.json.gz")
+                if os.path.exists(bot_file):
+                    bot_data = IOManager.read_json_gzip(bot_file, encrypted=False)
+                    if bot_data and "bot_id" in bot_data:
+                        bot_data["owner_id"] = int(user_id_str)
+                        self.child_bots[bot_data["bot_id"]] = bot_data
 
+    # Helper methods deprecated by Phase 3 structure, retained as no-ops to prevent crashes
     def _get_user_child_bot_shard(self, owner_id: int) -> Dict[str, Any]:
-        file_path = os.path.join(self.CHILD_BOTS_DIR, f"{owner_id}.json.gz")
-        return self._load_json_gzip(file_path, encrypted=False) or {}
-
+        return {}
     def _get_all_child_bot_shards(self) -> Dict[str, Dict[str, Any]]:
-        all_shards = {}
-        if not os.path.isdir(self.CHILD_BOTS_DIR):
-            return {}
-        for filename in os.listdir(self.CHILD_BOTS_DIR):
-            if filename.endswith(".json.gz"):
-                owner_id_str = filename[:-len(".json.gz")]
-                file_path = os.path.join(self.CHILD_BOTS_DIR, filename)
-                user_bot_data = self._load_json_gzip(file_path, encrypted=False)
-                if user_bot_data:
-                    all_shards[owner_id_str] = user_bot_data
-        return all_shards
-
+        return {}
     def _save_user_child_bot_shard(self, owner_id: int, data: Dict[str, Any]):
-        file_path = os.path.join(self.CHILD_BOTS_DIR, f"{owner_id}.json.gz")
-        if not data:
-            _delete_file_shard(file_path)
-        else:
-            self._atomic_json_save_gzip(data, file_path, encrypted=False)
+        pass
 
     def _load_server_api_keys(self):
         self.server_api_keys = {}
@@ -574,27 +783,27 @@ class StorageMixin:
             "submissions": submissions_data
         }
         
-        self._atomic_json_save_gzip(full_data, file_path)
+        IOManager.write_json_gzip(full_data, file_path, self.fernet)
 
     def _load_personal_api_keys(self):
         self.personal_api_keys = {}
-        if not os.path.isdir(self.PERSONAL_KEYS_DIR):
+        if not os.path.isdir(self.USERS_DIR):
             return
-        for filename in os.listdir(self.PERSONAL_KEYS_DIR):
-            if filename.endswith(".json.gz"):
-                user_id_str = filename[:-len(".json.gz")]
-                file_path = os.path.join(self.PERSONAL_KEYS_DIR, filename)
-                data = self._load_json_gzip(file_path)
+        for user_id_str in os.listdir(self.USERS_DIR):
+            if not user_id_str.isdigit(): continue
+            file_path = os.path.join(self.USERS_DIR, user_id_str, "keys.json.gz")
+            if os.path.exists(file_path):
+                data = IOManager.read_json_gzip(file_path, self.fernet)
                 if data and isinstance(data, dict) and "key" in data:
                     self.personal_api_keys[user_id_str] = data["key"]
 
     def _save_personal_api_key_shard(self, user_id_str: str, encrypted_key: Optional[str]):
-        file_path = os.path.join(self.PERSONAL_KEYS_DIR, f"{user_id_str}.json.gz")
+        file_path = os.path.join(self.USERS_DIR, user_id_str, "keys.json.gz")
         if not encrypted_key:
             _delete_file_shard(file_path)
         else:
             data_to_save = {"key": encrypted_key}
-            self._atomic_json_save_gzip(data_to_save, file_path)
+            IOManager.write_json_gzip(data_to_save, file_path, self.fernet)
 
     def _load_key_submissions(self):
         self.key_submissions = {}
@@ -617,22 +826,22 @@ class StorageMixin:
 
     def _load_profile_shares(self):
         self.profile_shares = {}
-        if not os.path.isdir(self.SHARES_DIR):
+        if not os.path.isdir(self.USERS_DIR):
             return
-        for filename in os.listdir(self.SHARES_DIR):
-            if filename.endswith(".json.gz"):
-                recipient_id_str = filename[:-len(".json.gz")]
-                file_path = os.path.join(self.SHARES_DIR, filename)
-                data = self._load_json_gzip(file_path)
+        for user_id_str in os.listdir(self.USERS_DIR):
+            if not user_id_str.isdigit(): continue
+            file_path = os.path.join(self.USERS_DIR, user_id_str, "shares.json.gz")
+            if os.path.exists(file_path):
+                data = IOManager.read_json_gzip(file_path, self.fernet)
                 if data:
-                    self.profile_shares[recipient_id_str] = data
+                    self.profile_shares[user_id_str] = data
 
     def _save_profile_share_shard(self, recipient_id_str: str, data: List):
-        file_path = os.path.join(self.SHARES_DIR, f"{recipient_id_str}.json.gz")
+        file_path = os.path.join(self.USERS_DIR, recipient_id_str, "shares.json.gz")
         if not data:
             _delete_file_shard(file_path)
         else:
-            self._atomic_json_save_gzip(data, file_path)
+            IOManager.write_json_gzip(data, file_path, self.fernet)
 
     async def _load_multi_profile_sessions(self):
         await self.bot.wait_until_ready()
@@ -862,12 +1071,10 @@ class StorageMixin:
         if not self.fernet: return None
         user_id_str = str(user_id)
 
-        file_path = os.path.join(self.PERSONAL_KEYS_DIR, f"{user_id_str}.json.gz")
-        data = self._load_json_gzip(file_path)
+        file_path = os.path.join(self.USERS_DIR, user_id_str, "keys.json.gz")
+        data = IOManager.read_json_gzip(file_path, self.fernet)
         
         if not data:
-            # Backward compatibility check for old single-string file format (though _load_json_gzip might fail on string)
-            # Assuming migration or clean start. If it returns dict:
             return None
 
         encrypted_key = None
@@ -881,9 +1088,9 @@ class StorageMixin:
 
         try:
             return self.fernet.decrypt(encrypted_key.encode()).decode()
-        except Exception as e:
-            print(f"Failed to decrypt a personal API key for user {user_id}: {e}")
-            return None
+        except Exception:
+            # Fallback if the key was saved in plain text or only value-level encrypted during migration
+            return encrypted_key
 
     def _is_profile_public(self, user_id: int, profile_name: str) -> bool:
         user_id_str = str(user_id)
@@ -897,279 +1104,268 @@ class StorageMixin:
         owner_id = int(defaultConfig.DISCORD_OWNER_ID)
 
         if active_profile_name == DEFAULT_PROFILE_NAME and user_id != owner_id:
-            owner_user_data = self._get_user_data_entry(owner_id)
-            profile_data = owner_user_data.get("profiles", {}).get(DEFAULT_PROFILE_NAME)
-            if not profile_data:
+            owner_config = self._get_profile_config(owner_id, DEFAULT_PROFILE_NAME)
+            if not owner_config:
                 self._get_or_create_user_profile(owner_id, DEFAULT_PROFILE_NAME)
-                profile_data = owner_user_data.get("profiles", {}).get(DEFAULT_PROFILE_NAME, {})
+                owner_config = self._get_profile_config(owner_id, DEFAULT_PROFILE_NAME) or {}
+            
+            owner_prompts = self._get_profile_prompts(owner_id, DEFAULT_PROFILE_NAME) or {}
 
-            persona = profile_data.get("persona", {})
-            ai_instructions = profile_data.get("ai_instructions", "")
-            grounding_enabled = profile_data.get("grounding_enabled", False)
-            temperature = profile_data.get("temperature", defaultConfig.GEMINI_TEMPERATURE)
-            top_p = profile_data.get("top_p", defaultConfig.GEMINI_TOP_P)
-            top_k = profile_data.get("top_k", defaultConfig.GEMINI_TOP_K)
-            training_context_size = profile_data.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE)
-            training_relevance_threshold = profile_data.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD)
-            primary_model = profile_data.get("primary_model", PRIMARY_MODEL_NAME)
-            fallback_model = profile_data.get("fallback_model", FALLBACK_MODEL_NAME)
+            persona = owner_prompts.get("persona", {})
+            ai_instructions = owner_prompts.get("ai_instructions", "")
+            grounding_enabled = owner_config.get("grounding_enabled", False)
+            temperature = owner_config.get("temperature", defaultConfig.GEMINI_TEMPERATURE)
+            top_p = owner_config.get("top_p", defaultConfig.GEMINI_TOP_P)
+            top_k = owner_config.get("top_k", defaultConfig.GEMINI_TOP_K)
+            training_context_size = owner_config.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE)
+            training_relevance_threshold = owner_config.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD)
+            primary_model = owner_config.get("primary_model", PRIMARY_MODEL_NAME)
+            fallback_model = owner_config.get("fallback_model", FALLBACK_MODEL_NAME)
             
             return (persona, ai_instructions, grounding_enabled, float(temperature), float(top_p), int(top_k), int(training_context_size), float(training_relevance_threshold), primary_model, fallback_model)
 
-        user_data = self._get_user_data_entry(user_id)
-        is_borrowed = active_profile_name in user_data.get("borrowed_profiles", {})
+        index = self._get_user_index(user_id)
+        is_borrowed = active_profile_name in index.get("borrowed", [])
         
-        if is_borrowed:
-            borrowed_data = user_data["borrowed_profiles"][active_profile_name]
-            source_owner_id = int(borrowed_data["original_owner_id"])
-            source_profile_name = borrowed_data["original_profile_name"]
-            source_owner_user_data = self._get_user_data_entry(source_owner_id)
-            owner_profile_data = source_owner_user_data.get("profiles", {}).get(source_profile_name, {})
-            
-            persona = owner_profile_data.get("persona", {})
-            ai_instructions = owner_profile_data.get("ai_instructions", "")
-            training_context_size = owner_profile_data.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE)
-            training_relevance_threshold = owner_profile_data.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD)
-            
-            # [UPDATED] Check local borrowed_data first for overrides, fallback to owner_profile_data
-            temperature = borrowed_data.get("temperature", owner_profile_data.get("temperature", defaultConfig.GEMINI_TEMPERATURE))
-            top_p = borrowed_data.get("top_p", owner_profile_data.get("top_p", defaultConfig.GEMINI_TOP_P))
-            top_k = borrowed_data.get("top_k", owner_profile_data.get("top_k", defaultConfig.GEMINI_TOP_K))
-            
-            primary_model = borrowed_data.get("primary_model", owner_profile_data.get("primary_model", PRIMARY_MODEL_NAME))
-            fallback_model = borrowed_data.get("fallback_model", owner_profile_data.get("fallback_model", FALLBACK_MODEL_NAME))
+        config = self._get_profile_config(user_id, active_profile_name, is_borrowed)
+        if not config:
+            return {}, "", False, defaultConfig.GEMINI_TEMPERATURE, defaultConfig.GEMINI_TOP_P, defaultConfig.GEMINI_TOP_K, defaultConfig.TRAINING_CONTEXT_SIZE, defaultConfig.TRAINING_RELEVANCE_THRESHOLD, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME
 
-            grounding_enabled = borrowed_data.get("grounding_enabled", False)
+        if is_borrowed:
+            source_owner_id = int(config.get("original_owner_id", owner_id))
+            source_profile_name = config.get("original_profile_name", DEFAULT_PROFILE_NAME)
+            source_config = self._get_profile_config(source_owner_id, source_profile_name, False) or {}
+            prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
         else:
-            profile_data = user_data.get("profiles", {}).get(active_profile_name)
+            source_config = config
+            prompts = self._get_profile_prompts(user_id, active_profile_name) or {}
             
-            if not profile_data:
-                # This can happen if a user's active personal profile was deleted.
-                # We return empty data, which will cause a graceful failure message to be sent.
-                return {}, "", False, defaultConfig.GEMINI_TEMPERATURE, defaultConfig.GEMINI_TOP_P, defaultConfig.GEMINI_TOP_K, defaultConfig.TRAINING_CONTEXT_SIZE, defaultConfig.TRAINING_RELEVANCE_THRESHOLD, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME
-            
-            persona = profile_data.get("persona", {})
-            ai_instructions = profile_data.get("ai_instructions", "")
-            grounding_enabled = profile_data.get("grounding_enabled", False)
-            temperature = profile_data.get("temperature", defaultConfig.GEMINI_TEMPERATURE)
-            top_p = profile_data.get("top_p", defaultConfig.GEMINI_TOP_P)
-            top_k = profile_data.get("top_k", defaultConfig.GEMINI_TOP_K)
-            training_context_size = profile_data.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE)
-            training_relevance_threshold = profile_data.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD)
-            primary_model = profile_data.get("primary_model", PRIMARY_MODEL_NAME)
-            fallback_model = profile_data.get("fallback_model", FALLBACK_MODEL_NAME)
-            
+        persona = prompts.get("persona", {})
+        ai_instructions = prompts.get("ai_instructions", "")
+        
+        # Local overrides first, then source, then default
+        training_context_size = config.get("training_context_size", source_config.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE))
+        training_relevance_threshold = config.get("training_relevance_threshold", source_config.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD))
+        temperature = config.get("temperature", source_config.get("temperature", defaultConfig.GEMINI_TEMPERATURE))
+        top_p = config.get("top_p", source_config.get("top_p", defaultConfig.GEMINI_TOP_P))
+        top_k = config.get("top_k", source_config.get("top_k", defaultConfig.GEMINI_TOP_K))
+        primary_model = config.get("primary_model", source_config.get("primary_model", PRIMARY_MODEL_NAME))
+        fallback_model = config.get("fallback_model", source_config.get("fallback_model", FALLBACK_MODEL_NAME))
+        grounding_enabled = config.get("grounding_enabled", source_config.get("grounding_enabled", False))
+
         return (persona, ai_instructions, grounding_enabled, float(temperature), float(top_p), int(top_k), int(training_context_size), float(training_relevance_threshold), primary_model, fallback_model)
     
-    def _get_user_data_entry(self, user_id: int) -> Dict[str, Any]:
-        user_id_str = str(user_id)
-        if user_id_str in self.user_profiles:
-            return self.user_profiles[user_id_str]
-
-        file_path = os.path.join(self.PROFILES_DIR, f"{user_id_str}.json.gz")
-        user_data = self._load_json_gzip(file_path)
-
-        if user_data is None:
-            user_data = {
-                "profiles": {},
-                "borrowed_profiles": {},
-                "channel_active_profiles": {},
-            }
-
-        if "profiles" not in user_data: user_data["profiles"] = {}
-        if "borrowed_profiles" not in user_data: user_data["borrowed_profiles"] = {}
-        if "channel_active_profiles" not in user_data: user_data["channel_active_profiles"] = {}
-
-        # --- Data Migration: Fix for "personality traits" key ---
-        data_was_migrated = False
-        for pname, pdata in user_data.get("profiles", {}).items():
-            if "persona" in pdata and "personality traits" in pdata["persona"]:
-                pdata["persona"]["personality_traits"] = pdata["persona"].pop("personality traits")
-                data_was_migrated = True
-        if data_was_migrated:
-            self._save_user_data_entry(user_id, user_data)
-        # --- End Migration ---
-
-        for pname, pdata in user_data.get("profiles", {}).items():
-            pdata.setdefault("grounding_enabled", False)
-            pdata.setdefault("top_p", defaultConfig.GEMINI_TOP_P)
-            pdata.setdefault("top_k", defaultConfig.GEMINI_TOP_K)
-            pdata.setdefault("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE)
-            pdata.setdefault("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD)
-            pdata.setdefault("primary_model", PRIMARY_MODEL_NAME)
-            pdata.setdefault("fallback_model", FALLBACK_MODEL_NAME)
-            pdata.setdefault("time_tracking_enabled", True)
-            pdata.setdefault("timezone", "UTC")
-            pdata.setdefault("realistic_typing_enabled", False)
-            pdata.setdefault("freewill_enabled", False)
-            pdata.setdefault("wakewords", [])
-            pdata.setdefault("safety_level", "low")
-            pdata.setdefault("ltm_creation_enabled", False)
-            pdata.setdefault("speech_voice", "Aoede")
-            pdata.setdefault("speech_model", "gemini-2.5-flash-preview-tts")
-            pdata.setdefault("speech_temperature", 1.0)
-            pdata.setdefault("speech_archetype", "")
-            pdata.setdefault("speech_accent", "")
-            pdata.setdefault("speech_dynamics", "")
-            pdata.setdefault("speech_style", "")
-            pdata.setdefault("speech_pacing", "")
-
-        for pname, pdata in user_data.get("borrowed_profiles", {}).items():
-            pdata.setdefault("ltm_creation_enabled", False)
-            pdata.setdefault("thinking_summary_visible", "off")
-            pdata.setdefault("thinking_level", "high")
-            pdata.setdefault("thinking_budget", -1)
-
-        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-        if user_id != owner_id and DEFAULT_PROFILE_NAME not in user_data.get("borrowed_profiles", {}):
-            owner_user_data = self._get_user_data_entry(owner_id)
-            
-            owner_profile_data = owner_user_data.get("profiles", {}).get(DEFAULT_PROFILE_NAME)
-            if not owner_profile_data:
-                owner_profile_data = self._get_or_create_user_profile(owner_id, DEFAULT_PROFILE_NAME)
-
-            user_data.setdefault("borrowed_profiles", {})[DEFAULT_PROFILE_NAME] = {
-                "original_owner_id": str(owner_id),
-                "original_profile_name": DEFAULT_PROFILE_NAME,
-                "borrowed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "grounding_enabled": owner_profile_data.get("grounding_enabled", False),
-                "realistic_typing_enabled": owner_profile_data.get("realistic_typing_enabled", False),
-                "time_tracking_enabled": owner_profile_data.get("time_tracking_enabled", False),
-                "timezone": owner_profile_data.get("timezone", "UTC")
-            }
-
-        self.user_profiles[user_id_str] = user_data
-        return user_data
-    
-    def _save_user_data_entry(self, user_id: int, data: Dict[str, Any]):
-        user_id_str = str(user_id)
-        file_path = os.path.join(self.PROFILES_DIR, f"{user_id_str}.json.gz")
-        try:
-            self._atomic_json_save_gzip(data, file_path)
-            if user_id_str in self.user_profiles:
-                self.user_profiles[user_id_str] = data
-        except Exception as e:
-            print(f"Error saving user profile shard for {user_id_str}: {e}")
-
     def _get_or_create_user_profile(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
-        user_data = self._get_user_data_entry(user_id)
         profile_name = profile_name.lower().strip()
         owner_id = int(defaultConfig.DISCORD_OWNER_ID)
 
         if profile_name == DEFAULT_PROFILE_NAME and user_id != owner_id:
             return None
 
-        if profile_name not in user_data["profiles"]:
-            if len(user_data["profiles"]) >= MAX_USER_PROFILES and profile_name != DEFAULT_PROFILE_NAME:
+        index = self._get_user_index(user_id)
+        
+        if profile_name not in index.get("personal", []):
+            if len(index.get("personal", [])) >= MAX_USER_PROFILES and profile_name != DEFAULT_PROFILE_NAME:
                 return None 
-            user_data["profiles"][profile_name] = {
-                "persona": {},
-                "ai_instructions": ["", "", "", ""], # [NEW] 4 slots for expanded instructions
-                "grounding_enabled": False,
-                "stm_length": defaultConfig.CHATBOT_MEMORY_LENGTH,
-                "temperature": defaultConfig.GEMINI_TEMPERATURE,
-                "top_p": defaultConfig.GEMINI_TOP_P,
-                "top_k": defaultConfig.GEMINI_TOP_K,
-                "training_context_size": defaultConfig.TRAINING_CONTEXT_SIZE,
+            
+            index.setdefault("personal", []).append(profile_name)
+            self._save_user_index(user_id, index)
+            
+            config = {
+                "grounding_enabled": False, "stm_length": defaultConfig.CHATBOT_MEMORY_LENGTH,
+                "temperature": defaultConfig.GEMINI_TEMPERATURE, "top_p": defaultConfig.GEMINI_TOP_P,
+                "top_k": defaultConfig.GEMINI_TOP_K, "training_context_size": defaultConfig.TRAINING_CONTEXT_SIZE,
                 "training_relevance_threshold": defaultConfig.TRAINING_RELEVANCE_THRESHOLD,
-                "ltm_context_size": 3,
-                "ltm_relevance_threshold": 0.75,
-                "ltm_creation_interval": 10,
-                "ltm_summarization_context": 10,
-                "ltm_scope": "server",
-                "ltm_summarization_instructions": self._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS),
-                "safety_level": "low",
-                "primary_model": PRIMARY_MODEL_NAME,
-                "fallback_model": FALLBACK_MODEL_NAME,
-                "time_tracking_enabled": True,
-                "timezone": "UTC",
-                "generation_metadata_enabled": False,
-                "realistic_typing_enabled": False,
-                "ltm_creation_enabled": False,
-                "image_generation_enabled": False,
-                "image_generation_model": "gemini-2.5-flash-image",
-                "url_fetching_enabled": False,
-                "response_mode": "regular",
-                "thinking_summary_visible": "off",
-                "thinking_level": "high",
-                "thinking_budget": -1,
-                "thinking_signatures_enabled": "off",
-                "error_response": "An error has occurred."
+                "ltm_context_size": 3, "ltm_relevance_threshold": 0.75, "ltm_creation_interval": 10,
+                "ltm_summarization_context": 10, "ltm_scope": "server", "safety_level": "low",
+                "primary_model": PRIMARY_MODEL_NAME, "fallback_model": FALLBACK_MODEL_NAME,
+                "time_tracking_enabled": True, "timezone": "UTC", "generation_metadata_enabled": False,
+                "realistic_typing_enabled": False, "ltm_creation_enabled": False,
+                "image_generation_enabled": False, "image_generation_model": "gemini-2.5-flash-image",
+                "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
+                "thinking_level": "high", "thinking_budget": -1, "thinking_signatures_enabled": "off",
+                "error_response": "An error has occurred.", "speech_voice": "Aoede",
+                "speech_model": "gemini-2.5-flash-preview-tts", "speech_temperature": 1.0,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }
-        else: 
-            profile = user_data["profiles"][profile_name]
-            profile.setdefault("error_response", "An error has occurred.")
-            profile.setdefault("grounding_enabled", False)
-            profile.setdefault("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
-            profile.setdefault("temperature", defaultConfig.GEMINI_TEMPERATURE)
-            profile.setdefault("top_p", defaultConfig.GEMINI_TOP_P)
-            profile.setdefault("top_k", defaultConfig.GEMINI_TOP_K)
-            profile.setdefault("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE)
-            profile.setdefault("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD)
-            profile.setdefault("ltm_context_size", 3)
-            profile.setdefault("ltm_relevance_threshold", 0.75)
-            profile.setdefault("ltm_scope", "server")
-            profile.setdefault("ltm_summarization_instructions", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
-            profile.setdefault("safety_level", "low")
-            profile.setdefault("primary_model", PRIMARY_MODEL_NAME)
-            profile.setdefault("fallback_model", FALLBACK_MODEL_NAME)
-            profile.setdefault("time_tracking_enabled", True)
-            profile.setdefault("timezone", "UTC")
-            profile.setdefault("generation_metadata_enabled", False)
-            profile.setdefault("realistic_typing_enabled", False)
-            profile.setdefault("ltm_creation_enabled", False)
-            profile.setdefault("image_generation_prompt", None)
-            profile.setdefault("image_generation_model", "gemini-2.5-flash-image")
-            profile.setdefault("thinking_summary_visible", "off")
-            profile.setdefault("thinking_level", "medium")
-            profile.setdefault("thinking_budget", -1)
-            profile.setdefault("thinking_signatures_enabled", "off")
-            profile.setdefault("speech_voice", "Aoede")
-            profile.setdefault("speech_model", "gemini-2.5-flash-preview-tts")
-            profile.setdefault("speech_temperature", 1.0)
-            profile.setdefault("speech_archetype", "")
-            profile.setdefault("speech_accent", "")
-            profile.setdefault("speech_dynamics", "")
-            profile.setdefault("speech_style", "")
-            profile.setdefault("speech_pacing", "")
-        return user_data["profiles"][profile_name]
+            
+            prompts = {
+                "persona": {}, "ai_instructions": ["", "", "", ""], "image_generation_prompt": None,
+                "ltm_summarization_instructions": self._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
+            }
+            
+            self._save_profile_config(user_id, profile_name, config)
+            self._save_profile_prompts(user_id, profile_name, prompts)
+            return {"config": config, "prompts": prompts}
+            
+        return {"config": self._get_profile_config(user_id, profile_name), "prompts": self._get_profile_prompts(user_id, profile_name)}
     
     def _get_active_user_profile_name_for_channel(self, user_id: int, channel_id: int) -> str:
-        user_data = self._get_user_data_entry(user_id)
-        return user_data.get("channel_active_profiles", {}).get(str(channel_id), DEFAULT_PROFILE_NAME)
+        index = self._get_user_index(user_id)
+        return index.get("channel_active_profiles", {}).get(str(channel_id), DEFAULT_PROFILE_NAME)
 
     def _get_active_user_profile_data(self, user_id: int, channel_id: int) -> Optional[Dict[str, Any]]:
-        user_data = self._get_user_data_entry(user_id)
         active_profile_name = self._get_active_user_profile_name_for_channel(user_id, channel_id)
+        index = self._get_user_index(user_id)
         
-        profile = user_data.get("profiles", {}).get(active_profile_name)
-        if not profile and active_profile_name != DEFAULT_PROFILE_NAME: 
-            profile = user_data.get("profiles", {}).get(DEFAULT_PROFILE_NAME)
+        is_borrowed = active_profile_name in index.get("borrowed", [])
+        config = self._get_profile_config(user_id, active_profile_name, is_borrowed)
         
-        if profile: 
-            profile.setdefault("grounding_enabled", False)
-            profile.setdefault("temperature", defaultConfig.GEMINI_TEMPERATURE)
-            profile.setdefault("top_p", defaultConfig.GEMINI_TOP_P)
-            profile.setdefault("top_k", defaultConfig.GEMINI_TOP_K)
-            profile.setdefault("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE)
-            profile.setdefault("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD)
-            profile.setdefault("primary_model", PRIMARY_MODEL_NAME)
-            profile.setdefault("fallback_model", FALLBACK_MODEL_NAME)
-        return profile
+        if not config and active_profile_name != DEFAULT_PROFILE_NAME: 
+            config = self._get_profile_config(user_id, DEFAULT_PROFILE_NAME, False)
+        
+        if config: 
+            config.setdefault("grounding_enabled", False)
+            config.setdefault("temperature", defaultConfig.GEMINI_TEMPERATURE)
+            config.setdefault("top_p", defaultConfig.GEMINI_TOP_P)
+            config.setdefault("top_k", defaultConfig.GEMINI_TOP_K)
+            config.setdefault("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE)
+            config.setdefault("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD)
+            config.setdefault("primary_model", PRIMARY_MODEL_NAME)
+            config.setdefault("fallback_model", FALLBACK_MODEL_NAME)
+        return config
+
+    def _get_user_index(self, user_id: int) -> Dict[str, Any]:
+        user_id_str = str(user_id)
+        if user_id_str in self.user_indices: return self.user_indices[user_id_str]
+        
+        path = os.path.join(self.USERS_DIR, user_id_str, "index.json")
+        index = IOManager.read_json(path)
+        
+        if not index:
+            index = {"personal": [], "borrowed": [], "channel_active_profiles": {}}
+            owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+            
+            if user_id != owner_id:
+                index["borrowed"].append(DEFAULT_PROFILE_NAME)
+                self._save_user_index(user_id, index)
+                
+                b_config = self._get_profile_config(user_id, DEFAULT_PROFILE_NAME, True)
+                if not b_config:
+                    owner_config = self._get_profile_config(owner_id, DEFAULT_PROFILE_NAME, False) or {}
+                    self._save_profile_config(user_id, DEFAULT_PROFILE_NAME, {
+                        "original_owner_id": str(owner_id),
+                        "original_profile_name": DEFAULT_PROFILE_NAME,
+                        "borrowed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "grounding_enabled": owner_config.get("grounding_enabled", False),
+                        "realistic_typing_enabled": owner_config.get("realistic_typing_enabled", False),
+                        "time_tracking_enabled": owner_config.get("time_tracking_enabled", False),
+                        "timezone": owner_config.get("timezone", "UTC")
+                    }, is_borrowed=True)
+                    
+        self.user_indices[user_id_str] = index
+        return index
+
+    def _save_user_index(self, user_id: int, data: Dict[str, Any]):
+        user_id_str = str(user_id)
+        path = os.path.join(self.USERS_DIR, user_id_str, "index.json")
+        IOManager.write_json(data, path)
+        self.user_indices[user_id_str] = data
+
+    def _get_profile_config(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> Optional[Dict[str, Any]]:
+        cache_key = f"{user_id}:{profile_name}:{'b' if is_borrowed else 'p'}"
+        if cache_key in self.profile_configs: return self.profile_configs[cache_key]
+        
+        filename = "borrowed_config.json.gz" if is_borrowed else "config.json.gz"
+        path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, filename)
+        data = IOManager.read_json_gzip(path, self.fernet)
+        
+        if data is not None:
+            if not is_borrowed and "profile_id" not in data:
+                import uuid
+                data["profile_id"] = str(uuid.uuid4().hex[:8].upper())
+                self._save_profile_config(user_id, profile_name, data, False)
+            self.profile_configs[cache_key] = data
+        return data
+
+    def _save_profile_config(self, user_id: int, profile_name: str, data: Dict[str, Any], is_borrowed: bool = False):
+        cache_key = f"{user_id}:{profile_name}:{'b' if is_borrowed else 'p'}"
+        filename = "borrowed_config.json.gz" if is_borrowed else "config.json.gz"
+        path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, filename)
+        IOManager.write_json_gzip(data, path, self.fernet)
+        self.profile_configs[cache_key] = data
+
+    def _get_profile_prompts(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
+        cache_key = f"{user_id}:{profile_name}"
+        if cache_key in self.profile_prompts: return self.profile_prompts[cache_key]
+        
+        path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "prompts.json.gz")
+        data = IOManager.read_json_gzip(path, self.fernet)
+        
+        if data is not None:
+            self.profile_prompts[cache_key] = data
+        return data
+
+    def _save_profile_prompts(self, user_id: int, profile_name: str, data: Dict[str, Any]):
+        cache_key = f"{user_id}:{profile_name}"
+        path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "prompts.json.gz")
+        IOManager.write_json_gzip(data, path, self.fernet)
+        self.profile_prompts[cache_key] = data
+
+    def _get_or_create_user_profile(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
+        profile_name = profile_name.lower().strip()
+        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+
+        if profile_name == DEFAULT_PROFILE_NAME and user_id != owner_id:
+            return None
+
+        index = self._get_user_index(user_id)
+        
+        if profile_name not in index.get("personal", []):
+            if len(index.get("personal", [])) >= MAX_USER_PROFILES and profile_name != DEFAULT_PROFILE_NAME:
+                return None 
+            
+            index.setdefault("personal", []).append(profile_name)
+            self._save_user_index(user_id, index)
+            
+            import uuid
+            config = {
+                "profile_id": str(uuid.uuid4().hex[:8].upper()),
+                "grounding_enabled": False, "stm_length": defaultConfig.CHATBOT_MEMORY_LENGTH,
+                "temperature": defaultConfig.GEMINI_TEMPERATURE, "top_p": defaultConfig.GEMINI_TOP_P,
+                "top_k": defaultConfig.GEMINI_TOP_K, "training_context_size": defaultConfig.TRAINING_CONTEXT_SIZE,
+                "training_relevance_threshold": defaultConfig.TRAINING_RELEVANCE_THRESHOLD,
+                "ltm_context_size": 3, "ltm_relevance_threshold": 0.75, "ltm_creation_interval": 10,
+                "ltm_summarization_context": 10, "ltm_scope": "server", "safety_level": "low",
+                "primary_model": PRIMARY_MODEL_NAME, "fallback_model": FALLBACK_MODEL_NAME,
+                "time_tracking_enabled": True, "timezone": "UTC", "generation_metadata_enabled": False,
+                "id_metadata_enabled": False, "realistic_typing_enabled": False, "ltm_creation_enabled": False,
+                "image_generation_enabled": False, "image_generation_model": "gemini-2.5-flash-image",
+                "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
+                "thinking_level": "high", "thinking_budget": -1, "thinking_signatures_enabled": "off",
+                "error_response": "An error has occurred.", "speech_voice": "Aoede",
+                "speech_model": "gemini-2.5-flash-preview-tts", "speech_temperature": 1.0,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }
+            
+            prompts = {
+                "persona": {}, "ai_instructions": ["", "", "", ""], "image_generation_prompt": None,
+                "ltm_summarization_instructions": self._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
+            }
+            
+            self._save_profile_config(user_id, profile_name, config)
+            self._save_profile_prompts(user_id, profile_name, prompts)
+            return {"config": config, "prompts": prompts}
+            
+        return {"config": self._get_profile_config(user_id, profile_name), "prompts": self._get_profile_prompts(user_id, profile_name)}
+    
+    def _get_active_user_profile_name_for_channel(self, user_id: int, channel_id: int) -> str:
+        index = self._get_user_index(user_id)
+        return index.get("channel_active_profiles", {}).get(str(channel_id), DEFAULT_PROFILE_NAME)
 
     async def _set_active_user_profile_for_channel(self, user_id: int, channel_id: int, profile_name: str, interaction_for_feedback: Optional[discord.Interaction] = None) -> bool:
-        user_data = self._get_user_data_entry(user_id)
+        index = self._get_user_index(user_id)
         profile_name = profile_name.lower().strip()
-        is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
+        is_borrowed = profile_name in index.get("borrowed", [])
 
-        if not is_borrowed and profile_name != DEFAULT_PROFILE_NAME and profile_name not in user_data.get("profiles", {}): 
+        if not is_borrowed and profile_name != DEFAULT_PROFILE_NAME and profile_name not in index.get("personal", []): 
             if interaction_for_feedback:
                 await interaction_for_feedback.followup.send(f"Your profile '{profile_name}' not found. Cannot activate.", ephemeral=True)
             return False
         
         old_profile_name = self._get_active_user_profile_name_for_channel(user_id, channel_id)
-        user_data.setdefault("channel_active_profiles", {})[str(channel_id)] = profile_name
-        self._save_user_data_entry(user_id, user_data)
+        index.setdefault("channel_active_profiles", {})[str(channel_id)] = profile_name
+        self._save_user_index(user_id, index)
         
         if interaction_for_feedback and interaction_for_feedback.guild:
             warning_key_to_clear = (user_id, interaction_for_feedback.guild.id, old_profile_name)
@@ -1195,14 +1391,15 @@ class StorageMixin:
             effective_owner_id = user_id
             effective_profile_name = profile_name
             if is_borrowed:
-                borrowed_data = user_data["borrowed_profiles"][profile_name]
-                effective_owner_id = int(borrowed_data["original_owner_id"])
-                effective_profile_name = borrowed_data["original_profile_name"]
+                b_config = self._get_profile_config(user_id, profile_name, True)
+                if b_config:
+                    effective_owner_id = int(b_config.get("original_owner_id", user_id))
+                    effective_profile_name = b_config.get("original_profile_name", profile_name)
             
             active_appearance = None
-            owner_id_str = str(effective_owner_id)
-            if owner_id_str in self.user_appearances and effective_profile_name in self.user_appearances[owner_id_str]:
-                active_appearance = self.user_appearances[owner_id_str][effective_profile_name]
+            owner_config = self._get_profile_config(effective_owner_id, effective_profile_name)
+            if owner_config and (owner_config.get("custom_display_name") or owner_config.get("custom_avatar_url")):
+                active_appearance = owner_config
 
             app_name = self.bot.user.name if self.bot.user else "Bot"
             app_avatar_url = self.bot.user.display_avatar.url if self.bot.user else None
@@ -1217,42 +1414,62 @@ class StorageMixin:
             
             await interaction_for_feedback.followup.send(embed=embed, ephemeral=True)
         return True
-    
+
+    def _check_unrestricted_safety_policy(self, profile_owner_id: int, profile_name: str, channel: discord.abc.Messageable) -> bool:
+        index = self._get_user_index(profile_owner_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
+        config = self._get_profile_config(profile_owner_id, profile_name, is_borrowed) or {}
+        
+        safety_level = config.get("safety_level", "low")
+
+        if safety_level == "unrestricted":
+            if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
+                return False 
+            return channel.is_nsfw()
+        
+        return True 
+
     async def _validate_and_clean_borrowed_profiles(self, user_id: int) -> int:
         """
         Scans a user's borrowed profiles. If the source profile no longer exists
         (deleted by owner), it removes the borrowed entry.
         Returns the number of profiles removed.
         """
-        user_data = self._get_user_data_entry(user_id)
-        borrowed = user_data.get("borrowed_profiles", {})
+        index = self._get_user_index(user_id)
+        borrowed = index.get("borrowed", [])
         if not borrowed:
             return 0
 
         # Group by owner to minimize I/O
         profiles_by_owner = {}
-        for local_name, data in borrowed.items():
-            o_id = data.get("original_owner_id")
-            o_name = data.get("original_profile_name")
-            if o_id and o_name:
-                profiles_by_owner.setdefault(str(o_id), []).append((local_name, o_name))
+        for local_name in borrowed:
+            b_config = self._get_profile_config(user_id, local_name, True)
+            if b_config:
+                o_id = b_config.get("original_owner_id")
+                o_name = b_config.get("original_profile_name")
+                if o_id and o_name:
+                    profiles_by_owner.setdefault(str(o_id), []).append((local_name, o_name))
 
         removed_count = 0
         ids_to_remove = []
 
         for owner_id_str, items in profiles_by_owner.items():
-            # Load owner data once per owner
-            owner_data = self._get_user_data_entry(int(owner_id_str))
-            owner_profiles = owner_data.get("profiles", {})
+            owner_index = self._get_user_index(int(owner_id_str))
+            owner_profiles = owner_index.get("personal", [])
             
             for local_name, original_name in items:
                 if original_name not in owner_profiles:
                     ids_to_remove.append(local_name)
 
         if ids_to_remove:
+            index["borrowed"] = [b for b in borrowed if b not in ids_to_remove]
+            self._save_user_index(user_id, index)
+            
             for local_name in ids_to_remove:
-                del user_data["borrowed_profiles"][local_name]
-            self._save_user_data_entry(user_id, user_data)
+                import shutil
+                p_dir = os.path.join(self.USERS_DIR, str(user_id), "profiles", local_name)
+                shutil.rmtree(p_dir, ignore_errors=True)
+                
             removed_count = len(ids_to_remove)
             
         return removed_count
@@ -1260,24 +1477,28 @@ class StorageMixin:
     def _cascade_delete_borrowed_profiles(self, original_owner_id: int, original_profile_name: str):
         """Instantly removes all borrowed variants linked to a deleted personal profile across the entire system."""
         owner_str = str(original_owner_id)
-        if not os.path.isdir(self.PROFILES_DIR): return
+        if not os.path.isdir(self.USERS_DIR): return
         
-        for filename in os.listdir(self.PROFILES_DIR):
-            if not filename.endswith(".json.gz"): continue
-            user_id_str = filename[:-len(".json.gz")]
+        for user_id_str in os.listdir(self.USERS_DIR):
+            if not user_id_str.isdigit(): continue
             try:
-                user_data = self._get_user_data_entry(int(user_id_str))
-                borrowed = user_data.get("borrowed_profiles", {})
+                uid = int(user_id_str)
+                index = self._get_user_index(uid)
+                borrowed = index.get("borrowed", [])
                 
                 to_delete = []
-                for b_name, b_data in borrowed.items():
-                    if str(b_data.get("original_owner_id")) == owner_str and b_data.get("original_profile_name") == original_profile_name:
+                for b_name in borrowed:
+                    b_config = self._get_profile_config(uid, b_name, True)
+                    if b_config and str(b_config.get("original_owner_id")) == owner_str and b_config.get("original_profile_name") == original_profile_name:
                         to_delete.append(b_name)
                 
                 if to_delete:
+                    index["borrowed"] = [b for b in borrowed if b not in to_delete]
+                    self._save_user_index(uid, index)
                     for b_name in to_delete:
-                        del user_data["borrowed_profiles"][b_name]
-                    self._save_user_data_entry(int(user_id_str), user_data)
+                        import shutil
+                        p_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles", b_name)
+                        shutil.rmtree(p_dir, ignore_errors=True)
             except Exception as e:
                 print(f"Error in cascade delete for user {user_id_str}: {e}")
     

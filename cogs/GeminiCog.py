@@ -77,20 +77,24 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         
         print(f"GeminiAgent Init. Models: Primary='{PRIMARY_MODEL_NAME}', Fallback='{FALLBACK_MODEL_NAME}'.")
 
-        self.PROFILES_DIR = PROFILES_DIR
-        self.LTM_DIR = LTM_DIR
-        self.TRAINING_DIR = TRAINING_DIR
+        self.PROFILES_DIR = LEGACY_PROFILES_DIR
+        self.LTM_DIR = LEGACY_LTM_DIR
+        self.TRAINING_DIR = LEGACY_TRAINING_DIR
         self.PUBLIC_PROFILES_DIR = PUBLIC_PROFILES_DIR
-        self.CHILD_BOTS_DIR = CHILD_BOTS_DIR
+        self.CHILD_BOTS_DIR = LEGACY_CHILD_BOTS_DIR
         self.USERS_DIR = USERS_DIR
         self.APPEARANCES_DIR = APPEARANCES_DIR
-        self.SHARES_DIR = SHARES_DIR
-        self.PERSONAL_KEYS_DIR = PERSONAL_KEYS_DIR
+        self.SHARES_DIR = LEGACY_SHARES_DIR
+        self.PERSONAL_KEYS_DIR = LEGACY_PERSONAL_KEYS_DIR
         self.DATA_DIR = DATA_DIR
         self.FREEWILL_SERVERS_DIR = FREEWILL_SERVERS_DIR
-        self.SESSIONS_GLOBAL_DIR = SESSIONS_GLOBAL_DIR
-        self.SESSIONS_SERVERS_DIR = SESSIONS_SERVERS_DIR
-        for d in [PROFILES_DIR, LTM_DIR, TRAINING_DIR, PUBLIC_PROFILES_DIR, CHILD_BOTS_DIR, USERS_DIR, APPEARANCES_DIR, SHARES_DIR, PERSONAL_KEYS_DIR, DATA_DIR, FREEWILL_SERVERS_DIR, SESSIONS_GLOBAL_DIR, SESSIONS_SERVERS_DIR]:
+        self.SESSIONS_GLOBAL_DIR = LEGACY_GLOBAL_CHAT_DIR
+        self.SERVERS_DIR = SERVERS_DIR
+        
+        # Only create the active Phase 3 directories to prevent ghost folders on boot
+        active_dirs = [self.USERS_DIR, self.DATA_DIR, self.PUBLIC_PROFILES_DIR, self.SERVERS_DIR]
+        
+        for d in active_dirs:
             os.makedirs(d, exist_ok=True)
 
         try:
@@ -101,7 +105,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         self.persona_modal_sections_order = ['backstory', 'personality_traits', 'likes', 'dislikes', 'appearance'] 
         
-        self.user_profiles: LRUCache = LRUCache(max_size=10)
+        self.user_indices: LRUCache = LRUCache(max_size=20)
+        self.profile_configs: LRUCache = LRUCache(max_size=50)
+        self.profile_prompts: LRUCache = LRUCache(max_size=20)
         
         self.user_appearances: Dict[str, Dict[str, Dict[str, Optional[str]]]] = {}
         self._load_user_appearances()
@@ -201,22 +207,19 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         profile_name = profile_name.lower().strip()
         
-        if not profile_name:
-            await interaction.followup.send("Profile name cannot be empty.", ephemeral=True)
+        is_valid, err_msg = self._is_valid_profile_name(profile_name)
+        if not is_valid:
+            await interaction.followup.send(f"❌ **Invalid Name:** {err_msg}", ephemeral=True)
             return
 
-        if profile_name == DEFAULT_PROFILE_NAME or profile_name.lower() == 'clyde':
-            await interaction.followup.send(f"The name '{profile_name}' is reserved and cannot be used.", ephemeral=True)
-            return
-
-        user_data = self._get_user_data_entry(interaction.user.id)
+        index = self._get_user_index(interaction.user.id)
         
-        if profile_name in user_data.get("profiles", {}) or profile_name in user_data.get("borrowed_profiles", {}):
+        if profile_name in index.get("personal", []) or profile_name in index.get("borrowed", []):
             await interaction.followup.send(f"A profile with the name '{profile_name}' already exists.", ephemeral=True)
             return
 
         # FIXED: Dynamic Limit Check
-        current_count = len(user_data.get("profiles", {}))
+        current_count = len(index.get("personal", []))
         is_premium = self.is_user_premium(interaction.user.id)
         limit = defaultConfig.LIMIT_PROFILES_PREMIUM if is_premium else defaultConfig.LIMIT_PROFILES_FREE
         
@@ -233,8 +236,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         new_profile = self._get_or_create_user_profile(interaction.user.id, profile_name)
         if new_profile:
             # [NEW] Add Creation Timestamp
-            new_profile['created_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            self._save_user_data_entry(interaction.user.id, user_data)
+            config = new_profile.get('config', {})
+            config['created_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            self._save_profile_config(interaction.user.id, profile_name, config)
         
         await interaction.followup.send(f"Successfully created new profile '{profile_name}'.\nUse `/profile manage profile_name:{profile_name}` to start editing it.", ephemeral=True)
 
@@ -248,20 +252,21 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         await interaction.response.defer(ephemeral=True, thinking=True)
         profile_name = profile_name.lower().strip()
 
-        if not profile_name or not prompt.strip():
-            await interaction.followup.send("Profile name and prompt cannot be empty.", ephemeral=True)
+        is_valid, err_msg = self._is_valid_profile_name(profile_name)
+        if not is_valid:
+            await interaction.followup.send(f"❌ **Invalid Name:** {err_msg}", ephemeral=True)
+            return
+            
+        if not prompt.strip():
+            await interaction.followup.send("Prompt cannot be empty.", ephemeral=True)
             return
 
-        if profile_name == DEFAULT_PROFILE_NAME or profile_name.lower() == 'clyde':
-            await interaction.followup.send(f"The name '{profile_name}' is reserved and cannot be used.", ephemeral=True)
-            return
-
-        user_data = self._get_user_data_entry(interaction.user.id)
-        if profile_name in user_data.get("profiles", {}) or profile_name in user_data.get("borrowed_profiles", {}):
+        index = self._get_user_index(interaction.user.id)
+        if profile_name in index.get("personal", []) or profile_name in index.get("borrowed", []):
             await interaction.followup.send(f"A profile with the name '{profile_name}' already exists.", ephemeral=True)
             return
 
-        if len(user_data.get("profiles", {})) >= MAX_USER_PROFILES:
+        if len(index.get("personal", [])) >= MAX_USER_PROFILES:
             await interaction.followup.send(f"You have reached the maximum of {MAX_USER_PROFILES} personal profiles.", ephemeral=True)
             return
 
@@ -338,10 +343,14 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             encrypted_persona = {key: [self._encrypt_data(line) for line in value.splitlines()] for key, value in generated_data['persona'].items()}
             encrypted_instructions = self._encrypt_data(generated_data['ai_instructions'])
 
-            new_profile['persona'] = encrypted_persona
-            new_profile['ai_instructions'] = encrypted_instructions
+            prompts = new_profile.get('prompts', {})
+            prompts['persona'] = encrypted_persona
             
-            self._save_user_data_entry(interaction.user.id, user_data)
+            if not isinstance(prompts.get('ai_instructions'), list):
+                prompts['ai_instructions'] = ["", "", "", ""]
+            prompts['ai_instructions'][0] = encrypted_instructions
+            
+            self._save_profile_prompts(interaction.user.id, profile_name, prompts)
 
             await interaction.followup.send(f"✅ Successfully generated and created new profile '{profile_name}'.\nUse `/profile manage profile_name:{profile_name}` to view or edit it.", ephemeral=True)
 
@@ -357,9 +366,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     async def manage_profile_slash(self, interaction: discord.Interaction, profile_name: str):
         await interaction.response.defer(ephemeral=True)
 
-        user_data = self._get_user_data_entry(interaction.user.id)
-        is_personal = profile_name in user_data.get("profiles", {})
-        is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
+        index = self._get_user_index(interaction.user.id)
+        is_personal = profile_name in index.get("personal", [])
+        is_borrowed = profile_name in index.get("borrowed", [])
         is_default = profile_name == DEFAULT_PROFILE_NAME
 
         if not is_personal and not is_borrowed and not is_default:
@@ -388,13 +397,14 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     async def list_profiles_slash(self, interaction: discord.Interaction): 
         if not self.has_lock and interaction.guild : return
         await interaction.response.defer(ephemeral=True)
-        user_data = self._get_user_data_entry(interaction.user.id)
-        if not user_data:
+        
+        index = self._get_user_index(interaction.user.id)
+        if not index.get("personal") and not index.get("borrowed"):
             await interaction.followup.send("You have no saved profiles yet.", ephemeral=True)
             return
         
-        personal_profiles_data = user_data.get("profiles", {})
-        borrowed_profiles_data = user_data.get("borrowed_profiles", {})
+        personal_list_raw = index.get("personal", [])
+        borrowed_list_raw = index.get("borrowed", [])
         
         embed = discord.Embed(title=f"Your Profiles", color=discord.Color.purple())
         
@@ -408,7 +418,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         # Process Personal Profiles
         personal_list = []
-        for name in sorted(personal_profiles_data.keys()):
+        for name in sorted(personal_list_raw):
             marker = f" (Active)" if name == active_in_current_channel else ""
             personal_list.append(f"- `{name}`{marker}")
         
@@ -419,8 +429,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         # Process Borrowed Profiles
         borrowed_list = []
-        for name, data in sorted(borrowed_profiles_data.items()):
-            owner_id = int(data["original_owner_id"])
+        for name in sorted(borrowed_list_raw):
+            b_config = self._get_profile_config(interaction.user.id, name, True) or {}
+            owner_id = int(b_config.get("original_owner_id", 0))
             owner = self.bot.get_user(owner_id) or await self.bot.fetch_user(owner_id)
             owner_name = owner.display_name if owner else "Unknown"
             marker = f" (Active)" if name == active_in_current_channel else ""
@@ -483,11 +494,11 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         if not self.has_lock: return
         
         profile_name = profile_name.lower().strip()
-        user_data = self._get_user_data_entry(interaction.user.id)
+        index = self._get_user_index(interaction.user.id)
         owner_id = int(defaultConfig.DISCORD_OWNER_ID)
 
-        is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
-        is_personal = profile_name in user_data.get("profiles", {})
+        is_borrowed = profile_name in index.get("borrowed", [])
+        is_personal = profile_name in index.get("personal", [])
         
         can_manage = is_personal or is_borrowed or profile_name == DEFAULT_PROFILE_NAME
         if not can_manage:
@@ -503,8 +514,8 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             if profile_name == DEFAULT_PROFILE_NAME:
                 effective_owner_id = owner_id
             else:
-                borrow_data = user_data["borrowed_profiles"][profile_name]
-                effective_owner_id = int(borrow_data["original_owner_id"])
+                b_config = self._get_profile_config(interaction.user.id, profile_name, True) or {}
+                effective_owner_id = int(b_config.get("original_owner_id", 0))
 
         await interaction.response.defer(ephemeral=True)
         view = DataManageView(self, interaction, profile_name, is_borrowed=is_view_borrowed, effective_owner_id=effective_owner_id)
@@ -623,9 +634,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             except Exception as e:
                 print(f"Error cleaning up freewill session dir: {e}")
 
-            user_data = self._get_user_data_entry(interaction.user.id)
-            personal_profiles = user_data.get("profiles", {}).keys()
-            borrowed_profiles = user_data.get("borrowed_profiles", {}).keys()
+            index = self._get_user_index(interaction.user.id)
+            personal_profiles = index.get("personal", [])
+            borrowed_profiles = index.get("borrowed", [])
             all_selectable_profiles = list(personal_profiles) + list(borrowed_profiles)
 
             if len(all_selectable_profiles) < 1:
@@ -759,9 +770,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             return
 
         if profile_name:
-            user_data = self._get_user_data_entry(interaction.user.id)
-            is_personal = profile_name in user_data.get("profiles", {})
-            is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
+            index = self._get_user_index(interaction.user.id)
+            is_personal = profile_name in index.get("personal", [])
+            is_borrowed = profile_name in index.get("borrowed", [])
             if not is_personal and not is_borrowed:
                 await interaction.followup.send(f"You do not have a profile named '{profile_name}'.", ephemeral=True)
                 return
@@ -770,9 +781,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             effective_owner_id = interaction.user.id
             effective_profile_name = profile_name
             if is_borrowed:
-                borrowed_data = user_data["borrowed_profiles"][profile_name]
-                effective_owner_id = int(borrowed_data["original_owner_id"])
-                effective_profile_name = borrowed_data["original_profile_name"]
+                borrowed_data = self._get_profile_config(interaction.user.id, profile_name, True) or {}
+                effective_owner_id = int(borrowed_data.get("original_owner_id", interaction.user.id))
+                effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
 
             linked_bot_id = next((bot_id for bot_id, data in self.child_bots.items() if data.get("owner_id") == effective_owner_id and data.get("profile_name") == effective_profile_name), None)
             is_bot_in_guild = linked_bot_id and interaction.guild.get_member(int(linked_bot_id))
@@ -1293,12 +1304,16 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             mapping_key = ('global_chat', user_id)
             self.mapping_caches.pop(mapping_key, None)
 
-            dir_path = pathlib.Path(self.SESSIONS_GLOBAL_DIR) / str(user_id)
+            dir_path = pathlib.Path(self.USERS_DIR) / str(user_id) / "profiles"
             if dir_path.is_dir():
-                try:
-                    shutil.rmtree(dir_path)
-                except Exception as e:
-                    print(f"Error suspending all global chats for {user_id}: {e}")
+                for p_dir in dir_path.iterdir():
+                    if p_dir.is_dir():
+                        gc_file = p_dir / "global_chat.json.gz"
+                        if gc_file.exists():
+                            try:
+                                gc_file.unlink()
+                            except Exception as e:
+                                print(f"Error suspending global chat for {user_id} profile {p_dir.name}: {e}")
 
             await interaction.followup.send("✅ All global conversation histories have been permanently deleted.", ephemeral=True)
             return
@@ -1333,9 +1348,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             await interaction.response.defer(ephemeral=False, thinking=True)
             await self._execute_global_chat(interaction, profile_name_lower, message)
         else:
-            user_data = self._get_user_data_entry(user_id)
-            is_personal = profile_name_lower in user_data.get("profiles", {})
-            is_borrowed = profile_name_lower in user_data.get("borrowed_profiles", {})
+            index = self._get_user_index(user_id)
+            is_personal = profile_name_lower in index.get("personal", [])
+            is_borrowed = profile_name_lower in index.get("borrowed", [])
             if not is_personal and not is_borrowed:
                 await interaction.response.send_message(f"Profile '{profile_name_lower}' not found.", ephemeral=True)
                 return
@@ -1868,14 +1883,14 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 if owner_id != interaction.user.id and interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
                     continue
             
-            user_data = self._get_user_data_entry(owner_id)
-            is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
+            index = self._get_user_index(owner_id)
+            is_borrowed = profile_name in index.get("borrowed", [])
             effective_owner_id = owner_id
             effective_profile_name = profile_name
             if is_borrowed:
-                borrowed_data = user_data["borrowed_profiles"][profile_name]
-                effective_owner_id = int(borrowed_data["original_owner_id"])
-                effective_profile_name = borrowed_data["original_profile_name"]
+                borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
+                effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
+                effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
             
             display_name = effective_profile_name
             appearance_data = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})

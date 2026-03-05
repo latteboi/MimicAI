@@ -401,15 +401,15 @@ class ServicesMixin:
 
         model_cache_key = (channel_id, profile_owner_id_for_instructions, profile_name_for_instructions)
 
-        user_data = self._get_user_data_entry(profile_owner_id_for_instructions)
-        is_borrowed = profile_name_for_instructions in user_data.get("borrowed_profiles", {})
+        user_index = self._get_user_index(profile_owner_id_for_instructions)
+        is_borrowed = profile_name_for_instructions in user_index.get("borrowed", [])
         
         original_owner_id = profile_owner_id_for_instructions
         original_profile_name = profile_name_for_instructions
         if is_borrowed:
-            borrowed_data = user_data["borrowed_profiles"][profile_name_for_instructions]
-            original_owner_id = int(borrowed_data["original_owner_id"])
-            original_profile_name = borrowed_data["original_profile_name"]
+            borrowed_data = self._get_profile_config(profile_owner_id_for_instructions, profile_name_for_instructions, True) or {}
+            original_owner_id = int(borrowed_data.get("original_owner_id", profile_owner_id_for_instructions))
+            original_profile_name = borrowed_data.get("original_profile_name", profile_name_for_instructions)
 
         current_profile_key_for_model = (original_owner_id, original_profile_name)
 
@@ -448,7 +448,7 @@ class ServicesMixin:
         model_instance, model_init_error = None, True
         
         safety_level_str = "low" 
-        profile_data_for_safety = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name_for_instructions, {})
+        profile_data_for_safety = self._get_profile_config(profile_owner_id_for_instructions, profile_name_for_instructions, is_borrowed) or {}
         safety_level_str = profile_data_for_safety.get("safety_level", "low")
 
         safety_map = {
@@ -469,7 +469,7 @@ class ServicesMixin:
         model_to_create = primary_model
         
         # [NEW] Extract parameters once for either provider
-        p_sett_thinking = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name_for_instructions, {})
+        p_sett_thinking = self._get_profile_config(profile_owner_id_for_instructions, profile_name_for_instructions, is_borrowed) or {}
         t_params = {
             "thinking_summary_visible": p_sett_thinking.get("thinking_summary_visible", "off"),
             "thinking_level": p_sett_thinking.get("thinking_level", "high"),
@@ -514,18 +514,17 @@ class ServicesMixin:
         return model_instance, final_error_state, temperature, top_p, top_k, warning_message, fallback_model
 
     async def _get_or_create_model_for_global_chat(self, user_id: int, profile_name: str) -> Tuple[Optional[Any], float, float, int, Optional[str], Optional[str]]:
-        user_data = self._get_user_data_entry(user_id)
-        is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
+        index = self._get_user_index(user_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
         
         source_owner_id = user_id
         source_profile_name = profile_name
         if is_borrowed:
-            borrowed_data = user_data["borrowed_profiles"][profile_name]
-            source_owner_id = int(borrowed_data["original_owner_id"])
-            source_profile_name = borrowed_data["original_profile_name"]
+            borrowed_data = self._get_profile_config(user_id, profile_name, True) or {}
+            source_owner_id = int(borrowed_data.get("original_owner_id", user_id))
+            source_profile_name = borrowed_data.get("original_profile_name", profile_name)
         
-        source_owner_data = self._get_user_data_entry(source_owner_id)
-        profile_data = source_owner_data.get("profiles", {}).get(source_profile_name)
+        profile_data = self._get_profile_config(source_owner_id, source_profile_name, False)
         if not profile_data:
             return None, 0.0, 0.0, 0, f"The source for your active global profile ('{profile_name}') could not be found.", None
 
@@ -593,13 +592,9 @@ class ServicesMixin:
         timezone_str = "UTC"
 
         if profile_owner_id is not None: 
-            user_data = self._get_user_data_entry(profile_owner_id)
-            is_borrowed = profile_name_to_use in user_data.get("borrowed_profiles", {})
-            
-            if is_borrowed:
-                profile_data = user_data["borrowed_profiles"][profile_name_to_use]
-            else:
-                profile_data = user_data.get("profiles", {}).get(profile_name_to_use, {})
+            user_index = self._get_user_index(profile_owner_id)
+            is_borrowed = profile_name_to_use in user_index.get("borrowed", [])
+            profile_data = self._get_profile_config(profile_owner_id, profile_name_to_use, is_borrowed) or {}
 
             persona_data, ai_instr_str, grounding_enabled, temperature, top_p, top_k, _, _, primary_model, fallback_model = self._get_user_profile_for_model(profile_owner_id, channel_id, profile_name_to_use)
             
@@ -826,9 +821,9 @@ class ServicesMixin:
                     p_key = (p_data['owner_id'], p_data['profile_name'])
                     if p_key not in session['chat_sessions'] or session['chat_sessions'][p_key] is None:
                         # Rebuild history from the currently loaded log
-                        p_user_data = self._get_user_data_entry(p_data['owner_id'])
-                        p_is_b = p_data['profile_name'] in p_user_data.get("borrowed_profiles", {})
-                        p_settings = p_user_data.get("borrowed_profiles" if p_is_b else "profiles", {}).get(p_data['profile_name'], {})
+                        p_index = self._get_user_index(p_data['owner_id'])
+                        p_is_b = p_data['profile_name'] in p_index.get("borrowed", [])
+                        p_settings = self._get_profile_config(p_data['owner_id'], p_data['profile_name'], p_is_b) or {}
                         
                         participant_history = []
                         for turn in session.get("unified_log", []):
@@ -859,11 +854,12 @@ class ServicesMixin:
                         target_participant = cast[1]
                         target_id = target_participant['owner_id']
                         target_profile = target_participant['profile_name']
-                        target_user_data = self._get_user_data_entry(target_id)
+                        
+                        target_index = self._get_user_index(target_id)
                         target_appearance_name = target_profile
-                        if target_profile in target_user_data.get("borrowed_profiles", {}):
-                            borrowed_data = target_user_data["borrowed_profiles"][target_profile]
-                            target_appearance_name = borrowed_data["original_profile_name"]
+                        if target_profile in target_index.get("borrowed", []):
+                            borrowed_data = self._get_profile_config(target_id, target_profile, True) or {}
+                            target_appearance_name = borrowed_data.get("original_profile_name", target_profile)
                         
                         target_display_name = target_appearance_name
                         if str(target_id) in self.user_appearances and target_appearance_name in self.user_appearances[str(target_id)]:
@@ -973,9 +969,9 @@ class ServicesMixin:
                         # [NEW] URL Context Logic: Enforce Profile Setting & Separation
                         any_url_enabled = False
                         for p in session['profiles']:
-                            p_udata = self._get_user_data_entry(p['owner_id'])
-                            p_is_b = p['profile_name'] in p_udata.get("borrowed_profiles", {})
-                            p_settings = p_udata.get("borrowed_profiles" if p_is_b else "profiles", {}).get(p['profile_name'], {})
+                            p_index = self._get_user_index(p['owner_id'])
+                            p_is_b = p['profile_name'] in p_index.get("borrowed", [])
+                            p_settings = self._get_profile_config(p['owner_id'], p['profile_name'], p_is_b) or {}
                             if p_settings.get("url_fetching_enabled", True):
                                 any_url_enabled = True; break
                         
@@ -992,14 +988,15 @@ class ServicesMixin:
                             trigger_media_parts = url_media
 
                         # [NEW] Localized User Timestamp Logic
-                        u_data_author = self._get_user_data_entry(triggering_user_id)
+                        u_index_author = self._get_user_index(triggering_user_id)
                         u_prof_author = self._get_active_user_profile_name_for_channel(triggering_user_id, channel_id)
-                        u_is_b_author = u_prof_author in u_data_author.get("borrowed_profiles", {})
-                        u_sett_author = u_data_author.get("borrowed_profiles" if u_is_b_author else "profiles", {}).get(u_prof_author, {})
+                        u_is_b_author = u_prof_author in u_index_author.get("borrowed", [])
+                        u_sett_author = self._get_profile_config(triggering_user_id, u_prof_author, u_is_b_author) or {}
                         author_tz = u_sett_author.get("timezone", "UTC")
+                        user_hash = self._get_user_hash(triggering_user_id)
 
                         created_at = datetime.datetime.now(datetime.timezone.utc) if is_child_mention else trigger_obj.created_at
-                        user_line = self._format_history_entry(author_name, created_at, content, author_tz)
+                        user_line = self._format_history_entry(author_name, created_at, content, author_tz, entity_id=user_hash)
                         
                         turn_id = str(uuid.uuid4())
                         
@@ -1122,9 +1119,9 @@ class ServicesMixin:
                     for p_key, chat_session in session['chat_sessions'].items():
                         if chat_session is None: continue
                         p_owner_id, p_name = p_key
-                        p_udata = self._get_user_data_entry(p_owner_id)
-                        p_is_b = p_name in p_udata.get("borrowed_profiles", {})
-                        p_settings = p_udata.get("borrowed_profiles" if p_is_b else "profiles", {}).get(p_name, {})
+                        p_index = self._get_user_index(p_owner_id)
+                        p_is_b = p_name in p_index.get("borrowed", [])
+                        p_settings = self._get_profile_config(p_owner_id, p_name, p_is_b) or {}
                         
                         final_parts = [base_text]
                         if url_ctx and p_settings.get("url_fetching_enabled", True):
@@ -1143,7 +1140,7 @@ class ServicesMixin:
                 channel = self.bot.get_channel(channel_id)
 
                 is_single_turn_only = False
-                if isinstance(initial_trigger, tuple) and initial_trigger[0] in ['reaction_single', 'child_mention', 'ad_hoc_mention', 'reply']:
+                if isinstance(initial_trigger, tuple) and initial_trigger[0] == 'reaction_single':
                     is_single_turn_only = True
 
                 if freewill_mode == 'reactive':
@@ -1201,10 +1198,26 @@ class ServicesMixin:
                             profile_order = [initial_turn_profile]
                 
                 else: # Standard multi-profile or proactive freewill
+                    if starting_profile_override:
+                        start_p = starting_profile_override
+                        
+                        session_mode = session.get("session_mode", "sequential")
+                        if session_mode == 'sequential':
+                            try:
+                                # Find the index of the profile we are starting with
+                                start_idx = session['profiles'].index(start_p)
+                                # Rotate the list to make that profile the first element
+                                new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
+                                session['profiles'] = new_order
+                                self._save_multi_profile_sessions()
+                            except ValueError:
+                                # The starting profile wasn't in the list, this shouldn't happen but handle gracefully
+                                pass
+
                      # Filter profiles that are marked as skipped via reaction
                     active_participants = [p for p in session['profiles'] if not p.get('is_skipped', False)]
                     
-                    if not active_participants and not is_single_turn_only:
+                    if not active_participants:
                         # If everyone is skipped, mark triggers as done and wait for next input
                         for trigger in all_triggers_for_round:
                             if trigger is not None: session['task_queue'].task_done()
@@ -1212,25 +1225,25 @@ class ServicesMixin:
 
                     if starting_profile_override:
                         # Ensure the override profile isn't skipped; if it is, fall back to first active
-                        if starting_profile_override.get('is_skipped') and active_participants:
+                        if starting_profile_override.get('is_skipped'):
                             start_p = active_participants[0]
                         else:
                             start_p = starting_profile_override
+                        
+                        session_mode = session.get("session_mode", "sequential")
+                        if session_mode == 'sequential':
+                            try:
+                                start_idx = session['profiles'].index(start_p)
+                                new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
+                                session['profiles'] = new_order
+                                self._save_multi_profile_sessions()
+                            except ValueError: pass
 
                         if is_single_turn_only:
                             profile_order = [start_p]
                         else:
                             profile_order = [p for p in session['profiles'] if p in active_participants]
-                            
-                            session_mode = session.get("session_mode", "sequential")
-                            if session_mode == 'sequential':
-                                try:
-                                    start_idx = profile_order.index(start_p)
-                                    profile_order = profile_order[start_idx:] + profile_order[:start_idx]
-                                except ValueError:
-                                    if start_p not in profile_order:
-                                        profile_order.insert(0, start_p)
-                            elif session_mode == 'random':
+                            if session_mode == 'random':
                                 if start_p in profile_order: profile_order.remove(start_p)
                                 random.shuffle(profile_order)
                                 profile_order.insert(0, start_p)
@@ -1250,6 +1263,28 @@ class ServicesMixin:
                                 # But only include those not skipped
                                 profile_order = [p for p in rotated if p in active_participants]
                             except (ValueError, StopIteration): pass
+
+                # --- Ephemeral Participant Injection ---
+                ephemeral_participant = None
+                if isinstance(initial_trigger, tuple):
+                    if initial_trigger[0] in ['child_mention', 'ad_hoc_mention']:
+                        _, _, ephemeral_participant = initial_trigger
+                    elif initial_trigger[0] == 'reply' and starting_profile_override and starting_profile_override.get('ephemeral'):
+                        ephemeral_participant = starting_profile_override
+
+                if ephemeral_participant:
+                    # For child bots, bot_id is the key. For parent bot (webhook), profile_name/owner_id is the key.
+                    existing_permanent = None
+                    if ephemeral_participant.get('method') == 'child_bot':
+                        existing_permanent = next((p for p in profile_order if p.get('bot_id') == ephemeral_participant.get('bot_id')), None)
+                    else:
+                        existing_permanent = next((p for p in profile_order if p['owner_id'] == ephemeral_participant['owner_id'] and p['profile_name'] == ephemeral_participant['profile_name']), None)
+
+                    if existing_permanent:
+                        profile_order.remove(existing_permanent)
+                        profile_order.insert(0, existing_permanent)
+                    else:
+                        profile_order.insert(0, ephemeral_participant)
 
                 channel = self.bot.get_channel(channel_id)
                 has_gemini = self._get_api_key_for_guild(channel.guild.id, "gemini")
@@ -1279,14 +1314,14 @@ class ServicesMixin:
                     
                     if generator_profile_key:
                         gen_owner_id, gen_profile_name = generator_profile_key
-                        gen_user_data = self._get_user_data_entry(gen_owner_id)
-                        gen_is_borrowed = gen_profile_name in gen_user_data.get("borrowed_profiles", {})
+                        gen_index = self._get_user_index(gen_owner_id)
+                        gen_is_borrowed = gen_profile_name in gen_index.get("borrowed", [])
                         gen_effective_owner_id = gen_owner_id
                         gen_effective_profile_name = gen_profile_name
                         if gen_is_borrowed:
-                            borrowed_data = gen_user_data["borrowed_profiles"][gen_profile_name]
-                            gen_effective_owner_id = int(borrowed_data["original_owner_id"])
-                            gen_effective_profile_name = borrowed_data["original_profile_name"]
+                            borrowed_data = self._get_profile_config(gen_owner_id, gen_profile_name, True) or {}
+                            gen_effective_owner_id = int(borrowed_data.get("original_owner_id", gen_owner_id))
+                            gen_effective_profile_name = borrowed_data.get("original_profile_name", gen_profile_name)
                         
                         gen_appearance_data = self.user_appearances.get(str(gen_effective_owner_id), {}).get(gen_effective_profile_name, {})
                         if gen_appearance_data.get("custom_display_name"):
@@ -1342,9 +1377,9 @@ class ServicesMixin:
                 if grounding_target_participant:
                     g_owner_id = grounding_target_participant['owner_id']
                     g_profile_name = grounding_target_participant['profile_name']
-                    g_user_data = self._get_user_data_entry(g_owner_id)
-                    g_is_borrowed = g_profile_name in g_user_data.get("borrowed_profiles", {})
-                    g_profile_settings = g_user_data.get("borrowed_profiles" if g_is_borrowed else "profiles", {}).get(g_profile_name, {})
+                    g_index = self._get_user_index(g_owner_id)
+                    g_is_borrowed = g_profile_name in g_index.get("borrowed", [])
+                    g_profile_settings = self._get_profile_config(g_owner_id, g_profile_name, g_is_borrowed) or {}
                     
                     grounding_mode = g_profile_settings.get("grounding_mode", "off")
                     if isinstance(grounding_mode, bool): grounding_mode = "on" if grounding_mode else "off"
@@ -1402,14 +1437,14 @@ class ServicesMixin:
                                         if mapping_key not in self.mapping_caches: self.mapping_caches[mapping_key] = {}
                                         self.mapping_caches[mapping_key]['grounding_checkpoint'] = turn_id
 
-                # [NEW] Phase: Research Once (URL Context)
+                ## [NEW] Phase: Research Once (URL Context)
                 round_url_text_contexts = []
                 
                 any_url_enabled = False
                 for p in session['profiles']:
-                    p_udata = self._get_user_data_entry(p['owner_id'])
-                    p_is_b = p['profile_name'] in p_udata.get("borrowed_profiles", {})
-                    p_settings = p_udata.get("borrowed_profiles" if p_is_b else "profiles", {}).get(p['profile_name'], {})
+                    p_index = self._get_user_index(p['owner_id'])
+                    p_is_b = p['profile_name'] in p_index.get("borrowed", [])
+                    p_settings = self._get_profile_config(p['owner_id'], p['profile_name'], p_is_b) or {}
                     if p_settings.get("url_fetching_enabled", True):
                         any_url_enabled = True; break
                 
@@ -1444,9 +1479,9 @@ class ServicesMixin:
                     # Resolve Real-time settings
                     p_owner_id = participant['owner_id']
                     p_name = participant['profile_name']
-                    p_udata = self._get_user_data_entry(p_owner_id)
-                    p_is_b = p_name in p_udata.get("borrowed_profiles", {})
-                    p_settings = p_udata.get("borrowed_profiles" if p_is_b else "profiles", {}).get(p_name, {})
+                    p_index = self._get_user_index(p_owner_id)
+                    p_is_b = p_name in p_index.get("borrowed", [])
+                    p_settings = self._get_profile_config(p_owner_id, p_name, p_is_b) or {}
 
                     # Check Image Gen intent vs Profile Toggle
                     if is_image_gen_round and participant_key == generator_profile_key:
@@ -1502,7 +1537,8 @@ class ServicesMixin:
 
                         for author_id, author_name, timestamp, content in initial_history_data:
                             role = 'model' if author_id == participant_user_id else 'user'
-                            formatted_line = self._format_history_entry(author_name, timestamp, content)
+                            e_id = self._get_user_hash(author_id)
+                            formatted_line = self._format_history_entry(author_name, timestamp, content, entity_id=e_id)
                             content_obj = content_types.to_content({'role': role, 'parts': [formatted_line]})
                             initial_history_content.append(content_obj)
 
@@ -1538,14 +1574,14 @@ class ServicesMixin:
                             other_chat.history.append(error_content_obj)
                         continue
 
-                    user_data = self._get_user_data_entry(owner_id)
-                    is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
+                    user_index = self._get_user_index(owner_id)
+                    is_borrowed = profile_name in user_index.get("borrowed", [])
                     effective_owner_id = owner_id
                     effective_profile_name = profile_name
                     if is_borrowed:
-                        borrowed_data = user_data["borrowed_profiles"][profile_name]
-                        effective_owner_id = int(borrowed_data["original_owner_id"])
-                        effective_profile_name = borrowed_data["original_profile_name"]
+                        borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
+                        effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
+                        effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
 
                     speaker_display_name = profile_name
                     appearance_data = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
@@ -1564,14 +1600,14 @@ class ServicesMixin:
 
                         # This block is crucial to define the generator's variables when triggered mid-round
                         gen_owner_id, gen_profile_name = generator_profile_key
-                        gen_user_data = self._get_user_data_entry(gen_owner_id)
-                        gen_is_borrowed = gen_profile_name in gen_user_data.get("borrowed_profiles", {})
+                        gen_index = self._get_user_index(gen_owner_id)
+                        gen_is_borrowed = gen_profile_name in gen_index.get("borrowed", [])
                         gen_effective_owner_id = gen_owner_id
                         gen_effective_profile_name = gen_profile_name
                         if gen_is_borrowed:
-                            borrowed_data = gen_user_data["borrowed_profiles"][gen_profile_name]
-                            gen_effective_owner_id = int(borrowed_data["original_owner_id"])
-                            gen_effective_profile_name = borrowed_data["original_profile_name"]
+                            borrowed_data = self._get_profile_config(gen_owner_id, gen_profile_name, True) or {}
+                            gen_effective_owner_id = int(borrowed_data.get("original_owner_id", gen_owner_id))
+                            gen_effective_profile_name = borrowed_data.get("original_profile_name", gen_profile_name)
                         
                         gen_appearance_data = self.user_appearances.get(str(gen_effective_owner_id), {}).get(gen_effective_profile_name, {})
                         if gen_appearance_data.get("custom_display_name"):
@@ -1582,9 +1618,9 @@ class ServicesMixin:
                     # Resolve Real-time settings
                         p_owner_id = participant['owner_id']
                         p_name = participant['profile_name']
-                        p_udata = self._get_user_data_entry(p_owner_id)
-                        p_is_b = p_name in p_udata.get("borrowed_profiles", {})
-                        p_settings = p_udata.get("borrowed_profiles" if p_is_b else "profiles", {}).get(p_name, {})
+                        p_index = self._get_user_index(p_owner_id)
+                        p_is_b = p_name in p_index.get("borrowed", [])
+                        p_settings = self._get_profile_config(p_owner_id, p_name, p_is_b) or {}
 
                         if p_settings.get("url_fetching_enabled", True) and round_url_text_contexts:
                             url_instr = "<url_research>\n[Context from links in current messages]:\n" + "\n".join(round_url_text_contexts) + "\n</url_research>"
@@ -1639,13 +1675,12 @@ class ServicesMixin:
                                 source_owner_id = owner_id
                                 source_profile_name = profile_name
                                 if is_borrowed:
-                                    borrowed_data = user_data["borrowed_profiles"][profile_name]
-                                    source_owner_id = int(borrowed_data["original_owner_id"])
-                                    source_profile_name = borrowed_data["original_profile_name"]
+                                    borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
+                                    source_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
+                                    source_profile_name = borrowed_data.get("original_profile_name", profile_name)
                                 
-                                source_owner_data = self._get_user_data_entry(source_owner_id)
-                                source_profile_data = source_owner_data.get("profiles", {}).get(source_profile_name, {})
-                                persona = source_profile_data.get("persona", {})
+                                source_prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
+                                persona = source_prompts.get("persona", {})
                                 appearance_lines_encrypted = persona.get("appearance", [])
                                 appearance_text = "\n".join([self._decrypt_data(line) for line in appearance_lines_encrypted])
 
@@ -1658,7 +1693,7 @@ class ServicesMixin:
                                     gen_profile_name.lower() in prompt_lower:
                                         final_prompt_text = f"Your appearance:\n{appearance_text.strip()}\n\nUser's prompt:\n{image_gen_prompt}"
 
-                                profile_settings = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name, {})
+                                profile_settings = self._get_profile_config(owner_id, profile_name, is_borrowed) or {}
                                 safety_level_str = profile_settings.get('safety_level', 'low')
 
                                 safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
@@ -1760,13 +1795,12 @@ class ServicesMixin:
                         )
                         
                         # [MOVED] Critic Check - Injection into System Instruction
-                        profile_settings = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name, {})
+                        profile_settings = self._get_profile_config(owner_id, profile_name, is_borrowed) or {}
                         if profile_settings.get("critic_enabled", False):
                             critic_constraints = await self._run_critic(chat_session.history, speaker_display_name, channel.guild.id)
                             if critic_constraints:
                                 full_system_instruction += f"\n\nNEGATIVE CONSTRAINTS (STRICT ADHERENCE REQUIRED):\n{critic_constraints}"
 
-                        profile_settings = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name, {})
                         safety_level_str = profile_settings.get('safety_level', 'low')
 
                         safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
@@ -1885,6 +1919,10 @@ class ServicesMixin:
                             contents_for_api_call.append({'role': 'user', 'parts': ["<internal_note>Begin conversation.</internal_note>"]})
 
                         # [NEW] Advanced Params Injection
+                        p_index = self._get_user_index(owner_id)
+                        p_is_borrowed = profile_name in p_index.get("borrowed", [])
+                        profile_settings = self._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
+                        
                         adv_params = {
                             "frequency_penalty": profile_settings.get("frequency_penalty"),
                             "presence_penalty": profile_settings.get("presence_penalty"),
@@ -1974,17 +2012,17 @@ class ServicesMixin:
                                 
                                 all_participant_names = []
                                 for p_data in session.get("profiles", []):
-                                    owner_id = p_data['owner_id']
-                                    p_name = p_data['profile_name']
+                                    p_owner_id_temp = p_data['owner_id']
+                                    p_name_temp = p_data['profile_name']
                                     
-                                    p_user_data = self._get_user_data_entry(owner_id)
-                                    p_is_borrowed = p_name in p_user_data.get("borrowed_profiles", {})
-                                    p_effective_owner_id = owner_id
-                                    p_effective_profile_name = p_name
-                                    if p_is_borrowed:
-                                        borrowed_data = p_user_data["borrowed_profiles"][p_name]
-                                        p_effective_owner_id = int(borrowed_data["original_owner_id"])
-                                        p_effective_profile_name = borrowed_data["original_profile_name"]
+                                    p_index_temp = self._get_user_index(p_owner_id_temp)
+                                    p_is_borrowed_temp = p_name_temp in p_index_temp.get("borrowed", [])
+                                    p_effective_owner_id = p_owner_id_temp
+                                    p_effective_profile_name = p_name_temp
+                                    if p_is_borrowed_temp:
+                                        borrowed_data = self._get_profile_config(p_owner_id_temp, p_name_temp, True) or {}
+                                        p_effective_owner_id = int(borrowed_data.get("original_owner_id", p_owner_id_temp))
+                                        p_effective_profile_name = borrowed_data.get("original_profile_name", p_name_temp)
                                     
                                     display_name = p_effective_profile_name
                                     appearance_data = self.user_appearances.get(str(p_effective_owner_id), {}).get(p_effective_profile_name, {})
@@ -2121,8 +2159,11 @@ class ServicesMixin:
                     sent_timestamp = datetime.datetime.now(datetime.timezone.utc) 
 
                     timezone_str = profile_settings.get("timezone", "UTC")
-                    main_history_line = self._format_history_entry(speaker_display_name, sent_timestamp, response_text, timezone_str)
+                    profile_id = self._get_profile_id(owner_id, profile_name)
+                    main_history_line = self._format_history_entry(speaker_display_name, sent_timestamp, response_text, timezone_str, entity_id=profile_id)
                     
+                    history_line = main_history_line
+                    # Transcript metadata injection (hidden from visual UI but available for context)
                     if profile_settings.get("generation_metadata_enabled", False):
                         try:
                             t1_formatted = t1_start_utc.astimezone(ZoneInfo(timezone_str)).strftime('%I:%M:%S %p %Z')
@@ -2130,6 +2171,16 @@ class ServicesMixin:
                             t1_formatted = t1_start_utc.strftime('%I:%M:%S %p UTC')
                         metadata_line = f"(Thought Initiated: {t1_formatted} | Duration: {duration:.2f}s)"
                         history_line = f"{main_history_line.strip()}\n{metadata_line}\n"
+
+                    # UI Subtext delivery
+                    ui_meta = []
+                    if profile_settings.get("generation_metadata_enabled", False):
+                        ui_meta.append(f"Dur: {duration:.2f}s")
+                    if profile_settings.get("id_metadata_enabled", False):
+                        ui_meta.append(f"PID: {profile_id}")
+                    
+                    if ui_meta:
+                        display_text += f"\n\n-# { ' | '.join(ui_meta) }"
                     else:
                         history_line = main_history_line
 
@@ -2438,10 +2489,10 @@ class ServicesMixin:
                                     # [NEW] Batch URL Context Logic
                                     any_url_enabled_batch = False
                                     for p in session['profiles']:
-                                        p_udata = self._get_user_data_entry(p['owner_id'])
-                                        p_is_b = p['profile_name'] in p_udata.get("borrowed_profiles", {})
-                                        p_settings = p_udata.get("borrowed_profiles" if p_is_b else "profiles", {}).get(p['profile_name'], {})
-                                        if p_settings.get("url_fetching_enabled", True):
+                                        p_index_batch = self._get_user_index(p['owner_id'])
+                                        p_is_b_batch = p['profile_name'] in p_index_batch.get("borrowed", [])
+                                        p_settings_batch = self._get_profile_config(p['owner_id'], p['profile_name'], p_is_b_batch) or {}
+                                        if p_settings_batch.get("url_fetching_enabled", True):
                                             any_url_enabled_batch = True; break
                                     
                                     url_text_batch = None
@@ -2453,13 +2504,14 @@ class ServicesMixin:
                                         url_media_batch = url_media
 
                                     # [NEW] Localized User Timestamp Logic (Batch)
-                                    u_data_batch = self._get_user_data_entry(trigger.author.id)
+                                    u_index_batch2 = self._get_user_index(trigger.author.id)
                                     u_prof_batch = self._get_active_user_profile_name_for_channel(trigger.author.id, channel_id)
-                                    u_is_b_batch = u_prof_batch in u_data_batch.get("borrowed_profiles", {})
-                                    u_sett_batch = u_data_batch.get("borrowed_profiles" if u_is_b_batch else "profiles", {}).get(u_prof_batch, {})
+                                    u_is_b_batch = u_prof_batch in u_index_batch2.get("borrowed", [])
+                                    u_sett_batch = self._get_profile_config(trigger.author.id, u_prof_batch, u_is_b_batch) or {}
                                     batch_tz = u_sett_batch.get("timezone", "UTC")
+                                    batch_hash = self._get_user_hash(trigger.author.id)
 
-                                    user_line = self._format_history_entry(author_name, trigger.created_at, content, batch_tz)
+                                    user_line = self._format_history_entry(author_name, trigger.created_at, content, batch_tz, entity_id=batch_hash)
                                     
                                     batch_msg_media = []
                                     message_attachments = [a for a in trigger.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))]
@@ -2473,13 +2525,13 @@ class ServicesMixin:
                                     # [NEW] Conditional Injection into Chat Sessions
                                     for p_key, inner_chat_session in session['chat_sessions'].items():
                                         if inner_chat_session is None: continue
-                                        p_owner_id, p_name = p_key
-                                        p_udata = self._get_user_data_entry(p_owner_id)
-                                        p_is_b = p_name in p_udata.get("borrowed_profiles", {})
-                                        p_settings = p_udata.get("borrowed_profiles" if p_is_b else "profiles", {}).get(p_name, {})
+                                        p_owner_id_b, p_name_b = p_key
+                                        p_index_b = self._get_user_index(p_owner_id_b)
+                                        p_is_b_b = p_name_b in p_index_b.get("borrowed", [])
+                                        p_settings_b = self._get_profile_config(p_owner_id_b, p_name_b, p_is_b_b) or {}
                                         
                                         final_parts = [user_line]
-                                        if url_text_batch and p_settings.get("url_fetching_enabled", True):
+                                        if url_text_batch and p_settings_b.get("url_fetching_enabled", True):
                                             final_parts.append(f"\n<document_context>\n{url_text_batch}\n</document_context>")
                                         
                                         final_parts.extend(url_media_batch)
@@ -2580,8 +2632,9 @@ class ServicesMixin:
                     for participant in profile_order:
                         owner_id = participant['owner_id']
                         profile_name = participant['profile_name']
-                        p_user_data = self._get_user_data_entry(owner_id)
-                        p_settings = p_user_data.get("profiles", {}).get(profile_name, {})
+                        p_index = self._get_user_index(owner_id)
+                        p_is_borrowed = profile_name in p_index.get("borrowed", [])
+                        p_settings = self._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
                         
                         if not p_settings.get("ltm_creation_enabled", False): continue
                         
@@ -2633,9 +2686,9 @@ class ServicesMixin:
                 for p_data in session["profiles"]:
                     p_key = (p_data['owner_id'], p_data['profile_name'])
                     
-                    p_user_data = self._get_user_data_entry(p_data['owner_id'])
-                    p_is_borrowed = p_data['profile_name'] in p_user_data.get("borrowed_profiles", {})
-                    p_profile_settings = p_user_data.get("borrowed_profiles" if p_is_borrowed else "profiles", {}).get(p_data['profile_name'], {})
+                    p_index = self._get_user_index(p_data['owner_id'])
+                    p_is_borrowed = p_data['profile_name'] in p_index.get("borrowed", [])
+                    p_profile_settings = self._get_profile_config(p_data['owner_id'], p_data['profile_name'], p_is_borrowed) or {}
                     stm_length = int(p_profile_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
 
                     history_slice = trimmed_unified_log[-(stm_length * 2):] if stm_length > 0 else []
@@ -2833,9 +2886,10 @@ class ServicesMixin:
                         final_response_text = response_text
                         owner_id = package['effective_profile_owner_id']
                         profile_name = package['effective_profile_name']
-                        user_data = self._get_user_data_entry(owner_id)
-                        is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
-                        profile_settings = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name, {})
+                        
+                        p_index = self._get_user_index(owner_id)
+                        is_borrowed = profile_name in p_index.get("borrowed", [])
+                        profile_settings = self._get_profile_config(owner_id, profile_name, is_borrowed) or {}
                         is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
 
                     except Exception as e:
@@ -3037,19 +3091,17 @@ class ServicesMixin:
                 print(f"Error in image generation worker #{worker_id}: {e}"); traceback.print_exc()
 
     async def _get_relevant_ltm_for_prompt(self, session_key: Any, history: list, profile_owner_id: int, profile_name: str, msg_content: str, author_dn: str, guild_id: Optional[int], triggering_user_id: int) -> Optional[str]:
-        user_data = self._get_user_data_entry(profile_owner_id)
-        is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
+        index = self._get_user_index(profile_owner_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
 
-        ltm_params_owner_data = user_data
-        ltm_params_profile_name = profile_name
         if is_borrowed:
-            borrowed_data = user_data["borrowed_profiles"][profile_name]
-            owner_id = int(borrowed_data["original_owner_id"])
-            owner_profile_name = borrowed_data["original_profile_name"]
-            ltm_params_owner_data = self._get_user_data_entry(owner_id)
-            ltm_params_profile_name = owner_profile_name
+            borrowed_data = self._get_profile_config(profile_owner_id, profile_name, True) or {}
+            owner_id = int(borrowed_data.get("original_owner_id", profile_owner_id))
+            owner_profile_name = borrowed_data.get("original_profile_name", profile_name)
+            params_source = self._get_profile_config(owner_id, owner_profile_name, False) or {}
+        else:
+            params_source = self._get_profile_config(profile_owner_id, profile_name, False) or {}
 
-        params_source = ltm_params_owner_data.get("profiles", {}).get(ltm_params_profile_name)
         if not params_source:
             return None
 
@@ -3172,16 +3224,16 @@ class ServicesMixin:
             return []
 
         owner_id_str = str(profile_owner_id)
-        user_data = self._get_user_data_entry(profile_owner_id)
-        is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
+        index = self._get_user_index(profile_owner_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
         
         effective_owner_id_for_training = profile_owner_id
         effective_profile_name_for_training = profile_name
         
         if is_borrowed:
-            borrowed_data = user_data["borrowed_profiles"][profile_name]
-            effective_owner_id_for_training = int(borrowed_data["original_owner_id"])
-            effective_profile_name_for_training = borrowed_data["original_profile_name"]
+            borrowed_data = self._get_profile_config(profile_owner_id, profile_name, True) or {}
+            effective_owner_id_for_training = int(borrowed_data.get("original_owner_id", profile_owner_id))
+            effective_profile_name_for_training = borrowed_data.get("original_profile_name", profile_name)
 
         profile_examples = self._load_training_shard(str(effective_owner_id_for_training), effective_profile_name_for_training)
 
@@ -3290,21 +3342,18 @@ class ServicesMixin:
         
         instructions = DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS
         if profile_owner_id and profile_name:
-            user_data = self._get_user_data_entry(profile_owner_id)
-            is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
+            index = self._get_user_index(profile_owner_id)
+            is_borrowed = profile_name in index.get("borrowed", [])
 
             if is_borrowed:
-                borrowed_data = user_data["borrowed_profiles"][profile_name]
-                source_owner_id = int(borrowed_data["original_owner_id"])
-                source_profile_name = borrowed_data["original_profile_name"]
-                
-                source_owner_user_data = self._get_user_data_entry(source_owner_id)
-                profile_data = source_owner_user_data.get("profiles", {}).get(source_profile_name, {})
+                borrowed_data = self._get_profile_config(profile_owner_id, profile_name, True) or {}
+                source_owner_id = int(borrowed_data.get("original_owner_id", profile_owner_id))
+                source_profile_name = borrowed_data.get("original_profile_name", profile_name)
+                prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
             else:
-                # LTM summarization instructions are only on personal profiles
-                profile_data = user_data.get("profiles", {}).get(profile_name, {})
+                prompts = self._get_profile_prompts(profile_owner_id, profile_name) or {}
             
-            encrypted_instructions = profile_data.get("ltm_summarization_instructions", self._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS))
+            encrypted_instructions = prompts.get("ltm_summarization_instructions", self._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS))
             instructions = self._decrypt_data(encrypted_instructions)
 
         cfg = {"temperature": 0.2}
@@ -3340,9 +3389,9 @@ class ServicesMixin:
     async def _maybe_create_ltm(self, context_obj: Union[discord.Message, discord.abc.Messageable], author_dn: str, hist: list, profile_owner_id: int, profile_name: str, gen_config_params: Dict[str, Any], force_user_scope: bool = False, triggering_user_id_override: Optional[int] = None):
         guild = getattr(context_obj, 'guild', None)
         
-        user_data = self._get_user_data_entry(profile_owner_id)
-        is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
-        profile_settings = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name, {})
+        index = self._get_user_index(profile_owner_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
+        profile_settings = self._get_profile_config(profile_owner_id, profile_name, is_borrowed) or {}
         
         if not profile_settings.get("ltm_creation_enabled", False):
             return
@@ -3386,14 +3435,14 @@ class ServicesMixin:
             user_id_map = {triggering_user_id: author_dn}
             sanitized_history, sanitized_author = self._get_sanitized_history_and_author(h_sum, user_id_map, triggering_user_id)
 
-            user_data = self._get_user_data_entry(profile_owner_id)
-            is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
+            index = self._get_user_index(profile_owner_id)
+            is_borrowed = profile_name in index.get("borrowed", [])
             effective_owner_id = profile_owner_id
             effective_profile_name = profile_name
             if is_borrowed:
-                borrowed_data = user_data["borrowed_profiles"][profile_name]
-                effective_owner_id = int(borrowed_data["original_owner_id"])
-                effective_profile_name = borrowed_data["original_profile_name"]
+                borrowed_data = self._get_profile_config(profile_owner_id, profile_name, True) or {}
+                effective_owner_id = int(borrowed_data.get("original_owner_id", profile_owner_id))
+                effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
             
             bot_display_name = effective_profile_name
             appearance = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
@@ -3436,17 +3485,17 @@ class ServicesMixin:
         is_placeholder = (content == f"{PLACEHOLDER_EMOJI}")
 
         if profile_owner_id_for_appearance is not None and profile_name_for_appearance:
-            borrower_user_data = self._get_user_data_entry(profile_owner_id_for_appearance)
-            is_borrowed = profile_name_for_appearance in borrower_user_data.get("borrowed_profiles", {})
+            index = self._get_user_index(profile_owner_id_for_appearance)
+            is_borrowed = profile_name_for_appearance in index.get("borrowed", [])
 
             if is_borrowed:
-                borrowed_data = borrower_user_data["borrowed_profiles"][profile_name_for_appearance]
+                borrowed_data = self._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, True) or {}
                 is_realistic_typing = borrowed_data.get("realistic_typing_enabled", False)
                 
-                effective_owner_id = int(borrowed_data["original_owner_id"])
-                effective_profile_name = borrowed_data["original_profile_name"]
+                effective_owner_id = int(borrowed_data.get("original_owner_id", profile_owner_id_for_appearance))
+                effective_profile_name = borrowed_data.get("original_profile_name", profile_name_for_appearance)
             else:
-                personal_profile_data = borrower_user_data.get("profiles", {}).get(profile_name_for_appearance, {})
+                personal_profile_data = self._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, False) or {}
                 is_realistic_typing = personal_profile_data.get("realistic_typing_enabled", False)
 
                 effective_owner_id = profile_owner_id_for_appearance
@@ -3574,10 +3623,9 @@ class ServicesMixin:
             final_content_for_send = chunk
             if is_first_chunk and reply_to and not is_placeholder:
                 # Handle Response Mode for Webhooks
-                user_data_target = self._get_user_data_entry(profile_owner_id_for_appearance)
-                target_profile_settings = user_data_target.get("profiles", {}).get(profile_name_for_appearance, {})
-                if not target_profile_settings:
-                    target_profile_settings = user_data_target.get("borrowed_profiles", {}).get(profile_name_for_appearance, {})
+                index = self._get_user_index(profile_owner_id_for_appearance)
+                is_borrowed = profile_name_for_appearance in index.get("borrowed", [])
+                target_profile_settings = self._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, is_borrowed) or {}
                 
                 rmode = target_profile_settings.get("response_mode", "regular")
                 # Webhooks fallback to text mention for 'mention' and 'mention_reply'
@@ -3664,10 +3712,12 @@ class ServicesMixin:
                 scrubbed_text = re.sub(r'<([^>]+)>.*?</\1>', '', scrubbed_text, flags=re.DOTALL)
                 # Removes any remaining single or unclosed tags globally
                 scrubbed_text = re.sub(r'<[^>]+>', '', scrubbed_text)
+                
+                # Strip hallucinated IDs
+                scrubbed_text = re.sub(r'\[ID:\s*[A-Z0-9]{8}\]', '', scrubbed_text, flags=re.IGNORECASE)
 
-                # 2. Broad Global Header Scrubber (Name [Timestamp]:)
-                # Matches Name [Timestamp] with an optional colon, anywhere in the text
-                pattern_header_global = r'[^\[\n\r]+ \[[^\]\r\n]+\]:?\s*'
+                # 2. Broad Global Header Scrubber (Name [ID] [Timestamp]:)
+                pattern_header_global = r'[^\[\n\r]+ (?:\[ID:\s*[A-Z0-9]{8}\]\s*)?\[[^\]\r\n]+\]:?\s*'
                 scrubbed_text = re.sub(pattern_header_global, '', scrubbed_text)
 
                 # 3. Global Technical Metadata Scrubber
@@ -3782,13 +3832,12 @@ class ServicesMixin:
             print(f"Warning: {e}. Returning original text.")
             return text
         
-    def _format_history_entry(self, display_name: str, timestamp: Union[datetime.datetime, str], content: str, timezone_str: str = "UTC") -> str:
+    def _format_history_entry(self, display_name: str, timestamp: Union[datetime.datetime, str], content: str, timezone_str: str = "UTC", entity_id: str = "00000000") -> str:
         # Convert string timestamp to datetime object if necessary
         if isinstance(timestamp, str):
             try:
                 timestamp = datetime.datetime.fromisoformat(timestamp)
             except ValueError:
-                # If parsing fails, default to current time to prevent crash
                 timestamp = datetime.datetime.now(datetime.timezone.utc)
 
         try:
@@ -3797,7 +3846,8 @@ class ServicesMixin:
             time_str = local_time.strftime("[%a, %d %b %Y, %I:%M %p %Z]")
         except Exception:
             time_str = timestamp.strftime("[%a, %d %b %Y, %I:%M %p UTC]")
-        return f"{display_name} {time_str}:\n{content}\n"
+            
+        return f"{display_name} [ID: {entity_id}] {time_str}:\n{content}\n"
     
     @tasks.loop(minutes=1.0)
     async def freewill_task(self):
@@ -3909,11 +3959,12 @@ class ServicesMixin:
                 target_participant = cast[1]
                 target_id = target_participant['owner_id']
                 target_profile = target_participant['profile_name']
-                target_user_data = self._get_user_data_entry(target_id)
+                
+                target_index = self._get_user_index(target_id)
                 target_appearance_name = target_profile
-                if target_profile in target_user_data.get("borrowed_profiles", {}):
-                    borrowed_data = target_user_data["borrowed_profiles"][target_profile]
-                    target_appearance_name = borrowed_data["original_profile_name"]
+                if target_profile in target_index.get("borrowed", []):
+                    borrowed_data = self._get_profile_config(target_id, target_profile, True) or {}
+                    target_appearance_name = borrowed_data.get("original_profile_name", target_profile)
                 
                 target_display_name = target_appearance_name
                 if str(target_id) in self.user_appearances and target_appearance_name in self.user_appearances[str(target_id)]:
@@ -3933,11 +3984,9 @@ class ServicesMixin:
 
                 await session['task_queue'].put(director_prompt)
                 
-                if not session.get('worker_task') or session['worker_task'].done():
+                if not session.get('is_running'):
                     session['is_running'] = True 
-                    task = self.bot.loop.create_task(self._multi_profile_worker(channel.id))
-                    session['worker_task'] = task
-                    self.background_tasks.add(task)
+                    session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(channel.id))
 
     @tasks.loop(seconds=60.0)
     async def evict_inactive_sessions_task(self):
@@ -4044,8 +4093,8 @@ class ServicesMixin:
                 sharer_id_str = str(share.get("sharer_id"))
                 profile_name = share.get("profile_name")
                 if sharer_id_str in all_bot_member_ids:
-                    sharer_data = self._get_user_data_entry(int(sharer_id_str))
-                    if profile_name in sharer_data.get("profiles", {}):
+                    sharer_index = self._get_user_index(int(sharer_id_str))
+                    if profile_name in sharer_index.get("personal", []):
                         valid_shares.append(share)
             
             if len(valid_shares) < original_len:
@@ -4089,23 +4138,12 @@ class ServicesMixin:
 
         # --- 5. Orphaned Server-Level Files ---
         cleaned_server_files = 0
-        # Freewill
-        if os.path.isdir(self.FREEWILL_SERVERS_DIR):
-            for filename in os.listdir(self.FREEWILL_SERVERS_DIR):
-                try:
-                    server_id = int(filename.split('.')[0])
-                    if server_id not in bot_guild_ids:
-                        _delete_file_shard(os.path.join(self.FREEWILL_SERVERS_DIR, filename))
-                        cleaned_server_files += 1
-                except (ValueError, IndexError):
-                    continue
-        # Sessions
-        sessions_servers_path = pathlib.Path(SESSIONS_SERVERS_DIR)
-        if sessions_servers_path.is_dir():
-            for server_dir in sessions_servers_path.iterdir():
+        servers_path = pathlib.Path(SERVERS_DIR)
+        if servers_path.is_dir():
+            for server_dir in list(servers_path.iterdir()):
                 try:
                     if server_dir.is_dir() and int(server_dir.name) not in bot_guild_ids:
-                        shutil.rmtree(server_dir)
+                        shutil.rmtree(server_dir, ignore_errors=True)
                         cleaned_server_files += 1
                 except ValueError:
                     continue
@@ -4143,49 +4181,39 @@ class ServicesMixin:
             log.append(f"🧹 Removed all data for {cleaned_users_count} users no longer sharing a server with the bot.")
 
         # --- 7. Detailed Per-User & Per-Server Integrity Check ---
-        cleaned_ltm_shards, cleaned_training_shards, cleaned_appearances, cleaned_borrows = 0, 0, 0, 0
+        cleaned_borrows = 0
         cleaned_session_files, cleaned_child_bots = 0, 0
         
-        profile_shard_files = [f for f in os.listdir(self.PROFILES_DIR) if f.endswith(".json.gz")] if os.path.isdir(self.PROFILES_DIR) else []
-        for profile_shard_file in profile_shard_files:
-            user_id_str = profile_shard_file[:-len(".json.gz")]
-            user_data = self._get_user_data_entry(int(user_id_str))
-            if not user_data: continue
+        users_path = pathlib.Path(self.USERS_DIR)
+        user_dirs = [d.name for d in users_path.iterdir() if d.is_dir() and d.name.isdigit()] if users_path.exists() else []
+        
+        for user_id_str in user_dirs:
+            uid = int(user_id_str)
+            index = self._get_user_index(uid)
+            if not index: continue
 
-            user_profiles = set(user_data.get("profiles", {}).keys())
-            all_valid_profiles = user_profiles | set(user_data.get("borrowed_profiles", {}).keys())
+            user_profiles = set(index.get("personal", []))
+            borrowed_profiles = set(index.get("borrowed", []))
+            all_valid_profiles = user_profiles | borrowed_profiles
             data_changed = False
 
-            # LTM/Training/Appearance cleanup (vs personal profiles)
-            for data_dir, counter_ref in [(self.LTM_DIR, "ltm"), (self.TRAINING_DIR, "train")]:
-                user_data_dir = os.path.join(data_dir, user_id_str)
-                if os.path.isdir(user_data_dir):
-                    for data_file in os.listdir(user_data_dir):
-                        profile_name = data_file[:-len(".json.gz")]
-                        if profile_name not in user_profiles:
-                            _delete_file_shard(os.path.join(user_data_dir, data_file))
-                            if counter_ref == "ltm": cleaned_ltm_shards += 1
-                            else: cleaned_training_shards += 1
-            
-            if user_id_str in self.user_appearances:
-                for appearance_name in list(self.user_appearances[user_id_str].keys()):
-                    if appearance_name not in user_profiles:
-                        del self.user_appearances[user_id_str][appearance_name]
-                        cleaned_appearances += 1
-            
             # Borrowed profile cleanup
-            for borrowed_name, borrow_data in list(user_data.get("borrowed_profiles", {}).items()):
-                owner_id = borrow_data.get("original_owner_id")
-                original_name = borrow_data.get("original_profile_name")
-                if owner_id and original_name:
-                    owner_data = self._get_user_data_entry(int(owner_id))
-                    if original_name not in owner_data.get("profiles", {}):
-                        del user_data["borrowed_profiles"][borrowed_name]
-                        cleaned_borrows += 1
-                        data_changed = True
+            for borrowed_name in list(borrowed_profiles):
+                b_config = self._get_profile_config(uid, borrowed_name, True)
+                if b_config:
+                    owner_id = b_config.get("original_owner_id")
+                    original_name = b_config.get("original_profile_name")
+                    if owner_id and original_name:
+                        owner_index = self._get_user_index(int(owner_id))
+                        if original_name not in owner_index.get("personal", []):
+                            index["borrowed"].remove(borrowed_name)
+                            import shutil
+                            shutil.rmtree(str(users_path / user_id_str / "profiles" / borrowed_name), ignore_errors=True)
+                            cleaned_borrows += 1
+                            data_changed = True
             
-            # Session file cleanup (vs all valid profiles)
-            global_session_dir = pathlib.Path(SESSIONS_GLOBAL_DIR) / user_id_str
+            # Session file cleanup
+            global_session_dir = pathlib.Path(self.SESSIONS_GLOBAL_DIR) / user_id_str
             if global_session_dir.is_dir():
                 for session_file in global_session_dir.iterdir():
                     if session_file.name.endswith(".json.gz"):
@@ -4194,39 +4222,43 @@ class ServicesMixin:
                             _delete_file_shard(str(session_file))
                             cleaned_session_files += 1
             
-            if data_changed: self._save_user_data_entry(int(user_id_str), user_data)
+            if data_changed: self._save_user_index(uid, index)
 
         # Child Bot cleanup
         child_bots_changed = False
-        for owner_id_str, user_shard in list(self._get_all_child_bot_shards().items()):
-            owner_data = self._get_user_data_entry(int(owner_id_str))
-            owner_profiles = set(owner_data.get("profiles", {}).keys())
-            for bot_id, bot_config in list(user_shard.items()):
-                if bot_config.get("profile_name") not in owner_profiles:
-                    del user_shard[bot_id]
+        for user_id_str in user_dirs:
+            profiles_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles")
+            if not os.path.isdir(profiles_dir): continue
+            index = self._get_user_index(int(user_id_str))
+            owner_profiles = set(index.get("personal", []))
+            
+            for profile_name in os.listdir(profiles_dir):
+                bot_file = os.path.join(profiles_dir, profile_name, "child_bot.json.gz")
+                if os.path.exists(bot_file) and profile_name not in owner_profiles:
+                    _delete_file_shard(bot_file)
                     cleaned_child_bots += 1
                     child_bots_changed = True
-            if child_bots_changed: self._save_user_child_bot_shard(int(owner_id_str), user_shard)
+                    
         if child_bots_changed: self._load_child_bots()
 
-        if cleaned_ltm_shards > 0: log.append(f"🧹 Removed {cleaned_ltm_shards} orphaned LTM data files.")
-        if cleaned_training_shards > 0: log.append(f"🧹 Removed {cleaned_training_shards} orphaned Training data files.")
-        if cleaned_appearances > 0: log.append(f"🧹 Removed {cleaned_appearances} orphaned appearances.")
         if cleaned_borrows > 0: log.append(f"🧹 Removed {cleaned_borrows} broken borrowed profiles.")
         if cleaned_session_files > 0: log.append(f"🧹 Removed {cleaned_session_files} orphaned session files for deleted profiles.")
         if cleaned_child_bots > 0: log.append(f"🧹 Removed {cleaned_child_bots} orphaned child bot configurations.")
 
         # --- 8. Channel & User Session Directory Cleanup ---
         cleaned_channel_dirs, cleaned_user_session_dirs = 0, 0
-        sessions_servers_path = pathlib.Path(SESSIONS_SERVERS_DIR)
-        if sessions_servers_path.is_dir():
-            for server_dir in list(sessions_servers_path.iterdir()):
+        servers_path = pathlib.Path(SERVERS_DIR)
+        if servers_path.is_dir():
+            for server_dir in list(servers_path.iterdir()):
                 if not server_dir.is_dir(): continue
                 try:
                     server_id_int = int(server_dir.name)
                     guild = self.bot.get_guild(server_id_int)
                     
-                    for channel_dir in list(server_dir.iterdir()):
+                    sessions_dir = server_dir / "sessions"
+                    if not sessions_dir.is_dir(): continue
+                    
+                    for channel_dir in list(sessions_dir.iterdir()):
                         if not channel_dir.is_dir(): continue
                         try:
                             channel_id = int(channel_dir.name)
@@ -4319,10 +4351,11 @@ class ServicesMixin:
             guild = self.bot.get_guild(guild_id) if guild_id else None
             if guild and not guild.get_member(original_owner_id):
                 author_id = message_payload.get("author_id")
-                author_data = self._get_user_data_entry(author_id)
+                author_index = self._get_user_index(author_id)
                 borrowed_name = None
-                for b_name, b_data in author_data.get("borrowed_profiles", {}).items():
-                    if int(b_data["original_owner_id"]) == original_owner_id and b_data["original_profile_name"] == original_profile_name:
+                for b_name in author_index.get("borrowed", []):
+                    b_data = self._get_profile_config(author_id, b_name, True) or {}
+                    if int(b_data.get("original_owner_id", 0)) == original_owner_id and b_data.get("original_profile_name") == original_profile_name:
                         borrowed_name = b_name
                         break
                 
@@ -4334,10 +4367,10 @@ class ServicesMixin:
                     found_in_session = False
                     if session:
                         for p in session.get("profiles", []):
-                            p_data = self._get_user_data_entry(p['owner_id'])
-                            if p['profile_name'] in p_data.get("borrowed_profiles", {}):
-                                b_data = p_data["borrowed_profiles"][p['profile_name']]
-                                if int(b_data["original_owner_id"]) == original_owner_id and b_data["original_profile_name"] == original_profile_name:
+                            p_index = self._get_user_index(p['owner_id'])
+                            if p['profile_name'] in p_index.get("borrowed", []):
+                                b_data = self._get_profile_config(p['owner_id'], p['profile_name'], True) or {}
+                                if int(b_data.get("original_owner_id", 0)) == original_owner_id and b_data.get("original_profile_name") == original_profile_name:
                                     effective_owner_id = p['owner_id']
                                     effective_profile_name = p['profile_name']
                                     found_in_session = True
@@ -4378,10 +4411,8 @@ class ServicesMixin:
             await session['task_queue'].put(trigger)
             
             # Start the worker if it's not running
-            if not session.get('worker_task') or session['worker_task'].done():
-                task = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
-                session['worker_task'] = task
-                self.background_tasks.add(task)
+            if not session.get('is_running'):
+                session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
 
     async def handle_child_bot_image_request(self, event_data: Dict):
         bot_id = event_data.get("bot_id")
@@ -4429,10 +4460,11 @@ class ServicesMixin:
             guild = self.bot.get_guild(guild_id) if guild_id else None
             if guild and not guild.get_member(original_owner_id):
                 author_id = message_data.get("author_id")
-                author_data = self._get_user_data_entry(author_id)
+                author_index = self._get_user_index(author_id)
                 borrowed_name = None
-                for b_name, b_data in author_data.get("borrowed_profiles", {}).items():
-                    if int(b_data["original_owner_id"]) == original_owner_id and b_data["original_profile_name"] == original_profile_name:
+                for b_name in author_index.get("borrowed", []):
+                    b_data = self._get_profile_config(author_id, b_name, True) or {}
+                    if int(b_data.get("original_owner_id", 0)) == original_owner_id and b_data.get("original_profile_name") == original_profile_name:
                         borrowed_name = b_name
                         break
                 
@@ -4448,9 +4480,9 @@ class ServicesMixin:
             prompt_text = message_data.get("content", "")[len(used_prefix):].strip()
             if not prompt_text: return
             
-            user_data = self._get_user_data_entry(owner_id)
-            is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
-            profile_data = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name, {})
+            index = self._get_user_index(owner_id)
+            is_borrowed = profile_name in index.get("borrowed", [])
+            profile_data = self._get_profile_config(owner_id, profile_name, is_borrowed) or {}
 
             if not profile_data.get("image_generation_enabled", True):
                 return
@@ -4465,13 +4497,12 @@ class ServicesMixin:
             source_owner_id = owner_id
             source_profile_name = profile_name
             if is_borrowed:
-                borrowed_data = user_data["borrowed_profiles"][profile_name]
-                source_owner_id = int(borrowed_data["original_owner_id"])
-                source_profile_name = borrowed_data["original_profile_name"]
+                borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
+                source_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
+                source_profile_name = borrowed_data.get("original_profile_name", profile_name)
             
-            source_owner_data = self._get_user_data_entry(source_owner_id)
-            source_profile_data = source_owner_data.get("profiles", {}).get(source_profile_name, {})
-            persona = source_profile_data.get("persona", {})
+            source_prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
+            persona = source_prompts.get("persona", {})
             appearance_lines_encrypted = persona.get("appearance", [])
             appearance_text = "\n".join([self._decrypt_data(line) for line in appearance_lines_encrypted])
 
@@ -4921,9 +4952,9 @@ class ServicesMixin:
                 # Conditional Metadata Injection
                 if ltm_recall_text: final_prompt_parts.append(ltm_recall_text)
                 
-                p_udata = self._get_user_data_entry(profile_owner_id)
-                p_is_b = profile_name in p_udata.get("borrowed_profiles", {})
-                p_settings = p_udata.get("borrowed_profiles" if p_is_b else "profiles", {}).get(profile_name, {})
+                p_index = self._get_user_index(profile_owner_id)
+                p_is_b = profile_name in p_index.get("borrowed", [])
+                p_settings = self._get_profile_config(profile_owner_id, profile_name, p_is_b) or {}
                 
                 if p_settings.get("url_fetching_enabled", True):
                     u_t, _ = await self._process_urls_in_content(prompt_content, channel.guild.id, {"url_fetching_enabled": True})
@@ -4950,8 +4981,9 @@ class ServicesMixin:
                             )
                             
                             # Re-calculate safety settings locally
-                            p_settings = self._get_user_data_entry(profile_owner_id).get("profiles", {}).get(profile_name, {})
-                            if not p_settings: p_settings = self._get_user_data_entry(profile_owner_id).get("borrowed_profiles", {}).get(profile_name, {})
+                            p_index = self._get_user_index(profile_owner_id)
+                            p_is_b = profile_name in p_index.get("borrowed", [])
+                            p_settings = self._get_profile_config(profile_owner_id, profile_name, p_is_b) or {}
                             
                             safe_lvl = p_settings.get("safety_level", "low")
                             safe_thresh = HarmBlockThreshold.BLOCK_ONLY_HIGH
@@ -5022,8 +5054,9 @@ class ServicesMixin:
 
             response_text = self._deduplicate_response(response_text)
 
-            p_settings = self._get_user_data_entry(profile_owner_id).get("profiles", {}).get(profile_name, {})
-            if not p_settings: p_settings = self._get_user_data_entry(profile_owner_id).get("borrowed_profiles", {}).get(profile_name, {})
+            p_index = self._get_user_index(profile_owner_id)
+            p_is_b = profile_name in p_index.get("borrowed", [])
+            p_settings = self._get_profile_config(profile_owner_id, profile_name, p_is_b) or {}
 
             user_content_obj = {'role': 'user', 'parts': [prompt_content]}
             model_content_obj = {'role': 'model', 'parts': [response_text]}
@@ -5165,17 +5198,18 @@ class ServicesMixin:
             if not response_text: raise ValueError("Model returned an empty response.")
             
             # Save to Slot 4 (Index 3)
-            user_data = self._get_user_data_entry(user_id)
-            profile = user_data.get("profiles", {}).get(profile_name)
-            if profile:
-                # Ensure ai_instructions is a list of 4
-                if not isinstance(profile["ai_instructions"], list):
-                    profile["ai_instructions"] = [profile["ai_instructions"], "", "", ""]
-                while len(profile["ai_instructions"]) < 4:
-                    profile["ai_instructions"].append("")
+            index = self._get_user_index(user_id)
+            if profile_name in index.get("personal", []):
+                prompts = self._get_profile_prompts(user_id, profile_name) or {}
                 
-                profile["ai_instructions"][3] = self._encrypt_data(response_text[:4000])
-                self._save_user_data_entry(user_id, user_data)
+                # Ensure ai_instructions is a list of 4
+                if not isinstance(prompts.get("ai_instructions"), list):
+                    prompts["ai_instructions"] = [prompts.get("ai_instructions", ""), "", "", ""]
+                while len(prompts["ai_instructions"]) < 4:
+                    prompts["ai_instructions"].append("")
+                
+                prompts["ai_instructions"][3] = self._encrypt_data(response_text[:4000])
+                self._save_profile_prompts(user_id, profile_name, prompts)
                 
                 await interaction.followup.send(f"✅ **Analysis Complete.** Style guide saved to AI Instructions for '{profile_name}'.", ephemeral=True)
             else:
@@ -5411,24 +5445,23 @@ class ServicesMixin:
             self._log_api_call(user_id=0, guild_id=guild_id, context="grounding_combined", model_used=model_name, status=status)
 
     def _get_image_gen_system_instruction(self, owner_id: int, profile_name: str) -> Optional[str]:
-        user_data = self._get_user_data_entry(owner_id)
-        is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
+        index = self._get_user_index(owner_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
 
         effective_owner_id = owner_id
         effective_profile_name = profile_name
         if is_borrowed:
-            borrowed_data = user_data["borrowed_profiles"][profile_name]
-            effective_owner_id = int(borrowed_data["original_owner_id"])
-            effective_profile_name = borrowed_data["original_profile_name"]
+            borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
+            effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
+            effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
 
-        source_owner_data = self._get_user_data_entry(effective_owner_id)
-        source_profile_data = source_owner_data.get("profiles", {}).get(effective_profile_name, {})
+        source_prompts = self._get_profile_prompts(effective_owner_id, effective_profile_name)
 
-        if not source_profile_data:
+        if not source_prompts:
             return None
 
         # Get the general image style prompt
-        encrypted_style_prompt = source_profile_data.get("image_generation_prompt")
+        encrypted_style_prompt = source_prompts.get("image_generation_prompt")
         style_prompt = self._decrypt_data(encrypted_style_prompt) if encrypted_style_prompt else ""
         
         return style_prompt.strip() or None
@@ -5569,9 +5602,9 @@ class ServicesMixin:
             effective_profile_owner_id = message.author.id
             effective_profile_name = self._get_active_user_profile_name_for_channel(effective_profile_owner_id, message.channel.id)
 
-            user_data = self._get_user_data_entry(effective_profile_owner_id)
-            is_borrowed = effective_profile_name in user_data.get("borrowed_profiles", {})
-            profile_data = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(effective_profile_name, {})
+            index = self._get_user_index(effective_profile_owner_id)
+            is_borrowed = effective_profile_name in index.get("borrowed", [])
+            profile_data = self._get_profile_config(effective_profile_owner_id, effective_profile_name, is_borrowed) or {}
 
             if not profile_data.get("image_generation_enabled", True):
                 return
@@ -5606,9 +5639,9 @@ class ServicesMixin:
                 )
                  placeholder_message = placeholders[0] if placeholders else None
 
-            user_data = self._get_user_data_entry(effective_profile_owner_id)
-            is_borrowed = effective_profile_name in user_data.get("borrowed_profiles", {})
-            profile_data = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(effective_profile_name, {})
+            index = self._get_user_index(effective_profile_owner_id)
+            is_borrowed = effective_profile_name in index.get("borrowed", [])
+            profile_data = self._get_profile_config(effective_profile_owner_id, effective_profile_name, is_borrowed) or {}
             safety_level_str = profile_data.get("safety_level", "low")
             
             safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
@@ -5619,13 +5652,12 @@ class ServicesMixin:
             source_owner_id = effective_profile_owner_id
             source_profile_name = effective_profile_name
             if is_borrowed:
-                borrowed_data = user_data["borrowed_profiles"][effective_profile_name]
-                source_owner_id = int(borrowed_data["original_owner_id"])
-                source_profile_name = borrowed_data["original_profile_name"]
+                borrowed_data = self._get_profile_config(effective_profile_owner_id, effective_profile_name, True) or {}
+                source_owner_id = int(borrowed_data.get("original_owner_id", effective_profile_owner_id))
+                source_profile_name = borrowed_data.get("original_profile_name", effective_profile_name)
             
-            source_owner_data = self._get_user_data_entry(source_owner_id)
-            source_profile_data = source_owner_data.get("profiles", {}).get(source_profile_name, {})
-            persona = source_profile_data.get("persona", {})
+            source_prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
+            persona = source_prompts.get("persona", {})
             appearance_lines_encrypted = persona.get("appearance", [])
             appearance_text = "\n".join([self._decrypt_data(line) for line in appearance_lines_encrypted])
 
@@ -5927,8 +5959,9 @@ class ServicesMixin:
                 model.system_instruction = full_system_instruction
             
             # [NEW] Advanced Params Injection for Regeneration
-            u_data = self._get_user_data_entry(p_owner_id)
-            p_profile = u_data.get("profiles", {}).get(p_name) or u_data.get("borrowed_profiles", {}).get(p_name, {})
+            index = self._get_user_index(p_owner_id)
+            is_borrowed = p_name in index.get("borrowed", [])
+            p_profile = self._get_profile_config(p_owner_id, p_name, is_borrowed) or {}
             
             adv_params = {
                 "frequency_penalty": p_profile.get("frequency_penalty"),
@@ -5950,15 +5983,17 @@ class ServicesMixin:
             
             # 5. Apply Changes
             sent_timestamp = datetime.datetime.now(datetime.timezone.utc)
-            u_data = self._get_user_data_entry(p_owner_id)
-            p_profile = u_data.get("profiles", {}).get(p_name) or u_data.get("borrowed_profiles", {}).get(p_name, {})
+            p_index = self._get_user_index(p_owner_id)
+            p_is_borrowed = p_name in p_index.get("borrowed", [])
+            p_profile = self._get_profile_config(p_owner_id, p_name, p_is_borrowed) or {}
             tz_str = p_profile.get("timezone", "UTC")
             
             sp_name = p_name
             app_data = self.user_appearances.get(str(p_owner_id), {}).get(p_name, {})
             if app_data.get("custom_display_name"): sp_name = app_data["custom_display_name"]
             
-            new_history_line = self._format_history_entry(sp_name, sent_timestamp, new_text, tz_str)
+            profile_id = self._get_profile_id(p_owner_id, p_name)
+            new_history_line = self._format_history_entry(sp_name, sent_timestamp, new_text, tz_str, entity_id=profile_id)
             turn_object["content"] = new_history_line
             turn_object["timestamp"] = sent_timestamp.isoformat()
             

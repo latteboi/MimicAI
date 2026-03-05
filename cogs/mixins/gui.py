@@ -86,11 +86,12 @@ class GlobalChatHistoryView(ui.View):
                 profiles.add(key[2])
 
         # 2. Scan Disk
-        dir_path = pathlib.Path(self.cog.SESSIONS_GLOBAL_DIR) / self.user_id_str
+        dir_path = pathlib.Path(self.cog.USERS_DIR) / self.user_id_str / "profiles"
         if dir_path.is_dir():
-            for f in dir_path.iterdir():
-                if f.name.endswith(".json.gz") and f.name != "_mappings.json.gz":
-                    profiles.add(f.name[:-len(".json.gz")])
+            for p_dir in dir_path.iterdir():
+                if p_dir.is_dir():
+                    if (p_dir / "global_chat.json.gz").exists():
+                        profiles.add(p_dir.name)
         
         return sorted(list(profiles))
 
@@ -185,16 +186,16 @@ class GlobalChatHistoryView(ui.View):
         display_name = self.selected_profile
         avatar_url = self.cog.bot.user.display_avatar.url
         
-        user_data = self.cog._get_user_data_entry(self.user_id)
-        is_borrowed = self.selected_profile in user_data.get("borrowed_profiles", {})
+        index = self.cog._get_user_index(self.user_id)
+        is_borrowed = self.selected_profile in index.get("borrowed", [])
         
         effective_owner_id = self.user_id
         effective_profile_name = self.selected_profile
         
         if is_borrowed:
-            borrowed_data = user_data["borrowed_profiles"][self.selected_profile]
-            effective_owner_id = int(borrowed_data["original_owner_id"])
-            effective_profile_name = borrowed_data["original_profile_name"]
+            borrowed_data = self.cog._get_profile_config(self.user_id, self.selected_profile, True) or {}
+            effective_owner_id = int(borrowed_data.get("original_owner_id", self.user_id))
+            effective_profile_name = borrowed_data.get("original_profile_name", self.selected_profile)
         
         appearance_data = self.cog.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name)
         if appearance_data:
@@ -416,13 +417,13 @@ class WhisperHistoryView(ui.View):
         response_content = "\n".join(response_turn.get("content", "").split("\n")[1:]).strip() # Remove header line
         whisper_content = "\n".join(whisper_turn.get("content", "").split("\n")[1:]).strip() # Remove header line
 
-        user_data = self.cog._get_user_data_entry(owner_id)
-        is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
+        index = self.cog._get_user_index(owner_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
         effective_owner_id, effective_profile_name = owner_id, profile_name
         if is_borrowed:
-            borrowed_data = user_data["borrowed_profiles"][profile_name]
-            effective_owner_id = int(borrowed_data["original_owner_id"])
-            effective_profile_name = borrowed_data["original_profile_name"]
+            borrowed_data = self.cog._get_profile_config(owner_id, profile_name, True) or {}
+            effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
+            effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
         
         display_name = effective_profile_name
         avatar_url = self.cog.bot.user.display_avatar.url
@@ -588,12 +589,13 @@ class ProfileDirectorDeskModal(ui.Modal, title="Director's Desk: TTS Instruction
         }
 
         user_id = interaction.user.id
-        user_data = self.cog._get_user_data_entry(user_id)
-        profile = user_data.get("profiles", {}).get(self.profile_name)
+        index = self.cog._get_user_index(user_id)
+        is_borrowed = self.profile_name in index.get("borrowed", [])
+        profile = self.cog._get_profile_config(user_id, self.profile_name, is_borrowed)
         
         if profile:
             profile.update(new_params)
-            self.cog._save_user_data_entry(user_id, user_data)
+            self.cog._save_profile_config(user_id, self.profile_name, profile, is_borrowed)
             await interaction.followup.send(f"✅ TTS Instructions updated for '{self.profile_name}'.", ephemeral=True)
             if self.callback: await self.callback(interaction)
 
@@ -652,13 +654,11 @@ class ProfileSpeechSettingsModal(ui.Modal, title="Speech & Voice Settings"):
         }
 
         user_id = interaction.user.id
-        user_data = self.cog._get_user_data_entry(user_id)
-        target_dict = user_data.get("borrowed_profiles" if self.is_borrowed else "profiles", {})
-        profile = target_dict.get(self.profile_name)
+        profile = self.cog._get_profile_config(user_id, self.profile_name, self.is_borrowed)
         
         if profile:
             profile.update(new_params)
-            self.cog._save_user_data_entry(user_id, user_data)
+            self.cog._save_profile_config(user_id, self.profile_name, profile, self.is_borrowed)
             
             keys_to_clear = [
                 k for k in self.cog.channel_models.keys() 
@@ -825,8 +825,7 @@ class ProfileManageView(ui.View):
         choice = interaction.data['values'][0]
         user_id = self.user_id
         profile_name = self.profile_name
-        user_data = self.cog._get_user_data_entry(user_id)
-        profile = user_data.get("borrowed_profiles" if self.is_borrowed else "profiles", {}).get(profile_name)
+        profile = self.cog._get_profile_config(user_id, profile_name, self.is_borrowed)
         
         if not profile:
             await interaction.response.send_message("Profile data not found.", ephemeral=True); return
@@ -841,11 +840,10 @@ class ProfileManageView(ui.View):
         elif choice == "delete":
             await self._handle_delete(interaction)
         elif choice == "safety_level":
-            await self._handle_safety_cycle(interaction, user_data, profile)
+            await self._handle_safety_cycle(interaction, profile)
         elif choice == "error_response":
-            user_data = self.cog._get_user_data_entry(interaction.user.id)
             is_b = getattr(self, "is_borrowed", False)
-            target_profile = user_data.get("borrowed_profiles", {}).get(self.profile_name) if is_b else user_data.get("profiles", {}).get(self.profile_name)
+            target_profile = self.cog._get_profile_config(interaction.user.id, self.profile_name, is_b)
 
             if not target_profile:
                 await interaction.response.send_message("❌ Error: Profile not found.", ephemeral=True)
@@ -855,12 +853,11 @@ class ProfileManageView(ui.View):
                 await modal_interaction.response.defer(ephemeral=True)
                 val_to_save = new_val.strip() or "An error has occurred."
                 
-                u_data = self.cog._get_user_data_entry(modal_interaction.user.id)
-                target = u_data.get("borrowed_profiles", {}).get(self.profile_name) if is_b else u_data.get("profiles", {}).get(self.profile_name)
+                target = self.cog._get_profile_config(modal_interaction.user.id, self.profile_name, is_b)
                 
                 if target:
                     target["error_response"] = val_to_save
-                    self.cog._save_user_data_entry(modal_interaction.user.id, u_data)
+                    self.cog._save_profile_config(modal_interaction.user.id, self.profile_name, target, is_b)
                     await modal_interaction.followup.send(f"✅ Custom error message updated for '{self.profile_name}'.", ephemeral=True)
                 else:
                     await modal_interaction.followup.send("❌ Error: Profile not found.", ephemeral=True)
@@ -877,10 +874,12 @@ class ProfileManageView(ui.View):
 
         # --- Persona Tab Logic ---
         elif choice == "edit_persona":
-            modal = EditUserProfilePersonaModal(self.cog, profile_name, profile.get("persona", {}), user_id)
+            prompts = self.cog._get_profile_prompts(user_id, profile_name) or {}
+            modal = EditUserProfilePersonaModal(self.cog, profile_name, prompts.get("persona", {}), user_id)
             await interaction.response.send_modal(modal)
         elif choice == "edit_instructions":
-            modal = EditUserProfileAIInstructionsModal(self.cog, profile_name, profile.get("ai_instructions", ""), user_id)
+            prompts = self.cog._get_profile_prompts(user_id, profile_name) or {}
+            modal = EditUserProfileAIInstructionsModal(self.cog, profile_name, prompts.get("ai_instructions", ""), user_id)
             await interaction.response.send_modal(modal)
         elif choice == "tts_instructions":
             async def refresh_cb(modal_interaction: discord.Interaction):
@@ -933,7 +932,7 @@ class ProfileManageView(ui.View):
             modes = ["regular", "mention", "reply", "mention_reply"]
             curr = profile.get("response_mode", "regular")
             profile["response_mode"] = modes[(modes.index(curr) + 1) % len(modes)]
-            await self._save_and_refresh(interaction, user_data, profile_name)
+            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice in ["image_settings", "image_toggle"]:
             async def refresh_cb(modal_interaction: discord.Interaction):
                 new_embed = await self.cog._build_profile_manage_embed(modal_interaction, profile_name)
@@ -942,24 +941,27 @@ class ProfileManageView(ui.View):
             await interaction.response.send_modal(modal)
         elif choice == "typing":
             profile["realistic_typing_enabled"] = not profile.get("realistic_typing_enabled", False)
-            await self._save_and_refresh(interaction, user_data, profile_name)
+            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice == "grounding":
             current_mode = profile.get("grounding_mode", "off")
             if isinstance(current_mode, bool): current_mode = "on" if current_mode else "off"
             cycle_map = {"off": "on", "on": "on+", "on+": "off"}
             profile["grounding_mode"] = cycle_map.get(current_mode, "off")
-            await self._save_and_refresh(interaction, user_data, profile_name)
+            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice == "url_toggle":
             profile["url_fetching_enabled"] = not profile.get("url_fetching_enabled", False)
-            await self._save_and_refresh(interaction, user_data, profile_name)
+            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice == "time":
-            await self._handle_timezone(interaction, user_data, profile)
+            await self._handle_timezone(interaction, profile, self.is_borrowed)
         elif choice == "metadata_toggle":
-            profile["generation_metadata_enabled"] = not profile.get("generation_metadata_enabled", False)
-            await self._save_and_refresh(interaction, user_data, profile_name)
+            async def refresh_cb(modal_interaction: discord.Interaction):
+                new_embed = await self.cog._build_profile_manage_embed(modal_interaction, profile_name)
+                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
+            modal = ProfileMetadataModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb)
+            await interaction.response.send_modal(modal)
         elif choice == "critic":
             profile["critic_enabled"] = not profile.get("critic_enabled", False)
-            await self._save_and_refresh(interaction, user_data, profile_name)
+            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
 
         # --- Memory Tab Logic ---
         elif choice == "data":
@@ -968,18 +970,18 @@ class ProfileManageView(ui.View):
             if self.is_borrowed:
                 if profile_name == DEFAULT_PROFILE_NAME: effective_owner_id = owner_id_config
                 else:
-                    borrow_data = user_data.get("borrowed_profiles", {}).get(profile_name)
-                    if borrow_data: effective_owner_id = int(borrow_data["original_owner_id"])
+                    borrow_data = self.cog._get_profile_config(user_id, profile_name, True) or {}
+                    effective_owner_id = int(borrow_data.get("original_owner_id", user_id))
             view = DataManageView(self.cog, self.original_interaction, profile_name, self.is_borrowed, effective_owner_id)
             await view.start()
             await interaction.response.defer()
         elif choice == "ltm_creation":
             profile["ltm_creation_enabled"] = not profile.get("ltm_creation_enabled", False)
-            await self._save_and_refresh(interaction, user_data, profile_name)
+            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice == "ltm_scope":
             scope_cycle = {'global': 'server', 'server': 'user', 'user': 'global'}
             profile['ltm_scope'] = scope_cycle.get(profile.get('ltm_scope', 'server'), 'server')
-            await self._save_and_refresh(interaction, user_data, profile_name)
+            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice == "ltm_params":
             async def refresh_cb(i):
                 new_embed = await self.cog._build_profile_manage_embed(i, profile_name)
@@ -999,8 +1001,8 @@ class ProfileManageView(ui.View):
 
     # --- Internal Helpers for UI Flow ---
 
-    async def _save_and_refresh(self, interaction, user_data, profile_name):
-        self.cog._save_user_data_entry(self.user_id, user_data)
+    async def _save_and_refresh(self, interaction, profile, profile_name, is_borrowed):
+        self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
         
         # [NEW] Hot-Swap: Invalidate model and session caches for this profile immediately
         # This ensures settings take effect even if a multi-profile session is active.
@@ -1016,13 +1018,13 @@ class ProfileManageView(ui.View):
         new_embed = await self.cog._build_profile_manage_embed(interaction, profile_name)
         await interaction.response.edit_message(embed=new_embed, view=self)
 
-    async def _handle_safety_cycle(self, interaction, user_data, profile):
+    async def _handle_safety_cycle(self, interaction, profile):
         is_public = self.cog._is_profile_public(self.user_id, self.profile_name)
         cycle_full = {'low': 'medium', 'medium': 'high', 'high': 'unrestricted', 'unrestricted': 'low'}
         cycle_rest = {'low': 'medium', 'medium': 'high', 'high': 'low'}
         curr = profile.get('safety_level', 'low')
         profile['safety_level'] = (cycle_rest if (self.is_borrowed or is_public) else cycle_full).get(curr, 'low')
-        await self._save_and_refresh(interaction, user_data, self.profile_name)
+        await self._save_and_refresh(interaction, profile, self.profile_name, self.is_borrowed)
 
     async def _handle_appearance(self, interaction):
         user_apps = self.cog.user_appearances.get(str(self.user_id), {})
@@ -1041,25 +1043,35 @@ class ProfileManageView(ui.View):
             await i.response.defer()
             new_name = new_name_input.value.lower().strip()
             old_name = self.profile_name
+            
+            is_valid, err_msg = self.cog._is_valid_profile_name(new_name)
+            if not is_valid:
+                await self.original_interaction.edit_original_response(content=f"Rename failed: {err_msg}", view=None, embed=None); return
+                
             if old_name == DEFAULT_PROFILE_NAME:
                 await self.original_interaction.edit_original_response(content=f"Rename failed: '{DEFAULT_PROFILE_NAME}' cannot be renamed.", view=None, embed=None); return
             if not new_name or new_name.lower() == 'clyde':
                 await self.original_interaction.edit_original_response(content="Rename failed: Invalid name.", view=None, embed=None); return
-            user_data = self.cog._get_user_data_entry(self.user_id)
-            if new_name in user_data.get("profiles", {}) or new_name in user_data.get("borrowed_profiles", {}):
+            user_index = self.cog._get_user_index(self.user_id)
+            if new_name in user_index.get("personal", []) or new_name in user_index.get("borrowed", []):
                 await self.original_interaction.edit_original_response(content="Rename failed: Name already exists.", view=None, embed=None); return
             
-            p_dict_key = "borrowed_profiles" if self.is_borrowed else "profiles"
-            if old_name in user_data[p_dict_key]:
-                # Logic for public update omitted for brevity (keep existing logic)
-                profile_data = user_data[p_dict_key].pop(old_name)
-                user_data[p_dict_key][new_name] = profile_data
-                for ch_id, act in user_data.get("channel_active_profiles", {}).items():
-                    if act == old_name: user_data["channel_active_profiles"][ch_id] = new_name
+            p_dict_key = "borrowed" if self.is_borrowed else "personal"
+            if old_name in user_index[p_dict_key]:
+                user_index[p_dict_key].remove(old_name)
+                user_index[p_dict_key].append(new_name)
+                for ch_id, act in user_index.get("channel_active_profiles", {}).items():
+                    if act == old_name: user_index["channel_active_profiles"][ch_id] = new_name
                 if not self.is_borrowed:
                     self.cog._rename_ltm_shards(str(self.user_id), old_name, new_name)
                     self.cog._rename_training_shards(str(self.user_id), old_name, new_name)
-                self.cog._save_user_data_entry(self.user_id, user_data)
+                self.cog._save_user_index(self.user_id, user_index)
+                
+                old_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", old_name)
+                new_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", new_name)
+                if os.path.exists(old_dir):
+                    os.rename(old_dir, new_dir)
+                
                 await self.original_interaction.edit_original_response(content=f"Profile '{old_name}' renamed to '{new_name}'.", view=None, embed=None)
         modal.on_submit = rename_submit
         await interaction.response.send_modal(modal)
@@ -1071,14 +1083,38 @@ class ProfileManageView(ui.View):
         async def duplicate_submit(i: discord.Interaction):
             await i.response.defer()
             new_name = new_name_input.value.lower().strip()
-            if not new_name: return
-            user_data = self.cog._get_user_data_entry(self.user_id)
+            
+            is_valid, err_msg = self.cog._is_valid_profile_name(new_name)
+            if not is_valid:
+                await self.original_interaction.edit_original_response(content=f"Duplicate failed: {err_msg}", view=None, embed=None); return
+                
+            user_index = self.cog._get_user_index(self.user_id)
+            if new_name in user_index.get("personal", []) or new_name in user_index.get("borrowed", []):
+                await self.original_interaction.edit_original_response(content="Duplicate failed: Name already exists.", view=None, embed=None); return
+            
             limit = defaultConfig.LIMIT_PROFILES_PREMIUM if self.cog.is_user_premium(self.user_id) else defaultConfig.LIMIT_PROFILES_FREE
-            if len(user_data.get("profiles", {})) >= limit:
+            if len(user_index.get("personal", [])) >= limit:
                 await self.original_interaction.edit_original_response(content="Limit reached.", view=None, embed=None); return
-            user_data["profiles"][new_name] = copy.deepcopy(user_data["profiles"][self.profile_name])
-            user_data["profiles"][new_name]['created_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            self.cog._save_user_data_entry(self.user_id, user_data)
+            
+            old_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", self.profile_name)
+            new_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", new_name)
+            
+            import shutil
+            try:
+                shutil.copytree(old_dir, new_dir)
+            except Exception as e:
+                print(f"Error duplicating profile directory: {e}")
+            
+            user_index.setdefault("personal", []).append(new_name)
+            self.cog._save_user_index(self.user_id, user_index)
+            
+            config = self.cog._get_profile_config(self.user_id, new_name, False)
+            if config:
+                import uuid
+                config['profile_id'] = str(uuid.uuid4().hex[:8].upper()) # Force unique PID for duplicate
+                config['created_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                self.cog._save_profile_config(self.user_id, new_name, config, False)
+
             self.cog._copy_ltm_shard(str(self.user_id), self.profile_name, new_name)
             self.cog._copy_training_shard(str(self.user_id), self.profile_name, new_name)
             await self.original_interaction.edit_original_response(content=f"Duplicated to '{new_name}'.", view=None, embed=None)
@@ -1099,22 +1135,28 @@ class ProfileManageView(ui.View):
         confirm_view = ui.View(timeout=60)
         async def confirm_delete(i: discord.Interaction):
             await i.response.defer()
-            user_data = self.cog._get_user_data_entry(self.user_id)
-            p_dict_key = "borrowed_profiles" if self.is_borrowed else "profiles"
-            if self.profile_name in user_data[p_dict_key]:
-                del user_data[p_dict_key][self.profile_name]
+            user_index = self.cog._get_user_index(self.user_id)
+            list_key = "borrowed" if self.is_borrowed else "personal"
+            
+            if self.profile_name in user_index.get(list_key, []):
+                user_index[list_key].remove(self.profile_name)
+                
                 if not self.is_borrowed:
-                    self.cog._delete_ltm_shard(str(self.user_id), self.profile_name)
-                    self.cog._delete_training_shard(str(self.user_id), self.profile_name)
                     self.cog._cascade_delete_borrowed_profiles(self.user_id, self.profile_name)
-                self.cog._save_user_data_entry(self.user_id, user_data)
+                
+                self.cog._save_user_index(self.user_id, user_index)
+                
+                import shutil
+                p_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", self.profile_name)
+                shutil.rmtree(p_dir, ignore_errors=True)
+                
                 await self.original_interaction.edit_original_response(content=f"Profile '{self.profile_name}' deleted.", view=None, embed=None)
         confirm_btn = ui.Button(label="Confirm Deletion", style=discord.ButtonStyle.danger)
         confirm_btn.callback = confirm_delete
         confirm_view.add_item(confirm_btn)
         await interaction.response.send_message(f"Delete profile '{self.profile_name}'?", view=confirm_view, ephemeral=True)
 
-    async def _handle_timezone(self, interaction, user_data, profile):
+    async def _handle_timezone(self, interaction, profile, is_borrowed):
         view = ui.View(timeout=180)
         common_tzs = ["UTC", "GMT", "US/Pacific", "US/Central", "US/Eastern", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Australia/Sydney"]
         opts = [discord.SelectOption(label=tz, value=tz) for tz in common_tzs]
@@ -1128,7 +1170,7 @@ class ProfileManageView(ui.View):
                 async def custom_sub(mi: discord.Interaction):
                     try: 
                         ZoneInfo(inp.value); profile['timezone'] = inp.value
-                        self.cog._save_user_data_entry(self.user_id, user_data)
+                        self.cog._save_profile_config(self.user_id, self.profile_name, profile, is_borrowed)
                         new_embed = await self.cog._build_profile_manage_embed(mi, self.profile_name)
                         await self.original_interaction.edit_original_response(embed=new_embed, view=self)
                         await mi.response.send_message("Updated.", ephemeral=True, delete_after=3)
@@ -1137,7 +1179,7 @@ class ProfileManageView(ui.View):
                 await i.response.send_modal(modal)
             else:
                 profile['timezone'] = select.values[0]
-                self.cog._save_user_data_entry(self.user_id, user_data)
+                self.cog._save_profile_config(self.user_id, self.profile_name, profile, is_borrowed)
                 new_embed = await self.cog._build_profile_manage_embed(i, self.profile_name)
                 await self.original_interaction.edit_original_response(embed=new_embed, view=self)
                 await i.response.defer()
@@ -1185,8 +1227,8 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
         sharer_name = owner.name if owner else "Unknown"
 
         # [NEW] Dynamic Limit Check
-        user_data = self.cog._get_user_data_entry(interaction.user.id)
-        current_borrowed = len(user_data.get("borrowed_profiles", {}))
+        index = self.cog._get_user_index(interaction.user.id)
+        current_borrowed = len(index.get("borrowed", []))
         
         is_premium = self.cog.is_user_premium(interaction.user.id)
         limit = defaultConfig.LIMIT_BORROWED_PREMIUM if is_premium else defaultConfig.LIMIT_BORROWED_FREE
@@ -1206,10 +1248,10 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
 
         for profile_name in profiles_to_borrow:
             # Lazy check: ensure source still exists
-            owner_data = self.cog._get_user_data_entry(int(owner_id_str))
-            owner_profile_data = owner_data.get("profiles", {}).get(profile_name)
+            owner_index = self.cog._get_user_index(int(owner_id_str))
+            owner_profile_data = self.cog._get_profile_config(int(owner_id_str), profile_name, False)
             
-            if not owner_profile_data:
+            if not owner_profile_data or profile_name not in owner_index.get("personal", []):
                 failed_profiles[profile_name] = "Original profile deleted by owner."
                 continue
 
@@ -1248,12 +1290,14 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
                 if adv_k in owner_profile_data:
                     snapshot_data[adv_k] = owner_profile_data[adv_k]
 
-            user_data.setdefault("borrowed_profiles", {})[desired_name] = snapshot_data
+            if desired_name not in index.get("borrowed", []):
+                index.setdefault("borrowed", []).append(desired_name)
+            self.cog._save_profile_config(interaction.user.id, desired_name, snapshot_data, True)
             accepted_profiles.append(f"`{profile_name}` (as `{desired_name}`)")
 
         # Save and Delete Code
         if accepted_profiles:
-            self.cog._save_user_data_entry(interaction.user.id, user_data)
+            self.cog._save_user_index(interaction.user.id, index)
             del self.cog.share_codes[code]
         
         message = ""
@@ -1324,9 +1368,9 @@ class HubHomeView(HubBaseView):
         total_public = len(self.cog.public_profiles)
         unique_creators = len(set(p['owner_id'] for p in self.cog.public_profiles.values()))
         
-        user_data = self.cog._get_user_data_entry(self.user_id)
-        user_owned = len(user_data.get("profiles", {}))
-        user_borrowed = len(user_data.get("borrowed_profiles", {}))
+        index = self.cog._get_user_index(self.user_id)
+        user_owned = len(index.get("personal", []))
+        user_borrowed = len(index.get("borrowed", []))
         
         embed = discord.Embed(title="MimicAI Profile Hub", description=defaultConfig.MIMIC_NEWS, color=discord.Color.gold())
         
@@ -1432,10 +1476,11 @@ class HubPublicLibraryView(HubBaseView):
                 borrow_style = discord.ButtonStyle.grey
                 borrow_disabled = True
             else:
-                user_data = self.cog._get_user_data_entry(self.user_id)
-                for b_data in user_data.get("borrowed_profiles", {}).values():
-                    if int(b_data["original_owner_id"]) == p_info['owner_id'] and \
-                       b_data["original_profile_name"] == p_info['profile_name']:
+                index = self.cog._get_user_index(self.user_id)
+                for b_name in index.get("borrowed", []):
+                    b_data = self.cog._get_profile_config(self.user_id, b_name, True)
+                    if b_data and int(b_data.get("original_owner_id", 0)) == p_info['owner_id'] and \
+                       b_data.get("original_profile_name") == p_info['profile_name']:
                         borrow_label = "Borrowed"
                         borrow_style = discord.ButtonStyle.grey
                         borrow_disabled = True
@@ -1509,9 +1554,10 @@ class HubPublicLibraryView(HubBaseView):
             await i.response.send_message("You cannot borrow your own profile.", ephemeral=True)
             return
         
-        user_data = self.cog._get_user_data_entry(i.user.id)
-        for b_data in user_data.get("borrowed_profiles", {}).values():
-            if int(b_data["original_owner_id"]) == p_info['owner_id'] and b_data["original_profile_name"] == p_info['profile_name']:
+        index = self.cog._get_user_index(i.user.id)
+        for b_name in index.get("borrowed", []):
+            b_data = self.cog._get_profile_config(i.user.id, b_name, True)
+            if b_data and int(b_data.get("original_owner_id", 0)) == p_info['owner_id'] and b_data.get("original_profile_name") == p_info['profile_name']:
                 await i.response.send_message("You already have this profile.", ephemeral=True)
                 return
 
@@ -1657,8 +1703,8 @@ class HubIncomingView(HubBaseView):
         shares = [s for s in self.cog.profile_shares.get(str(self.user_id), []) if s['sharer_id'] == sharer_id]
         
         limit = defaultConfig.LIMIT_BORROWED_PREMIUM if self.cog.is_user_premium(self.user_id) else defaultConfig.LIMIT_BORROWED_FREE
-        user_data = self.cog._get_user_data_entry(self.user_id)
-        current_borrowed = len(user_data.get("borrowed_profiles", {}))
+        index = self.cog._get_user_index(self.user_id)
+        current_borrowed = len(index.get("borrowed", []))
 
         if current_borrowed + len(shares) > limit:
             await i.followup.send(f"Limit Reached. Accepting these would exceed your limit of {limit} borrowed profiles.", ephemeral=True)
@@ -1670,8 +1716,8 @@ class HubIncomingView(HubBaseView):
 
         for s in shares:
             p_name = s['profile_name']
-            sharer_data = self.cog._get_user_data_entry(sharer_id)
-            if p_name not in sharer_data.get("profiles", {}):
+            sharer_index = self.cog._get_user_index(sharer_id)
+            if p_name not in sharer_index.get("personal", []):
                 await self.cog._reject_share_request(self.original_interaction, sharer_id, p_name, notify_sharer=False)
                 continue
 
@@ -1704,8 +1750,8 @@ class HubShareManagerView(HubBaseView):
         self.selected_users = []
         self.processing = False
         
-        user_data = self.cog._get_user_data_entry(self.user_id)
-        self.personal_profiles = sorted(list(user_data.get("profiles", {}).keys()))
+        index = self.cog._get_user_index(self.user_id)
+        self.personal_profiles = sorted(list(index.get("personal", [])))
         self.current_page = 0
         
         self.setup_items()
@@ -1938,7 +1984,7 @@ class HubShareManagerView(HubBaseView):
                 disp = appearance_data.get("custom_display_name") or name
                 ava = appearance_data.get("custom_avatar_url")
                 
-                p_data = self.cog._get_user_data_entry(self.user_id).get("profiles", {}).get(name, {})
+                p_data = self.cog._get_profile_config(self.user_id, name, False) or {}
                 if p_data.get("safety_level") == "unrestricted":
                     failed_list[name] = "Safety Level is 'Unrestricted 18+'. Only 'Low', 'Medium', or 'High' can be published."
                     continue
@@ -2458,14 +2504,13 @@ class ProfileThinkingParamsModal(ui.Modal, title="Thinking & Reasoning Parameter
         if self.profile_name == "BULK_APPLY":
             return
 
-        user_data = self.cog._get_user_data_entry(interaction.user.id)
+        index = self.cog._get_user_index(interaction.user.id)
         
-        target_dict = user_data.get("borrowed_profiles" if self.is_borrowed else "profiles", {})
-        profile = target_dict.get(self.profile_name)
+        target_dict = self.cog._get_profile_config(interaction.user.id, self.profile_name, self.is_borrowed)
         
-        if profile:
-            profile.update(new_params)
-            self.cog._save_user_data_entry(interaction.user.id, user_data)
+        if target_dict:
+            target_dict.update(new_params)
+            self.cog._save_profile_config(interaction.user.id, self.profile_name, target_dict, self.is_borrowed)
             
             cache_key = (interaction.channel_id, interaction.user.id, self.profile_name)
             self.cog.channel_models.pop(cache_key, None)
@@ -2538,16 +2583,13 @@ class ProfileLTMSummarizationModal(ui.Modal, title="Set LTM Summarization Instru
             new_instructions = DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS
         
         user_id = interaction.user.id
-        user_data = self.cog.user_profiles.get(str(user_id))
-        profile = user_data.get("profiles", {}).get(self.profile_name)
-        
-        if not profile:
-            await interaction.followup.send("Profile not found.", ephemeral=True)
+        prompts = self.cog._get_profile_prompts(user_id, self.profile_name)
+        if not prompts:
+            await interaction.followup.send("Profile prompts not found.", ephemeral=True)
             return
 
-        profile["ltm_summarization_instructions"] = new_instructions
-        self.cog._save_user_data_entry(user_id, user_data)
-        
+        prompts["ltm_summarization_instructions"] = self.cog._encrypt_data(new_instructions)
+        self.cog._save_profile_prompts(user_id, self.profile_name, prompts)
         
         await interaction.followup.send(f"LTM summarization instructions updated for profile '{self.profile_name}'.", ephemeral=True)
 
@@ -2573,11 +2615,12 @@ class ProfileLTMTriggerModal(ui.Modal, title="Set LTM Frequency & Context"):
         except ValueError as e:
             await interaction.followup.send(f"❌ **Invalid Input:** {e}.", ephemeral=True); return
 
-        user_data = self.cog._get_user_data_entry(interaction.user.id)
-        profile = user_data.get("profiles", {}).get(self.profile_name)
+        index = self.cog._get_user_index(interaction.user.id)
+        is_borrowed = self.profile_name in index.get("borrowed", [])
+        profile = self.cog._get_profile_config(interaction.user.id, self.profile_name, is_borrowed)
         if profile:
             profile.update(new_params)
-            self.cog._save_user_data_entry(interaction.user.id, user_data)
+            self.cog._save_profile_config(interaction.user.id, self.profile_name, profile, is_borrowed)
             await interaction.followup.send(f"✅ LTM frequency settings updated for '{self.profile_name}'.", ephemeral=True)
             if self.callback: await self.callback(interaction)
 
@@ -2623,12 +2666,48 @@ class ProfileImageGenSettingsModal(ui.Modal, title="Image Generation Settings"):
             if self.callback: await self.callback(interaction, new_params)
             return
             
-        user_data = self.cog._get_user_data_entry(interaction.user.id)
-        target = user_data.get("borrowed_profiles" if self.is_borrowed else "profiles", {}).get(self.profile_name)
+        target = self.cog._get_profile_config(interaction.user.id, self.profile_name, self.is_borrowed)
         if target:
             target.update(new_params)
-            self.cog._save_user_data_entry(interaction.user.id, user_data)
+            self.cog._save_profile_config(interaction.user.id, self.profile_name, target, self.is_borrowed)
             await interaction.followup.send("✅ Image generation settings updated.", ephemeral=True)
+            if self.callback: await self.callback(interaction)
+        else:
+            await interaction.followup.send("❌ Profile not found.", ephemeral=True)
+
+class ProfileMetadataModal(ui.Modal, title="Set Generation Metadata"):
+    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+        super().__init__()
+        self.cog = cog
+        self.profile_name = profile_name
+        self.is_borrowed = is_borrowed
+        self.callback = callback
+        
+        dur_val = "on" if current_params.get("generation_metadata_enabled", False) else "off"
+        self.add_item(ui.TextInput(label="Show Duration & Latency (on/off)", custom_id="duration", default=dur_val, required=True))
+        
+        id_val = "on" if current_params.get("id_metadata_enabled", False) else "off"
+        self.add_item(ui.TextInput(label="Show Profile ID (on/off)", custom_id="pid", default=id_val, required=True))
+        
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        new_params = {}
+        try:
+            def gv(cid): return next((c.value for c in self.children if c.custom_id == cid), None).strip().lower()
+            new_params["generation_metadata_enabled"] = (gv("duration") == "on")
+            new_params["id_metadata_enabled"] = (gv("pid") == "on")
+        except Exception:
+            await interaction.followup.send("Error parsing input.", ephemeral=True); return
+        
+        if self.profile_name == "BULK_APPLY":
+            if self.callback: await self.callback(interaction, new_params)
+            return
+            
+        target = self.cog._get_profile_config(interaction.user.id, self.profile_name, self.is_borrowed)
+        if target:
+            target.update(new_params)
+            self.cog._save_profile_config(interaction.user.id, self.profile_name, target, self.is_borrowed)
+            await interaction.followup.send("✅ Metadata settings updated.", ephemeral=True)
             if self.callback: await self.callback(interaction)
         else:
             await interaction.followup.send("❌ Profile not found.", ephemeral=True)
@@ -2673,11 +2752,10 @@ class MultiProfileSelectView(ui.View):
         self.view_source: Literal['personal', 'borrowed', 'child_bot'] = 'personal'
         self.current_page = 0
         
-        # Pre-load lists - Ensure data is fetched via the helper method
-        user_data = self.cog._get_user_data_entry(self.user_id)
+        index = self.cog._get_user_index(self.user_id)
         self.lists = {
-            'personal': sorted(list(user_data.get("profiles", {}).keys())),
-            'borrowed': sorted(list(user_data.get("borrowed_profiles", {}).keys())),
+            'personal': sorted(list(index.get("personal", []))),
+            'borrowed': sorted(list(index.get("borrowed", []))),
             'child_bot': sorted(
                 [b for b_id, b in self.cog.child_bots.items() if b['owner_id'] == self.user_id],
                 key=lambda x: x.get('profile_name', '')
@@ -2940,9 +3018,9 @@ class SingleProfileModelView(ui.View):
         self.profile_name = profile_name
         self.view_mode = 'google'
 
-        user_data = self.cog._get_user_data_entry(self.user_id)
-        is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
-        self.profile_data = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name, {})
+        index = self.cog._get_user_index(self.user_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
+        self.profile_data = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed) or {}
         
         self._primary_model = self.profile_data.get("primary_model", PRIMARY_MODEL_NAME)
         self._fallback_model = self.profile_data.get("fallback_model", FALLBACK_MODEL_NAME)
@@ -2976,13 +3054,13 @@ class SingleProfileModelView(ui.View):
         self._save_changes("show_fallback_indicator", value)
 
     def _save_changes(self, key, value):
-        user_data = self.cog._get_user_data_entry(self.user_id)
-        is_borrowed = self.profile_name in user_data.get("borrowed_profiles", {})
-        target_dict = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(self.profile_name)
+        index = self.cog._get_user_index(self.user_id)
+        is_borrowed = self.profile_name in index.get("borrowed", [])
+        target_dict = self.cog._get_profile_config(self.user_id, self.profile_name, is_borrowed)
         
         if target_dict:
             target_dict[key] = value
-            self.cog._save_user_data_entry(self.user_id, user_data)
+            self.cog._save_profile_config(self.user_id, self.profile_name, target_dict, is_borrowed)
             
             # Clear model cache for this user
             keys_to_delete = []
@@ -3108,9 +3186,9 @@ class ModelApplyView(ui.View):
         self.show_fallback_indicator: bool = True 
 
         # [UPDATED] Load ALL profiles (Personal + Borrowed)
-        user_data = self.cog._get_user_data_entry(self.user_id)
-        personal = list(user_data.get("profiles", {}).keys())
-        borrowed = list(user_data.get("borrowed_profiles", {}).keys())
+        index = self.cog._get_user_index(self.user_id)
+        personal = list(index.get("personal", []))
+        borrowed = list(index.get("borrowed", []))
         self.all_profiles = sorted(personal + borrowed)
         
         self._build_view()
@@ -3266,8 +3344,9 @@ class ModelApplyView(ui.View):
             return
 
         success_count = 0
+        index = self.cog._get_user_index(self.user_id)
         for profile_name in self.target_profiles:
-            is_borrowed = profile_name in self.cog.user_profiles.get(str(self.user_id), {}).get("borrowed_profiles", {})
+            is_borrowed = profile_name in index.get("borrowed", [])
             if await self.cog.update_profile_models(self.user_id, profile_name, self.primary_model, self.fallback_model, is_borrowed, self.interaction.channel_id, show_fallback_indicator=self.show_fallback_indicator):
                 success_count += 1
         
@@ -3290,9 +3369,9 @@ class BaseBulkProfileView(ui.View):
         self.include_borrowed = include_borrowed
         self.selected_profiles = set()
         
-        user_data = self.cog._get_user_data_entry(self.user_id)
-        self.personal_profiles = sorted(list(user_data.get("profiles", {}).keys()))
-        self.borrowed_profiles = sorted(list(user_data.get("borrowed_profiles", {}).keys())) if include_borrowed else []
+        index = self.cog._get_user_index(self.user_id)
+        self.personal_profiles = sorted(list(index.get("personal", [])))
+        self.borrowed_profiles = sorted(list(index.get("borrowed", []))) if include_borrowed else []
         
         self.current_page = 0
         self.view_source = 'personal'
@@ -3428,15 +3507,14 @@ class BulkCriticView(BaseBulkProfileView):
             await interaction.edit_original_response(content="Please select an action and at least one profile.", view=None); return
 
         updated_count = 0
-        user_data = self.cog._get_user_data_entry(self.user_id)
+        index = self.cog._get_user_index(self.user_id)
         for profile_name in self.selected_profiles:
-            is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
-            profile = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name)
+            is_borrowed = profile_name in index.get("borrowed", [])
+            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
             if profile:
                 profile["critic_enabled"] = self.toggle_choice
+                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
                 updated_count += 1
-        
-        if updated_count > 0: self.cog._save_user_data_entry(self.user_id, user_data)
         
         status = "ENABLED" if self.toggle_choice else "DISABLED"
         await interaction.edit_original_response(content=f"Critic has been set to **{status}** for {updated_count} profile(s).", view=None)
@@ -3475,6 +3553,8 @@ class BulkActionView(BaseBulkProfileView):
             final_message = await self.cog.bulk_apply_ltm_summarization_instructions(self.user_id, target_profiles_list, self.params)
         elif self.action == "apply_image_settings":
             final_message = await self.cog.bulk_apply_image_settings(self.user_id, target_profiles_list, self.params)
+        elif self.action == "apply_metadata":
+            final_message = await self.cog.bulk_apply_metadata_settings(self.user_id, target_profiles_list, self.params)
         
         await interaction.edit_original_response(content=final_message, view=None)
 
@@ -3512,16 +3592,15 @@ class BulkGroundingView(BaseBulkProfileView):
         if self.grounding_mode is None or not target_profiles:
             await interaction.edit_original_response(content="Please select a grounding mode and at least one profile.", view=None); return
 
-        user_data = self.cog._get_user_data_entry(self.user_id)
         updated_count = 0
+        index = self.cog._get_user_index(self.user_id)
         for profile_name in target_profiles:
-            is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
-            profile = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name)
+            is_borrowed = profile_name in index.get("borrowed", [])
+            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
             if profile:
                 profile["grounding_mode"] = self.grounding_mode
+                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
                 updated_count += 1
-        
-        if updated_count > 0: self.cog._save_user_data_entry(self.user_id, user_data)
         
         display_mode = {"off": "Off", "on": "On", "on+": "On+"}.get(self.grounding_mode)
         await interaction.edit_original_response(content=f"Grounding has been set to **{display_mode}** for {updated_count} profile(s).", view=None)
@@ -3558,14 +3637,17 @@ class BulkResponseModeView(BaseBulkProfileView):
         if not self.mode_choice or not self.selected_profiles:
             await interaction.edit_original_response(content="Select a mode and at least one profile.", view=None); return
 
-        user_data = self.cog._get_user_data_entry(self.user_id)
         updated_count = 0
+        index = self.cog._get_user_index(self.user_id)
         for name in self.selected_profiles:
-            p = user_data.get("profiles", {}).get(name) or user_data.get("borrowed_profiles", {}).get(name)
-            if p: p["response_mode"] = self.mode_choice; updated_count += 1
+            is_borrowed = name in index.get("borrowed", [])
+            p = self.cog._get_profile_config(self.user_id, name, is_borrowed)
+            if p: 
+                p["response_mode"] = self.mode_choice
+                self.cog._save_profile_config(self.user_id, name, p, is_borrowed)
+                updated_count += 1
         
         if updated_count > 0:
-            self.cog._save_user_data_entry(self.user_id, user_data)
             # Hot-Swap Cache Invalidation
             keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.user_id]
             for k in keys: self.cog.channel_models.pop(k, None); self.cog.chat_sessions.pop(k, None)
@@ -3602,14 +3684,17 @@ class BulkURLContextView(BaseBulkProfileView):
         if self.toggle_choice is None or not self.selected_profiles:
             await interaction.edit_original_response(content="Select an action and at least one profile.", view=None); return
 
-        user_data = self.cog._get_user_data_entry(self.user_id)
         updated_count = 0
+        index = self.cog._get_user_index(self.user_id)
         for name in self.selected_profiles:
-            p = user_data.get("profiles", {}).get(name) or user_data.get("borrowed_profiles", {}).get(name)
-            if p: p["url_fetching_enabled"] = self.toggle_choice; updated_count += 1
+            is_borrowed = name in index.get("borrowed", [])
+            p = self.cog._get_profile_config(self.user_id, name, is_borrowed)
+            if p: 
+                p["url_fetching_enabled"] = self.toggle_choice
+                self.cog._save_profile_config(self.user_id, name, p, is_borrowed)
+                updated_count += 1
         
         if updated_count > 0:
-            self.cog._save_user_data_entry(self.user_id, user_data)
             keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.user_id]
             for k in keys: self.cog.channel_models.pop(k, None); self.cog.chat_sessions.pop(k, None)
 
@@ -3683,17 +3768,18 @@ class BulkTimezoneView(BaseBulkProfileView):
         if not self.selected_tz or not self.selected_profiles:
             await interaction.edit_original_response(content="Select a timezone and at least one profile.", view=None); return
 
-        user_data = self.cog._get_user_data_entry(self.user_id)
         updated_count = 0
+        index = self.cog._get_user_index(self.user_id)
         for name in self.selected_profiles:
-            p = user_data.get("profiles", {}).get(name) or user_data.get("borrowed_profiles", {}).get(name)
+            is_borrowed = name in index.get("borrowed", [])
+            p = self.cog._get_profile_config(self.user_id, name, is_borrowed)
             if p:
                 p["timezone"] = self.selected_tz
                 p["time_tracking_enabled"] = True # Force always-on
+                self.cog._save_profile_config(self.user_id, name, p, is_borrowed)
                 updated_count += 1
         
         if updated_count > 0:
-            self.cog._save_user_data_entry(self.user_id, user_data)
             # Flush caches for the user
             keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.user_id]
             for k in keys: 
@@ -3737,15 +3823,14 @@ class BulkMetadataView(BaseBulkProfileView):
             await interaction.edit_original_response(content="Please select an action and at least one profile.", view=None); return
 
         updated_count = 0
-        user_data = self.cog._get_user_data_entry(self.user_id)
+        index = self.cog._get_user_index(self.user_id)
         for profile_name in target_profiles:
-            is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
-            profile = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name)
+            is_borrowed = profile_name in index.get("borrowed", [])
+            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
             if profile:
                 profile["generation_metadata_enabled"] = self.toggle_choice
+                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
                 updated_count += 1
-        
-        if updated_count > 0: self.cog._save_user_data_entry(self.user_id, user_data)
         
         status = "ENABLED" if self.toggle_choice else "DISABLED"
         await interaction.edit_original_response(content=f"Generation metadata has been set to **{status}** for {updated_count} profile(s).", view=None)
@@ -3836,8 +3921,8 @@ class BulkSafetyLevelView(BaseBulkProfileView):
         if not self.selected_level or not target_profiles:
             await interaction.edit_original_response(content="You must select a safety level and at least one profile.", view=None); return
 
-        user_data = self.cog._get_user_data_entry(self.user_id)
         updated_count, adjusted_count = 0, 0
+        index = self.cog._get_user_index(self.user_id)
         
         safety_map = {"unrestricted": 0, "low": 1, "medium": 2, "high": 3}
         reverse_safety_map = {v: k for k, v in safety_map.items()}
@@ -3845,9 +3930,9 @@ class BulkSafetyLevelView(BaseBulkProfileView):
 
         for profile_name in target_profiles:
             is_borrowed = profile_name in self.borrowed_profiles
-            profile_dict = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {})
+            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
             
-            if profile_name in profile_dict:
+            if profile:
                 is_public = self.cog._is_profile_public(self.user_id, profile_name)
                 min_level_num = safety_map["low"] if is_public or is_borrowed else safety_map["unrestricted"]
                 
@@ -3855,10 +3940,9 @@ class BulkSafetyLevelView(BaseBulkProfileView):
                 final_level_str = reverse_safety_map[final_level_num]
                 
                 if final_level_num > desired_level_num: adjusted_count += 1
-                profile_dict[profile_name]['safety_level'] = final_level_str
+                profile['safety_level'] = final_level_str
+                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
                 updated_count += 1
-        
-        if updated_count > 0: self.cog._save_user_data_entry(self.user_id, user_data)
         
         message = f"Successfully updated safety level for {updated_count} profile(s)."
         if adjusted_count > 0: message += f"\nThe '{self.selected_level}' level was automatically adjusted to 'low' for {adjusted_count} public/borrowed profile(s)."
@@ -3898,16 +3982,16 @@ class BulkLtmScopeView(BaseBulkProfileView):
         if not self.selected_scope or not target_profiles:
             await interaction.edit_original_response(content="You must select a scope and at least one profile.", view=None); return
 
-        user_data = self.cog._get_user_data_entry(self.user_id)
         updated_count = 0
+        index = self.cog._get_user_index(self.user_id)
         for profile_name in target_profiles:
             is_borrowed = profile_name in self.borrowed_profiles
-            profile_dict = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {})
-            if profile_name in profile_dict:
-                profile_dict[profile_name]['ltm_scope'] = self.selected_scope
+            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
+            if profile:
+                profile['ltm_scope'] = self.selected_scope
+                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
                 updated_count += 1
         
-        if updated_count > 0: self.cog._save_user_data_entry(self.user_id, user_data)
         await interaction.edit_original_response(content=f"Successfully set LTM scope to '{self.selected_scope}' for {updated_count} profile(s).", view=None)
 
 class BulkDeleteView(BaseBulkProfileView):
@@ -3935,20 +4019,24 @@ class BulkDeleteView(BaseBulkProfileView):
 
         deleted_count = 0
         user_id_str = str(self.user_id)
-        user_data = self.cog._get_user_data_entry(self.user_id)
+        index = self.cog._get_user_index(self.user_id)
         
         for name in items_to_delete:
-            if name in user_data.get("borrowed_profiles", {}):
-                del user_data["borrowed_profiles"][name]
+            if name in index.get("borrowed", []):
+                index["borrowed"].remove(name)
                 deleted_count += 1
-            elif name in user_data.get("profiles", {}):
-                del user_data["profiles"][name]
-                self.cog._delete_ltm_shard(user_id_str, name)
-                self.cog._delete_training_shard(user_id_str, name)
+                import shutil
+                p_dir = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", name)
+                shutil.rmtree(p_dir, ignore_errors=True)
+            elif name in index.get("personal", []):
+                index["personal"].remove(name)
                 self.cog._cascade_delete_borrowed_profiles(self.user_id, name)
                 deleted_count += 1
+                import shutil
+                p_dir = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", name)
+                shutil.rmtree(p_dir, ignore_errors=True)
         
-        if deleted_count > 0: self.cog._save_user_data_entry(self.user_id, user_data)
+        if deleted_count > 0: self.cog._save_user_index(self.user_id, index)
         await interaction.edit_original_response(content=f"Successfully deleted {deleted_count} profiles.", view=None)
 
 class SearchDataModal(ui.Modal, title="Search Data"):
@@ -4518,7 +4606,7 @@ class SubmitAPIKeyModal(ui.Modal, title="Edit API Key"):
         
         if self.target_type == 'personal':
             user_id_str = str(interaction.user.id)
-            path = os.path.join(self.cog.PERSONAL_KEYS_DIR, f"{user_id_str}.json.gz")
+            path = os.path.join(self.cog.USERS_DIR, user_id_str, "keys.json.gz")
             existing_data = self.cog._load_json_gzip(path) or {}
             
             key_field = "key" if provider == "gemini" else "openrouter_key"
@@ -4611,7 +4699,7 @@ class SettingsHomeView(SettingsBaseView):
 
     async def update_display(self):
         # Gather Stats
-        path = os.path.join(self.cog.PERSONAL_KEYS_DIR, f"{str(self.user_id)}.json.gz")
+        path = os.path.join(self.cog.USERS_DIR, str(self.user_id), "keys.json.gz")
         u_data = self.cog._load_json_gzip(path)
         u_tier = u_data.get("tier", "free").title() if u_data else "Free"
 
@@ -4722,7 +4810,7 @@ class SettingsAPIView(SettingsBaseView):
         
         if self.selected_server_id is None:
             # Personal View
-            path = os.path.join(self.cog.PERSONAL_KEYS_DIR, f"{str(self.user_id)}.json.gz")
+            path = os.path.join(self.cog.USERS_DIR, str(self.user_id), "keys.json.gz")
             u_data = self.cog._load_json_gzip(path)
             u_tier = u_data.get("tier", "free").title() if u_data else "Free"
 
@@ -4872,16 +4960,17 @@ class SettingsChildBotView(SettingsBaseView):
         await self.update_display()
 
     async def delete_bot(self, i: discord.Interaction):
-        # Logic from delete_child_bot_callback
         bot_to_delete = self.cog.child_bots.get(self.selected_bot_id)
         if bot_to_delete:
             owner_id = bot_to_delete['owner_id']
-            user_shard = self.cog._get_user_child_bot_shard(owner_id)
-            if self.selected_bot_id in user_shard:
-                del user_shard[self.selected_bot_id]
-                self.cog._save_user_child_bot_shard(owner_id, user_shard)
-                self.cog._load_child_bots()
-                await self.cog.manager_queue.put({"action": "shutdown_bot", "bot_id": self.selected_bot_id})
+            profile_name = bot_to_delete['profile_name']
+            
+            bot_file = os.path.join(self.cog.USERS_DIR, str(owner_id), "profiles", profile_name, "child_bot.json.gz")
+            from .storage import _delete_file_shard
+            _delete_file_shard(bot_file)
+            
+            self.cog._load_child_bots()
+            await self.cog.manager_queue.put({"action": "shutdown_bot", "bot_id": self.selected_bot_id})
         
         self.selected_bot_id = None
         self.setup_items()
@@ -4903,8 +4992,13 @@ class BorrowNameModal(ui.Modal, title="Name Your Borrowed Profile"):
         await interaction.response.defer(ephemeral=True)
         desired_name = self.profile_name_input.value.lower().strip()
         
-        user_data = self.cog._get_user_data_entry(interaction.user.id)
-        if desired_name in user_data.get("profiles", {}) or desired_name in user_data.get("borrowed_profiles", {}):
+        is_valid, err_msg = self.cog._is_valid_profile_name(desired_name)
+        if not is_valid:
+            await interaction.followup.send(f"❌ **Invalid Name:** {err_msg}", ephemeral=True)
+            return
+
+        index = self.cog._get_user_index(interaction.user.id)
+        if desired_name in index.get("personal", []) or desired_name in index.get("borrowed", []):
             await interaction.followup.send(f"You already have a profile named '{desired_name}'. Please choose a different name.", ephemeral=True)
             return
 
@@ -5384,15 +5478,14 @@ class TypingManageView(BaseBulkProfileView):
             await interaction.edit_original_response(content="Please select an action and at least one profile.", view=None); return
 
         updated_count = 0
-        user_data = self.cog._get_user_data_entry(self.user_id)
+        index = self.cog._get_user_index(self.user_id)
         for profile_name in target_profiles:
-            is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
-            profile = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name)
+            is_borrowed = profile_name in index.get("borrowed", [])
+            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
             if profile:
                 profile["realistic_typing_enabled"] = self.toggle_choice
+                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
                 updated_count += 1
-        
-        if updated_count > 0: self.cog._save_user_data_entry(self.user_id, user_data)
         
         status = "ENABLED" if self.toggle_choice else "DISABLED"
         await interaction.edit_original_response(content=f"Realistic typing has been set to **{status}** for {updated_count} profile(s).", view=None)
@@ -5432,15 +5525,14 @@ class BulkCriticView(BaseBulkProfileView):
             await interaction.edit_original_response(content="Please select an action and at least one profile.", view=None); return
 
         updated_count = 0
-        user_data = self.cog._get_user_data_entry(self.user_id)
+        index = self.cog._get_user_index(self.user_id)
         for profile_name in target_profiles:
-            is_borrowed = profile_name in user_data.get("borrowed_profiles", {})
-            profile = user_data.get("borrowed_profiles" if is_borrowed else "profiles", {}).get(profile_name)
+            is_borrowed = profile_name in index.get("borrowed", [])
+            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
             if profile:
                 profile["critic_enabled"] = self.toggle_choice
+                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
                 updated_count += 1
-        
-        if updated_count > 0: self.cog._save_user_data_entry(self.user_id, user_data)
         
         status = "ENABLED" if self.toggle_choice else "DISABLED"
         await interaction.edit_original_response(content=f"Critic has been set to **{status}** for {updated_count} profile(s).", view=None)
@@ -5466,13 +5558,16 @@ class AppearanceCreateModal(ui.Modal):
             await interaction.followup.send("The name 'clyde' is reserved and cannot be used as a display name.", ephemeral=True)
             return
 
-        user_apps = self.cog.user_appearances.setdefault(user_id_str, {})
-        if len(user_apps) >= MAX_USER_APPEARANCES:
-            await interaction.followup.send(f"Max appearances ({MAX_USER_APPEARANCES}) reached.", ephemeral=True)
-            return
-
-        user_apps[self.profile_name] = {"custom_avatar_url": avatar_url, "custom_display_name": display_name}
-        self.cog._save_user_appearance_shard(user_id_str, user_apps)
+        config = self.cog._get_profile_config(interaction.user.id, self.profile_name, False)
+        if config:
+            config["custom_display_name"] = display_name
+            config["custom_avatar_url"] = avatar_url
+            self.cog._save_profile_config(interaction.user.id, self.profile_name, config, False)
+            
+            self.cog.user_appearances.setdefault(user_id_str, {})[self.profile_name] = {
+                "custom_display_name": display_name,
+                "custom_avatar_url": avatar_url
+            }
 
         # Check if this profile is linked to a child bot and send an update
         linked_bot_id = next((bot_id for bot_id, data in self.cog.child_bots.items() if str(data.get("owner_id")) == user_id_str and data.get("profile_name") == self.profile_name), None)
@@ -5540,9 +5635,16 @@ class AppearanceEditModal(ui.Modal):
                 await interaction.followup.send(f"**Could not save appearance.** The new display name or avatar was flagged for a content policy violation: {reason}\n\nIf you wish to proceed with this restricted edit, you must first unpublish the profile using `/profile public manage`.", ephemeral=True)
                 return
 
-        user_apps = self.cog.user_appearances.setdefault(user_id_str, {})
-        user_apps[self.profile_name] = {"custom_avatar_url": new_avatar_url, "custom_display_name": new_display_name}
-        self.cog._save_user_appearance_shard(user_id_str, user_apps)
+        config = self.cog._get_profile_config(interaction.user.id, self.profile_name, False)
+        if config:
+            config["custom_display_name"] = new_display_name
+            config["custom_avatar_url"] = new_avatar_url
+            self.cog._save_profile_config(interaction.user.id, self.profile_name, config, False)
+            
+            self.cog.user_appearances.setdefault(user_id_str, {})[self.profile_name] = {
+                "custom_display_name": new_display_name,
+                "custom_avatar_url": new_avatar_url
+            }
 
         # Check if this profile is linked to a child bot and send an update
         linked_bot_id = next((bot_id for bot_id, data in self.cog.child_bots.items() if str(data.get("owner_id")) == user_id_str and data.get("profile_name") == self.profile_name), None)
@@ -5618,12 +5720,16 @@ class AppearanceEditView(ui.View):
         
         async def confirm_delete(i: discord.Interaction):
             await i.response.defer()
+            config = self.cog._get_profile_config(self.user_id, self.profile_name, False)
+            if config:
+                config.pop("custom_display_name", None)
+                config.pop("custom_avatar_url", None)
+                self.cog._save_profile_config(self.user_id, self.profile_name, config, False)
+            
             user_id_str = str(self.user_id)
             if user_id_str in self.cog.user_appearances and self.profile_name in self.cog.user_appearances[user_id_str]:
-                user_apps = self.cog.user_appearances[user_id_str]
-                del user_apps[self.profile_name]
-                self.cog._save_user_appearance_shard(user_id_str, user_apps)
-            
+                del self.cog.user_appearances[user_id_str][self.profile_name]
+                
             # Refresh the main profile manage embed
             new_embed = await self.cog._build_profile_manage_embed(self.original_interaction, self.profile_name)
             await self.original_interaction.edit_original_response(embed=new_embed)
@@ -5651,7 +5757,7 @@ class BulkManageView(ui.View):
             discord.SelectOption(label="Configure Image Generation", value="image_gen", description="Setup models, prompts, and toggles for multiple profiles."),
             discord.SelectOption(label="Toggle URL Context Fetching", value="url_context", description="Enable or disable link scraping for multiple profiles."),
             discord.SelectOption(label="Set Time & Timezone", value="timezone", description="Enable time-awareness and set a specific timezone."),
-            discord.SelectOption(label="Toggle Generation Metadata", value="metadata_toggle", description="Show/hide generation time and duration."),
+            discord.SelectOption(label="Set Profile Metadata", value="metadata_toggle", description="Configure visual ID and Duration metadata."),
             discord.SelectOption(label="Toggle Critic (Anti-Repetition)", value="critic", description="Enable or disable the critic for multiple profiles."),
             discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable or disable realistic typing for multiple profiles."),
             discord.SelectOption(label="Set Safety Level", value="safety_level", description="Apply a content safety level to multiple profiles."),
@@ -5669,8 +5775,8 @@ class BulkManageView(ui.View):
     
     async def select_callback(self, interaction: discord.Interaction):
         choice = interaction.data['values'][0]
-        user_data = self.cog._get_user_data_entry(self.user_id)
-        all_profiles = list(user_data.get("profiles", {}).keys()) + list(user_data.get("borrowed_profiles", {}).keys())
+        index = self.cog._get_user_index(self.user_id)
+        all_profiles = list(index.get("personal", [])) + list(index.get("borrowed", []))
         
         if not all_profiles:
             await self.original_interaction.edit_original_response(content="You have no profiles to apply settings to.", view=None)
@@ -5834,9 +5940,12 @@ class BulkManageView(ui.View):
             await self.original_interaction.edit_original_response(content="Select a timezone and the profiles to apply it to:", view=view)
             
         elif choice == "metadata_toggle":
-            await interaction.response.defer()
-            view = BulkMetadataView(self.cog, self.user_id)
-            await self.original_interaction.edit_original_response(content="Select metadata toggle action and profiles:", view=view)
+            modal = ProfileMetadataModal(self.cog, "BULK_APPLY", {}, False)
+            async def modal_callback(i: discord.Interaction, params: Dict):
+                view = BulkActionView(self.cog, self.user_id, "apply_metadata", "Select profiles to apply metadata settings to...", params=params, include_borrowed=True)
+                await self.original_interaction.edit_original_response(content="Metadata settings validated. Select the profiles to apply them to:", view=view)
+            modal.callback = modal_callback
+            await interaction.response.send_modal(modal)
         
         elif choice == "critic":
             await interaction.response.defer()
@@ -5884,8 +5993,8 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
         profile_name = self.profile_name_input.value.lower().strip()
         owner_id = interaction.user.id
 
-        user_data = self.cog._get_user_data_entry(owner_id)
-        if profile_name not in user_data.get("profiles", {}):
+        index = self.cog._get_user_index(owner_id)
+        if profile_name not in index.get("personal", []):
             await interaction.followup.send(f"❌ **Error:** You do not have a personal profile named '{profile_name}'.", ephemeral=True)
             return
 
@@ -5908,13 +6017,18 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
 
         encrypted_token = self.cog._encrypt_data(token)
         
-        user_shard = self.cog._get_user_child_bot_shard(owner_id)
-        user_shard[bot_user_id] = {
+        bot_config = {
             "token_encrypted": encrypted_token,
             "profile_name": profile_name,
-            "approved_servers": []
+            "approved_servers": [],
+            "bot_id": bot_user_id
         }
-        self.cog._save_user_child_bot_shard(owner_id, user_shard)
+        
+        # Save directly to the profile's directory
+        bot_file = os.path.join(self.cog.USERS_DIR, str(owner_id), "profiles", profile_name, "child_bot.json.gz")
+        from .storage import IOManager
+        IOManager.write_json_gzip(bot_config, bot_file, encrypted=False)
+        
         self.cog._load_child_bots() # Reload all bots into memory
         
         new_bot_config = self.cog.child_bots.get(bot_user_id)
