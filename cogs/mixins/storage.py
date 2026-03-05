@@ -646,10 +646,20 @@ class StorageMixin:
             if not user_id_str.isdigit(): continue
             profiles_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles")
             if not os.path.isdir(profiles_dir): continue
+            
             for profile_name in os.listdir(profiles_dir):
+                # Check both Personal and Borrowed configs for custom appearances
                 config_path = os.path.join(profiles_dir, profile_name, "config.json.gz")
+                borrowed_path = os.path.join(profiles_dir, profile_name, "borrowed_config.json.gz")
+                
+                target_path = None
                 if os.path.exists(config_path):
-                    data = self._load_json_gzip(config_path)
+                    target_path = config_path
+                elif os.path.exists(borrowed_path):
+                    target_path = borrowed_path
+                    
+                if target_path:
+                    data = self._load_json_gzip(target_path)
                     if data and (data.get("custom_display_name") or data.get("custom_avatar_url")):
                         self.user_appearances.setdefault(user_id_str, {})[profile_name] = {
                             "custom_display_name": data.get("custom_display_name"),

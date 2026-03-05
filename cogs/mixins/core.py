@@ -32,6 +32,9 @@ class CoreMixin:
         # [NEW] Patch legacy ID fields and standardise to 8-character PIDs
         await self._patch_profile_ids()
         
+        # [FIXED] Reload appearances into memory AFTER the migration scripts move the files
+        self._load_user_appearances()
+        
         if not self.sessions_loaded:
             await self._load_multi_profile_sessions()
             self.sessions_loaded = True
