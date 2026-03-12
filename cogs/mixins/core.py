@@ -464,7 +464,7 @@ class CoreMixin:
 
                     # [NEW] Queue Mechanism for Regeneration
                     async def queue_regeneration():
-                        while session.get('is_running') or session.get('is_regenerating'):
+                        while session.get('is_running') or session.get('is_regenerating') or session.get('is_purging'):
                             await asyncio.sleep(1)
                         
                         # Verify the turn hasn't been deleted while waiting

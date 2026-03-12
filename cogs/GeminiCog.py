@@ -1166,6 +1166,12 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 self.purged_message_ids.add(m.id)
             return valid
 
+        session_lock = self.multi_profile_channels.get(interaction.channel_id)
+        if session_lock:
+            session_lock['is_purging'] = True
+            while session_lock.get('is_running') or session_lock.get('is_regenerating'):
+                await asyncio.sleep(0.5)
+
         try:
             messages_to_delete = await interaction.channel.purge(limit=amount, check=check_and_track, before=interaction.created_at, reason=f"Purge by {interaction.user}")
             
@@ -1278,6 +1284,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         except Exception as e:
             await interaction.followup.send(f"An error occurred during purge: {e}", ephemeral=True)
             traceback.print_exc()
+        finally:
+            if session_lock:
+                session_lock['is_purging'] = False
 
     @profile_group.command(name="global_chat", description="Have a persistent, private conversation with a profile.")
     @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)
@@ -2055,6 +2064,29 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         view = WhisperHistoryView(self, interaction, paired_whispers)
         await interaction.followup.send(embed=view._get_current_embed(), view=view, ephemeral=True)
+
+    @app_commands.command(name="stats", description="View bot statistics (Bot Owner Only).")
+    @app_commands.dm_only()
+    @is_owner_in_dm_check()
+    async def top_servers_slash(self, interaction: discord.Interaction):
+        # Sort guilds by the join date of the bot user within that guild
+        guilds_sorted = sorted(
+            self.bot.guilds, 
+            key=lambda g: g.me.joined_at if (g.me and g.me.joined_at) else datetime.datetime.now(datetime.timezone.utc)
+        )
+        top_10 = guilds_sorted[:10]
+        
+        embed = discord.Embed(title="Top 10 Servers by date:", color=discord.Color.gold())
+        description = ""
+        
+        for i, guild in enumerate(top_10, 1):
+            join_str = "Unknown"
+            if guild.me and guild.me.joined_at:
+                join_str = guild.me.joined_at.strftime("%d/%m/%Y")
+            description += f"{i}. **{guild.name}** — Joined: `{join_str}`\n"
+        
+        embed.description = description if description else "No guild data available."
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(GeminiAgent(bot))

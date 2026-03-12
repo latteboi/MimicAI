@@ -790,6 +790,10 @@ class ServicesMixin:
                 
                 try:
                     initial_trigger = await asyncio.wait_for(session['task_queue'].get(), timeout=timeout)
+                    
+                    while session.get('is_purging') or session.get('is_regenerating'):
+                        await asyncio.sleep(0.5)
+                        
                     # Round has officially started
                     session['is_running'] = True
                     if initial_trigger is None and session.get("freewill_mode") == "proactive":
@@ -6037,8 +6041,8 @@ class ServicesMixin:
 
     def _format_api_error(self, error: Exception) -> str:
         """Analyses API exceptions to provide specific, user-friendly diagnostic strings."""
-        if isinstance(error, asyncio.TimeoutError):
-            return "Request Timed Out (Gateway)"
+        if isinstance(error, asyncio.TimeoutError) or isinstance(error, TimeoutError):
+            return "Response Timed-out (Took longer than 2 minutes)"
         
         error_str = str(error)
         
@@ -6057,6 +6061,7 @@ class ServicesMixin:
         # [NEW] Parse OpenRouter JSON errors gracefully
         if "OpenRouter API Error" in error_str:
             try:
+                import orjson as json
                 json_part = error_str[error_str.find("{"):]
                 err_data = json.loads(json_part)
                 if "error" in err_data and "message" in err_data["error"]:
