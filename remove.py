@@ -39,10 +39,13 @@ def remove_mimic():
     for path in to_delete:
         if os.path.exists(path):
             print(f" - Deleting: {path}")
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-            else:
-                os.remove(path)
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+            except Exception as e:
+                print(f"   - Warning: Could not fully delete {path} (it may be in use by another process): {e}")
 
     print("\n" + "="*48)
     print("UNINSTALL COMPLETE")

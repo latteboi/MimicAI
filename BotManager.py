@@ -1,18 +1,28 @@
+import os
+import sys
+from dotenv import load_dotenv
+
+# Load variables from .env file if it exists
+load_dotenv()
+
+# Pre-emptively suppress DefaultConfig warnings if Manual Auth is flagged
+if os.getenv("MANUAL_AUTH_MODE", "False").lower() == "true":
+    if not os.getenv("DISCORD_SDK"): os.environ["DISCORD_SDK"] = "MANUAL_MODE_PENDING"
+    if not os.getenv("DISCORD_OWNER_ID"): os.environ["DISCORD_OWNER_ID"] = "MANUAL_MODE_PENDING"
+    if not os.getenv("ENCRYPTION_KEY"): os.environ["ENCRYPTION_KEY"] = "MANUAL_MODE_PENDING"
+
 import configs.DefaultConfig as defaultConfig
 import asyncio
 import discord
 from discord.ext import commands
 import subprocess
 import orjson as json
-import os
-import sys
 from cryptography.fernet import Fernet
 import websockets
 import signal
 import platform
-from dotenv import load_dotenv
 
-# Load variables from .env file if it exists
+# --- Global State for Orchestration ---
 load_dotenv()
 
 # --- Global State for Orchestration ---
@@ -141,12 +151,88 @@ async def on_ready():
 
 # --- Main asynchronous function to setup and run the bot ---
 async def main():
+    import hashlib
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+    
+    manual_auth = os.getenv("MANUAL_AUTH_MODE", "False").lower() == "true"
+    
+    def _clean_key(val):
+        if not val: return ""
+        import re
+        return re.sub(r'\s+', '', str(val).replace('"', '').replace("'", ""))
+    
+    if manual_auth:
+        print("\n--- Manual Authentication Mode ---")
+        defaultConfig.DISCORD_SDK = _clean_key(input("Enter DISCORD_SDK: "))
+        defaultConfig.DISCORD_OWNER_ID = _clean_key(input("Enter DISCORD_OWNER_ID: "))
+        defaultConfig.ENCRYPTION_KEY = _clean_key(input("Enter ENCRYPTION_KEY: "))
+        print("----------------------------------\n")
+    else:
+        # Force re-read from environment and clean
+        defaultConfig.DISCORD_SDK = _clean_key(os.getenv("DISCORD_SDK"))
+        defaultConfig.DISCORD_OWNER_ID = _clean_key(os.getenv("DISCORD_OWNER_ID"))
+        defaultConfig.ENCRYPTION_KEY = _clean_key(os.getenv("ENCRYPTION_KEY"))
+        
+        if not defaultConfig.DISCORD_SDK or not defaultConfig.ENCRYPTION_KEY:
+            print("CRITICAL ERROR: MANUAL_AUTH_MODE is False, but your keys are missing from the .env file.")
+            return
+
+    # Validate Fernet Key Integrity before proceeding
+    try:
+        Fernet(defaultConfig.ENCRYPTION_KEY)
+    except ValueError:
+        print("\nCRITICAL ERROR: The ENCRYPTION_KEY provided is invalid.")
+        print("A valid key must be exactly 44 url-safe base64 characters. If you copied it, ensure you didn't miss the '=' at the end.")
+        return
+    except Exception as e:
+        print(f"\nCRITICAL ERROR: Could not validate ENCRYPTION_KEY: {e}")
+        return
+
+    # System Lock Verification
+    lock_path = os.path.join(os.path.dirname(__file__), "cogs", "data", "system_lock.json")
+    if os.path.exists(lock_path):
+        try:
+            with open(lock_path, "rb") as f:
+                lock_data = json.loads(f.read())
+            
+            s_h = hashlib.sha256(defaultConfig.DISCORD_SDK.encode()).hexdigest()
+            o_h = hashlib.sha256(defaultConfig.DISCORD_OWNER_ID.encode()).hexdigest()
+            k_h = hashlib.sha256(defaultConfig.ENCRYPTION_KEY.encode()).hexdigest()
+            
+            mismatches = []
+            if lock_data.get("sdk_hash") != s_h: mismatches.append("DISCORD_SDK")
+            if lock_data.get("owner_hash") != o_h: mismatches.append("DISCORD_OWNER_ID")
+            if lock_data.get("key_hash") != k_h: mismatches.append("ENCRYPTION_KEY")
+            
+            if mismatches:
+                print(f"\nCRITICAL ERROR: Authentication mismatch in: {', '.join(mismatches)}")
+                print("The provided credentials do not match the original setup. Bot startup aborted to prevent data corruption.")
+                return
+        except Exception as e:
+            print(f"\nCRITICAL ERROR: Failed to read system lock file: {e}")
+            return
+    else:
+        # Create lock if missing (first run recovery)
+        try:
+            lock_data = {
+                "sdk_hash": hashlib.sha256(defaultConfig.DISCORD_SDK.encode()).hexdigest(),
+                "owner_hash": hashlib.sha256(defaultConfig.DISCORD_OWNER_ID.encode()).hexdigest(),
+                "key_hash": hashlib.sha256(defaultConfig.ENCRYPTION_KEY.encode()).hexdigest()
+            }
+            os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+            with open(lock_path, "wb") as f:
+                f.write(json.dumps(lock_data))
+        except Exception as e:
+            print(f"\nCRITICAL ERROR: Failed to create system lock file: {e}")
+            return
+
     # Load encryption key
     global fernet
-    if defaultConfig.ENCRYPTION_KEY:
+    try:
         fernet = Fernet(defaultConfig.ENCRYPTION_KEY)
-    else:
-        print("CRITICAL: Encryption key not found. Child bot system will not function.")
+    except Exception as e:
+        print(f"\nCRITICAL ERROR: Failed to load encryption key: {e}")
         return
 
     # Load child bot configurations
@@ -159,8 +245,8 @@ async def main():
             if not user_id_str.isdigit(): continue
             profiles_dir = os.path.join(users_dir, user_id_str, "profiles")
             if not os.path.isdir(profiles_dir): continue
-            for profile_name in os.listdir(profiles_dir):
-                bot_file = os.path.join(profiles_dir, profile_name, "child_bot.json.gz")
+            for pid_folder in os.listdir(profiles_dir):
+                bot_file = os.path.join(profiles_dir, pid_folder, "child_bot.json.gz")
                 if os.path.exists(bot_file):
                     try:
                         with gzip.open(bot_file, 'rb') as f:
@@ -169,7 +255,7 @@ async def main():
                             bot_data["owner_id"] = int(user_id_str)
                             bot.child_bot_config[bot_data["bot_id"]] = bot_data
                     except Exception as e:
-                        print(f"Failed to load child bot for {profile_name}: {e}")
+                        print(f"Failed to load child bot for {pid_folder}: {e}")
     
     # Attach manager queue to bot object for cog access
     bot.manager_queue = manager_queue

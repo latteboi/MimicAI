@@ -87,11 +87,13 @@ class GlobalChatHistoryView(ui.View):
 
         # 2. Scan Disk
         dir_path = pathlib.Path(self.cog.USERS_DIR) / self.user_id_str / "profiles"
-        if dir_path.is_dir():
-            for p_dir in dir_path.iterdir():
-                if p_dir.is_dir():
-                    if (p_dir / "global_chat.json.gz").exists():
-                        profiles.add(p_dir.name)
+        index = self.cog._get_user_index(self.user_id)
+        
+        all_profiles = list(index.get("personal", {})) + list(index.get("borrowed", {}))
+        for p_name in all_profiles:
+            pid = self.cog._get_pid_from_name_any(self.user_id, p_name)
+            if (dir_path / pid / "global_chat.json.gz").exists():
+                profiles.add(p_name)
         
         return sorted(list(profiles))
 
@@ -250,26 +252,21 @@ class GlobalChatHistoryView(ui.View):
             # Rebuild ChatSession
             new_history = []
             for t in session_data['unified_log']:
-                role = 'model' if t.get('role') == 'model' else 'user'
+                role = 'model' if t.get('is_user') is False else 'user'
                 new_history.append({'role': role, 'parts': [t.get('content')]})
             session_data['chat_session'] = GoogleGenAIChatSession(history=new_history)
             
-            # Cleanup mapping
-            mapping_key = self.cog._get_mapping_key_for_session(self.session_key, 'global_chat')
-            if mapping_key in self.cog.mapping_caches:
-                mapping_data = self.cog.mapping_caches[mapping_key]
-                keys_to_del = [k for k, v in mapping_data.items() if isinstance(v, (list, tuple)) and len(v) > 2 and v[2] in ids_to_delete]
-                for k in keys_to_del:
-                    del mapping_data[k]
+            # Save the updated log to disk
+            self.cog._save_session_to_disk(self.session_key, 'global_chat', session_data)
 
-            self._load_current_session() # Reload rounds logic
+            # Reload internal state from the modified data
+            self._load_current_session()
             self._build_view()
             
             if not self.rounds:
                 self.cog._delete_session_from_disk(self.session_key, 'global_chat')
-                # If we have other profiles, switch to one of them?
-                # Or just show empty state.
-                self.available_profiles = self._scan_profiles()
+                self.available_profiles.remove(self.selected_profile)
+                
                 if self.available_profiles:
                     self.selected_profile = self.available_profiles[0]
                     self._load_current_session()
@@ -362,12 +359,23 @@ class WhisperHistoryView(ui.View):
         # --- Build Profile Filter Dropdown ---
         profile_keys = set()
         for whisper, _ in self.all_whispers:
-            profile_keys.add(tuple(whisper.get("target_key")))
+            target_pid = whisper.get("target_pid")
+            # We must map target_pid back to a name for the UI. Since we are looking from the user's perspective, 
+            # we check the user's index to resolve the PID to the local name.
+            index = self.cog._get_user_index(self.user_id)
+            p_name = "Unknown Profile"
+            if isinstance(index.get("personal"), dict):
+                for name, mapped_pid in index["personal"].items():
+                    if mapped_pid == target_pid: p_name = name; break
+            if p_name == "Unknown Profile" and isinstance(index.get("borrowed"), dict):
+                for name, mapped_pid in index["borrowed"].items():
+                    if mapped_pid == target_pid: p_name = name; break
+
+            profile_keys.add((target_pid, p_name))
         
         profile_options = [discord.SelectOption(label="All Profiles", value="all", default=(self.selected_profile_key is None))]
-        for p_key in sorted(list(profile_keys)):
-            owner_id, profile_name = p_key
-            profile_options.append(discord.SelectOption(label=profile_name, value=f"{owner_id}:{profile_name}", default=(self.selected_profile_key == f"{owner_id}:{profile_name}")))
+        for pid, p_name in sorted(list(profile_keys), key=lambda x: x[1]):
+            profile_options.append(discord.SelectOption(label=p_name, value=pid, default=(self.selected_profile_key == pid)))
         
         profile_select = ui.Select(placeholder="Filter by profile...", options=profile_options, row=0)
         profile_select.callback = self.profile_filter_callback
@@ -375,19 +383,26 @@ class WhisperHistoryView(ui.View):
 
         # --- Filter whispers based on selection ---
         if self.selected_profile_key:
-            owner_id, profile_name = self.selected_profile_key.split(":")
-            p_key_tuple = (int(owner_id), profile_name)
-            self.filtered_whispers = [pair for pair in self.all_whispers if tuple(pair[0].get("target_key")) == p_key_tuple]
+            self.filtered_whispers = [pair for pair in self.all_whispers if pair[0].get("target_pid") == self.selected_profile_key]
         else:
             self.filtered_whispers = self.all_whispers
 
         # --- Build Whisper Jump Dropdown ---
         if self.filtered_whispers:
-            whisper_options = []
+            self.current_page = max(0, min(self.current_page, len(self.filtered_whispers) - 1))
+            whisper_options =[]
             for i, (whisper, _) in enumerate(self.filtered_whispers):
-                ts = datetime.datetime.fromisoformat(whisper.get("timestamp"))
+                ts_raw = whisper.get("timestamp")
+                if ts_raw:
+                    try: ts = datetime.datetime.fromisoformat(ts_raw)
+                    except: ts = datetime.datetime.now(datetime.timezone.utc)
+                else:
+                    ts = datetime.datetime.now(datetime.timezone.utc)
                 ts_str = ts.strftime('%b %d, %I:%M %p')
-                content_preview = whisper.get("content", "").split("\n")[1][:50]
+                
+                c_split = whisper.get("content", "").split("\n")
+                content_preview = c_split[1][:50] if len(c_split) > 1 else c_split[0][:50]
+                
                 whisper_options.append(discord.SelectOption(label=f"({ts_str}) {content_preview}...", value=str(i), default=(i == self.current_page)))
             
             whisper_select = ui.Select(placeholder="Jump to a whisper...", options=whisper_options[:DROPDOWN_MAX_OPTIONS], row=1)
@@ -413,17 +428,29 @@ class WhisperHistoryView(ui.View):
 
         whisper_turn, response_turn = self.filtered_whispers[self.current_page]
         
-        owner_id, profile_name = tuple(response_turn.get("speaker_key"))
-        response_content = "\n".join(response_turn.get("content", "").split("\n")[1:]).strip() # Remove header line
-        whisper_content = "\n".join(whisper_turn.get("content", "").split("\n")[1:]).strip() # Remove header line
+        r_split = response_turn.get("content", "").split("\n")
+        response_content = "\n".join(r_split[1:]).strip() if len(r_split) > 1 else r_split[0].strip()
+        
+        w_split = whisper_turn.get("content", "").split("\n")
+        whisper_content = "\n".join(w_split[1:]).strip() if len(w_split) > 1 else w_split[0].strip()
 
-        index = self.cog._get_user_index(owner_id)
-        is_borrowed = profile_name in index.get("borrowed", [])
-        effective_owner_id, effective_profile_name = owner_id, profile_name
+        target_pid = whisper_turn.get("target_pid")
+        index = self.cog._get_user_index(self.user_id)
+        
+        effective_profile_name = "Unknown Profile"
+        if isinstance(index.get("personal"), dict):
+            for name, mapped_pid in index["personal"].items():
+                if mapped_pid == target_pid: effective_profile_name = name; break
+        if effective_profile_name == "Unknown Profile" and isinstance(index.get("borrowed"), dict):
+            for name, mapped_pid in index["borrowed"].items():
+                if mapped_pid == target_pid: effective_profile_name = name; break
+
+        is_borrowed = effective_profile_name in index.get("borrowed", {})
+        effective_owner_id = self.user_id
         if is_borrowed:
-            borrowed_data = self.cog._get_profile_config(owner_id, profile_name, True) or {}
-            effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
-            effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
+            borrowed_data = self.cog._get_profile_config(self.user_id, effective_profile_name, True) or {}
+            effective_owner_id = int(borrowed_data.get("original_owner_id", self.user_id))
+            effective_profile_name = borrowed_data.get("original_profile_name", effective_profile_name)
         
         display_name = effective_profile_name
         avatar_url = self.cog.bot.user.display_avatar.url
@@ -497,13 +524,12 @@ class WhisperActionView(ui.View):
             session = self.cog._ensure_session_hydrated(self.channel_id, session.get("type", "multi"))
 
         turn_ids_to_delete = {self.whisper_turn_id, self.response_turn_id}
-        
         original_log_len = len(session.get("unified_log", []))
         
-        target_profile_key = None
+        target_pid = None
         for turn in session.get("unified_log", []):
             if turn.get("turn_id") in turn_ids_to_delete:
-                target_profile_key = tuple(turn.get("target_key") or turn.get("speaker_key"))
+                target_pid = turn.get("target_pid") or turn.get("speaker_pid")
                 break
 
         session["unified_log"] = [
@@ -511,25 +537,14 @@ class WhisperActionView(ui.View):
             if turn.get("turn_id") not in turn_ids_to_delete
         ]
 
-        if len(session["unified_log"]) < original_log_len and target_profile_key:
-            participant_history = []
-            for turn in session["unified_log"]:
-                turn_type = turn.get("type")
-                if not turn_type:
-                    speaker_key = tuple(turn.get("speaker_key", []))
-                    role = 'model' if speaker_key == target_profile_key else 'user'
-                    participant_history.append({'role': role, 'parts': [turn.get("content")]})
-                elif turn_type == "whisper":
-                    t_key = tuple(turn.get("target_key", []))
-                    if target_profile_key == t_key:
-                        participant_history.append({'role': 'user', 'parts': [turn.get("content")]})
-                elif turn_type == "private_response":
-                    s_key = tuple(turn.get("speaker_key", []))
-                    if target_profile_key == s_key:
-                        participant_history.append({'role': 'model', 'parts': [turn.get("content")]})
-
-            session["chat_sessions"][target_profile_key] = GoogleGenAIChatSession(history=participant_history)
-            session.get("pending_whispers", {}).pop(target_profile_key, None)
+        if len(session["unified_log"]) < original_log_len and target_pid:
+            # Save the modified log to disk first
+            session_type = session.get("type", "multi")
+            self.cog._save_session_to_disk((self.channel_id, None, None), session_type, session["unified_log"])
+            
+            # Now, force a re-hydration to update all in-memory participant histories
+            session["is_hydrated"] = False
+            self.cog._ensure_session_hydrated(self.channel_id, session_type)
 
         await interaction.edit_original_response(content="Whisper has been deleted from the profile's memory.", view=None, embed=None)
 
@@ -1057,20 +1072,41 @@ class ProfileManageView(ui.View):
                 await self.original_interaction.edit_original_response(content="Rename failed: Name already exists.", view=None, embed=None); return
             
             p_dict_key = "borrowed" if self.is_borrowed else "personal"
-            if old_name in user_index[p_dict_key]:
-                user_index[p_dict_key].remove(old_name)
-                user_index[p_dict_key].append(new_name)
+            if old_name in user_index.get(p_dict_key, {}):
+                if isinstance(user_index[p_dict_key], dict):
+                    pid = user_index[p_dict_key].pop(old_name)
+                    user_index[p_dict_key][new_name] = pid
+                    # Update local name text file
+                    with open(os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", pid, "name.txt"), "w", encoding="utf-8") as f:
+                        f.write(new_name)
+                else:
+                    user_index[p_dict_key].remove(old_name)
+                    user_index[p_dict_key].append(new_name)
+                    old_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", old_name)
+                    new_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", new_name)
+                    if os.path.exists(old_dir):
+                        os.rename(old_dir, new_dir)
+                
                 for ch_id, act in user_index.get("channel_active_profiles", {}).items():
                     if act == old_name: user_index["channel_active_profiles"][ch_id] = new_name
-                if not self.is_borrowed:
-                    self.cog._rename_ltm_shards(str(self.user_id), old_name, new_name)
-                    self.cog._rename_training_shards(str(self.user_id), old_name, new_name)
-                self.cog._save_user_index(self.user_id, user_index)
                 
-                old_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", old_name)
-                new_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", new_name)
-                if os.path.exists(old_dir):
-                    os.rename(old_dir, new_dir)
+                self.cog._save_user_index(self.user_id, user_index)
+
+                # Hot-swap live sessions and models to prevent corruption
+                for ch_id, session in self.cog.multi_profile_channels.items():
+                    for p in session.get("profiles", []):
+                        if p["owner_id"] == self.user_id and p["profile_name"] == old_name:
+                            p["profile_name"] = new_name
+                    
+                    old_key = (self.user_id, old_name)
+                    new_key = (self.user_id, new_name)
+                    if old_key in session.get("chat_sessions", {}):
+                        session["chat_sessions"][new_key] = session["chat_sessions"].pop(old_key)
+                
+                keys_to_clear = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.user_id and k[2] == old_name]
+                for k in keys_to_clear:
+                    self.cog.channel_models.pop(k, None)
+                    self.cog.channel_model_last_profile_key.pop(k, None)
                 
                 await self.original_interaction.edit_original_response(content=f"Profile '{old_name}' renamed to '{new_name}'.", view=None, embed=None)
         modal.on_submit = rename_submit
@@ -1093,19 +1129,41 @@ class ProfileManageView(ui.View):
                 await self.original_interaction.edit_original_response(content="Duplicate failed: Name already exists.", view=None, embed=None); return
             
             limit = defaultConfig.LIMIT_PROFILES_PREMIUM if self.cog.is_user_premium(self.user_id) else defaultConfig.LIMIT_PROFILES_FREE
-            if len(user_index.get("personal", [])) >= limit:
+            if len(user_index.get("personal", {})) >= limit:
                 await self.original_interaction.edit_original_response(content="Limit reached.", view=None, embed=None); return
             
-            old_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", self.profile_name)
-            new_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", new_name)
+            old_pid = self.cog._get_pid_from_name_any(self.user_id, self.profile_name)
+            old_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", old_pid)
+            
+            import uuid
+            if isinstance(user_index.get("personal"), dict):
+                new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
+                user_index["personal"][new_name] = new_pid
+            else:
+                new_pid = new_name
+                user_index.setdefault("personal", []).append(new_name)
+                
+            new_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", new_pid)
             
             import shutil
             try:
-                shutil.copytree(old_dir, new_dir)
+                os.makedirs(new_dir, exist_ok=True)
+                for item in os.listdir(old_dir):
+                    if item in ["child_bot.json.gz", "global_chat.json.gz", "ltm.json.gz"]:
+                        continue
+                    s = os.path.join(old_dir, item)
+                    d = os.path.join(new_dir, item)
+                    if os.path.isdir(s):
+                        shutil.copytree(s, d)
+                    else:
+                        shutil.copy2(s, d)
+                
+                if isinstance(user_index.get("personal"), dict):
+                    with open(os.path.join(new_dir, "name.txt"), "w", encoding="utf-8") as f:
+                        f.write(new_name)
             except Exception as e:
                 print(f"Error duplicating profile directory: {e}")
             
-            user_index.setdefault("personal", []).append(new_name)
             self.cog._save_user_index(self.user_id, user_index)
             
             config = self.cog._get_profile_config(self.user_id, new_name, False)
@@ -1138,8 +1196,12 @@ class ProfileManageView(ui.View):
             user_index = self.cog._get_user_index(self.user_id)
             list_key = "borrowed" if self.is_borrowed else "personal"
             
-            if self.profile_name in user_index.get(list_key, []):
-                user_index[list_key].remove(self.profile_name)
+            if self.profile_name in user_index.get(list_key, {}):
+                if isinstance(user_index[list_key], dict):
+                    pid = user_index[list_key].pop(self.profile_name)
+                else:
+                    user_index[list_key].remove(self.profile_name)
+                    pid = self.profile_name
                 
                 if not self.is_borrowed:
                     self.cog._cascade_delete_borrowed_profiles(self.user_id, self.profile_name)
@@ -1147,7 +1209,7 @@ class ProfileManageView(ui.View):
                 self.cog._save_user_index(self.user_id, user_index)
                 
                 import shutil
-                p_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", self.profile_name)
+                p_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", pid)
                 shutil.rmtree(p_dir, ignore_errors=True)
                 
                 await self.original_interaction.edit_original_response(content=f"Profile '{self.profile_name}' deleted.", view=None, embed=None)
@@ -1989,7 +2051,7 @@ class HubShareManagerView(HubBaseView):
                     failed_list[name] = "Safety Level is 'Unrestricted 18+'. Only 'Low', 'Medium', or 'High' can be published."
                     continue
 
-                is_safe, reason = await self.cog._is_profile_content_safe(name, disp, ava, self.original_interaction.guild_id)
+                is_safe, reason = await self.cog._is_profile_content_safe(self.user_id, name, disp, ava)
                 if is_safe:
                     pid = f"pub_{uuid.uuid4().hex[:8]}"
                     # Snapshot metadata for index
@@ -2046,18 +2108,15 @@ class ShutdownConfirmView(ui.View):
     @ui.button(label="Yes, Shutdown", style=discord.ButtonStyle.danger)
     async def confirm_shutdown(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.edit_message(content="Shutting down child bots and main instance...", view=None)
-        print(f"Shutdown confirmed by user {interaction.user.id} for cog {self.cog.cog_id}.")
-
-        # Explicitly shut down all child bots via the manager queue
+        
+        # 1. Close child processes first
         if hasattr(self.cog.bot, 'child_bot_config'):
             for bot_id in list(self.cog.bot.child_bot_config.keys()):
-                await self.cog.manager_queue.put({
-                    "action": "shutdown_bot",
-                    "bot_id": bot_id
-                })
+                await self.cog.manager_queue.put({"action": "shutdown_bot", "bot_id": bot_id})
         
-        await asyncio.sleep(2) # Give the manager a moment to process
+        await asyncio.sleep(1)
 
+        # 2. Flush all in-memory sessions to disk
         for session_key, chat_session in self.cog.global_chat_sessions.items():
             self.cog._save_session_to_disk(session_key, 'global_chat', chat_session)
         
@@ -2068,17 +2127,14 @@ class ShutdownConfirmView(ui.View):
                 if unified_log is not None:
                     dummy_session_key = (ch_id, None, None)
                     self.cog._save_session_to_disk(dummy_session_key, session_type, unified_log)
-                
-                mapping_key = (session_type, ch_id)
-                if mapping_key in self.cog.mapping_caches:
-                    self.cog._save_mapping_to_disk(mapping_key, self.cog.mapping_caches[mapping_key])
 
+        # 3. Force stop all loops and close
         if self.cog.has_lock:
             try:
                 if os.path.exists(COG_LOCK_FILE_PATH):
                     os.remove(COG_LOCK_FILE_PATH)
-            except Exception as e:
-                print(f"Error releasing lock file during shutdown: {e}")
+            except: pass
+        
         await self.cog.bot.close()
 
     async def on_timeout(self):
@@ -4022,18 +4078,26 @@ class BulkDeleteView(BaseBulkProfileView):
         index = self.cog._get_user_index(self.user_id)
         
         for name in items_to_delete:
-            if name in index.get("borrowed", []):
-                index["borrowed"].remove(name)
+            if name in index.get("borrowed", {}):
+                if isinstance(index["borrowed"], dict):
+                    pid = index["borrowed"].pop(name)
+                else:
+                    index["borrowed"].remove(name)
+                    pid = name
                 deleted_count += 1
                 import shutil
-                p_dir = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", name)
+                p_dir = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", pid)
                 shutil.rmtree(p_dir, ignore_errors=True)
-            elif name in index.get("personal", []):
-                index["personal"].remove(name)
+            elif name in index.get("personal", {}):
+                if isinstance(index["personal"], dict):
+                    pid = index["personal"].pop(name)
+                else:
+                    index["personal"].remove(name)
+                    pid = name
                 self.cog._cascade_delete_borrowed_profiles(self.user_id, name)
                 deleted_count += 1
                 import shutil
-                p_dir = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", name)
+                p_dir = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", pid)
                 shutil.rmtree(p_dir, ignore_errors=True)
         
         if deleted_count > 0: self.cog._save_user_index(self.user_id, index)
@@ -4935,7 +4999,7 @@ class SettingsChildBotView(SettingsBaseView):
             p_name = b_data.get('profile_name')
             embed.add_field(name="Selected Bot", value=f"**Name:** `{name}`\n**Linked Profile:** `{p_name}`", inline=False)
         else:
-            embed.add_field(name="Overview", value="Select a bot from the dropdown to manage it, or create a new one.", inline=False)
+            embed.add_field(name="Overview", value="Select a bot from the dropdown to manage it, or create a new one.\n*(Note: You will need the **PID** of the profile you want to link, which can be found in `/profile manage`.)*", inline=False)
         
         await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
 
@@ -4965,7 +5029,8 @@ class SettingsChildBotView(SettingsBaseView):
             owner_id = bot_to_delete['owner_id']
             profile_name = bot_to_delete['profile_name']
             
-            bot_file = os.path.join(self.cog.USERS_DIR, str(owner_id), "profiles", profile_name, "child_bot.json.gz")
+            pid = self.cog._get_pid_from_name_any(owner_id, profile_name)
+            bot_file = os.path.join(self.cog.USERS_DIR, str(owner_id), "profiles", pid, "child_bot.json.gz")
             from .storage import _delete_file_shard
             _delete_file_shard(bot_file)
             
@@ -5630,7 +5695,7 @@ class AppearanceEditModal(ui.Modal):
 
         is_public = self.cog._is_profile_public(interaction.user.id, self.profile_name)
         if is_public:
-            is_safe, reason = await self.cog._is_profile_content_safe(self.profile_name, new_display_name or self.profile_name, new_avatar_url, interaction.guild_id)
+            is_safe, reason = await self.cog._is_profile_content_safe(interaction.user.id, self.profile_name, new_display_name or self.profile_name, new_avatar_url)
             if not is_safe:
                 await interaction.followup.send(f"**Could not save appearance.** The new display name or avatar was flagged for a content policy violation: {reason}\n\nIf you wish to proceed with this restricted edit, you must first unpublish the profile using `/profile public manage`.", ephemeral=True)
                 return
@@ -5982,20 +6047,34 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
         super().__init__()
         self.cog = cog
         self.parent_view = view
-        self.profile_name_input = ui.TextInput(label="Profile Name to Link", placeholder="The personal profile this bot will embody.", required=True)
+        self.profile_id_input = ui.TextInput(label="Personal Profile ID (A-Class PID)", placeholder="e.g. A1B2C3D4E5F6789", required=True, min_length=16, max_length=16)
         self.token_input = ui.TextInput(label="Bot Token", placeholder="Paste the token from the Discord Developer Portal.", style=discord.TextStyle.paragraph, required=True)
-        self.add_item(self.profile_name_input)
+        self.add_item(self.profile_id_input)
         self.add_item(self.token_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         token = self.token_input.value.strip()
-        profile_name = self.profile_name_input.value.lower().strip()
+        pid = self.profile_id_input.value.strip().upper()
         owner_id = interaction.user.id
 
+        if not pid.startswith("A"):
+            await interaction.followup.send("❌ **Error:** Child bots can only be linked to Personal Profiles (PIDs starting with 'A').", ephemeral=True)
+            return
+
         index = self.cog._get_user_index(owner_id)
-        if profile_name not in index.get("personal", []):
-            await interaction.followup.send(f"❌ **Error:** You do not have a personal profile named '{profile_name}'.", ephemeral=True)
+        profile_name = None
+        if isinstance(index.get("personal"), dict):
+            for name, mapped_pid in index["personal"].items():
+                if mapped_pid == pid:
+                    profile_name = name
+                    break
+        else:
+            await interaction.followup.send("❌ **Error:** Profile index is not in the updated PID format.", ephemeral=True)
+            return
+
+        if not profile_name:
+            await interaction.followup.send(f"❌ **Error:** You do not own a personal profile with the PID '{pid}'.", ephemeral=True)
             return
 
         temp_client = discord.Client(intents=discord.Intents.none())
@@ -6019,13 +6098,11 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
         
         bot_config = {
             "token_encrypted": encrypted_token,
-            "profile_name": profile_name,
             "approved_servers": [],
             "bot_id": bot_user_id
         }
         
-        # Save directly to the profile's directory
-        bot_file = os.path.join(self.cog.USERS_DIR, str(owner_id), "profiles", profile_name, "child_bot.json.gz")
+        bot_file = os.path.join(self.cog.USERS_DIR, str(owner_id), "profiles", pid, "child_bot.json.gz")
         from .storage import IOManager
         IOManager.write_json_gzip(bot_config, bot_file, encrypted=False)
         

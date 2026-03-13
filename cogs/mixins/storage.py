@@ -123,6 +123,68 @@ class IOManager:
 
 class StorageMixin:
 
+    def _migrate_to_pid_v2(self):
+        users_dir = pathlib.Path(self.USERS_DIR)
+        if not users_dir.exists(): return
+        print("Phase 4 Migration: Upgrading to A/B 16-Hex PID Architecture...")
+        import uuid
+        migrated_any = False
+        
+        for user_dir in users_dir.iterdir():
+            if not user_dir.is_dir() or not user_dir.name.isdigit(): continue
+            index_path = user_dir / "index.json"
+            if not index_path.exists(): continue
+            
+            index = IOManager.read_json(str(index_path))
+            if not index: continue
+            
+            migrated = False
+            for p_type, prefix in [("personal", "A"), ("borrowed", "B")]:
+                p_data = index.get(p_type)
+                if isinstance(p_data, list):
+                    new_dict = {}
+                    for pname in p_data:
+                        if pname == DEFAULT_PROFILE_NAME:
+                            new_dict[pname] = pname
+                            continue
+                        
+                        pid = f"{prefix}{uuid.uuid4().hex[:15].upper()}"
+                        new_dict[pname] = pid
+                        
+                        old_p_dir = user_dir / "profiles" / pname
+                        new_p_dir = user_dir / "profiles" / pid
+                        if old_p_dir.exists() and old_p_dir.is_dir():
+                            old_p_dir.rename(new_p_dir)
+                            with open(new_p_dir / "name.txt", "w", encoding="utf-8") as f:
+                                f.write(pname)
+                    index[p_type] = new_dict
+                    migrated = True
+                    migrated_any = True
+            
+            if migrated:
+                IOManager.write_json(index, str(index_path))
+                
+        if migrated_any:
+            print("Phase 4 Migration complete. Immutable PID directories created.")
+
+    def _get_pid_from_name(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> str:
+        if profile_name == DEFAULT_PROFILE_NAME: return DEFAULT_PROFILE_NAME
+        index = self._get_user_index(user_id)
+        key = "borrowed" if is_borrowed else "personal"
+        mapping = index.get(key, {})
+        if isinstance(mapping, dict):
+            return mapping.get(profile_name, profile_name)
+        return profile_name
+
+    def _get_pid_from_name_any(self, user_id: int, profile_name: str) -> str:
+        if profile_name == DEFAULT_PROFILE_NAME: return DEFAULT_PROFILE_NAME
+        index = self._get_user_index(user_id)
+        if isinstance(index.get("personal"), dict) and profile_name in index["personal"]:
+            return index["personal"][profile_name]
+        if isinstance(index.get("borrowed"), dict) and profile_name in index["borrowed"]:
+            return index["borrowed"][profile_name]
+        return profile_name
+
     def _is_valid_profile_name(self, name: str) -> tuple[bool, str]:
         if not name or not name.strip():
             return False, "Profile name cannot be empty."
@@ -136,23 +198,19 @@ class StorageMixin:
 
     def _get_user_hash(self, user_id: int) -> str:
         import hashlib
-        return hashlib.sha256(str(user_id).encode()).hexdigest()[:8].upper()
+        # Prefix with 'U' and return 15 hex characters for a total 16-character PID
+        return "A" + hashlib.sha256(str(user_id).encode()).hexdigest()[:15].upper()
 
     def _get_profile_id(self, user_id: int, profile_name: str) -> str:
         index = self._get_user_index(user_id)
         is_borrowed = profile_name in index.get("borrowed", [])
         if is_borrowed:
             config = self._get_profile_config(user_id, profile_name, True) or {}
-            orig_id = config.get("original_profile_id")
-            if orig_id: return orig_id
-            
             orig_owner = config.get("original_owner_id", user_id)
             orig_name = config.get("original_profile_name", profile_name)
-            src_config = self._get_profile_config(int(orig_owner), orig_name, False) or {}
-            return src_config.get("profile_id", "00000000")
+            return self._get_pid_from_name_any(int(orig_owner), orig_name)
         else:
-            config = self._get_profile_config(user_id, profile_name, False) or {}
-            return config.get("profile_id", "00000000")
+            return self._get_pid_from_name_any(user_id, profile_name)
 
     def _encrypt_data(self, plaintext: str) -> str:
         if not self.fernet or not plaintext:
@@ -179,28 +237,29 @@ class StorageMixin:
         return IOManager.read_json_gzip(file_path, self.fernet, encrypted)
         
     def _load_ltm_shard(self, user_id: str, profile_name: str) -> Optional[Dict[str, List[Dict]]]:
-        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "ltm.json.gz")
+        pid = self._get_pid_from_name_any(int(user_id), profile_name)
+        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "ltm.json.gz")
         return self._load_json_gzip(file_path)
 
     def _save_ltm_shard(self, user_id: str, profile_name: str, data: Dict[str, List[Dict]]):
-        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "ltm.json.gz")
+        pid = self._get_pid_from_name_any(int(user_id), profile_name)
+        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "ltm.json.gz")
         self._atomic_json_save_gzip(data, file_path)
 
     def _delete_ltm_shard(self, user_id: str, profile_name: str):
-        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "ltm.json.gz")
+        pid = self._get_pid_from_name_any(int(user_id), profile_name)
+        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "ltm.json.gz")
         _delete_file_shard(file_path)
 
     def _rename_ltm_shards(self, user_id: str, old_profile_name: str, new_profile_name: str):
-        old_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", old_profile_name, "ltm.json.gz")
-        if os.path.exists(old_path):
-            new_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", new_profile_name, "ltm.json.gz")
-            os.makedirs(os.path.dirname(new_path), exist_ok=True)
-            os.rename(old_path, new_path)
+        pass # Obsolete. Data moves seamlessly when string changes in index.json
 
     def _copy_ltm_shard(self, user_id: str, source_profile_name: str, new_profile_name: str):
-        source_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", source_profile_name, "ltm.json.gz")
+        src_pid = self._get_pid_from_name_any(int(user_id), source_profile_name)
+        new_pid = self._get_pid_from_name_any(int(user_id), new_profile_name)
+        source_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", src_pid, "ltm.json.gz")
         if os.path.exists(source_path):
-            new_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", new_profile_name, "ltm.json.gz")
+            new_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", new_pid, "ltm.json.gz")
             os.makedirs(os.path.dirname(new_path), exist_ok=True)
             import shutil
             shutil.copy2(source_path, new_path)
@@ -283,28 +342,29 @@ class StorageMixin:
         return False
     
     def _load_training_shard(self, user_id: str, profile_name: str) -> Optional[List[Dict]]:
-        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "training.json.gz")
+        pid = self._get_pid_from_name_any(int(user_id), profile_name)
+        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "training.json.gz")
         return self._load_json_gzip(file_path)
 
     def _save_training_shard(self, user_id: str, profile_name: str, data: List[Dict]):
-        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "training.json.gz")
+        pid = self._get_pid_from_name_any(int(user_id), profile_name)
+        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "training.json.gz")
         self._atomic_json_save_gzip(data, file_path)
 
     def _delete_training_shard(self, user_id: str, profile_name: str):
-        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "training.json.gz")
+        pid = self._get_pid_from_name_any(int(user_id), profile_name)
+        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "training.json.gz")
         _delete_file_shard(file_path)
 
     def _rename_training_shards(self, user_id: str, old_profile_name: str, new_profile_name: str):
-        old_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", old_profile_name, "training.json.gz")
-        if os.path.exists(old_path):
-            new_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", new_profile_name, "training.json.gz")
-            os.makedirs(os.path.dirname(new_path), exist_ok=True)
-            os.rename(old_path, new_path)
+        pass # Obsolete. Data moves seamlessly when string changes in index.json
 
     def _copy_training_shard(self, user_id: str, source_profile_name: str, new_profile_name: str):
-        source_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", source_profile_name, "training.json.gz")
+        src_pid = self._get_pid_from_name_any(int(user_id), source_profile_name)
+        new_pid = self._get_pid_from_name_any(int(user_id), new_profile_name)
+        source_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", src_pid, "training.json.gz")
         if os.path.exists(source_path):
-            new_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", new_profile_name, "training.json.gz")
+            new_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", new_pid, "training.json.gz")
             os.makedirs(os.path.dirname(new_path), exist_ok=True)
             import shutil
             shutil.copy2(source_path, new_path)
@@ -477,7 +537,8 @@ class StorageMixin:
     def _get_session_path(self, session_key: Any, session_type: str) -> pathlib.Path:
         if session_type == 'global_chat':
             _, user_id, profile_name = session_key
-            return pathlib.Path(self.USERS_DIR) / str(user_id) / "profiles" / profile_name / "global_chat.json.gz"
+            pid = self._get_pid_from_name_any(user_id, profile_name)
+            return pathlib.Path(self.USERS_DIR) / str(user_id) / "profiles" / pid / "global_chat.json.gz"
         
         dir_path = self._get_session_dir_path(session_key, session_type)
         # All other session types use a unified log
@@ -644,13 +705,13 @@ class StorageMixin:
             return
         for user_id_str in os.listdir(self.USERS_DIR):
             if not user_id_str.isdigit(): continue
-            profiles_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles")
-            if not os.path.isdir(profiles_dir): continue
+            index = self._get_user_index(int(user_id_str))
+            all_profiles = list(index.get("personal", {})) + list(index.get("borrowed", {}))
             
-            for profile_name in os.listdir(profiles_dir):
-                # Check both Personal and Borrowed configs for custom appearances
-                config_path = os.path.join(profiles_dir, profile_name, "config.json.gz")
-                borrowed_path = os.path.join(profiles_dir, profile_name, "borrowed_config.json.gz")
+            for profile_name in all_profiles:
+                pid = self._get_pid_from_name_any(int(user_id_str), profile_name)
+                config_path = os.path.join(self.USERS_DIR, user_id_str, "profiles", pid, "config.json.gz")
+                borrowed_path = os.path.join(self.USERS_DIR, user_id_str, "profiles", pid, "borrowed_config.json.gz")
                 
                 target_path = None
                 if os.path.exists(config_path):
@@ -751,13 +812,23 @@ class StorageMixin:
             profiles_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles")
             if not os.path.isdir(profiles_dir): continue
             
-            for profile_name in os.listdir(profiles_dir):
-                bot_file = os.path.join(profiles_dir, profile_name, "child_bot.json.gz")
+            for pid_folder in os.listdir(profiles_dir):
+                bot_file = os.path.join(profiles_dir, pid_folder, "child_bot.json.gz")
                 if os.path.exists(bot_file):
                     bot_data = IOManager.read_json_gzip(bot_file, encrypted=False)
                     if bot_data and "bot_id" in bot_data:
-                        bot_data["owner_id"] = int(user_id_str)
-                        self.child_bots[bot_data["bot_id"]] = bot_data
+                        # Dynamically resolve the profile name from the directory's name.txt
+                        name_file = os.path.join(profiles_dir, pid_folder, "name.txt")
+                        p_name = None
+                        if os.path.exists(name_file):
+                            with open(name_file, 'r', encoding='utf-8') as nf:
+                                p_name = nf.read().strip()
+                        
+                        if p_name:
+                            bot_data["owner_id"] = int(user_id_str)
+                            bot_data["profile_name"] = p_name
+                            bot_data["pid"] = pid_folder
+                            self.child_bots[bot_data["bot_id"]] = bot_data
 
     # Helper methods deprecated by Phase 3 structure, retained as no-ops to prevent crashes
     def _get_user_child_bot_shard(self, owner_id: int) -> Dict[str, Any]:
@@ -1243,11 +1314,11 @@ class StorageMixin:
         index = IOManager.read_json(path)
         
         if not index:
-            index = {"personal": [], "borrowed": [], "channel_active_profiles": {}}
+            index = {"personal": {}, "borrowed": {}, "channel_active_profiles": {}}
             owner_id = int(defaultConfig.DISCORD_OWNER_ID)
             
             if user_id != owner_id:
-                index["borrowed"].append(DEFAULT_PROFILE_NAME)
+                index["borrowed"][DEFAULT_PROFILE_NAME] = DEFAULT_PROFILE_NAME
                 self._save_user_index(user_id, index)
                 
                 b_config = self._get_profile_config(user_id, DEFAULT_PROFILE_NAME, True)
@@ -1276,8 +1347,9 @@ class StorageMixin:
         cache_key = f"{user_id}:{profile_name}:{'b' if is_borrowed else 'p'}"
         if cache_key in self.profile_configs: return self.profile_configs[cache_key]
         
+        pid = self._get_pid_from_name(user_id, profile_name, is_borrowed)
         filename = "borrowed_config.json.gz" if is_borrowed else "config.json.gz"
-        path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, filename)
+        path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, filename)
         data = IOManager.read_json_gzip(path, self.fernet)
         
         if data is not None:
@@ -1290,8 +1362,9 @@ class StorageMixin:
 
     def _save_profile_config(self, user_id: int, profile_name: str, data: Dict[str, Any], is_borrowed: bool = False):
         cache_key = f"{user_id}:{profile_name}:{'b' if is_borrowed else 'p'}"
+        pid = self._get_pid_from_name(user_id, profile_name, is_borrowed)
         filename = "borrowed_config.json.gz" if is_borrowed else "config.json.gz"
-        path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, filename)
+        path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, filename)
         IOManager.write_json_gzip(data, path, self.fernet)
         self.profile_configs[cache_key] = data
 
@@ -1299,7 +1372,8 @@ class StorageMixin:
         cache_key = f"{user_id}:{profile_name}"
         if cache_key in self.profile_prompts: return self.profile_prompts[cache_key]
         
-        path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "prompts.json.gz")
+        pid = self._get_pid_from_name_any(user_id, profile_name)
+        path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "prompts.json.gz")
         data = IOManager.read_json_gzip(path, self.fernet)
         
         if data is not None:
@@ -1308,7 +1382,8 @@ class StorageMixin:
 
     def _save_profile_prompts(self, user_id: int, profile_name: str, data: Dict[str, Any]):
         cache_key = f"{user_id}:{profile_name}"
-        path = os.path.join(self.USERS_DIR, str(user_id), "profiles", profile_name, "prompts.json.gz")
+        pid = self._get_pid_from_name_any(user_id, profile_name)
+        path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "prompts.json.gz")
         IOManager.write_json_gzip(data, path, self.fernet)
         self.profile_prompts[cache_key] = data
 
@@ -1328,9 +1403,7 @@ class StorageMixin:
             index.setdefault("personal", []).append(profile_name)
             self._save_user_index(user_id, index)
             
-            import uuid
             config = {
-                "profile_id": str(uuid.uuid4().hex[:8].upper()),
                 "grounding_enabled": False, "stm_length": defaultConfig.CHATBOT_MEMORY_LENGTH,
                 "temperature": defaultConfig.GEMINI_TEMPERATURE, "top_p": defaultConfig.GEMINI_TOP_P,
                 "top_k": defaultConfig.GEMINI_TOP_K, "training_context_size": defaultConfig.TRAINING_CONTEXT_SIZE,
@@ -1339,7 +1412,7 @@ class StorageMixin:
                 "ltm_summarization_context": 10, "ltm_scope": "server", "safety_level": "low",
                 "primary_model": PRIMARY_MODEL_NAME, "fallback_model": FALLBACK_MODEL_NAME,
                 "time_tracking_enabled": True, "timezone": "UTC", "generation_metadata_enabled": False,
-                "id_metadata_enabled": False, "realistic_typing_enabled": False, "ltm_creation_enabled": False,
+                "realistic_typing_enabled": False, "ltm_creation_enabled": False,
                 "image_generation_enabled": False, "image_generation_model": "gemini-2.5-flash-image",
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
                 "thinking_level": "high", "thinking_budget": -1, "thinking_signatures_enabled": "off",
@@ -1472,14 +1545,20 @@ class StorageMixin:
                     ids_to_remove.append(local_name)
 
         if ids_to_remove:
-            index["borrowed"] = [b for b in borrowed if b not in ids_to_remove]
-            self._save_user_index(user_id, index)
-            
-            for local_name in ids_to_remove:
-                import shutil
-                p_dir = os.path.join(self.USERS_DIR, str(user_id), "profiles", local_name)
-                shutil.rmtree(p_dir, ignore_errors=True)
+            if isinstance(borrowed, dict):
+                for local_name in ids_to_remove:
+                    pid = index["borrowed"].pop(local_name, local_name)
+                    import shutil
+                    p_dir = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid)
+                    shutil.rmtree(p_dir, ignore_errors=True)
+            else:
+                index["borrowed"] = [b for b in borrowed if b not in ids_to_remove]
+                for local_name in ids_to_remove:
+                    import shutil
+                    p_dir = os.path.join(self.USERS_DIR, str(user_id), "profiles", local_name)
+                    shutil.rmtree(p_dir, ignore_errors=True)
                 
+            self._save_user_index(user_id, index)
             removed_count = len(ids_to_remove)
             
         return removed_count
@@ -1494,21 +1573,28 @@ class StorageMixin:
             try:
                 uid = int(user_id_str)
                 index = self._get_user_index(uid)
-                borrowed = index.get("borrowed", [])
+                borrowed = index.get("borrowed", {})
                 
                 to_delete = []
-                for b_name in borrowed:
+                for b_name in list(borrowed):
                     b_config = self._get_profile_config(uid, b_name, True)
                     if b_config and str(b_config.get("original_owner_id")) == owner_str and b_config.get("original_profile_name") == original_profile_name:
                         to_delete.append(b_name)
                 
                 if to_delete:
-                    index["borrowed"] = [b for b in borrowed if b not in to_delete]
+                    if isinstance(borrowed, dict):
+                        for b_name in to_delete:
+                            pid = index["borrowed"].pop(b_name, b_name)
+                            import shutil
+                            p_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles", pid)
+                            shutil.rmtree(p_dir, ignore_errors=True)
+                    else:
+                        index["borrowed"] = [b for b in borrowed if b not in to_delete]
+                        for b_name in to_delete:
+                            import shutil
+                            p_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles", b_name)
+                            shutil.rmtree(p_dir, ignore_errors=True)
                     self._save_user_index(uid, index)
-                    for b_name in to_delete:
-                        import shutil
-                        p_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles", b_name)
-                        shutil.rmtree(p_dir, ignore_errors=True)
             except Exception as e:
                 print(f"Error in cascade delete for user {user_id_str}: {e}")
     

@@ -21,9 +21,15 @@ def run_pip(python_exe, command):
 def setup_mimic():
     print("--- MimicAI Self-Hosted Setup ---")
 
+    print("\n[0/5] Configuration Mode")
+    print("Manual Authentication Mode stores session keys in volatile memory only.")
+    print("It requires manual STDIN injection on every boot.")
+    print("Recommended ONLY for strictly ephemeral environments. Do NOT use unless you understand the service implications.")
+    manual_auth = input("Enable Manual Authentication Mode? [y/N]: ").strip().lower() == 'y'
+
     # 0. Linux-specific preparation
     if platform.system() == "Linux":
-        print("\n[0/4] Checking Linux system dependencies...")
+        print("\n[1/5] Checking Linux system dependencies...")
         # Note: venv is now imported at the top level
         
         # Check for build-essential if the user is on a very stripped instance
@@ -37,20 +43,20 @@ def setup_mimic():
     activate_script = os.path.join(venv_dir, "Scripts", "activate") if platform.system() == "Windows" else os.path.join(venv_dir, "bin", "activate")
     
     if os.path.exists(venv_dir) and not os.path.exists(activate_script):
-        print(f"\n[1/4] Found broken virtual environment folder. Deleting and recreating...")
+        print(f"\n[2/5] Found broken virtual environment folder. Deleting and recreating...")
         import shutil
         try:
-            shutil.rmtree(venv_dir)
+            shutil.rmtree(venv_dir, ignore_errors=True)
         except Exception as e:
             print(f" ! Error cleaning up broken environment: {e}")
             sys.exit(1)
 
     if not os.path.exists(venv_dir):
-        print("\n[1/4] Creating local virtual environment (.venv)...")
+        print("\n[2/5] Creating local virtual environment (.venv)...")
         venv.create(venv_dir, with_pip=True)
         print(" - Virtual environment created.")
     else:
-        print("\n[1/4] Virtual environment already exists. Skipping creation.")
+        print("\n[2/5] Virtual environment already exists. Skipping creation.")
 
     venv_python = get_venv_python()
 
@@ -68,9 +74,9 @@ def setup_mimic():
             sys.exit(1)
 
     # 2. Install Dependencies inside Venv
-    print("\n[2/4] Installing required libraries into the environment...")
+    print("\n[3/5] Installing required libraries into the environment...")
     # Standard dependencies list
-    deps = ["discord.py", "google-genai", "google-generativeai", "websockets", "orjson", "cryptography", "aiohttp", "httpx", "numpy", "python-dotenv", "Pillow"]
+    deps = ["discord.py", "google-genai", "google-generativeai", "websockets", "orjson", "cryptography", "aiohttp", "httpx", "numpy", "python-dotenv", "Pillow", "tzdata"]
     
     if os.path.exists("requirements.txt"):
         run_pip(venv_python, ["-r", "requirements.txt"])
@@ -78,19 +84,11 @@ def setup_mimic():
         run_pip(venv_python, deps)
 
     # 3. Create Directory Structure
-    print("\n[3/4] Creating data directories...")
+    print("\n[4/5] Creating data directories...")
     directories = [
-        "cogs/data/profiles",
-        "cogs/data/ltm",
-        "cogs/data/training",
-        "cogs/data/public_profiles",
-        "cogs/data/sessions/global_chat",
-        "cogs/data/sessions/servers",
+        "cogs/data/users",
         "cogs/data/servers",
-        "cogs/data/child_bots",
-        "cogs/data/users/appearances",
-        "cogs/data/users/shares",
-        "cogs/data/users/personal_keys",
+        "cogs/data/public_profiles",
         "cogs/data/models"
     ]
     for directory in directories:
@@ -98,31 +96,61 @@ def setup_mimic():
         print(f" - Created: {directory}")
 
     # 4. Handle Environment Variables
-    print("\n[4/4] Configuring environment...")
+    print("\n[5/5] Configuring environment...")
+    
+    def _clean_key(val):
+        if not val: return ""
+        import re
+        # Aggressively strip all quotes, spaces, tabs, and newlines
+        return re.sub(r'\s+', '', str(val).replace('"', '').replace("'", ""))
+
     if not os.path.exists(".env"):
         # We run the key generation via the venv python to ensure cryptography is available
-        # But for the setup script itself, we can just try to import it now that it's installed
-        # We need to add the venv site-packages to path or use a subprocess
         print(" - Generating secure encryption key...")
         gen_key_code = "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-        fernet_key = subprocess.check_output([venv_python, "-c", gen_key_code]).decode().strip()
+        fernet_key = _clean_key(subprocess.check_output([venv_python, "-c", gen_key_code]).decode())
         
-        sdk_token = input("Enter your Discord Bot Token (SDK): ").strip()
-        owner_id = input("Enter your Discord User ID (Owner): ").strip()
+        sdk_token = _clean_key(input("Enter your Discord Bot Token (SDK): "))
+        owner_id = _clean_key(input("Enter your Discord User ID (Owner): "))
+        
+        if manual_auth:
+            print("\n" + "!"*70)
+            print("MANUAL AUTHENTICATION MODE ACTIVE")
+            print("Your generated Fernet Encryption Key is:")
+            print(f"\n{fernet_key}\n")
+            print("SAVE THIS KEY NOW IN A SECURE LOCATION.")
+            print("It will NOT be saved to disk. If you lose it, your data is permanently corrupted.")
+            print("!"*70)
+            input("\nPress Enter to confirm you have safely stored the key...")
+        
+        import hashlib
+        import json
+        lock_data = {
+            "sdk_hash": hashlib.sha256(sdk_token.encode()).hexdigest(),
+            "owner_hash": hashlib.sha256(owner_id.encode()).hexdigest(),
+            "key_hash": hashlib.sha256(fernet_key.encode()).hexdigest()
+        }
+        os.makedirs("cogs/data", exist_ok=True)
+        with open("cogs/data/system_lock.json", "w") as f:
+            json.dump(lock_data, f)
         
         env_content = (
-            f"DISCORD_SDK={sdk_token}\n"
-            f"DISCORD_OWNER_ID={owner_id}\n"
-            f"ENCRYPTION_KEY={fernet_key}\n"
             f"PLACEHOLDER_EMOJI=⌛\n"
-            f"ALL_USERS_PREMIUM=True\n"
+            f"MANUAL_AUTH_MODE={'True' if manual_auth else 'False'}\n"
         )
         
+        if not manual_auth:
+            env_content += (
+                f"DISCORD_SDK={sdk_token}\n"
+                f"DISCORD_OWNER_ID={owner_id}\n"
+                f"ENCRYPTION_KEY={fernet_key}\n"
+            )
+            
         with open(".env", "w", encoding="utf-8") as f:
             f.write(env_content)
-        print("\nSUCCESS: .env file created.")
+        print("\nSUCCESS: .env file and system lock created.")
     else:
-        print("\nINFO: .env file already exists. Skipping creation.")
+        print("\nINFO: .env file already exists. Configuration skipped to protect existing keys.")
 
     # 5. Linux Service Configuration (systemd)
     if platform.system() == "Linux":

@@ -28,6 +28,7 @@ class CoreMixin:
         self._migrate_servers_directory()
         self._migrate_users_root_directory()
         self._migrate_profiles_directory()
+        self._migrate_to_pid_v2()
         
         # [NEW] Patch legacy ID fields and standardise to 8-character PIDs
         await self._patch_profile_ids()
@@ -76,45 +77,42 @@ class CoreMixin:
                 if message.reference.resolved.author.id != self.bot.user.id and message.channel.id not in self.multi_profile_channels:
                     return
 
-            turn_info = self.message_to_history_turn.get(message.reference.message_id)
-            if not turn_info:
-                session_type = self.multi_profile_channels.get(message.channel.id, {}).get("type", "multi")
-                mapping_key = (session_type, message.channel.id)
-                if mapping_key not in self.mapping_caches:
-                    self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
-                turn_info = self.mapping_caches[mapping_key].get(str(message.reference.message_id))
-
-            if turn_info and isinstance(turn_info, (list, tuple)) and len(turn_info) == 3:
-                channel_id, session_type, turn_id_to_find = turn_info
-                session = self._ensure_session_hydrated(channel_id, session_type)
+            session = self.multi_profile_channels.get(message.channel.id)
+            if session:
+                session_type = session.get("type", "multi")
+                if not session.get("is_hydrated"):
+                    session = self._ensure_session_hydrated(message.channel.id, session_type)
+                
                 if session:
-                    turn_object = next((turn for turn in session.get("unified_log", []) if turn.get("turn_id") == turn_id_to_find), None)
-                    if turn_object:
-                        speaker_key = tuple(turn_object.get("speaker_key", []))
-                        replied_to_participant = next((p for p in session.get('profiles', []) if (p['owner_id'], p['profile_name']) == speaker_key), None)
+                    turn_object = next((turn for turn in session.get("unified_log", []) if message.reference.message_id in turn.get("message_ids", [])), None)
+                    
+                    if turn_object and turn_object.get("is_user") is False:
+                        bot_pid = turn_object.get("speaker_pid")
+                        o_id = turn_object.get("owner_id")
+                        p_name = turn_object.get("profile_name")
                         
-                        if not replied_to_participant:
+                        replied_to_participant = next((p for p in session.get('profiles', []) if self._get_pid_from_name_any(p['owner_id'], p['profile_name']) == bot_pid), None)
+                        
+                        if not replied_to_participant and o_id and p_name:
                             # Reconstruct ephemeral participant
-                            p_owner_id, p_name = speaker_key
                             method = 'webhook'
                             bot_id = None
-                            linked_bot_id = next((bid for bid, data in self.child_bots.items() if data.get("owner_id") == p_owner_id and data.get("profile_name") == p_name), None)
+                            linked_bot_id = next((bid for bid, data in self.child_bots.items() if data.get("owner_id") == o_id and data.get("profile_name") == p_name), None)
                             if linked_bot_id and message.guild and message.guild.get_member(int(linked_bot_id)):
                                 method = 'child_bot'
                                 bot_id = linked_bot_id
                             
                             replied_to_participant = {
-                                "owner_id": p_owner_id, "profile_name": p_name,
+                                "owner_id": o_id, "profile_name": p_name,
                                 "method": method, "bot_id": bot_id, "ephemeral": True
                             }
 
                         if replied_to_participant:
-                            # [UPDATED] Eager feedback removed to respect the queue/batching flow
                             reply_trigger = ('reply', message, replied_to_participant)
                             await session['task_queue'].put(reply_trigger)
                             
                             if not session.get('worker_task') or session['worker_task'].done():
-                                task = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
+                                task = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
                                 session['worker_task'] = task
                                 self.background_tasks.add(task)
                             return
@@ -391,51 +389,27 @@ class CoreMixin:
         if not any([is_regen, is_next, is_continue, is_mute, is_skip]):
             return
 
-        turn_info = self.message_to_history_turn.get(payload.message_id)
-        
-        # Cold path: if not in hot cache, check on-disk mapping
-        if not turn_info:
-            # We must guess the session type to find the right mapping file.
-            # We check 'multi' first, then 'freewill' as a fallback.
-            potential_mapping_keys = [
-                ('multi', payload.channel_id),
-                ('freewill', payload.channel_id)
-            ]
-            for key in potential_mapping_keys:
-                if key not in self.mapping_caches:
-                    self.mapping_caches[key] = self._load_mapping_from_disk(key)
-                turn_info = self.mapping_caches[key].get(str(payload.message_id))
-                if turn_info:
-                    break
-        
-        if not turn_info or not isinstance(turn_info, (list, tuple)) or len(turn_info) != 3:
-            return # Not a message we are tracking or malformed data
-
-        channel_id, session_type, turn_id_to_find = turn_info
-        if session_type not in ['multi', 'freewill']:
-            return
-
-        # [NEW] Re-hydrate/Reset Timer
+        channel_id = payload.channel_id
         session = self.multi_profile_channels.get(channel_id)
-        if not session or not session.get("is_hydrated"):
-            session = self._ensure_session_hydrated(channel_id, session_type)
+        if not session: return
         
-        if not session:
-            return
+        session_type = session.get("type", "multi")
+        if not session.get("is_hydrated"):
+            session = self._ensure_session_hydrated(channel_id, session_type)
+        if not session: return
 
         self.session_last_accessed[channel_id] = time.time()
 
-        # Find the turn in the unified log
         turn_index = -1
         turn_object = None
         for i, turn in enumerate(session.get("unified_log", [])):
-            if turn.get("turn_id") == turn_id_to_find:
+            if payload.message_id in turn.get("message_ids", []):
                 turn_index = i
                 turn_object = turn
                 break
 
         if turn_object:
-            # [FIXED] Move mute logic outside of participant check to support human messages
+            turn_id_to_find = turn_object["turn_id"]
             if is_mute:
                 turn_object["is_hidden"] = True
                 self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
@@ -443,12 +417,14 @@ class CoreMixin:
                 self._ensure_session_hydrated(channel_id, session_type)
                 return
 
-            speaker_key = tuple(turn_object.get("speaker_key", []))
+            if turn_object.get("is_user") is True:
+                return # Can't skip/regen a user turn
+
+            speaker_pid = turn_object.get("speaker_pid")
             
             reacted_to_participant = None
             for participant in session['profiles']:
-                p_key = (participant['owner_id'], participant['profile_name'])
-                if p_key == speaker_key:
+                if self._get_pid_from_name_any(participant['owner_id'], participant['profile_name']) == speaker_pid:
                     reacted_to_participant = participant
                     break
             
@@ -549,19 +525,22 @@ class CoreMixin:
         
         if not is_mute and not is_skip: return
 
-        turn_info = self.message_to_history_turn.get(payload.message_id)
-        if not turn_info: return
-        
-        channel_id, session_type, turn_id_to_find = turn_info
+        channel_id = payload.channel_id
         session = self.multi_profile_channels.get(channel_id)
-        if not session or not session.get("is_hydrated"):
-            session = self._ensure_session_hydrated(channel_id, session_type)
+        if not session: return
         
+        session_type = session.get("type", "multi")
+        if not session.get("is_hydrated"):
+            session = self._ensure_session_hydrated(channel_id, session_type)
         if not session: return
 
-        turn_object = next((turn for turn in session.get("unified_log", []) if turn.get("turn_id") == turn_id_to_find), None)
+        turn_object = None
+        for turn in session.get("unified_log", []):
+            if payload.message_id in turn.get("message_ids", []):
+                turn_object = turn
+                break
+
         if turn_object:
-            # [FIXED] Move mute restoration outside of participant check
             if is_mute:
                 turn_object["is_hidden"] = False
                 self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
@@ -569,9 +548,9 @@ class CoreMixin:
                 self._ensure_session_hydrated(channel_id, session_type)
                 return
             
-            elif is_skip:
-                speaker_key = tuple(turn_object.get("speaker_key", []))
-                participant = next((p for p in session['profiles'] if (p['owner_id'], p['profile_name']) == speaker_key), None)
+            elif is_skip and turn_object.get("is_user") is False:
+                speaker_pid = turn_object.get("speaker_pid")
+                participant = next((p for p in session['profiles'] if self._get_pid_from_name_any(p['owner_id'], p['profile_name']) == speaker_pid), None)
                 if participant:
                     participant["is_skipped"] = False
                     self._save_multi_profile_sessions()
@@ -586,139 +565,106 @@ class CoreMixin:
             self.purged_message_ids.discard(deleted_message_id)
             return
         
-        turn_info = self.message_to_history_turn.pop(deleted_message_id, None)
-        
-        if not turn_info:
-            # Cold path: find the mapping on disk
-            session_type = self.multi_profile_channels.get(payload.channel_id, {}).get("type", "multi")
-            mapping_key = (session_type, payload.channel_id)
-            if mapping_key not in self.mapping_caches:
-                self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
-            turn_info = self.mapping_caches[mapping_key].get(str(deleted_message_id))
-
-        if not turn_info:
-            return
-
-        # If turn_info came from JSON, its inner tuple (the session key) will be a list. Convert it back.
-        if isinstance(turn_info[0], list):
-            turn_info[0] = tuple(turn_info[0])
-
-        session_key_or_channel_id, session_type, turn_data = turn_info
-        
-        if session_type == 'global_chat':
-            session_key = session_key_or_channel_id
-            turn_id_to_delete = turn_data
+        # 1. Check Global Chat Sessions (DMs)
+        if not payload.guild_id:
+            channel = self.bot.get_channel(payload.channel_id)
+            user_id = None
+            if channel and isinstance(channel, discord.DMChannel):
+                user_id = channel.recipient.id
             
-            # [NEW] Decrement Counter for Single/Global
-            owner_id, profile_name = session_key[1], session_key[2]
-            ltm_counter_key = (owner_id, profile_name, "guild")
-            if ltm_counter_key in self.message_counters_for_ltm:
-                self.message_counters_for_ltm[ltm_counter_key] = max(0, self.message_counters_for_ltm[ltm_counter_key] - 1)
+            if user_id:
+                index = self._get_user_index(user_id)
+                all_pnames = list(index.get("personal", [])) + list(index.get("borrowed", []))
+                
+                for p_name in all_pnames:
+                    session_key = ('global', user_id, p_name)
+                    session_data = self.global_chat_sessions.get(session_key)
+                    
+                    if not session_data:
+                        session_data = self._load_session_from_disk(session_key, 'global_chat')
+                        if session_data:
+                            self.global_chat_sessions[session_key] = session_data
 
-            mapping_key = self._get_mapping_key_for_session(session_key, session_type)
-            if mapping_key in self.mapping_caches:
-                self.mapping_caches[mapping_key].pop('grounding_checkpoint', None)
-                mapping_data = self.mapping_caches[mapping_key]
-                keys_to_delete = [
-                    msg_id for msg_id, t_info in mapping_data.items()
-                    if isinstance(t_info, (list, tuple)) and len(t_info) > 2 and t_info[2] == turn_id_to_delete
-                ]
-                for msg_id in keys_to_delete:
-                    mapping_data.pop(msg_id, None)
+                    if session_data:
+                        turn_id_to_delete = None
+                        for turn in session_data.get("unified_log", []):
+                            if deleted_message_id in turn.get("message_ids", []):
+                                turn_id_to_delete = turn.get("turn_id")
+                                break
+                        
+                        if turn_id_to_delete:
+                            ltm_counter_key = (user_id, p_name, "dm")
+                            if ltm_counter_key in self.message_counters_for_ltm:
+                                self.message_counters_for_ltm[ltm_counter_key] = max(0, self.message_counters_for_ltm[ltm_counter_key] - 1)
 
-            session_data = self.global_chat_sessions.get(session_key)
-            if not session_data:
-                session_data = self._load_session_from_disk(session_key, session_type)
-                if session_data: self.global_chat_sessions[session_key] = session_data
-            
-            if session_data:
-                original_len = len(session_data['unified_log'])
-                session_data['unified_log'] = [t for t in session_data['unified_log'] if t.get('turn_id') != turn_id_to_delete]
+                            original_len = len(session_data['unified_log'])
+                            session_data['unified_log'] = [t for t in session_data['unified_log'] if t.get('turn_id') != turn_id_to_delete]
 
-                if len(session_data['unified_log']) < original_len:
-                    # Rebuild history
-                    new_history = []
-                    for t in session_data['unified_log']:
-                        role = 'model' if t.get('role') == 'model' else 'user'
-                        new_history.append({'role': role, 'parts': [t.get('content')]})
-                    session_data['chat_session'] = GoogleGenAIChatSession(history=new_history)
+                            if len(session_data['unified_log']) < original_len:
+                                new_history = []
+                                for t in session_data['unified_log']:
+                                    role = 'model' if t.get('is_user') is False else 'user'
+                                    new_history.append({'role': role, 'parts': [t.get('content')]})
+                                session_data['chat_session'] = GoogleGenAIChatSession(history=new_history)
 
-                if not session_data['unified_log']:
-                    self.global_chat_sessions.pop(session_key, None)
-                    self.session_last_accessed.pop(session_key, None)
-                    self._delete_session_from_disk(session_key, session_type)
-                    if mapping_key in self.mapping_caches:
-                        self.mapping_caches.pop(mapping_key, None)
-                        self._save_mapping_to_disk(mapping_key, {})
-                    self.ltm_recall_history.pop(session_key, None)
-                else:
-                    self.session_last_accessed[session_key] = time.time()
+                            if not session_data['unified_log']:
+                                self.global_chat_sessions.pop(session_key, None)
+                                self.session_last_accessed.pop(session_key, None)
+                                self._delete_session_from_disk(session_key, 'global_chat')
+                                self.ltm_recall_history.pop(session_key, None)
+                            else:
+                                self._save_session_to_disk(session_key, 'global_chat', session_data)
+                                self.session_last_accessed[session_key] = time.time()
+                            return
+
+        # 2. Check Multi/Freewill Sessions (Servers)
+        session = self.multi_profile_channels.get(payload.channel_id)
+        if not session: return
         
-        elif session_type in ['multi', 'freewill']:
-            channel_id = session_key_or_channel_id
-            turn_id_to_delete = turn_data
+        session_type = session.get("type", "multi")
+        if not session.get("is_hydrated"):
+            session = self._ensure_session_hydrated(payload.channel_id, session_type)
+        if not session: return
+
+        turn_id_to_delete = None
+        turn_object = None
+        for turn in session.get("unified_log", []):
+            if deleted_message_id in turn.get("message_ids", []):
+                turn_id_to_delete = turn.get("turn_id")
+                turn_object = turn
+                break
+
+        if turn_id_to_delete and turn_object:
+            if turn_object.get("is_user") is False:
+                bot_pid = turn_object.get("speaker_pid")
+                for p in session.get('profiles', []):
+                    if self._get_pid_from_name_any(p['owner_id'], p['profile_name']) == bot_pid:
+                        p['ltm_counter'] = max(0, p.get('ltm_counter', 0) - 1)
+                        break
+
+            original_log_len = len(session.get("unified_log", []))
+            session["unified_log"] = [t for t in session.get("unified_log", []) if t.get("turn_id") != turn_id_to_delete]
             
-            mapping_key = (session_type, channel_id)
-            if mapping_key in self.mapping_caches:
-                self.mapping_caches[mapping_key].pop('grounding_checkpoint', None)
-                mapping_data = self.mapping_caches[mapping_key]
-                
-                keys_to_delete = [
-                    msg_id for msg_id, t_info in mapping_data.items()
-                    if isinstance(t_info, (list, tuple)) and len(t_info) > 2 and t_info[2] == turn_id_to_delete
-                ]
-                for msg_id in keys_to_delete:
-                    mapping_data.pop(msg_id, None)
-
-            session = self.multi_profile_channels.get(channel_id)
-            if session:
-                if not session.get("is_hydrated"):
-                    session = self._ensure_session_hydrated(channel_id, session_type)
-                
-                # [NEW] Decrement Counter for Multi/Freewill
-                turn_object = next((turn for turn in session.get("unified_log", []) if turn.get("turn_id") == turn_id_to_delete), None)
-                if turn_object:
-                    speaker_key = tuple(turn_object.get("speaker_key", []))
-                    for p in session.get('profiles', []):
-                        if (p['owner_id'], p['profile_name']) == speaker_key:
-                            p['ltm_counter'] = max(0, p.get('ltm_counter', 0) - 1)
-                            break
-
-                original_log_len = len(session.get("unified_log", []))
-                session["unified_log"] = [
-                    turn for turn in session.get("unified_log", [])
-                    if turn.get("turn_id") != turn_id_to_delete
-                ]
-                
-                if len(session["unified_log"]) < original_log_len:
-                    for p_data in session["profiles"]:
-                        p_key = (p_data['owner_id'], p_data['profile_name'])
-                        participant_history = []
-                        for turn in session["unified_log"]:
-                            speaker_key = tuple(turn.get("speaker_key", []))
-                            role = 'model' if speaker_key == p_key else 'user'
-                            participant_history.append({'role': role, 'parts': [turn.get("content")]})
-                        session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
-
+            if len(session["unified_log"]) < original_log_len:
                 is_effectively_empty = not session.get("unified_log") or all(
                     turn.get("type") in ["whisper", "private_response"] for turn in session.get("unified_log", [])
                 )
+                
+                dummy_session_key = (payload.channel_id, None, None)
                 if is_effectively_empty:
-                    # Clean up disk artifacts but KEEP session in memory to preserve participants
-                    dummy_session_key = (channel_id, None, None)
                     self._delete_session_from_disk(dummy_session_key, session_type)
-                    
-                    mapping_key = (session_type, channel_id)
-                    path = self._get_mapping_path(mapping_key)
-                    _delete_file_shard(str(path))
-                    
-                    # Clear LTM cooldowns since context is gone
                     for p_key in session.get("chat_sessions", {}).keys():
                         owner_id, profile_name = p_key
-                        full_session_key = (channel_id, owner_id, profile_name)
+                        full_session_key = (payload.channel_id, owner_id, profile_name)
                         self.ltm_recall_history.pop(full_session_key, None)
+                else:
+                    self._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
 
-                self.session_last_accessed[channel_id] = time.time()
+                # Now that the correct state is on disk, force a re-read and rebuild
+                session["is_hydrated"] = False
+                self._ensure_session_hydrated(payload.channel_id, session_type)
+
+            self.session_last_accessed[payload.channel_id] = time.time()
 
     @commands.Cog.listener()
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
@@ -727,47 +673,31 @@ class CoreMixin:
         message_id = payload.message_id
         channel_id = payload.channel_id
         
-        turn_info = self.message_to_history_turn.get(message_id)
-        
-        if not turn_info:
-            session_type = self.multi_profile_channels.get(channel_id, {}).get("type", "multi")
-            mapping_key = (session_type, channel_id)
-            if mapping_key not in self.mapping_caches:
-                self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
-            turn_info = self.mapping_caches[mapping_key].get(str(message_id))
-
-        if not turn_info:
-            return
-
-        if isinstance(turn_info[0], list):
-            turn_info[0] = tuple(turn_info[0])
-            
-        session_key_or_channel_id, session_type, turn_id_to_edit = turn_info
-        
-        # Currently only implementing dynamic edits for Multi/Freewill sessions
-        if session_type not in ['multi', 'freewill']:
-            return 
-            
-        channel = self.bot.get_channel(channel_id)
-        if not channel: return
-        
-        try:
-            msg = await channel.fetch_message(message_id)
-        except discord.NotFound:
-            return
-
         session = self.multi_profile_channels.get(channel_id)
-        if not session or not session.get("is_hydrated"):
+        if not session: return
+        
+        session_type = session.get("type", "multi")
+        if not session.get("is_hydrated"):
             session = self._ensure_session_hydrated(channel_id, session_type)
-            
         if not session: return
 
-        turn_object = next((turn for turn in session.get("unified_log", []) if turn.get("turn_id") == turn_id_to_edit), None)
-        
+        turn_object = None
+        for turn in session.get("unified_log", []):
+            if message_id in turn.get("message_ids", []):
+                turn_object = turn
+                break
+
         if turn_object:
             # We only edit user messages. If a bot message is edited natively, we ignore it to prevent looping.
-            speaker_key = turn_object.get("speaker_key", [])
-            if len(speaker_key) == 2 and speaker_key[1] != "user":
+            if turn_object.get("is_user") is False:
+                return
+            
+            channel = self.bot.get_channel(channel_id)
+            if not channel: return
+            
+            try:
+                msg = await channel.fetch_message(message_id)
+            except discord.NotFound:
                 return
             
             author_id = msg.author.id
@@ -883,25 +813,25 @@ class CoreMixin:
 
         profile_id = self._get_profile_id(effective_owner_id, effective_profile_name)
         history_line = self._format_history_entry(speaker_display_name, interaction_to_respond.created_at, message, entity_id=profile_id)
-        turn_info = None
-        mapping_key = None
         
+        turn_object = None
         if session:
             participant_key = (user_id, profile_name)
             model_content_obj = {'role': 'model', 'parts': [history_line]}
             user_content_obj = {'role': 'user', 'parts': [history_line]}
 
-            # Add the turn to the unified log
             turn_id = str(uuid.uuid4())
             turn_object = {
                 "turn_id": turn_id,
-                "speaker_key": [user_id, profile_name],
-                "content": history_line,
-                "timestamp": interaction_to_respond.created_at.isoformat()
+                "is_user": False,
+                "speaker_pid": self._get_pid_from_name_any(user_id, profile_name),
+                "owner_id": effective_owner_id,
+                "profile_name": effective_profile_name,
+                "message_ids": [],
+                "content": history_line
             }
             session.get("unified_log", []).append(turn_object)
 
-            # Update in-memory histories for all participants
             for key, chat_session in session["chat_sessions"].items():
                 if key == participant_key:
                     chat_session.history.append(model_content_obj)
@@ -909,16 +839,8 @@ class CoreMixin:
                     chat_session.history.append(user_content_obj)
             
             session_type = session.get("type", "multi")
-            turn_info = (channel.id, session_type, turn_id)
-            mapping_key = (session_type, channel.id)
             self.session_last_accessed[channel.id] = time.time()
-            
-            # Persist log immediately for multi-sessions
             self._save_session_to_disk((channel.id, None, None), session_type, session["unified_log"])
-        else:
-            # [UPDATED] Removed legacy 'single' session creation for stateless speak_as responses
-            turn_info = None
-            mapping_key = None
 
         sent_messages = []
         if delivery_method == 'child_bot' and child_bot_id:
@@ -926,7 +848,6 @@ class CoreMixin:
             
             if session:
                 participant_data = next((p for p in session.get("profiles", []) if p.get("owner_id") == user_id and p.get("profile_name") == profile_name), None)
-                _, _, turn_id = turn_info
                 self.pending_child_confirmations[correlation_id] = {
                     "type": "multi_profile", "participant": participant_data,
                     "history_line": history_line, "channel_id": channel.id, "turn_id": turn_id,
@@ -948,15 +869,10 @@ class CoreMixin:
                 profile_name_for_appearance=effective_profile_name
             )
 
-        if sent_messages and turn_info and mapping_key:
-            if mapping_key not in self.mapping_caches:
-                self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
+        if sent_messages and turn_object:
             for msg in sent_messages:
-                self.message_to_history_turn[msg.id] = turn_info
-                self.mapping_caches[mapping_key][str(msg.id)] = turn_info
-            
-            # Update mappings on disk for webhook delivery
-            self._save_mapping_to_disk(mapping_key, self.mapping_caches[mapping_key])
+                turn_object.setdefault("message_ids", []).append(msg.id)
+            self._save_session_to_disk((channel.id, None, None), session.get("type", "multi"), session["unified_log"])
 
         await interaction_to_respond.followup.send("Message sent.", ephemeral=True)
 
@@ -1334,7 +1250,7 @@ class CoreMixin:
                 reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
             
             p_index = self._get_user_index(owner_id)
-            p_is_borrowed = profile_name in p_index.get("borrowed", [])
+            p_is_borrowed = profile_name in p_index.get("borrowed",[])
             p_settings = self._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
             
             custom_main = p_settings.get("error_response", "An error has occurred.")
@@ -1342,8 +1258,14 @@ class CoreMixin:
         elif response.candidates:
             response_text = getattr(response, 'text', "...").strip()
 
+        # PREVENT GLOBAL XML SCRUBBER FROM DELETING THE RESPONSE
+        # If the AI mimics the history format and wraps its reply in tags, we strip the tags but KEEP the text.
+        response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
+        response_text = re.sub(r'</?private_whisper>', '', response_text, flags=re.IGNORECASE)
+        response_text = re.sub(r'</?private_context>', '', response_text, flags=re.IGNORECASE)
+
         user_index = self._get_user_index(owner_id)
-        is_borrowed = profile_name in user_index.get("borrowed", [])
+        is_borrowed = profile_name in user_index.get("borrowed",[])
         effective_owner_id = owner_id
         effective_profile_name = profile_name
         if is_borrowed:
@@ -1359,14 +1281,18 @@ class CoreMixin:
         scrubbed_text = self._scrub_response_text(response_text, participant_names=[display_name])
         response_text = self._deduplicate_response(scrubbed_text)
 
-        # [FIXED] Storing only clean text in the log; XML is now added dynamically during AI hydration
         whisper_turn_id = str(uuid.uuid4())
         user_hash = self._get_user_hash(interaction.user.id)
         whisper_content = self._format_history_entry(interaction.user.name, interaction.created_at, whisper_message, entity_id=user_hash)
+        
+        target_pid = self._get_pid_from_name_any(owner_id, profile_name)
+        
         session["unified_log"].append({
             "turn_id": whisper_turn_id, "type": "whisper",
-            "whisperer_id": interaction.user.id, "target_key": list(participant_key),
-            "content": whisper_content, "timestamp": interaction.created_at.isoformat()
+            "is_user": True, "speaker_pid": str(interaction.user.id), "target_pid": target_pid,
+            "message_ids":[],
+            "content": whisper_content,
+            "timestamp": interaction.created_at.isoformat()
         })
 
         response_turn_id = str(uuid.uuid4())
@@ -1374,13 +1300,15 @@ class CoreMixin:
         response_content = self._format_history_entry(profile_name, datetime.datetime.now(datetime.timezone.utc), response_text, entity_id=profile_id)
         
         p_index = self._get_user_index(owner_id)
-        p_is_borrowed = profile_name in p_index.get("borrowed", [])
+        p_is_borrowed = profile_name in p_index.get("borrowed",[])
         p_settings = self._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
         
         resp_log = {
             "turn_id": response_turn_id, "type": "private_response",
-            "speaker_key": list(participant_key), "target_id": interaction.user.id,
-            "content": response_content, "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            "is_user": False, "speaker_pid": target_pid, "target_id": interaction.user.id,
+            "message_ids":[],
+            "content": response_content,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
         if p_settings.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
             sig = response.thought_signature
@@ -1390,10 +1318,14 @@ class CoreMixin:
             
         session["unified_log"].append(resp_log)
 
-        # Add to the target's in-memory history
-        chat_session.history.append({'role': 'user', 'parts': [whisper_content]})
+        # [FIXED] Add to the target's in-memory history WRAPPED in XML tags so the AI knows it is private
+        header_w, body_w = whisper_content.split('\n', 1)
+        wrapped_whisper = f"{header_w}\n<private_whisper>\n{body_w.strip()}\n</private_whisper>\n"
+        chat_session.history.append({'role': 'user', 'parts': [wrapped_whisper]})
         
-        model_obj = {'role': 'model', 'parts': [response_content]}
+        header_r, body_r = response_content.split('\n', 1)
+        wrapped_response = f"{header_r}\n<private_response>\n{body_r.strip()}\n</private_response>\n"
+        model_obj = {'role': 'model', 'parts': [wrapped_response]}
         if 'thought_signature' in resp_log:
             model_obj['thought_signature'] = resp_log['thought_signature']
         chat_session.history.append(model_obj)
@@ -1427,7 +1359,12 @@ class CoreMixin:
         embed.set_footer(text=f"Private whisper: {whisper_message}", icon_url=interaction.user.display_avatar.url)
         
         view = WhisperActionView(self, interaction, whisper_turn_id, response_turn_id)
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        resp_msg = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        
+        # Inject the message ID back into the log turn
+        if resp_msg:
+            resp_log["message_ids"] = [resp_msg.id]
+            self._save_session_to_disk((interaction.channel_id, None, None), session_type, session["unified_log"])
 
     async def _execute_export(self, interaction: discord.Interaction, profile_names: List[str], filters: Set[str]):
         user_id = interaction.user.id
@@ -1463,6 +1400,7 @@ class CoreMixin:
                 p_config_out["image_generation_prompt"] = p_prompts["image_generation_prompt"]
 
             p_entry = {
+                "pid": self._get_pid_from_name_any(user_id, name),
                 "config": p_config_out,
                 "persona": {},
                 "ai_instructions": [],
@@ -1550,9 +1488,13 @@ class CoreMixin:
                 
                 config.update(p_data.get("config", {}))
                 
-                # Ensure imported profile gets a fresh, unique PID
-                import uuid
-                config["profile_id"] = str(uuid.uuid4().hex[:8].upper())
+                # Import original PID if valid, otherwise keep the newly generated one
+                imported_pid = p_data.get("pid")
+                if imported_pid and len(imported_pid) == 16 and imported_pid.startswith("A"):
+                    config["profile_id"] = imported_pid
+                elif "profile_id" not in config or len(config["profile_id"]) != 16:
+                    import uuid
+                    config["profile_id"] = f"A{uuid.uuid4().hex[:15].upper()}"
                 
                 prompts["persona"] = clean_persona
                 prompts["ai_instructions"] = clean_instr
@@ -1819,6 +1761,7 @@ class CoreMixin:
         
         for p_data in session["profiles"]:
             p_key = (p_data['owner_id'], p_data['profile_name'])
+            bot_pid = self._get_pid_from_name_any(p_data['owner_id'], p_data['profile_name'])
             
             p_index = self._get_user_index(p_data['owner_id'])
             p_is_borrowed = p_data['profile_name'] in p_index.get("borrowed", [])
@@ -1833,11 +1776,11 @@ class CoreMixin:
                 
                 if not turn_type:
                     # A public turn from this profile clears its pending whispers
-                    if tuple(turn.get("speaker_key", [])) == p_key:
+                    if turn.get("speaker_pid") == bot_pid:
                         pending_for_this_profile.clear()
                 elif turn_type == "whisper":
                     # A whisper targeted at this profile is added to the pending queue
-                    if tuple(turn.get("target_key", [])) == p_key:
+                    if turn.get("target_pid") == bot_pid:
                         pending_for_this_profile.append(turn.get("content"))
             
             if pending_for_this_profile:
@@ -1855,8 +1798,7 @@ class CoreMixin:
                 
                 turn_type = turn.get("type")
                 if not turn_type: 
-                    speaker_key = tuple(turn.get("speaker_key", []))
-                    role = 'model' if speaker_key == p_key else 'user'
+                    role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
                     
                     parts = [turn.get("content")]
                     if role == 'user':
@@ -1867,14 +1809,14 @@ class CoreMixin:
 
                     participant_history.append({'role': role, 'parts': parts})
                 elif turn_type == "whisper":
-                    if p_key == tuple(turn.get("target_key", [])):
+                    if turn.get("target_pid") == bot_pid:
                         # [NEW] Wrap clean text in XML tags only when feeding to the AI
                         clean_content = turn.get("content")
                         header, body = clean_content.split('\n', 1)
                         wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
                         participant_history.append({'role': 'user', 'parts': [wrapped]})
                 elif turn_type == "private_response":
-                    if p_key == tuple(turn.get("speaker_key", [])):
+                    if turn.get("speaker_pid") == bot_pid:
                         # [NEW] Apply dynamic XML wrapping during re-hydration
                         clean_content = turn.get("content")
                         header, body = clean_content.split('\n', 1)
@@ -2038,7 +1980,7 @@ class CoreMixin:
             owner_name = owner_user.name if owner_user else "Unknown User"
             profile_type = f"Borrowed (from {owner_name})"
 
-        profile_id = source_profile_data.get("profile_id", "00000000")
+        profile_id = self._get_profile_id(effective_owner_id, effective_profile_name)
 
         # --- Embed Construction ---
         embed = discord.Embed(title=f"Participant: {display_name}", color=discord.Color.blue())
@@ -2128,7 +2070,7 @@ class CoreMixin:
         safety_level = source_profile_data.get("safety_level", "low").title()
 
         # 1. Top Section
-        profile_id = source_profile_data.get("profile_id", "00000000")
+        profile_id = self._get_profile_id(effective_owner_id, effective_profile_name)
         
         embed.add_field(name="Profile Type", value=f"`{profile_type}`", inline=True)
         embed.add_field(name="Created", value=created_display, inline=True)
@@ -2789,8 +2731,17 @@ class CoreMixin:
             if adv_k in owner_profile_data:
                 snapshot_data[adv_k] = owner_profile_data[adv_k]
         
-        if desired_name not in index.get("borrowed", []):
-            index.setdefault("borrowed", []).append(desired_name)
+        if desired_name not in index.get("borrowed", {}):
+            if isinstance(index.get("borrowed"), dict):
+                import uuid
+                pid = f"B{uuid.uuid4().hex[:15].upper()}"
+                index["borrowed"][desired_name] = pid
+                p_dir = os.path.join(self.cog.USERS_DIR, str(interaction.user.id), "profiles", pid)
+                os.makedirs(p_dir, exist_ok=True)
+                with open(os.path.join(p_dir, "name.txt"), "w", encoding="utf-8") as f:
+                    f.write(desired_name)
+            else:
+                index.setdefault("borrowed", []).append(desired_name)
             self._save_user_index(interaction.user.id, index)
             
         self._save_profile_config(interaction.user.id, desired_name, snapshot_data, is_borrowed=True)
@@ -2828,20 +2779,24 @@ class CoreMixin:
             
             owner_index = self._get_user_index(owner_id)
             if owner_profile_name not in owner_index.get("personal", []):
-                index["borrowed"].remove(active_profile_name)
+                if isinstance(index["borrowed"], dict):
+                    pid = index["borrowed"].pop(active_profile_name, active_profile_name)
+                else:
+                    index["borrowed"].remove(active_profile_name)
+                    pid = active_profile_name
+                
                 index.setdefault("channel_active_profiles", {})[str(channel.id)] = DEFAULT_PROFILE_NAME
                 self._save_user_index(user_id, index)
                 
                 try:
                     import shutil
-                    p_dir = os.path.join(self.USERS_DIR, str(user_id), "profiles", active_profile_name)
+                    p_dir = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid)
                     shutil.rmtree(p_dir, ignore_errors=True)
                     await channel.send(f"<@{user_id}>, the borrowed profile '{active_profile_name}' is broken because the original was deleted or renamed. It has been removed from your list and your active profile in this channel has been reset to '{DEFAULT_PROFILE_NAME}'.")
                 except discord.Forbidden:
                     pass
                 return False
         return True
-        
 
     async def _resolve_reply_context(self, message: discord.Message) -> Optional[str]:
         if not message.reference or not message.reference.message_id:

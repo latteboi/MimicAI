@@ -148,8 +148,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         self.message_counters_for_ltm: Dict[Tuple[int, str, Literal["guild", "dm"]], int] = {}
         
-        self.message_id_to_original_prompt: LRUCache = LRUCache(max_size=PROMPT_CACHE_MAX_SIZE)
-        self.message_to_history_turn: LRUCache = LRUCache(max_size=PROMPT_CACHE_MAX_SIZE * 4) 
         self.model_override_warnings_sent: Set[Tuple[int, int, str]] = set()
         self.debug_users: Set[int] = set()
         self.global_chat_sessions: LRUCache = LRUCache(max_size=10)
@@ -159,7 +157,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         self.global_blacklist: Set[int] = set()
         self._load_blacklist()
         self.session_last_accessed = {}
-        self.mapping_caches: LRUCache = LRUCache(max_size=5) # Cache for on-disk mappings
         self.evict_inactive_sessions_task.start()
         self.message_cooldown = commands.CooldownMapping.from_cooldown(5, 60.0, commands.BucketType.user)
         self.processed_child_messages: LRUCache = LRUCache(max_size=25)
@@ -695,6 +692,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     @session_group.command(name="swap", description="Swaps, adds, or removes a profile from the current session.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     @app_commands.guild_only()
+    @is_admin_or_owner_check()
     @app_commands.autocomplete(profile_name=CoreMixin.profile_autocomplete)
     @app_commands.describe(
         profile_name="The profile to swap or add. Leave blank to remove a profile.",
@@ -1025,11 +1023,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         session_type = session.get("type", "multi")
         dummy_session_key = (ch_id, None, None)
         self._delete_session_from_disk(dummy_session_key, session_type)
-        
-        mapping_key = (session_type, ch_id)
-        self.mapping_caches.pop(mapping_key, None)
-        path = self._get_mapping_path(mapping_key)
-        _delete_file_shard(str(path))
 
         for p_key in session["chat_sessions"].keys():
             session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=[])
@@ -1126,11 +1119,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         session_type = session.get("type", "multi")
         dummy_session_key = (ch_id, None, None)
         self._delete_session_from_disk(dummy_session_key, session_type)
-        
-        mapping_key = (session_type, ch_id)
-        self.mapping_caches.pop(mapping_key, None)
-        path = self._get_mapping_path(mapping_key)
-        _delete_file_shard(str(path))
 
         if session.get('worker_task'):
             self._safe_cancel_task(session['worker_task'])
@@ -1159,7 +1147,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         check_fn = (lambda m: m.author == user) if user else (lambda m: True)
         
-        # [FIXED] Intercept message IDs during the filter check to prevent on_raw_message_delete race condition
         def check_and_track(m):
             valid = check_fn(m)
             if valid:
@@ -1177,67 +1164,33 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             
             progress_message = await interaction.followup.send(f"Deleted {len(messages_to_delete)} message(s). Now cleaning them from my memory...", ephemeral=True)
 
-            # [UPDATED] Removed legacy 'single' session data structures
-            multi_turns_to_remove = {}  # { (channel_id, session_type): {turn_ids} }
-            
-            session_type_multi = self.multi_profile_channels.get(interaction.channel_id, {}).get("type", "multi")
-            mapping_key_multi = (session_type_multi, interaction.channel_id)
-            if mapping_key_multi not in self.mapping_caches:
-                self.mapping_caches[mapping_key_multi] = self._load_mapping_from_disk(mapping_key_multi)
-
-            for msg in messages_to_delete:
-                turn_info = self.message_to_history_turn.pop(msg.id, None)
-                # Fallback to multi mapping check
-                if not turn_info and mapping_key_multi in self.mapping_caches:
-                    turn_info = self.mapping_caches[mapping_key_multi].pop(str(msg.id), None)
-
-                if turn_info:
-                    if isinstance(turn_info[0], list): turn_info[0] = tuple(turn_info[0])
-
-                    # Modern Multi/Freewill Session Mapping
-                    if isinstance(turn_info[0], int):
-                        try:
-                            channel_id, session_type, turn_id = turn_info
-                            session_id = (channel_id, session_type)
-                            if session_id not in multi_turns_to_remove:
-                                multi_turns_to_remove[session_id] = set()
-                            multi_turns_to_remove[session_id].add(turn_id)
-                        except ValueError:
-                            continue
-
-            # --- Clean mapping files before cleaning history ---
-            for (channel_id, session_type), lines_to_delete in multi_turns_to_remove.items():
-                mapping_key = (session_type, channel_id)
-                if mapping_key in self.mapping_caches:
-                    keys_to_delete = [
-                        msg_id for msg_id, t_info in self.mapping_caches[mapping_key].items()
-                        if isinstance(t_info, (list, tuple)) and len(t_info) > 2 and t_info[2] in lines_to_delete
-                    ]
-                    for msg_id in keys_to_delete:
-                        self.mapping_caches[mapping_key].pop(msg_id, None)
-
+            session = self.multi_profile_channels.get(interaction.channel_id)
             cleaned_turns_count = 0
-            
-            # Process multi/freewill sessions
-            for (channel_id, session_type), turn_ids_to_delete in multi_turns_to_remove.items():
-                mapping_key = (session_type, channel_id)
-                if mapping_key in self.mapping_caches:
-                    self.mapping_caches[mapping_key].pop('grounding_checkpoint', None)
 
-                # Restore missing increment
-                cleaned_turns_count += len(turn_ids_to_delete)
-                session = self.multi_profile_channels.get(channel_id)
-                if session:
-                    if not session.get("is_hydrated"):
-                        session = self._ensure_session_hydrated(channel_id, session_type)
+            if session:
+                session_type = session.get("type", "multi")
+                if not session.get("is_hydrated"):
+                    session = self._ensure_session_hydrated(interaction.channel_id, session_type)
+
+                deleted_msg_ids = {m.id for m in messages_to_delete}
+                turn_ids_to_delete = set()
+
+                # Find which turns contain the deleted message IDs
+                for turn in session.get("unified_log", []):
+                    turn_msg_ids = turn.get("message_ids", [])
+                    if any(mid in deleted_msg_ids for mid in turn_msg_ids):
+                        turn_ids_to_delete.add(turn.get("turn_id"))
+
+                if turn_ids_to_delete:
+                    cleaned_turns_count = len(turn_ids_to_delete)
                     
                     # Decrement Individual Counters
                     for t_id in turn_ids_to_delete:
                         turn_obj = next((turn for turn in session.get("unified_log", []) if turn.get("turn_id") == t_id), None)
-                        if turn_obj:
-                            s_key = tuple(turn_obj.get("speaker_key", []))
+                        if turn_obj and turn_obj.get("is_user") is False:
+                            bot_pid = turn_obj.get("speaker_pid")
                             for p in session.get('profiles', []):
-                                if (p['owner_id'], p['profile_name']) == s_key:
+                                if self._get_pid_from_name_any(p['owner_id'], p['profile_name']) == bot_pid:
                                     p['ltm_counter'] = max(0, p.get('ltm_counter', 0) - 1)
                                     break
 
@@ -1247,36 +1200,26 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                         if turn.get("turn_id") not in turn_ids_to_delete
                     ]
 
-                    # If the log was modified, we must rebuild all in-memory chat histories
                     if len(session["unified_log"]) < original_log_len:
-                        for p_data in session["profiles"]:
-                            p_key = (p_data['owner_id'], p_data['profile_name'])
-                            participant_history = []
-                            for turn in session["unified_log"]:
-                                speaker_key = tuple(turn.get("speaker_key", []))
-                                role = 'model' if speaker_key == p_key else 'user'
-                                participant_history.append({'role': role, 'parts': [turn.get("content")]})
-                            session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
-
-                    # Check if the session is now effectively empty (contains no public turns)
-                    is_effectively_empty = not session.get("unified_log") or all(
-                        turn.get("type") in ["whisper", "private_response"] for turn in session.get("unified_log", [])
-                    )
-                    if is_effectively_empty:
-                        dummy_session_key = (channel_id, None, None)
-                        self._delete_session_from_disk(dummy_session_key, session_type)
+                        is_effectively_empty = not session.get("unified_log") or all(
+                            turn.get("type") in ["whisper", "private_response"] for turn in session.get("unified_log", [])
+                        )
                         
-                        mapping_key = (session_type, channel_id)
-                        path = self._get_mapping_path(mapping_key)
-                        _delete_file_shard(str(path))
-                        
-                        # Clear LTM cooldowns since context is gone
-                        for p_key in session.get("chat_sessions", {}).keys():
-                            owner_id, profile_name = p_key
-                            full_session_key = (channel_id, owner_id, profile_name)
-                            self.ltm_recall_history.pop(full_session_key, None)
+                        dummy_session_key = (interaction.channel_id, None, None)
+                        if is_effectively_empty:
+                            self._delete_session_from_disk(dummy_session_key, session_type)
+                            for p_key in session.get("chat_sessions", {}).keys():
+                                owner_id, profile_name = p_key
+                                full_session_key = (interaction.channel_id, owner_id, profile_name)
+                                self.ltm_recall_history.pop(full_session_key, None)
+                        else:
+                            self._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
 
-                    self.session_last_accessed[channel_id] = time.time()
+                        # Now that the correct state is on disk, force a re-read and rebuild
+                        session["is_hydrated"] = False
+                        self._ensure_session_hydrated(interaction.channel_id, session_type)
+
+                    self.session_last_accessed[interaction.channel_id] = time.time()
 
             spec = f" from {user.mention}" if user else ""
             await progress_message.edit(content=f"Deleted {len(messages_to_delete)} message(s){spec} and cleaned {cleaned_turns_count} turn(s) from memory.")
@@ -2040,23 +1983,19 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         user_id = interaction.user.id
         
-        whisper_turns = {turn['turn_id']: turn for turn in session.get("unified_log", []) if turn.get("type") == "whisper" and turn.get("whisperer_id") == user_id}
-        response_turns = {turn['turn_id']: turn for turn in session.get("unified_log", [])}
-
-        # Pair up whispers with their responses
+        # [FIXED] Changed whisperer_id to speaker_pid to match the new unified_log format
+        whisper_turns = {turn['turn_id']: turn for turn in session.get("unified_log", []) if turn.get("type") == "whisper" and turn.get("speaker_pid") == str(user_id)}
+        
         paired_whispers = []
         log = session.get("unified_log", [])
         for i, turn in enumerate(log):
             if turn.get("turn_id") in whisper_turns:
-                # Find the next turn that is a private_response from the same profile
-                if i + 1 < len(log):
-                    next_turn = log[i+1]
-                    t_key = turn.get("target_key")
-                    s_key = next_turn.get("speaker_key")
-                    
-                    # [FIXED] Ensure keys exist before casting to tuple to prevent silent crashes
-                    if next_turn.get("type") == "private_response" and t_key and s_key and tuple(s_key) == tuple(t_key):
+                # Search forward from the whisper to find the first corresponding private response
+                for j in range(i + 1, len(log)):
+                    next_turn = log[j]
+                    if next_turn.get("type") == "private_response" and turn.get("target_pid") == next_turn.get("speaker_pid"):
                         paired_whispers.append((turn, next_turn))
+                        break # Found the pair, stop searching for this whisper
 
         if not paired_whispers:
             await interaction.followup.send("You have no whisper history in this session.", ephemeral=True)

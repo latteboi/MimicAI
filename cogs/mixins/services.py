@@ -660,10 +660,9 @@ class ServicesMixin:
         
         rule_block = (
             "<context_rules>\n"
-            "ESSENTIAL CONTEXT:\n"
-            "- '[Name] [Timestamp]' are individual active participants.\n"
-            "- XML-wrapped text are data from YOU, NOT users.\n"
-            "- Respond as yourself. Do NOT include headers and technical metadata.\n"
+            "- '[Name] [ID: XXXXXXXXXXXXXXXX] [Timestamp]' are individual active participants.\n"
+            "- XML-wrapped text are either your personal data or a private message.\n"
+            "- Respond as yourself.\n"
             "</context_rules>"
         )
         current_instructions_str += "\n\n" + rule_block
@@ -771,8 +770,8 @@ class ServicesMixin:
                         for p_dict in current_opted_in_dicts:
                             if (p_dict['owner_id'], p_dict['profile_name']) in added_keys:
                                 session['profiles'].append(p_dict)
-                                model = genai.GenerativeModel('gemini-flash-latest')
-                                session['chat_sessions'][(p_dict['owner_id'], p_dict['profile_name'])] = model.start_chat(history=list(history_to_copy))
+                                # [FIXED] Initialise internal helper class directly instead of using legacy SDK methods
+                                session['chat_sessions'][(p_dict['owner_id'], p_dict['profile_name'])] = GoogleGenAIChatSession(history=list(history_to_copy))
 
                     removed_keys = session_participants_set - master_participants_set
                     if removed_keys:
@@ -904,18 +903,21 @@ class ServicesMixin:
                         elif isinstance(trigger, str):
                             # Handle string prompts
                             content = trigger
-                            author_name = "System"
-                            created_at = datetime.datetime.now(datetime.timezone.utc)
-                            
                             turn_id = str(uuid.uuid4())
+                            
+                            # XML-standardised system turn without Name/Timestamp header
+                            system_content = f"<system_note>\n{content}\n</system_note>"
+                            
                             turn_object = {
-                                "turn_id": turn_id, "speaker_key": ["system", "system"],
-                                "content": f"{author_name} {created_at.isoformat()}:\n{content}\n",
-                                "timestamp": created_at.isoformat()
+                                "turn_id": turn_id,
+                                "is_user": False,
+                                "speaker_pid": "SYSTEM",
+                                "message_ids": [],
+                                "content": system_content
                             }
                             session.get("unified_log", []).append(turn_object)
                             
-                            new_round_turn_data.append((content, None, []))
+                            new_round_turn_data.append((system_content, None, []))
                             
                             message_trigger = None
                         else: message_trigger = trigger
@@ -1003,10 +1005,14 @@ class ServicesMixin:
                         user_line = self._format_history_entry(author_name, created_at, content, author_tz, entity_id=user_hash)
                         
                         turn_id = str(uuid.uuid4())
+                        trigger_id = trigger_obj['id'] if is_child_mention else trigger_obj.id
                         
                         turn_object = {
-                            "turn_id": turn_id, "speaker_key": [triggering_user_id, "user"],
-                            "content": user_line, "timestamp": created_at.isoformat()
+                            "turn_id": turn_id, 
+                            "is_user": True,
+                            "speaker_pid": str(triggering_user_id),
+                            "message_ids": [trigger_id],
+                            "content": user_line
                         }
                         if url_text_content:
                             # Clear any previous URL context from the log to make the new one exclusive
@@ -1017,19 +1023,8 @@ class ServicesMixin:
                             
                         session.get("unified_log", []).append(turn_object)
 
-                        session_type = session.get("type", "multi")
-                        turn_data = (channel_id, session_type, turn_id)
-                        trigger_id = trigger_obj['id'] if is_child_mention else trigger_obj.id
-                        self.message_to_history_turn[trigger_id] = turn_data
-                        
-                        mapping_key = (session_type, channel_id)
-                        if mapping_key not in self.mapping_caches:
-                            self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
-                        self.mapping_caches[mapping_key][str(trigger_id)] = turn_data
-
                         # [NEW] Immediate persistence for user turns
                         self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
-                        self._save_mapping_to_disk(mapping_key, self.mapping_caches[mapping_key])
                         
                         # Initialize list for standard message attachments/reply images
                         new_message_parts = []
@@ -1428,18 +1423,7 @@ class ServicesMixin:
                                 grounding_sources = g_sources
                             grounding_profile_key = (g_owner_id, g_profile_name)
                             if should_set_checkpoint:
-                                trigger_message = None
-                                if isinstance(initial_trigger, discord.Message):
-                                    trigger_message = initial_trigger
-                                elif isinstance(initial_trigger, tuple) and len(initial_trigger) > 1 and isinstance(initial_trigger[1], discord.Message):
-                                    trigger_message = initial_trigger[1]
-                                
-                                if trigger_message:
-                                    turn_info = self.message_to_history_turn.get(trigger_message.id)
-                                    if turn_info and len(turn_info) > 2:
-                                        turn_id = turn_info[2]
-                                        if mapping_key not in self.mapping_caches: self.mapping_caches[mapping_key] = {}
-                                        self.mapping_caches[mapping_key]['grounding_checkpoint'] = turn_id
+                                session["grounding_checkpoint"] = turn_id
 
                 ## [NEW] Phase: Research Once (URL Context)
                 round_url_text_contexts = []
@@ -1543,7 +1527,7 @@ class ServicesMixin:
                             role = 'model' if author_id == participant_user_id else 'user'
                             e_id = self._get_user_hash(author_id)
                             formatted_line = self._format_history_entry(author_name, timestamp, content, entity_id=e_id)
-                            content_obj = content_types.to_content({'role': role, 'parts': [formatted_line]})
+                            content_obj = {'role': role, 'parts': [formatted_line]}
                             initial_history_content.append(content_obj)
 
                         chat_session.history = initial_history_content + chat_session.history
@@ -1628,10 +1612,10 @@ class ServicesMixin:
 
                         if p_settings.get("url_fetching_enabled", True) and round_url_text_contexts:
                             url_instr = "<url_research>\n[Context from links in current messages]:\n" + "\n".join(round_url_text_contexts) + "\n</url_research>"
-                            contents_for_api_call.append(content_types.to_content({'role': 'user', 'parts': [url_instr]}))
+                            contents_for_api_call.append({'role': 'user', 'parts': [url_instr]})
 
                         if not contents_for_api_call:
-                            contents_for_api_call.append(content_types.to_content({'role': 'user', 'parts': ["<internal_note>Start the conversation.</internal_note>"]}))
+                            contents_for_api_call.append({'role': 'user', 'parts':["<internal_note>Start the conversation.</internal_note>"]})
 
                         ltm_recall_text = await self._get_relevant_ltm_for_prompt(session_key, chat_session.history, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id)
 
@@ -2189,11 +2173,15 @@ class ServicesMixin:
                         history_line = main_history_line
 
                     turn_id = str(uuid.uuid4())
+                    bot_pid = self._get_pid_from_name_any(owner_id, profile_name)
                     turn_object = {
                         "turn_id": turn_id,
-                        "speaker_key": [owner_id, profile_name],
-                        "content": history_line,
-                        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                        "is_user": False,
+                        "speaker_pid": bot_pid,
+                        "owner_id": owner_id,
+                        "profile_name": profile_name,
+                        "message_ids": [],
+                        "content": history_line
                     }
                     if profile_settings.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
                         sig = response.thought_signature
@@ -2203,7 +2191,7 @@ class ServicesMixin:
                     session.get("unified_log", []).append(turn_object)
                     session['last_speaker_key'] = participant_key
 
-                    # [UPDATED] Persist log immediately; Mapping save is now handled after message delivery
+                    # [UPDATED] Persist log immediately
                     session_type = session.get("type", "multi")
                     self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
 
@@ -2414,18 +2402,11 @@ class ServicesMixin:
                         if sent_messages:
                             session['last_bot_message_id'] = sent_messages[-1].id
                             session_type = session.get("type", "multi")
-                            turn_data = (channel_id, session_type, turn_id)
                             
-                            mapping_key = (session_type, channel_id)
-                            if mapping_key not in self.mapping_caches:
-                                self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
-
                             for msg in sent_messages:
-                                self.message_to_history_turn[msg.id] = turn_data
-                                self.mapping_caches[mapping_key][str(msg.id)] = turn_data
+                                turn_object.setdefault("message_ids", []).append(msg.id)
                             
-                            # [FIXED] Persist mappings to disk AFTER message IDs are added to the cache
-                            self._save_mapping_to_disk(mapping_key, self.mapping_caches[mapping_key])
+                            self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
                     
                     if sources_text:
                         for line in sources_text.split('\n'):
@@ -2563,22 +2544,15 @@ class ServicesMixin:
                                     new_turn_id = str(uuid.uuid4())
                                     new_turn_object = {
                                         "turn_id": new_turn_id,
-                                        "speaker_key": [trigger.author.id, "user"],
-                                        "content": user_line,
-                                        "timestamp": trigger.created_at.isoformat()
+                                        "is_user": True,
+                                        "speaker_pid": str(trigger.author.id),
+                                        "message_ids": [trigger.id],
+                                        "content": user_line
                                     }
                                     if url_text_batch:
                                         new_turn_object["url_context"] = url_text_batch
                                     session.get("unified_log", []).append(new_turn_object)
 
-                                    session_type = session.get("type", "multi")
-                                    turn_data = (channel_id, session_type, new_turn_id)
-                                    self.message_to_history_turn[trigger.id] = turn_data
-                                    
-                                    mapping_key = (session_type, channel_id)
-                                    if mapping_key not in self.mapping_caches:
-                                        self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
-                                    self.mapping_caches[mapping_key][str(trigger.id)] = turn_data
                             all_triggers_for_round.extend(batched_triggers)
                     
                     # Force garbage collection to clear image buffers from this turn
@@ -2674,21 +2648,20 @@ class ServicesMixin:
                 if 'all_triggers_for_round' in locals(): del all_triggers_for_round
 
                 # Trim the unified log to be the single source of truth for the session's history window.
-                if len(session.get("unified_log", [])) > self.max_history_items * 2:
-                    session["unified_log"] = session["unified_log"][-(self.max_history_items * 2):]
+                if len(session.get("unified_log", [])) > 1000:
+                    session["unified_log"] = session["unified_log"][-1000:]
 
                 # [NEW] Mandatory Round-End Persistence
                 # Ensures the transcript is saved immediately after the last participant speaks.
                 dummy_session_key = (channel_id, None, None)
                 self._save_session_to_disk(dummy_session_key, session_type, session.get("unified_log", []))
-                if (session_type, channel_id) in self.mapping_caches:
-                    self._save_mapping_to_disk((session_type, channel_id), self.mapping_caches[(session_type, channel_id)])
 
                 # Rebuild all participant histories from the trimmed unified log to ensure consistency.
                 trimmed_unified_log = session.get("unified_log", [])
 
                 for p_data in session["profiles"]:
                     p_key = (p_data['owner_id'], p_data['profile_name'])
+                    bot_pid = self._get_pid_from_name_any(p_data['owner_id'], p_data['profile_name'])
                     
                     p_index = self._get_user_index(p_data['owner_id'])
                     p_is_borrowed = p_data['profile_name'] in p_index.get("borrowed", [])
@@ -2701,8 +2674,7 @@ class ServicesMixin:
                     for turn in history_slice:
                         turn_type = turn.get("type")
                         if not turn_type:
-                            speaker_key = tuple(turn.get("speaker_key", []))
-                            role = 'model' if speaker_key == p_key else 'user'
+                            role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
                             
                             # [UPDATED] Standardised Headers
                             parts = [turn.get("content")]
@@ -2945,22 +2917,9 @@ class ServicesMixin:
                             file=image_file_to_send, reply_to=anchor_msg
                         )
                         
-                        turn_data = (model_cache_key, 'single', turn_id)
-                        mapping_key = self._get_mapping_key_for_session(model_cache_key, 'single')
-                        if mapping_key not in self.mapping_caches: self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
+                        # [NEW] Find the turn in chat history (for single-profile) or session log and attach message IDs
+                        # Since single-profile sessions are also pivoting, we assume 'package' contains the turn info.
                         
-                        # Map the original user trigger message
-                        original_message_id = package.get("original_message_id")
-                        if original_message_id:
-                            self.message_to_history_turn[original_message_id] = turn_data
-                            self.mapping_caches[mapping_key][str(original_message_id)] = turn_data
-
-                        # Map the bot's response messages
-                        if sent_messages:
-                            for msg in sent_messages: 
-                                self.message_to_history_turn[msg.id] = turn_data
-                                self.mapping_caches[mapping_key][str(msg.id)] = turn_data
-                    
                     grounding_sources = package.get("grounding_sources")
                     grounding_mode = package.get("grounding_mode")
                     if grounding_mode == "on+" and grounding_sources:
@@ -3363,7 +3322,9 @@ class ServicesMixin:
         cfg = {"temperature": 0.2}
         ltm_model_name = 'gemini-flash-lite-latest'
         
-        api_key = self._get_api_key_for_guild(guild_id) if guild_id else self._get_api_key_for_user(profile_owner_id)
+        # Use provided guild_id, or fallback to 0 (DM context)
+        effective_guild_id = guild_id or 0
+        api_key = self._get_api_key_for_guild(effective_guild_id) if effective_guild_id else self._get_api_key_for_user(profile_owner_id)
         if not api_key: return None
 
         status = "api_error"
@@ -3683,14 +3644,12 @@ class ServicesMixin:
 
     async def _get_or_create_webhook(self, channel: Union[discord.TextChannel, discord.Thread]) -> Optional[discord.Webhook]:
         parent_channel = channel.parent if isinstance(channel, discord.Thread) else channel
-        if parent_channel.id in self.channel_webhooks:
-            try:
-                wh_data = self.channel_webhooks[parent_channel.id]
-                return discord.Webhook.from_url(wh_data['url'], session=self.bot.http._HTTPClient__session)
-            except (discord.errors.InvalidArgument, KeyError):
-                pass
         
-        if parent_channel.permissions_for(parent_channel.guild.me).manage_webhooks:
+        # Soft-fail for DMs or environments without guilds
+        if not getattr(parent_channel, 'guild', None):
+            return None
+            
+        if parent_channel.id in self.channel_webhooks:
             try:
                 webhooks = await parent_channel.webhooks()
                 bot_webhook = next((wh for wh in webhooks if wh.user and wh.user.id == self.bot.user.id), None)
@@ -3712,20 +3671,16 @@ class ServicesMixin:
                 scrubbed_text = scrubbed_text.replace("&#x20;", " ")
 
                 # 1. Global XML Tag Scrubber (Internal thoughts, metadata, and context)
-                # Removes paired tags and everything in between globally
                 scrubbed_text = re.sub(r'<([^>]+)>.*?</\1>', '', scrubbed_text, flags=re.DOTALL)
-                # Removes any remaining single or unclosed tags globally
                 scrubbed_text = re.sub(r'<[^>]+>', '', scrubbed_text)
                 
-                # Strip hallucinated IDs
-                scrubbed_text = re.sub(r'\[ID:\s*[A-Z0-9]{8}\]', '', scrubbed_text, flags=re.IGNORECASE)
-
-                # 2. Broad Global Header Scrubber (Name [ID] [Timestamp]:)
-                pattern_header_global = r'[^\[\n\r]+ (?:\[ID:\s*[A-Z0-9]{8}\]\s*)?\[[^\]\r\n]+\]:?\s*'
-                scrubbed_text = re.sub(pattern_header_global, '', scrubbed_text)
+                # 2. Simplified Header Scrubber
+                # This matches ANY line containing a bracketed block of 15+ characters (the timestamp signature)
+                # and removes that entire line. Multiline mode (?m) ensures it catches mid-paragraph hallucinations.
+                pattern_timestamp_line = r'(?m)^.*\[[^\]\r\n]{15,}\].*$'
+                scrubbed_text = re.sub(pattern_timestamp_line, '', scrubbed_text)
 
                 # 3. Global Technical Metadata Scrubber
-                # Catches (Thought Initiated: ... | Duration: ...) even if partially stripped
                 pattern_metadata = r'\(?\s*(?:Thought Initiated:)?\s*[^|\n\r]*?\|?\s*Duration: \d+\.\d+s\s*\)?'
                 scrubbed_text = re.sub(pattern_metadata, '', scrubbed_text, flags=re.IGNORECASE)
 
@@ -4019,10 +3974,6 @@ class ServicesMixin:
                         self._safe_cancel_task(session_to_evict['worker_task'])
                         session_to_evict['worker_task'] = None
                     
-                    mapping_key = (session_type, key)
-                    if mapping_key in self.mapping_caches:
-                        self._save_mapping_to_disk(mapping_key, self.mapping_caches.pop(mapping_key))
-
                     # FIXED: Aggressively dehydrate the session to release memory.
                     session_to_evict['is_hydrated'] = False
                     
@@ -4046,10 +3997,6 @@ class ServicesMixin:
                     session_type = 'global_chat' if key in self.global_chat_sessions else 'single'
                     self._save_session_to_disk(key, session_type, session_to_save)
                     
-                    mapping_key = self._get_mapping_key_for_session(key, session_type)
-                    if mapping_key in self.mapping_caches:
-                        self._save_mapping_to_disk(mapping_key, self.mapping_caches.pop(mapping_key))
-
                 self.chat_sessions.pop(key, None)
                 self.global_chat_sessions.pop(key, None)
 
@@ -4210,9 +4157,13 @@ class ServicesMixin:
                     if owner_id and original_name:
                         owner_index = self._get_user_index(int(owner_id))
                         if original_name not in owner_index.get("personal", []):
-                            index["borrowed"].remove(borrowed_name)
+                            if isinstance(index["borrowed"], dict):
+                                pid = index["borrowed"].pop(borrowed_name, borrowed_name)
+                            else:
+                                index["borrowed"].remove(borrowed_name)
+                                pid = borrowed_name
                             import shutil
-                            shutil.rmtree(str(users_path / user_id_str / "profiles" / borrowed_name), ignore_errors=True)
+                            shutil.rmtree(str(users_path / user_id_str / "profiles" / pid), ignore_errors=True)
                             cleaned_borrows += 1
                             data_changed = True
             
@@ -4233,15 +4184,24 @@ class ServicesMixin:
         for user_id_str in user_dirs:
             profiles_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles")
             if not os.path.isdir(profiles_dir): continue
-            index = self._get_user_index(int(user_id_str))
-            owner_profiles = set(index.get("personal", []))
+            index = self.cog._get_user_index(int(user_id_str))
             
-            for profile_name in os.listdir(profiles_dir):
-                bot_file = os.path.join(profiles_dir, profile_name, "child_bot.json.gz")
-                if os.path.exists(bot_file) and profile_name not in owner_profiles:
-                    _delete_file_shard(bot_file)
-                    cleaned_child_bots += 1
-                    child_bots_changed = True
+            # [FIXED] Correctly resolve valid PIDs from the index (Personal only)
+            valid_pids = {DEFAULT_PROFILE_NAME}
+            personal_entry = index.get("personal", {})
+            if isinstance(personal_entry, dict):
+                valid_pids.update(personal_entry.values())
+            else:
+                valid_pids.update(personal_entry)
+            
+            for pid_folder in os.listdir(profiles_dir):
+                bot_file = os.path.join(profiles_dir, pid_folder, "child_bot.json.gz")
+                if os.path.exists(bot_file):
+                    # Check if the folder itself is valid before deleting its config
+                    if pid_folder not in valid_pids:
+                        _delete_file_shard(bot_file)
+                        cleaned_child_bots += 1
+                        child_bots_changed = True
                     
         if child_bots_changed: self._load_child_bots()
 
@@ -4693,57 +4653,29 @@ class ServicesMixin:
 
         confirmation_data = self.pending_child_confirmations.pop(correlation_id)
         message_ids = event_data.get("message_ids", [])
+        if not message_ids: return
         
         try:
             if confirmation_data.get("type") == "single_profile":
-                bot_id = confirmation_data.get("bot_id")
-                bot_config = self.child_bots.get(bot_id, {})
-                owner_id = bot_config.get("owner_id")
-                profile_name = bot_config.get("profile_name")
-                
-                if owner_id is not None and profile_name:
-                    channel_id = confirmation_data.get("channel_id") or event_data.get("channel_id")
-                    if not channel_id: return
-
-                    session_key = (channel_id, owner_id, profile_name)
-                    chat = self.chat_sessions.get(session_key)
-                    if chat:
-                        turn_id = confirmation_data.get("turn_id")
-                        if turn_id is None: return
-
-                        turn_data = (session_key, 'single', turn_id)
-                        mapping_key = self._get_mapping_key_for_session(session_key, 'single')
-                        if mapping_key not in self.mapping_caches:
-                            self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
-
-                        for msg_id in message_ids:
-                            self.message_to_history_turn[msg_id] = turn_data
-                            self.mapping_caches[mapping_key][str(msg_id)] = turn_data
+                pass # Deprecated Single Profile handling
             
             elif confirmation_data.get("type") == "multi_profile":
-                participant = confirmation_data.get("participant")
                 channel_id = confirmation_data.get("channel_id")
                 turn_id = confirmation_data.get("turn_id")
 
-                if not all([participant, channel_id, turn_id]):
+                if not all([channel_id, turn_id]):
                     return
 
                 session = self.multi_profile_channels.get(channel_id)
-                if session and message_ids:
+                if session:
                     session['last_bot_message_id'] = message_ids[-1]
+                    for turn in session.get("unified_log", []):
+                        if turn.get("turn_id") == turn_id:
+                            turn.setdefault("message_ids", []).extend(message_ids)
+                            break
+                    
                     session_type = session.get("type", "multi")
-                    turn_data = (channel_id, session_type, turn_id)
-                    
-                    mapping_key = (session_type, channel_id)
-                    if mapping_key not in self.mapping_caches:
-                        self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
-
-                    for msg_id in message_ids:
-                        self.message_to_history_turn[msg_id] = turn_data
-                        self.mapping_caches[mapping_key][str(msg_id)] = turn_data
-                    
-                    # [NEW] Persist new mappings to disk after Child Bot confirmation
-                    self._save_mapping_to_disk(mapping_key, self.mapping_caches[mapping_key])
+                    self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
         
         except Exception as e:
             print(f"Error during child bot confirmation ({correlation_id}): {e}")
@@ -4753,7 +4685,7 @@ class ServicesMixin:
             if "event" in confirmation_data and confirmation_data["event"]:
                 confirmation_data["event"].set()
 
-    async def _is_profile_content_safe(self, profile_name: str, display_name: str, avatar_url: Optional[str], guild_id: int) -> Tuple[bool, str]:
+    async def _is_profile_content_safe(self, user_id: int, profile_name: str, display_name: str, avatar_url: Optional[str]) -> Tuple[bool, str]:
         # Create a safer prompt that describes the content instead of including it directly.
         # The actual user content will be in the 'parts' of the request.
         prompt_text = (
@@ -4788,9 +4720,9 @@ class ServicesMixin:
                 return False, "An error occurred while processing the avatar URL."
 
         try:
-            api_key = self._get_api_key_for_guild(guild_id)
+            api_key = self._get_api_key_for_user(user_id)
             if not api_key:
-                return False, "Server API key is not available for moderation."
+                return False, "A Personal Google Gemini API Key is required to perform safety analysis for public profiles. Please configure one via the `/settings` command."
             
             model_name = 'gemini-flash-lite-latest'
             status = "api_error"
@@ -4814,7 +4746,7 @@ class ServicesMixin:
                 response = await model.generate_content_async(eval_payload)
                 status = "blocked_by_safety" if not response.candidates else "success"
             finally:
-                self._log_api_call(user_id=0, guild_id=guild_id, context="moderation_check", model_used=model_name, status=status)
+                self._log_api_call(user_id=0, guild_id=None, context="moderation_check", model_used=model_name, status=status)
 
             if not response.candidates:
                 reason = "Unknown"
@@ -5284,17 +5216,21 @@ class ServicesMixin:
         return text_contexts, media_parts
 
     async def _get_hybrid_grounding_context(self, user_query: str, guild_id: int, conversation_history: List, mapping_key: Any, safety_settings: Optional[Dict] = None, is_for_image: bool = False) -> Optional[Tuple[str, List[Dict], bool]]:
-        api_key = self._get_api_key_for_guild(guild_id)
+        effective_guild_id = guild_id or 0
+        api_key = self._get_api_key_for_guild(effective_guild_id)
         if not api_key:
             return None
 
         status = "api_error"
         model_name = 'gemini-2.0-flash' # Use a single, tool-capable model
         try:
-            if mapping_key not in self.mapping_caches:
-                self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
-            mapping_data = self.mapping_caches.get(mapping_key, {})
-            checkpoint = mapping_data.get("grounding_checkpoint")
+            # Check for grounding checkpoint in the session log rather than a separate mapping
+            checkpoint = None
+            session_id = mapping_key[1] if isinstance(mapping_key, tuple) else None
+            if session_id:
+                session = self.multi_profile_channels.get(session_id)
+                if session:
+                    checkpoint = session.get("grounding_checkpoint")
 
             history_for_decision = conversation_history
             if checkpoint is not None:
@@ -5835,18 +5771,13 @@ class ServicesMixin:
         turn_id = turn_object.get("turn_id")
         session_type = session.get("type", "multi")
         dummy_key = (channel.id, None, None)
-        mapping_key = (session_type, channel.id)
         
         # Ensure session state is flushed to disk immediately (Crucial for first-message ad-hoc sessions)
         self._save_multi_profile_sessions()
         self._save_session_to_disk(dummy_key, session_type, session["unified_log"])
         
         try:
-            if mapping_key not in self.mapping_caches:
-                self.mapping_caches[mapping_key] = self._load_mapping_from_disk(mapping_key)
-            
-            mapping_data = self.mapping_caches[mapping_key]
-            message_ids_to_check = [int(mid) for mid, tinfo in mapping_data.items() if isinstance(tinfo, (list, tuple)) and len(tinfo) > 2 and tinfo[2] == turn_id]
+            message_ids_to_check = turn_object.get("message_ids", [])
             
             # Initial Edit to Placeholder
             if participant.get('method') == 'child_bot':
@@ -5876,8 +5807,6 @@ class ServicesMixin:
                     has_image = any(a.content_type and a.content_type.startswith("image/") for a in msg.attachments)
                     if not is_sources and not has_image:
                         await msg.delete()
-                        self.message_to_history_turn.pop(msg_id, None)
-                        mapping_data.pop(str(msg_id), None)
                 except: pass
 
             # 3. History Slicing (Time Travel)
@@ -5885,18 +5814,31 @@ class ServicesMixin:
             p_owner_id = participant['owner_id']
             p_name = participant['profile_name']
             p_key = (p_owner_id, p_name)
+            bot_pid = self._get_pid_from_name_any(p_owner_id, p_name)
             
             participant_history = []
             for turn in sliced_unified_log:
-                # [NEW] Respect Mute Reactions in history slice
                 if turn.get("is_hidden", False):
                     continue
-                    
-                speaker_key = tuple(turn.get("speaker_key", []))
-                role = 'model' if speaker_key == p_key else 'user'
-                participant_history.append({'role': role, 'parts': [turn.get("content")]})
+                
+                turn_type = turn.get("type")
+                if not turn_type:
+                    role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
+                    participant_history.append({'role': role, 'parts': [turn.get("content")]})
+                elif turn_type == "whisper":
+                    if turn.get("target_pid") == bot_pid:
+                        clean_content = turn.get("content")
+                        header, body = clean_content.split('\n', 1)
+                        wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
+                        participant_history.append({'role': 'user', 'parts': [wrapped]})
+                elif turn_type == "private_response":
+                    if turn.get("speaker_pid") == bot_pid:
+                        clean_content = turn.get("content")
+                        header, body = clean_content.split('\n', 1)
+                        wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
+                        participant_history.append({'role': 'model', 'parts': [wrapped]})
 
-            # [NEW] Pseudo-turn injection to ensure history ends with a 'user' role
+            # Pseudo-turn injection to ensure history ends with a 'user' role
             if participant_history and participant_history[-1].get('role', 'user') == 'model':
                 participant_history.append({'role': 'user', 'parts': ["<internal_note>No response from anyone OR no user is present.</internal_note>"]})
             elif not participant_history:
@@ -5909,43 +5851,41 @@ class ServicesMixin:
             )
             if not model: return
 
-            last_user_turn = next((t for t in reversed(sliced_unified_log) if tuple(t.get("speaker_key", [])) != p_key), None)
+            last_user_turn = next((t for t in reversed(sliced_unified_log) if t.get("is_user") is True), None)
             trigger_content = last_user_turn.get("content", "") if last_user_turn else ""
             
             # [NEW] Media Recovery Logic for Regeneration
             recovered_media_parts = []
             if last_user_turn:
-                last_turn_id = last_user_turn.get("turn_id")
-                if last_turn_id:
-                    # Reverse lookup the original Discord message ID for this turn
-                    target_msg_id = next((int(mid) for mid, tinfo in mapping_data.items() if isinstance(tinfo, (list, tuple)) and len(tinfo) > 2 and tinfo[2] == last_turn_id), None)
-                    if target_msg_id:
-                        try:
-                            target_msg = await channel.fetch_message(target_msg_id)
-                            # Recover standard attachments
-                            attachments = [a for a in target_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))]
-                            if attachments:
-                                async with httpx.AsyncClient() as client:
-                                    for attachment in attachments:
-                                        response = await client.get(attachment.url)
-                                        response.raise_for_status()
-                                        recovered_media_parts.append({"mime_type": attachment.content_type, "data": await response.aread()})
-                            
-                            # Recover replied-to media
-                            if target_msg.reference and target_msg.reference.message_id:
-                                ref_msg = target_msg.reference.resolved
-                                if not ref_msg:
-                                    r_ch = self.bot.get_channel(target_msg.reference.channel_id)
-                                    if r_ch: ref_msg = await r_ch.fetch_message(target_msg.reference.message_id)
-                                if ref_msg and ref_msg.attachments:
-                                    ref_media = next((a for a in ref_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))), None)
-                                    if ref_media:
-                                        async with httpx.AsyncClient() as client:
-                                            resp = await client.get(ref_media.url)
-                                            if resp.status_code == 200:
-                                                recovered_media_parts.append({"mime_type": ref_media.content_type, "data": await resp.aread()})
-                        except Exception as e:
-                            print(f"Failed to recover media for regeneration: {e}")
+                user_msg_ids = last_user_turn.get("message_ids", [])
+                if user_msg_ids:
+                    target_msg_id = user_msg_ids[-1]
+                    try:
+                        target_msg = await channel.fetch_message(target_msg_id)
+                        # Recover standard attachments
+                        attachments = [a for a in target_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))]
+                        if attachments:
+                            async with httpx.AsyncClient() as client:
+                                for attachment in attachments:
+                                    response = await client.get(attachment.url)
+                                    response.raise_for_status()
+                                    recovered_media_parts.append({"mime_type": attachment.content_type, "data": await response.aread()})
+                        
+                        # Recover replied-to media
+                        if target_msg.reference and target_msg.reference.message_id:
+                            ref_msg = target_msg.reference.resolved
+                            if not ref_msg:
+                                r_ch = self.bot.get_channel(target_msg.reference.channel_id)
+                                if r_ch: ref_msg = await r_ch.fetch_message(target_msg.reference.message_id)
+                            if ref_msg and ref_msg.attachments:
+                                ref_media = next((a for a in ref_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))), None)
+                                if ref_media:
+                                    async with httpx.AsyncClient() as client:
+                                        resp = await client.get(ref_media.url)
+                                        if resp.status_code == 200:
+                                            recovered_media_parts.append({"mime_type": ref_media.content_type, "data": await resp.aread()})
+                    except Exception as e:
+                        print(f"Failed to recover media for regeneration: {e}")
 
             # Inject recovered media into the history right before generation
             if recovered_media_parts and participant_history:
@@ -6028,7 +5968,6 @@ class ServicesMixin:
 
             # Re-sync memory and save final state
             self._save_session_to_disk(dummy_key, session_type, session["unified_log"])
-            self._save_mapping_to_disk(mapping_key, mapping_data)
             
             # Re-hydrate histories for all participants to reflect the edit
             session["is_hydrated"] = False
