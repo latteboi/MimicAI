@@ -2679,15 +2679,18 @@ class CoreMixin:
         
         return False
     
-    async def _accept_share_request(self, interaction: discord.Interaction, sharer_id: int, profile_name: str, desired_name: str, is_public_borrow: bool = False):
-        owner_profile_data = self._get_profile_config(sharer_id, profile_name, False)
+    async def _accept_share_request(self, interaction: discord.Interaction, sharer_id: int, target_pid: Optional[str], fallback_name: str, desired_name: str, is_public_borrow: bool = False):
+        current_name = self._get_name_from_pid(sharer_id, target_pid) if target_pid else fallback_name
+        if not current_name: current_name = fallback_name
+
+        owner_profile_data = self._get_profile_config(sharer_id, current_name, False)
         if not owner_profile_data:
             await interaction.followup.send("The shared profile seems to no longer exist.", ephemeral=True)
             return
 
         # [NEW] Dynamic Limit Check
         index = self._get_user_index(interaction.user.id)
-        current_borrowed = len(index.get("borrowed", []))
+        current_borrowed = len(index.get("borrowed",[]))
         
         limit = defaultConfig.LIMIT_BORROWED_PREMIUM if self.is_user_premium(interaction.user.id) else defaultConfig.LIMIT_BORROWED_FREE
 
@@ -2698,7 +2701,8 @@ class CoreMixin:
 
         snapshot_data = {
             "original_owner_id": str(sharer_id),
-            "original_profile_name": profile_name,
+            "original_pid": target_pid or owner_profile_data.get("profile_id"),
+            "original_profile_name": current_name,
             "original_profile_id": owner_profile_data.get("profile_id", "00000000"),
             "borrowed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "grounding_enabled": owner_profile_data.get("grounding_enabled", False),
@@ -2741,18 +2745,22 @@ class CoreMixin:
                 with open(os.path.join(p_dir, "name.txt"), "w", encoding="utf-8") as f:
                     f.write(desired_name)
             else:
-                index.setdefault("borrowed", []).append(desired_name)
+                index.setdefault("borrowed",[]).append(desired_name)
             self._save_user_index(interaction.user.id, index)
             
         self._save_profile_config(interaction.user.id, desired_name, snapshot_data, is_borrowed=True)
         
         if not is_public_borrow:
-            await self._reject_share_request(interaction, sharer_id, profile_name, notify_sharer=True, accepted=True)
+            await self._reject_share_request(interaction, sharer_id, target_pid, fallback_name, notify_sharer=True, accepted=True)
 
-    async def _reject_share_request(self, interaction: discord.Interaction, sharer_id: int, profile_name: str, notify_sharer: bool = True, accepted: bool = False):
+    async def _reject_share_request(self, interaction: discord.Interaction, sharer_id: int, target_pid: Optional[str], fallback_name: str, notify_sharer: bool = True, accepted: bool = False):
         recipient_id_str = str(interaction.user.id)
         if recipient_id_str in self.profile_shares:
-            updated_shares = [s for s in self.profile_shares[recipient_id_str] if not (s['sharer_id'] == sharer_id and s['profile_name'] == profile_name)]
+            if target_pid:
+                updated_shares = [s for s in self.profile_shares[recipient_id_str] if not (s['sharer_id'] == sharer_id and s.get('original_pid') == target_pid)]
+            else:
+                updated_shares =[s for s in self.profile_shares[recipient_id_str] if not (s['sharer_id'] == sharer_id and s['profile_name'] == fallback_name)]
+                
             if not updated_shares:
                 del self.profile_shares[recipient_id_str]
             else:
@@ -2764,7 +2772,7 @@ class CoreMixin:
             if sharer:
                 status = "accepted" if accepted else "rejected"
                 try:
-                    await sharer.send(f"Your share request for '{profile_name}' to **{interaction.user.name}** was **{status}**.")
+                    await sharer.send(f"Your share request for '{fallback_name}' to **{interaction.user.name}** was **{status}**.")
                 except discord.Forbidden:
                     pass
 

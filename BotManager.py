@@ -169,25 +169,38 @@ async def main():
         defaultConfig.ENCRYPTION_KEY = _clean_key(input("Enter ENCRYPTION_KEY: "))
         print("----------------------------------\n")
     else:
+        gcp_project_id = os.getenv("GCP_PROJECT_ID")
+        if gcp_project_id:
+            print(f"GCP_PROJECT_ID detected ({gcp_project_id}). Fetching keys from Google Cloud Secret Manager...")
+            try:
+                from google.cloud import secretmanager
+                client = secretmanager.SecretManagerServiceClient()
+                
+                def fetch_secret(secret_name):
+                    try:
+                        name = f"projects/{gcp_project_id}/secrets/{secret_name}/versions/latest"
+                        response = client.access_secret_version(request={"name": name})
+                        return response.payload.data.decode("UTF-8").strip()
+                    except Exception as e:
+                        print(f"Failed to fetch {secret_name} from GCP: {e}")
+                        return None
+
+                if not os.getenv("DISCORD_SDK"): os.environ["DISCORD_SDK"] = fetch_secret("DISCORD_SDK") or ""
+                if not os.getenv("DISCORD_OWNER_ID"): os.environ["DISCORD_OWNER_ID"] = fetch_secret("DISCORD_OWNER_ID") or ""
+                if not os.getenv("ENCRYPTION_KEY"): os.environ["ENCRYPTION_KEY"] = fetch_secret("ENCRYPTION_KEY") or ""
+            except ImportError:
+                print("WARNING: 'google-cloud-secret-manager' library not found. Please install it to use GCP secrets.")
+            except Exception as e:
+                print(f"WARNING: GCP Secret Manager initialization failed: {e}")
+
         # Force re-read from environment and clean
         defaultConfig.DISCORD_SDK = _clean_key(os.getenv("DISCORD_SDK"))
         defaultConfig.DISCORD_OWNER_ID = _clean_key(os.getenv("DISCORD_OWNER_ID"))
         defaultConfig.ENCRYPTION_KEY = _clean_key(os.getenv("ENCRYPTION_KEY"))
         
         if not defaultConfig.DISCORD_SDK or not defaultConfig.ENCRYPTION_KEY:
-            print("CRITICAL ERROR: MANUAL_AUTH_MODE is False, but your keys are missing from the .env file.")
+            print("CRITICAL ERROR: MANUAL_AUTH_MODE is False, but your keys are missing from the .env file and GCP Secret Manager.")
             return
-
-    # Validate Fernet Key Integrity before proceeding
-    try:
-        Fernet(defaultConfig.ENCRYPTION_KEY)
-    except ValueError:
-        print("\nCRITICAL ERROR: The ENCRYPTION_KEY provided is invalid.")
-        print("A valid key must be exactly 44 url-safe base64 characters. If you copied it, ensure you didn't miss the '=' at the end.")
-        return
-    except Exception as e:
-        print(f"\nCRITICAL ERROR: Could not validate ENCRYPTION_KEY: {e}")
-        return
 
     # System Lock Verification
     lock_path = os.path.join(os.path.dirname(__file__), "cogs", "data", "system_lock.json")

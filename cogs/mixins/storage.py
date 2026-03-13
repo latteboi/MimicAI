@@ -185,6 +185,15 @@ class StorageMixin:
             return index["borrowed"][profile_name]
         return profile_name
 
+    def _get_name_from_pid(self, user_id: int, target_pid: str) -> Optional[str]:
+        if target_pid == DEFAULT_PROFILE_NAME: return DEFAULT_PROFILE_NAME
+        index = self._get_user_index(user_id)
+        personal = index.get("personal", {})
+        if isinstance(personal, dict):
+            for name, pid in personal.items():
+                if pid == target_pid: return name
+        return None
+
     def _is_valid_profile_name(self, name: str) -> tuple[bool, str]:
         if not name or not name.strip():
             return False, "Profile name cannot be empty."
@@ -1529,20 +1538,27 @@ class StorageMixin:
             b_config = self._get_profile_config(user_id, local_name, True)
             if b_config:
                 o_id = b_config.get("original_owner_id")
+                o_pid = b_config.get("original_pid")
                 o_name = b_config.get("original_profile_name")
-                if o_id and o_name:
-                    profiles_by_owner.setdefault(str(o_id), []).append((local_name, o_name))
+                if o_id and (o_pid or o_name):
+                    profiles_by_owner.setdefault(str(o_id),[]).append((local_name, o_pid, o_name))
 
         removed_count = 0
-        ids_to_remove = []
+        ids_to_remove =[]
 
         for owner_id_str, items in profiles_by_owner.items():
             owner_index = self._get_user_index(int(owner_id_str))
-            owner_profiles = owner_index.get("personal", [])
-            
-            for local_name, original_name in items:
-                if original_name not in owner_profiles:
-                    ids_to_remove.append(local_name)
+            owner_personal = owner_index.get("personal", {})
+            valid_pids = list(owner_personal.values()) if isinstance(owner_personal, dict) else[]
+            valid_names = list(owner_personal.keys()) if isinstance(owner_personal, dict) else owner_personal
+
+            for local_name, o_pid, o_name in items:
+                if o_pid:
+                    if o_pid not in valid_pids:
+                        ids_to_remove.append(local_name)
+                else:
+                    if o_name not in valid_names:
+                        ids_to_remove.append(local_name)
 
         if ids_to_remove:
             if isinstance(borrowed, dict):
@@ -1563,7 +1579,7 @@ class StorageMixin:
             
         return removed_count
 
-    def _cascade_delete_borrowed_profiles(self, original_owner_id: int, original_profile_name: str):
+    def _cascade_delete_borrowed_profiles(self, original_owner_id: int, deleted_pid: str, original_profile_name: str):
         """Instantly removes all borrowed variants linked to a deleted personal profile across the entire system."""
         owner_str = str(original_owner_id)
         if not os.path.isdir(self.USERS_DIR): return
@@ -1575,11 +1591,15 @@ class StorageMixin:
                 index = self._get_user_index(uid)
                 borrowed = index.get("borrowed", {})
                 
-                to_delete = []
+                to_delete =[]
                 for b_name in list(borrowed):
                     b_config = self._get_profile_config(uid, b_name, True)
-                    if b_config and str(b_config.get("original_owner_id")) == owner_str and b_config.get("original_profile_name") == original_profile_name:
-                        to_delete.append(b_name)
+                    if b_config and str(b_config.get("original_owner_id")) == owner_str:
+                        b_pid = b_config.get("original_pid")
+                        if b_pid and b_pid == deleted_pid:
+                            to_delete.append(b_name)
+                        elif not b_pid and b_config.get("original_profile_name") == original_profile_name:
+                            to_delete.append(b_name)
                 
                 if to_delete:
                     if isinstance(borrowed, dict):

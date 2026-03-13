@@ -1204,7 +1204,7 @@ class ProfileManageView(ui.View):
                     pid = self.profile_name
                 
                 if not self.is_borrowed:
-                    self.cog._cascade_delete_borrowed_profiles(self.user_id, self.profile_name)
+                    self.cog._cascade_delete_borrowed_profiles(self.user_id, pid, self.profile_name)
                 
                 self.cog._save_user_index(self.user_id, user_index)
                 
@@ -1277,9 +1277,10 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
             return
         
         owner_id_str = share_data["owner_id"]
-        profiles_to_borrow = share_data["profile_name"]
-        if not isinstance(profiles_to_borrow, list):
-            profiles_to_borrow = [profiles_to_borrow]
+        pids_to_borrow = share_data.get("pids",[])
+        names_to_borrow = share_data.get("profile_names", share_data.get("profile_name",[]))
+        if not isinstance(names_to_borrow, list):
+            names_to_borrow = [names_to_borrow]
 
         if owner_id_str == str(interaction.user.id):
             await interaction.followup.send("You cannot borrow a profile from yourself.", ephemeral=True)
@@ -1290,38 +1291,44 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
 
         # [NEW] Dynamic Limit Check
         index = self.cog._get_user_index(interaction.user.id)
-        current_borrowed = len(index.get("borrowed", []))
+        current_borrowed = len(index.get("borrowed",[]))
         
         is_premium = self.cog.is_user_premium(interaction.user.id)
         limit = defaultConfig.LIMIT_BORROWED_PREMIUM if is_premium else defaultConfig.LIMIT_BORROWED_FREE
 
-        if current_borrowed + len(profiles_to_borrow) > limit:
+        if current_borrowed + len(names_to_borrow) > limit:
             tier_name = "Premium" if is_premium else "Free"
             await interaction.followup.send(
                 f"**Limit Reached.**\n"
-                f"Redeeming this code would put you at {current_borrowed + len(profiles_to_borrow)}/{limit} borrowed profiles ({tier_name} Tier).\n"
+                f"Redeeming this code would put you at {current_borrowed + len(names_to_borrow)}/{limit} borrowed profiles ({tier_name} Tier).\n"
                 f"Please delete some profiles or upgrade to Premium.", 
                 ephemeral=True
             )
             return
 
-        accepted_profiles = []
+        accepted_profiles =[]
         failed_profiles = {}
 
-        for profile_name in profiles_to_borrow:
-            # Lazy check: ensure source still exists
+        for idx, fallback_name in enumerate(names_to_borrow):
+            target_pid = pids_to_borrow[idx] if idx < len(pids_to_borrow) else None
+            current_name = self.cog._get_name_from_pid(int(owner_id_str), target_pid) if target_pid else fallback_name
+            if not current_name: current_name = fallback_name
+
             owner_index = self.cog._get_user_index(int(owner_id_str))
-            owner_profile_data = self.cog._get_profile_config(int(owner_id_str), profile_name, False)
+            owner_profile_data = self.cog._get_profile_config(int(owner_id_str), current_name, False)
             
-            if not owner_profile_data or profile_name not in owner_index.get("personal", []):
-                failed_profiles[profile_name] = "Original profile deleted by owner."
+            if not owner_profile_data or current_name not in owner_index.get("personal", []):
+                failed_profiles[fallback_name] = "Original profile deleted by owner."
                 continue
 
-            desired_name = self.cog._generate_unique_local_name(interaction.user.id, profile_name, sharer_name)
+            desired_name = self.cog._generate_unique_local_name(interaction.user.id, current_name, sharer_name)
+            final_pid = target_pid or owner_profile_data.get("profile_id", "00000000")
 
             snapshot_data = {
                 "original_owner_id": owner_id_str,
-                "original_profile_name": profile_name,
+                "original_pid": final_pid,
+                "original_profile_name": current_name,
+                "original_profile_id": owner_profile_data.get("profile_id", "00000000"),
                 "borrowed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "grounding_enabled": owner_profile_data.get("grounding_enabled", False),
                 "realistic_typing_enabled": owner_profile_data.get("realistic_typing_enabled", False),
@@ -1348,14 +1355,23 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
                 "ltm_context_size": owner_profile_data.get("ltm_context_size", 3),
                 "ltm_relevance_threshold": owner_profile_data.get("ltm_relevance_threshold", 0.75),
             }
-            for adv_k in ["frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a"]:
+            for adv_k in["frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a"]:
                 if adv_k in owner_profile_data:
                     snapshot_data[adv_k] = owner_profile_data[adv_k]
 
-            if desired_name not in index.get("borrowed", []):
-                index.setdefault("borrowed", []).append(desired_name)
+            if desired_name not in index.get("borrowed", {}):
+                if isinstance(index.get("borrowed"), dict):
+                    import uuid
+                    pid = f"B{uuid.uuid4().hex[:15].upper()}"
+                    index["borrowed"][desired_name] = pid
+                    p_dir = os.path.join(self.cog.USERS_DIR, str(interaction.user.id), "profiles", pid)
+                    os.makedirs(p_dir, exist_ok=True)
+                    with open(os.path.join(p_dir, "name.txt"), "w", encoding="utf-8") as f:
+                        f.write(desired_name)
+                else:
+                    index.setdefault("borrowed",[]).append(desired_name)
             self.cog._save_profile_config(interaction.user.id, desired_name, snapshot_data, True)
-            accepted_profiles.append(f"`{profile_name}` (as `{desired_name}`)")
+            accepted_profiles.append(f"`{fallback_name}` (as `{desired_name}`)")
 
         # Save and Delete Code
         if accepted_profiles:
@@ -1473,6 +1489,7 @@ class HubPublicLibraryView(HubBaseView):
             raw_list.append({
                 "id": p_id,
                 "owner_id": p_info['owner_id'],
+                "original_pid": p_info.get("original_pid"),
                 "profile_name": p_info['original_profile_name'],
                 "published_at": p_info.get("published_at", ""),
                 "display_name": p_info.get("display_name", p_info['original_profile_name']),
@@ -1617,13 +1634,14 @@ class HubPublicLibraryView(HubBaseView):
             return
         
         index = self.cog._get_user_index(i.user.id)
-        for b_name in index.get("borrowed", []):
+        for b_name in index.get("borrowed",[]):
             b_data = self.cog._get_profile_config(i.user.id, b_name, True)
-            if b_data and int(b_data.get("original_owner_id", 0)) == p_info['owner_id'] and b_data.get("original_profile_name") == p_info['profile_name']:
+            if b_data and int(b_data.get("original_owner_id", 0)) == p_info['owner_id'] and \
+               (b_data.get("original_pid") == p_info.get('original_pid') or b_data.get("original_profile_name") == p_info['profile_name']):
                 await i.response.send_message("You already have this profile.", ephemeral=True)
                 return
 
-        modal = BorrowNameModal(self.cog, self.original_interaction, p_info['owner_id'], p_info['profile_name'], is_public_borrow=True)
+        modal = BorrowNameModal(self.cog, self.original_interaction, p_info['owner_id'], p_info.get('original_pid'), p_info['profile_name'], is_public_borrow=True)
         await i.response.send_modal(modal)
 
     async def search_cb(self, i: discord.Interaction):
@@ -1772,20 +1790,24 @@ class HubIncomingView(HubBaseView):
             await i.followup.send(f"Limit Reached. Accepting these would exceed your limit of {limit} borrowed profiles.", ephemeral=True)
             return
 
-        accepted = []
+        accepted =[]
         sharer_user = self.cog.bot.get_user(sharer_id)
         sharer_name = sharer_user.name if sharer_user else "User"
 
         for s in shares:
-            p_name = s['profile_name']
+            fallback_name = s['profile_name']
+            target_pid = s.get('original_pid')
+            current_name = self.cog._get_name_from_pid(sharer_id, target_pid) if target_pid else fallback_name
+            if not current_name: current_name = fallback_name
+
             sharer_index = self.cog._get_user_index(sharer_id)
-            if p_name not in sharer_index.get("personal", []):
-                await self.cog._reject_share_request(self.original_interaction, sharer_id, p_name, notify_sharer=False)
+            if current_name not in sharer_index.get("personal",[]):
+                await self.cog._reject_share_request(self.original_interaction, sharer_id, target_pid, fallback_name, notify_sharer=False)
                 continue
 
-            local_name = self.cog._generate_unique_local_name(self.user_id, p_name, sharer_name)
-            await self.cog._accept_share_request(self.original_interaction, sharer_id, p_name, local_name)
-            accepted.append(p_name)
+            local_name = self.cog._generate_unique_local_name(self.user_id, current_name, sharer_name)
+            await self.cog._accept_share_request(self.original_interaction, sharer_id, target_pid, current_name, local_name)
+            accepted.append(current_name)
         
         msg = f"Accepted: {', '.join(accepted)}" if accepted else "No valid profiles found."
         await i.followup.send(msg, ephemeral=True)
@@ -1796,9 +1818,9 @@ class HubIncomingView(HubBaseView):
     async def reject_all(self, i: discord.Interaction):
         await i.response.defer(ephemeral=True)
         sharer_id = self.selected_sharer_id
-        shares = [s for s in self.cog.profile_shares.get(str(self.user_id), []) if s['sharer_id'] == sharer_id]
+        shares =[s for s in self.cog.profile_shares.get(str(self.user_id), []) if s['sharer_id'] == sharer_id]
         for s in shares:
-            await self.cog._reject_share_request(self.original_interaction, sharer_id, s['profile_name'], notify_sharer=False)
+            await self.cog._reject_share_request(self.original_interaction, sharer_id, s.get('original_pid'), s['profile_name'], notify_sharer=False)
         await i.followup.send(f"Rejected shares.", ephemeral=True)
         self.selected_sharer_id = None
         self.setup_items()
@@ -1980,12 +2002,13 @@ class HubShareManagerView(HubBaseView):
             recipient = self.cog.bot.get_user(recipient_id)
             if not recipient or recipient.bot or recipient.id == self.user_id: continue
 
-            self.cog.profile_shares.setdefault(str(recipient_id), [])
-            newly_shared = []
+            self.cog.profile_shares.setdefault(str(recipient_id),[])
+            newly_shared =[]
             for profile_name in self.selected_profiles:
-                existing = next((s for s in self.cog.profile_shares[str(recipient_id)] if s['sharer_id'] == self.user_id and s['profile_name'] == profile_name), None)
+                pid = self.cog._get_pid_from_name_any(self.user_id, profile_name)
+                existing = next((s for s in self.cog.profile_shares[str(recipient_id)] if s['sharer_id'] == self.user_id and (s.get('original_pid') == pid or s.get('profile_name') == profile_name)), None)
                 if not existing:
-                    share_req = {"sharer_id": self.user_id, "profile_name": profile_name, "shared_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+                    share_req = {"sharer_id": self.user_id, "original_pid": pid, "profile_name": profile_name, "shared_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
                     self.cog.profile_shares[str(recipient_id)].append(share_req)
                     newly_shared.append(profile_name)
             
@@ -2006,7 +2029,8 @@ class HubShareManagerView(HubBaseView):
         if not self.selected_profiles:
             await i.response.send_message("Select at least one profile.", ephemeral=True); return
         code = f"SHR-{uuid.uuid4().hex[:8].upper()}"
-        self.cog.share_codes[code] = {"owner_id": str(self.user_id), "profile_name": self.selected_profiles, "expires_at": time.time() + 300}
+        pids =[self.cog._get_pid_from_name_any(self.user_id, p) for p in self.selected_profiles]
+        self.cog.share_codes[code] = {"owner_id": str(self.user_id), "pids": pids, "profile_names": self.selected_profiles, "expires_at": time.time() + 300}
         await i.response.send_message(f"Share Code: `{code}`\nExpires in 5 minutes.", ephemeral=True)
 
     async def apply_public(self, i: discord.Interaction):
@@ -2053,17 +2077,18 @@ class HubShareManagerView(HubBaseView):
 
                 is_safe, reason = await self.cog._is_profile_content_safe(self.user_id, name, disp, ava)
                 if is_safe:
-                    pid = f"pub_{uuid.uuid4().hex[:8]}"
+                    pid_entry = f"pub_{uuid.uuid4().hex[:8]}"
                     # Snapshot metadata for index
                     data = {
                         "owner_id": self.user_id, 
                         "original_profile_name": name, 
+                        "original_pid": self.cog._get_pid_from_name_any(self.user_id, name),
                         "published_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), 
                         "status": "active",
                         "display_name": disp,
                         "avatar_url": ava
                     }
-                    self.cog.public_profiles[pid] = data
+                    self.cog.public_profiles[pid_entry] = data
                     published_list.append(name)
                 else:
                     failed_list[name] = reason
@@ -5045,12 +5070,13 @@ class SettingsChildBotView(SettingsBaseView):
 class BorrowNameModal(ui.Modal, title="Name Your Borrowed Profile"):
     profile_name_input = ui.TextInput(label="Enter a unique local name", required=True, min_length=1, max_length=50)
     
-    def __init__(self, cog: 'GeminiAgent', original_interaction: discord.Interaction, sharer_id: int, profile_to_borrow: str, is_public_borrow: bool = False):
+    def __init__(self, cog: 'GeminiAgent', original_interaction: discord.Interaction, sharer_id: int, target_pid: Optional[str], fallback_name: str, is_public_borrow: bool = False):
         super().__init__()
         self.cog = cog
         self.original_interaction = original_interaction
         self.sharer_id = sharer_id
-        self.profile_to_borrow = profile_to_borrow
+        self.target_pid = target_pid
+        self.fallback_name = fallback_name
         self.is_public_borrow = is_public_borrow
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -5063,12 +5089,12 @@ class BorrowNameModal(ui.Modal, title="Name Your Borrowed Profile"):
             return
 
         index = self.cog._get_user_index(interaction.user.id)
-        if desired_name in index.get("personal", []) or desired_name in index.get("borrowed", []):
+        if desired_name in index.get("personal", []) or desired_name in index.get("borrowed",[]):
             await interaction.followup.send(f"You already have a profile named '{desired_name}'. Please choose a different name.", ephemeral=True)
             return
 
-        await self.cog._accept_share_request(interaction, self.sharer_id, self.profile_to_borrow, desired_name, self.is_public_borrow)
-        await interaction.followup.send(f"✅ Successfully borrowed profile **{self.profile_to_borrow}** and named it **{desired_name}**. You can now use it with `/profile swap`.", ephemeral=True)
+        await self.cog._accept_share_request(interaction, self.sharer_id, self.target_pid, self.fallback_name, desired_name, self.is_public_borrow)
+        await interaction.followup.send(f"✅ Successfully borrowed profile **{self.fallback_name}** and named it **{desired_name}**. You can now use it with `/profile swap`.", ephemeral=True)
 
 class ActionTextInputModal(ui.Modal):
     def __init__(self, title: str, label: str, placeholder: str, on_submit_callback, default: Optional[str] = None, required: bool = True):

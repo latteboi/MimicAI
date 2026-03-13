@@ -24,7 +24,7 @@ def setup_mimic():
     print("\n[0/5] Configuration Mode")
     print("Manual Authentication Mode stores session keys in volatile memory only.")
     print("It requires manual STDIN injection on every boot.")
-    print("Recommended ONLY for strictly ephemeral environments. Do NOT use unless you understand the service implications.")
+    print("Do NOT use unless you understand the service implications.")
     manual_auth = input("Enable Manual Authentication Mode? [y/N]: ").strip().lower() == 'y'
 
     # 0. Linux-specific preparation
