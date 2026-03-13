@@ -171,25 +171,47 @@ async def main():
     else:
         gcp_project_id = os.getenv("GCP_PROJECT_ID")
         if gcp_project_id:
+            gcp_project_id = gcp_project_id.strip()
             print(f"GCP_PROJECT_ID detected ({gcp_project_id}). Fetching keys from Google Cloud Secret Manager...")
             try:
                 from google.cloud import secretmanager
                 client = secretmanager.SecretManagerServiceClient()
                 
                 def fetch_secret(secret_name):
-                    try:
-                        name = f"projects/{gcp_project_id}/secrets/{secret_name}/versions/latest"
-                        response = client.access_secret_version(request={"name": name})
-                        return response.payload.data.decode("UTF-8").strip()
-                    except Exception as e:
-                        print(f"Failed to fetch {secret_name} from GCP: {e}")
-                        return None
+                    # Try exact name first, then lowercase as fallback
+                    for name_variant in [secret_name, secret_name.lower()]:
+                        try:
+                            resource_name = f"projects/{gcp_project_id}/secrets/{name_variant}/versions/latest"
+                            response = client.access_secret_version(request={"name": resource_name})
+                            return response.payload.data.decode("UTF-8").strip()
+                        except Exception:
+                            continue
+                    return None
 
-                if not os.getenv("DISCORD_SDK"): os.environ["DISCORD_SDK"] = fetch_secret("DISCORD_SDK") or ""
-                if not os.getenv("DISCORD_OWNER_ID"): os.environ["DISCORD_OWNER_ID"] = fetch_secret("DISCORD_OWNER_ID") or ""
-                if not os.getenv("ENCRYPTION_KEY"): os.environ["ENCRYPTION_KEY"] = fetch_secret("ENCRYPTION_KEY") or ""
+                # Diagnostics: List available secrets if a primary fetch fails
+                def debug_secrets():
+                    try:
+                        parent = f"projects/{gcp_project_id}"
+                        print(f"DEBUG: Listing all secrets in project {gcp_project_id}...")
+                        for secret in client.list_secrets(request={"parent": parent}):
+                            print(f" - Found secret: {secret.name.split('/')[-1]}")
+                    except Exception as e:
+                        print(f"DEBUG: Could not list secrets: {e}")
+
+                s_val = fetch_secret("DISCORD_SDK")
+                o_val = fetch_secret("DISCORD_OWNER_ID")
+                k_val = fetch_secret("ENCRYPTION_KEY")
+
+                if not s_val or not o_val or not k_val:
+                    print("ERROR: One or more secrets could not be found.")
+                    debug_secrets()
+
+                if not os.getenv("DISCORD_SDK"): os.environ["DISCORD_SDK"] = s_val or ""
+                if not os.getenv("DISCORD_OWNER_ID"): os.environ["DISCORD_OWNER_ID"] = o_val or ""
+                if not os.getenv("ENCRYPTION_KEY"): os.environ["ENCRYPTION_KEY"] = k_val or ""
+                
             except ImportError:
-                print("WARNING: 'google-cloud-secret-manager' library not found. Please install it to use GCP secrets.")
+                print("CRITICAL ERROR: 'google-cloud-secret-manager' library not found. Install via 'pip install google-cloud-secret-manager'.")
             except Exception as e:
                 print(f"WARNING: GCP Secret Manager initialization failed: {e}")
 
