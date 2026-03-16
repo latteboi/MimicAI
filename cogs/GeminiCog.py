@@ -106,6 +106,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         self.persona_modal_sections_order = ['backstory', 'personality_traits', 'likes', 'dislikes', 'appearance'] 
         
         self.user_indices: LRUCache = LRUCache(max_size=20)
+        self.server_indices: LRUCache = LRUCache(max_size=50)
         self.profile_configs: LRUCache = LRUCache(max_size=50)
         self.profile_prompts: LRUCache = LRUCache(max_size=20)
         
@@ -263,8 +264,12 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             await interaction.followup.send(f"A profile with the name '{profile_name}' already exists.", ephemeral=True)
             return
 
-        if len(index.get("personal", [])) >= MAX_USER_PROFILES:
-            await interaction.followup.send(f"You have reached the maximum of {MAX_USER_PROFILES} personal profiles.", ephemeral=True)
+        is_premium = self.is_user_premium(interaction.user.id)
+        limit = defaultConfig.LIMIT_PROFILES_PREMIUM if is_premium else defaultConfig.LIMIT_PROFILES_FREE
+        
+        if len(index.get("personal", [])) >= limit:
+            tier_name = "Premium" if is_premium else "Free"
+            await interaction.followup.send(f"You have reached the maximum of {limit} personal profiles ({tier_name} tier).", ephemeral=True)
             return
 
         api_key = self._get_api_key_for_guild(interaction.guild_id)
@@ -708,24 +713,37 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             return
 
         if not profile_name and not slot:
-            if not session or not session.get("profiles"):
+            server_id_str = str(interaction.guild_id) if interaction.guild_id else "dm"
+            server_index = self._get_server_index(server_id_str)
+            channel_str = str(interaction.channel_id)
+            
+            active_sessions = server_index.get("active_sessions", {})
+            session_data_idx = {}
+            if isinstance(active_sessions, dict):
+                session_data_idx = active_sessions.get("regular", {}).get(channel_str)
+                if not session_data_idx:
+                    session_data_idx = active_sessions.get("freewill", {}).get(channel_str)
+
+            if not session_data_idx or not session_data_idx.get("profiles"):
                 await interaction.followup.send("There is no active session in this channel.", ephemeral=True)
                 return
             
             profile_list = []
-            for i, p_data in enumerate(session["profiles"]):
-                p_owner_id = p_data['owner_id']
-                p_name = p_data['profile_name']
-                p_method = p_data.get('method', 'webhook')
+            for i, p_data in enumerate(session_data_idx["profiles"]):
+                p_name = p_data.get('profile_name')
+                pid = p_data.get('pid', 'Unknown PID')
                 
-                if p_method == 'child_bot':
-                    bot_user = self.bot.get_user(int(p_data['bot_id']))
-                    display = bot_user.name if bot_user else p_name
+                if p_data.get('method') == 'child_bot':
+                    display = f"Child Bot ({p_name})"
                 else:
                     display = p_name
-                profile_list.append(f"**{i+1}.** `{display}`")
+                profile_list.append(f"**{i+1}.** `{display}` [PID: {pid}]")
             
-            await interaction.followup.send("Current session participants:\n" + "\n".join(profile_list), ephemeral=True)
+            owner_user = self.bot.get_user(session_data_idx.get('owner_id'))
+            admin_name = owner_user.name if owner_user else "Unknown Admin"
+            
+            msg = f"**Session Admin:** {admin_name}\n\n**Current Participants:**\n" + "\n".join(profile_list)
+            await interaction.followup.send(msg, ephemeral=True)
             return
 
         # If no session exists, we must have a profile name to start one
@@ -943,22 +961,35 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     @app_commands.checks.cooldown(5, 10.0, key=lambda i: i.user.id)
     async def session_view_slash(self, interaction: discord.Interaction):
         if not self.has_lock: return
-        session = self.multi_profile_channels.get(interaction.channel_id)
         
-        if not session:
+        server_id_str = str(interaction.guild_id) if interaction.guild_id else "dm"
+        server_index = self._get_server_index(server_id_str)
+        channel_str = str(interaction.channel_id)
+        
+        active_sessions = server_index.get("active_sessions", {})
+        session_data_idx = None
+        is_freewill = False
+        
+        if isinstance(active_sessions, dict):
+            if channel_str in active_sessions.get("freewill", {}):
+                session_data_idx = active_sessions["freewill"][channel_str]
+                is_freewill = True
+            elif channel_str in active_sessions.get("regular", {}):
+                session_data_idx = active_sessions["regular"][channel_str]
+
+        if not session_data_idx:
             await interaction.response.send_message("No active session in this channel.", ephemeral=True)
             return
 
-        session_type = session.get("type", "multi")
-        type_display = "Regular (Multi-Profile)" if session_type == "multi" else "Freewill (Proactive/Reactive)"
+        type_display = "Freewill (Proactive/Reactive)" if is_freewill else "Regular (Multi-Profile)"
         
-        owner = self.bot.get_user(session.get("owner_id"))
-        owner_name = owner.name if owner else f"ID: {session.get('owner_id')}"
+        owner_id = session_data_idx.get("owner_id")
+        owner = self.bot.get_user(owner_id)
+        owner_name = owner.name if owner else f"ID: {owner_id}"
         
-        # Logic to gather profiles for display
         profiles_for_display = []
         
-        if session_type == "freewill":
+        if is_freewill:
             # For Freewill, show all opted-in profiles regardless of current scene status
             server_data = self.freewill_participation.get(str(interaction.guild.id), {})
             channel_data = server_data.get(str(interaction.channel.id), {})
@@ -971,24 +1002,30 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                     if settings.get("personality", "off") != "off":
                         # Pass the channel object to the helper
                         p_dict = self._build_freewill_participant_dict(int(user_id_str), profile_name, interaction.channel)
-                        if p_dict: profiles_for_display.append(p_dict)
+                        if p_dict:
+                            p_dict['pid'] = self._get_pid_from_name_any(int(user_id_str), profile_name)
+                            profiles_for_display.append(p_dict)
         else:
-            # For Regular, use the session's profile list
-            profiles_for_display = session.get("profiles", [])
+            # For Regular, use the session's profile list from the index
+            profiles_for_display = session_data_idx.get("profiles", [])
 
         participant_count = len(profiles_for_display)
         
         embed = discord.Embed(title=f"Session Info: #{interaction.channel.name}", color=discord.Color.gold())
         embed.add_field(name="Session Type", value=type_display, inline=True)
-        embed.add_field(name="Session Owner", value=owner_name, inline=True)
+        embed.add_field(name="Session Admin", value=owner_name, inline=True)
         embed.add_field(name="Participants", value=str(participant_count), inline=True)
         
-        if session.get("session_prompt"):
-            embed.add_field(name="Prompt", value=session["session_prompt"][:200] + "..." if len(session["session_prompt"]) > 200 else session["session_prompt"], inline=False)
+        if session_data_idx.get("session_prompt"):
+            prompt_val = session_data_idx["session_prompt"]
+            embed.add_field(name="Prompt", value=prompt_val[:200] + "..." if len(prompt_val) > 200 else prompt_val, inline=False)
 
         # Create a temporary session dict for the View to use
-        session_view_data = session.copy()
-        session_view_data["profiles"] = profiles_for_display
+        session_view_data = {
+            "type": "freewill" if is_freewill else "multi",
+            "owner_id": owner_id,
+            "profiles": profiles_for_display
+        }
 
         view = SessionView(self, interaction, session_view_data)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
@@ -1022,7 +1059,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         session_type = session.get("type", "multi")
         dummy_session_key = (ch_id, None, None)
-        self._delete_session_from_disk(dummy_session_key, session_type)
+        await self._delete_session_from_disk(dummy_session_key, session_type)
 
         for p_key in session["chat_sessions"].keys():
             session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=[])
@@ -1118,7 +1155,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         session_type = session.get("type", "multi")
         dummy_session_key = (ch_id, None, None)
-        self._delete_session_from_disk(dummy_session_key, session_type)
+        await self._delete_session_from_disk(dummy_session_key, session_type)
 
         if session.get('worker_task'):
             self._safe_cancel_task(session['worker_task'])
@@ -1170,7 +1207,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             if session:
                 session_type = session.get("type", "multi")
                 if not session.get("is_hydrated"):
-                    session = self._ensure_session_hydrated(interaction.channel_id, session_type)
+                    session = await self._ensure_session_hydrated(interaction.channel_id, session_type)
 
                 deleted_msg_ids = {m.id for m in messages_to_delete}
                 turn_ids_to_delete = set()
@@ -1207,17 +1244,17 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                         
                         dummy_session_key = (interaction.channel_id, None, None)
                         if is_effectively_empty:
-                            self._delete_session_from_disk(dummy_session_key, session_type)
+                            await self._delete_session_from_disk(dummy_session_key, session_type)
                             for p_key in session.get("chat_sessions", {}).keys():
                                 owner_id, profile_name = p_key
                                 full_session_key = (interaction.channel_id, owner_id, profile_name)
                                 self.ltm_recall_history.pop(full_session_key, None)
                         else:
-                            self._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
+                            await self._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
 
                         # Now that the correct state is on disk, force a re-read and rebuild
                         session["is_hydrated"] = False
-                        self._ensure_session_hydrated(interaction.channel_id, session_type)
+                        await self._ensure_session_hydrated(interaction.channel_id, session_type)
 
                     self.session_last_accessed[interaction.channel_id] = time.time()
 
@@ -1271,8 +1308,8 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             return
 
         if not profile_name:
-            # Open the History UI which acts as the selector
             view = GlobalChatHistoryView(self, interaction, user_id)
+            await view.initialize()
             if not view.available_profiles:
                 await interaction.response.send_message("You have no active global chat histories.", ephemeral=True)
             else:
@@ -1285,13 +1322,11 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             await interaction.response.defer(ephemeral=True)
             session_key = ('global', user_id, profile_name_lower)
             
-            # Clear from memory
             self.global_chat_sessions.pop(session_key, None)
             self.session_last_accessed.pop(session_key, None)
             self.ltm_recall_history.pop(session_key, None)
 
-            # Clear from disk
-            self._delete_session_from_disk(session_key, 'global_chat')
+            await self._delete_session_from_disk(session_key, 'global_chat')
             
             await interaction.followup.send(f"Your global chat history with '{profile_name_lower}' has been cleared.", ephemeral=True)
             return
@@ -1307,17 +1342,15 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 await interaction.response.send_message(f"Profile '{profile_name_lower}' not found.", ephemeral=True)
                 return
 
-            # Load the session to show history
             model_cache_key = ('global', user_id, profile_name_lower)
             session_data = self.global_chat_sessions.get(model_cache_key)
             
             if not session_data:
-                session_data = self._load_session_from_disk(model_cache_key, 'global_chat')
+                session_data = await self._load_session_from_disk(model_cache_key, 'global_chat')
                 if session_data: 
                     self.global_chat_sessions[model_cache_key] = session_data
             
             if not session_data or not session_data.get('unified_log'):
-                # If empty, fall back to the modal input
                 async def modal_callback(modal_interaction: discord.Interaction, message_text: str):
                     await modal_interaction.response.defer(ephemeral=False, thinking=True)
                     await self._execute_global_chat(modal_interaction, profile_name_lower, message_text)
@@ -1330,9 +1363,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 )
                 await interaction.response.send_modal(modal)
             else:
-                # Open the History View
                 await interaction.response.defer(ephemeral=True)
-                view = GlobalChatHistoryView(self, interaction, model_cache_key, session_data['unified_log'])
+                view = GlobalChatHistoryView(self, interaction, user_id, profile_name_lower)
+                await view.initialize()
                 await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="clear", description="Clears all of the bot's messages from this DM channel.")
@@ -1821,12 +1854,23 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 self._record_model_usage(model_used, "openrouter")
 
     async def session_participant_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        session = self.multi_profile_channels.get(interaction.channel_id)
-        if not session:
+        server_id_str = str(interaction.guild_id) if interaction.guild_id else "dm"
+        server_index = self._get_server_index(server_id_str)
+        channel_str = str(interaction.channel_id)
+        
+        active_sessions = server_index.get("active_sessions", {})
+        session_data = {}
+        if isinstance(active_sessions, dict):
+            session_data = active_sessions.get("regular", {}).get(channel_str)
+            if not session_data:
+                session_data = active_sessions.get("freewill", {}).get(channel_str)
+
+        if not session_data:
             return []
 
         choices = []
-        for participant in session.get("profiles", []):
+        current_lower = current.lower()
+        for participant in session_data.get("profiles", []):
             owner_id = participant.get("owner_id")
             profile_name = participant.get("profile_name")
             
@@ -1835,28 +1879,10 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 if owner_id != interaction.user.id and interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
                     continue
             
-            index = self._get_user_index(owner_id)
-            is_borrowed = profile_name in index.get("borrowed", [])
-            effective_owner_id = owner_id
-            effective_profile_name = profile_name
-            if is_borrowed:
-                borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
-                effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
-                effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
-            
-            display_name = effective_profile_name
-            appearance_data = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
-            if appearance_data and appearance_data.get("custom_display_name"):
-                display_name = appearance_data.get("custom_display_name")
-
-            owner_user = self.bot.get_user(effective_owner_id)
-            owner_name = owner_user.name if owner_user else f"User {effective_owner_id}"
-
-            label = f"{display_name} ({profile_name}) by ({owner_name})"
             value = f"{owner_id}:{profile_name}"
 
-            if current.lower() in label.lower():
-                choices.append(app_commands.Choice(name=label[:100], value=value))
+            if current_lower in profile_name.lower():
+                choices.append(app_commands.Choice(name=profile_name, value=value))
         
         return choices[:25]
     
@@ -1979,7 +2005,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             return
 
         if not session.get("is_hydrated"):
-            session = self._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi"))
+            session = await self._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi"))
 
         user_id = interaction.user.id
         

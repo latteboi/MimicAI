@@ -123,6 +123,39 @@ class IOManager:
 
 class StorageMixin:
 
+    def _get_server_index(self, server_id_str: str) -> Dict[str, Any]:
+        if hasattr(self, 'server_indices') and server_id_str in self.server_indices:
+            return self.server_indices[server_id_str]
+        
+        path = os.path.join(self.SERVERS_DIR, server_id_str, "index.json")
+        index = IOManager.read_json(path)
+        
+        if not index:
+            index = {
+                "user_active_profiles": {}, 
+                "active_sessions": {"regular": {}, "freewill": {}}, 
+                "freewill_config": {}, 
+                "freewill_participation": {}
+            }
+        else:
+            if "active_sessions" not in index or isinstance(index.get("active_sessions"), list):
+                index["active_sessions"] = {"regular": {}, "freewill": {}}
+            if "freewill_config" not in index:
+                index["freewill_config"] = {}
+            if "freewill_participation" not in index:
+                index["freewill_participation"] = {}
+        
+        if hasattr(self, 'server_indices'):
+            self.server_indices[server_id_str] = index
+        return index
+
+    def _save_server_index(self, server_id_str: str, data: Dict[str, Any]):
+        path = os.path.join(self.SERVERS_DIR, server_id_str, "index.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        IOManager.write_json(data, path)
+        if hasattr(self, 'server_indices'):
+            self.server_indices[server_id_str] = data
+
     def _migrate_to_pid_v2(self):
         users_dir = pathlib.Path(self.USERS_DIR)
         if not users_dir.exists(): return
@@ -139,6 +172,11 @@ class StorageMixin:
             if not index: continue
             
             migrated = False
+            
+            if "channel_active_profiles" in index:
+                del index["channel_active_profiles"]
+                migrated = True
+
             for p_type, prefix in [("personal", "A"), ("borrowed", "B")]:
                 p_data = index.get(p_type)
                 if isinstance(p_data, list):
@@ -165,7 +203,7 @@ class StorageMixin:
                 IOManager.write_json(index, str(index_path))
                 
         if migrated_any:
-            print("Phase 4 Migration complete. Immutable PID directories created.")
+            print("Phase 4 Migration complete. Immutable PID directories created and legacy keys purged.")
 
     def _get_pid_from_name(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> str:
         if profile_name == DEFAULT_PROFILE_NAME: return DEFAULT_PROFILE_NAME
@@ -478,8 +516,7 @@ class StorageMixin:
                 # 1. Create Lightweight Index
                 index_data = {
                     "personal": list(user_data.get("profiles", {}).keys()),
-                    "borrowed": list(user_data.get("borrowed_profiles", {}).keys()),
-                    "channel_active_profiles": user_data.get("channel_active_profiles", {})
+                    "borrowed": list(user_data.get("borrowed_profiles", {}).keys())
                 }
                 IOManager.write_json(index_data, str(user_target_dir / "index.json"))
                 
@@ -553,22 +590,20 @@ class StorageMixin:
         # All other session types use a unified log
         return dir_path / "session_log.json.gz"
     
-    def _save_session_to_disk(self, session_key: Any, session_type: str, session_data: Union[GoogleGenAIChatSession, List[Dict], Dict]):
+    async def _save_session_to_disk(self, session_key: Any, session_type: str, session_data: Union[GoogleGenAIChatSession, List[Dict], Dict]):
         if not session_data:
-            self._delete_session_from_disk(session_key, session_type)
+            await self._delete_session_from_disk(session_key, session_type)
             return
         
         data_to_save = session_data
 
         if session_type == 'global_chat':
-            # If it's the hydrated dict {chat_session, unified_log}, extract the log
             if isinstance(session_data, dict) and 'unified_log' in session_data:
                 if not session_data['unified_log']:
-                    self._delete_session_from_disk(session_key, session_type)
+                    await self._delete_session_from_disk(session_key, session_type)
                     return
                 data_to_save = session_data['unified_log']
             elif hasattr(session_data, 'history'):
-                 # Convert chat session to log format on save if needed (fallback)
                  log = []
                  for content in session_data.history:
                      parts_text = "".join(p if isinstance(p, str) else p.get('text', '') for p in content.get('parts', []))
@@ -579,47 +614,52 @@ class StorageMixin:
                  data_to_save = log
 
         if hasattr(data_to_save, 'history') and not data_to_save.history:
-             self._delete_session_from_disk(session_key, session_type)
+             await self._delete_session_from_disk(session_key, session_type)
              return
 
         try:
             path = self._get_session_path(session_key, session_type)
             path.parent.mkdir(parents=True, exist_ok=True)
             
-            # Always save as JSON list (unified log)
-            serialized_bytes = json.dumps(data_to_save)
+            import copy
+            data_copy = copy.deepcopy(data_to_save)
+            
+            def _thread_save():
+                serialized_bytes = json.dumps(data_copy)
+                compressed_bytes = gzip.compress(serialized_bytes)
+                encrypted_compressed_bytes = self.fernet.encrypt(compressed_bytes)
 
-            compressed_bytes = gzip.compress(serialized_bytes)
-            encrypted_compressed_bytes = self.fernet.encrypt(compressed_bytes)
-
-            temp_path = path.with_suffix(path.suffix + '.tmp')
-            with open(temp_path, 'wb') as f:
-                f.write(encrypted_compressed_bytes)
-            os.replace(temp_path, path)
+                temp_path = path.with_suffix(path.suffix + '.tmp')
+                with open(temp_path, 'wb') as f:
+                    f.write(encrypted_compressed_bytes)
+                os.replace(temp_path, path)
+                
+            await asyncio.to_thread(_thread_save)
         except Exception as e:
             print(f"Error saving session for key {session_key}: {e}")
 
-    def _load_session_from_disk(self, session_key: Any, session_type: str) -> Optional[Union[GoogleGenAIChatSession, List[Dict], Dict]]:
+    async def _load_session_from_disk(self, session_key: Any, session_type: str) -> Optional[Union[GoogleGenAIChatSession, List[Dict], Dict]]:
         try:
             path = self._get_session_path(session_key, session_type)
             if not path.exists():
                 return None
             
-            with open(path, 'rb') as f:
-                encrypted_compressed_bytes = f.read()
-
-            decrypted_compressed_bytes = self.fernet.decrypt(encrypted_compressed_bytes)
-            json_bytes = gzip.decompress(decrypted_compressed_bytes)
+            def _thread_load():
+                with open(path, 'rb') as f:
+                    encrypted_compressed_bytes = f.read()
+                decrypted_compressed_bytes = self.fernet.decrypt(encrypted_compressed_bytes)
+                json_bytes = gzip.decompress(decrypted_compressed_bytes)
+                if not json_bytes: return None
+                return json.loads(json_bytes)
+                
+            data = await asyncio.to_thread(_thread_load)
             
-            if not json_bytes:
-                _delete_file_shard(str(path))
+            if not data:
+                await self._delete_session_from_disk(session_key, session_type)
                 return None
-
-            data = json.loads(json_bytes)
 
             if session_type == 'global_chat':
                 if data and isinstance(data, list) and 'parts' in data[0]:
-                    # Convert old format to new unified_log format
                     unified_log = []
                     for item in data:
                         role = item.get('role')
@@ -657,19 +697,19 @@ class StorageMixin:
                 
                 return None
 
-            else: # Multi/Freewill use raw unified log
+            else: 
                 return data
         except (gzip.BadGzipFile, json.JSONDecodeError, InvalidToken):
              print(f"Warning: Corrupted or old-format session file for key {session_key}. Deleting file.")
-             self._delete_session_from_disk(session_key, session_type)
+             await self._delete_session_from_disk(session_key, session_type)
         except Exception as e:
             print(f"Error loading session for key {session_key}: {e}")
         return None
 
-    def _delete_session_from_disk(self, session_key: Any, session_type: str):
+    async def _delete_session_from_disk(self, session_key: Any, session_type: str):
         try:
             path = self._get_session_path(session_key, session_type)
-            _delete_file_shard(str(path))
+            await asyncio.to_thread(_delete_file_shard, str(path))
         except Exception as e:
             print(f"Error deleting session file for key {session_key}: {e}")
 
@@ -936,7 +976,7 @@ class StorageMixin:
     async def _load_multi_profile_sessions(self):
         await self.bot.wait_until_ready()
         
-        servers_dir = self.FREEWILL_SERVERS_DIR # This is cogs/data/servers
+        servers_dir = self.FREEWILL_SERVERS_DIR
         if not os.path.isdir(servers_dir):
             return
 
@@ -944,87 +984,108 @@ class StorageMixin:
             if not server_id_str.isdigit():
                 continue
             
-            server_path = os.path.join(servers_dir, server_id_str)
-            sessions_file = os.path.join(server_path, "sessions.json.gz")
+            server_index = self._get_server_index(server_id_str)
+            active_sessions = server_index.get("active_sessions", {})
+            if isinstance(active_sessions, list):
+                continue
+            
+            # Combine regular and freewill for memory loading
+            all_sessions = {**active_sessions.get("regular", {}), **active_sessions.get("freewill", {})}
 
-            if os.path.exists(sessions_file):
+            for ch_id_str, session_data in all_sessions.items():
                 try:
-                    saved_sessions = self._load_json_gzip(sessions_file)
-                    if not saved_sessions: continue
-
-                    for ch_id_str, session_data in saved_sessions.items():
-                        channel_id = int(ch_id_str)
-                        channel = self.bot.get_channel(channel_id)
-                        if not channel or not channel.guild: continue
-                        
-                        owner_id = session_data.get("owner_id")
-                        profiles_data = session_data.get("profiles", [])
-
-                        if not owner_id or not profiles_data:
-                            continue
-                        
-                        if profiles_data and isinstance(profiles_data[0], list):
-                            profiles_data = [{"owner_id": p[0], "profile_name": p[1], "method": "webhook"} for p in profiles_data]
-
-                        chat_sessions = {}
-                        for p_data in profiles_data:
-                            p_key = (p_data['owner_id'], p_data['profile_name'])
-                            chat_sessions[p_key] = None # Create placeholder, do not load yet
-
-                        self.multi_profile_channels[channel_id] = {
-                            "profiles": profiles_data,
-                            "chat_sessions": chat_sessions,
-                            "is_hydrated": False, 
-                            "last_bot_message_id": None,
-                            "owner_id": owner_id,
-                            "is_running": False,
-                            "task_queue": asyncio.Queue(),
-                            "worker_task": None,
-                            "turns_since_last_ltm": 0,
-                            "session_prompt": session_data.get("session_prompt"),
-                            "session_mode": session_data.get("session_mode", "sequential"),
-                            "audio_mode": session_data.get("audio_mode", "text-only"),
-                            "type": session_data.get("type"),
-                            "freewill_mode": session_data.get("freewill_mode")
-                        }
-                except Exception as e:
-                    print(f"Unexpected error reloading multi-profile sessions for server {server_id_str}: {e}")
-
-    def _save_multi_profile_sessions(self):
-        try:
-            # Group sessions by server_id
-            server_grouped_sessions = {}
-            for channel_id, session_data in self.multi_profile_channels.items():
-                channel = self.bot.get_channel(channel_id)
-                if channel and hasattr(channel, 'guild'):
-                    server_id = channel.guild.id
-                    if server_id not in server_grouped_sessions:
-                        server_grouped_sessions[server_id] = {}
+                    channel_id = int(ch_id_str)
+                    channel = self.bot.get_channel(channel_id)
+                    if not channel or not channel.guild: continue
                     
-                    # Store only the blueprint, not the live state
-                    server_grouped_sessions[server_id][str(channel_id)] = {
-                        "owner_id": session_data["owner_id"],
-                        "profiles": session_data["profiles"],
+                    owner_id = session_data.get("owner_id")
+                    profiles_data = session_data.get("profiles", [])
+
+                    if not owner_id or not profiles_data:
+                        continue
+
+                    chat_sessions = {}
+                    for p_data in profiles_data:
+                        p_key = (p_data['owner_id'], p_data['profile_name'])
+                        chat_sessions[p_key] = None
+
+                    self.multi_profile_channels[channel_id] = {
+                        "profiles": profiles_data,
+                        "chat_sessions": chat_sessions,
+                        "is_hydrated": False, 
+                        "last_bot_message_id": None,
+                        "owner_id": owner_id,
+                        "is_running": False,
+                        "task_queue": asyncio.Queue(),
+                        "worker_task": None,
+                        "turns_since_last_ltm": 0,
                         "session_prompt": session_data.get("session_prompt"),
                         "session_mode": session_data.get("session_mode", "sequential"),
                         "audio_mode": session_data.get("audio_mode", "text-only"),
                         "type": session_data.get("type", "multi"),
                         "freewill_mode": session_data.get("freewill_mode")
                     }
+                except Exception as e:
+                    print(f"Unexpected error reloading multi-profile sessions for server {server_id_str}, channel {ch_id_str}: {e}")
 
-            # Save each server's sessions to its own file
+    def _save_multi_profile_sessions(self):
+        try:
+            import collections
+            current_server_sessions = collections.defaultdict(lambda: {"regular": {}, "freewill": {}})
+            
+            for channel_id, session_data in self.multi_profile_channels.items():
+                channel = self.bot.get_channel(channel_id)
+                server_id_str = str(channel.guild.id) if channel and getattr(channel, 'guild', None) else "dm"
+                
+                s_type = session_data.get("type", "multi")
+                category = "freewill" if s_type == "freewill" else "regular"
+                
+                profiles_to_save = []
+                for p in session_data.get("profiles", []):
+                    pid = self._get_pid_from_name_any(p["owner_id"], p["profile_name"])
+                    profiles_to_save.append({
+                        "pid": pid,
+                        "profile_name": p["profile_name"],
+                        "owner_id": p["owner_id"],
+                        "method": p.get("method", "webhook"),
+                        "bot_id": p.get("bot_id"),
+                        "ephemeral": p.get("ephemeral", False)
+                    })
+
+                blueprint = {
+                    "owner_id": session_data.get("owner_id"),
+                    "profiles": profiles_to_save,
+                    "session_prompt": session_data.get("session_prompt"),
+                    "session_mode": session_data.get("session_mode", "sequential"),
+                    "audio_mode": session_data.get("audio_mode", "text-only"),
+                    "type": s_type,
+                    "freewill_mode": session_data.get("freewill_mode")
+                }
+                
+                current_server_sessions[server_id_str][category][str(channel_id)] = blueprint
+
             servers_dir = self.FREEWILL_SERVERS_DIR
-            for server_id, sessions_for_server in server_grouped_sessions.items():
-                server_path = os.path.join(servers_dir, str(server_id))
-                os.makedirs(server_path, exist_ok=True)
-                file_path = os.path.join(server_path, "sessions.json.gz")
-                self._atomic_json_save_gzip(sessions_for_server, file_path)
+            if os.path.exists(servers_dir):
+                for s_dir in os.listdir(servers_dir):
+                    if os.path.isdir(os.path.join(servers_dir, s_dir)) and s_dir not in current_server_sessions:
+                        current_server_sessions[s_dir] = {"regular": {}, "freewill": {}}
+
+            for server_id_str, sessions_for_server in current_server_sessions.items():
+                server_index = self._get_server_index(server_id_str)
+                server_index["active_sessions"] = sessions_for_server
+                self._save_server_index(server_id_str, server_index)
+                
+                # Housekeeping: Delete legacy file if it exists
+                old_file = os.path.join(servers_dir, server_id_str, "sessions.json.gz")
+                if os.path.exists(old_file):
+                    _delete_file_shard(old_file)
+                    
         except Exception as e:
-            print(f"Error saving sharded multi-profile sessions: {e}")
+            print(f"Error saving sharded multi-profile sessions to index: {e}")
 
     def _load_freewill_config(self):
         self.freewill_config = {}
-        servers_dir = self.FREEWILL_SERVERS_DIR # This is cogs/data/servers
+        servers_dir = self.FREEWILL_SERVERS_DIR
         if not os.path.isdir(servers_dir):
             return
 
@@ -1034,20 +1095,26 @@ class StorageMixin:
             
             server_path = os.path.join(servers_dir, server_id_str)
             settings_file = os.path.join(server_path, "settings.json.gz")
+            server_index = self._get_server_index(server_id_str)
 
+            # Auto-migrate legacy compressed settings to the server index
             if os.path.exists(settings_file):
                 data = self._load_json_gzip(settings_file)
                 if data:
-                    # Extract only the freewill-related keys
                     fw_data = {
                         "enabled": data.get("freewill_enabled", False),
                         "living_channel_ids": data.get("freewill_living_channel_ids", []),
                         "lurking_channel_ids": data.get("freewill_lurking_channel_ids", []),
-                        "event_chance": data.get("freewill_event_chance", "off"), # Legacy fallback
-                        "event_cooldown": data.get("freewill_event_cooldown", 300), # Legacy fallback
-                        "channel_settings": data.get("freewill_channel_settings", {}) # [ADDED]
+                        "event_chance": data.get("freewill_event_chance", "off"),
+                        "event_cooldown": data.get("freewill_event_cooldown", 300),
+                        "channel_settings": data.get("freewill_channel_settings", {})
                     }
-                    self.freewill_config[server_id_str] = fw_data
+                    server_index["freewill_config"] = fw_data
+                    self._save_server_index(server_id_str, server_index)
+                _delete_file_shard(settings_file)
+
+            if "freewill_config" in server_index and server_index["freewill_config"]:
+                self.freewill_config[server_id_str] = server_index["freewill_config"]
 
     def _get_freewill_server_file_path(self, guild_id: int) -> str:
         return os.path.join(self.FREEWILL_SERVERS_DIR, f"{guild_id}.json.gz")
@@ -1056,69 +1123,59 @@ class StorageMixin:
         self.freewill_participation = {}
         if not os.path.isdir(self.FREEWILL_SERVERS_DIR):
             return
+            
+        # 1. Load from legacy rogue files and migrate to indices
         for filename in os.listdir(self.FREEWILL_SERVERS_DIR):
-            if filename.endswith(".json.gz"):
+            if filename.endswith(".json.gz") and filename[:-len(".json.gz")].isdigit():
                 guild_id_str = filename[:-len(".json.gz")]
                 file_path = os.path.join(self.FREEWILL_SERVERS_DIR, filename)
                 data = self._load_json_gzip(file_path)
                 if data:
-                    self.freewill_participation[guild_id_str] = data
+                    server_index = self._get_server_index(guild_id_str)
+                    server_index["freewill_participation"] = data
+                    self._save_server_index(guild_id_str, server_index)
+                _delete_file_shard(file_path)
+
+        # 2. Load into memory directly from indices
+        for server_id_str in os.listdir(self.FREEWILL_SERVERS_DIR):
+            if server_id_str.isdigit():
+                server_index = self._get_server_index(server_id_str)
+                part_data = server_index.get("freewill_participation", {})
+                if part_data:
+                    self.freewill_participation[server_id_str] = part_data
 
     def _save_freewill_for_server(self, guild_id: int):
         guild_id_str = str(guild_id)
-        server_data = self.freewill_participation.get(guild_id_str)
-        file_path = self._get_freewill_server_file_path(guild_id)
-        if not server_data:
-            _delete_file_shard(file_path)
-        else:
-            self._atomic_json_save_gzip(server_data, file_path)
+        server_data = self.freewill_participation.get(guild_id_str, {})
+        server_index = self._get_server_index(guild_id_str)
+        server_index["freewill_participation"] = server_data
+        self._save_server_index(guild_id_str, server_index)
+        
+        # Housekeeping safety net
+        legacy_path = os.path.join(self.FREEWILL_SERVERS_DIR, f"{guild_id_str}.json.gz")
+        if os.path.exists(legacy_path):
+            _delete_file_shard(legacy_path)
 
     def _load_channel_settings(self):
-        # Initialize only Freewill settings
-        servers_dir = self.FREEWILL_SERVERS_DIR
-        if not os.path.isdir(servers_dir):
-            return
-
-        for server_id_str in os.listdir(servers_dir):
-            try:
-                if not server_id_str.isdigit():
-                    continue
-                server_id = int(server_id_str)
-                server_path = os.path.join(servers_dir, server_id_str)
-                if os.path.isdir(server_path):
-                    settings_file = os.path.join(server_path, "settings.json.gz")
-                    if os.path.exists(settings_file):
-                        # Use existing load logic but don't populate removed dicts
-                        pass
-            except (ValueError, TypeError) as e:
-                print(f"Warning: Could not process settings for server directory '{server_id_str}': {e}")
+        pass # Deprecated. Handled by _load_freewill_config via Server Index.
 
     def _save_channel_settings(self):
         try:
-            # Group settings by server ID (Only Freewill configs remain)
-            all_server_data = {}
-            # Use guild list as source of truth for saving configs that exist in memory
             for guild in self.bot.guilds:
-                fw_config = self.freewill_config.get(str(guild.id), {})
+                server_id_str = str(guild.id)
+                fw_config = self.freewill_config.get(server_id_str, {})
                 if fw_config:
                     settings_for_server = {
-                        "freewill_enabled": fw_config.get("enabled", False),
-                        "freewill_living_channel_ids": fw_config.get("living_channel_ids", []),
-                        "freewill_lurking_channel_ids": fw_config.get("lurking_channel_ids", []),
-                        "freewill_channel_settings": fw_config.get("channel_settings", {}),
+                        "enabled": fw_config.get("enabled", False),
+                        "living_channel_ids": fw_config.get("living_channel_ids", []),
+                        "lurking_channel_ids": fw_config.get("lurking_channel_ids", []),
+                        "channel_settings": fw_config.get("channel_settings", {}),
                     }
-                    all_server_data[str(guild.id)] = settings_for_server
-
-            # Save each server's settings to its own file
-            servers_dir = self.FREEWILL_SERVERS_DIR
-            for server_id_str, settings_data in all_server_data.items():
-                server_path = os.path.join(servers_dir, server_id_str)
-                os.makedirs(server_path, exist_ok=True)
-                file_path = os.path.join(server_path, "settings.json.gz")
-                self._atomic_json_save_gzip(settings_data, file_path)
-
+                    server_index = self._get_server_index(server_id_str)
+                    server_index["freewill_config"] = settings_for_server
+                    self._save_server_index(server_id_str, server_index)
         except Exception as e:
-            print(f"Error saving sharded channel settings: {e}"); traceback.print_exc()
+            print(f"Error saving sharded channel settings to index: {e}"); traceback.print_exc()
 
     def _get_api_key_for_guild(self, guild_id: int, provider: str = "gemini") -> Optional[str]:
         if not self.fernet: return None
@@ -1315,6 +1372,85 @@ class StorageMixin:
             config.setdefault("fallback_model", FALLBACK_MODEL_NAME)
         return config
 
+    def _repair_user_index(self, user_id: int) -> Dict[str, Any]:
+        """Scans the user's profile directory to reconstruct a missing or corrupted index.json."""
+        user_id_str = str(user_id)
+        index = {"personal": {}, "borrowed": {}}
+        profiles_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles")
+        
+        if os.path.isdir(profiles_dir):
+            for pid_folder in os.listdir(profiles_dir):
+                p_dir = os.path.join(profiles_dir, pid_folder)
+                if not os.path.isdir(p_dir):
+                    continue
+                
+                # Determine profile name (fallback to folder name if name.txt is missing)
+                p_name = pid_folder
+                name_file = os.path.join(p_dir, "name.txt")
+                if os.path.exists(name_file):
+                    try:
+                        with open(name_file, 'r', encoding='utf-8') as f:
+                            p_name = f.read().strip()
+                    except Exception:
+                        pass
+                
+                is_borrowed = False
+                if os.path.exists(os.path.join(p_dir, "borrowed_config.json.gz")):
+                    is_borrowed = True
+                elif not os.path.exists(os.path.join(p_dir, "config.json.gz")):
+                    continue # Neither exists, invalid folder
+                
+                # Deep fallback for missing name.txt
+                if p_name == pid_folder:
+                    config_path = os.path.join(p_dir, "borrowed_config.json.gz" if is_borrowed else "config.json.gz")
+                    try:
+                        config_data = self._load_json_gzip(config_path)
+                        if config_data:
+                            if is_borrowed and config_data.get("original_profile_name"):
+                                p_name = config_data["original_profile_name"]
+                            elif not is_borrowed and config_data.get("custom_display_name"):
+                                p_name = config_data["custom_display_name"]
+                            
+                            # If we successfully recovered a name, save it for the future
+                            if p_name != pid_folder:
+                                with open(name_file, 'w', encoding='utf-8') as f:
+                                    f.write(p_name)
+                    except Exception:
+                        pass
+
+                # Determine profile type
+                if is_borrowed:
+                    index["borrowed"][p_name] = pid_folder
+                else:
+                    index["personal"][p_name] = pid_folder
+
+        # Enforce Default Profile Injection for non-owners
+        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+        if user_id != owner_id and DEFAULT_PROFILE_NAME not in index["personal"] and DEFAULT_PROFILE_NAME not in index["borrowed"]:
+            index["borrowed"][DEFAULT_PROFILE_NAME] = DEFAULT_PROFILE_NAME
+            
+            # Recreate the default borrowed config and folder structure if it's entirely missing
+            b_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles", DEFAULT_PROFILE_NAME)
+            b_config_path = os.path.join(b_dir, "borrowed_config.json.gz")
+            if not os.path.exists(b_config_path):
+                os.makedirs(b_dir, exist_ok=True)
+                owner_config = self._get_profile_config(owner_id, DEFAULT_PROFILE_NAME, False) or {}
+                self._save_profile_config(user_id, DEFAULT_PROFILE_NAME, {
+                    "original_owner_id": str(owner_id),
+                    "original_profile_name": DEFAULT_PROFILE_NAME,
+                    "borrowed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "grounding_enabled": owner_config.get("grounding_enabled", False),
+                    "realistic_typing_enabled": owner_config.get("realistic_typing_enabled", False),
+                    "time_tracking_enabled": owner_config.get("time_tracking_enabled", False),
+                    "timezone": owner_config.get("timezone", "UTC")
+                }, is_borrowed=True)
+                
+                with open(os.path.join(b_dir, "name.txt"), "w", encoding="utf-8") as f:
+                    f.write(DEFAULT_PROFILE_NAME)
+
+        self._save_user_index(user_id, index)
+        return index
+
     def _get_user_index(self, user_id: int) -> Dict[str, Any]:
         user_id_str = str(user_id)
         if user_id_str in self.user_indices: return self.user_indices[user_id_str]
@@ -1322,26 +1458,9 @@ class StorageMixin:
         path = os.path.join(self.USERS_DIR, user_id_str, "index.json")
         index = IOManager.read_json(path)
         
-        if not index:
-            index = {"personal": {}, "borrowed": {}, "channel_active_profiles": {}}
-            owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-            
-            if user_id != owner_id:
-                index["borrowed"][DEFAULT_PROFILE_NAME] = DEFAULT_PROFILE_NAME
-                self._save_user_index(user_id, index)
-                
-                b_config = self._get_profile_config(user_id, DEFAULT_PROFILE_NAME, True)
-                if not b_config:
-                    owner_config = self._get_profile_config(owner_id, DEFAULT_PROFILE_NAME, False) or {}
-                    self._save_profile_config(user_id, DEFAULT_PROFILE_NAME, {
-                        "original_owner_id": str(owner_id),
-                        "original_profile_name": DEFAULT_PROFILE_NAME,
-                        "borrowed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                        "grounding_enabled": owner_config.get("grounding_enabled", False),
-                        "realistic_typing_enabled": owner_config.get("realistic_typing_enabled", False),
-                        "time_tracking_enabled": owner_config.get("time_tracking_enabled", False),
-                        "timezone": owner_config.get("timezone", "UTC")
-                    }, is_borrowed=True)
+        # Trigger automatic repair if the index is missing or using the deprecated array format
+        if not index or not isinstance(index.get("personal"), dict) or not isinstance(index.get("borrowed"), dict):
+            index = self._repair_user_index(user_id)
                     
         self.user_indices[user_id_str] = index
         return index
@@ -1373,9 +1492,21 @@ class StorageMixin:
         cache_key = f"{user_id}:{profile_name}:{'b' if is_borrowed else 'p'}"
         pid = self._get_pid_from_name(user_id, profile_name, is_borrowed)
         filename = "borrowed_config.json.gz" if is_borrowed else "config.json.gz"
-        path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, filename)
+        
+        p_dir = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid)
+        path = os.path.join(p_dir, filename)
+        
         IOManager.write_json_gzip(data, path, self.fernet)
         self.profile_configs[cache_key] = data
+
+        # Safety net: Ensure name.txt exists for recovery
+        name_file = os.path.join(p_dir, "name.txt")
+        if not os.path.exists(name_file):
+            try:
+                with open(name_file, "w", encoding="utf-8") as f:
+                    f.write(profile_name)
+            except Exception:
+                pass
 
     def _get_profile_prompts(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
         cache_key = f"{user_id}:{profile_name}"
@@ -1406,10 +1537,19 @@ class StorageMixin:
         index = self._get_user_index(user_id)
         
         if profile_name not in index.get("personal", []):
-            if len(index.get("personal", [])) >= MAX_USER_PROFILES and profile_name != DEFAULT_PROFILE_NAME:
+            is_premium = self.is_user_premium(user_id)
+            limit = defaultConfig.LIMIT_PROFILES_PREMIUM if is_premium else defaultConfig.LIMIT_PROFILES_FREE
+            
+            if len(index.get("personal", [])) >= limit and profile_name != DEFAULT_PROFILE_NAME:
                 return None 
             
-            index.setdefault("personal", []).append(profile_name)
+            if isinstance(index.get("personal"), dict):
+                import uuid
+                pid = f"A{uuid.uuid4().hex[:15].upper()}"
+                index["personal"][profile_name] = pid
+            else:
+                index.setdefault("personal", []).append(profile_name)
+            
             self._save_user_index(user_id, index)
             
             config = {
@@ -1442,8 +1582,10 @@ class StorageMixin:
         return {"config": self._get_profile_config(user_id, profile_name), "prompts": self._get_profile_prompts(user_id, profile_name)}
     
     def _get_active_user_profile_name_for_channel(self, user_id: int, channel_id: int) -> str:
-        index = self._get_user_index(user_id)
-        return index.get("channel_active_profiles", {}).get(str(channel_id), DEFAULT_PROFILE_NAME)
+        channel = self.bot.get_channel(channel_id)
+        server_id_str = str(channel.guild.id) if channel and getattr(channel, 'guild', None) else "dm"
+        server_index = self._get_server_index(server_id_str)
+        return server_index.get("user_active_profiles", {}).get(str(user_id), {}).get(str(channel_id), DEFAULT_PROFILE_NAME)
 
     async def _set_active_user_profile_for_channel(self, user_id: int, channel_id: int, profile_name: str, interaction_for_feedback: Optional[discord.Interaction] = None) -> bool:
         index = self._get_user_index(user_id)
@@ -1455,9 +1597,13 @@ class StorageMixin:
                 await interaction_for_feedback.followup.send(f"Your profile '{profile_name}' not found. Cannot activate.", ephemeral=True)
             return False
         
-        old_profile_name = self._get_active_user_profile_name_for_channel(user_id, channel_id)
-        index.setdefault("channel_active_profiles", {})[str(channel_id)] = profile_name
-        self._save_user_index(user_id, index)
+        channel = self.bot.get_channel(channel_id)
+        server_id_str = str(channel.guild.id) if channel and getattr(channel, 'guild', None) else "dm"
+        server_index = self._get_server_index(server_id_str)
+        
+        old_profile_name = server_index.get("user_active_profiles", {}).get(str(user_id), {}).get(str(channel_id), DEFAULT_PROFILE_NAME)
+        server_index.setdefault("user_active_profiles", {}).setdefault(str(user_id), {})[str(channel_id)] = profile_name
+        self._save_server_index(server_id_str, server_index)
         
         if interaction_for_feedback and interaction_for_feedback.guild:
             warning_key_to_clear = (user_id, interaction_for_feedback.guild.id, old_profile_name)

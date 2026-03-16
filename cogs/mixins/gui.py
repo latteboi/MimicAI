@@ -67,25 +67,22 @@ class GlobalChatHistoryView(ui.View):
         self.available_profiles = self._scan_profiles()
         self.selected_profile = initial_profile if initial_profile in self.available_profiles else (self.available_profiles[0] if self.available_profiles else None)
         
-        self.rounds = [] # List of tuples: (user_turn_dict, model_turn_dict)
+        self.rounds = [] 
         self.session_key = None
         self.current_page = 0
         
+    async def initialize(self):
         if self.selected_profile:
-            self._load_current_session()
-            
+            await self._load_current_session()
         self._build_view()
 
     def _scan_profiles(self) -> List[str]:
         profiles = set()
         
-        # 1. Scan Memory
         for key in self.cog.global_chat_sessions.keys():
-            # key structure: ('global', user_id (int), profile_name (str))
             if isinstance(key, tuple) and len(key) == 3 and key[0] == 'global' and key[1] == self.user_id:
                 profiles.add(key[2])
 
-        # 2. Scan Disk
         dir_path = pathlib.Path(self.cog.USERS_DIR) / self.user_id_str / "profiles"
         index = self.cog._get_user_index(self.user_id)
         
@@ -97,13 +94,13 @@ class GlobalChatHistoryView(ui.View):
         
         return sorted(list(profiles))
 
-    def _load_current_session(self):
+    async def _load_current_session(self):
         if not self.selected_profile: return
         self.session_key = ('global', self.user_id, self.selected_profile)
         
         session_data = self.cog.global_chat_sessions.get(self.session_key)
         if not session_data:
-            session_data = self.cog._load_session_from_disk(self.session_key, 'global_chat')
+            session_data = await self.cog._load_session_from_disk(self.session_key, 'global_chat')
             if session_data:
                 self.cog.global_chat_sessions[self.session_key] = session_data
         
@@ -114,15 +111,11 @@ class GlobalChatHistoryView(ui.View):
             while i < len(log) - 1:
                 curr = log[i]
                 next_t = log[i+1]
-                # Simple pairing strategy: User followed by Model
                 if curr.get('role') == 'user' and next_t.get('role') == 'model':
                     self.rounds.append((curr, next_t))
                     i += 2
                 else:
                     i += 1
-            
-            # If no pairs found but we have data, maybe show just models? 
-            # For now strict pairing mirrors Whisper behavior best.
         
         self.current_page = max(0, len(self.rounds) - 1)
 
@@ -184,7 +177,6 @@ class GlobalChatHistoryView(ui.View):
             
         user_turn, model_turn = self.rounds[self.current_page]
         
-        # Resolve Appearance
         display_name = self.selected_profile
         avatar_url = self.cog.bot.user.display_avatar.url
         
@@ -214,7 +206,7 @@ class GlobalChatHistoryView(ui.View):
 
     async def profile_callback(self, interaction: discord.Interaction):
         self.selected_profile = interaction.data['values'][0]
-        self._load_current_session()
+        await self._load_current_session()
         self._build_view()
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
@@ -249,27 +241,24 @@ class GlobalChatHistoryView(ui.View):
         session_data['unified_log'] = [t for t in session_data['unified_log'] if t.get('turn_id') not in ids_to_delete]
         
         if len(session_data['unified_log']) < original_len:
-            # Rebuild ChatSession
             new_history = []
             for t in session_data['unified_log']:
                 role = 'model' if t.get('is_user') is False else 'user'
                 new_history.append({'role': role, 'parts': [t.get('content')]})
             session_data['chat_session'] = GoogleGenAIChatSession(history=new_history)
             
-            # Save the updated log to disk
-            self.cog._save_session_to_disk(self.session_key, 'global_chat', session_data)
+            await self.cog._save_session_to_disk(self.session_key, 'global_chat', session_data)
 
-            # Reload internal state from the modified data
-            self._load_current_session()
+            await self._load_current_session()
             self._build_view()
             
             if not self.rounds:
-                self.cog._delete_session_from_disk(self.session_key, 'global_chat')
+                await self.cog._delete_session_from_disk(self.session_key, 'global_chat')
                 self.available_profiles.remove(self.selected_profile)
                 
                 if self.available_profiles:
                     self.selected_profile = self.available_profiles[0]
-                    self._load_current_session()
+                    await self._load_current_session()
                     self._build_view()
                     await interaction.edit_original_response(content="Round deleted. Switching to next available profile.", embed=self.get_embed(), view=self)
                 else:
@@ -521,7 +510,7 @@ class WhisperActionView(ui.View):
             return
 
         if not session.get("is_hydrated"):
-            session = self.cog._ensure_session_hydrated(self.channel_id, session.get("type", "multi"))
+            session = await self.cog._ensure_session_hydrated(self.channel_id, session.get("type", "multi"))
 
         turn_ids_to_delete = {self.whisper_turn_id, self.response_turn_id}
         original_log_len = len(session.get("unified_log", []))
@@ -538,13 +527,11 @@ class WhisperActionView(ui.View):
         ]
 
         if len(session["unified_log"]) < original_log_len and target_pid:
-            # Save the modified log to disk first
             session_type = session.get("type", "multi")
-            self.cog._save_session_to_disk((self.channel_id, None, None), session_type, session["unified_log"])
+            await self.cog._save_session_to_disk((self.channel_id, None, None), session_type, session["unified_log"])
             
-            # Now, force a re-hydration to update all in-memory participant histories
             session["is_hydrated"] = False
-            self.cog._ensure_session_hydrated(self.channel_id, session_type)
+            await self.cog._ensure_session_hydrated(self.channel_id, session_type)
 
         await interaction.edit_original_response(content="Whisper has been deleted from the profile's memory.", view=None, embed=None)
 
@@ -1087,9 +1074,6 @@ class ProfileManageView(ui.View):
                     if os.path.exists(old_dir):
                         os.rename(old_dir, new_dir)
                 
-                for ch_id, act in user_index.get("channel_active_profiles", {}).items():
-                    if act == old_name: user_index["channel_active_profiles"][ch_id] = new_name
-                
                 self.cog._save_user_index(self.user_id, user_index)
 
                 # Hot-swap live sessions and models to prevent corruption
@@ -1522,6 +1506,7 @@ class HubPublicLibraryView(HubBaseView):
             owner = self.cog.bot.get_user(p['owner_id'])
             owner_name = owner.name if owner else "Unknown"
             label = f"{p['profile_name']} (by {owner_name})"[:100]
+            
             # Value is index on the page (0-24)
             option = discord.SelectOption(label=label, value=str(i), default=(i == self.selected_index_on_page))
             options.append(option)
@@ -2143,7 +2128,7 @@ class ShutdownConfirmView(ui.View):
 
         # 2. Flush all in-memory sessions to disk
         for session_key, chat_session in self.cog.global_chat_sessions.items():
-            self.cog._save_session_to_disk(session_key, 'global_chat', chat_session)
+            await self.cog._save_session_to_disk(session_key, 'global_chat', chat_session)
         
         for ch_id, session_data in self.cog.multi_profile_channels.items():
             if session_data.get("is_hydrated"):
@@ -2151,7 +2136,7 @@ class ShutdownConfirmView(ui.View):
                 unified_log = session_data.get("unified_log")
                 if unified_log is not None:
                     dummy_session_key = (ch_id, None, None)
-                    self.cog._save_session_to_disk(dummy_session_key, session_type, unified_log)
+                    await self.cog._save_session_to_disk(dummy_session_key, session_type, unified_log)
 
         # 3. Force stop all loops and close
         if self.cog.has_lock:
@@ -2867,8 +2852,7 @@ class MultiProfileSelectView(ui.View):
                     # item is dict
                     p_name = item.get('profile_name')
                     bot_user_id = next((bid for bid, b in self.cog.child_bots.items() if b is item), None)
-                    bot_user = self.cog.bot.get_user(int(bot_user_id)) if bot_user_id else None
-                    label = f"{bot_user.name} ({p_name})" if bot_user else f"Bot {p_name}"
+                    label = f"Child Bot ({p_name})"
                     value = f"child_{bot_user_id}"
                 else:
                     # item is string name
@@ -2876,7 +2860,7 @@ class MultiProfileSelectView(ui.View):
                     value = item
                 
                 is_selected = value in self.selection_order
-                options.append(discord.SelectOption(label=label[:100], value=value, default=is_selected))
+                options.append(discord.SelectOption(label=label, value=value, default=is_selected))
         else:
             options.append(discord.SelectOption(label="No profiles found in this source", value="none"))
 
@@ -3361,7 +3345,9 @@ class ModelApplyView(ui.View):
         start = self.current_page * DROPDOWN_MAX_OPTIONS
         page_profiles = self.all_profiles[start : start + DROPDOWN_MAX_OPTIONS]
         
-        options = [discord.SelectOption(label=name, value=name, default=(name in self.target_profiles)) for name in page_profiles]
+        options = []
+        for name in page_profiles:
+            options.append(discord.SelectOption(label=name, value=name, default=(name in self.target_profiles)))
         
         if options:
             profile_select = ui.Select(placeholder="Select profiles...", min_values=0, max_values=len(options), options=options, row=3)
@@ -3470,7 +3456,8 @@ class BaseBulkProfileView(ui.View):
         
         options = []
         if page_items:
-            options = [discord.SelectOption(label=name, value=name, default=(name in self.selected_profiles)) for name in page_items]
+            for name in page_items:
+                options.append(discord.SelectOption(label=name, value=name, default=(name in self.selected_profiles)))
         else:
             options = [discord.SelectOption(label="No profiles found", value="none", default=False)]
 
@@ -5316,7 +5303,7 @@ class FreewillParticipantsView(FreewillBaseView):
                 if isinstance(p_val, str):
                     p_val = {"introverted": 10, "regular": 50, "outgoing": 90, "off": 0}.get(p_val, 10)
                 
-                label = f"{pname} ({p_val}%)"
+                label = f"[{p_val}%] {pname}"
                 all_participants.append({"label": label, "value": f"{uid}:{pname}", "uid": uid, "name": pname, "chance": p_val, "settings": settings})
         
         all_participants.sort(key=lambda x: x['name'])
@@ -6158,8 +6145,10 @@ class SessionView(ui.View):
         for i, p in enumerate(session.get("profiles", [])):
             p_name = p.get("profile_name")
             method = p.get("method", "webhook")
+            
             label = p_name
             description = f"Owner ID: {p.get('owner_id')}"
+            
             if method == 'child_bot':
                 bot_id = p.get("bot_id")
                 bot_user = self.cog.bot.get_user(int(bot_id)) if bot_id else None

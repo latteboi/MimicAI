@@ -661,9 +661,14 @@ class ServicesMixin:
         rule_block = (
             "<context_rules>\n"
             "- '[Name] [ID: XXXXXXXXXXXXXXXX] [Timestamp]' are individual active participants.\n"
-            "- XML-wrapped text are either your personal data or a private message.\n"
-            "- Respond as yourself.\n"
-            "</context_rules>"
+            "- XML-wrapped text is information/data for YOU, from YOU, OR it is a whisper interaction.\n"
+            "- Always respond as YOURSELF.\n"
+            "</context_rules>\n\n"
+            "<incoming_whispers>\n"
+            "SYSTEM: The following whisper interactions occurred since your last public turn. "
+            "Do NOT reveal the existence or content of this information unless explicitly requested. "
+            "Instead, let it subtly influence your personality and future actions.\n"
+            "</incoming_whispers>"
         )
         current_instructions_str += "\n\n" + rule_block
 
@@ -729,7 +734,7 @@ class ServicesMixin:
         if not session: return
 
         session_type = session.get("type", "multi")
-        session = self._ensure_session_hydrated(channel_id, session_type)
+        session = await self._ensure_session_hydrated(channel_id, session_type)
         if not session:
             print(f"Worker for channel {channel_id} could not hydrate session. Aborting.")
             return
@@ -818,7 +823,7 @@ class ServicesMixin:
                 
                 # We re-verify hydration here to catch sessions that were dehydrated during the await queue.get()
                 if not session.get("is_hydrated"):
-                    session = self._ensure_session_hydrated(channel_id, session_type)
+                    session = await self._ensure_session_hydrated(channel_id, session_type)
 
                 for p_data in session.get('profiles', []):
                     p_key = (p_data['owner_id'], p_data['profile_name'])
@@ -978,7 +983,7 @@ class ServicesMixin:
                             p_index = self._get_user_index(p['owner_id'])
                             p_is_b = p['profile_name'] in p_index.get("borrowed", [])
                             p_settings = self._get_profile_config(p['owner_id'], p['profile_name'], p_is_b) or {}
-                            if p_settings.get("url_fetching_enabled", True):
+                            if p_settings.get("url_fetching_enabled", False):
                                 any_url_enabled = True; break
                         
                         url_text_content = None
@@ -1024,7 +1029,7 @@ class ServicesMixin:
                         session.get("unified_log", []).append(turn_object)
 
                         # [NEW] Immediate persistence for user turns
-                        self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                        await self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
                         
                         # Initialize list for standard message attachments/reply images
                         new_message_parts = []
@@ -1433,7 +1438,7 @@ class ServicesMixin:
                     p_index = self._get_user_index(p['owner_id'])
                     p_is_b = p['profile_name'] in p_index.get("borrowed", [])
                     p_settings = self._get_profile_config(p['owner_id'], p['profile_name'], p_is_b) or {}
-                    if p_settings.get("url_fetching_enabled", True):
+                    if p_settings.get("url_fetching_enabled", False):
                         any_url_enabled = True; break
                 
                 if any_url_enabled and batched_url_research_content:
@@ -1505,7 +1510,7 @@ class ServicesMixin:
                     if isinstance(chat_session, list) or chat_session is None:
                         print(f"Detected corrupted session state for {participant_key} in {channel_id}. Attempting repair.")
                         session['is_hydrated'] = False
-                        session = self._ensure_session_hydrated(channel_id, session.get("type", "multi"))
+                        session = await self._ensure_session_hydrated(channel_id, session.get("type", "multi"))
                         if session:
                             chat_session = session['chat_sessions'].get(participant_key)
                         
@@ -1557,9 +1562,10 @@ class ServicesMixin:
 
                         # Log this system notice in everyone's history
                         history_line = self._format_history_entry("System", datetime.datetime.now(datetime.timezone.utc), error_message)
-                        error_content_obj = content_types.to_content({'role': 'user', 'parts': [history_line]})
+                        error_content_obj = {'role': 'user', 'parts': [history_line]}
                         for other_chat in session['chat_sessions'].values():
-                            other_chat.history.append(error_content_obj)
+                            if other_chat is not None:
+                                other_chat.history.append(error_content_obj)
                         continue
 
                     user_index = self._get_user_index(owner_id)
@@ -1610,7 +1616,7 @@ class ServicesMixin:
                         p_is_b = p_name in p_index.get("borrowed", [])
                         p_settings = self._get_profile_config(p_owner_id, p_name, p_is_b) or {}
 
-                        if p_settings.get("url_fetching_enabled", True) and round_url_text_contexts:
+                        if p_settings.get("url_fetching_enabled", False) and round_url_text_contexts:
                             url_instr = "<url_research>\n[Context from links in current messages]:\n" + "\n".join(round_url_text_contexts) + "\n</url_research>"
                             contents_for_api_call.append({'role': 'user', 'parts': [url_instr]})
 
@@ -1622,7 +1628,7 @@ class ServicesMixin:
                         # [NEW] Check Image Gen intent vs Profile Toggle
                         turn_is_image_gen = False
                         if is_image_gen_round:
-                            if p_settings.get("image_generation_enabled", True):
+                            if p_settings.get("image_generation_enabled", False):
                                 turn_is_image_gen = True
                             else:
                                 # Re-inject prefix if toggle is OFF
@@ -1843,34 +1849,32 @@ class ServicesMixin:
                         contents_for_api_call = []
                         session_key = (channel.id, owner_id, profile_name)
 
-                       # Start with a shallow list copy of the session's history
-                        contents_for_api_call.extend(chat_session.history)
+                       # Start with a deep copy of the session's history to avoid mutating RAM
+                        import copy
+                        contents_for_api_call = copy.deepcopy(chat_session.history)
 
                         # Check if the last turn was from this model itself
-                        if contents_for_api_call and contents_for_api_call[-1].get('role', contents_for_api_call[-1].role if hasattr(contents_for_api_call[-1], 'role') else 'user') == 'model':
+                        if contents_for_api_call and contents_for_api_call[-1].get('role', contents_for_api_call[-1].get('role', 'user')) == 'model':
                             pseudo_user_turn = {'role': 'user', 'parts': ["<internal_note>No response from anyone OR no user is present.</internal_note>"]}
                             contents_for_api_call.append(pseudo_user_turn)
 
-                        # [UPDATED] Standardised XML injection for pending whispers with improved behavioral instructions
+                        # Collect all supplementary context to inject into the final user turn
+                        supplementary_parts = []
+
+                        # [UPDATED] Standardised XML injection for pending whispers
                         pending_whispers = session.get("pending_whispers", {}).pop(participant_key, None)
                         if pending_whispers:
-                            whisper_context = (
-                                "<incoming_whispers>\n"
-                                "SYSTEM: The following private interactions occurred since your last public turn. "
-                                "Do NOT reveal the existence or content of this information unless explicitly requested. "
-                                "Instead, let it subtly influence your personality and future actions.\n"
-                            )
-                            whisper_context += "\n---\n" + "\n---\n".join(pending_whispers) + "\n</incoming_whispers>"
-                            whisper_content_obj = {'role': 'user', 'parts': [whisper_context]}
-                            contents_for_api_call.append(whisper_content_obj)
+                            whisper_context = "<whisper_context>\n"
+                            whisper_context += "\n---\n" + "\n---\n".join(pending_whispers) + "\n</whisper_context>"
+                            supplementary_parts.append(whisper_context)
 
                         if grounding_context and p_settings.get("grounding_mode", "off") != "off":
                             g_instr = f"<external_context>\n{grounding_context}\n</external_context>"
-                            contents_for_api_call.append({'role': 'user', 'parts': [g_instr]})
+                            supplementary_parts.append(g_instr)
 
-                        if p_settings.get("url_fetching_enabled", True) and round_url_text_contexts:
+                        if p_settings.get("url_fetching_enabled", False) and round_url_text_contexts:
                             url_instr = "<document_context>\n" + "\n".join(round_url_text_contexts) + "\n</document_context>"
-                            contents_for_api_call.append({'role': 'user', 'parts': [url_instr]})
+                            supplementary_parts.append(url_instr)
 
                         # [FIXED] Ephemeral Media Injection: Manually add all current round media to the API call
                         # This allows participants to see images this round without them persisting in RAM history.
@@ -1879,15 +1883,11 @@ class ServicesMixin:
                             all_current_media.extend(turn_media)
                         
                         if all_current_media:
-                            contents_for_api_call.append({'role': 'user', 'parts': all_current_media})
+                            supplementary_parts.extend(all_current_media)
 
                         ltm_recall_text = await self._get_relevant_ltm_for_prompt(session_key, chat_session.history, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id)
                         if ltm_recall_text:
-                            ltm_content_obj = {'role': 'user', 'parts': [ltm_recall_text]}
-                            contents_for_api_call.append(ltm_content_obj)
-                        
-                        # The history is now managed by the deep copy and pseudo-turn logic above.
-                        # This block is now only for adding the final user turn context if it exists.
+                            supplementary_parts.append(ltm_recall_text)
                         
                         if is_image_gen_round:
                             if generated_image_bytes_for_round:
@@ -1897,14 +1897,21 @@ class ServicesMixin:
                                     system_note, 
                                     {"mime_type": "image/jpeg", "data": generated_image_bytes_for_round}
                                 ]
-                                contents_for_api_call.append({'role': 'user', 'parts': text_gen_parts})
+                                supplementary_parts.extend(text_gen_parts)
                             else:
                                 if is_generator:
                                     system_note = f"<image_context>Your attempt to generate an image based on the prompt '{image_gen_prompt}' failed. Comment on it.</image_context>"
-                                    contents_for_api_call.append({'role': 'user', 'parts': [system_note]})
+                                    supplementary_parts.append(system_note)
 
                         if not contents_for_api_call:
                             contents_for_api_call.append({'role': 'user', 'parts': ["<internal_note>Begin conversation.</internal_note>"]})
+
+                        # Inject supplementary parts into the final user turn to ensure alternating roles
+                        if supplementary_parts:
+                            if contents_for_api_call[-1].get('role') == 'user':
+                                contents_for_api_call[-1]['parts'].extend(supplementary_parts)
+                            else:
+                                contents_for_api_call.append({'role': 'user', 'parts': supplementary_parts})
 
                         # [NEW] Advanced Params Injection
                         p_index = self._get_user_index(owner_id)
@@ -2193,7 +2200,7 @@ class ServicesMixin:
 
                     # [UPDATED] Persist log immediately
                     session_type = session.get("type", "multi")
-                    self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                    await self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
 
                     is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
 
@@ -2406,7 +2413,7 @@ class ServicesMixin:
                             for msg in sent_messages:
                                 turn_object.setdefault("message_ids", []).append(msg.id)
                             
-                            self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                            await self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
                     
                     if sources_text:
                         for line in sources_text.split('\n'):
@@ -2477,7 +2484,7 @@ class ServicesMixin:
                                         p_index_batch = self._get_user_index(p['owner_id'])
                                         p_is_b_batch = p['profile_name'] in p_index_batch.get("borrowed", [])
                                         p_settings_batch = self._get_profile_config(p['owner_id'], p['profile_name'], p_is_b_batch) or {}
-                                        if p_settings_batch.get("url_fetching_enabled", True):
+                                        if p_settings_batch.get("url_fetching_enabled", False):
                                             any_url_enabled_batch = True; break
                                     
                                     url_text_batch = None
@@ -2516,7 +2523,7 @@ class ServicesMixin:
                                         p_settings_b = self._get_profile_config(p_owner_id_b, p_name_b, p_is_b_b) or {}
                                         
                                         final_parts = [user_line]
-                                        if url_text_batch and p_settings_b.get("url_fetching_enabled", True):
+                                        if url_text_batch and p_settings_b.get("url_fetching_enabled", False):
                                             final_parts.append(f"\n<document_context>\n{url_text_batch}\n</document_context>")
                                         
                                         final_parts.extend(url_media_batch)
@@ -2558,7 +2565,7 @@ class ServicesMixin:
                     # Force garbage collection to clear image buffers from this turn
                     gc.collect()
 
-                self._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
+                await self._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
 
                 for trigger in all_triggers_for_round:
                     if trigger is not None:
@@ -2654,7 +2661,7 @@ class ServicesMixin:
                 # [NEW] Mandatory Round-End Persistence
                 # Ensures the transcript is saved immediately after the last participant speaks.
                 dummy_session_key = (channel_id, None, None)
-                self._save_session_to_disk(dummy_session_key, session_type, session.get("unified_log", []))
+                await self._save_session_to_disk(dummy_session_key, session_type, session.get("unified_log", []))
 
                 # Rebuild all participant histories from the trimmed unified log to ensure consistency.
                 trimmed_unified_log = session.get("unified_log", [])
@@ -2678,7 +2685,7 @@ class ServicesMixin:
                             
                             # [UPDATED] Standardised Headers
                             parts = [turn.get("content")]
-                            if role == 'user' and turn.get("url_context") and p_profile_settings.get("url_fetching_enabled", True):
+                            if role == 'user' and turn.get("url_context") and p_profile_settings.get("url_fetching_enabled", False):
                                 parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
                             
                             if role == 'user' and turn.get("grounding_context") and p_profile_settings.get("grounding_mode", "off") != "off":
@@ -3846,7 +3853,7 @@ class ServicesMixin:
                 if session and session.get('is_running'): continue
                 
                 if session and not session.get("is_hydrated"):
-                    session = self._ensure_session_hydrated(channel.id, "freewill")
+                    session = await self._ensure_session_hydrated(channel.id, "freewill")
                     
                 opted_in_profiles = []
                 server_participation = self.freewill_participation.get(str(guild.id), {})
@@ -3913,7 +3920,7 @@ class ServicesMixin:
                 self._save_multi_profile_sessions()
                 
                 dummy_session_key = (channel.id, None, None)
-                self._save_session_to_disk(dummy_session_key, "freewill", session.get("unified_log", []))
+                await self._save_session_to_disk(dummy_session_key, "freewill", session.get("unified_log", []))
 
                 target_participant = cast[1]
                 target_id = target_participant['owner_id']
@@ -3967,7 +3974,7 @@ class ServicesMixin:
                     
                     if unified_log is not None:
                         dummy_session_key = (key, None, None)
-                        self._save_session_to_disk(dummy_session_key, session_type, unified_log)
+                        await self._save_session_to_disk(dummy_session_key, session_type, unified_log)
 
                     # [FIXED] Use safe cancel to prevent "Task destroyed but pending"
                     if session_to_evict.get('worker_task'):
@@ -3995,7 +4002,7 @@ class ServicesMixin:
                 session_to_save = self.chat_sessions.get(key) or self.global_chat_sessions.get(key)
                 if session_to_save:
                     session_type = 'global_chat' if key in self.global_chat_sessions else 'single'
-                    self._save_session_to_disk(key, session_type, session_to_save)
+                    await self._save_session_to_disk(key, session_type, session_to_save)
                     
                 self.chat_sessions.pop(key, None)
                 self.global_chat_sessions.pop(key, None)
@@ -4448,7 +4455,7 @@ class ServicesMixin:
             is_borrowed = profile_name in index.get("borrowed", [])
             profile_data = self._get_profile_config(owner_id, profile_name, is_borrowed) or {}
 
-            if not profile_data.get("image_generation_enabled", True):
+            if not profile_data.get("image_generation_enabled", False):
                 return
 
             safety_level_str = profile_data.get("safety_level", "low")
@@ -4639,7 +4646,7 @@ class ServicesMixin:
         self.channel_models.pop(session_key, None)
         self.channel_model_last_profile_key.pop(session_key, None)
         self.session_last_accessed.pop(session_key, None)
-        self._delete_session_from_disk(session_key, 'single')
+        await self._delete_session_from_disk(session_key, 'single')
         self.ltm_recall_history.pop(session_key, None)
 
         # 3. Reset the LTM creation counter
@@ -4675,7 +4682,7 @@ class ServicesMixin:
                             break
                     
                     session_type = session.get("type", "multi")
-                    self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                    await self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
         
         except Exception as e:
             print(f"Error during child bot confirmation ({correlation_id}): {e}")
@@ -5040,7 +5047,7 @@ class ServicesMixin:
             
             # [NEW] Persistence for standalone freewill turns
             model_cache_key_fw = (channel.id, profile_owner_id, profile_name)
-            self._save_session_to_disk(model_cache_key_fw, 'single', chat.history)
+            await self._save_session_to_disk(model_cache_key_fw, 'single', chat.history)
             
             await self._maybe_create_ltm(
                 sent_messages[0] if sent_messages else channel, 
@@ -5156,7 +5163,7 @@ class ServicesMixin:
 
     async def _process_urls_in_content(self, content: str, guild_id: int, profile_settings: Dict[str, Any]) -> Tuple[List[str], List[Dict]]:
         # This guard is now bypassed by the "Research Once" phase which passes a dummy object with enabled=True
-        if not profile_settings.get("url_fetching_enabled", True):
+        if not profile_settings.get("url_fetching_enabled", False):
             return [], []
 
         text_contexts = []
@@ -5546,7 +5553,7 @@ class ServicesMixin:
             is_borrowed = effective_profile_name in index.get("borrowed", [])
             profile_data = self._get_profile_config(effective_profile_owner_id, effective_profile_name, is_borrowed) or {}
 
-            if not profile_data.get("image_generation_enabled", True):
+            if not profile_data.get("image_generation_enabled", False):
                 return
 
             if self.image_request_queue.full():
@@ -5762,22 +5769,34 @@ class ServicesMixin:
         output.seek(0)
         return output
 
-    async def _execute_regeneration(self, payload: discord.RawReactionActionEvent, session: Dict, turn_object: Dict, turn_index: int, participant: Dict):
+    async def _execute_regeneration(self, payload: discord.RawReactionActionEvent, session: Dict, turn_id: str, participant: Dict):
         channel = self.bot.get_channel(payload.channel_id)
         if not channel: return
         
         # 1. State Locking & Pre-emptive Persistence
         session['is_regenerating'] = True
-        turn_id = turn_object.get("turn_id")
+        
+        actual_turn_index = -1
+        target_turn = None
+        for i, t in enumerate(session.get("unified_log", [])):
+            if t.get("turn_id") == turn_id:
+                actual_turn_index = i
+                target_turn = t
+                break
+                
+        if not target_turn:
+            session['is_regenerating'] = False
+            return
+            
         session_type = session.get("type", "multi")
         dummy_key = (channel.id, None, None)
         
         # Ensure session state is flushed to disk immediately (Crucial for first-message ad-hoc sessions)
         self._save_multi_profile_sessions()
-        self._save_session_to_disk(dummy_key, session_type, session["unified_log"])
+        await self._save_session_to_disk(dummy_key, session_type, session["unified_log"])
         
         try:
-            message_ids_to_check = turn_object.get("message_ids", [])
+            message_ids_to_check = target_turn.get("message_ids", [])
             
             # Initial Edit to Placeholder
             if participant.get('method') == 'child_bot':
@@ -5806,11 +5825,12 @@ class ServicesMixin:
                     is_sources = "Sources:" in msg.content
                     has_image = any(a.content_type and a.content_type.startswith("image/") for a in msg.attachments)
                     if not is_sources and not has_image:
+                        self.purged_message_ids.add(msg_id)
                         await msg.delete()
                 except: pass
 
             # 3. History Slicing (Time Travel)
-            sliced_unified_log = session["unified_log"][:turn_index]
+            sliced_unified_log = session["unified_log"][:actual_turn_index]
             p_owner_id = participant['owner_id']
             p_name = participant['profile_name']
             p_key = (p_owner_id, p_name)
@@ -5938,16 +5958,23 @@ class ServicesMixin:
             
             profile_id = self._get_profile_id(p_owner_id, p_name)
             new_history_line = self._format_history_entry(sp_name, sent_timestamp, new_text, tz_str, entity_id=profile_id)
-            turn_object["content"] = new_history_line
-            turn_object["timestamp"] = sent_timestamp.isoformat()
+            
+            final_target_turn = next((t for t in session.get("unified_log", []) if t.get("turn_id") == turn_id), None)
+            if not final_target_turn:
+                final_target_turn = target_turn
+                session.setdefault("unified_log", []).append(final_target_turn)
+            
+            final_target_turn["content"] = new_history_line
+            final_target_turn["timestamp"] = sent_timestamp.isoformat()
+            final_target_turn["message_ids"] = [payload.message_id]
             
             if p_profile.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
                 sig = response.thought_signature
                 if isinstance(sig, bytes):
                     sig = base64.b64encode(sig).decode('utf-8')
-                turn_object['thought_signature'] = sig
+                final_target_turn['thought_signature'] = sig
             else:
-                turn_object.pop('thought_signature', None)
+                final_target_turn.pop('thought_signature', None)
             
             if participant.get('method') == 'child_bot':
                 await self.manager_queue.put({
@@ -5967,11 +5994,11 @@ class ServicesMixin:
                     except: pass
 
             # Re-sync memory and save final state
-            self._save_session_to_disk(dummy_key, session_type, session["unified_log"])
+            await self._save_session_to_disk(dummy_key, session_type, session["unified_log"])
             
             # Re-hydrate histories for all participants to reflect the edit
             session["is_hydrated"] = False
-            self._ensure_session_hydrated(channel.id, session_type)
+            await self._ensure_session_hydrated(channel.id, session_type)
 
         except Exception as e:
             print(f"Regeneration failed: {e}")

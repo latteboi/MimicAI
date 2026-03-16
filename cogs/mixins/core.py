@@ -81,7 +81,7 @@ class CoreMixin:
             if session:
                 session_type = session.get("type", "multi")
                 if not session.get("is_hydrated"):
-                    session = self._ensure_session_hydrated(message.channel.id, session_type)
+                    session = await self._ensure_session_hydrated(message.channel.id, session_type)
                 
                 if session:
                     turn_object = next((turn for turn in session.get("unified_log", []) if message.reference.message_id in turn.get("message_ids", [])), None)
@@ -395,7 +395,7 @@ class CoreMixin:
         
         session_type = session.get("type", "multi")
         if not session.get("is_hydrated"):
-            session = self._ensure_session_hydrated(channel_id, session_type)
+            session = await self._ensure_session_hydrated(channel_id, session_type)
         if not session: return
 
         self.session_last_accessed[channel_id] = time.time()
@@ -412,9 +412,9 @@ class CoreMixin:
             turn_id_to_find = turn_object["turn_id"]
             if is_mute:
                 turn_object["is_hidden"] = True
-                self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                await self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
                 session["is_hydrated"] = False
-                self._ensure_session_hydrated(channel_id, session_type)
+                await self._ensure_session_hydrated(channel_id, session_type)
                 return
 
             if turn_object.get("is_user") is True:
@@ -446,7 +446,7 @@ class CoreMixin:
                         # Verify the turn hasn't been deleted while waiting
                         still_exists = any(t.get("turn_id") == turn_id_to_find for t in session.get("unified_log", []))
                         if still_exists:
-                            await self._execute_regeneration(payload, session, turn_object, turn_index, reacted_to_participant)
+                            await self._execute_regeneration(payload, session, turn_id_to_find, reacted_to_participant)
 
                     asyncio.create_task(queue_regeneration())
                     return
@@ -531,7 +531,7 @@ class CoreMixin:
         
         session_type = session.get("type", "multi")
         if not session.get("is_hydrated"):
-            session = self._ensure_session_hydrated(channel_id, session_type)
+            session = await self._ensure_session_hydrated(channel_id, session_type)
         if not session: return
 
         turn_object = None
@@ -543,9 +543,9 @@ class CoreMixin:
         if turn_object:
             if is_mute:
                 turn_object["is_hidden"] = False
-                self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                await self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
                 session["is_hydrated"] = False
-                self._ensure_session_hydrated(channel_id, session_type)
+                await self._ensure_session_hydrated(channel_id, session_type)
                 return
             
             elif is_skip and turn_object.get("is_user") is False:
@@ -581,7 +581,7 @@ class CoreMixin:
                     session_data = self.global_chat_sessions.get(session_key)
                     
                     if not session_data:
-                        session_data = self._load_session_from_disk(session_key, 'global_chat')
+                        session_data = await self._load_session_from_disk(session_key, 'global_chat')
                         if session_data:
                             self.global_chat_sessions[session_key] = session_data
 
@@ -610,10 +610,10 @@ class CoreMixin:
                             if not session_data['unified_log']:
                                 self.global_chat_sessions.pop(session_key, None)
                                 self.session_last_accessed.pop(session_key, None)
-                                self._delete_session_from_disk(session_key, 'global_chat')
+                                await self._delete_session_from_disk(session_key, 'global_chat')
                                 self.ltm_recall_history.pop(session_key, None)
                             else:
-                                self._save_session_to_disk(session_key, 'global_chat', session_data)
+                                await self._save_session_to_disk(session_key, 'global_chat', session_data)
                                 self.session_last_accessed[session_key] = time.time()
                             return
 
@@ -623,7 +623,7 @@ class CoreMixin:
         
         session_type = session.get("type", "multi")
         if not session.get("is_hydrated"):
-            session = self._ensure_session_hydrated(payload.channel_id, session_type)
+            session = await self._ensure_session_hydrated(payload.channel_id, session_type)
         if not session: return
 
         turn_id_to_delete = None
@@ -652,17 +652,17 @@ class CoreMixin:
                 
                 dummy_session_key = (payload.channel_id, None, None)
                 if is_effectively_empty:
-                    self._delete_session_from_disk(dummy_session_key, session_type)
+                    await self._delete_session_from_disk(dummy_session_key, session_type)
                     for p_key in session.get("chat_sessions", {}).keys():
                         owner_id, profile_name = p_key
                         full_session_key = (payload.channel_id, owner_id, profile_name)
                         self.ltm_recall_history.pop(full_session_key, None)
                 else:
-                    self._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
+                    await self._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
 
                 # Now that the correct state is on disk, force a re-read and rebuild
                 session["is_hydrated"] = False
-                self._ensure_session_hydrated(payload.channel_id, session_type)
+                await self._ensure_session_hydrated(payload.channel_id, session_type)
 
             self.session_last_accessed[payload.channel_id] = time.time()
 
@@ -678,7 +678,7 @@ class CoreMixin:
         
         session_type = session.get("type", "multi")
         if not session.get("is_hydrated"):
-            session = self._ensure_session_hydrated(channel_id, session_type)
+            session = await self._ensure_session_hydrated(channel_id, session_type)
         if not session: return
 
         turn_object = None
@@ -723,11 +723,11 @@ class CoreMixin:
             
             # Flush changes to disk
             dummy_session_key = (channel_id, None, None)
-            self._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
+            await self._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
             
             # Force Re-hydration so all participant histories get the updated log context instantly
             session["is_hydrated"] = False
-            self._ensure_session_hydrated(channel_id, session_type)
+            await self._ensure_session_hydrated(channel_id, session_type)
             self.session_last_accessed[channel_id] = time.time()
 
     async def _execute_speak_as(self, interaction_to_respond: discord.Interaction, channel: discord.abc.Messageable, author: discord.User, profile_name: str, message: str, method: str):
@@ -770,7 +770,7 @@ class CoreMixin:
             # Fix: Use the standard hydration method to ensure ChatSession objects are created,
             # not raw lists from _load_session_from_disk.
             if not session.get("is_hydrated"):
-                session = self._ensure_session_hydrated(channel.id, session.get("type", "multi"))
+                session = await self._ensure_session_hydrated(channel.id, session.get("type", "multi"))
                 if not session:
                     await interaction_to_respond.followup.send("Failed to load session data.", ephemeral=True)
                     return
@@ -840,7 +840,7 @@ class CoreMixin:
             
             session_type = session.get("type", "multi")
             self.session_last_accessed[channel.id] = time.time()
-            self._save_session_to_disk((channel.id, None, None), session_type, session["unified_log"])
+            await self._save_session_to_disk((channel.id, None, None), session_type, session["unified_log"])
 
         sent_messages = []
         if delivery_method == 'child_bot' and child_bot_id:
@@ -872,7 +872,7 @@ class CoreMixin:
         if sent_messages and turn_object:
             for msg in sent_messages:
                 turn_object.setdefault("message_ids", []).append(msg.id)
-            self._save_session_to_disk((channel.id, None, None), session.get("type", "multi"), session["unified_log"])
+            await self._save_session_to_disk((channel.id, None, None), session.get("type", "multi"), session["unified_log"])
 
         await interaction_to_respond.followup.send("Message sent.", ephemeral=True)
 
@@ -927,7 +927,7 @@ class CoreMixin:
 
             session_data = self.global_chat_sessions.get(model_cache_key)
             if not session_data:
-                session_data = self._load_session_from_disk(model_cache_key, 'global_chat')
+                session_data = await self._load_session_from_disk(model_cache_key, 'global_chat')
             
             if not session_data:
                 chat = GoogleGenAIChatSession(history=[])
@@ -943,7 +943,7 @@ class CoreMixin:
                 parts = [t.get('content')]
                 
                 if t_role == 'user':
-                    if t.get('url_context') and profile_data.get('url_fetching_enabled', True):
+                    if t.get('url_context') and profile_data.get('url_fetching_enabled', False):
                         parts.append(f"\n<document_context>\n{t.get('url_context')}\n</document_context>")
                     if t.get('grounding_context') and profile_data.get('grounding_mode', 'off') != 'off':
                         parts.append(f"\n<external_context>\n{t.get('grounding_context')}\n</external_context>")
@@ -986,7 +986,7 @@ class CoreMixin:
             if ltm_recall_text:
                 final_user_parts.append(ltm_recall_text)
             
-            if profile_data.get('url_fetching_enabled', True):
+            if profile_data.get('url_fetching_enabled', False):
                 u_text, _ = await self._process_urls_in_content(message, 0, {"url_fetching_enabled": True})
                 if u_text:
                     final_user_parts.append(f"<document_context>\n" + "\n".join(u_text) + "\n</document_context>")
@@ -1181,7 +1181,7 @@ class CoreMixin:
                 chat.history[-1] = new_turn
 
             # Persist immediately to disk for safety and UI consistency
-            self._save_session_to_disk(model_cache_key, 'global_chat', session_data)
+            await self._save_session_to_disk(model_cache_key, 'global_chat', session_data)
 
             await self._maybe_create_ltm(
                 interaction.channel, interaction.user.display_name, chat.history, user_id, profile_name,
@@ -1203,7 +1203,7 @@ class CoreMixin:
 
         # Ensure session is hydrated to get history
         if not session.get("is_hydrated"):
-            session = self._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi"))
+            session = await self._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi"))
 
         chat_session = session.get("chat_sessions", {}).get(participant_key)
         if not chat_session:
@@ -1220,11 +1220,19 @@ class CoreMixin:
             return
 
         # Construct the prompt for the private response
-        whisper_prompt = f"<private_context author='{interaction.user.name}'>\n{whisper_message}\nYour response will be sent privately. Respond directly to the user.\n</private_context>"
+        user_hash = self._get_user_hash(interaction.user.id)
+        whisper_content = self._format_history_entry(interaction.user.name, interaction.created_at, whisper_message, entity_id=user_hash)
         
-        # Use shallow copy of history list
-        contents_for_api_call = list(chat_session.history)
-        contents_for_api_call.append({'role': 'user', 'parts': [whisper_prompt]})
+        api_whisper_prompt = f"<whisper_context>\n{whisper_content.strip()}\n</whisper_context>\n"
+        
+        import copy
+        contents_for_api_call = copy.deepcopy(chat_session.history)
+        
+        # Ensure alternating roles by appending to the last user turn if present
+        if contents_for_api_call and contents_for_api_call[-1].get('role', 'user') == 'user':
+            contents_for_api_call[-1]['parts'].append(api_whisper_prompt)
+        else:
+            contents_for_api_call.append({'role': 'user', 'parts': [api_whisper_prompt]})
         
         # Enable internal thoughts but keep summary display off (UI ignores it)
         gen_config = {
@@ -1261,7 +1269,7 @@ class CoreMixin:
         # PREVENT GLOBAL XML SCRUBBER FROM DELETING THE RESPONSE
         # If the AI mimics the history format and wraps its reply in tags, we strip the tags but KEEP the text.
         response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
-        response_text = re.sub(r'</?private_whisper>', '', response_text, flags=re.IGNORECASE)
+        response_text = re.sub(r'</?whisper_context>', '', response_text, flags=re.IGNORECASE)
         response_text = re.sub(r'</?private_context>', '', response_text, flags=re.IGNORECASE)
 
         user_index = self._get_user_index(owner_id)
@@ -1335,7 +1343,7 @@ class CoreMixin:
 
         # [NEW] Immediate persistence for private whisper turns
         session_type = session.get("type", "multi")
-        self._save_session_to_disk((interaction.channel_id, None, None), session_type, session["unified_log"])
+        await self._save_session_to_disk((interaction.channel_id, None, None), session_type, session["unified_log"])
 
         # Send the private response to the user
         user_index = self._get_user_index(owner_id)
@@ -1364,7 +1372,7 @@ class CoreMixin:
         # Inject the message ID back into the log turn
         if resp_msg:
             resp_log["message_ids"] = [resp_msg.id]
-            self._save_session_to_disk((interaction.channel_id, None, None), session_type, session["unified_log"])
+            await self._save_session_to_disk((interaction.channel_id, None, None), session_type, session["unified_log"])
 
     async def _execute_export(self, interaction: discord.Interaction, profile_names: List[str], filters: Set[str]):
         user_id = interaction.user.id
@@ -1594,20 +1602,6 @@ class CoreMixin:
                 return new_name
             counter += 1
 
-    def _check_unrestricted_safety_policy(self, profile_owner_id: int, profile_name: str, channel: discord.abc.Messageable) -> bool:
-        index = self._get_user_index(profile_owner_id)
-        is_borrowed = profile_name in index.get("borrowed", [])
-        profile_data = self._get_profile_config(profile_owner_id, profile_name, is_borrowed) or {}
-        
-        safety_level = profile_data.get("safety_level", "low")
-
-        if safety_level == "unrestricted":
-            if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
-                return False # Cannot be NSFW in this channel type
-            return channel.is_nsfw()
-        
-        return True # Not unrestricted, so it's allowed.
-    
     async def setup_multi_profile_session(self, interaction: discord.Interaction, participants: List[Dict], session_prompt: Optional[str], session_mode: str, as_admin_scope: bool = False, audio_mode: str = "text-only"):
         user_id = interaction.user.id
         is_update = interaction.channel_id in self.multi_profile_channels
@@ -1615,7 +1609,7 @@ class CoreMixin:
         if is_update:
             session = self.multi_profile_channels[interaction.channel_id]
             if not session.get("is_hydrated"):
-                session = self._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi"))
+                session = await self._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi"))
 
             existing_keys = set(session.get("chat_sessions", {}).keys())
             new_keys = { (p['owner_id'], p['profile_name']) for p in participants }
@@ -1683,7 +1677,7 @@ class CoreMixin:
         
         await interaction.edit_original_response(content=msg, view=None)
 
-    def _ensure_session_hydrated(self, channel_id: int, session_type: str) -> Optional[Dict]:
+    async def _ensure_session_hydrated(self, channel_id: int, session_type: str) -> Optional[Dict]:
         """Checks if a session is in memory and hydrated. If not, loads it from disk."""
         session = self.multi_profile_channels.get(channel_id)
         if session and session.get("is_hydrated"):
@@ -1701,13 +1695,15 @@ class CoreMixin:
         
         if not guild_id_str: return None
 
-        # [FIXED] Load Blueprint if session entry is missing OR profiles list is empty
         if not session or not session.get("profiles"):
-            sessions_file = os.path.join(self.FREEWILL_SERVERS_DIR, guild_id_str, "sessions.json.gz")
-            if os.path.exists(sessions_file):
-                all_sessions_config = self._load_json_gzip(sessions_file)
-                if all_sessions_config and str(channel_id) in all_sessions_config:
-                    session_config = all_sessions_config.get(str(channel_id))
+            server_index = self._get_server_index(guild_id_str)
+            active_sessions = server_index.get("active_sessions", {})
+            if isinstance(active_sessions, dict):
+                session_config = active_sessions.get("regular", {}).get(str(channel_id))
+                if not session_config:
+                    session_config = active_sessions.get("freewill", {}).get(str(channel_id))
+
+                if session_config:
                     profiles = session_config.get("profiles", [])
                     for p in profiles: p.setdefault('ltm_counter', 0)
                     
@@ -1725,7 +1721,7 @@ class CoreMixin:
                         }
                         self.multi_profile_channels[channel_id] = session
                     else:
-                        # Update the existing dehydrated shell with disk data
+                        # Update the existing dehydrated shell with index data
                         session["profiles"] = profiles
                         session["owner_id"] = session_config.get("owner_id")
                         session["session_prompt"] = session_config.get("session_prompt")
@@ -1738,16 +1734,13 @@ class CoreMixin:
 
         # 2. Load History Log
         dummy_session_key = (channel_id, None, None)
-        disk_log = self._load_session_from_disk(dummy_session_key, session_type) or []
+        disk_log = await self._load_session_from_disk(dummy_session_key, session_type) or []
         
-        # [FIXED] Integrity Check: Do not overwrite populated memory with empty disk data
         current_mem_log = session.get("unified_log", [])
         if not disk_log and current_mem_log:
-            # Memory has data, disk is empty. Keep memory and flush it to disk to fix the gap.
-            self._save_session_to_disk(dummy_session_key, session_type, current_mem_log)
+            await self._save_session_to_disk(dummy_session_key, session_type, current_mem_log)
             unified_log = current_mem_log
-        elif len(disk_log) < len(current_mem_log):
-            # Disk is stale compared to memory. Use memory.
+        elif current_mem_log and len(current_mem_log) >= len(disk_log):
             unified_log = current_mem_log
         else:
             unified_log = disk_log
@@ -1794,26 +1787,24 @@ class CoreMixin:
 
             participant_history = []
             for turn in history_slice:
-                if turn.get("is_hidden", False): continue
+                if turn.get("is_hidden"): continue
                 
                 turn_type = turn.get("type")
                 if not turn_type: 
                     role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
                     
                     parts = [turn.get("content")]
-                    if role == 'user':
-                        if turn.get("url_context") and p_profile_settings.get("url_fetching_enabled", True):
-                            parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
-                        if turn.get("grounding_context") and p_profile_settings.get("grounding_mode", "off") != "off":
-                            parts.append(f"\n<external_context>\n{turn.get('grounding_context')}\n</external_context>")
+                    if role == 'user' and turn.get("url_context") and p_profile_settings.get("url_fetching_enabled", False):
+                        parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
+                    if role == 'user' and turn.get("grounding_context") and p_profile_settings.get("grounding_mode", "off") != "off":
+                        parts.append(f"\n<external_context>\n{turn.get('grounding_context')}\n</external_context>")
 
                     participant_history.append({'role': role, 'parts': parts})
                 elif turn_type == "whisper":
                     if turn.get("target_pid") == bot_pid:
-                        # [NEW] Wrap clean text in XML tags only when feeding to the AI
+                        # [NEW] Apply standardised XML wrapping during re-hydration
                         clean_content = turn.get("content")
-                        header, body = clean_content.split('\n', 1)
-                        wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
+                        wrapped = f"<whisper_context>\n{clean_content.strip()}\n</whisper_context>\n"
                         participant_history.append({'role': 'user', 'parts': [wrapped]})
                 elif turn_type == "private_response":
                     if turn.get("speaker_pid") == bot_pid:
@@ -1855,19 +1846,24 @@ class CoreMixin:
         mapping_key = (session_type, channel_id)
         self.mapping_caches.pop(mapping_key, None)
 
-        # 4. Persist the removal of the session from the main config blueprint file
+        # 4. Persist the removal of the session from the server index
         channel = self.bot.get_channel(channel_id)
-        if channel and channel.guild:
-            server_id_str = str(channel.guild.id)
-            sessions_file = os.path.join(self.FREEWILL_SERVERS_DIR, server_id_str, "sessions.json.gz")
-            if os.path.exists(sessions_file):
-                all_sessions_config = self._load_json_gzip(sessions_file)
-                if all_sessions_config and str(channel_id) in all_sessions_config:
-                    del all_sessions_config[str(channel_id)]
-                    if not all_sessions_config: # If the file is now empty
-                        _delete_file_shard(sessions_file)
-                    else:
-                        self._atomic_json_save_gzip(all_sessions_config, sessions_file)
+        server_id_str = str(channel.guild.id) if channel and getattr(channel, 'guild', None) else "dm"
+        
+        server_index = self._get_server_index(server_id_str)
+        ch_id_str = str(channel_id)
+        
+        modified = False
+        if isinstance(server_index.get("active_sessions"), dict):
+            if ch_id_str in server_index["active_sessions"].get("freewill", {}):
+                del server_index["active_sessions"]["freewill"][ch_id_str]
+                modified = True
+            if ch_id_str in server_index["active_sessions"].get("regular", {}):
+                del server_index["active_sessions"]["regular"][ch_id_str]
+                modified = True
+                
+        if modified:
+            self._save_server_index(server_id_str, server_index)
 
     async def _build_freewill_history(self, channel: discord.TextChannel, anchor_message: Optional[discord.Message] = None) -> List[Tuple[int, str, datetime.datetime, str]]:
         history_data = []
@@ -2116,13 +2112,13 @@ class CoreMixin:
         embed.add_field(name="Advanced (OpenRouter Only)", value=adv_val, inline=True)
 
         # 4. Tools Section
-        img_gen = "**`ON`**" if source_profile_data.get("image_generation_enabled", True) else "`OFF`"
+        img_gen = "**`ON`**" if source_profile_data.get("image_generation_enabled", False) else "`OFF`"
         
         raw_ground_mode = source_profile_data.get("grounding_mode", "off")
         if isinstance(raw_ground_mode, bool): raw_ground_mode = "on" if raw_ground_mode else "off"
         grounding_display = {"off": "`OFF`", "on": "**`ON`**", "on+": "**`ON+`**"}.get(raw_ground_mode, "`OFF`")
         
-        url_ctx = "**`ON`**" if source_profile_data.get("url_fetching_enabled", True) else "`OFF`"
+        url_ctx = "**`ON`**" if source_profile_data.get("url_fetching_enabled", False) else "`OFF`"
         timezone = source_profile_data.get("timezone", "UTC")
         typing = "**`ON`**" if source_profile_data.get("realistic_typing_enabled", False) else "`OFF`"
         critic = "**`ON`**" if source_profile_data.get("critic_enabled", False) else "`OFF`"
@@ -2274,21 +2270,15 @@ class CoreMixin:
     async def profile_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
         index = self._get_user_index(interaction.user.id)
         choices = []
+        current_lower = current.lower()
         
-        # Personal Profiles
         for p in index.get("personal", []):
-            if current.lower() in p.lower():
+            if current_lower in p.lower():
                 choices.append(app_commands.Choice(name=p, value=p))
 
-        # Borrowed Profiles
-        for name in index.get("borrowed", []):
-            if current.lower() in name.lower():
-                b_config = self._get_profile_config(interaction.user.id, name, True)
-                if b_config:
-                    owner_id = int(b_config.get("original_owner_id", 0))
-                    owner = self.bot.get_user(owner_id) or await self.bot.fetch_user(owner_id)
-                    owner_name = owner.display_name if owner else "Unknown User"
-                    choices.append(app_commands.Choice(name=f"{name} (from {owner_name})", value=name))
+        for p in index.get("borrowed", []):
+            if current_lower in p.lower():
+                choices.append(app_commands.Choice(name=p, value=p))
 
         return choices[:25]
     
@@ -2306,19 +2296,10 @@ class CoreMixin:
         choices = []
         current_lower = current.lower()
 
-        # Personal Public Profiles
         for name in index.get("personal", []):
-            if (str(user_id), name) in public_pointers:
-                config = self._get_profile_config(user_id, name) or {}
-                display_name = config.get("custom_display_name", name)
-                
-                owner_name = interaction.user.name
-                label = f"{display_name} ({name}) by ({owner_name})"
-                
-                if current_lower in label.lower():
-                    choices.append(app_commands.Choice(name=label[:100], value=name))
+            if (str(user_id), name) in public_pointers and current_lower in name.lower():
+                choices.append(app_commands.Choice(name=name, value=name))
         
-        # Borrowed Public Profiles
         for local_name in index.get("borrowed", []):
             b_config = self._get_profile_config(user_id, local_name, True)
             if not b_config: continue
@@ -2326,26 +2307,28 @@ class CoreMixin:
             orig_oid = str(b_config.get("original_owner_id"))
             orig_name = b_config.get("original_profile_name")
             
-            if (orig_oid, orig_name) in public_pointers:
-                source_config = self._get_profile_config(int(orig_oid), orig_name) or {}
-                display_name = source_config.get("custom_display_name", orig_name)
-                    
-                owner = self.bot.get_user(int(orig_oid))
-                owner_name = owner.name if owner else f"User {orig_oid}"
-                
-                label = f"{display_name} ({local_name}) by ({owner_name})"
-                
-                if current_lower in label.lower():
-                    choices.append(app_commands.Choice(name=label[:100], value=local_name))
+            if (orig_oid, orig_name) in public_pointers and current_lower in local_name.lower():
+                choices.append(app_commands.Choice(name=local_name, value=local_name))
         
         return choices[:25]
 
     async def personal_profile_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
         index = self._get_user_index(interaction.user.id)
         choices = []
+        current_lower = current.lower()
         for p in index.get("personal", []):
-            if current.lower() in p.lower():
+            if current_lower in p.lower():
                 choices.append(app_commands.Choice(name=p, value=p))
+        return choices[:25]
+
+    async def personal_profile_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+        index = self._get_user_index(interaction.user.id)
+        choices = []
+        current_lower = current.lower()
+        for p in index.get("personal", []):
+            label = self._build_autocomplete_label(interaction.user.id, p, False)
+            if current_lower in label.lower():
+                choices.append(app_commands.Choice(name=label, value=p))
         return choices[:25]
 
     async def appearance_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
@@ -2793,8 +2776,13 @@ class CoreMixin:
                     index["borrowed"].remove(active_profile_name)
                     pid = active_profile_name
                 
-                index.setdefault("channel_active_profiles", {})[str(channel.id)] = DEFAULT_PROFILE_NAME
                 self._save_user_index(user_id, index)
+                
+                channel_obj = self.bot.get_channel(channel.id) if hasattr(channel, 'id') else channel
+                server_id_str = str(channel_obj.guild.id) if channel_obj and getattr(channel_obj, 'guild', None) else "dm"
+                server_index = self._get_server_index(server_id_str)
+                server_index.setdefault("user_active_profiles", {}).setdefault(str(user_id), {})[str(channel.id)] = DEFAULT_PROFILE_NAME
+                self._save_server_index(server_id_str, server_index)
                 
                 try:
                     import shutil
@@ -2890,7 +2878,7 @@ class CoreMixin:
                 print(f"Unexpected error refreshing lock file: {e}. Potential lock loss.")
                 self.has_lock = False
 
-    def cog_unload(self):
+    async def cog_unload(self):
         if self.has_lock:
             try:
                 if os.path.exists(COG_LOCK_FILE_PATH):
@@ -2915,12 +2903,8 @@ class CoreMixin:
                 self._safe_cancel_task(session_data['worker_task'])
                 session_data['worker_task'] = None
         
-        # Final flush of any remaining data
-        asyncio.run_coroutine_threadsafe(self._flush_api_stats_to_db(), self.bot.loop)
-        for session_key, chat_session in self.chat_sessions.items():
-            self._save_session_to_disk(session_key, 'single', chat_session)
         for session_key, chat_session in self.global_chat_sessions.items():
-            self._save_session_to_disk(session_key, 'global_chat', chat_session)
+            await self._save_session_to_disk(session_key, 'global_chat', chat_session)
         for ch_id, session_data in self.multi_profile_channels.items():
             if session_data.get("is_hydrated"): # Only save sessions that are loaded in memory
                 session_type = session_data.get("type", "multi")
@@ -2928,7 +2912,7 @@ class CoreMixin:
                 if unified_log is not None:
                     # For multi-profile, the session_key is just the channel_id for path generation
                     dummy_session_key = (ch_id, None, None)
-                    self._save_session_to_disk(dummy_session_key, session_type, unified_log)
+                    await self._save_session_to_disk(dummy_session_key, session_type, unified_log)
                 
                 # Also save the corresponding mapping file atomically with the session log
                 mapping_key = (session_type, ch_id)
