@@ -859,7 +859,9 @@ class ServicesMixin:
         rule_block = (
             "<context_rules>\n"
             "- '[Name] [ID: XXXXXXXXXXXXXXXX] [Timestamp]' are individual active participants.\n"
-            "- XML-wrapped text is information/data for YOU, from YOU, OR it is a whisper interaction.\n"
+            "- XML-wrapped text is information/data for YOU, from YOU.\n"
+            "- <whisper_context> or <private_whisper> means a user is speaking privately to you.\n"
+            "- <private_response> is your past private reply to a whisper.\n"
             "- Always respond as YOURSELF.\n"
             "</context_rules>\n\n"
         )
@@ -1026,12 +1028,30 @@ class ServicesMixin:
                         p_is_b = p_data['profile_name'] in p_index.get("borrowed", [])
                         p_settings = self._get_profile_config(p_data['owner_id'], p_data['profile_name'], p_is_b) or {}
                         
+                        bot_pid = self._get_pid_from_name_any(p_data['owner_id'], p_data['profile_name'])
                         participant_history = []
                         for turn in session.get("unified_log", []):
                             if turn.get("is_hidden"): continue
-                            speaker_key = tuple(turn.get("speaker_key", []))
-                            role = 'model' if speaker_key == p_key else 'user'
-                            participant_history.append({'role': role, 'parts': [turn.get("content")]})
+                            turn_type = turn.get("type")
+                            
+                            if not turn_type:
+                                role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
+                                participant_history.append({'role': role, 'parts': [turn.get("content")]})
+                            elif turn_type == "whisper":
+                                if turn.get("target_pid") == bot_pid:
+                                    clean_content = turn.get("content")
+                                    header, body = clean_content.split('\n', 1)
+                                    wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
+                                    participant_history.append({'role': 'user', 'parts': [wrapped]})
+                            elif turn_type == "private_response":
+                                if turn.get("speaker_pid") == bot_pid:
+                                    clean_content = turn.get("content")
+                                    header, body = clean_content.split('\n', 1)
+                                    wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
+                                    obj = {'role': 'model', 'parts': [wrapped]}
+                                    if turn.get('thought_signature'):
+                                        obj['thought_signature'] = turn.get('thought_signature')
+                                    participant_history.append(obj)
                         
                         session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 
@@ -1113,7 +1133,7 @@ class ServicesMixin:
                                 "message_ids": [],
                                 "content": system_content
                             }
-                            session.get("unified_log", []).append(turn_object)
+                            session.setdefault("unified_log", []).append(turn_object)
                             
                             new_round_turn_data.append((system_content, None, []))
                             
@@ -1219,10 +1239,10 @@ class ServicesMixin:
                                     del turn["url_context"]
                             turn_object["url_context"] = url_text_content
                             
-                        session.get("unified_log", []).append(turn_object)
+                        session.setdefault("unified_log", []).append(turn_object)
 
                         # [NEW] Immediate persistence for user turns
-                        await self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                        await self._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
                         
                         # Initialize list for standard message attachments/reply images
                         new_message_parts = []
@@ -2070,6 +2090,7 @@ class ServicesMixin:
                         pending_whispers = session.get("pending_whispers", {}).pop(participant_key, None)
                         if pending_whispers:
                             whisper_context = "<whisper_context>\n"
+                            whisper_context += "SYSTEM NOTE: You previously received and replied to these private whispers. Keep them in mind for context, but behave how you would treat whispers.\n"
                             whisper_context += "\n---\n" + "\n---\n".join(pending_whispers) + "\n</whisper_context>"
                             supplementary_parts.append(whisper_context)
 
@@ -2151,6 +2172,8 @@ class ServicesMixin:
                                     raise ValueError("Response blocked or empty")
                                 
                                 raw_text_check = getattr(response, 'text', "").strip()
+                                if not raw_text_check:
+                                    raise ValueError("Empty Response (AI produced no text content)")
                                 if re.search(r'(.)\1{999,}', raw_text_check):
                                     raise ValueError("[REPETITIVE_CONTENT_ERROR]")
                                     
@@ -2196,6 +2219,12 @@ class ServicesMixin:
                                         if not response or not response.candidates:
                                             pass
                                         else:
+                                            fb_raw_check = getattr(response, 'text', "").strip()
+                                            if not fb_raw_check:
+                                                raise ValueError("Empty Response (AI produced no text content)")
+                                            if re.search(r'(.)\1{999,}', fb_raw_check):
+                                                raise ValueError("[REPETITIVE_CONTENT_ERROR]")
+
                                             fallback_used = True
                                             self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile_fallback", model_used=fb_name, status="success")
                                     except asyncio.CancelledError:
@@ -2419,12 +2448,12 @@ class ServicesMixin:
                         if isinstance(sig, bytes):
                             sig = base64.b64encode(sig).decode('utf-8')
                         turn_object['thought_signature'] = sig
-                    session.get("unified_log", []).append(turn_object)
+                    session.setdefault("unified_log", []).append(turn_object)
                     session['last_speaker_key'] = participant_key
 
                     # [UPDATED] Persist log immediately
                     session_type = session.get("type", "multi")
-                    await self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                    await self._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
 
                     is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
 
@@ -2782,7 +2811,7 @@ class ServicesMixin:
                                     }
                                     if url_text_batch:
                                         new_turn_object["url_context"] = url_text_batch
-                                    session.get("unified_log", []).append(new_turn_object)
+                                    session.setdefault("unified_log", []).append(new_turn_object)
 
                             all_triggers_for_round.extend(batched_triggers)
                     
@@ -2921,16 +2950,14 @@ class ServicesMixin:
                             participant_history.append(content_obj)
 
                         elif turn_type == "whisper":
-                            target_key = tuple(turn.get("target_key", []))
-                            if p_key == target_key:
+                            if turn.get("target_pid") == bot_pid:
                                 # [NEW] Apply dynamic XML wrapping during re-hydration
                                 clean_content = turn.get("content")
                                 header, body = clean_content.split('\n', 1)
                                 wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
                                 participant_history.append({'role': 'user', 'parts': [wrapped]})
                         elif turn_type == "private_response":
-                            speaker_key = tuple(turn.get("speaker_key", []))
-                            if p_key == speaker_key:
+                            if turn.get("speaker_pid") == bot_pid:
                                 # [NEW] Apply dynamic XML wrapping during re-hydration
                                 clean_content = turn.get("content")
                                 header, body = clean_content.split('\n', 1)
@@ -4908,7 +4935,7 @@ class ServicesMixin:
                             break
                     
                     session_type = session.get("type", "multi")
-                    await self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                    await self._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
         
         except Exception as e:
             print(f"Error during child bot confirmation ({correlation_id}): {e}")
@@ -5149,6 +5176,11 @@ class ServicesMixin:
                         
                     if not response or not response.candidates:
                         raise ValueError("Response blocked or empty")
+                    
+                    raw_text_check = getattr(response, 'text', "").strip()
+                    if not raw_text_check:
+                        raise ValueError("Empty Response (AI produced no text content)")
+
                     status = "success"
                 except asyncio.CancelledError:
                     return []
@@ -5207,7 +5239,12 @@ class ServicesMixin:
                             if not response or not response.candidates:
                                 pass
                             else:
+                                fb_raw_check = getattr(response, 'text', "").strip()
+                                if not fb_raw_check:
+                                    raise ValueError("Empty Response (AI produced no text content)")
+
                                 fallback_used = True
+                                status = "success"
                                 self._log_api_call(user_id=triggering_user_id or 0, guild_id=channel.guild.id, context="freewill_fallback", model_used=fb_name, status="success")
 
                         except asyncio.CancelledError:
@@ -6090,6 +6127,7 @@ class ServicesMixin:
             bot_pid = self._get_pid_from_name_any(p_owner_id, p_name)
             
             participant_history = []
+            pending_whispers_for_regen = []
             for turn in sliced_unified_log:
                 if turn.get("is_hidden", False):
                     continue
@@ -6098,12 +6136,15 @@ class ServicesMixin:
                 if not turn_type:
                     role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
                     participant_history.append({'role': role, 'parts': [turn.get("content")]})
+                    if role == 'model':
+                        pending_whispers_for_regen.clear()
                 elif turn_type == "whisper":
                     if turn.get("target_pid") == bot_pid:
                         clean_content = turn.get("content")
                         header, body = clean_content.split('\n', 1)
                         wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
                         participant_history.append({'role': 'user', 'parts': [wrapped]})
+                        pending_whispers_for_regen.append(clean_content)
                 elif turn_type == "private_response":
                     if turn.get("speaker_pid") == bot_pid:
                         clean_content = turn.get("content")
@@ -6165,6 +6206,17 @@ class ServicesMixin:
                 for h_turn in reversed(participant_history):
                     if h_turn.get('role') == 'user':
                         h_turn['parts'].extend(recovered_media_parts)
+                        break
+
+            # Inject pending whispers if any
+            if pending_whispers_for_regen and participant_history:
+                whisper_context = "<whisper_context>\n"
+                whisper_context += "SYSTEM NOTE: You previously received and replied to these private whispers. Keep them in mind for context, but behave how you would treat whispers.\n"
+                whisper_context += "\n---\n" + "\n---\n".join(pending_whispers_for_regen) + "\n</whisper_context>"
+                
+                for h_turn in reversed(participant_history):
+                    if h_turn.get('role') == 'user':
+                        h_turn['parts'].append(whisper_context)
                         break
 
             training_examples = await self._get_relevant_training_examples(p_owner_id, p_name, trigger_content, channel.guild.id)
@@ -6273,6 +6325,8 @@ class ServicesMixin:
     def _format_api_error(self, error: Exception) -> str:
         """Analyses API exceptions to provide specific, user-friendly diagnostic strings."""
         if isinstance(error, asyncio.TimeoutError) or isinstance(error, TimeoutError):
+            if "Generation stalled or timed out" in str(error):
+                return "Generation Stalled (No data received for 20s)"
             return "Response Timed-out (Took longer than 2 minutes)"
         
         error_str = str(error)

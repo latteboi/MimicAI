@@ -830,7 +830,7 @@ class CoreMixin:
                 "message_ids": [],
                 "content": history_line
             }
-            session.get("unified_log", []).append(turn_object)
+            session.setdefault("unified_log", []).append(turn_object)
 
             for key, chat_session in session["chat_sessions"].items():
                 if key == participant_key:
@@ -1024,6 +1024,11 @@ class CoreMixin:
                 )
                 if not response or not response.candidates:
                     raise ValueError("Response blocked or empty")
+                
+                raw_text_check = getattr(response, 'text', "").strip()
+                if not raw_text_check:
+                    raise ValueError("Empty Response (AI produced no text content)")
+
                 status = "success"
             except asyncio.CancelledError:
                 return
@@ -1085,6 +1090,10 @@ class CoreMixin:
                             )
                             status = "blocked_by_safety" if not response or not response.candidates else "success"
                             if status == "success":
+                                fb_raw_check = getattr(response, 'text', "").strip()
+                                if not fb_raw_check:
+                                    raise ValueError("Empty Response (AI produced no text content)")
+
                                 fallback_used = True
                                 self._log_api_call(user_id=user_id, guild_id=None, context="global_chat_fallback", model_used=fb_name, status="success")
                     except asyncio.CancelledError:
@@ -1240,7 +1249,13 @@ class CoreMixin:
         user_hash = self._get_user_hash(interaction.user.id)
         whisper_content = self._format_history_entry(interaction.user.name, interaction.created_at, whisper_message, entity_id=user_hash)
         
-        api_whisper_prompt = f"<whisper_context>\n{whisper_content.strip()}\n</whisper_context>\n"
+        api_whisper_prompt = (
+            f"<whisper_context>\n"
+            f"SYSTEM NOTE: The following is a private whisper directed exclusively to you. "
+            f"You MUST reply directly to this whisper. It will NOT be seen by other users.\n\n"
+            f"{whisper_content.strip()}\n"
+            f"</whisper_context>\n"
+        )
         
         import copy
         contents_for_api_call = copy.deepcopy(chat_session.history)
@@ -1333,7 +1348,7 @@ class CoreMixin:
         
         target_pid = self._get_pid_from_name_any(owner_id, profile_name)
         
-        session["unified_log"].append({
+        session.setdefault("unified_log", []).append({
             "turn_id": whisper_turn_id, "type": "whisper",
             "is_user": True, "speaker_pid": str(interaction.user.id), "target_pid": target_pid,
             "message_ids":[],
@@ -1362,7 +1377,7 @@ class CoreMixin:
                 sig = base64.b64encode(sig).decode('utf-8')
             resp_log['thought_signature'] = sig
             
-        session["unified_log"].append(resp_log)
+        session.setdefault("unified_log", []).append(resp_log)
 
         # [FIXED] Add to the target's in-memory history WRAPPED in XML tags so the AI knows it is private
         header_w, body_w = whisper_content.split('\n', 1)
