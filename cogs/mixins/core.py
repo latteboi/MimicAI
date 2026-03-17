@@ -1011,12 +1011,22 @@ class CoreMixin:
             response = None
             fallback_used = False
             blocked_reason_override = None
+            
+            # --- SEND PLACEHOLDER EMBED ---
+            placeholder_embed = discord.Embed(description=f"{PLACEHOLDER_EMOJI}", color=discord.Color.dark_grey())
+            placeholder_embed.set_author(name=bot_display_name, icon_url=appearance.get("custom_avatar_url") if appearance else self.bot.user.display_avatar.url)
+            placeholder_embed.set_footer(text=message[:1000], icon_url=interaction.user.display_avatar.url)
+            placeholder_msg = await interaction.followup.send(embed=placeholder_embed, ephemeral=False, wait=True)
+            
             try:
-                # [UPDATED] Applied 120-second fail-safe timeout
-                response = await asyncio.wait_for(model.generate_content_async(contents_for_api_call, generation_config=gen_config), timeout=120.0)
+                response, _ = await self._generate_with_heartbeat(
+                    model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg, is_fallback=False, message_type="embed"
+                )
                 if not response or not response.candidates:
                     raise ValueError("Response blocked or empty")
                 status = "success"
+            except asyncio.CancelledError:
+                return
             except Exception as e:
                 blocked_reason_override = self._format_api_error(e)
 
@@ -1070,11 +1080,15 @@ class CoreMixin:
                             else:
                                 raise ValueError("No Google key for fallback")
 
-                            response = await fallback_instance.generate_content_async(contents_for_api_call, generation_config=gen_config)
-                            status = "blocked_by_safety" if not response.candidates else "success"
+                            response, _ = await self._generate_with_heartbeat(
+                                fallback_instance, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg, is_fallback=True, message_type="embed"
+                            )
+                            status = "blocked_by_safety" if not response or not response.candidates else "success"
                             if status == "success":
                                 fallback_used = True
                                 self._log_api_call(user_id=user_id, guild_id=None, context="global_chat_fallback", model_used=fb_name, status="success")
+                    except asyncio.CancelledError:
+                        return
                     except Exception as retry_e:
                         print(f"Global Chat fallback retry failed: {retry_e}")
                         status = "api_error"
@@ -1094,7 +1108,10 @@ class CoreMixin:
                     reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
                 
                 custom_main = profile_data.get("error_response", "An error has occurred.")
-                await interaction.followup.send(f"{custom_main}\n\n-# Blocked due to: **{reason}**.", ephemeral=False)
+                
+                err_embed = placeholder_msg.embeds[0]
+                err_embed.description = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
+                await placeholder_msg.edit(embed=err_embed)
                 return
 
             raw_text = getattr(response, 'text', "").strip()
@@ -1152,7 +1169,7 @@ class CoreMixin:
             embed.set_author(name=display_name, icon_url=avatar_url)
             embed.set_footer(text=message, icon_url=interaction.user.display_avatar.url)
             
-            response_message = await interaction.followup.send(embed=embed, ephemeral=False)
+            response_message = await placeholder_msg.edit(embed=embed)
 
             t2_end_mono = time.monotonic()
             duration = t2_end_mono - t1_start_mono
@@ -1242,38 +1259,10 @@ class CoreMixin:
         
         status = "api_error"
         response = None
-        try:
-            response = await model.generate_content_async(contents_for_api_call, generation_config=gen_config)
-            status = "blocked_by_safety" if not response.candidates else "success"
-        except Exception as e:
-            print(f"Whisper generation error: {e}")
-            status = "api_error"
-        finally:
-            self._log_api_call(user_id=interaction.user.id, guild_id=interaction.guild.id, context="whisper", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
-        
-        response_text = "..."
-        if not response or not response.candidates:
-            reason = "Safety Filter"
-            if response and response.prompt_feedback and response.prompt_feedback.block_reason:
-                reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
-            
-            p_index = self._get_user_index(owner_id)
-            p_is_borrowed = profile_name in p_index.get("borrowed",[])
-            p_settings = self._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
-            
-            custom_main = p_settings.get("error_response", "An error has occurred.")
-            response_text = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
-        elif response.candidates:
-            response_text = getattr(response, 'text', "...").strip()
 
-        # PREVENT GLOBAL XML SCRUBBER FROM DELETING THE RESPONSE
-        # If the AI mimics the history format and wraps its reply in tags, we strip the tags but KEEP the text.
-        response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
-        response_text = re.sub(r'</?whisper_context>', '', response_text, flags=re.IGNORECASE)
-        response_text = re.sub(r'</?private_context>', '', response_text, flags=re.IGNORECASE)
-
+        # Resolve appearance and identity for placeholder
         user_index = self._get_user_index(owner_id)
-        is_borrowed = profile_name in user_index.get("borrowed",[])
+        is_borrowed = profile_name in user_index.get("borrowed", [])
         effective_owner_id = owner_id
         effective_profile_name = profile_name
         if is_borrowed:
@@ -1283,8 +1272,57 @@ class CoreMixin:
         
         display_name = effective_profile_name
         appearance = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name)
+        avatar_url = self.bot.user.display_avatar.url
         if appearance:
             display_name = appearance.get("custom_display_name") or display_name
+            avatar_url = appearance.get("custom_avatar_url") or avatar_url
+            
+        # --- SEND PLACEHOLDER EMBED ---
+        placeholder_embed = discord.Embed(description=f"{PLACEHOLDER_EMOJI}", color=discord.Color.dark_grey())
+        placeholder_embed.set_author(name=display_name, icon_url=avatar_url)
+        placeholder_embed.set_footer(text=f"Private whisper: {whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
+        placeholder_msg = await interaction.followup.send(embed=placeholder_embed, ephemeral=True, wait=True)
+        
+        try:
+            if not model:
+                raise ValueError("Could not initialize the AI model.")
+
+            response, _ = await self._generate_with_heartbeat(
+                model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg, is_fallback=False, message_type="embed"
+            )
+            status = "blocked_by_safety" if not response or not response.candidates else "success"
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"Whisper generation error: {e}")
+            status = "api_error"
+        finally:
+            self._log_api_call(user_id=interaction.user.id, guild_id=interaction.guild.id, context="whisper", model_used=model.model_name if (model and hasattr(model, 'model_name')) else "unknown", status=status)
+        
+        response_text = "..."
+        if not response or not response.candidates:
+            reason = "Safety Filter"
+            if response and hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
+                reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
+            
+            p_index = self._get_user_index(owner_id)
+            p_is_borrowed = profile_name in p_index.get("borrowed",[])
+            p_settings = self._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
+            
+            custom_main = p_settings.get("error_response", "An error has occurred.")
+            
+            err_embed = placeholder_msg.embeds[0]
+            err_embed.description = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
+            await placeholder_msg.edit(embed=err_embed)
+            return
+        elif response.candidates:
+            response_text = getattr(response, 'text', "...").strip()
+
+        # PREVENT GLOBAL XML SCRUBBER FROM DELETING THE RESPONSE
+        # If the AI mimics the history format and wraps its reply in tags, we strip the tags but KEEP the text.
+        response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
+        response_text = re.sub(r'</?whisper_context>', '', response_text, flags=re.IGNORECASE)
+        response_text = re.sub(r'</?private_context>', '', response_text, flags=re.IGNORECASE)
 
         scrubbed_text = self._scrub_response_text(response_text, participant_names=[display_name])
         response_text = self._deduplicate_response(scrubbed_text)
@@ -1346,6 +1384,37 @@ class CoreMixin:
         await self._save_session_to_disk((interaction.channel_id, None, None), session_type, session["unified_log"])
 
         # Send the private response to the user
+        embed = discord.Embed(description=response_text, color=discord.Color.dark_grey())
+        embed.set_author(name=display_name, icon_url=avatar_url)
+        embed.set_footer(text=f"Private whisper: {whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
+        
+        view = WhisperActionView(self, interaction, whisper_turn_id, response_turn_id, target_participant, whisper_message)
+        resp_msg = await placeholder_msg.edit(embed=embed, view=view)
+        
+        # Inject the message ID back into the log turn
+        if resp_msg:
+            resp_log["message_ids"] = [resp_msg.id]
+            await self._save_session_to_disk((interaction.channel_id, None, None), session_type, session["unified_log"])
+
+    async def _execute_whisper_regeneration(self, interaction: discord.Interaction, whisper_turn_id: str, response_turn_id: str, target_participant: Dict, whisper_message: str):
+        session = self.multi_profile_channels.get(interaction.channel_id)
+        if not session:
+            await interaction.response.send_message("Session not found.", ephemeral=True)
+            return
+
+        owner_id = target_participant['owner_id']
+        profile_name = target_participant['profile_name']
+        participant_key = (owner_id, profile_name)
+
+        if not session.get("is_hydrated"):
+            session = await self.cog._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi"))
+
+        model, _, temp, top_p, top_k, _, fallback_model_name = await self._get_or_create_model_for_channel(
+            interaction.channel_id, interaction.user.id, interaction.guild.id,
+            profile_owner_override=owner_id, profile_name_override=profile_name
+        )
+
+        # Resolve appearance
         user_index = self._get_user_index(owner_id)
         is_borrowed = profile_name in user_index.get("borrowed", [])
         effective_owner_id = owner_id
@@ -1356,23 +1425,90 @@ class CoreMixin:
             effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
         
         display_name = effective_profile_name
-        avatar_url = self.bot.user.display_avatar.url
         appearance = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name)
+        avatar_url = self.bot.user.display_avatar.url
         if appearance:
             display_name = appearance.get("custom_display_name") or display_name
             avatar_url = appearance.get("custom_avatar_url") or avatar_url
 
-        embed = discord.Embed(description=response_text, color=discord.Color.dark_grey())
-        embed.set_author(name=display_name, icon_url=avatar_url)
-        embed.set_footer(text=f"Private whisper: {whisper_message}", icon_url=interaction.user.display_avatar.url)
+        # --- IMMEDIATE EDIT TO PLACEHOLDER ---
+        placeholder_embed = discord.Embed(description=f"{PLACEHOLDER_EMOJI}", color=discord.Color.dark_grey())
+        placeholder_embed.set_author(name=display_name, icon_url=avatar_url)
+        placeholder_embed.set_footer(text=f"Private whisper: {whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
         
-        view = WhisperActionView(self, interaction, whisper_turn_id, response_turn_id)
-        resp_msg = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        await interaction.response.edit_message(embed=placeholder_embed, view=None)
+        placeholder_msg = await interaction.original_response()
+
+        # Reconstruct context for AI
+        log = session.get("unified_log", [])
+        try:
+            old_resp_index = next(i for i, t in enumerate(log) if t.get("turn_id") == response_turn_id)
+            sliced_log = log[:old_resp_index]
+        except StopIteration:
+            await interaction.followup.send("Original response not found in log.", ephemeral=True)
+            return
+
+        participant_history = []
+        bot_pid = self._get_pid_from_name_any(owner_id, profile_name)
+        for turn in sliced_log:
+            if turn.get("is_hidden"): continue
+            turn_type = turn.get("type")
+            if not turn_type:
+                role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
+                participant_history.append({'role': role, 'parts': [turn.get("content")]})
+            elif turn_type == "whisper" and turn.get("target_pid") == bot_pid:
+                header, body = turn.get("content").split('\n', 1)
+                wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
+                participant_history.append({'role': 'user', 'parts': [wrapped]})
+            elif turn_type == "private_response" and turn.get("speaker_pid") == bot_pid:
+                header, body = turn.get("content").split('\n', 1)
+                wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
+                participant_history.append({'role': 'model', 'parts': [wrapped]})
+
+        gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "thinking_config": {"include_thoughts": True}}
         
-        # Inject the message ID back into the log turn
-        if resp_msg:
-            resp_log["message_ids"] = [resp_msg.id]
-            await self._save_session_to_disk((interaction.channel_id, None, None), session_type, session["unified_log"])
+        status = "api_error"
+        response = None
+        try:
+            response, _ = await self._generate_with_heartbeat(
+                model, participant_history, gen_config, interaction.channel, None, placeholder_msg, is_fallback=False, message_type="embed"
+            )
+            status = "success"
+        except asyncio.CancelledError: return
+        except Exception: status = "api_error"
+        finally:
+            self._log_api_call(user_id=interaction.user.id, guild_id=interaction.guild.id, context="whisper_regen", model_used=model.model_name if model else "unknown", status=status)
+
+        if not response or not response.candidates:
+            err_embed = placeholder_embed.copy()
+            err_embed.description = "Regeneration failed."
+            await interaction.edit_original_response(embed=err_embed)
+            return
+
+        response_text = getattr(response, 'text', "...").strip()
+        response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
+        response_text = self._deduplicate_response(self._scrub_response_text(response_text, participant_names=[display_name]))
+
+        # Update log
+        profile_id = self._get_profile_id(effective_owner_id, effective_profile_name)
+        new_content = self._format_history_entry(profile_name, datetime.datetime.now(datetime.timezone.utc), response_text, entity_id=profile_id)
+        
+        for turn in log:
+            if turn.get("turn_id") == response_turn_id:
+                turn["content"] = new_content
+                if hasattr(response, 'thought_signature') and response.thought_signature:
+                    import base64
+                    turn['thought_signature'] = base64.b64encode(response.thought_signature).decode('utf-8')
+                break
+        
+        await self._save_session_to_disk((interaction.channel_id, None, None), session.get("type", "multi"), log)
+        session["is_hydrated"] = False
+
+        # Final Embed Update
+        final_embed = placeholder_embed.copy()
+        final_embed.description = response_text
+        view = WhisperActionView(self, interaction, whisper_turn_id, response_turn_id, target_participant, whisper_message)
+        await interaction.edit_original_response(embed=final_embed, view=view)
 
     async def _execute_export(self, interaction: discord.Interaction, profile_names: List[str], filters: Set[str]):
         user_id = interaction.user.id

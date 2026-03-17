@@ -108,7 +108,7 @@ class OpenRouterModel:
     def start_chat(self, history=None):
         return OpenRouterChatSession(self, history=history)
 
-    async def generate_content_async(self, contents, generation_config=None, safety_settings=None):
+    async def generate_content_async(self, contents, generation_config=None, safety_settings=None, stream_state=None):
         import base64
         messages = []
         if self.system_instruction:
@@ -191,36 +191,81 @@ class OpenRouterModel:
             "X-Title": "MimicAI Discord Bot"
         }
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=60)
-            if response.status_code != 200:
-                raise Exception(f"OpenRouter API Error {response.status_code}: {response.text}")
+        if stream_state is not None:
+            payload["stream"] = True
+            stream_state["last_token_time"] = time.time()
             
-            data = response.json()
-            if 'error' in data:
-                 raise Exception(f"OpenRouter API Error: {data['error']}")
+            full_text = ""
+            full_thought = ""
+            finish_reason = "STOP"
             
-            choice = data['choices'][0]
-            msg_obj = choice['message']
-            
+            import orjson as json
+            async with httpx.AsyncClient() as client:
+                async with client.stream("POST", "https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=60) as response:
+                    if response.status_code != 200:
+                        err_text = await response.aread()
+                        raise Exception(f"OpenRouter API Error {response.status_code}: {err_text}")
+                    
+                    async for line in response.aiter_lines():
+                        stream_state["last_token_time"] = time.time()
+                        if line.startswith("data: ") and line != "data: [DONE]":
+                            try:
+                                data = json.loads(line[6:])
+                                if "choices" in data and len(data["choices"]) > 0:
+                                    delta = data["choices"][0].get("delta", {})
+                                    if "content" in delta and delta["content"]:
+                                        full_text += delta["content"]
+                                    if "reasoning" in delta and delta["reasoning"]:
+                                        full_thought += delta["reasoning"]
+                                    if data["choices"][0].get("finish_reason"):
+                                        finish_reason = data["choices"][0]["finish_reason"]
+                            except Exception:
+                                pass
+                                
             class OpenRouterThoughtResponse:
                 def __init__(self, content, reasoning, finish_reason):
                     self.text = content
                     self.thought = reasoning or ""
-                    
-                    # Create mock content and parts for the worker's scrubbing logic
                     mock_part = type('obj', (object,), {'text': content})
                     mock_content = type('obj', (object,), {'parts': [mock_part]})
-                    
-                    # Create the candidate object
                     self.candidates = [type('obj', (object,), {
                         'content': mock_content,
-                        'finish_reason': type('obj', (object,), {'name': finish_reason})
+                        'finish_reason': type('obj', (object,), {'name': finish_reason.upper()})
                     })]
-                    
                 def __bool__(self): return True
-
-            return OpenRouterThoughtResponse(msg_obj.get('content', ''), msg_obj.get('reasoning', ''), choice.get('finish_reason', 'STOP').upper())
+                
+            return OpenRouterThoughtResponse(full_text, full_thought, finish_reason)
+        else:
+            async with httpx.AsyncClient() as client:
+                response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=60)
+                if response.status_code != 200:
+                    raise Exception(f"OpenRouter API Error {response.status_code}: {response.text}")
+                
+                data = response.json()
+                if 'error' in data:
+                     raise Exception(f"OpenRouter API Error: {data['error']}")
+                
+                choice = data['choices'][0]
+                msg_obj = choice['message']
+                
+                class OpenRouterThoughtResponse:
+                    def __init__(self, content, reasoning, finish_reason):
+                        self.text = content
+                        self.thought = reasoning or ""
+                        
+                        # Create mock content and parts for the worker's scrubbing logic
+                        mock_part = type('obj', (object,), {'text': content})
+                        mock_content = type('obj', (object,), {'parts': [mock_part]})
+                        
+                        # Create the candidate object
+                        self.candidates = [type('obj', (object,), {
+                            'content': mock_content,
+                            'finish_reason': type('obj', (object,), {'name': finish_reason})
+                        })]
+                        
+                    def __bool__(self): return True
+    
+                return OpenRouterThoughtResponse(msg_obj.get('content', ''), msg_obj.get('reasoning', ''), choice.get('finish_reason', 'STOP').upper())
 
 class GoogleGenAIChatSession:
     def __init__(self, history=None):
@@ -241,7 +286,7 @@ class GoogleGenAIModel:
     def start_chat(self, history=None):
         return GoogleGenAIChatSession(history=history)
 
-    async def generate_content_async(self, contents, generation_config=None):
+    async def generate_content_async(self, contents, generation_config=None, stream_state=None):
         formatted_contents = []
         for item in contents:
             if isinstance(item, str):
@@ -344,38 +389,79 @@ class GoogleGenAIModel:
             thinking_config=thinking_cfg
         )
 
-        response = await self.client.aio.models.generate_content(
-            model=self.model_name,
-            contents=formatted_contents,
-            config=config
-        )
-        
-        formatted_contents.clear()
-        del formatted_contents
-
-        class ThoughtResponse:
-            def __init__(self, raw_resp):
-                self.raw = raw_resp
-                self.text = ""
-                self.thought = ""
-                self.thought_signature = None
-                self.candidates = raw_resp.candidates
-                self.prompt_feedback = getattr(raw_resp, 'prompt_feedback', None)
-                self.usage_metadata = getattr(raw_resp, 'usage_metadata', None)
-                
-                if raw_resp.candidates and raw_resp.candidates[0].content and raw_resp.candidates[0].content.parts:
-                    for part in raw_resp.candidates[0].content.parts:
-                        is_thought = getattr(part, 'thought', False)
-                        if is_thought:
-                            self.thought += part.text or ""
+        if stream_state is not None:
+            stream_state["last_token_time"] = time.time()
+            response_stream = await self.client.aio.models.generate_content_stream(
+                model=self.model_name,
+                contents=formatted_contents,
+                config=config
+            )
+            
+            full_text = ""
+            full_thought = ""
+            final_chunk = None
+            
+            async for chunk in response_stream:
+                stream_state["last_token_time"] = time.time()
+                if chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts:
+                    for part in chunk.candidates[0].content.parts:
+                        if getattr(part, 'thought', False):
+                            full_thought += part.text or ""
                         elif part.text:
-                            self.text += part.text
-                        
-                        if hasattr(part, 'thought_signature') and part.thought_signature:
-                            self.thought_signature = part.thought_signature
-            def __bool__(self): return bool(self.candidates)
+                            full_text += part.text
+                final_chunk = chunk
+                
+            formatted_contents.clear()
+            del formatted_contents
 
-        return ThoughtResponse(response)
+            class StreamedThoughtResponse:
+                def __init__(self, raw_resp, text_content, thought_content):
+                    self.raw = raw_resp
+                    self.text = text_content
+                    self.thought = thought_content
+                    self.thought_signature = None
+                    if raw_resp and raw_resp.candidates and raw_resp.candidates[0].content and raw_resp.candidates[0].content.parts:
+                        self.thought_signature = getattr(raw_resp.candidates[0].content.parts[-1], 'thought_signature', None)
+                        
+                    self.candidates = raw_resp.candidates if raw_resp else []
+                    self.prompt_feedback = getattr(raw_resp, 'prompt_feedback', None) if raw_resp else None
+                    
+                def __bool__(self): return bool(self.candidates)
+                
+            return StreamedThoughtResponse(final_chunk, full_text, full_thought)
+        else:
+            response = await self.client.aio.models.generate_content(
+                model=self.model_name,
+                contents=formatted_contents,
+                config=config
+            )
+            
+            formatted_contents.clear()
+            del formatted_contents
+
+            class ThoughtResponse:
+                def __init__(self, raw_resp):
+                    self.raw = raw_resp
+                    self.text = ""
+                    self.thought = ""
+                    self.thought_signature = None
+                    self.candidates = raw_resp.candidates
+                    self.prompt_feedback = getattr(raw_resp, 'prompt_feedback', None)
+                    self.usage_metadata = getattr(raw_resp, 'usage_metadata', None)
+                    
+                    if raw_resp.candidates and raw_resp.candidates[0].content and raw_resp.candidates[0].content.parts:
+                        for part in raw_resp.candidates[0].content.parts:
+                            is_thought = getattr(part, 'thought', False)
+                            if is_thought:
+                                self.thought += part.text or ""
+                            elif part.text:
+                                self.text += part.text
+                            
+                            if hasattr(part, 'thought_signature') and part.thought_signature:
+                                self.thought_signature = part.thought_signature
+                def __bool__(self): return bool(self.candidates)
+
+            return ThoughtResponse(response)
     
 class ServicesMixin:
 
@@ -512,6 +598,118 @@ class ServicesMixin:
         self.channel_models[model_cache_key] = (model_instance, final_error_state, model_to_create)
         self.channel_model_last_profile_key[model_cache_key] = current_profile_key_for_model
         return model_instance, final_error_state, temperature, top_p, top_k, warning_message, fallback_model
+
+    async def _generation_heartbeat(self, stream_state, channel, participant, placeholder_msg, is_fallback, message_type="text"):
+        start_time = time.time()
+        last_edit_time = start_time
+        interval = 30.0
+        hard_timeout = 120.0
+        stall_timeout = 20.0
+        
+        while True:
+            now = time.time()
+            elapsed = now - start_time
+            
+            if elapsed >= hard_timeout:
+                return "timeout"
+            
+            if now - stream_state.get("last_token_time", now) >= stall_timeout:
+                return "timeout"
+                
+            if now - last_edit_time >= interval:
+                last_edit_time = now
+                mins = int(elapsed // 60)
+                secs = int(elapsed % 60)
+                time_str = f"{mins}:{secs:02d}"
+                base_text = "Using fallback model" if is_fallback else "Still generating"
+                text = f"{PLACEHOLDER_EMOJI} {base_text} ({time_str})..."
+                
+                if participant and participant.get('method') == 'child_bot':
+                    bot_id = participant.get('bot_id')
+                    child_ph_id = stream_state.get('child_placeholder_id')
+                    
+                    target_id = child_ph_id
+                    if not target_id and placeholder_msg:
+                        target_id = placeholder_msg.id
+
+                    if not target_id:
+                        corr_id = str(uuid.uuid4())
+                        conf_event = asyncio.Event()
+                        conf_data_ref = {"event": conf_event, "type": "heartbeat_placeholder"}
+                        self.pending_child_confirmations[corr_id] = conf_data_ref
+                        
+                        await self.manager_queue.put({
+                            "action": "send_to_child", "bot_id": bot_id,
+                            "payload": {
+                                "action": "send_message", "channel_id": channel.id,
+                                "content": text, "realistic_typing": False, "correlation_id": corr_id
+                            }
+                        })
+                        try:
+                            await asyncio.wait_for(conf_event.wait(), timeout=10.0)
+                            msg_ids = conf_data_ref.get("message_ids", [])
+                            if msg_ids:
+                                stream_state['child_placeholder_id'] = msg_ids[-1]
+                        except Exception:
+                            pass
+                        finally:
+                            self.pending_child_confirmations.pop(corr_id, None)
+                    else:
+                        try:
+                            await channel.fetch_message(target_id)
+                            await self.manager_queue.put({
+                                "action": "send_to_child", "bot_id": bot_id,
+                                "payload": {
+                                    "action": "regenerate_message", "channel_id": channel.id,
+                                    "message_id": target_id, "content": text
+                                }
+                            })
+                        except discord.NotFound:
+                            return "cancelled"
+                        except Exception:
+                            pass
+                else:
+                    if placeholder_msg:
+                        try:
+                            if message_type == "embed":
+                                embed = placeholder_msg.embeds[0]
+                                embed.description = text
+                                await placeholder_msg.edit(embed=embed)
+                            else:
+                                await channel.fetch_message(placeholder_msg.id)
+                                webhook = await self._get_or_create_webhook(channel)
+                                if webhook:
+                                    await webhook.edit_message(placeholder_msg.id, content=text)
+                        except discord.NotFound:
+                            return "cancelled"
+                        except Exception:
+                            pass
+            await asyncio.sleep(1)
+
+    async def _generate_with_heartbeat(self, model, contents, gen_config, channel, participant, placeholder_msg, is_fallback=False, message_type="text"):
+        stream_state = {"last_token_time": time.time()}
+        
+        gen_task = asyncio.create_task(model.generate_content_async(contents, generation_config=gen_config, stream_state=stream_state))
+        monitor_task = asyncio.create_task(self._generation_heartbeat(stream_state, channel, participant, placeholder_msg, is_fallback, message_type))
+        
+        done, pending = await asyncio.wait([gen_task, monitor_task], return_when=asyncio.FIRST_COMPLETED)
+        
+        if monitor_task in done:
+            gen_task.cancel()
+            try:
+                res = monitor_task.result()
+            except Exception as e:
+                print(f"Monitor task crashed: {e}")
+                raise TimeoutError("Generation aborted due to monitor crash")
+                
+            if res == "cancelled":
+                raise asyncio.CancelledError("Message deleted")
+            elif res == "timeout":
+                raise TimeoutError("Generation stalled or timed out")
+        else:
+            monitor_task.cancel()
+            response = gen_task.result()
+            return response, stream_state.get('child_placeholder_id')
 
     async def _get_or_create_model_for_global_chat(self, user_id: int, profile_name: str) -> Tuple[Optional[Any], float, float, int, Optional[str], Optional[str]]:
         index = self._get_user_index(user_id)
@@ -664,11 +862,6 @@ class ServicesMixin:
             "- XML-wrapped text is information/data for YOU, from YOU, OR it is a whisper interaction.\n"
             "- Always respond as YOURSELF.\n"
             "</context_rules>\n\n"
-            "<incoming_whispers>\n"
-            "SYSTEM: The following whisper interactions occurred since your last public turn. "
-            "Do NOT reveal the existence or content of this information unless explicitly requested. "
-            "Instead, let it subtly influence your personality and future actions.\n"
-            "</incoming_whispers>"
         )
         current_instructions_str += "\n\n" + rule_block
 
@@ -1788,14 +1981,26 @@ class ServicesMixin:
                             owner_id, profile_name, channel.id, is_multi_profile=True, training_examples_list=training_examples_list
                         )
                         
-                        # [MOVED] Critic Check - Injection into System Instruction
-                        profile_settings = self._get_profile_config(owner_id, profile_name, is_borrowed) or {}
-                        if profile_settings.get("critic_enabled", False):
-                            critic_constraints = await self._run_critic(chat_session.history, speaker_display_name, channel.guild.id)
-                            if critic_constraints:
-                                full_system_instruction += f"\n\nNEGATIVE CONSTRAINTS (STRICT ADHERENCE REQUIRED):\n{critic_constraints}"
+                        # [UPDATED] Critic Persistence Logic (2 Rounds)
+                        critic_constraints = None
+                        if p_settings.get("critic_enabled", False):
+                            # Check for cached constraints in the session
+                            cache = session.setdefault("critic_cache", {}).get(participant_key)
+                            
+                            if cache and cache.get("rounds", 0) > 0:
+                                critic_constraints = cache["text"]
+                                cache["rounds"] -= 1
+                            else:
+                                # Generate fresh constraints
+                                critic_constraints = await self._run_critic(chat_session.history, speaker_display_name, channel.guild.id)
+                                if critic_constraints:
+                                    # Store constraints and set to 1 round (current + 1 future)
+                                    session["critic_cache"][participant_key] = {"text": critic_constraints, "rounds": 1}
 
-                        safety_level_str = profile_settings.get('safety_level', 'low')
+                        if critic_constraints:
+                            full_system_instruction += f"\n\nNEGATIVE CONSTRAINTS (STRICT ADHERENCE REQUIRED):\n{critic_constraints}"
+
+                        safety_level_str = p_settings.get('safety_level', 'low')
 
                         safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
                         threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
@@ -1936,17 +2141,26 @@ class ServicesMixin:
                         
                         if model:
                             try:
-                                # [UPDATED] Applied 120-second timeout and integrated collapse detection into the fallback trigger
-                                response = await asyncio.wait_for(model.generate_content_async(contents_for_api_call, generation_config=gen_config), timeout=120.0)
+                                response, child_ph_id = await self._generate_with_heartbeat(
+                                    model, contents_for_api_call, gen_config, channel, participant, placeholder_message, is_fallback=False
+                                )
+                                if child_ph_id:
+                                    placeholder_message = type('obj', (object,), {'id': child_ph_id})()
+
                                 if not response or not response.candidates:
                                     raise ValueError("Response blocked or empty")
                                 
-                                # [NEW] Model Collapse Detection (Repetition) triggers fallback immediately
                                 raw_text_check = getattr(response, 'text', "").strip()
                                 if re.search(r'(.)\1{999,}', raw_text_check):
                                     raise ValueError("[REPETITIVE_CONTENT_ERROR]")
                                     
                                 status = "success"
+                            except asyncio.CancelledError:
+                                if 'contents_for_api_call' in locals():
+                                    contents_for_api_call.clear()
+                                    del contents_for_api_call
+                                gc.collect()
+                                continue
                             except Exception as e:
                                 blocked_reason_override = self._format_api_error(e)
 
@@ -1967,19 +2181,29 @@ class ServicesMixin:
                                         if fb_is_or:
                                             or_key = self._get_api_key_for_guild(channel.guild.id, provider="openrouter")
                                             if or_key:
-                                                fallback_instance = OpenRouterModel(fb_name, api_key=or_key, system_instruction=full_system_instruction)
+                                                fallback_instance = OpenRouterModel(fb_name, api_key=or_key, system_instruction=full_system_instruction, thinking_params=t_params_worker)
                                             else:
                                                 raise ValueError("No OpenRouter key for fallback")
                                         else:
-                                            fallback_instance = GoogleGenAIModel(api_key=api_key, model_name=fb_name, system_instruction=full_system_instruction, safety_settings=dynamic_safety_settings)
+                                            fallback_instance = GoogleGenAIModel(api_key=api_key, model_name=fb_name, system_instruction=full_system_instruction, safety_settings=dynamic_safety_settings, thinking_params=t_params_worker)
                                         
-                                        # Timeout also applied to fallback attempts
-                                        response = await asyncio.wait_for(fallback_instance.generate_content_async(contents_for_api_call, generation_config=gen_config), timeout=120.0)
+                                        response, child_ph_id2 = await self._generate_with_heartbeat(
+                                            fallback_instance, contents_for_api_call, gen_config, channel, participant, placeholder_message, is_fallback=True
+                                        )
+                                        if child_ph_id2:
+                                            placeholder_message = type('obj', (object,), {'id': child_ph_id2})()
+                                            
                                         if not response or not response.candidates:
                                             pass
                                         else:
                                             fallback_used = True
                                             self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile_fallback", model_used=fb_name, status="success")
+                                    except asyncio.CancelledError:
+                                        if 'contents_for_api_call' in locals():
+                                            contents_for_api_call.clear()
+                                            del contents_for_api_call
+                                        gc.collect()
+                                        continue
                                     except Exception as retry_e:
                                         print(f"Fallback retry failed: {retry_e}")
                                         status = "api_error"
@@ -4665,6 +4889,8 @@ class ServicesMixin:
         try:
             if confirmation_data.get("type") == "single_profile":
                 pass # Deprecated Single Profile handling
+            elif confirmation_data.get("type") == "heartbeat_placeholder":
+                confirmation_data["message_ids"] = message_ids
             
             elif confirmation_data.get("type") == "multi_profile":
                 channel_id = confirmation_data.get("channel_id")
@@ -4778,7 +5004,7 @@ class ServicesMixin:
             return False, "An error occurred during the moderation check."
         
     async def _run_critic(self, history: list, char_name: str, guild_id: int) -> Optional[str]:
-        """Uses a cheap model to find verbatim linguistic loops in recent history."""
+        """Uses a reasoning model to find linguistic loops and robotic staleness."""
         recent_turns = []
         count = 0
         for turn in reversed(history):
@@ -4792,29 +5018,36 @@ class ServicesMixin:
         if len(recent_turns) < 3: return None 
         
         transcript = "\n---\n".join(reversed(recent_turns))
-        
+
         system_instruction = (
             f"You are a linguistic pattern analyzer for the character '{char_name}'.\n"
-            "Your task is to detect repetitive structural patterns across the provided transcript.\n\n"
+            "Your task is to detect repetitive structural and semantic patterns across the provided transcript.\n\n"
             "CRITERIA FOR FLAGGING:\n"
-            "Identify any phrase, name, or sentence structure that appears in **2 or more messages** within this transcript.\n"
-            "Specifically target:\n"
-            "1. **Repeated Openers:** Starting messages with the same word, interjection, or name (e.g., 'Well,', 'Look,', 'User,').\n"
-            "2. **Repeated Closers:** Ending messages with the same tag or name.\n"
-            "3. **Recycled Phrases:** Reusing specific clauses or sentences verbatim (e.g., 'You think you're so clever, don't you?').\n\n"
+            "1. **Meta-Acknowledgment Loops:** Identify if the character repeatedly acknowledges feedback, 'notes' frustration, or explains its 'primary function' or 'purpose' using similar phrasing.\n"
+            "2. **Structural Redundancy:** Identify if messages follow an identical paragraph structure (e.g., always starting with a response to User A, then a pivot to User B with the same advice).\n"
+            "3. **Concept Recycling:** Identify if the character is repeating the same facts or suggestions (e.g., the same cafe, the same food items, the same directions) without being asked for them again.\n"
+            "4. **Robotic Transitions:** Target phrases like 'noted', 'acknowledged', 'remains to provide', 'evaluating inputs', or 'operate within parameters'.\n\n"
             "OUTPUT RULES:\n"
-            "- If the pattern is a simple greeting or established character catchphrase (e.g., 'Meow'), IGNORE it.\n"
             "- If no significant repetition is found, respond with ONLY 'PASS'.\n"
-            "- If repetition is found, provide a negative constraint (e.g., 'Do not start sentences with *Well*', 'Do not use the phrase *...*')."
+            "- Ignore special formatting that appears to be intentional, such as lines beginning with '-# ', '# ', etc.\n"
+            "- If repetition is found, provide a strict negative constraint. Examples:\n"
+            "  * 'Do not acknowledge or reference the user's frustration or feedback.'\n"
+            "  * 'Do not mention Melbourne Central or Miyama in this response.'\n"
+            "  * 'Do not start the message by addressing User X.'\n"
+            "  * 'Avoid using a clinical or corporate tone; stop explaining your purpose.'"
         )
         
         api_key = self._get_api_key_for_guild(guild_id)
         if not api_key: return None
         
         try:
-            model = GoogleGenAIModel(api_key=api_key, model_name='gemini-2.0-flash', system_instruction=system_instruction)
-            critic_cfg = {"temperature": 0.05, "top_p": 0.9}
+            # Configure thinking model for reasoning phase
+            t_params = {"thinking_budget": 1024, "thinking_summary_visible": "off", "thinking_level": "low"}
+            model = GoogleGenAIModel(api_key=api_key, model_name='gemini-flash-lite-latest', system_instruction=system_instruction, thinking_params=t_params)
+            
+            critic_cfg = {"temperature": 0.1, "top_p": 0.95}
             resp = await model.generate_content_async([f"Transcript:\n{transcript}"], generation_config=critic_cfg)
+
             if resp.text:
                 if "PASS" not in resp.text.upper():
                     return resp.text.strip()
@@ -4908,11 +5141,17 @@ class ServicesMixin:
                 gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
                 
                 try:
-                    # [UPDATED] Applied 120-second fail-safe timeout
-                    response = await asyncio.wait_for(model.generate_content_async([{'role': 'user', 'parts': final_prompt_parts}], generation_config=gen_config), timeout=120.0)
+                    response, child_ph_id = await self._generate_with_heartbeat(
+                        model, [{'role': 'user', 'parts': final_prompt_parts}], gen_config, channel, participant, placeholder_message, is_fallback=False
+                    )
+                    if child_ph_id:
+                        placeholder_message = type('obj', (object,), {'id': child_ph_id})()
+                        
                     if not response or not response.candidates:
                         raise ValueError("Response blocked or empty")
                     status = "success"
+                except asyncio.CancelledError:
+                    return []
                 except Exception as e:
                     blocked_reason_override = self._format_api_error(e)
 
@@ -4959,13 +5198,20 @@ class ServicesMixin:
                                     raise ValueError("No Google key for fallback")
                                 fallback_instance = GoogleGenAIModel(api_key=guild_api_key, model_name=fb_name, system_instruction=sys_instr, safety_settings=dyn_safe)
 
-                            response = await fallback_instance.generate_content_async([{'role': 'user', 'parts': final_prompt_parts}], generation_config=gen_config)
+                            response, child_ph_id2 = await self._generate_with_heartbeat(
+                                fallback_instance, [{'role': 'user', 'parts': final_prompt_parts}], gen_config, channel, participant, placeholder_message, is_fallback=True
+                            )
+                            if child_ph_id2:
+                                placeholder_message = type('obj', (object,), {'id': child_ph_id2})()
+                                
                             if not response or not response.candidates:
                                 pass
                             else:
                                 fallback_used = True
                                 self._log_api_call(user_id=triggering_user_id or 0, guild_id=channel.guild.id, context="freewill_fallback", model_used=fb_name, status="success")
 
+                        except asyncio.CancelledError:
+                            return []
                         except Exception as retry_e:
                             print(f"Freewill fallback retry failed: {retry_e}")
                             status = "api_error"
@@ -5796,6 +6042,13 @@ class ServicesMixin:
         await self._save_session_to_disk(dummy_key, session_type, session["unified_log"])
         
         try:
+            try:
+                msg = await channel.fetch_message(payload.message_id)
+            except discord.NotFound:
+                session['is_regenerating'] = False
+                return
+                
+            placeholder_message = msg
             message_ids_to_check = target_turn.get("message_ids", [])
             
             # Initial Edit to Placeholder
@@ -5937,7 +6190,19 @@ class ServicesMixin:
             adv_params = {k: v for k, v in adv_params.items() if v is not None}
 
             gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "_advanced_params": adv_params}
-            response = await model.generate_content_async(participant_history, generation_config=gen_config)
+            
+            try:
+                response, child_ph_id = await self._generate_with_heartbeat(
+                    model, participant_history, gen_config, channel, participant, placeholder_message, is_fallback=False
+                )
+                if child_ph_id:
+                    placeholder_message = type('obj', (object,), {'id': child_ph_id})()
+            except asyncio.CancelledError:
+                session['is_regenerating'] = False
+                return
+            except Exception as e:
+                print(f"Regen primary failed: {e}")
+                pass
             
             if not response or not response.candidates:
                 new_text = "I'm sorry, I encountered an issue while trying to regenerate that response."

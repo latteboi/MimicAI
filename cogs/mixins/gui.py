@@ -483,34 +483,37 @@ class WhisperHistoryView(ui.View):
         whisper_turn_id = whisper_turn.get("turn_id")
         response_turn_id = response_turn.get("turn_id")
 
-        # Use the same logic as the single-delete view
+        # Re-using logic via the updated WhisperActionView (passing None for optional regen args)
         view = WhisperActionView(self.cog, self.original_interaction, whisper_turn_id, response_turn_id)
-        # Manually create a button and trigger its callback to perform the deletion
-        button = ui.Button(label="Confirm")
         await view.delete_button.callback(interaction)
         
         # After deletion, refresh the history view
         await self.cog._show_whisper_history(self.original_interaction)
 
 class WhisperActionView(ui.View):
-    def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, whisper_turn_id: str, response_turn_id: str):
+    def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, whisper_turn_id: str, response_turn_id: str, target_participant: Optional[Dict] = None, whisper_message: Optional[str] = None):
         super().__init__(timeout=300)
         self.cog = cog
         self.original_interaction = interaction
         self.channel_id = interaction.channel_id
         self.whisper_turn_id = whisper_turn_id
         self.response_turn_id = response_turn_id
+        self.target_participant = target_participant
+        self.whisper_message = whisper_message
 
-    @ui.button(label="Delete Whisper", style=discord.ButtonStyle.danger, custom_id="delete_whisper")
+    @ui.button(label="Delete", style=discord.ButtonStyle.danger, custom_id="delete_whisper")
     async def delete_button(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.defer()
         session = self.cog.multi_profile_channels.get(self.channel_id)
         if not session:
-            await interaction.edit_original_response(content="Session not found or has ended.", view=None, embed=None)
+            await interaction.response.edit_message(content="Session not found or has ended.", view=None, embed=None)
             return
 
         if not session.get("is_hydrated"):
             session = await self.cog._ensure_session_hydrated(self.channel_id, session.get("type", "multi"))
+
+        if not session:
+            await interaction.response.edit_message(content="Failed to load session memory.", view=None, embed=None)
+            return
 
         turn_ids_to_delete = {self.whisper_turn_id, self.response_turn_id}
         original_log_len = len(session.get("unified_log", []))
@@ -529,11 +532,16 @@ class WhisperActionView(ui.View):
         if len(session["unified_log"]) < original_log_len and target_pid:
             session_type = session.get("type", "multi")
             await self.cog._save_session_to_disk((self.channel_id, None, None), session_type, session["unified_log"])
-            
             session["is_hydrated"] = False
-            await self.cog._ensure_session_hydrated(self.channel_id, session_type)
 
-        await interaction.edit_original_response(content="Whisper has been deleted from the profile's memory.", view=None, embed=None)
+        await interaction.response.edit_message(content="Whisper has been deleted from the profile's memory.", view=None, embed=None)
+
+    @ui.button(label="Regenerate", style=discord.ButtonStyle.secondary, custom_id="regenerate_whisper")
+    async def regenerate_button(self, interaction: discord.Interaction, button: ui.Button):
+        if not self.target_participant or not self.whisper_message:
+            await interaction.response.send_message("Regeneration is only available for recent whispers.", ephemeral=True)
+            return
+        await self.cog._execute_whisper_regeneration(interaction, self.whisper_turn_id, self.response_turn_id, self.target_participant, self.whisper_message)
 
 class ProfileDirectorDeskModal(ui.Modal, title="Director's Desk: TTS Instructions"):
     def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], callback=None):
@@ -4106,7 +4114,9 @@ class BulkDeleteView(BaseBulkProfileView):
                 else:
                     index["personal"].remove(name)
                     pid = name
-                self.cog._cascade_delete_borrowed_profiles(self.user_id, name)
+                
+                # Pass the pid to cascade delete to match the method signature
+                self.cog._cascade_delete_borrowed_profiles(self.user_id, pid, name)
                 deleted_count += 1
                 import shutil
                 p_dir = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", pid)

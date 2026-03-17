@@ -2027,6 +2027,8 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             await interaction.followup.send("You have no whisper history in this session.", ephemeral=True)
             return
 
+        # Note: History view regeneration is disabled because the target_participant dict 
+        # is not easily reconstructed from old logs without PID-to-Owner mapping.
         view = WhisperHistoryView(self, interaction, paired_whispers)
         await interaction.followup.send(embed=view._get_current_embed(), view=view, ephemeral=True)
 
