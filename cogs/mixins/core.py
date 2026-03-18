@@ -1295,7 +1295,7 @@ class CoreMixin:
         # --- SEND PLACEHOLDER EMBED ---
         placeholder_embed = discord.Embed(description=f"{PLACEHOLDER_EMOJI}", color=discord.Color.dark_grey())
         placeholder_embed.set_author(name=display_name, icon_url=avatar_url)
-        placeholder_embed.set_footer(text=f"Private whisper: {whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
+        placeholder_embed.set_footer(text=f"{whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
         placeholder_msg = await interaction.followup.send(embed=placeholder_embed, ephemeral=True, wait=True)
         
         try:
@@ -1401,7 +1401,7 @@ class CoreMixin:
         # Send the private response to the user
         embed = discord.Embed(description=response_text, color=discord.Color.dark_grey())
         embed.set_author(name=display_name, icon_url=avatar_url)
-        embed.set_footer(text=f"Private whisper: {whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
+        embed.set_footer(text=f"{whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
         
         view = WhisperActionView(self, interaction, whisper_turn_id, response_turn_id, target_participant, whisper_message)
         resp_msg = await placeholder_msg.edit(embed=embed, view=view)
@@ -1449,7 +1449,7 @@ class CoreMixin:
         # --- IMMEDIATE EDIT TO PLACEHOLDER ---
         placeholder_embed = discord.Embed(description=f"{PLACEHOLDER_EMOJI}", color=discord.Color.dark_grey())
         placeholder_embed.set_author(name=display_name, icon_url=avatar_url)
-        placeholder_embed.set_footer(text=f"Private whisper: {whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
+        placeholder_embed.set_footer(text=f"{whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
         
         await interaction.response.edit_message(embed=placeholder_embed, view=None)
         placeholder_msg = await interaction.original_response()

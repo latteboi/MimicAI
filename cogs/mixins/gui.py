@@ -450,7 +450,7 @@ class WhisperHistoryView(ui.View):
 
         embed = discord.Embed(description=response_content, color=discord.Color.dark_grey())
         embed.set_author(name=display_name, icon_url=avatar_url)
-        embed.set_footer(text=f"Private whisper: {whisper_content}", icon_url=self.original_interaction.user.display_avatar.url)
+        embed.set_footer(text=f"{whisper_content}", icon_url=self.original_interaction.user.display_avatar.url)
         
         return embed
 

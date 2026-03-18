@@ -200,27 +200,32 @@ class OpenRouterModel:
             finish_reason = "STOP"
             
             import orjson as json
-            async with httpx.AsyncClient() as client:
-                async with client.stream("POST", "https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=60) as response:
-                    if response.status_code != 200:
-                        err_text = await response.aread()
-                        raise Exception(f"OpenRouter API Error {response.status_code}: {err_text}")
-                    
-                    async for line in response.aiter_lines():
-                        stream_state["last_token_time"] = time.time()
-                        if line.startswith("data: ") and line != "data: [DONE]":
-                            try:
-                                data = json.loads(line[6:])
-                                if "choices" in data and len(data["choices"]) > 0:
-                                    delta = data["choices"][0].get("delta", {})
-                                    if "content" in delta and delta["content"]:
-                                        full_text += delta["content"]
-                                    if "reasoning" in delta and delta["reasoning"]:
-                                        full_thought += delta["reasoning"]
-                                    if data["choices"][0].get("finish_reason"):
-                                        finish_reason = data["choices"][0]["finish_reason"]
-                            except Exception:
-                                pass
+            try:
+                async with httpx.AsyncClient() as client:
+                    async with client.stream("POST", "https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=60) as response:
+                        if response.status_code != 200:
+                            err_text = await response.aread()
+                            raise Exception(f"OpenRouter API Error {response.status_code}: {err_text}")
+                        
+                        async for line in response.aiter_lines():
+                            stream_state["last_token_time"] = time.time()
+                            if line.startswith("data: ") and line != "data: [DONE]":
+                                try:
+                                    data = json.loads(line[6:])
+                                    if "choices" in data and len(data["choices"]) > 0:
+                                        delta = data["choices"][0].get("delta", {})
+                                        if "content" in delta and delta["content"]:
+                                            full_text += delta["content"]
+                                        if "reasoning" in delta and delta["reasoning"]:
+                                            full_thought += delta["reasoning"]
+                                        if data["choices"][0].get("finish_reason"):
+                                            finish_reason = data["choices"][0]["finish_reason"]
+                                except Exception:
+                                    pass
+            except httpx.RequestError as e:
+                raise Exception(f"OpenRouter Network Error: {str(e)}")
+            except asyncio.CancelledError:
+                raise
                                 
             class OpenRouterThoughtResponse:
                 def __init__(self, content, reasoning, finish_reason):
@@ -236,36 +241,41 @@ class OpenRouterModel:
                 
             return OpenRouterThoughtResponse(full_text, full_thought, finish_reason)
         else:
-            async with httpx.AsyncClient() as client:
-                response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=60)
-                if response.status_code != 200:
-                    raise Exception(f"OpenRouter API Error {response.status_code}: {response.text}")
-                
-                data = response.json()
-                if 'error' in data:
-                     raise Exception(f"OpenRouter API Error: {data['error']}")
-                
-                choice = data['choices'][0]
-                msg_obj = choice['message']
-                
-                class OpenRouterThoughtResponse:
-                    def __init__(self, content, reasoning, finish_reason):
-                        self.text = content
-                        self.thought = reasoning or ""
-                        
-                        # Create mock content and parts for the worker's scrubbing logic
-                        mock_part = type('obj', (object,), {'text': content})
-                        mock_content = type('obj', (object,), {'parts': [mock_part]})
-                        
-                        # Create the candidate object
-                        self.candidates = [type('obj', (object,), {
-                            'content': mock_content,
-                            'finish_reason': type('obj', (object,), {'name': finish_reason})
-                        })]
-                        
-                    def __bool__(self): return True
-    
-                return OpenRouterThoughtResponse(msg_obj.get('content', ''), msg_obj.get('reasoning', ''), choice.get('finish_reason', 'STOP').upper())
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=60)
+                    if response.status_code != 200:
+                        raise Exception(f"OpenRouter API Error {response.status_code}: {response.text}")
+                    
+                    data = response.json()
+                    if 'error' in data:
+                         raise Exception(f"OpenRouter API Error: {data['error']}")
+                    
+                    choice = data['choices'][0]
+                    msg_obj = choice['message']
+                    
+                    class OpenRouterThoughtResponse:
+                        def __init__(self, content, reasoning, finish_reason):
+                            self.text = content
+                            self.thought = reasoning or ""
+                            
+                            # Create mock content and parts for the worker's scrubbing logic
+                            mock_part = type('obj', (object,), {'text': content})
+                            mock_content = type('obj', (object,), {'parts': [mock_part]})
+                            
+                            # Create the candidate object
+                            self.candidates = [type('obj', (object,), {
+                                'content': mock_content,
+                                'finish_reason': type('obj', (object,), {'name': finish_reason})
+                            })]
+                            
+                        def __bool__(self): return True
+        
+                    return OpenRouterThoughtResponse(msg_obj.get('content', ''), msg_obj.get('reasoning', ''), choice.get('finish_reason', 'STOP').upper())
+            except httpx.RequestError as e:
+                raise Exception(f"OpenRouter Network Error: {str(e)}")
+            except asyncio.CancelledError:
+                raise
 
 class GoogleGenAIChatSession:
     def __init__(self, history=None):
@@ -696,6 +706,13 @@ class ServicesMixin:
         
         if monitor_task in done:
             gen_task.cancel()
+            
+            # Fire-and-forget exception retriever to prevent "Task exception was never retrieved" warnings
+            async def _cleanup(t):
+                try: await t
+                except Exception: pass
+            asyncio.create_task(_cleanup(gen_task))
+            
             try:
                 res = monitor_task.result()
             except Exception as e:
@@ -708,6 +725,12 @@ class ServicesMixin:
                 raise TimeoutError("Generation stalled or timed out")
         else:
             monitor_task.cancel()
+            
+            async def _cleanup(t):
+                try: await t
+                except Exception: pass
+            asyncio.create_task(_cleanup(monitor_task))
+            
             response = gen_task.result()
             return response, stream_state.get('child_placeholder_id')
 
