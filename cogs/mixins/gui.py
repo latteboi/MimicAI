@@ -25,6 +25,288 @@ if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
     from ..GeminiCog import GeminiAgent
 
+class GlobalChatInputModal(ui.Modal, title="Draft Your Reply"):
+    def __init__(self, cog, view, existing_text="", is_edit=False):
+        super().__init__()
+        self.cog = cog
+        self.parent_view = view
+        self.is_edit = is_edit
+        self.input_field = ui.TextInput(
+            label="Message Content",
+            style=discord.TextStyle.paragraph,
+            default=existing_text,
+            max_length=2000,
+            required=True
+        )
+        self.add_item(self.input_field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        session_data = self.cog.global_chat_sessions.get(self.parent_view.session_key)
+        if not session_data:
+            await interaction.response.send_message("Session expired.", ephemeral=True)
+            return
+
+        queue = session_data.setdefault("pending_queue", {})
+        queue[interaction.user.id] = {
+            "user_id": interaction.user.id,
+            "display_name": interaction.user.display_name,
+            "content": self.input_field.value.strip(),
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        }
+        
+        active_typers = session_data.setdefault("active_typers", set())
+        active_typers.discard(interaction.user.id)
+        
+        # If everyone finished typing, remove the lock immediately
+        if not active_typers:
+            session_data["lock_deadline"] = 0
+        
+        self.parent_view._build_view()
+        try:
+            await self.parent_view.original_interaction.edit_original_response(view=self.parent_view)
+        except Exception:
+            pass
+
+        queue_view = GlobalChatQueueView(self.cog, self.parent_view, interaction.user.id)
+        embed = queue_view.get_embed()
+        
+        if self.is_edit:
+            await interaction.response.edit_message(embed=embed, view=queue_view)
+        else:
+            await interaction.response.send_message(embed=embed, view=queue_view, ephemeral=True)
+
+class GlobalChatQueueView(ui.View):
+    def __init__(self, cog, parent_view, user_id):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.parent_view = parent_view
+        self.user_id = user_id
+
+    def get_embed(self):
+        session_data = self.cog.global_chat_sessions.get(self.parent_view.session_key, {})
+        queue = session_data.get("pending_queue", {})
+        
+        embed = discord.Embed(title="Queued Messages", color=discord.Color.gold())
+        
+        script_text = ""
+        queued_turns = sorted(list(queue.values()), key=lambda x: x["timestamp"])
+        for turn in queued_turns:
+            preview = turn['content']
+            if len(preview) > 800: preview = preview[:797] + "..."
+            marker = "[You] " if turn['user_id'] == self.user_id else ""
+            script_text += f"**{marker}{turn['display_name']}**: {preview}\n\n"
+        
+        if not script_text:
+            script_text = "No messages currently in the queue."
+            
+        embed.description = script_text
+        return embed
+
+    @ui.button(label="Edit Reply", style=discord.ButtonStyle.primary)
+    async def edit_btn(self, interaction: discord.Interaction, button: ui.Button):
+        session_data = self.cog.global_chat_sessions.get(self.parent_view.session_key)
+        if not session_data or self.user_id not in session_data.get("pending_queue", {}):
+            await interaction.response.send_message("This turn has already been played or removed.", ephemeral=True)
+            return
+        
+        # Re-add to active typers if they edit, but do NOT extend the absolute 30s deadline
+        now = time.time()
+        deadline = session_data.get("lock_deadline", 0)
+        if deadline != 0 and now < deadline:
+            session_data.setdefault("active_typers", set()).add(self.user_id)
+            self.parent_view._build_view()
+            try:
+                await self.parent_view.original_interaction.edit_original_response(view=self.parent_view)
+            except Exception: pass
+        
+        existing_text = session_data["pending_queue"][self.user_id]["content"]
+        modal = GlobalChatInputModal(self.cog, self.parent_view, existing_text, is_edit=True)
+        await interaction.response.send_modal(modal)
+
+    @ui.button(label="Delete Reply", style=discord.ButtonStyle.danger)
+    async def del_btn(self, interaction: discord.Interaction, button: ui.Button):
+        session_data = self.cog.global_chat_sessions.get(self.parent_view.session_key)
+        if session_data and self.user_id in session_data.get("pending_queue", {}):
+            del session_data["pending_queue"][self.user_id]
+            
+            # Also ensure they are removed from typers if they somehow deleted while marked active
+            session_data.setdefault("active_typers", set()).discard(self.user_id)
+            if not session_data["active_typers"]:
+                session_data["lock_deadline"] = 0
+                
+            self.parent_view._build_view()
+            try:
+                await self.parent_view.original_interaction.edit_original_response(view=self.parent_view)
+            except Exception: pass
+            
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+class GlobalChatPlayView(ui.View):
+    def __init__(self, cog, interaction, user_id, profile_name):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.original_interaction = interaction
+        self.user_id = user_id
+        self.profile_name = profile_name
+        self.session_key = ('global', user_id, profile_name)
+        
+    async def initialize(self):
+        await self._load_current_session()
+        self._build_view()
+        
+    async def _load_current_session(self):
+        session_data = self.cog.global_chat_sessions.get(self.session_key)
+        if not session_data:
+            session_data = await self.cog._load_session_from_disk(self.session_key, 'global_chat')
+            if not session_data:
+                chat = GoogleGenAIChatSession(history=[])
+                session_data = {'chat_session': chat, 'unified_log': []}
+            self.cog.global_chat_sessions[self.session_key] = session_data
+            
+    def _build_view(self):
+        self.clear_items()
+        session_data = self.cog.global_chat_sessions.get(self.session_key, {})
+        queue = session_data.get("pending_queue", {})
+        active_typers = session_data.get("active_typers", set())
+        deadline = session_data.get("lock_deadline", 0)
+        now = time.time()
+        
+        is_locked = len(active_typers) > 0 and now < deadline
+        
+        reply_btn = ui.Button(label="Reply", style=discord.ButtonStyle.primary, row=0)
+        reply_btn.callback = self.reply_callback
+        self.add_item(reply_btn)
+        
+        if queue:
+            if is_locked:
+                play_btn = ui.Button(label="Waiting for writers...", style=discord.ButtonStyle.secondary, disabled=True, row=0)
+            else:
+                play_btn = ui.Button(label=f"Play ({len(queue)})", style=discord.ButtonStyle.success, disabled=False, row=0)
+        else:
+            play_btn = ui.Button(label="Play", style=discord.ButtonStyle.secondary, disabled=True, row=0)
+            
+        play_btn.callback = self.play_callback
+        self.add_item(play_btn)
+        
+    def get_embed(self):
+        session_data = self.cog.global_chat_sessions.get(self.session_key, {})
+        log = session_data.get('unified_log', [])
+        
+        display_name = self.profile_name
+        avatar_url = self.cog.bot.user.display_avatar.url
+        
+        index = self.cog._get_user_index(self.user_id)
+        is_borrowed = self.profile_name in index.get("borrowed", [])
+        
+        eff_owner = self.user_id
+        eff_name = self.profile_name
+        if is_borrowed:
+            b_data = self.cog._get_profile_config(self.user_id, self.profile_name, True) or {}
+            eff_owner = int(b_data.get("original_owner_id", self.user_id))
+            eff_name = b_data.get("original_profile_name", self.profile_name)
+            
+        app = self.cog.user_appearances.get(str(eff_owner), {}).get(eff_name)
+        if app:
+            display_name = app.get("custom_display_name") or display_name
+            avatar_url = app.get("custom_avatar_url") or avatar_url
+            
+        embed = discord.Embed(color=discord.Color.dark_grey())
+        embed.set_author(name=display_name, icon_url=avatar_url)
+        
+        last_user = None
+        last_model = None
+        
+        for turn in reversed(log):
+            if turn.get('role') == 'model' and not last_model:
+                last_model = turn
+            elif turn.get('role') == 'user' and not last_user:
+                last_user = turn
+                
+            if last_user and last_model: break
+        
+        if not last_model:
+            embed.description = "No conversation history found. Click 'Reply' to start."
+        else:
+            embed.description = last_model.get("content")
+            if last_user:
+                user_input = last_user.get("content", "")
+                embed.set_footer(text=f"You: {user_input}", icon_url=self.original_interaction.user.display_avatar.url)
+                
+        return embed
+
+    async def _wait_and_unlock(self, session_key, deadline, time_left):
+        await asyncio.sleep(time_left + 0.5)
+        session_data = self.cog.global_chat_sessions.get(session_key)
+        if session_data and session_data.get("lock_deadline") == deadline:
+            if time.time() >= deadline:
+                session_data.setdefault("active_typers", set()).clear()
+                session_data["lock_deadline"] = 0
+                self._build_view()
+                try:
+                    await self.original_interaction.edit_original_response(view=self)
+                except Exception:
+                    pass
+
+    async def reply_callback(self, interaction: discord.Interaction):
+        session_data = self.cog.global_chat_sessions.setdefault(self.session_key, {'chat_session': GoogleGenAIChatSession(history=[]), 'unified_log': []})
+        now = time.time()
+        
+        deadline = session_data.get("lock_deadline", 0)
+        extensions = session_data.setdefault("timer_extensions", set())
+        
+        if deadline == 0 or now > deadline:
+            # First interaction or timer died: Start fresh 10s timer and record this user
+            session_data["lock_deadline"] = now + 10
+            deadline = session_data["lock_deadline"]
+            extensions.add(interaction.user.id)
+        else:
+            # Timer is currently active. Extend ONLY if this user hasn't extended yet this round
+            if interaction.user.id not in extensions:
+                session_data["lock_deadline"] = now + 10
+                deadline = session_data["lock_deadline"]
+                extensions.add(interaction.user.id)
+
+        time_left = max(0, deadline - now)
+        session_data.setdefault("active_typers", set()).add(interaction.user.id)
+        
+        queue = session_data.setdefault("pending_queue", {})
+        existing_text = queue.get(interaction.user.id, {}).get("content", "")
+
+        modal = GlobalChatInputModal(self.cog, self, existing_text)
+        await interaction.response.send_modal(modal)
+
+        self._build_view()
+        try:
+            await self.original_interaction.edit_original_response(view=self)
+        except Exception:
+            pass
+            
+        self.cog.bot.loop.create_task(self._wait_and_unlock(self.session_key, deadline, time_left))
+
+    async def play_callback(self, interaction: discord.Interaction):
+        session_data = self.cog.global_chat_sessions.get(self.session_key)
+        if not session_data: return
+        
+        queue = session_data.get("pending_queue", {})
+        if not queue: return
+
+        queued_turns = sorted(list(queue.values()), key=lambda x: x["timestamp"])
+        session_data["pending_queue"] = {} 
+        session_data["timer_extensions"] = set()
+        session_data["active_typers"] = set()
+        session_data["lock_deadline"] = 0
+        
+        self.clear_items()
+        await interaction.response.edit_message(view=self)
+
+        host_user_id = self.session_key[1]
+        profile_name = self.session_key[2]
+        await self.cog._execute_global_chat(interaction, host_user_id, profile_name, queued_turns)
+        
+        await self._load_current_session()
+        self._build_view()
+        await interaction.edit_original_response(embed=self.get_embed(), view=self)
+
 class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
     model_id_input = ui.TextInput(label="Model ID", placeholder="e.g. anthropic/claude-3", required=True)
 
@@ -172,11 +454,6 @@ class GlobalChatHistoryView(ui.View):
         self.add_item(delete_btn)
 
     def get_embed(self) -> discord.Embed:
-        if not self.rounds:
-            return discord.Embed(description="No conversation history found.", color=discord.Color.dark_grey())
-            
-        user_turn, model_turn = self.rounds[self.current_page]
-        
         display_name = self.selected_profile
         avatar_url = self.cog.bot.user.display_avatar.url
         
@@ -196,6 +473,12 @@ class GlobalChatHistoryView(ui.View):
             display_name = appearance_data.get("custom_display_name") or display_name
             avatar_url = appearance_data.get("custom_avatar_url") or avatar_url
 
+        if not self.rounds:
+            embed = discord.Embed(description="No conversation history found. Click 'Reply' to start.", color=discord.Color.dark_grey())
+            embed.set_author(name=display_name, icon_url=avatar_url)
+            return embed
+            
+        user_turn, model_turn = self.rounds[self.current_page]
         embed = discord.Embed(description=model_turn.get("content"), color=discord.Color.dark_grey())
         embed.set_author(name=display_name, icon_url=avatar_url)
         
@@ -203,6 +486,70 @@ class GlobalChatHistoryView(ui.View):
         embed.set_footer(text=f"You: {user_input}", icon_url=self.original_interaction.user.display_avatar.url)
         
         return embed
+
+    async def _wait_and_unlock(self, session_key):
+        await asyncio.sleep(10.5) # Slight buffer over 10s
+        session_data = self.cog.global_chat_sessions.get(session_key)
+        if session_data and time.time() >= session_data.get("lock_expiry", 0):
+            # Enforce the deadline by clearing the active typers
+            session_data.setdefault("active_typers", set()).clear()
+            self._build_view()
+            try:
+                await self.original_interaction.edit_original_response(view=self)
+            except Exception:
+                pass
+
+    async def reply_callback(self, interaction: discord.Interaction):
+        session_data = self.cog.global_chat_sessions.setdefault(self.session_key, {})
+        
+        # Timer / Lock Logic
+        lock_resets = session_data.get("lock_resets", 0)
+        now = time.time()
+        
+        if now > session_data.get("lock_expiry", 0):
+            session_data["lock_resets"] = 0
+            lock_resets = 0
+
+        # Allow max 2 resets (30s deadline)
+        if lock_resets <= 2:
+            session_data["lock_expiry"] = now + 10
+            session_data["lock_resets"] = lock_resets + 1
+            
+        session_data.setdefault("active_typers", set()).add(interaction.user.id)
+        
+        self._build_view()
+        try:
+            await self.original_interaction.edit_original_response(view=self)
+        except Exception:
+            pass
+
+        queue = session_data.setdefault("pending_queue", {})
+        existing_text = queue.get(interaction.user.id, {}).get("content", "")
+
+        modal = GlobalChatInputModal(self.cog, self, existing_text)
+        await interaction.response.send_modal(modal)
+        
+        self.cog.bot.loop.create_task(self._wait_and_unlock(self.session_key))
+
+    async def play_callback(self, interaction: discord.Interaction):
+        session_data = self.cog.global_chat_sessions.get(self.session_key)
+        if not session_data: return
+        
+        queue = session_data.get("pending_queue", {})
+        if not queue: return
+
+        queued_turns = sorted(list(queue.values()), key=lambda x: x["timestamp"])
+        session_data["pending_queue"] = {} 
+        
+        self.clear_items()
+        await interaction.response.edit_message(view=self)
+
+        profile_name = self.session_key[2]
+        await self.cog._execute_global_chat(interaction, profile_name, queued_turns)
+        
+        await self._load_current_session()
+        self._build_view()
+        await interaction.edit_original_response(embed=self.get_embed(), view=self)
 
     async def profile_callback(self, interaction: discord.Interaction):
         self.selected_profile = interaction.data['values'][0]

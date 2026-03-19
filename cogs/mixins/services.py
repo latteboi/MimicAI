@@ -202,12 +202,14 @@ class OpenRouterModel:
             import orjson as json
             try:
                 async with httpx.AsyncClient() as client:
-                    async with client.stream("POST", "https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=60) as response:
+                    async with client.stream("POST", "https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=120.0) as response:
                         if response.status_code != 200:
                             err_text = await response.aread()
                             raise Exception(f"OpenRouter API Error {response.status_code}: {err_text}")
                         
                         async for line in response.aiter_lines():
+                            if stream_state.get("first_token_received") is False:
+                                stream_state["first_token_received"] = True
                             stream_state["last_token_time"] = time.time()
                             if line.startswith("data: ") and line != "data: [DONE]":
                                 try:
@@ -243,7 +245,7 @@ class OpenRouterModel:
         else:
             try:
                 async with httpx.AsyncClient() as client:
-                    response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=60)
+                    response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=120.0)
                     if response.status_code != 200:
                         raise Exception(f"OpenRouter API Error {response.status_code}: {response.text}")
                     
@@ -412,6 +414,8 @@ class GoogleGenAIModel:
             final_chunk = None
             
             async for chunk in response_stream:
+                if stream_state.get("first_token_received") is False:
+                    stream_state["first_token_received"] = True
                 stream_state["last_token_time"] = time.time()
                 if chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts:
                     for part in chunk.candidates[0].content.parts:
@@ -609,64 +613,70 @@ class ServicesMixin:
         self.channel_model_last_profile_key[model_cache_key] = current_profile_key_for_model
         return model_instance, final_error_state, temperature, top_p, top_k, warning_message, fallback_model
 
-    async def _generation_heartbeat(self, stream_state, channel, participant, placeholder_msg, is_fallback, message_type="text"):
+    async def _generation_heartbeat(self, stream_state, channel, participant, placeholder_msg, is_fallback, message_type="text", total_start_time=None):
         start_time = time.time()
+        if total_start_time is None:
+            total_start_time = start_time
+            
+        interval = 10.0
+        hard_timeout = 60.0 if is_fallback else 120.0
+        
+        initial_stall_limit = 90.0
+        active_stall_limit = 20.0
+        
         last_edit_time = start_time
-        interval = 30.0
-        hard_timeout = 120.0
-        stall_timeout = 20.0
         
         while True:
             now = time.time()
-            elapsed = now - start_time
+            elapsed_task = now - start_time
+            elapsed_total = now - total_start_time
             
-            if elapsed >= hard_timeout:
+            if elapsed_task >= hard_timeout:
                 return "timeout"
             
-            if now - stream_state.get("last_token_time", now) >= stall_timeout:
+            current_stall_limit = initial_stall_limit if stream_state.get("first_token_received") is False else active_stall_limit
+            if now - stream_state.get("last_token_time", now) >= current_stall_limit:
                 return "timeout"
                 
             if now - last_edit_time >= interval:
                 last_edit_time = now
-                mins = int(elapsed // 60)
-                secs = int(elapsed % 60)
+                rounded_total = int(round(elapsed_total / 10.0) * 10)
+                mins = rounded_total // 60
+                secs = rounded_total % 60
                 time_str = f"{mins}:{secs:02d}"
+                
                 base_text = "Using fallback model" if is_fallback else "Still generating"
                 text = f"{PLACEHOLDER_EMOJI} {base_text} ({time_str})..."
                 
-                if participant and participant.get('method') == 'child_bot':
-                    bot_id = participant.get('bot_id')
-                    child_ph_id = stream_state.get('child_placeholder_id')
-                    
-                    target_id = child_ph_id
-                    if not target_id and placeholder_msg:
-                        target_id = placeholder_msg.id
-
-                    if not target_id:
-                        corr_id = str(uuid.uuid4())
-                        conf_event = asyncio.Event()
-                        conf_data_ref = {"event": conf_event, "type": "heartbeat_placeholder"}
-                        self.pending_child_confirmations[corr_id] = conf_data_ref
+                try:
+                    if participant and participant.get('method') == 'child_bot':
+                        bot_id = participant.get('bot_id')
+                        child_ph_id = stream_state.get('child_placeholder_id')
                         
-                        await self.manager_queue.put({
-                            "action": "send_to_child", "bot_id": bot_id,
-                            "payload": {
-                                "action": "send_message", "channel_id": channel.id,
-                                "content": text, "realistic_typing": False, "correlation_id": corr_id
-                            }
-                        })
-                        try:
-                            await asyncio.wait_for(conf_event.wait(), timeout=10.0)
-                            msg_ids = conf_data_ref.get("message_ids", [])
-                            if msg_ids:
-                                stream_state['child_placeholder_id'] = msg_ids[-1]
-                        except Exception:
-                            pass
-                        finally:
-                            self.pending_child_confirmations.pop(corr_id, None)
-                    else:
-                        try:
-                            await channel.fetch_message(target_id)
+                        target_id = child_ph_id if child_ph_id else (placeholder_msg.id if placeholder_msg else None)
+
+                        if not target_id:
+                            corr_id = str(uuid.uuid4())
+                            conf_event = asyncio.Event()
+                            conf_data_ref = {"event": conf_event, "type": "heartbeat_placeholder"}
+                            self.pending_child_confirmations[corr_id] = conf_data_ref
+                            
+                            await self.manager_queue.put({
+                                "action": "send_to_child", "bot_id": bot_id,
+                                "payload": {
+                                    "action": "send_message", "channel_id": channel.id,
+                                    "content": text, "realistic_typing": False, "correlation_id": corr_id
+                                }
+                            })
+                            try:
+                                await asyncio.wait_for(conf_event.wait(), timeout=5.0)
+                                msg_ids = conf_data_ref.get("message_ids", [])
+                                if msg_ids: stream_state['child_placeholder_id'] = msg_ids[-1]
+                            except asyncio.TimeoutError:
+                                pass
+                            finally: 
+                                self.pending_child_confirmations.pop(corr_id, None)
+                        else:
                             await self.manager_queue.put({
                                 "action": "send_to_child", "bot_id": bot_id,
                                 "payload": {
@@ -674,65 +684,51 @@ class ServicesMixin:
                                     "message_id": target_id, "content": text
                                 }
                             })
-                        except discord.NotFound:
-                            return "cancelled"
-                        except Exception:
-                            pass
-                else:
-                    if placeholder_msg:
-                        try:
-                            if message_type == "embed":
-                                embed = placeholder_msg.embeds[0]
-                                embed.description = text
-                                await placeholder_msg.edit(embed=embed)
-                            else:
-                                await channel.fetch_message(placeholder_msg.id)
-                                webhook = await self._get_or_create_webhook(channel)
-                                if webhook:
-                                    await webhook.edit_message(placeholder_msg.id, content=text)
-                        except discord.NotFound:
-                            return "cancelled"
-                        except Exception:
-                            pass
+                    elif placeholder_msg:
+                        if message_type == "embed":
+                            embed = placeholder_msg.embeds[0]
+                            embed.description = text
+                            await placeholder_msg.edit(embed=embed)
+                        else:
+                            webhook = await self._get_or_create_webhook(channel)
+                            if webhook: await webhook.edit_message(placeholder_msg.id, content=text)
+                except asyncio.CancelledError:
+                    raise
+                except (discord.NotFound, discord.Forbidden):
+                    return "cancelled"
+                except Exception:
+                    pass
+
             await asyncio.sleep(1)
 
-    async def _generate_with_heartbeat(self, model, contents, gen_config, channel, participant, placeholder_msg, is_fallback=False, message_type="text"):
-        stream_state = {"last_token_time": time.time()}
+    async def _generate_with_heartbeat(self, model, contents, gen_config, channel, participant, placeholder_msg, is_fallback=False, message_type="text", total_start_time=None):
+        if total_start_time is None:
+            total_start_time = time.time()
+            
+        stream_state = {"last_token_time": time.time(), "first_token_received": False}
         
         gen_task = asyncio.create_task(model.generate_content_async(contents, generation_config=gen_config, stream_state=stream_state))
-        monitor_task = asyncio.create_task(self._generation_heartbeat(stream_state, channel, participant, placeholder_msg, is_fallback, message_type))
+        monitor_task = asyncio.create_task(self._generation_heartbeat(stream_state, channel, participant, placeholder_msg, is_fallback, message_type, total_start_time))
         
         done, pending = await asyncio.wait([gen_task, monitor_task], return_when=asyncio.FIRST_COMPLETED)
         
         if monitor_task in done:
             gen_task.cancel()
-            
-            # Fire-and-forget exception retriever to prevent "Task exception was never retrieved" warnings
             async def _cleanup(t):
                 try: await t
                 except Exception: pass
             asyncio.create_task(_cleanup(gen_task))
             
-            try:
-                res = monitor_task.result()
-            except Exception as e:
-                print(f"Monitor task crashed: {e}")
-                raise TimeoutError("Generation aborted due to monitor crash")
-                
-            if res == "cancelled":
-                raise asyncio.CancelledError("Message deleted")
-            elif res == "timeout":
-                raise TimeoutError("Generation stalled or timed out")
+            res = monitor_task.result()
+            if res == "cancelled": raise asyncio.CancelledError("Message deleted")
+            raise TimeoutError("Generation stalled or timed out")
         else:
             monitor_task.cancel()
-            
             async def _cleanup(t):
                 try: await t
                 except Exception: pass
             asyncio.create_task(_cleanup(monitor_task))
-            
-            response = gen_task.result()
-            return response, stream_state.get('child_placeholder_id')
+            return gen_task.result(), stream_state.get('child_placeholder_id')
 
     async def _get_or_create_model_for_global_chat(self, user_id: int, profile_name: str) -> Tuple[Optional[Any], float, float, int, Optional[str], Optional[str]]:
         index = self._get_user_index(user_id)
@@ -2183,10 +2179,11 @@ class ServicesMixin:
                         fallback_used = False
                         blocked_reason_override = None
                         
+                        t_start = time.time()
                         if model:
                             try:
                                 response, child_ph_id = await self._generate_with_heartbeat(
-                                    model, contents_for_api_call, gen_config, channel, participant, placeholder_message, is_fallback=False
+                                    model, contents_for_api_call, gen_config, channel, participant, placeholder_message, is_fallback=False, total_start_time=t_start
                                 )
                                 if child_ph_id:
                                     placeholder_message = type('obj', (object,), {'id': child_ph_id})()
@@ -2234,7 +2231,7 @@ class ServicesMixin:
                                             fallback_instance = GoogleGenAIModel(api_key=api_key, model_name=fb_name, system_instruction=full_system_instruction, safety_settings=dynamic_safety_settings, thinking_params=t_params_worker)
                                         
                                         response, child_ph_id2 = await self._generate_with_heartbeat(
-                                            fallback_instance, contents_for_api_call, gen_config, channel, participant, placeholder_message, is_fallback=True
+                                            fallback_instance, contents_for_api_call, gen_config, channel, participant, placeholder_message, is_fallback=True, total_start_time=t_start
                                         )
                                         if child_ph_id2:
                                             placeholder_message = type('obj', (object,), {'id': child_ph_id2})()
@@ -2565,6 +2562,12 @@ class ServicesMixin:
                         file_to_send = audio_file_for_send
 
                     if participant.get('method') == 'child_bot':
+                        if placeholder_message and hasattr(placeholder_message, 'id'):
+                            try:
+                                msg_to_del = await channel.fetch_message(placeholder_message.id)
+                                await msg_to_del.delete()
+                            except Exception: pass
+                            
                         correlation_id = str(uuid.uuid4())
                         confirmation_event = asyncio.Event()
                         self.pending_child_confirmations[correlation_id] = {
@@ -3153,6 +3156,12 @@ class ServicesMixin:
                         final_response_text = f"An unexpected error occurred in the finalization stage: {e}"; print(f"Error in finisher stage: {e}"); traceback.print_exc()
 
                     if is_child_bot:
+                        if placeholder_message and hasattr(placeholder_message, 'id'):
+                            try:
+                                msg_to_del = await channel.fetch_message(placeholder_message.id)
+                                await msg_to_del.delete()
+                            except Exception: pass
+                            
                         correlation_id = str(uuid.uuid4())
                         self.pending_child_confirmations[correlation_id] = {
                             "type": "single_profile", "user_turn": user_turn, "model_turn": model_turn,
@@ -3773,7 +3782,16 @@ class ServicesMixin:
         
         if target_message_to_edit and use_webhook and content != f"{PLACEHOLDER_EMOJI}":
             try:
-                await target_message_to_edit.delete()
+                webhook_for_delete = await self._get_or_create_webhook(channel) if isinstance(channel, (discord.TextChannel, discord.Thread)) else None
+                if webhook_for_delete:
+                    try:
+                        await webhook_for_delete.delete_message(target_message_to_edit.id)
+                    except discord.NotFound:
+                        pass
+                    except discord.HTTPException:
+                        await target_message_to_edit.delete()
+                else:
+                    await target_message_to_edit.delete()
             except discord.NotFound:
                 pass 
             except Exception as e:
@@ -5190,9 +5208,10 @@ class ServicesMixin:
                 
                 gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
                 
+                t_start = time.time()
                 try:
                     response, child_ph_id = await self._generate_with_heartbeat(
-                        model, [{'role': 'user', 'parts': final_prompt_parts}], gen_config, channel, participant, placeholder_message, is_fallback=False
+                        model, [{'role': 'user', 'parts': final_prompt_parts}], gen_config, channel, participant, placeholder_message, is_fallback=False, total_start_time=t_start
                     )
                     if child_ph_id:
                         placeholder_message = type('obj', (object,), {'id': child_ph_id})()
@@ -5254,7 +5273,7 @@ class ServicesMixin:
                                 fallback_instance = GoogleGenAIModel(api_key=guild_api_key, model_name=fb_name, system_instruction=sys_instr, safety_settings=dyn_safe)
 
                             response, child_ph_id2 = await self._generate_with_heartbeat(
-                                fallback_instance, [{'role': 'user', 'parts': final_prompt_parts}], gen_config, channel, participant, placeholder_message, is_fallback=True
+                                fallback_instance, [{'role': 'user', 'parts': final_prompt_parts}], gen_config, channel, participant, placeholder_message, is_fallback=True, total_start_time=t_start
                             )
                             if child_ph_id2:
                                 placeholder_message = type('obj', (object,), {'id': child_ph_id2})()
@@ -5323,6 +5342,12 @@ class ServicesMixin:
                 text_to_send += f"\n\n-# Fallback Model Used **({blocked_reason_override})**."
 
             if method == 'child_bot' and bot_id:
+                if placeholder_message and hasattr(placeholder_message, 'id'):
+                    try:
+                        msg_to_del = await channel.fetch_message(placeholder_message.id)
+                        await msg_to_del.delete()
+                    except Exception: pass
+                    
                 correlation_id = str(uuid.uuid4())
                 self.pending_child_confirmations[correlation_id] = {
                     "type": "single_profile",
@@ -6266,9 +6291,10 @@ class ServicesMixin:
 
             gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "_advanced_params": adv_params}
             
+            t_start = time.time()
             try:
                 response, child_ph_id = await self._generate_with_heartbeat(
-                    model, participant_history, gen_config, channel, participant, placeholder_message, is_fallback=False
+                    model, participant_history, gen_config, channel, participant, placeholder_message, is_fallback=False, total_start_time=t_start
                 )
                 if child_ph_id:
                     placeholder_message = type('obj', (object,), {'id': child_ph_id})()

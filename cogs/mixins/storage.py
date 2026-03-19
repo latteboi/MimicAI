@@ -598,11 +598,15 @@ class StorageMixin:
         data_to_save = session_data
 
         if session_type == 'global_chat':
-            if isinstance(session_data, dict) and 'unified_log' in session_data:
-                if not session_data['unified_log']:
-                    await self._delete_session_from_disk(session_key, session_type)
+            if isinstance(session_data, dict):
+                if 'unified_log' in session_data:
+                    if not session_data['unified_log']:
+                        await self._delete_session_from_disk(session_key, session_type)
+                        return
+                    data_to_save = session_data['unified_log']
+                else:
+                    # Non-persistent or dormant global chat state, skip saving
                     return
-                data_to_save = session_data['unified_log']
             elif hasattr(session_data, 'history'):
                  log = []
                  for content in session_data.history:

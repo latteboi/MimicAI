@@ -876,29 +876,24 @@ class CoreMixin:
 
         await interaction_to_respond.followup.send("Message sent.", ephemeral=True)
 
-    async def _execute_global_chat(self, interaction: discord.Interaction, profile_name: str, message: str):
+    async def _execute_global_chat(self, interaction: discord.Interaction, host_user_id: int, profile_name: str, queued_turns: List[Dict]):
         t1_start_mono = time.monotonic()
         t1_start_utc = datetime.datetime.now(datetime.timezone.utc)
-        user_id = interaction.user.id
         
-        if not self._is_profile_public(user_id, profile_name):
-            await interaction.followup.send(f"This command is reserved for interacting with publicly published profiles. Your selected profile, **'{profile_name}'**, is not public.\n\nPlease use `/profile public manage` to publish it.", ephemeral=True)
-            return
-
-        index = self._get_user_index(user_id)
+        index = self._get_user_index(host_user_id)
         is_borrowed = profile_name in index.get("borrowed", [])
         
-        source_owner_id = user_id
+        source_owner_id = host_user_id
         source_profile_name = profile_name
         if is_borrowed:
-            borrowed_data = self._get_profile_config(user_id, profile_name, True) or {}
-            source_owner_id = int(borrowed_data.get("original_owner_id", user_id))
+            borrowed_data = self._get_profile_config(host_user_id, profile_name, True) or {}
+            source_owner_id = int(borrowed_data.get("original_owner_id", host_user_id))
             source_profile_name = borrowed_data.get("original_profile_name", profile_name)
         
         profile_data = self._get_profile_config(source_owner_id, source_profile_name, False)
 
         if not profile_data:
-            await interaction.followup.send(f"The source for your selected profile ('{profile_name}') could not be found.", ephemeral=True)
+            await interaction.followup.send(f"The source for '{profile_name}' could not be found.", ephemeral=True)
             return
 
         safety_level = profile_data.get("safety_level", "low")
@@ -906,22 +901,22 @@ class CoreMixin:
             await interaction.followup.send("For safety reasons, profiles with an 'Unrestricted 18+' safety level cannot be used with `/profile global_chat`. Please set the safety level to 'Low', 'Medium', or 'High'.", ephemeral=True)
             return
 
-        user_api_key = self._get_api_key_for_user(user_id)
+        user_api_key = self._get_api_key_for_user(host_user_id)
         if not user_api_key:
-            await interaction.followup.send("This feature requires you to have your own personal API key. Please use the `/settings` command in a DM with me to submit one.", ephemeral=True)
+            await interaction.followup.send("The host of this session needs to submit a personal API key using `/settings` to use this feature.", ephemeral=True)
             return
 
-        model_cache_key = ('global', user_id, profile_name)
+        model_cache_key = ('global', host_user_id, profile_name)
         
         try:
-            model, temp, top_p, top_k, warning_message, fallback_model_name = await self._get_or_create_model_for_global_chat(user_id, profile_name)
+            model, temp, top_p, top_k, warning_message, fallback_model_name = await self._get_or_create_model_for_global_chat(host_user_id, profile_name)
             
             if warning_message:
                 try: await interaction.user.send(warning_message)
                 except discord.Forbidden: pass
 
             if not model:
-                error_msg = warning_message or "Could not initialize the AI model for your profile."
+                error_msg = warning_message or "Could not initialize the AI model for this profile."
                 await interaction.followup.send(error_msg, ephemeral=True)
                 return
 
@@ -934,11 +929,21 @@ class CoreMixin:
                 session_data = {'chat_session': chat, 'unified_log': []}
             
             self.global_chat_sessions[model_cache_key] = session_data
-            chat = session_data['chat_session']
+            
+            # FIX: Reconstruct Chat Session if missing from ram cache
+            chat = session_data.get('chat_session')
+            if not chat:
+                rebuilt_history = []
+                for t in session_data.get('unified_log', []):
+                    role = 'model' if t.get('is_user') is False else 'user'
+                    rebuilt_history.append({'role': role, 'parts': [t.get('content')]})
+                chat = GoogleGenAIChatSession(history=rebuilt_history)
+                session_data['chat_session'] = chat
+                
             self.session_last_accessed[model_cache_key] = time.time()
 
             rebuilt_history = []
-            for t in session_data['unified_log']:
+            for t in session_data.get('unified_log', []):
                 t_role = t.get('role')
                 parts = [t.get('content')]
                 
@@ -959,15 +964,18 @@ class CoreMixin:
                 chat.history = chat.history[-(STM_LIMIT_MAX * 2):]
             session_data['unified_log'] = session_data['unified_log'][-(STM_LIMIT_MAX * 2):]
             
-            ltm_recall_text = await self._get_relevant_ltm_for_prompt(model_cache_key, chat.history, user_id, profile_name, message, interaction.user.display_name, guild_id=None, triggering_user_id=user_id)
+            combined_prompt_text = "\n\n".join([f"{t['display_name']}: {t['content']}" for t in queued_turns])
+            combined_footer_text = " ".join([f"{t['display_name']}: {t['content']}" for t in queued_turns])
+
+            ltm_recall_text = await self._get_relevant_ltm_for_prompt(model_cache_key, chat.history, host_user_id, profile_name, combined_prompt_text, interaction.user.display_name, guild_id=None, triggering_user_id=interaction.user.id)
             
-            user_index = self._get_user_index(user_id)
+            user_index = self._get_user_index(host_user_id)
             is_borrowed = profile_name in user_index.get("borrowed", [])
-            source_owner_id = user_id
+            source_owner_id = host_user_id
             source_profile_name = profile_name
             if is_borrowed:
-                b_data = self._get_profile_config(user_id, profile_name, True) or {}
-                source_owner_id = int(b_data.get("original_owner_id", user_id))
+                b_data = self._get_profile_config(host_user_id, profile_name, True) or {}
+                source_owner_id = int(b_data.get("original_owner_id", host_user_id))
                 source_profile_name = b_data.get("original_profile_name", profile_name)
             
             bot_display_name = source_profile_name
@@ -977,21 +985,20 @@ class CoreMixin:
 
             contents_for_api_call = []
             
-            # [NEW] Localized User Timestamp Logic
             user_tz = profile_data.get("timezone", "UTC")
-            user_hash = self._get_user_hash(user_id)
-            user_line = self._format_history_entry(interaction.user.display_name, interaction.created_at, message, user_tz, entity_id=user_hash)
-            
             final_user_parts = []
             if ltm_recall_text:
                 final_user_parts.append(ltm_recall_text)
             
             if profile_data.get('url_fetching_enabled', False):
-                u_text, _ = await self._process_urls_in_content(message, 0, {"url_fetching_enabled": True})
+                u_text, _ = await self._process_urls_in_content(combined_prompt_text, 0, {"url_fetching_enabled": True})
                 if u_text:
                     final_user_parts.append(f"<document_context>\n" + "\n".join(u_text) + "\n</document_context>")
 
-            final_user_parts.append(user_line)
+            for turn in queued_turns:
+                user_hash = self._get_user_hash(turn["user_id"])
+                user_line = self._format_history_entry(turn["display_name"], turn["timestamp"], turn["content"], user_tz, entity_id=user_hash)
+                final_user_parts.append(user_line)
 
             user_content_obj_for_turn = {'role': 'user', 'parts': final_user_parts}
             
@@ -1012,15 +1019,18 @@ class CoreMixin:
             fallback_used = False
             blocked_reason_override = None
             
-            # --- SEND PLACEHOLDER EMBED ---
+            # --- EDIT ORIGINAL RESPONSE ---
             placeholder_embed = discord.Embed(description=f"{PLACEHOLDER_EMOJI}", color=discord.Color.dark_grey())
             placeholder_embed.set_author(name=bot_display_name, icon_url=appearance.get("custom_avatar_url") if appearance else self.bot.user.display_avatar.url)
-            placeholder_embed.set_footer(text=message[:1000], icon_url=interaction.user.display_avatar.url)
-            placeholder_msg = await interaction.followup.send(embed=placeholder_embed, ephemeral=False, wait=True)
+            placeholder_embed.set_footer(text=combined_footer_text[:1000], icon_url=interaction.user.display_avatar.url)
             
+            await interaction.edit_original_response(embed=placeholder_embed, view=None)
+            placeholder_msg = await interaction.original_response()
+            
+            t_start = time.time()
             try:
                 response, _ = await self._generate_with_heartbeat(
-                    model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg, is_fallback=False, message_type="embed"
+                    model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg, is_fallback=False, message_type="embed", total_start_time=t_start
                 )
                 if not response or not response.candidates:
                     raise ValueError("Response blocked or empty")
@@ -1037,15 +1047,15 @@ class CoreMixin:
 
                 if fallback_model_name:
                     try:
-                        sys_instr, _, _, _, _, _, _, _ = self._construct_system_instructions(user_id, profile_name, 0)
+                        sys_instr, _, _, _, _, _, _, _ = self._construct_system_instructions(host_user_id, profile_name, 0)
                         
-                        user_index_f = self._get_user_index(user_id)
+                        user_index_f = self._get_user_index(host_user_id)
                         is_borrowed_f = profile_name in user_index_f.get("borrowed", [])
-                        source_id_f = user_id
+                        source_id_f = host_user_id
                         source_name_f = profile_name
                         if is_borrowed_f:
-                            bd = self._get_profile_config(user_id, profile_name, True) or {}
-                            source_id_f = int(bd.get("original_owner_id", user_id))
+                            bd = self._get_profile_config(host_user_id, profile_name, True) or {}
+                            source_id_f = int(bd.get("original_owner_id", host_user_id))
                             source_name_f = bd.get("original_profile_name", profile_name)
                         
                         p_data_f = self._get_profile_config(source_id_f, source_name_f, False) or {}
@@ -1068,13 +1078,13 @@ class CoreMixin:
                             fb_is_or = True
                         
                         if fb_is_or:
-                            or_key = self._get_api_key_for_user(user_id, provider="openrouter")
+                            or_key = self._get_api_key_for_user(host_user_id, provider="openrouter")
                             if or_key:
                                 fallback_instance = OpenRouterModel(fb_name, api_key=or_key, system_instruction=sys_instr, thinking_params={})
                             else:
                                 raise ValueError("No OR key for fallback")
                         else:
-                            user_key = self._get_api_key_for_user(user_id)
+                            user_key = self._get_api_key_for_user(host_user_id)
                             if user_key:
                                 t_params_f = {
                                     "thinking_summary_visible": p_data_f.get("thinking_summary_visible", "off"),
@@ -1086,7 +1096,7 @@ class CoreMixin:
                                 raise ValueError("No Google key for fallback")
 
                             response, _ = await self._generate_with_heartbeat(
-                                fallback_instance, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg, is_fallback=True, message_type="embed"
+                                fallback_instance, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg, is_fallback=True, message_type="embed", total_start_time=t_start
                             )
                             status = "blocked_by_safety" if not response or not response.candidates else "success"
                             if status == "success":
@@ -1095,7 +1105,7 @@ class CoreMixin:
                                     raise ValueError("Empty Response (AI produced no text content)")
 
                                 fallback_used = True
-                                self._log_api_call(user_id=user_id, guild_id=None, context="global_chat_fallback", model_used=fb_name, status="success")
+                                self._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat_fallback", model_used=fb_name, status="success")
                     except asyncio.CancelledError:
                         return
                     except Exception as retry_e:
@@ -1105,11 +1115,10 @@ class CoreMixin:
                     status = "api_error"
 
             except genai.errors.APIError as e:
-                await interaction.followup.send("An error has occurred. Your personal API key appears to be invalid or disabled.", ephemeral=True)
+                await interaction.followup.send("An error has occurred. The host's personal API key appears to be invalid or disabled.", ephemeral=True)
                 return
             finally:
-                # Always log the primary model's final status
-                self._log_api_call(user_id=user_id, guild_id=None, context="global_chat", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
+                self._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
 
             if not response or not response.candidates:
                 reason = blocked_reason_override or "Unknown"
@@ -1130,7 +1139,10 @@ class CoreMixin:
 
             if len(chat.history) > STM_LIMIT_MAX * 2:
                 chat.history = chat.history[-(STM_LIMIT_MAX * 2):]
-                session_data['unified_log'] = session_data['unified_log'][-(STM_LIMIT_MAX * 2):]
+                
+            current_log = session_data.get('unified_log', [])
+            if len(current_log) > STM_LIMIT_MAX * 2:
+                session_data['unified_log'] = current_log[-(STM_LIMIT_MAX * 2):]
             
             # Apply filters
             display_name = source_profile_name
@@ -1143,14 +1155,14 @@ class CoreMixin:
             response_text = self._deduplicate_response(scrubbed_text)
 
             # --- Turn Logging ---
-            user_turn_id = str(uuid.uuid4())
+            for turn in queued_turns:
+                user_turn_id = str(uuid.uuid4())
+                session_data.setdefault('unified_log', []).append({
+                    "turn_id": user_turn_id, "role": "user", "content": turn["content"], "timestamp": turn["timestamp"], "user_id": turn["user_id"], "display_name": turn["display_name"]
+                })
+            
             model_turn_id = str(uuid.uuid4())
             timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            
-            session_data['unified_log'].append({
-                "turn_id": user_turn_id, "role": "user", "content": message, "timestamp": timestamp
-            })
-            
             model_log = {
                 "turn_id": model_turn_id, "role": "model", "content": response_text, "timestamp": timestamp
             }
@@ -1159,7 +1171,7 @@ class CoreMixin:
                 if isinstance(sig, bytes):
                     sig = base64.b64encode(sig).decode('utf-8')
                 model_log['thought_signature'] = sig
-            session_data['unified_log'].append(model_log)
+            session_data.setdefault('unified_log', []).append(model_log)
 
             text_for_embed = response_text
             if fallback_used and profile_data.get("show_fallback_indicator", True):
@@ -1176,14 +1188,13 @@ class CoreMixin:
 
             embed = discord.Embed(description=text_for_embed, color=discord.Color.blue())
             embed.set_author(name=display_name, icon_url=avatar_url)
-            embed.set_footer(text=message, icon_url=interaction.user.display_avatar.url)
+            embed.set_footer(text=combined_footer_text[:1000], icon_url=interaction.user.display_avatar.url)
             
             response_message = await placeholder_msg.edit(embed=embed)
 
             t2_end_mono = time.monotonic()
             duration = t2_end_mono - t1_start_mono
             
-            # Update the history object with the metadata (Bot Only)
             timezone_str = profile_data.get("timezone", "UTC")
             profile_id = self._get_profile_id(source_owner_id, source_profile_name)
             main_history_line = self._format_history_entry(display_name, response_message.created_at, response_text, timezone_str, entity_id=profile_id)
@@ -1198,7 +1209,6 @@ class CoreMixin:
             else:
                 bot_response_formatted = main_history_line
             
-            # Replace the last model turn in history with the one containing metadata for context
             if chat.history and chat.history[-1].get('role', 'user') == 'model':
                 old_turn = chat.history[-1]
                 new_turn = {'role': 'model', 'parts': [bot_response_formatted]}
@@ -1206,11 +1216,10 @@ class CoreMixin:
                     new_turn['thought_signature'] = old_turn['thought_signature']
                 chat.history[-1] = new_turn
 
-            # Persist immediately to disk for safety and UI consistency
             await self._save_session_to_disk(model_cache_key, 'global_chat', session_data)
 
             await self._maybe_create_ltm(
-                interaction.channel, interaction.user.display_name, chat.history, user_id, profile_name,
+                interaction.channel, interaction.user.display_name, chat.history, host_user_id, profile_name,
                 {"temperature": temp, "top_p": top_p, "top_k": top_k},
                 force_user_scope=True
             )
@@ -1302,8 +1311,9 @@ class CoreMixin:
             if not model:
                 raise ValueError("Could not initialize the AI model.")
 
+            t_start = time.time()
             response, _ = await self._generate_with_heartbeat(
-                model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg, is_fallback=False, message_type="embed"
+                model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg, is_fallback=False, message_type="embed", total_start_time=t_start
             )
             status = "blocked_by_safety" if not response or not response.candidates else "success"
         except asyncio.CancelledError:
@@ -1484,9 +1494,10 @@ class CoreMixin:
         
         status = "api_error"
         response = None
+        t_start = time.time()
         try:
             response, _ = await self._generate_with_heartbeat(
-                model, participant_history, gen_config, interaction.channel, None, placeholder_msg, is_fallback=False, message_type="embed"
+                model, participant_history, gen_config, interaction.channel, None, placeholder_msg, is_fallback=False, message_type="embed", total_start_time=t_start
             )
             status = "success"
         except asyncio.CancelledError: return

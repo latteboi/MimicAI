@@ -1272,53 +1272,41 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)
     @app_commands.autocomplete(profile_name=CoreMixin.global_chat_profile_autocomplete)
     @app_commands.describe(
-        profile_name="The profile to chat with. Leave blank to view history of recent chats.",
-        message="The message to send. If omitted, shows history or input modal.",
+        profile_name="The profile to chat with. Leave blank to view private history.",
         refresh="Set to True to clear your conversation history with this profile.",
         suspend="Set to True to permanently delete ALL global chat histories for every profile."
     )
-    async def global_chat_slash(self, interaction: discord.Interaction, profile_name: Optional[str] = None, message: Optional[str] = None, refresh: Optional[bool] = False, suspend: Optional[bool] = False):
+    async def global_chat_slash(self, interaction: discord.Interaction, profile_name: Optional[str] = None, refresh: Optional[bool] = False, suspend: Optional[bool] = False):
         user_id = interaction.user.id
         
         if suspend:
             await interaction.response.defer(ephemeral=True)
             import shutil
             
-            keys_to_del = [k for k in self.global_chat_sessions.keys() if isinstance(k, tuple) and len(k) == 3 and k[0] == 'global' and k[1] == user_id]
-            for k in keys_to_del:
-                self.global_chat_sessions.pop(k, None)
-                self.session_last_accessed.pop(k, None)
-                self.ltm_recall_history.pop(k, None)
-            
-            mapping_key = ('global_chat', user_id)
-            self.mapping_caches.pop(mapping_key, None)
+            try:
+                keys_to_del = [k for k in self.global_chat_sessions.keys() if isinstance(k, tuple) and len(k) == 3 and k[0] == 'global' and k[1] == user_id]
+                for k in keys_to_del:
+                    self.global_chat_sessions.pop(k, None)
+                    self.session_last_accessed.pop(k, None)
+                    self.ltm_recall_history.pop(k, None)
 
-            dir_path = pathlib.Path(self.USERS_DIR) / str(user_id) / "profiles"
-            if dir_path.is_dir():
-                for p_dir in dir_path.iterdir():
-                    if p_dir.is_dir():
-                        gc_file = p_dir / "global_chat.json.gz"
-                        if gc_file.exists():
-                            try:
-                                gc_file.unlink()
-                            except Exception as e:
-                                print(f"Error suspending global chat for {user_id} profile {p_dir.name}: {e}")
+                dir_path = pathlib.Path(self.USERS_DIR) / str(user_id) / "profiles"
+                if dir_path.is_dir():
+                    for p_dir in dir_path.iterdir():
+                        if p_dir.is_dir():
+                            gc_file = p_dir / "global_chat.json.gz"
+                            if gc_file.exists():
+                                try: gc_file.unlink()
+                                except: pass
+            except Exception as e:
+                print(f"Error suspending global chat for {user_id}: {e}")
 
             await interaction.followup.send("✅ All global conversation histories have been permanently deleted.", ephemeral=True)
             return
 
-        if not profile_name:
-            view = GlobalChatHistoryView(self, interaction, user_id)
-            await view.initialize()
-            if not view.available_profiles:
-                await interaction.response.send_message("You have no active global chat histories.", ephemeral=True)
-            else:
-                await interaction.response.send_message(embed=view.get_embed(), view=view, ephemeral=True)
-            return
+        profile_name_lower = profile_name.lower().strip() if profile_name else None
 
-        profile_name_lower = profile_name.lower().strip()
-
-        if refresh:
+        if refresh and profile_name_lower:
             await interaction.response.defer(ephemeral=True)
             session_key = ('global', user_id, profile_name_lower)
             
@@ -1331,42 +1319,37 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             await interaction.followup.send(f"Your global chat history with '{profile_name_lower}' has been cleared.", ephemeral=True)
             return
 
-        if message:
-            await interaction.response.defer(ephemeral=False, thinking=True)
-            await self._execute_global_chat(interaction, profile_name_lower, message)
-        else:
-            index = self._get_user_index(user_id)
-            is_personal = profile_name_lower in index.get("personal", [])
-            is_borrowed = profile_name_lower in index.get("borrowed", [])
-            if not is_personal and not is_borrowed:
-                await interaction.response.send_message(f"Profile '{profile_name_lower}' not found.", ephemeral=True)
-                return
-
-            model_cache_key = ('global', user_id, profile_name_lower)
-            session_data = self.global_chat_sessions.get(model_cache_key)
-            
-            if not session_data:
-                session_data = await self._load_session_from_disk(model_cache_key, 'global_chat')
-                if session_data: 
-                    self.global_chat_sessions[model_cache_key] = session_data
-            
-            if not session_data or not session_data.get('unified_log'):
-                async def modal_callback(modal_interaction: discord.Interaction, message_text: str):
-                    await modal_interaction.response.defer(ephemeral=False, thinking=True)
-                    await self._execute_global_chat(modal_interaction, profile_name_lower, message_text)
-
-                modal = ActionTextInputModal(
-                    title=f"Global Chat with '{profile_name_lower}'",
-                    label="Message",
-                    placeholder="Enter your message...",
-                    on_submit_callback=modal_callback
-                )
-                await interaction.response.send_modal(modal)
+        if not profile_name_lower:
+            await interaction.response.defer(ephemeral=True)
+            view = GlobalChatHistoryView(self, interaction, user_id)
+            await view.initialize()
+            if not view.available_profiles:
+                await interaction.followup.send("You have no active global chat histories.", ephemeral=True)
             else:
-                await interaction.response.defer(ephemeral=True)
-                view = GlobalChatHistoryView(self, interaction, user_id, profile_name_lower)
-                await view.initialize()
                 await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
+            return
+
+        index = self._get_user_index(user_id)
+        is_personal = profile_name_lower in index.get("personal", [])
+        is_borrowed = profile_name_lower in index.get("borrowed", [])
+        if not is_personal and not is_borrowed:
+            await interaction.response.send_message(f"Profile '{profile_name_lower}' not found.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=False)
+
+        model_cache_key = ('global', user_id, profile_name_lower)
+        session_data = self.global_chat_sessions.get(model_cache_key)
+        if not session_data:
+            session_data = await self._load_session_from_disk(model_cache_key, 'global_chat')
+            if not session_data:
+                chat = GoogleGenAIChatSession(history=[])
+                session_data = {'chat_session': chat, 'unified_log': []}
+            self.global_chat_sessions[model_cache_key] = session_data
+
+        view = GlobalChatPlayView(self, interaction, user_id, profile_name_lower)
+        await view.initialize()
+        await interaction.followup.send(embed=view.get_embed(), view=view)
 
     @app_commands.command(name="clear", description="Clears all of the bot's messages from this DM channel.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
