@@ -191,93 +191,41 @@ class OpenRouterModel:
             "X-Title": "MimicAI Discord Bot"
         }
 
-        if stream_state is not None:
-            payload["stream"] = True
-            stream_state["last_token_time"] = time.time()
-            
-            full_text = ""
-            full_thought = ""
-            finish_reason = "STOP"
-            
-            import orjson as json
-            try:
-                async with httpx.AsyncClient() as client:
-                    async with client.stream("POST", "https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=120.0) as response:
-                        if response.status_code != 200:
-                            err_text = await response.aread()
-                            raise Exception(f"OpenRouter API Error {response.status_code}: {err_text}")
-                        
-                        async for line in response.aiter_lines():
-                            if stream_state.get("first_token_received") is False:
-                                stream_state["first_token_received"] = True
-                            stream_state["last_token_time"] = time.time()
-                            if line.startswith("data: ") and line != "data: [DONE]":
-                                try:
-                                    data = json.loads(line[6:])
-                                    if "choices" in data and len(data["choices"]) > 0:
-                                        delta = data["choices"][0].get("delta", {})
-                                        if "content" in delta and delta["content"]:
-                                            full_text += delta["content"]
-                                        if "reasoning" in delta and delta["reasoning"]:
-                                            full_thought += delta["reasoning"]
-                                        if data["choices"][0].get("finish_reason"):
-                                            finish_reason = data["choices"][0]["finish_reason"]
-                                except Exception:
-                                    pass
-            except httpx.RequestError as e:
-                raise Exception(f"OpenRouter Network Error: {str(e)}")
-            except asyncio.CancelledError:
-                raise
-                                
-            class OpenRouterThoughtResponse:
-                def __init__(self, content, reasoning, finish_reason):
-                    self.text = content
-                    self.thought = reasoning or ""
-                    mock_part = type('obj', (object,), {'text': content})
-                    mock_content = type('obj', (object,), {'parts': [mock_part]})
-                    self.candidates = [type('obj', (object,), {
-                        'content': mock_content,
-                        'finish_reason': type('obj', (object,), {'name': finish_reason.upper()})
-                    })]
-                def __bool__(self): return True
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=120.0)
+                if response.status_code != 200:
+                    raise Exception(f"OpenRouter API Error {response.status_code}: {response.text}")
                 
-            return OpenRouterThoughtResponse(full_text, full_thought, finish_reason)
-        else:
-            try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=120.0)
-                    if response.status_code != 200:
-                        raise Exception(f"OpenRouter API Error {response.status_code}: {response.text}")
-                    
-                    data = response.json()
-                    if 'error' in data:
-                         raise Exception(f"OpenRouter API Error: {data['error']}")
-                    
-                    choice = data['choices'][0]
-                    msg_obj = choice['message']
-                    
-                    class OpenRouterThoughtResponse:
-                        def __init__(self, content, reasoning, finish_reason):
-                            self.text = content
-                            self.thought = reasoning or ""
-                            
-                            # Create mock content and parts for the worker's scrubbing logic
-                            mock_part = type('obj', (object,), {'text': content})
-                            mock_content = type('obj', (object,), {'parts': [mock_part]})
-                            
-                            # Create the candidate object
-                            self.candidates = [type('obj', (object,), {
-                                'content': mock_content,
-                                'finish_reason': type('obj', (object,), {'name': finish_reason})
-                            })]
-                            
-                        def __bool__(self): return True
-        
-                    return OpenRouterThoughtResponse(msg_obj.get('content', ''), msg_obj.get('reasoning', ''), choice.get('finish_reason', 'STOP').upper())
-            except httpx.RequestError as e:
-                raise Exception(f"OpenRouter Network Error: {str(e)}")
-            except asyncio.CancelledError:
-                raise
+                data = response.json()
+                if 'error' in data:
+                     raise Exception(f"OpenRouter API Error: {data['error']}")
+                
+                choice = data['choices'][0]
+                msg_obj = choice['message']
+                
+                class OpenRouterThoughtResponse:
+                    def __init__(self, content, reasoning, finish_reason):
+                        self.text = content
+                        self.thought = reasoning or ""
+                        
+                        # Create mock content and parts for the worker's scrubbing logic
+                        mock_part = type('obj', (object,), {'text': content})
+                        mock_content = type('obj', (object,), {'parts': [mock_part]})
+                        
+                        # Create the candidate object
+                        self.candidates = [type('obj', (object,), {
+                            'content': mock_content,
+                            'finish_reason': type('obj', (object,), {'name': finish_reason})
+                        })]
+                        
+                    def __bool__(self): return True
+    
+                return OpenRouterThoughtResponse(msg_obj.get('content', ''), msg_obj.get('reasoning', ''), choice.get('finish_reason', 'STOP').upper())
+        except httpx.RequestError as e:
+            raise Exception(f"OpenRouter Network Error: {str(e)}")
+        except asyncio.CancelledError:
+            raise
 
 class GoogleGenAIChatSession:
     def __init__(self, history=None):
@@ -401,81 +349,38 @@ class GoogleGenAIModel:
             thinking_config=thinking_cfg
         )
 
-        if stream_state is not None:
-            stream_state["last_token_time"] = time.time()
-            response_stream = await self.client.aio.models.generate_content_stream(
-                model=self.model_name,
-                contents=formatted_contents,
-                config=config
-            )
-            
-            full_text = ""
-            full_thought = ""
-            final_chunk = None
-            
-            async for chunk in response_stream:
-                if stream_state.get("first_token_received") is False:
-                    stream_state["first_token_received"] = True
-                stream_state["last_token_time"] = time.time()
-                if chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts:
-                    for part in chunk.candidates[0].content.parts:
-                        if getattr(part, 'thought', False):
-                            full_thought += part.text or ""
+        response = await self.client.aio.models.generate_content(
+            model=self.model_name,
+            contents=formatted_contents,
+            config=config
+        )
+        
+        formatted_contents.clear()
+        del formatted_contents
+
+        class ThoughtResponse:
+            def __init__(self, raw_resp):
+                self.raw = raw_resp
+                self.text = ""
+                self.thought = ""
+                self.thought_signature = None
+                self.candidates = raw_resp.candidates
+                self.prompt_feedback = getattr(raw_resp, 'prompt_feedback', None)
+                self.usage_metadata = getattr(raw_resp, 'usage_metadata', None)
+                
+                if raw_resp.candidates and raw_resp.candidates[0].content and raw_resp.candidates[0].content.parts:
+                    for part in raw_resp.candidates[0].content.parts:
+                        is_thought = getattr(part, 'thought', False)
+                        if is_thought:
+                            self.thought += part.text or ""
                         elif part.text:
-                            full_text += part.text
-                final_chunk = chunk
-                
-            formatted_contents.clear()
-            del formatted_contents
-
-            class StreamedThoughtResponse:
-                def __init__(self, raw_resp, text_content, thought_content):
-                    self.raw = raw_resp
-                    self.text = text_content
-                    self.thought = thought_content
-                    self.thought_signature = None
-                    if raw_resp and raw_resp.candidates and raw_resp.candidates[0].content and raw_resp.candidates[0].content.parts:
-                        self.thought_signature = getattr(raw_resp.candidates[0].content.parts[-1], 'thought_signature', None)
+                            self.text += part.text
                         
-                    self.candidates = raw_resp.candidates if raw_resp else []
-                    self.prompt_feedback = getattr(raw_resp, 'prompt_feedback', None) if raw_resp else None
-                    
-                def __bool__(self): return bool(self.candidates)
-                
-            return StreamedThoughtResponse(final_chunk, full_text, full_thought)
-        else:
-            response = await self.client.aio.models.generate_content(
-                model=self.model_name,
-                contents=formatted_contents,
-                config=config
-            )
-            
-            formatted_contents.clear()
-            del formatted_contents
+                        if hasattr(part, 'thought_signature') and part.thought_signature:
+                            self.thought_signature = part.thought_signature
+            def __bool__(self): return bool(self.candidates)
 
-            class ThoughtResponse:
-                def __init__(self, raw_resp):
-                    self.raw = raw_resp
-                    self.text = ""
-                    self.thought = ""
-                    self.thought_signature = None
-                    self.candidates = raw_resp.candidates
-                    self.prompt_feedback = getattr(raw_resp, 'prompt_feedback', None)
-                    self.usage_metadata = getattr(raw_resp, 'usage_metadata', None)
-                    
-                    if raw_resp.candidates and raw_resp.candidates[0].content and raw_resp.candidates[0].content.parts:
-                        for part in raw_resp.candidates[0].content.parts:
-                            is_thought = getattr(part, 'thought', False)
-                            if is_thought:
-                                self.thought += part.text or ""
-                            elif part.text:
-                                self.text += part.text
-                            
-                            if hasattr(part, 'thought_signature') and part.thought_signature:
-                                self.thought_signature = part.thought_signature
-                def __bool__(self): return bool(self.candidates)
-
-            return ThoughtResponse(response)
+        return ThoughtResponse(response)
     
 class ServicesMixin:
 
@@ -613,49 +518,83 @@ class ServicesMixin:
         self.channel_model_last_profile_key[model_cache_key] = current_profile_key_for_model
         return model_instance, final_error_state, temperature, top_p, top_k, warning_message, fallback_model
 
-    async def _generation_heartbeat(self, stream_state, channel, participant, placeholder_msg, is_fallback, message_type="text", total_start_time=None):
+    def _resolve_appearance_data(self, owner_id: int, profile_name: str) -> Tuple[str, str]:
+        p_index = self._get_user_index(owner_id)
+        is_borrowed = profile_name in p_index.get("borrowed", [])
+        effective_owner_id = owner_id
+        effective_profile_name = profile_name
+        if is_borrowed:
+            borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
+            effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
+            effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
+        
+        display_name = effective_profile_name
+        avatar_url = self.bot.user.display_avatar.url if self.bot.user else ""
+        appearance = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
+        if appearance.get("custom_display_name"):
+            display_name = appearance["custom_display_name"]
+        if appearance.get("custom_avatar_url"):
+            avatar_url = appearance["custom_avatar_url"]
+        
+        return display_name, avatar_url
+
+    async def _safe_delete_placeholder(self, channel, message_id):
+        if not message_id: return
+        try:
+            webhook = await self._get_or_create_webhook(channel)
+            if webhook:
+                await webhook.delete_message(message_id)
+                return
+        except Exception: pass
+        try:
+            msg = await channel.fetch_message(message_id)
+            await msg.delete()
+        except Exception: pass
+
+    async def _generate_with_heartbeat(self, model, contents, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name='Bot', app_avatar=None, existing_state=None, message_type="text"):
+        # Hard DIY Limits: 4 minutes for Main, 3 minutes for Fallback
+        hard_timeout = 180.0 if is_fallback else 240.0 
+        
+        state_container = existing_state or {
+            'msg_a_id': msg_a_id,
+            'msg_b_id': None,
+            'app_name': app_name,
+            'app_avatar': app_avatar,
+            'message_type': message_type
+        }
+        
+        gen_task = asyncio.create_task(model.generate_content_async(contents, generation_config=gen_config))
         start_time = time.time()
-        if total_start_time is None:
-            total_start_time = start_time
-            
-        interval = 10.0
-        hard_timeout = 60.0 if is_fallback else 120.0
+        last_interval = 0
         
-        initial_stall_limit = 90.0
-        active_stall_limit = 20.0
-        
-        last_edit_time = start_time
-        
-        while True:
-            now = time.time()
-            elapsed_task = now - start_time
-            elapsed_total = now - total_start_time
+        # The Absolute Watchdog Loop
+        while not gen_task.done():
+            elapsed = time.time() - start_time
             
-            if elapsed_task >= hard_timeout:
-                return "timeout"
+            if elapsed >= hard_timeout:
+                gen_task.cancel()
+                err = TimeoutError(f"Generation timed out after {hard_timeout} seconds")
+                err.state_container = state_container
+                raise err
             
-            current_stall_limit = initial_stall_limit if stream_state.get("first_token_received") is False else active_stall_limit
-            if now - stream_state.get("last_token_time", now) >= current_stall_limit:
-                return "timeout"
+            # Every 10 seconds, handle Message B
+            current_interval = int(elapsed // 10)
+            if current_interval > last_interval:
+                last_interval = current_interval
                 
-            if now - last_edit_time >= interval:
-                last_edit_time = now
-                rounded_total = int(round(elapsed_total / 10.0) * 10)
-                mins = rounded_total // 60
-                secs = rounded_total % 60
+                mins = int(elapsed) // 60
+                secs = int(elapsed) % 60
                 time_str = f"{mins}:{secs:02d}"
                 
                 base_text = "Using fallback model" if is_fallback else "Still generating"
-                text = f"{PLACEHOLDER_EMOJI} {base_text} ({time_str})..."
+                text = f"-# {base_text}... ({time_str})"
+                
+                msg_b_id = state_container.get('msg_b_id')
                 
                 try:
                     if participant and participant.get('method') == 'child_bot':
                         bot_id = participant.get('bot_id')
-                        child_ph_id = stream_state.get('child_placeholder_id')
-                        
-                        target_id = child_ph_id if child_ph_id else (placeholder_msg.id if placeholder_msg else None)
-
-                        if not target_id:
+                        if not msg_b_id:
                             corr_id = str(uuid.uuid4())
                             conf_event = asyncio.Event()
                             conf_data_ref = {"event": conf_event, "type": "heartbeat_placeholder"}
@@ -671,64 +610,38 @@ class ServicesMixin:
                             try:
                                 await asyncio.wait_for(conf_event.wait(), timeout=5.0)
                                 msg_ids = conf_data_ref.get("message_ids", [])
-                                if msg_ids: stream_state['child_placeholder_id'] = msg_ids[-1]
-                            except asyncio.TimeoutError:
-                                pass
-                            finally: 
-                                self.pending_child_confirmations.pop(corr_id, None)
+                                if msg_ids: state_container['msg_b_id'] = msg_ids[-1]
+                            except asyncio.TimeoutError: pass
+                            finally: self.pending_child_confirmations.pop(corr_id, None)
                         else:
                             await self.manager_queue.put({
                                 "action": "send_to_child", "bot_id": bot_id,
                                 "payload": {
                                     "action": "regenerate_message", "channel_id": channel.id,
-                                    "message_id": target_id, "content": text
+                                    "message_id": msg_b_id, "content": text
                                 }
                             })
-                    elif placeholder_msg:
-                        if message_type == "embed":
-                            embed = placeholder_msg.embeds[0]
-                            embed.description = text
-                            await placeholder_msg.edit(embed=embed)
-                        else:
-                            webhook = await self._get_or_create_webhook(channel)
-                            if webhook: await webhook.edit_message(placeholder_msg.id, content=text)
-                except asyncio.CancelledError:
-                    raise
-                except (discord.NotFound, discord.Forbidden):
-                    return "cancelled"
+                    else:
+                        # Webhooks
+                        webhook = await self._get_or_create_webhook(channel)
+                        if webhook:
+                            if not msg_b_id:
+                                sent_msg = await webhook.send(
+                                    content=text, 
+                                    username=state_container.get('app_name', 'Bot'), 
+                                    avatar_url=state_container.get('app_avatar'), 
+                                    wait=True
+                                )
+                                if sent_msg: state_container['msg_b_id'] = sent_msg.id
+                            else:
+                                await webhook.edit_message(msg_b_id, content=text)
                 except Exception:
                     pass
-
+            
+            # Check exactly every 1 second
             await asyncio.sleep(1)
-
-    async def _generate_with_heartbeat(self, model, contents, gen_config, channel, participant, placeholder_msg, is_fallback=False, message_type="text", total_start_time=None):
-        if total_start_time is None:
-            total_start_time = time.time()
             
-        stream_state = {"last_token_time": time.time(), "first_token_received": False}
-        
-        gen_task = asyncio.create_task(model.generate_content_async(contents, generation_config=gen_config, stream_state=stream_state))
-        monitor_task = asyncio.create_task(self._generation_heartbeat(stream_state, channel, participant, placeholder_msg, is_fallback, message_type, total_start_time))
-        
-        done, pending = await asyncio.wait([gen_task, monitor_task], return_when=asyncio.FIRST_COMPLETED)
-        
-        if monitor_task in done:
-            gen_task.cancel()
-            async def _cleanup(t):
-                try: await t
-                except Exception: pass
-            asyncio.create_task(_cleanup(gen_task))
-            
-            res = monitor_task.result()
-            if res == "cancelled": raise asyncio.CancelledError("Message deleted")
-            raise TimeoutError("Generation stalled or timed out")
-        else:
-            monitor_task.cancel()
-            async def _cleanup(t):
-                try: await t
-                except Exception: pass
-            asyncio.create_task(_cleanup(monitor_task))
-            return gen_task.result(), stream_state.get('child_placeholder_id')
+        return gen_task.result(), state_container
 
     async def _get_or_create_model_for_global_chat(self, user_id: int, profile_name: str) -> Tuple[Optional[Any], float, float, int, Optional[str], Optional[str]]:
         index = self._get_user_index(user_id)
@@ -1872,20 +1785,23 @@ class ServicesMixin:
                         api_key = self._get_api_key_for_guild(channel.guild.id)
                         if not api_key: raise ValueError("Server API key is not configured.")
                         
+                        msg_a_id = None
+                        app_name, app_avatar = self._resolve_appearance_data(owner_id, profile_name)
+                        
                         if i == 0 and first_placeholder_message:
-                            placeholder_message = first_placeholder_message
-                        elif i > 0: # Not the first participant
+                            msg_a_id = first_placeholder_message.id
+                        elif i > 0:
                             if participant.get('method') == 'child_bot':
                                 await self.manager_queue.put({
                                     "action": "send_to_child", "bot_id": participant['bot_id'],
                                     "payload": {"action": "start_typing", "channel_id": channel_id}
                                 })
-                            else: # Webhook
+                            else:
                                 thinking_messages = await self._send_channel_message(
                                     channel, f"{PLACEHOLDER_EMOJI}",
                                     profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name
                                 )
-                                if thinking_messages: placeholder_message = thinking_messages[0]
+                                if thinking_messages: msg_a_id = thinking_messages[0].id
 
                         if is_generator and generated_image_bytes_for_round is None:
                             if self.image_gen_semaphore.locked() and image_gen_anchor_message:
@@ -2178,15 +2094,13 @@ class ServicesMixin:
                         response = None
                         fallback_used = False
                         blocked_reason_override = None
+                        state_container = None
                         
-                        t_start = time.time()
                         if model:
                             try:
-                                response, child_ph_id = await self._generate_with_heartbeat(
-                                    model, contents_for_api_call, gen_config, channel, participant, placeholder_message, is_fallback=False, total_start_time=t_start
+                                response, state_container = await self._generate_with_heartbeat(
+                                    model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar
                                 )
-                                if child_ph_id:
-                                    placeholder_message = type('obj', (object,), {'id': child_ph_id})()
 
                                 if not response or not response.candidates:
                                     raise ValueError("Response blocked or empty")
@@ -2205,16 +2119,21 @@ class ServicesMixin:
                                 gc.collect()
                                 continue
                             except Exception as e:
-                                blocked_reason_override = self._format_api_error(e)
-
-                                if fallback_model_name:
+                                is_timeout_main = isinstance(e, TimeoutError)
+                                if hasattr(e, 'state_container'): state_container = e.state_container
+                                
+                                if not fallback_model_name or primary_model == fallback_model_name:
+                                    if is_timeout_main:
+                                        blocked_reason_override = "Took longer than 4 minutes (No Fallback)"
+                                    else:
+                                        blocked_reason_override = f"Failed generation ({self._format_api_error(e)})"
+                                else:
                                     try:
                                         fb_name = fallback_model_name
                                         fb_is_or = False
                                         
                                         if fb_name.upper().startswith("GOOGLE/"):
                                             fb_name = fb_name[7:]
-                                            fb_is_or = False
                                         elif fb_name.upper().startswith("OPENROUTER/"):
                                             fb_name = fb_name[11:]
                                             fb_is_or = True
@@ -2230,23 +2149,21 @@ class ServicesMixin:
                                         else:
                                             fallback_instance = GoogleGenAIModel(api_key=api_key, model_name=fb_name, system_instruction=full_system_instruction, safety_settings=dynamic_safety_settings, thinking_params=t_params_worker)
                                         
-                                        response, child_ph_id2 = await self._generate_with_heartbeat(
-                                            fallback_instance, contents_for_api_call, gen_config, channel, participant, placeholder_message, is_fallback=True, total_start_time=t_start
+                                        response, state_container = await self._generate_with_heartbeat(
+                                            fallback_instance, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
                                         )
-                                        if child_ph_id2:
-                                            placeholder_message = type('obj', (object,), {'id': child_ph_id2})()
                                             
                                         if not response or not response.candidates:
-                                            pass
-                                        else:
-                                            fb_raw_check = getattr(response, 'text', "").strip()
-                                            if not fb_raw_check:
-                                                raise ValueError("Empty Response (AI produced no text content)")
-                                            if re.search(r'(.)\1{999,}', fb_raw_check):
-                                                raise ValueError("[REPETITIVE_CONTENT_ERROR]")
+                                            raise ValueError("Response blocked or empty")
+                                        fb_raw_check = getattr(response, 'text', "").strip()
+                                        if not fb_raw_check:
+                                            raise ValueError("Empty Response (AI produced no text content)")
+                                        if re.search(r'(.)\1{999,}', fb_raw_check):
+                                            raise ValueError("[REPETITIVE_CONTENT_ERROR]")
 
-                                            fallback_used = True
-                                            self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile_fallback", model_used=fb_name, status="success")
+                                        fallback_used = True
+                                        blocked_reason_override = "Main model failed"
+                                        self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile_fallback", model_used=fb_name, status="success")
                                     except asyncio.CancelledError:
                                         if 'contents_for_api_call' in locals():
                                             contents_for_api_call.clear()
@@ -2254,15 +2171,24 @@ class ServicesMixin:
                                         gc.collect()
                                         continue
                                     except Exception as retry_e:
-                                        print(f"Fallback retry failed: {retry_e}")
+                                        is_timeout_fallback = isinstance(retry_e, TimeoutError)
+                                        if hasattr(retry_e, 'state_container'): state_container = retry_e.state_container
+                                        
+                                        if is_timeout_main and is_timeout_fallback:
+                                            blocked_reason_override = "Took longer than 7 minutes (Fallback failed)"
+                                        elif is_timeout_fallback:
+                                            blocked_reason_override = "Took longer than 3 minutes (Fallback failed)"
+                                        else:
+                                            blocked_reason_override = "Failed generation (Both models failed)"
                                         status = "api_error"
-                                else:
-                                    status = "api_error"
                             finally:
                                 self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
                         else:
-                            # [NEW] Handle model initialization failure by simulating a blocked response
                             blocked_reason_override = warning_message or "Internal API Initialization Error"
+
+                        if state_container:
+                            await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
+                            await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
 
                         was_blocked = False
                         if not response or not response.candidates:
@@ -2664,7 +2590,7 @@ class ServicesMixin:
 
                     else: # Webhook logic
                         sent_messages = await self._send_channel_message(
-                            channel, display_text, target_message_to_edit=placeholder_message,
+                            channel, display_text, target_message_to_edit=None,
                             profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name,
                             file=file_to_send, reply_to=(anchor_message if i == 0 else None)
                         )
@@ -5097,7 +5023,7 @@ class ServicesMixin:
             "4. **Robotic Transitions:** Target phrases like 'noted', 'acknowledged', 'remains to provide', 'evaluating inputs', or 'operate within parameters'.\n\n"
             "OUTPUT RULES:\n"
             "- If no significant repetition is found, respond with ONLY 'PASS'.\n"
-            "- Ignore special formatting that appears to be intentional, such as lines beginning with '-# ', '# ', etc.\n"
+            "- Do NOT provide negative constraints for special formatting that appears to be intentional, such as lines beginning with '-# ', '# ', etc.\n"
             "- If repetition is found, provide a strict negative constraint. Examples:\n"
             "  * 'Do not acknowledge or reference the user's frustration or feedback.'\n"
             "  * 'Do not mention Melbourne Central or Miyama in this response.'\n"
@@ -5113,7 +5039,7 @@ class ServicesMixin:
             t_params = {"thinking_budget": 1024, "thinking_summary_visible": "off", "thinking_level": "low"}
             model = GoogleGenAIModel(api_key=api_key, model_name='gemini-flash-lite-latest', system_instruction=system_instruction, thinking_params=t_params)
             
-            critic_cfg = {"temperature": 0.1, "top_p": 0.95}
+            critic_cfg = {"temperature": 0.0, "top_p": 0.95}
             resp = await model.generate_content_async([f"Transcript:\n{transcript}"], generation_config=critic_cfg)
 
             if resp.text:
@@ -5141,7 +5067,12 @@ class ServicesMixin:
                 prompt_content=prompt_content
             )
             
-            # [UPDATED] If model fails, proceed to send the error message via profile instead of silent return
+            # [FIXED] Define missing variable for Fallback logic
+            p_index = self._get_user_index(profile_owner_id)
+            p_is_b = profile_name in p_index.get("borrowed", [])
+            p_settings = self._get_profile_config(profile_owner_id, profile_name, p_is_b) or {}
+            primary_model = p_settings.get("primary_model", PRIMARY_MODEL_NAME)
+            
             status = "api_error"
             response = None
             fallback_used = False
@@ -5155,12 +5086,15 @@ class ServicesMixin:
             if len(chat.history) > self.max_history_items * 2:
                 chat.history = chat.history[-(self.max_history_items * 2):]
 
+            msg_a_id = None
+            app_name, app_avatar = self._resolve_appearance_data(profile_owner_id, profile_name)
+
             if method == 'webhook':
                 thinking_messages = await self._send_channel_message(
                     channel, f"{PLACEHOLDER_EMOJI}",
                     profile_owner_id_for_appearance=profile_owner_id, profile_name_for_appearance=profile_name
                 )
-                placeholder_message = thinking_messages[0] if thinking_messages else None
+                if thinking_messages: msg_a_id = thinking_messages[0].id
             else:
                 await self.manager_queue.put({
                     "action": "send_to_child", "bot_id": bot_id,
@@ -5208,13 +5142,11 @@ class ServicesMixin:
                 
                 gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
                 
-                t_start = time.time()
+                state_container = None
                 try:
-                    response, child_ph_id = await self._generate_with_heartbeat(
-                        model, [{'role': 'user', 'parts': final_prompt_parts}], gen_config, channel, participant, placeholder_message, is_fallback=False, total_start_time=t_start
+                    response, state_container = await self._generate_with_heartbeat(
+                        model, [{'role': 'user', 'parts': final_prompt_parts}], gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar
                     )
-                    if child_ph_id:
-                        placeholder_message = type('obj', (object,), {'id': child_ph_id})()
                         
                     if not response or not response.candidates:
                         raise ValueError("Response blocked or empty")
@@ -5227,9 +5159,15 @@ class ServicesMixin:
                 except asyncio.CancelledError:
                     return []
                 except Exception as e:
-                    blocked_reason_override = self._format_api_error(e)
+                    is_timeout_main = isinstance(e, TimeoutError)
+                    if hasattr(e, 'state_container'): state_container = e.state_container
 
-                    if fallback_model_name:
+                    if not fallback_model_name or primary_model == fallback_model_name:
+                        if is_timeout_main:
+                            blocked_reason_override = "Took longer than 4 minutes (No Fallback)"
+                        else:
+                            blocked_reason_override = f"Failed generation ({self._format_api_error(e)})"
+                    else:
                         try:
                             # Re-construct instructions for the fallback model
                             sys_instr, _, _, _, _, _, _, _ = self._construct_system_instructions(
@@ -5248,6 +5186,12 @@ class ServicesMixin:
                             
                             dyn_safe = { cat: safe_thresh for cat in get_args(HarmCategory) }
 
+                            t_params_worker = {
+                                "thinking_summary_visible": p_settings.get("thinking_summary_visible", "off"),
+                                "thinking_level": p_settings.get("thinking_level", "high"),
+                                "thinking_budget": p_settings.get("thinking_budget", -1)
+                            }
+
                             fb_name = fallback_model_name
                             fb_is_or = False
                             
@@ -5263,39 +5207,44 @@ class ServicesMixin:
                             if fb_is_or:
                                 or_key = self._get_api_key_for_guild(channel.guild.id, provider="openrouter")
                                 if or_key:
-                                    fallback_instance = OpenRouterModel(fb_name, api_key=or_key, system_instruction=sys_instr)
+                                    fallback_instance = OpenRouterModel(fb_name, api_key=or_key, system_instruction=sys_instr, thinking_params=t_params_worker)
                                 else:
                                     raise ValueError("No OR key for fallback")
                             else:
                                 guild_api_key = self._get_api_key_for_guild(channel.guild.id)
                                 if not guild_api_key:
                                     raise ValueError("No Google key for fallback")
-                                fallback_instance = GoogleGenAIModel(api_key=guild_api_key, model_name=fb_name, system_instruction=sys_instr, safety_settings=dyn_safe)
+                                fallback_instance = GoogleGenAIModel(api_key=guild_api_key, model_name=fb_name, system_instruction=sys_instr, safety_settings=dyn_safe, thinking_params=t_params_worker)
 
-                            response, child_ph_id2 = await self._generate_with_heartbeat(
-                                fallback_instance, [{'role': 'user', 'parts': final_prompt_parts}], gen_config, channel, participant, placeholder_message, is_fallback=True, total_start_time=t_start
+                            response, state_container = await self._generate_with_heartbeat(
+                                fallback_instance, [{'role': 'user', 'parts': final_prompt_parts}], gen_config, channel, participant, msg_a_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
                             )
-                            if child_ph_id2:
-                                placeholder_message = type('obj', (object,), {'id': child_ph_id2})()
                                 
                             if not response or not response.candidates:
-                                pass
-                            else:
-                                fb_raw_check = getattr(response, 'text', "").strip()
-                                if not fb_raw_check:
-                                    raise ValueError("Empty Response (AI produced no text content)")
+                                raise ValueError("Response blocked or empty")
+                            fb_raw_check = getattr(response, 'text', "").strip()
+                            if not fb_raw_check:
+                                raise ValueError("Empty Response (AI produced no text content)")
 
-                                fallback_used = True
-                                status = "success"
-                                self._log_api_call(user_id=triggering_user_id or 0, guild_id=channel.guild.id, context="freewill_fallback", model_used=fb_name, status="success")
+                            fallback_used = True
+                            blocked_reason_override = "Main model failed"
+                            status = "success"
+                            self._log_api_call(user_id=triggering_user_id or 0, guild_id=channel.guild.id, context="freewill_fallback", model_used=fb_name, status="success")
 
                         except asyncio.CancelledError:
                             return []
                         except Exception as retry_e:
                             print(f"Freewill fallback retry failed: {retry_e}")
+                            is_timeout_fallback = isinstance(retry_e, TimeoutError)
+                            if hasattr(retry_e, 'state_container'): state_container = retry_e.state_container
+                            
+                            if is_timeout_main and is_timeout_fallback:
+                                blocked_reason_override = "Took longer than 7 minutes (Fallback failed)"
+                            elif is_timeout_fallback:
+                                blocked_reason_override = "Took longer than 3 minutes (Fallback failed)"
+                            else:
+                                blocked_reason_override = "Failed generation (Both models failed)"
                             status = "api_error"
-                    else:
-                        status = "api_error"
                 except (genai.errors.APIError) as e:
                     status = "api_error"
                 finally:
@@ -5303,6 +5252,10 @@ class ServicesMixin:
                     self._log_api_call(user_id=triggering_user_id or 0, guild_id=channel.guild.id, context="freewill", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
             else:
                 blocked_reason_override = warning_message or "API Error: Model failed to load."
+
+            if state_container:
+                await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
+                await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
 
             response_text = ""
             if response and response.candidates:
@@ -5342,12 +5295,6 @@ class ServicesMixin:
                 text_to_send += f"\n\n-# Fallback Model Used **({blocked_reason_override})**."
 
             if method == 'child_bot' and bot_id:
-                if placeholder_message and hasattr(placeholder_message, 'id'):
-                    try:
-                        msg_to_del = await channel.fetch_message(placeholder_message.id)
-                        await msg_to_del.delete()
-                    except Exception: pass
-                    
                 correlation_id = str(uuid.uuid4())
                 self.pending_child_confirmations[correlation_id] = {
                     "type": "single_profile",
@@ -5366,7 +5313,7 @@ class ServicesMixin:
                 sent_messages = []
             else:
                 sent_messages = await self._send_channel_message(
-                    channel, text_to_send, target_message_to_edit=placeholder_message,
+                    channel, text_to_send, target_message_to_edit=None,
                     profile_owner_id_for_appearance=profile_owner_id, profile_name_for_appearance=profile_name
                 )
 
@@ -6174,6 +6121,10 @@ class ServicesMixin:
             p_key = (p_owner_id, p_name)
             bot_pid = self._get_pid_from_name_any(p_owner_id, p_name)
             
+            p_index = self._get_user_index(p_owner_id)
+            p_is_borrowed = p_name in p_index.get("borrowed", [])
+            p_profile = self._get_profile_config(p_owner_id, p_name, p_is_borrowed) or {}
+            
             participant_history = []
             pending_whispers_for_regen = []
             for turn in sliced_unified_log:
@@ -6291,20 +6242,92 @@ class ServicesMixin:
 
             gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "_advanced_params": adv_params}
             
-            t_start = time.time()
+            # [FIXED] Define missing variables for Fallback logic
+            primary_model = p_profile.get("primary_model", PRIMARY_MODEL_NAME)
+            fallback_model_name = p_profile.get("fallback_model", FALLBACK_MODEL_NAME)
+
+            safety_level_str = p_profile.get('safety_level', 'low')
+            safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
+            threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
+            dynamic_safety_settings = { cat: threshold for cat in get_args(HarmCategory) }
+
+            t_params_worker = {
+                "thinking_summary_visible": p_profile.get("thinking_summary_visible", "off"),
+                "thinking_level": p_profile.get("thinking_level", "high"),
+                "thinking_budget": p_profile.get("thinking_budget", -1)
+            }
+            
+            app_name, app_avatar = self._resolve_appearance_data(p_owner_id, p_name)
+            state_container = None
+            status = "api_error"
+            
             try:
-                response, child_ph_id = await self._generate_with_heartbeat(
-                    model, participant_history, gen_config, channel, participant, placeholder_message, is_fallback=False, total_start_time=t_start
+                response, state_container = await self._generate_with_heartbeat(
+                    model, participant_history, gen_config, channel, participant, payload.message_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar
                 )
-                if child_ph_id:
-                    placeholder_message = type('obj', (object,), {'id': child_ph_id})()
+                
+                if not response or not response.candidates:
+                    raise ValueError("Response blocked or empty")
+                raw_text_check = getattr(response, 'text', "").strip()
+                if not raw_text_check:
+                    raise ValueError("Empty Response (AI produced no text content)")
+                if re.search(r'(.)\1{999,}', raw_text_check):
+                    raise ValueError("[REPETITIVE_CONTENT_ERROR]")
+                    
             except asyncio.CancelledError:
                 session['is_regenerating'] = False
                 return
             except Exception as e:
-                print(f"Regen primary failed: {e}")
-                pass
+                is_timeout_main = isinstance(e, TimeoutError)
+                if hasattr(e, 'state_container'): state_container = e.state_container
+                
+                if not fallback_model_name or primary_model == fallback_model_name:
+                    print(f"Regen primary failed: {e}")
+                else:
+                    try:
+                        fb_name = fallback_model_name
+                        fb_is_or = False
+                        
+                        if fb_name.upper().startswith("GOOGLE/"):
+                            fb_name = fb_name[7:]
+                        elif fb_name.upper().startswith("OPENROUTER/"):
+                            fb_name = fb_name[11:]
+                            fb_is_or = True
+                        elif "/" in fb_name:
+                            fb_is_or = True
+                        
+                        if fb_is_or:
+                            or_key = self._get_api_key_for_guild(channel.guild.id, provider="openrouter")
+                            if or_key:
+                                fallback_instance = OpenRouterModel(fb_name, api_key=or_key, system_instruction=full_system_instruction, thinking_params=t_params_worker)
+                            else:
+                                raise ValueError("No OpenRouter key for fallback")
+                        else:
+                            api_key = self._get_api_key_for_guild(channel.guild.id)
+                            fallback_instance = GoogleGenAIModel(api_key=api_key, model_name=fb_name, system_instruction=full_system_instruction, safety_settings=dynamic_safety_settings, thinking_params=t_params_worker)
+                        
+                        response, state_container = await self._generate_with_heartbeat(
+                            fallback_instance, participant_history, gen_config, channel, participant, payload.message_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
+                        )
+                            
+                        if not response or not response.candidates:
+                            raise ValueError("Response blocked or empty")
+                        fb_raw_check = getattr(response, 'text', "").strip()
+                        if not fb_raw_check:
+                            raise ValueError("Empty Response (AI produced no text content)")
+                        if re.search(r'(.)\1{999,}', fb_raw_check):
+                            raise ValueError("[REPETITIVE_CONTENT_ERROR]")
+
+                    except asyncio.CancelledError:
+                        session['is_regenerating'] = False
+                        return
+                    except Exception as retry_e:
+                        print(f"Regen fallback failed: {retry_e}")
+                        pass
             
+            if state_container:
+                await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
+
             if not response or not response.candidates:
                 new_text = "I'm sorry, I encountered an issue while trying to regenerate that response."
             else:

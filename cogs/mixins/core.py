@@ -911,6 +911,10 @@ class CoreMixin:
         try:
             model, temp, top_p, top_k, warning_message, fallback_model_name = await self._get_or_create_model_for_global_chat(host_user_id, profile_name)
             
+            # Resolve primary model and safety settings
+            profile_data = self._get_profile_config(source_owner_id, source_profile_name, False) or {}
+            primary_model = profile_data.get("primary_model", PRIMARY_MODEL_NAME)
+            
             if warning_message:
                 try: await interaction.user.send(warning_message)
                 except discord.Forbidden: pass
@@ -1018,6 +1022,7 @@ class CoreMixin:
             response = None
             fallback_used = False
             blocked_reason_override = None
+            state_container = None
             
             # --- EDIT ORIGINAL RESPONSE ---
             placeholder_embed = discord.Embed(description=f"{PLACEHOLDER_EMOJI}", color=discord.Color.dark_grey())
@@ -1027,10 +1032,11 @@ class CoreMixin:
             await interaction.edit_original_response(embed=placeholder_embed, view=None)
             placeholder_msg = await interaction.original_response()
             
-            t_start = time.time()
+            app_name, app_avatar = self._resolve_appearance_data(host_user_id, profile_name)
+            
             try:
-                response, _ = await self._generate_with_heartbeat(
-                    model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg, is_fallback=False, message_type="embed", total_start_time=t_start
+                response, state_container = await self._generate_with_heartbeat(
+                    model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, message_type="embed"
                 )
                 if not response or not response.candidates:
                     raise ValueError("Response blocked or empty")
@@ -1043,9 +1049,15 @@ class CoreMixin:
             except asyncio.CancelledError:
                 return
             except Exception as e:
-                blocked_reason_override = self._format_api_error(e)
-
-                if fallback_model_name:
+                is_timeout_main = isinstance(e, TimeoutError)
+                if hasattr(e, 'state_container'): state_container = e.state_container
+                
+                if not fallback_model_name or primary_model == fallback_model_name:
+                    if is_timeout_main:
+                        blocked_reason_override = "Took longer than 4 minutes (No Fallback)"
+                    else:
+                        blocked_reason_override = f"Failed generation ({self._format_api_error(e)})"
+                else:
                     try:
                         sys_instr, _, _, _, _, _, _, _ = self._construct_system_instructions(host_user_id, profile_name, 0)
                         
@@ -1095,8 +1107,8 @@ class CoreMixin:
                             else:
                                 raise ValueError("No Google key for fallback")
 
-                            response, _ = await self._generate_with_heartbeat(
-                                fallback_instance, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg, is_fallback=True, message_type="embed", total_start_time=t_start
+                            response, state_container = await self._generate_with_heartbeat(
+                                fallback_instance, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type="embed"
                             )
                             status = "blocked_by_safety" if not response or not response.candidates else "success"
                             if status == "success":
@@ -1105,20 +1117,28 @@ class CoreMixin:
                                     raise ValueError("Empty Response (AI produced no text content)")
 
                                 fallback_used = True
+                                blocked_reason_override = "Main model failed"
                                 self._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat_fallback", model_used=fb_name, status="success")
                     except asyncio.CancelledError:
                         return
                     except Exception as retry_e:
                         print(f"Global Chat fallback retry failed: {retry_e}")
+                        is_timeout_fallback = isinstance(retry_e, TimeoutError)
+                        if hasattr(retry_e, 'state_container'): state_container = retry_e.state_container
+                        
+                        if is_timeout_main and is_timeout_fallback:
+                            blocked_reason_override = "Took longer than 7 minutes (Fallback failed)"
+                        elif is_timeout_fallback:
+                            blocked_reason_override = "Took longer than 3 minutes (Fallback failed)"
+                        else:
+                            blocked_reason_override = "Failed generation (Both models failed)"
                         status = "api_error"
-                else:
-                    status = "api_error"
-
-            except genai.errors.APIError as e:
-                await interaction.followup.send("An error has occurred. The host's personal API key appears to be invalid or disabled.", ephemeral=True)
-                return
             finally:
                 self._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
+
+            # Crucial: Only delete Message B. Message A (embed placeholder) is edited into the final response below.
+            if state_container:
+                await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
 
             if not response or not response.candidates:
                 reason = blocked_reason_override or "Unknown"
@@ -1312,8 +1332,8 @@ class CoreMixin:
                 raise ValueError("Could not initialize the AI model.")
 
             t_start = time.time()
-            response, _ = await self._generate_with_heartbeat(
-                model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg, is_fallback=False, message_type="embed", total_start_time=t_start
+            response, state_container = await self._generate_with_heartbeat(
+                model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=False, message_type="embed"
             )
             status = "blocked_by_safety" if not response or not response.candidates else "success"
         except asyncio.CancelledError:
@@ -1322,6 +1342,8 @@ class CoreMixin:
             print(f"Whisper generation error: {e}")
             status = "api_error"
         finally:
+            if 'state_container' in locals() and state_container:
+                await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
             self._log_api_call(user_id=interaction.user.id, guild_id=interaction.guild.id, context="whisper", model_used=model.model_name if (model and hasattr(model, 'model_name')) else "unknown", status=status)
         
         response_text = "..."
@@ -1496,13 +1518,15 @@ class CoreMixin:
         response = None
         t_start = time.time()
         try:
-            response, _ = await self._generate_with_heartbeat(
-                model, participant_history, gen_config, interaction.channel, None, placeholder_msg, is_fallback=False, message_type="embed", total_start_time=t_start
+            response, state_container = await self._generate_with_heartbeat(
+                model, participant_history, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=False, message_type="embed"
             )
             status = "success"
         except asyncio.CancelledError: return
         except Exception: status = "api_error"
         finally:
+            if 'state_container' in locals() and state_container:
+                await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
             self._log_api_call(user_id=interaction.user.id, guild_id=interaction.guild.id, context="whisper_regen", model_used=model.model_name if model else "unknown", status=status)
 
         if not response or not response.candidates:
@@ -2628,6 +2652,19 @@ class CoreMixin:
                 updated_count += 1
         
         return f"Updated image generation settings for {updated_count} profile(s)."
+    
+    async def bulk_apply_generation_visual(self, user_id: int, profile_names: List[str], params: Dict) -> str:
+        index = self._get_user_index(user_id)
+        updated_count = 0
+        for name in profile_names:
+            is_borrowed = name in index.get("borrowed", [])
+            profile = self._get_profile_config(user_id, name, is_borrowed)
+            if profile:
+                profile["placeholder_emoji"] = params.get("placeholder_emoji")
+                profile["child_bot_placeholder"] = params.get("child_bot_placeholder", False)
+                self._save_profile_config(user_id, name, profile, is_borrowed)
+                updated_count += 1
+        return f"Updated generation visual settings for {updated_count} profile(s)."
     
     async def bulk_apply_metadata_settings(self, user_id: int, profile_names: List[str], params: Dict) -> str:
         index = self._get_user_index(user_id)
