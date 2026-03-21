@@ -1110,6 +1110,7 @@ class ProfileManageView(ui.View):
                 options.append(discord.SelectOption(label="Duplicate Profile", value="duplicate", description="Create a new profile from a copy of this one."))
                 options.append(discord.SelectOption(label="Share Profile", value="share", description="Share this profile with others or publish it."))
                 options.append(discord.SelectOption(label="Custom Error Message", value="error_response", description="Set the message shown when generation fails."))
+                options.append(discord.SelectOption(label="Generation Visual", value="generation_visual", description="Set custom placeholder emoji and child bot behavior."))
             
             options.append(discord.SelectOption(label="Cycle Content Safety Level", value="safety_level", description="Cycle: Low -> Medium -> High -> Unrestricted 18+."))
             
@@ -1227,6 +1228,13 @@ class ProfileManageView(ui.View):
                 required=False,
                 on_submit_callback=modal_callback
             )
+            await interaction.response.send_modal(modal)
+
+        elif choice == "generation_visual":
+            async def refresh_cb(modal_interaction: discord.Interaction):
+                new_embed = await self.cog._build_profile_manage_embed(modal_interaction, self.profile_name)
+                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
+            modal = ProfileGenerationVisualModal(self.cog, self.profile_name, profile, self.is_borrowed, callback=refresh_cb)
             await interaction.response.send_modal(modal)
 
         # --- Persona Tab Logic ---
@@ -3976,6 +3984,8 @@ class BulkActionView(BaseBulkProfileView):
             final_message = await self.cog.bulk_apply_ltm_summarization_instructions(self.user_id, target_profiles_list, self.params)
         elif self.action == "apply_image_settings":
             final_message = await self.cog.bulk_apply_image_settings(self.user_id, target_profiles_list, self.params)
+        elif self.action == "apply_generation_visual":
+            final_message = await self.cog.bulk_apply_generation_visual(self.user_id, target_profiles_list, self.params)
         elif self.action == "apply_metadata":
             final_message = await self.cog.bulk_apply_metadata_settings(self.user_id, target_profiles_list, self.params)
         
@@ -4210,6 +4220,79 @@ class BulkTimezoneView(BaseBulkProfileView):
                 self.cog.chat_sessions.pop(k, None)
 
         await interaction.edit_original_response(content=f"Timezone set to **{self.selected_tz}** for {updated_count} profiles.", view=None)
+
+class ProfileGenerationVisualModal(ui.Modal, title="Generation Visual"):
+    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+        super().__init__()
+        self.cog = cog
+        self.profile_name = profile_name
+        self.is_borrowed = is_borrowed
+        self.callback = callback
+
+        raw_emoji = current_params.get("placeholder_emoji") or ""
+        name_val = ""
+        id_val = ""
+        if raw_emoji.startswith("<") and raw_emoji.endswith(">"):
+            parts = raw_emoji.strip("<>").split(":")
+            if len(parts) >= 3:
+                name_val = f"a:{parts[1]}" if parts[0] == "a" else parts[1]
+                id_val = parts[2]
+        else:
+            name_val = raw_emoji
+
+        self.name_input = ui.TextInput(label="Emote Name (or Native Emote)", default=name_val, required=False, placeholder="e.g. mimic_thinking or 🤔", max_length=100)
+        self.id_input = ui.TextInput(label="Emote ID (Leave blank if native)", default=id_val, required=False, placeholder="e.g. 1441782350752120874", max_length=30)
+        
+        toggle_val = "on" if current_params.get("child_bot_placeholder", False) else "off"
+        self.toggle_input = ui.TextInput(label="Placeholder for Child Bot (on/off)", default=toggle_val, required=True, placeholder="on or off", max_length=10)
+
+        self.add_item(self.name_input)
+        self.add_item(self.id_input)
+        self.add_item(self.toggle_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        name = self.name_input.value.strip()
+        emote_id = self.id_input.value.strip()
+        toggle = self.toggle_input.value.strip().lower() == "on"
+
+        placeholder_emoji = ""
+        if name:
+            if name.startswith("<") and name.endswith(">"):
+                placeholder_emoji = name
+            else:
+                is_animated = False
+                if name.startswith("a:"):
+                    is_animated = True
+                    name = name[2:]
+                
+                name = name.strip(":")
+                
+                if emote_id:
+                    if is_animated:
+                        placeholder_emoji = f"<a:{name}:{emote_id}>"
+                    else:
+                        placeholder_emoji = f"<:{name}:{emote_id}>"
+                else:
+                    placeholder_emoji = name
+
+        new_params = {
+            "placeholder_emoji": placeholder_emoji if placeholder_emoji else None,
+            "child_bot_placeholder": toggle
+        }
+
+        if self.profile_name == "BULK_APPLY":
+            if self.callback: await self.callback(interaction, new_params)
+            return
+
+        target = self.cog._get_profile_config(interaction.user.id, self.profile_name, self.is_borrowed)
+        if target:
+            target.update(new_params)
+            self.cog._save_profile_config(interaction.user.id, self.profile_name, target, self.is_borrowed)
+            await interaction.followup.send("✅ Generation Visual settings updated.", ephemeral=True)
+            if self.callback: await self.callback(interaction)
+        else:
+            await interaction.followup.send("❌ Profile not found.", ephemeral=True)
 
 class BulkMetadataView(BaseBulkProfileView):
     def __init__(self, cog: 'GeminiAgent', user_id: int):
@@ -6193,6 +6276,7 @@ class BulkManageView(ui.View):
             discord.SelectOption(label="Toggle URL Context Fetching", value="url_context", description="Enable or disable link scraping for multiple profiles."),
             discord.SelectOption(label="Set Time & Timezone", value="timezone", description="Enable time-awareness and set a specific timezone."),
             discord.SelectOption(label="Set Profile Metadata", value="metadata_toggle", description="Configure visual ID and Duration metadata."),
+            discord.SelectOption(label="Set Generation Visual", value="generation_visual", description="Apply custom placeholder emoji to multiple profiles."),
             discord.SelectOption(label="Toggle Critic (Anti-Repetition)", value="critic", description="Enable or disable the critic for multiple profiles."),
             discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable or disable realistic typing for multiple profiles."),
             discord.SelectOption(label="Set Safety Level", value="safety_level", description="Apply a content safety level to multiple profiles."),
@@ -6379,6 +6463,14 @@ class BulkManageView(ui.View):
             async def modal_callback(i: discord.Interaction, params: Dict):
                 view = BulkActionView(self.cog, self.user_id, "apply_metadata", "Select profiles to apply metadata settings to...", params=params, include_borrowed=True)
                 await self.original_interaction.edit_original_response(content="Metadata settings validated. Select the profiles to apply them to:", view=view)
+            modal.callback = modal_callback
+            await interaction.response.send_modal(modal)
+            
+        elif choice == "generation_visual":
+            modal = ProfileGenerationVisualModal(self.cog, "BULK_APPLY", {}, False)
+            async def modal_callback(i: discord.Interaction, params: Dict):
+                view = BulkActionView(self.cog, self.user_id, "apply_generation_visual", "Select profiles to apply visual settings to...", params=params, include_borrowed=True)
+                await self.original_interaction.edit_original_response(content="Visual settings validated. Select the profiles to apply them to:", view=view)
             modal.callback = modal_callback
             await interaction.response.send_modal(modal)
         

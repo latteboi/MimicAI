@@ -551,17 +551,38 @@ class ServicesMixin:
             await msg.delete()
         except Exception: pass
 
+    async def _send_child_bot_placeholder(self, bot_id: str, channel_id: int, custom_emoji: str) -> Optional[int]:
+        corr_id = str(uuid.uuid4())
+        conf_event = asyncio.Event()
+        conf_data = {"event": conf_event, "type": "heartbeat_placeholder"}
+        self.pending_child_confirmations[corr_id] = conf_data
+        
+        await self.manager_queue.put({
+            "action": "send_to_child", "bot_id": bot_id,
+            "payload": {
+                "action": "send_message", "channel_id": channel_id,
+                "content": custom_emoji, "realistic_typing": False, "correlation_id": corr_id
+            }
+        })
+        try:
+            await asyncio.wait_for(conf_event.wait(), timeout=5.0)
+            msg_ids = conf_data.get("message_ids", [])
+            if msg_ids: return msg_ids[-1]
+        except asyncio.TimeoutError: pass
+        finally: self.pending_child_confirmations.pop(corr_id, None)
+        return None
+
     async def _generate_with_heartbeat(self, model, contents, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name='Bot', app_avatar=None, existing_state=None, message_type="text"):
         # Hard DIY Limits: 4 minutes for Main, 3 minutes for Fallback
         hard_timeout = 180.0 if is_fallback else 240.0 
         
-        state_container = existing_state or {
-            'msg_a_id': msg_a_id,
-            'msg_b_id': None,
-            'app_name': app_name,
-            'app_avatar': app_avatar,
-            'message_type': message_type
-        }
+        state_container = existing_state or {}
+        state_container.setdefault('msg_a_id', msg_a_id)
+        state_container.setdefault('msg_b_id', None)
+        state_container.setdefault('app_name', app_name)
+        state_container.setdefault('app_avatar', app_avatar)
+        state_container.setdefault('message_type', message_type)
+        state_container.setdefault('custom_emoji', PLACEHOLDER_EMOJI)
         
         gen_task = asyncio.create_task(model.generate_content_async(contents, generation_config=gen_config))
         start_time = time.time()
@@ -622,19 +643,28 @@ class ServicesMixin:
                                 }
                             })
                     else:
-                        # Webhooks
-                        webhook = await self._get_or_create_webhook(channel)
-                        if webhook:
-                            if not msg_b_id:
-                                sent_msg = await webhook.send(
-                                    content=text, 
-                                    username=state_container.get('app_name', 'Bot'), 
-                                    avatar_url=state_container.get('app_avatar'), 
-                                    wait=True
-                                )
-                                if sent_msg: state_container['msg_b_id'] = sent_msg.id
-                            else:
-                                await webhook.edit_message(msg_b_id, content=text)
+                        if state_container.get('message_type') == "embed" and state_container.get('placeholder_msg'):
+                            try:
+                                msg_obj = state_container['placeholder_msg']
+                                if msg_obj and msg_obj.embeds:
+                                    embed = msg_obj.embeds[0]
+                                    embed.description = f"{state_container['custom_emoji']}\n\n-# {base_text}... ({time_str})"
+                                    await msg_obj.edit(embed=embed)
+                            except Exception: pass
+                        else:
+                            # Webhooks
+                            webhook = await self._get_or_create_webhook(channel)
+                            if webhook:
+                                if not msg_b_id:
+                                    sent_msg = await webhook.send(
+                                        content=text, 
+                                        username=state_container.get('app_name', 'Bot'), 
+                                        avatar_url=state_container.get('app_avatar'), 
+                                        wait=True
+                                    )
+                                    if sent_msg: state_container['msg_b_id'] = sent_msg.id
+                                else:
+                                    await webhook.edit_message(msg_b_id, content=text)
                 except Exception:
                     pass
             
@@ -791,6 +821,7 @@ class ServicesMixin:
         rule_block = (
             "<context_rules>\n"
             "- '[Name] [ID: XXXXXXXXXXXXXXXX] [Timestamp]' are individual active participants.\n"
+            "- Each participant has an immutable, unique ID.\n"
             "- XML-wrapped text is information/data for YOU, from YOU.\n"
             "- <whisper_context> or <private_whisper> means a user is speaking privately to you.\n"
             "- <private_response> is your past private reply to a whisper.\n"
@@ -1505,10 +1536,21 @@ class ServicesMixin:
                 first_placeholder_message = None
                 if first_participant:
                     if first_participant.get('method') == 'child_bot':
-                        await self.manager_queue.put({
-                            "action": "send_to_child", "bot_id": first_participant['bot_id'],
-                            "payload": {"action": "start_typing", "channel_id": channel_id}
-                        })
+                        p_index = self._get_user_index(first_participant['owner_id'])
+                        p_is_b = first_participant['profile_name'] in p_index.get("borrowed", [])
+                        fp_settings = self._get_profile_config(first_participant['owner_id'], first_participant['profile_name'], p_is_b) or {}
+                        
+                        if fp_settings.get("child_bot_placeholder", False):
+                            custom_emoji = fp_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+                            msg_id = await self._send_child_bot_placeholder(first_participant['bot_id'], channel_id, custom_emoji)
+                            if msg_id:
+                                try: first_placeholder_message = await channel.fetch_message(msg_id)
+                                except: pass
+                        else:
+                            await self.manager_queue.put({
+                                "action": "send_to_child", "bot_id": first_participant['bot_id'],
+                                "payload": {"action": "start_typing", "channel_id": channel_id}
+                            })
                     else: # Webhook
                         thinking_messages = await self._send_channel_message(
                             channel, f"{PLACEHOLDER_EMOJI}",
@@ -1684,10 +1726,17 @@ class ServicesMixin:
                         session.setdefault("initial_turn_taken", set()).add(participant_key)
 
                     if participant.get('method') == 'child_bot':
-                        await self.manager_queue.put({
-                            "action": "send_to_child", "bot_id": participant['bot_id'],
-                            "payload": {"action": "start_typing", "channel_id": channel_id}
-                        })
+                        p_owner_id_typing = participant['owner_id']
+                        p_name_typing = participant['profile_name']
+                        p_index_typing = self._get_user_index(p_owner_id_typing)
+                        p_is_b_typing = p_name_typing in p_index_typing.get("borrowed", [])
+                        p_settings_typing = self._get_profile_config(p_owner_id_typing, p_name_typing, p_is_b_typing) or {}
+                        
+                        if not p_settings_typing.get("child_bot_placeholder", False):
+                            await self.manager_queue.put({
+                                "action": "send_to_child", "bot_id": participant['bot_id'],
+                                "payload": {"action": "start_typing", "channel_id": channel_id}
+                            })
 
                     owner_id = participant['owner_id']
                     profile_name = participant['profile_name']
@@ -1792,10 +1841,14 @@ class ServicesMixin:
                             msg_a_id = first_placeholder_message.id
                         elif i > 0:
                             if participant.get('method') == 'child_bot':
-                                await self.manager_queue.put({
-                                    "action": "send_to_child", "bot_id": participant['bot_id'],
-                                    "payload": {"action": "start_typing", "channel_id": channel_id}
-                                })
+                                if p_settings.get("child_bot_placeholder", False):
+                                    custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+                                    msg_a_id = await self._send_child_bot_placeholder(participant['bot_id'], channel_id, custom_emoji)
+                                else:
+                                    await self.manager_queue.put({
+                                        "action": "send_to_child", "bot_id": participant['bot_id'],
+                                        "payload": {"action": "start_typing", "channel_id": channel_id}
+                                    })
                             else:
                                 thinking_messages = await self._send_channel_message(
                                     channel, f"{PLACEHOLDER_EMOJI}",
@@ -2279,7 +2332,7 @@ class ServicesMixin:
                     except Exception as e:
                         print(f"Multi-profile generation error for '{profile_name}': {e}")
                         traceback.print_exc()
-                        response_text = "An error has occurred. The response may have been blocked by the safety filter."
+                        response_text = f"{custom_main}\n\n-# Blocked due to: **Unknown**."
 
                     # Resolve the chat session for this specific participant to handle persistence
                     participant_key = (participant['owner_id'], participant['profile_name'])
@@ -2972,9 +3025,20 @@ class ServicesMixin:
                             profile_name_for_appearance=package['effective_profile_name']
                         )
                         placeholder_message = placeholders[0] if placeholders else None
-                    elif is_child_bot and not package.get("reference_image_url"):
-                         # Typing was already started for non-ref images. For ref-images, start it now.
-                         await self.manager_queue.put({"action": "send_to_child", "bot_id": package['bot_id'], "payload": {"action": "start_typing", "channel_id": channel.id}})
+                    elif is_child_bot and not package.get("reference_image_urls"):
+                         p_index = self._get_user_index(package['effective_profile_owner_id'])
+                         p_is_b = package['effective_profile_name'] in p_index.get("borrowed", [])
+                         p_settings = self._get_profile_config(package['effective_profile_owner_id'], package['effective_profile_name'], p_is_b) or {}
+                         
+                         if p_settings.get("child_bot_placeholder", False):
+                             custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+                             msg_id = await self._send_child_bot_placeholder(package['bot_id'], channel.id, custom_emoji)
+                             if msg_id:
+                                 try: placeholder_message = await channel.fetch_message(msg_id)
+                                 except: pass
+                         else:
+                             # Typing was already started for non-ref images. For ref-images, start it now.
+                             await self.manager_queue.put({"action": "send_to_child", "bot_id": package['bot_id'], "payload": {"action": "start_typing", "channel_id": channel.id}})
                     
                     try:
                         # --- Just-in-Time Generation for Reference Images ---
@@ -3657,6 +3721,19 @@ class ServicesMixin:
             except (discord.NotFound, discord.Forbidden):
                 pass
             return []
+
+        is_placeholder = (content == f"{PLACEHOLDER_EMOJI}")
+        
+        if is_placeholder:
+            custom_emoji = None
+            if profile_owner_id_for_appearance is not None and profile_name_for_appearance:
+                index = self._get_user_index(profile_owner_id_for_appearance)
+                is_borrowed = profile_name_for_appearance in index.get("borrowed", [])
+                profile_data_to_use = self._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, is_borrowed) or {}
+                custom_emoji = profile_data_to_use.get("placeholder_emoji")
+            
+            if custom_emoji:
+                content = custom_emoji
 
         custom_display_name_to_use = self.bot.user.name if self.bot.user else "Bot"
         custom_avatar_url_to_use = self.bot.user.display_avatar.url if self.bot.user else None
@@ -4664,6 +4741,32 @@ class ServicesMixin:
                     await send_notification_to_child("My original owner is not in this server, and you have not borrowed my profile. Use `/profile hub` to find and borrow me first!")
                     return
 
+            index = self._get_user_index(owner_id)
+            is_borrowed = profile_name in index.get("borrowed", [])
+            profile_data = self._get_profile_config(owner_id, profile_name, is_borrowed) or {}
+
+            placeholder_message_obj = None
+            if self.image_request_queue.full():
+                await send_notification_to_child("The image generation backlog is currently full. Please try again in a moment.")
+                return
+
+            placeholder_sent = False
+            if self.image_gen_semaphore.locked():
+                qsize = self.image_request_queue.qsize()
+                await send_notification_to_child(f"Your image generation request has been queued. You are #{qsize + 1} in line.")
+            else:
+                if profile_data.get("child_bot_placeholder", False):
+                    custom_emoji = profile_data.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+                    msg_id = await self._send_child_bot_placeholder(bot_id, channel_id, custom_emoji)
+                    if msg_id:
+                        try:
+                            ch = self.bot.get_channel(channel_id)
+                            placeholder_message_obj = await ch.fetch_message(msg_id)
+                        except: pass
+                else:
+                    await self.manager_queue.put({"action": "send_to_child", "bot_id": bot_id, "payload": {"action": "start_typing", "channel_id": channel_id}})
+                placeholder_sent = True
+
             image_prefixes = ("!image", "!imagine")
             used_prefix = next((p for p in image_prefixes if message_data.get("content", "").lower().startswith(p)), "!image")
             prompt_text = message_data.get("content", "")[len(used_prefix):].strip()
@@ -4744,7 +4847,7 @@ class ServicesMixin:
                 "original_content": message_data['content'], "prompt_text": final_prompt_text, 
                 "effective_profile_owner_id": owner_id, "effective_profile_name": profile_name,
                 "bot_display_name": bot_display_name, "safety_settings": dynamic_safety_settings,
-                "system_instruction": system_instruction, "reference_image_urls": reference_image_urls, "placeholder_message": None, 
+                "system_instruction": system_instruction, "reference_image_urls": reference_image_urls, "placeholder_message": placeholder_message_obj, 
                 "grounding_sources": grounding_sources, "grounding_mode": grounding_mode,
                 "image_generation_model": profile_data.get("image_generation_model", "gemini-2.5-flash-image")
             }
@@ -5096,10 +5199,14 @@ class ServicesMixin:
                 )
                 if thinking_messages: msg_a_id = thinking_messages[0].id
             else:
-                await self.manager_queue.put({
-                    "action": "send_to_child", "bot_id": bot_id,
-                    "payload": {"action": "start_typing", "channel_id": channel.id}
-                })
+                if p_settings.get("child_bot_placeholder", False):
+                    custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+                    msg_a_id = await self._send_child_bot_placeholder(bot_id, channel.id, custom_emoji)
+                else:
+                    await self.manager_queue.put({
+                        "action": "send_to_child", "bot_id": bot_id,
+                        "payload": {"action": "start_typing", "channel_id": channel.id}
+                    })
 
             if model:
                 ltm_recall_text = await self._get_relevant_ltm_for_prompt(profile_owner_id, profile_name, prompt_content, author_display_name, channel.guild.id, triggering_user_id or self.bot.user.id)
@@ -6073,6 +6180,17 @@ class ServicesMixin:
         self._save_multi_profile_sessions()
         await self._save_session_to_disk(dummy_key, session_type, session["unified_log"])
         
+        p_owner_id = participant['owner_id']
+        p_name = participant['profile_name']
+        p_key = (p_owner_id, p_name)
+        bot_pid = self._get_pid_from_name_any(p_owner_id, p_name)
+        
+        p_index = self._get_user_index(p_owner_id)
+        p_is_borrowed = p_name in p_index.get("borrowed", [])
+        p_profile = self._get_profile_config(p_owner_id, p_name, p_is_borrowed) or {}
+        
+        custom_emoji = p_profile.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+
         try:
             try:
                 msg = await channel.fetch_message(payload.message_id)
@@ -6089,7 +6207,7 @@ class ServicesMixin:
                     "action": "send_to_child", "bot_id": participant['bot_id'],
                     "payload": {
                         "action": "regenerate_message", "channel_id": channel.id,
-                        "message_id": payload.message_id, "content": PLACEHOLDER_EMOJI
+                        "message_id": payload.message_id, "content": custom_emoji
                     }
                 })
             else:
@@ -6098,7 +6216,7 @@ class ServicesMixin:
                     try:
                         msg = await channel.fetch_message(payload.message_id)
                         kept_atts = [a for a in msg.attachments if a.content_type and a.content_type.startswith("image/")]
-                        await wh.edit_message(payload.message_id, content=PLACEHOLDER_EMOJI, attachments=kept_atts)
+                        await wh.edit_message(payload.message_id, content=custom_emoji, attachments=kept_atts)
                     except: pass
 
             # 2. Cleanup follow-up messages
@@ -6116,14 +6234,6 @@ class ServicesMixin:
 
             # 3. History Slicing (Time Travel)
             sliced_unified_log = session["unified_log"][:actual_turn_index]
-            p_owner_id = participant['owner_id']
-            p_name = participant['profile_name']
-            p_key = (p_owner_id, p_name)
-            bot_pid = self._get_pid_from_name_any(p_owner_id, p_name)
-            
-            p_index = self._get_user_index(p_owner_id)
-            p_is_borrowed = p_name in p_index.get("borrowed", [])
-            p_profile = self._get_profile_config(p_owner_id, p_name, p_is_borrowed) or {}
             
             participant_history = []
             pending_whispers_for_regen = []
@@ -6263,7 +6373,7 @@ class ServicesMixin:
             
             try:
                 response, state_container = await self._generate_with_heartbeat(
-                    model, participant_history, gen_config, channel, participant, payload.message_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar
+                    model, participant_history, gen_config, channel, participant, payload.message_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state={"custom_emoji": custom_emoji}
                 )
                 
                 if not response or not response.candidates:

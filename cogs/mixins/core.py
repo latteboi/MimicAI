@@ -149,10 +149,16 @@ class CoreMixin:
                 return
 
             for bot_id in mentioned_child_ids:
-                asyncio.create_task(self.manager_queue.put({
-                    "action": "send_to_child", "bot_id": bot_id,
-                    "payload": {"action": "start_typing", "channel_id": message.channel.id}
-                }))
+                bot_config = self.child_bots.get(bot_id)
+                if bot_config:
+                    p_index = self._get_user_index(bot_config['owner_id'])
+                    p_is_b = bot_config['profile_name'] in p_index.get("borrowed", [])
+                    p_settings = self._get_profile_config(bot_config['owner_id'], bot_config['profile_name'], p_is_b) or {}
+                    if not p_settings.get("child_bot_placeholder", False):
+                        asyncio.create_task(self.manager_queue.put({
+                            "action": "send_to_child", "bot_id": bot_id,
+                            "payload": {"action": "start_typing", "channel_id": message.channel.id}
+                        }))
 
             content_lower = message.content.lower()
             image_prefixes = ("!image", "!imagine")
@@ -1024,8 +1030,10 @@ class CoreMixin:
             blocked_reason_override = None
             state_container = None
             
+            custom_emoji = profile_data.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+            
             # --- EDIT ORIGINAL RESPONSE ---
-            placeholder_embed = discord.Embed(description=f"{PLACEHOLDER_EMOJI}", color=discord.Color.dark_grey())
+            placeholder_embed = discord.Embed(description=f"{custom_emoji}", color=discord.Color.dark_grey())
             placeholder_embed.set_author(name=bot_display_name, icon_url=appearance.get("custom_avatar_url") if appearance else self.bot.user.display_avatar.url)
             placeholder_embed.set_footer(text=combined_footer_text[:1000], icon_url=interaction.user.display_avatar.url)
             
@@ -1036,7 +1044,7 @@ class CoreMixin:
             
             try:
                 response, state_container = await self._generate_with_heartbeat(
-                    model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, message_type="embed"
+                    model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, message_type="embed", existing_state={"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg}
                 )
                 if not response or not response.candidates:
                     raise ValueError("Response blocked or empty")
@@ -1314,6 +1322,9 @@ class CoreMixin:
             effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
             effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
         
+        p_settings = self._get_profile_config(owner_id, profile_name, is_borrowed) or {}
+        custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+
         display_name = effective_profile_name
         appearance = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name)
         avatar_url = self.bot.user.display_avatar.url
@@ -1322,7 +1333,7 @@ class CoreMixin:
             avatar_url = appearance.get("custom_avatar_url") or avatar_url
             
         # --- SEND PLACEHOLDER EMBED ---
-        placeholder_embed = discord.Embed(description=f"{PLACEHOLDER_EMOJI}", color=discord.Color.dark_grey())
+        placeholder_embed = discord.Embed(description=f"{custom_emoji}", color=discord.Color.dark_grey())
         placeholder_embed.set_author(name=display_name, icon_url=avatar_url)
         placeholder_embed.set_footer(text=f"{whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
         placeholder_msg = await interaction.followup.send(embed=placeholder_embed, ephemeral=True, wait=True)
@@ -1333,7 +1344,7 @@ class CoreMixin:
 
             t_start = time.time()
             response, state_container = await self._generate_with_heartbeat(
-                model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=False, message_type="embed"
+                model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=False, message_type="embed", existing_state={"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg}
             )
             status = "blocked_by_safety" if not response or not response.candidates else "success"
         except asyncio.CancelledError:
@@ -1471,6 +1482,9 @@ class CoreMixin:
             effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
             effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
         
+        p_settings = self._get_profile_config(owner_id, profile_name, is_borrowed) or {}
+        custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+
         display_name = effective_profile_name
         appearance = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name)
         avatar_url = self.bot.user.display_avatar.url
@@ -1479,7 +1493,7 @@ class CoreMixin:
             avatar_url = appearance.get("custom_avatar_url") or avatar_url
 
         # --- IMMEDIATE EDIT TO PLACEHOLDER ---
-        placeholder_embed = discord.Embed(description=f"{PLACEHOLDER_EMOJI}", color=discord.Color.dark_grey())
+        placeholder_embed = discord.Embed(description=f"{custom_emoji}", color=discord.Color.dark_grey())
         placeholder_embed.set_author(name=display_name, icon_url=avatar_url)
         placeholder_embed.set_footer(text=f"{whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
         
@@ -1519,7 +1533,7 @@ class CoreMixin:
         t_start = time.time()
         try:
             response, state_container = await self._generate_with_heartbeat(
-                model, participant_history, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=False, message_type="embed"
+                model, participant_history, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=False, message_type="embed", existing_state={"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg}
             )
             status = "success"
         except asyncio.CancelledError: return
@@ -2316,6 +2330,9 @@ class CoreMixin:
         embed.add_field(name="\u200b", value="\u200b", inline=False)
 
         # 4. Tools Section (Change to inline)
+        cb_ph_text = " (CB ON)" if source_profile_data.get("child_bot_placeholder", False) else ""
+        ph_text = f"{source_profile_data.get('placeholder_emoji') or 'Default'}{cb_ph_text}"
+        
         tools_val = (
             f"Image Gen: {img_gen}\n"
             f"Grounding: {grounding_display}\n"
@@ -2324,7 +2341,8 @@ class CoreMixin:
             f"Timezone: `{timezone}`\n"
             f"Gen Metadata: {metadata_vis}\n"
             f"Realistic Typing: {typing}\n"
-            f"Critic: {critic}"
+            f"Critic: {critic}\n"
+            f"Placeholder: {ph_text}"
         )
         embed.add_field(name="Tools", value=tools_val, inline=True)
 
