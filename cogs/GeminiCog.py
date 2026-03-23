@@ -1165,12 +1165,12 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         await interaction.followup.send(f"Session suspended for {interaction.channel.mention} and Freewill triggers disabled. The bot will be silent until mentioned or configured again.", ephemeral=True)
 
-    @app_commands.command(name="purge", description="Purges messages and their associated memory (Admin Only).")
+    @app_commands.command(name="purge", description="Purges messages and memory, or gracefully dehydrates the session (Admin Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     @app_commands.guild_only()
     @is_admin_or_owner_check()
-    @app_commands.describe(amount="Number of messages to delete (1-100).", user="[Optional] Target a specific user's messages.")
-    async def purge_slash(self, interaction: discord.Interaction, amount: app_commands.Range[int,1,100], user: Optional[discord.Member]=None):
+    @app_commands.describe(amount="Messages to delete (1-100). Leave blank to gracefully dehydrate the session.")
+    async def purge_slash(self, interaction: discord.Interaction, amount: Optional[app_commands.Range[int,1,100]] = None):
         if not self.has_lock : return
         await interaction.response.defer(ephemeral=True)
 
@@ -1182,16 +1182,25 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         if not app_perms or not app_perms.manage_messages:
             await interaction.followup.send("I lack 'Manage Messages' permission.", ephemeral=True); return
 
-        check_fn = (lambda m: m.author == user) if user else (lambda m: True)
-        
+        if amount is None:
+            if interaction.channel_id in self.multi_profile_channels:
+                self.session_last_accessed[interaction.channel_id] = 0
+                await interaction.followup.send("Session marked for graceful dehydration. It will be unloaded from RAM when inactive.", ephemeral=True)
+            else:
+                await interaction.followup.send("No active session found in RAM to dehydrate.", ephemeral=True)
+            return
+
         def check_and_track(m):
-            valid = check_fn(m)
-            if valid:
-                self.purged_message_ids.add(m.id)
-            return valid
+            self.purged_message_ids.add(m.id)
+            return True
 
         session_lock = self.multi_profile_channels.get(interaction.channel_id)
         if session_lock:
+            # Re-hydrate immediately before executing the Discord API purge
+            session_type = session_lock.get("type", "multi")
+            if not session_lock.get("is_hydrated"):
+                session_lock = await self._ensure_session_hydrated(interaction.channel_id, session_type)
+                
             session_lock['is_purging'] = True
             while session_lock.get('is_running') or session_lock.get('is_regenerating'):
                 await asyncio.sleep(0.5)
@@ -1206,9 +1215,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
             if session:
                 session_type = session.get("type", "multi")
-                if not session.get("is_hydrated"):
-                    session = await self._ensure_session_hydrated(interaction.channel_id, session_type)
-
+                
                 deleted_msg_ids = {m.id for m in messages_to_delete}
                 turn_ids_to_delete = set()
 
@@ -1258,8 +1265,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
                     self.session_last_accessed[interaction.channel_id] = time.time()
 
-            spec = f" from {user.mention}" if user else ""
-            await progress_message.edit(content=f"Deleted {len(messages_to_delete)} message(s){spec} and cleaned {cleaned_turns_count} turn(s) from memory.")
+            await progress_message.edit(content=f"Deleted {len(messages_to_delete)} message(s) and cleaned {cleaned_turns_count} turn(s) from memory.")
 
         except Exception as e:
             await interaction.followup.send(f"An error occurred during purge: {e}", ephemeral=True)
@@ -1406,350 +1412,45 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    @app_commands.command(name="documentation", description="Interactive guide for prompt engineering, intelligence, and generation parameters.")
+    @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)
+    async def documentation_slash(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        from .mixins.content import DOC_CATEGORIES
+        view = DropdownContentView(DOC_CATEGORIES, "MimicAI Advanced Documentation")
+        await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
+
     @app_commands.command(name="transparency", description="Displays info about background AI models and their API costs.")
     @app_commands.checks.cooldown(1, 30.0, key=lambda i: i.user.id)
     async def transparency_slash(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-
-        pages_content = [
-            ("Overview", 
-             "MimicAI uses several specialized, high-speed AI models behind the scenes. This page provides transparency on what these models are, how they work, and their impact on API usage.\n\n*All prices are based on Google's pay-as-you-go tier and are calculated per 1 million tokens. A \"token\" is a piece of a word; roughly 750 words are equal to 1,000 tokens.*"),
-            
-            ("Long-Term Memories & Safety (The Workhorse)",
-             "**Purpose:**\n"
-             "- **Memory Creation (LTM):** Summarizes conversations to create long-term memories.\n"
-             "- **Safety:** Moderates content for public profiles.\n\n"
-             "**Pricing Impact:**\n"
-             "Uses `gemini-flash-lite-latest`.\n"
-             "• **Input:** $0.10 / 1M tokens\n"
-             "• **Output:** $0.40 / 1M tokens"),
-
-            ("Grounding (The Researcher)",
-             "**Purpose:**\n"
-             "- **Web Search (Grounding):** Decides if a search is needed, then finds and summarizes information from Google Search.\n\n"
-             "**Requirements:**\n"
-             "• **Google API Key:** Required (Free or Paid Tier). This feature **cannot** use an OpenRouter key as it relies on Google's integrated Search tool.\n\n"
-             "**Pricing Impact:**\n"
-             "Uses `gemini-2.0-flash`. If enabled, this adds **one extra API call** per message.\n"
-             "• **Input:** $0.10 / 1M tokens\n"
-             "• **Output:** $0.40 / 1M tokens\n"
-             "Grounding has a unique pricing model based on **Requests Per Day (RPD)**.\n"
-             "• **Free Tier:** Up to 500 RPD free.\n"
-             "• **Paid Tier:** Up to 1,500 RPD free. $35.00 per 1,000 requests after the free limit."),
-
-            ("Image Generation (The Artist)",
-             "**Purpose:**\n"
-             "- **Image Generation:** Creates all images for the `!image` and `!imagine` commands.\n\n"
-             "**Requirements:**\n"
-             "• **Google API Key:** Required (**Paid Tier Only**). This model is not available on free-tier API keys.\n\n"
-             "**Pricing Impact:**\n"
-             "Uses `gemini-2.5-flash-image`.\n"
-             "Each use requires **two** API calls (Image Model + Chat Model). The image generation itself costs **~$0.039 per image**."),
-
-            ("Embedding (The Librarian)",
-             "**Purpose:**\n"
-             "- **Semantic Search:** Converts text into numerical 'fingerprints' (embeddings) to power the search for LTM and Training Examples.\n"
-             "- **Optimization:** Uses **Matryoshka Representation Learning** to output truncated 256-dimensional vectors, significantly reducing database size without losing accuracy.\n\n"
-             "**Pricing Impact:**\n"
-             "Uses `gemini-embedding-001`.\n"
-             "This is the **cheapest operation** the bot performs. The cost is based on the amount of text being converted.\n"
-             "• **Per 1 Million Tokens:** ~$0.15"),
-
-            ("Profile Model (Variable)",
-             "**Purpose:**\n"
-             "- **Conversation:** The model you actually talk to (e.g., `GOOGLE/gemini-2.5-flash`, `OPENROUTER/anthropic/claude-3-opus`).\n\n"
-             "**Pricing Impact:**\n"
-             "This cost depends entirely on your selection in `/profile manage`.\n"
-             "• **Google Models:** Prices vary by tier (Flash vs Pro).\n"
-             "• **OpenRouter Models:** Prices are set by the provider (Anthropic, Meta, etc.).\n"
-             "• **Fallback:** If your primary model fails, the bot attempts to use your configured Fallback Model (defaulting to `gemini-flash-lite`), which incurs its own standard cost."),
-             
-            ("Anti-Repetition Critic (The Editor)",
-             "**Purpose:**\n"
-             "- **Loop Detection:** If enabled, a lightweight model analyzes the conversation history *before* the main model replies to detect verbatim repetition loops.\n"
-             "- **Quality Control:** Injects negative constraints into the system prompt to force the AI to break the loop.\n\n"
-             "**Pricing Impact:**\n"
-             "Uses `gemini-2.0-flash`. If enabled, this adds **one extra API call** per message.\n"
-             "• **Input:** $0.10 / 1M tokens\n"
-             "• **Output:** $0.40 / 1M tokens")
-        ]
-
-        embeds = []
-        page_titles = [item[0] for item in pages_content]
-        for i, (title, text) in enumerate(pages_content):
-            embed = discord.Embed(title=f"Transparency: {title}", description=text, color=discord.Color.from_rgb(0, 128, 255))
-            embed.set_footer(text=f"Page {i+1}/{len(pages_content)} | Info subject to change based on provider pricing.")
-            embeds.append(embed)
-
-        view = PaginatedEmbedView(embeds, page_titles)
-        # Re-attach the external link button to the view
-        view.add_item(ui.Button(label="Official Google Pricing Page", url="https://ai.google.dev/gemini-api/docs/pricing", row=2))
-        
-        await interaction.followup.send(embed=embeds[0], view=view, ephemeral=True)
+        from .mixins.content import TRANSPARENCY_CATEGORIES
+        view = DropdownContentView(TRANSPARENCY_CATEGORIES, "Transparency & Pricing", link_button_label="Official Google Pricing Page", link_button_url="https://ai.google.dev/gemini-api/docs/pricing")
+        await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="help", description="Displays detailed documentation about the bot's features and commands.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     async def help_slash(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-
-        admin_setup_content = (
-            "Authentication Requirements",
-            "This system requires API authentication to function. All generation tasks are passed to external inference endpoints.\n\n"
-            "**Primary Authentication (Google Gemini):**\n"
-            "1. Acquire a standard API key via Google AI Studio.\n"
-            "2. Execute the `/settings` command via Direct Message to access the configuration panel.\n\n"
-            "**Secondary Authentication (OpenRouter):**\n"
-            "1. Acquire an API key via OpenRouter to utilise alternative models (e.g., Anthropic, Meta).\n\n"
-            "**Key Pool Mechanism:**\n"
-            "Administrators may set a 'Primary Key' for server-wide execution. Users may also contribute personal keys to the 'Pool'. The system will cycle through valid keys in the pool if the Primary Key is exhausted."
-        )
-
-        user_docs_content = [
-            ("System Architecture Overview",
-             "MimicAI operates as a multimodal orchestration layer. It manages character state, session history, and external API requests.\n\n"
-             "The system is built upon a 'Profile' architecture. A Profile acts as a container for system instructions, inference parameters, and persistent memory. These profiles are executed within 'Sessions'—isolated conversational contexts tied to specific channels or direct messages.\n\n"
-             "Use the dropdown menu below to navigate the technical documentation."),
-            
-            ("Profile Classes",
-             "The system distinguishes between two classes of Profiles:\n\n"
-             "**Personal Profiles:**\n"
-             "These are primary entities owned and maintained by the user. The owner possesses full read/write privileges over generation parameters, memory vectors, and systemic instructions.\n\n"
-             "**Borrowed Profiles:**\n"
-             "These are read-only symbolic links to another user's Personal Profile, acquired via the Public Library or direct share code. Local configuration (such as temporal awareness and formatting) may be overridden, but core identity variables remain synchronised with the origin."),
-            
-            ("Persona Definition",
-             "The core identity of a Profile is constructed using modular text fields that are compiled into XML-tagged system instructions during inference.\n\n"
-             "The Persona module comprises:\n"
-             "- **Backstory:** Historical and contextual data.\n"
-             "- **Personality Traits:** Core psychological characteristics.\n"
-             "- **Likes/Dislikes:** Positive and negative biases.\n"
-             "- **Appearance:** Physical description (utilised heavily by the Visual Generation module for self-portraits)."),
-            
-            ("AI Instruction Protocol",
-             "AI Instructions dictate operational behaviour and formatting constraints. These bypass the Persona module and instruct the underlying model on strict structural adherence.\n\n"
-             "The interface provides four distinct data blocks to prevent context truncation. It is recommended to utilise standard declarative constraints (e.g., 'Do not output markdown', 'Keep responses under two sentences'). These instructions take priority over persona biases during generation."),
-            
-            ("Generation Parameters",
-             "Users may manipulate the statistical variance of the output via standard sampling parameters:\n\n"
-             "- **Temperature:** Controls the randomness of token selection. Lower values yield deterministic outputs; higher values yield diverse outputs.\n"
-             "- **Top P (Nucleus Sampling):** The model considers only the tokens comprising the top probability mass. Set to 1.0 to disable.\n"
-             "- **Top K:** Limits the token selection pool to the K most probable tokens.\n"
-             "- **STM Length:** Short-Term Memory. Defines how many previous conversational turns are appended to the context window."),
-             
-            ("Advanced Heuristics (OpenRouter)",
-             "For endpoints supporting OpenRouter specifications, additional penalisation parameters are available:\n\n"
-             "- **Frequency Penalty (-2.0 to 2.0):** Applies an additive penalty to tokens based on their existing frequency in the text, reducing verbatim repetition.\n"
-             "- **Presence Penalty (-2.0 to 2.0):** Applies an absolute penalty if a token exists at all, encouraging topic divergence.\n"
-             "- **Repetition Penalty:** Multiplicative penalty against recently generated tokens.\n"
-             "- **Min P / Top A:** Advanced thresholding metrics to dynamically cull low-probability tokens."),
-             
-            ("Reasoning Configuration",
-             "Specific models (e.g., Gemini 2.0 Flash Thinking, Gemini 3.0) support overt reasoning phases prior to text generation.\n\n"
-             "- **Thinking Level:** Determines the computational effort allocated to reasoning (None, Minimal, Low, Medium, High, XHigh).\n"
-             "- **Token Budget:** For models that accept explicit limits (e.g., Gemini 2.5), dictates the exact token cap allocated to internal thought.\n"
-             "- **Summary Visibility:** Toggles whether the raw reasoning tokens are exported and delivered as an attachment alongside the response."),
-             
-            ("Vocal Synthesis (Director's Desk)",
-             "The Director's Desk provides semantic priming for the Text-to-Speech (TTS) module.\n\n"
-             "Instead of raw audio manipulation, the TTS engine is a generative model capable of inferring tone from contextual metadata. Users may define:\n"
-             "- **Archetype:** E.g., 'A grizzled detective.'\n"
-             "- **Accent:** E.g., 'Standard British.'\n"
-             "- **Dynamics:** E.g., 'Speaking in a whisper in a cavern.'\n"
-             "- **Pacing & Style:** E.g., 'Rapid delivery with a subtle smile.'"),
-             
-            ("Vocal Synthesis (Hardware Settings)",
-             "Beyond semantic instruction, explicit TTS hardware configurations include:\n\n"
-             "- **Voice Name:** The designated prebuilt voice identity (e.g., 'Aoede', 'Kore', 'Charon').\n"
-             "- **Speech Model:** The backend endpoint (defaults to `gemini-2.5-flash-preview-tts`).\n"
-             "- **Prosody (Temperature):** Dictates the expressive variance in the audio generation. Values outside standard 1.0 may result in erratic audio artefacts."),
-             
-            ("Multimodal Audio Output",
-             "Audio delivery modes modify how the bot processes standard text generation:\n\n"
-             "- **Text-Only:** Default behaviour.\n"
-             "- **Audio + Text:** Delivers the primary text payload alongside a synthesised `.wav` attachment.\n"
-             "- **Audio-Only:** Suppresses the text output, delivering solely the audio file.\n"
-             "- **Multi-Audio:** In multi-profile sessions, delays audio transmission until the conclusion of the round, stitching all segments into a continuous master file."),
-
-            ("Short-Term Memory (STM)",
-             "The STM acts as the immediate conversational buffer. The system maintains a synchronised cache (`unified_log`) representing the chronological sequence of recent interactions.\n\n"
-             "This data is hydrated into specific `ChatSession` arrays prior to inference. The depth of this buffer is determined by the profile's STM Length parameter. Exceeding context limits may degrade the model's adherence to systemic instructions. The `/refresh` command flushes this buffer for the current channel."),
-
-            ("Long-Term Memory (LTM) Architecture",
-             "The LTM subsystem provides persistent data retention via an automated summarisation pipeline.\n\n"
-             "**Auto-Creation Pipeline:**\n"
-             "When a user communicates with a profile, an internal counter tracks the exchange volume. Once the `Creation Interval` threshold is met, the system extracts the last `Summarization Context` turns and submits them to an auxiliary model (`gemini-flash-lite`). The model condenses the excerpt into a strict, third-person factual summary."),
-             
-            ("LTM Retrieval Logistics",
-             "Memories are encoded using Matryoshka Representation Learning (256-dimensional embeddings) and stored locally.\n\n"
-             "During active chat, the user's prompt is embedded and cross-referenced against the profile's memory vault via cosine similarity. If the metric exceeds the profile's `Relevance Threshold`, the top results are injected into the system prompt as `<archive_context>`.\n\n"
-             "**LTM Scopes:**\n"
-             "- User: Recalled exclusively for the original author.\n"
-             "- Server: Recalled for any user within the originating guild.\n"
-             "- Global: Recalled universally."),
-
-            ("Contextual Training Examples",
-             "Training Examples are explicit, user-defined input/output pairs that dictate specific stylistic behaviour.\n\n"
-             "Like LTMs, they are embedded and retrieved via vector search. Upon matching the `Relevance Threshold`, the pairs are injected into the system instructions. This ensures the model dynamically alters its vernacular, sentence structure, and formatting based on semantic similarities to the user's current prompt. Manage these via `/profile data manage`."),
-
-            ("Redundancy (Model Fallback)",
-             "The system features a fault-tolerant generation loop. If the primary inference request fails due to rate limits, server timeouts, or strict safety blocks, the system automatically redirects the payload to the defined Fallback Model.\n\n"
-             "It is highly recommended to designate an efficient, low-cost model (e.g., `gemini-flash-lite-latest`) as the fallback to maintain uptime during primary endpoint degradation."),
-
-            ("Web Grounding (Search Indexing)",
-             "Grounding enables real-time information retrieval via Google Search.\n\n"
-             "If the Grounding Mode is active (`On` or `On+`), the system routes the query through a secondary decision-model to determine if external facts are required. If verified, a Google Search tool is executed, and the resultant chunks are parsed into `<external_context>` for the primary generation phase.\n\n"
-             "The `On+` mode forces the AI to append citation links beneath the final message."),
-
-            ("Web Grounding (URL Parsing)",
-             "If URL Fetching is enabled, the system intercepts HTTP/HTTPS links present in the user's prompt.\n\n"
-             "A headless asynchronous request extracts the raw HTML, stripping structural noise, scripts, and styling. The decoded text is injected into the payload as `<document_context>`. This process bypasses Google Search and relies strictly on direct endpoint resolution. Media objects (images) located at the endpoint are also appended for multimodal analysis."),
-
-            ("Visual Generation & Processing",
-             "Profiles may generate `.png` visuals using the `!image` or `!imagine` prefix.\n\n"
-             "This requires a paid-tier Google API key routing to the `gemini-2.5-flash-image` endpoint. The generation prompt automatically appends the profile's `Appearance` data if second-person pronouns are detected. Once the image is generated, it is fed back into the text model to produce an in-character comment attached to the resulting file.\n\n"
-             "To execute style transfers or iterative edits, reply to an existing image with the `!image` command."),
-
-            ("Output Modification: Anti-Repetition Critic",
-             "The Critic module acts as an automated linguistic quality assurance layer.\n\n"
-             "When enabled, the system reviews the last three model outputs prior to execution. If structural repetition is detected (e.g., reusing identical opening phrases or structural loops common in auto-regressive models), it formulates a negative constraint. This constraint is injected into the prompt, explicitly banning the repetitive pattern for the impending turn."),
-
-            ("Output Modification: Typing Simulation",
-             "Realistic Typing simulates human interface delays.\n\n"
-             "The output string is parsed via regex to identify sentence boundaries (accounting for standard abbreviations). The execution loop calculates a reading/typing delay based on character volume. Sentences are sequentially transmitted to the Discord Webhook API, creating a fragmented, continuous stream of text rather than a single monolithic block."),
-
-            ("Temporal Awareness Integration",
-             "If Time Tracking is enabled, the execution loop parses the profile's designated IANA Timezone (e.g., `Europe/London`).\n\n"
-             "A UTC datetime object is shifted to the local equivalent and formatted into a human-readable string. This data is injected as `<time_context>` into the system prompt, ensuring the model maintains continuity regarding the time of day, day of the week, and date."),
-
-            ("Standard Session Management",
-             "All conversational interactions occur within Sessions.\n\n"
-             "**Regular Mode (`/session config`):**\n"
-             "Initiates a manual session requiring an administrator to define the participating profiles. The operational mode determines execution flow:\n"
-             "- Sequential: Participants execute in the exact order established during configuration.\n"
-             "- Random: Execution order is shuffled per round.\n\n"
-             "Standard `/session swap` operations allow dynamic manipulation of the active cast during runtime."),
-
-            ("Session Management: Response Modes",
-             "Profiles may be configured to format their network payload differently depending on use-case requirements:\n\n"
-             "- **Regular:** Standard webhook message execution.\n"
-             "- **Mention:** Prepends the user's Discord ID to the message payload.\n"
-             "- **Reply:** Triggers the Discord API message reference parameter to visually connect the response to the user's prompt.\n"
-             "- **Mention + Reply:** A hybrid execution of both methodologies."),
-
-            ("Session Control via Reactions",
-             "Users may dynamically influence session state and execution flow by applying specific emoji reactions to messages.\n\n"
-             "- **Regenerate (🔁):** Regenerates a profile's message using the same context that lead to that response.\n"
-             "- **Next Speaker (⏯️):** Triggers the next profile participant to respond.\n"
-             "- **Continue Round (🍿):** Triggers a new round for all profile participants to respond.\n"
-             "- **Mute Turn (🔇):** Hides the targeted message from the session's transcript. The message remains in the channel but becomes invisible to the profiles when they respond.\n"
-             "- **Skip Participant (❌):** Suspends a specific profile from responding in the session."),
-
-            ("Automated Event Scheduling (Freewill)",
-             "The Freewill system enables autonomous bot execution without direct user invocation.\n\n"
-             "Administrators classify channels as either 'Living' (fully autonomous) or 'Lurking' (reactive only). Active users must opt their profiles into the system via the configuration dashboard. The system evaluates participation based on the defined 'Personality' percentages (Introverted, Regular, Outgoing), which determine the probability of intervention."),
-
-            ("Freewill Mode: Proactive Generation",
-             "In 'Living' channels, an asynchronous loop executes at one-minute intervals.\n\n"
-             "If the channel's `Event Cooldown` timer has expired, the system calculates a probability check based on the `Event Chance`. Upon success, it gathers an ad-hoc cast of opted-in profiles and forces a 'Director's Prompt' (e.g., 'You see X walk into the room. React.'). The profiles converse autonomously until the defined proactive round counter depletes."),
-
-            ("Freewill Mode: Reactive Triggers",
-             "In both 'Living' and 'Lurking' channels, the system evaluates all standard user messages against the active profiles.\n\n"
-             "If a user's text string contains an exact match to a profile's defined 'Wakeword', the profile immediately bypasses standard turn logic to interject. In the absence of wakewords, a probabilistic roll is made against the profile's personality metric to determine random interjection."),
-
-            ("Inter-Process Communication (Child Bots)",
-             "Child Bots are discrete Discord Application binaries orchestrated by the primary instance (Hivemind).\n\n"
-             "The system establishes a WebSocket Inter-Process Communication (IPC) layer on `ws://127.0.0.1:8765`. A background subprocess handles the asynchronous execution of `discord.py` clients. These child instances possess no internal logic; they blindly execute payloads formatted and routed by the primary engine. This allows profiles to exist as independent server members with dedicated online presence."),
-
-            ("Child Bot Registration & Sync",
-             "To instantiate a Child Bot:\n"
-             "1. Register a new Application within the Discord Developer Portal.\n"
-             "2. Extract the bot token and submit it via `/settings`.\n"
-             "3. The primary instance encrypts the token, establishes the IPC socket, and dispatches an initialization command.\n\n"
-             "The parent instance automatically synchronises the profile's display name and avatar URL to the child application via API calls upon creation or modification."),
-
-            ("Public Distribution Index (Hub)",
-             "The Hub (`/profile hub`) operates as a global metadata index for Profile distribution.\n\n"
-             "Premium users may publish profiles to the index. Upon request, the system executes an automated moderation check using `gemini-flash-lite` to evaluate the profile name, display name, and avatar for graphic or explicit violations. Upon clearance, the profile is appended to the `index.json` structure, allowing global read access for borrowing operations."),
-
-            ("Private Distribution (Share Codes)",
-             "For targeted distribution, users may generate temporary cryptographic Share Codes via the Hub interface.\n\n"
-             "These codes encode the original owner's ID and the profile string. The generated hex key is retained in a volatile dictionary with a 300-second (5 minute) Time-To-Live (TTL). When a recipient redeems the code, the system validates the TTL, reads the encoded source, and duplicates a symbolic link to their local directory."),
-
-            ("Data Import and Export Validation",
-             "Profiles and associated persistent memory (LTM/Training) may be exported to standard `.mimic` JSON files.\n\n"
-             "The export function decrypts local storage and packages the dictionaries into plaintext formatting. During import, the system validates the JSON schema, handles namespace collisions via UUID appending, re-encrypts the text blobs, and shunts the data to the appropriate `user_data` and `storage` shards."),
-
-            ("Command Reference: Administration",
-             "- `/session config`: Opens the interface to initialise standard or Freewill sessions.\n"
-             "- `/suspend`: Terminates the active session and flushes the buffer.\n"
-             "- `/purge`: Executes a bulk message deletion operation and recursively scrubs associated internal memory indices.\n"
-             "- `/profile speak`: Forces an anonymous execution of a designated profile payload. (Requires Webhook/Child Bot delivery)."),
-
-            ("Command Reference: Configuration",
-             "- `/settings`: Private interface for API key authentication and Child Bot provisioning.\n"
-             "- `/profile manage`: Central interface for profile manipulation.\n"
-             "- `/profile bulk manage`: Executes batch manipulation across multiple profiles simultaneously.\n"
-             "- `/profile data manage`: Interface for manual CRUD operations on vector-embedded databases (LTM/Training)."),
-
-            ("Command Reference: Interaction",
-             "- `/profile swap`: Changes the active profile context for the current channel.\n"
-             "- `/profile list`: Enumerates valid user indices.\n"
-             "- `/session view`: Dumps session variables and participant statuses to chat.\n"
-             "- `/refresh`: Performs a targeted wipe of the channel's Short-Term Memory buffer without destroying the session structure.\n"
-             "- `/whisper`: Transmits hidden variables directly to a profile's context window, eliciting an ephemeral response."),
-             
-             ("System Content Moderation Framework",
-             "The system strictly adheres to external provider usage guidelines regarding illicit content.\n\n"
-             "Users may classify profiles under specific safety tiers (Low, Medium, High). The 'Unrestricted 18+' tier disables standard filters; however, execution of these profiles is mathematically restricted by the core engine to channels designated as NSFW via Discord API flags. Attempts to execute unrestricted profiles in standard channels will abort with a silent failure or system error log."),
-
-            ("Contextual Metadata & Token Overhead",
-             "To maintain coherent multi-participant communication, the system forcefully injects hardcoded metadata into the prompt payload.\n\n"
-             "Every user and profile response within the history buffer is strictly prefixed with a designated `[Name] [Timestamp]:` string. While this incurs a nominal token overhead per conversational turn, it establishes a foundational chronological and spatial awareness for the model. This guarantees the AI can differentiate between multiple actors and comprehend the passage of time without confusing internal dialogue with external user prompts."),
-
-            ("Extensible Markup Language (XML) Standards",
-             "The orchestration layer heavily utilises XML formatting (e.g., `<document_context>`, `<archive_context>`) when appending system-generated data to the context window.\n\n"
-             "Large Language Models possess a high mechanical affinity for XML boundary demarcation. By segregating raw conversational text from background technical operations using explicit tags, the system establishes a hard partition. This significantly mitigates prompt injection vectors, reduces contextual hallucination, and ensures the model accurately separates 'what the user said' from 'what the system is instructing it to know'."),
-
-            ("Data Residency and End User Agreement",
-             "All user-generated strings, including memory sequences and API keys, are subjected to symmetric Fernet encryption prior to disc residency.\n\n"
-             "By configuring external inference endpoints, you acknowledge the terms of service of the respective API provider (Google LLC, OpenRouter, etc.).")
-        ]
-
-        final_docs_content = []
-        is_configured = True 
-        if interaction.guild:
-            api_key = self._get_api_key_for_guild(interaction.guild.id)
-            if not api_key:
-                is_configured = False
-
-        if not is_configured:
-            final_docs_content.append(admin_setup_content)
-        
-        final_docs_content.extend(user_docs_content)
-
-        embeds = []
-        page_titles = [item[0] for item in final_docs_content]
-        for i, (title, description) in enumerate(final_docs_content):
-            embed = discord.Embed(title=title, description=description, color=discord.Color.blue())
-            embed.set_footer(text=f"Page {i+1}/{len(final_docs_content)}")
-            embeds.append(embed)
-
-        view = PaginatedEmbedView(embeds, page_titles)
-        await interaction.followup.send(embed=embeds[0], view=view, ephemeral=True)
+        from .mixins.content import HELP_CATEGORIES
+        view = DropdownContentView(HELP_CATEGORIES, "MimicAI Help & Documentation")
+        await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="terms", description="View the MimicAI Terms of Service and Privacy Policy.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     async def terms_slash(self, interaction: discord.Interaction):
-        text = (
-            "**MimicAI Terms & Privacy**\n\n"
-            "**1. Self-Hosted Instance:** This instance of MimicAI is self-hosted. The developers of the MimicAI software are not responsible for the management, data retention, or uptime of this specific bot. Please contact the bot owner for local privacy inquiries.\n\n"
-            "**2. Software License:** This software is provided under the Prosperity Public License 3.0.0. Unauthorized commercial use is prohibited.\n\n"
-            "**3. Universal Disclaimers:** By using this software, you acknowledge that AI-generated content can be unpredictable and the software developers are not liable for any output produced by the model.\n\n"
-            "For the full legal documentation, visit the link below:"
-        )
-        view = ui.View()
-        view.add_item(ui.Button(label="Open Official Website", url="https://mimic-ai.org/", style=discord.ButtonStyle.link))
-        await interaction.response.send_message(text, view=view, ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        from .mixins.content import TERMS_CATEGORIES_OFFICIAL, TERMS_CATEGORIES_SELF_HOSTED
+        
+        OFFICIAL_BOT_ID = 1376696185947164854
+        
+        if self.bot.user and self.bot.user.id == OFFICIAL_BOT_ID:
+            categories_to_use = TERMS_CATEGORIES_OFFICIAL
+        else:
+            categories_to_use = TERMS_CATEGORIES_SELF_HOSTED
+            
+        view = DropdownContentView(categories_to_use, "Terms & Privacy", link_button_label="Open Official Website", link_button_url="https://mimic-ai.org/")
+        await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="settings", description="Manage API keys and your personal child bots (DM-Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)

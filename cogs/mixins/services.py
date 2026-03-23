@@ -221,7 +221,7 @@ class OpenRouterModel:
                         
                     def __bool__(self): return True
     
-                return OpenRouterThoughtResponse(msg_obj.get('content', ''), msg_obj.get('reasoning', ''), choice.get('finish_reason', 'STOP').upper())
+                return OpenRouterThoughtResponse(msg_obj.get('content', ''), msg_obj.get('reasoning', ''), (choice.get('finish_reason') or 'STOP').upper())
         except httpx.RequestError as e:
             raise Exception(f"OpenRouter Network Error: {str(e)}")
         except asyncio.CancelledError:
@@ -4252,12 +4252,17 @@ class ServicesMixin:
     @tasks.loop(seconds=60.0)
     async def evict_inactive_sessions_task(self):
         now = time.time()
-        inactive_threshold = 60  # 1 minute strict dehydration policy
+        inactive_threshold = 600  # 10 minute strict dehydration policy
         
-        keys_to_evict = [
-            key for key, last_time in self.session_last_accessed.items()
-            if now - last_time > inactive_threshold
-        ]
+        keys_to_evict = []
+        for key, last_time in self.session_last_accessed.items():
+            if now - last_time > inactive_threshold:
+                # Protect actively working multi-profile sessions
+                if isinstance(key, int):
+                    session = self.multi_profile_channels.get(key)
+                    if session and (session.get('is_running') or session.get('is_regenerating') or session.get('is_purging')):
+                        continue
+                keys_to_evict.append(key)
         
         for key in keys_to_evict:
             # Handle multi-profile sessions (key is channel_id int)

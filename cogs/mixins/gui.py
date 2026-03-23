@@ -1029,62 +1029,53 @@ class ProfileSpeechSettingsModal(ui.Modal, title="Speech & Voice Settings"):
             await interaction.followup.send(f"✅ Speech settings updated for '{self.profile_name}'.", ephemeral=True)
             if self.callback: await self.callback(interaction)
 
-class PaginatedEmbedView(ui.View):
-    def __init__(self, embeds: List[discord.Embed], page_titles: List[str]):
-        super().__init__(timeout=300)
-        self.embeds = embeds
-        self.page_titles = page_titles
-        self.current_page = 0
+class DropdownContentView(ui.View):
+    def __init__(self, content_dict: dict, title: str, link_button_label: Optional[str] = None, link_button_url: Optional[str] = None):
+        super().__init__(timeout=600)
+        self.content_dict = content_dict
+        self.view_title = title
+        self.link_button_label = link_button_label
+        self.link_button_url = link_button_url
+        
+        self.selected_category = list(self.content_dict.keys())[0]
+        self.selected_page = list(self.content_dict[self.selected_category].keys())[0]
         self._build_view()
 
     def _build_view(self):
         self.clear_items()
         
-        # Row 0: Dropdown (Chunked to 25 items max)
-        chunk_index = self.current_page // 25
-        start_idx = chunk_index * 25
-        end_idx = min(start_idx + 25, len(self.embeds))
-
-        options = []
-        for i in range(start_idx, end_idx):
-            title = self.page_titles[i]
-            options.append(discord.SelectOption(
-                label=f"{i+1}. {title[:80]}",
-                value=str(i),
-                default=(i == self.current_page)
-            ))
+        cat_options = [discord.SelectOption(label=cat[:100], value=cat[:100], default=(cat == self.selected_category)) for cat in self.content_dict.keys()]
+        cat_select = ui.Select(placeholder="Select Category...", options=cat_options, row=0)
         
-        placeholder = f"Index Sections {start_idx + 1}-{end_idx}..." if len(self.embeds) > 25 else "Jump to a section..."
-        select = ui.Select(placeholder=placeholder, options=options, row=0)
-        select.callback = self.select_callback
-        self.add_item(select)
+        async def cat_callback(interaction: discord.Interaction):
+            self.selected_category = interaction.data['values'][0]
+            self.selected_page = list(self.content_dict[self.selected_category].keys())[0]
+            self._build_view()
+            await interaction.response.edit_message(embed=self.get_embed(), view=self)
+            
+        cat_select.callback = cat_callback
+        self.add_item(cat_select)
+        
+        page_options = [discord.SelectOption(label=page[:100], value=page[:100], default=(page == self.selected_page)) for page in self.content_dict[self.selected_category].keys()]
+        page_select = ui.Select(placeholder="Select Page...", options=page_options, row=1)
+        
+        async def page_callback(interaction: discord.Interaction):
+            self.selected_page = interaction.data['values'][0]
+            self._build_view()
+            await interaction.response.edit_message(embed=self.get_embed(), view=self)
+            
+        page_select.callback = page_callback
+        self.add_item(page_select)
 
-        # Row 1: Pagination Navigation
-        prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page == 0), row=1)
-        prev_btn.callback = self.prev_callback
-        self.add_item(prev_btn)
+        if self.link_button_label and self.link_button_url:
+            btn = ui.Button(label=self.link_button_label, url=self.link_button_url, row=2)
+            self.add_item(btn)
 
-        page_lbl = ui.Button(label=f"Page {self.current_page + 1}/{len(self.embeds)}", style=discord.ButtonStyle.grey, disabled=True, row=1)
-        self.add_item(page_lbl)
-
-        next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page >= len(self.embeds) - 1), row=1)
-        next_btn.callback = self.next_callback
-        self.add_item(next_btn)
-
-    async def select_callback(self, interaction: discord.Interaction):
-        self.current_page = int(interaction.data['values'][0])
-        self._build_view()
-        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
-
-    async def prev_callback(self, interaction: discord.Interaction):
-        self.current_page -= 1
-        self._build_view()
-        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
-
-    async def next_callback(self, interaction: discord.Interaction):
-        self.current_page += 1
-        self._build_view()
-        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
+    def get_embed(self) -> discord.Embed:
+        content = self.content_dict[self.selected_category][self.selected_page]
+        embed = discord.Embed(title=self.selected_page, description=content, color=discord.Color.blurple())
+        embed.set_author(name=self.view_title)
+        return embed
 
 class ProfileManageView(ui.View):
     def __init__(self, cog: 'GeminiAgent', original_interaction: discord.Interaction, profile_name: str, is_borrowed: bool):
