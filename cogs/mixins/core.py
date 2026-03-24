@@ -997,11 +997,13 @@ class CoreMixin:
             
             user_tz = profile_data.get("timezone", "UTC")
             final_user_parts = []
+            turn_warnings = []
             if ltm_recall_text:
                 final_user_parts.append(ltm_recall_text)
             
             if profile_data.get('url_fetching_enabled', False):
-                u_text, _ = await self._process_urls_in_content(combined_prompt_text, 0, {"url_fetching_enabled": True})
+                u_text, _, u_warn = await self._process_urls_in_content(combined_prompt_text, 0, {"url_fetching_enabled": True})
+                turn_warnings.extend(u_warn)
                 if u_text:
                     final_user_parts.append(f"<document_context>\n" + "\n".join(u_text) + "\n</document_context>")
 
@@ -1027,7 +1029,8 @@ class CoreMixin:
             status = "api_error"
             response = None
             fallback_used = False
-            blocked_reason_override = None
+            api_error_reason = None
+            main_api_error = None
             state_container = None
             
             custom_emoji = profile_data.get("placeholder_emoji") or PLACEHOLDER_EMOJI
@@ -1058,13 +1061,11 @@ class CoreMixin:
                 return
             except Exception as e:
                 is_timeout_main = isinstance(e, TimeoutError)
+                main_api_error = self._format_api_error(e)
                 if hasattr(e, 'state_container'): state_container = e.state_container
                 
                 if not fallback_model_name or primary_model == fallback_model_name:
-                    if is_timeout_main:
-                        blocked_reason_override = "Took longer than 4 minutes (No Fallback)"
-                    else:
-                        blocked_reason_override = f"Failed generation ({self._format_api_error(e)})"
+                    api_error_reason = main_api_error
                 else:
                     try:
                         sys_instr, _, _, _, _, _, _, _ = self._construct_system_instructions(host_user_id, profile_name, 0)
@@ -1125,7 +1126,6 @@ class CoreMixin:
                                     raise ValueError("Empty Response (AI produced no text content)")
 
                                 fallback_used = True
-                                blocked_reason_override = "Main model failed"
                                 self._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat_fallback", model_used=fb_name, status="success")
                     except asyncio.CancelledError:
                         return
@@ -1135,29 +1135,37 @@ class CoreMixin:
                         if hasattr(retry_e, 'state_container'): state_container = retry_e.state_container
                         
                         if is_timeout_main and is_timeout_fallback:
-                            blocked_reason_override = "Took longer than 7 minutes (Fallback failed)"
-                        elif is_timeout_fallback:
-                            blocked_reason_override = "Took longer than 3 minutes (Fallback failed)"
+                            api_error_reason = ERR_REASON_TIMEOUT_BOTH
                         else:
-                            blocked_reason_override = "Failed generation (Both models failed)"
+                            api_error_reason = self._format_api_error(retry_e)
                         status = "api_error"
             finally:
                 self._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
 
-            # Crucial: Only delete Message B. Message A (embed placeholder) is edited into the final response below.
-            if state_container:
-                await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
-
             if not response or not response.candidates:
-                reason = blocked_reason_override or "Unknown"
-                if response and hasattr(response, 'prompt_feedback') and response.prompt_feedback and response.prompt_feedback.block_reason:
+                reason = api_error_reason or "Unknown Error"
+                is_safety = False
+                if response and hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
                     reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
+                    is_safety = True
                 
-                custom_main = profile_data.get("error_response", "An error has occurred.")
+                custom_main = profile_data.get("error_response", ERR_GENERAL_ERROR)
+                
+                if is_safety:
+                    turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=reason))
+                elif "Rate Limit" in reason:
+                    turn_warnings.append(ERR_RATE_LIMIT)
+                else:
+                    if fallback_model_name and primary_model != fallback_model_name:
+                        turn_warnings.append(WARN_BOTH_MODELS_FAILED.format(reason=reason))
+                    else:
+                        turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=reason))
                 
                 err_embed = placeholder_msg.embeds[0]
-                err_embed.description = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
+                err_embed.description = custom_main
                 await placeholder_msg.edit(embed=err_embed)
+                
+                await self._dispatch_warnings(interaction.channel, 'webhook', None, turn_warnings, host_user_id, profile_name)
                 return
 
             raw_text = getattr(response, 'text', "").strip()
@@ -1202,8 +1210,6 @@ class CoreMixin:
             session_data.setdefault('unified_log', []).append(model_log)
 
             text_for_embed = response_text
-            if fallback_used and profile_data.get("show_fallback_indicator", True):
-                text_for_embed += f"\n\n-# Fallback Model Used **({blocked_reason_override})**."
                 
             ui_meta = []
             if profile_data.get("generation_metadata_enabled", False):
@@ -1214,11 +1220,25 @@ class CoreMixin:
             if ui_meta:
                 text_for_embed += f"\n\n-# { ' | '.join(ui_meta) }"
 
+            if fallback_used and profile_data.get("show_fallback_indicator", True):
+                turn_warnings.append(WARN_FALLBACK_USED)
+                turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=main_api_error))
+
+            if state_container:
+                await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
+                state_container['msg_b_id'] = None
+
+            await self._update_sending_placeholder(interaction.channel, 'webhook', None, state_container, t1_start_mono)
+
             embed = discord.Embed(description=text_for_embed, color=discord.Color.blue())
             embed.set_author(name=display_name, icon_url=avatar_url)
             embed.set_footer(text=combined_footer_text[:1000], icon_url=interaction.user.display_avatar.url)
             
+            if state_container and state_container.get('sending_task'):
+                state_container['sending_task'].cancel()
+                
             response_message = await placeholder_msg.edit(embed=embed)
+            await self._dispatch_warnings(interaction.channel, 'webhook', None, turn_warnings, host_user_id, profile_name)
 
             t2_end_mono = time.monotonic()
             duration = t2_end_mono - t1_start_mono
@@ -2330,8 +2350,7 @@ class CoreMixin:
         embed.add_field(name="\u200b", value="\u200b", inline=False)
 
         # 4. Tools Section (Change to inline)
-        cb_ph_text = " (CB ON)" if source_profile_data.get("child_bot_placeholder", False) else ""
-        ph_text = f"{source_profile_data.get('placeholder_emoji') or 'Default'}{cb_ph_text}"
+        ph_text = f"{source_profile_data.get('placeholder_emoji') or 'Default'}"
         
         tools_val = (
             f"Image Gen: {img_gen}\n"

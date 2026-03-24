@@ -104,3 +104,27 @@ DEFAULT_SAFETY_SETTINGS = {
 class GoogleGenAIChatSession:
     def __init__(self, history=None):
         self.history = history or []
+
+# --- Standardised Error & Warning Messages ---
+WARN_FALLBACK_USED = "**Fallback Model Used**"
+WARN_MAIN_MODEL_FAILED = "**Main Model Failed** ({reason})"
+WARN_BOTH_MODELS_FAILED = "**Main & Fallback Model Failed** ({reason})"
+WARN_VOICE_SYNTHESIS_FAILED = "**Text-To-Speech Failed** ({reason})"
+WARN_URL_FETCHING_FAILED = "**URL Fetching Failed** ({reason})"
+WARN_GROUNDING_FAILED = "**Grounding Failed** ({reason})"
+WARN_IMAGE_GEN_FAILED = "**Image Generation Failed** ({reason})"
+
+ERR_GENERAL_ERROR = "An error has occurred."
+ERR_SAFETY_BLOCK = "Safety Filter ({reason})"
+ERR_RATE_LIMIT = "API Rate Limit"
+ERR_UNKNOWN = "Unknown Error"
+
+ERR_REASON_UNSUPPORTED_IMAGE = "Images Unsupported"
+ERR_REASON_UNSUPPORTED_AUDIO = "Audio Unsupported"
+ERR_REASON_UNSUPPORTED_VIDEO = "Video Unsupported"
+ERR_REASON_EMPTY_RESPONSE = "AI produced no text content"
+ERR_REASON_REPETITIVE_CONTENT = "Model Collapse"
+ERR_REASON_PROVIDER_ERROR = "Provider Error"
+ERR_REASON_TIMEOUT_MAIN = "Timed-out"
+ERR_REASON_TIMEOUT_FALLBACK = "Fallback Timed-out"
+ERR_REASON_TIMEOUT_BOTH = "Timed-out"

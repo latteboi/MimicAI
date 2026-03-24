@@ -22,6 +22,15 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple, Optional, Any, Literal, Set, Union, get_args
 from .constants import *
+from .constants import (
+    WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED, WARN_BOTH_MODELS_FAILED,
+    WARN_VOICE_SYNTHESIS_FAILED, WARN_URL_FETCHING_FAILED, WARN_GROUNDING_FAILED,
+    WARN_IMAGE_GEN_FAILED, ERR_GENERAL_ERROR, ERR_SAFETY_BLOCK, ERR_RATE_LIMIT,
+    ERR_UNKNOWN, ERR_REASON_UNSUPPORTED_IMAGE, ERR_REASON_UNSUPPORTED_AUDIO,
+    ERR_REASON_UNSUPPORTED_VIDEO, ERR_REASON_EMPTY_RESPONSE, ERR_REASON_REPETITIVE_CONTENT,
+    ERR_REASON_PROVIDER_ERROR, ERR_REASON_TIMEOUT_MAIN, ERR_REASON_TIMEOUT_FALLBACK,
+    ERR_REASON_TIMEOUT_BOTH
+)
 from .storage import (
     _delete_file_shard, 
     _quantize_embedding, 
@@ -232,7 +241,7 @@ class GoogleGenAIChatSession:
         self.history = history or []
 
 class GoogleGenAIModel:
-    def __init__(self, api_key, model_name, system_instruction=None, safety_settings=None, thinking_params=None):
+    def __init__(self, api_key, model_name, system_instruction=None, safety_settings=None, thinking_params=None, tools=None):
         # Force v1beta for stable "Thinking" part delivery
         self.client = genai.Client(
             api_key=api_key, 
@@ -242,6 +251,7 @@ class GoogleGenAIModel:
         self.system_instruction = system_instruction
         self.safety_settings = safety_settings
         self.thinking_params = thinking_params or {}
+        self.tools = tools
 
     def start_chat(self, history=None):
         return GoogleGenAIChatSession(history=history)
@@ -346,7 +356,8 @@ class GoogleGenAIModel:
             top_p=top_p,
             top_k=top_k,
             safety_settings=v2_safety if v2_safety else None,
-            thinking_config=thinking_cfg
+            thinking_config=thinking_cfg,
+            tools=self.tools
         )
 
         response = await self.client.aio.models.generate_content(
@@ -537,6 +548,13 @@ class ServicesMixin:
             avatar_url = appearance["custom_avatar_url"]
         
         return display_name, avatar_url
+
+    async def _send_session_warning(self, channel: discord.abc.Messageable, message: str):
+        if not channel: return
+        try:
+            await channel.send(f"⚠️ **Session Notice:** {message}", delete_after=10)
+        except Exception:
+            pass
 
     async def _safe_delete_placeholder(self, channel, message_id):
         if not message_id: return
@@ -1029,8 +1047,12 @@ class ServicesMixin:
                 starting_profile_override = None
                 triggering_user_id = session.get("owner_id")
                 
+                # Bind channel for the entire round early to prevent UnboundLocalErrors
+                channel = self.bot.get_channel(channel_id)
+                
                 # [NEW] Standardized initialization to prevent UnboundLocalErrors
                 url_media_parts = []
+                pre_generation_warnings = []
 
                 if is_proactive_auto_round and session.get("proactive_initial_rounds") == 1:
                     cast = session['profiles']
@@ -1166,7 +1188,8 @@ class ServicesMixin:
                         trigger_media_parts = []
                         
                         if any_url_enabled:
-                            url_text_list, url_media = await self._process_urls_in_content(content, trigger_obj['guild_id'] if is_child_mention else trigger_obj.guild.id, {"url_fetching_enabled": True})
+                            url_text_list, url_media, url_warnings = await self._process_urls_in_content(content, trigger_obj['guild_id'] if is_child_mention else trigger_obj.guild.id, {"url_fetching_enabled": True})
+                            pre_generation_warnings.extend(url_warnings)
                             if url_text_list:
                                 url_text_content = "\n".join(url_text_list)
                             
@@ -1597,7 +1620,10 @@ class ServicesMixin:
                         mapping_key = (session.get("type", "multi"), channel.id)
                         grounding_result = await self._get_hybrid_grounding_context(grounding_query, channel.guild.id, history_for_grounding, mapping_key, safety_settings=g_dynamic_safety_settings, is_for_image=is_for_image_flag)
                         if grounding_result:
-                            g_context, g_sources, should_set_checkpoint = grounding_result
+                            g_context, g_sources, should_set_checkpoint, g_warning = grounding_result
+                            if g_warning:
+                                pre_generation_warnings.append(g_warning)
+                            
                             if g_context:
                                 if is_image_gen_round:
                                     image_gen_prompt = f"{image_gen_prompt}\n\nUse this information to help generate the image:\n{g_context}"
@@ -1631,10 +1657,15 @@ class ServicesMixin:
                 if any_url_enabled and batched_url_research_content:
                     print(f"[DEBUG: URL-Multi] Performing round research on {len(batched_url_research_content)} items.")
                     for content_str, g_id in batched_url_research_content:
-                        u_t, _ = await self._process_urls_in_content(content_str, g_id, {"url_fetching_enabled": True})
+                        u_t, _, u_w = await self._process_urls_in_content(content_str, g_id, {"url_fetching_enabled": True})
+                        pre_generation_warnings.extend(u_w)
                         round_url_text_contexts.extend(u_t)
 
                 for i, participant in enumerate(profile_order):
+                    turn_warnings = []
+                    if i == 0:
+                        turn_warnings.extend(pre_generation_warnings)
+                    
                     channel = self.bot.get_channel(channel_id)
                     api_key = self._get_api_key_for_guild(channel.guild.id)
                     
@@ -1662,6 +1693,9 @@ class ServicesMixin:
                     p_index = self._get_user_index(p_owner_id)
                     p_is_b = p_name in p_index.get("borrowed", [])
                     p_settings = self._get_profile_config(p_owner_id, p_name, p_is_b) or {}
+
+                    # Ensure custom_main is safely bound early for error fallback
+                    custom_main = p_settings.get("error_response", "An error has occurred.")
 
                     # Check Image Gen intent vs Profile Toggle
                     if is_image_gen_round and participant_key == generator_profile_key:
@@ -1856,6 +1890,7 @@ class ServicesMixin:
                                 )
                                 if thinking_messages: msg_a_id = thinking_messages[0].id
 
+                        image_gen_error_msg = None
                         if is_generator and generated_image_bytes_for_round is None:
                             if self.image_gen_semaphore.locked() and image_gen_anchor_message:
                                 try:
@@ -1967,13 +2002,17 @@ class ServicesMixin:
                                                 print(f"Error fetching attached image for generation: {e}")
                                 
                                 status = "api_error"
+                                response = None
                                 try:
                                     response = await image_model.generate_content_async([{'role': 'user', 'parts': parts}])
                                     status = "blocked_by_safety" if not response.candidates else "success"
+                                except Exception as e:
+                                    image_gen_error_msg = self._format_api_error(e)
+                                    status = "api_error"
                                 finally:
                                     self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="image_generation_multi", model_used=image_model.model_name, status=status)
 
-                                if response.candidates and response.candidates[0].finish_reason.name == 'STOP':
+                                if response and response.candidates and response.candidates[0].finish_reason.name == 'STOP':
                                     for part in response.candidates[0].content.parts:
                                         if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/'):
                                             generated_image_bytes_for_round = part.inline_data.data
@@ -2114,7 +2153,8 @@ class ServicesMixin:
                                 supplementary_parts.extend(text_gen_parts)
                             else:
                                 if is_generator:
-                                    system_note = f"<image_context>Your attempt to generate an image based on the prompt '{image_gen_prompt}' failed. Comment on it.</image_context>"
+                                    fail_reason = image_gen_error_msg or "Safety Filter / Unknown"
+                                    system_note = f"<image_context>Your attempt to generate an image based on the prompt '{image_gen_prompt}' failed due to: {fail_reason}. Comment on this failure in character.</image_context>"
                                     supplementary_parts.append(system_note)
 
                         if not contents_for_api_call:
@@ -2146,7 +2186,8 @@ class ServicesMixin:
                         status = "api_error"
                         response = None
                         fallback_used = False
-                        blocked_reason_override = None
+                        api_error_reason = None
+                        main_api_error = None
                         state_container = None
                         
                         if model:
@@ -2173,13 +2214,11 @@ class ServicesMixin:
                                 continue
                             except Exception as e:
                                 is_timeout_main = isinstance(e, TimeoutError)
+                                main_api_error = self._format_api_error(e)
                                 if hasattr(e, 'state_container'): state_container = e.state_container
                                 
                                 if not fallback_model_name or primary_model == fallback_model_name:
-                                    if is_timeout_main:
-                                        blocked_reason_override = "Took longer than 4 minutes (No Fallback)"
-                                    else:
-                                        blocked_reason_override = f"Failed generation ({self._format_api_error(e)})"
+                                    api_error_reason = main_api_error
                                 else:
                                     try:
                                         fb_name = fallback_model_name
@@ -2215,7 +2254,6 @@ class ServicesMixin:
                                             raise ValueError("[REPETITIVE_CONTENT_ERROR]")
 
                                         fallback_used = True
-                                        blocked_reason_override = "Main model failed"
                                         self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile_fallback", model_used=fb_name, status="success")
                                     except asyncio.CancelledError:
                                         if 'contents_for_api_call' in locals():
@@ -2228,29 +2266,36 @@ class ServicesMixin:
                                         if hasattr(retry_e, 'state_container'): state_container = retry_e.state_container
                                         
                                         if is_timeout_main and is_timeout_fallback:
-                                            blocked_reason_override = "Took longer than 7 minutes (Fallback failed)"
-                                        elif is_timeout_fallback:
-                                            blocked_reason_override = "Took longer than 3 minutes (Fallback failed)"
+                                            api_error_reason = ERR_REASON_TIMEOUT_BOTH
                                         else:
-                                            blocked_reason_override = "Failed generation (Both models failed)"
+                                            api_error_reason = self._format_api_error(retry_e)
                                         status = "api_error"
                             finally:
                                 self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
                         else:
-                            blocked_reason_override = warning_message or "Internal API Initialization Error"
-
-                        if state_container:
-                            await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
-                            await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
+                            api_error_reason = warning_message or "Internal API Initialization Error"
 
                         was_blocked = False
                         if not response or not response.candidates:
-                            reason = blocked_reason_override or "Unknown"
+                            reason = api_error_reason or "Unknown Error"
+                            is_safety = False
                             if response and response.prompt_feedback and response.prompt_feedback.block_reason: 
                                 reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
+                                is_safety = True
                             
-                            custom_main = p_settings.get("error_response", "An error has occurred.")
-                            response_text = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
+                            custom_main = p_settings.get("error_response", ERR_GENERAL_ERROR)
+                            response_text = custom_main
+                            
+                            if is_safety:
+                                turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=reason))
+                            elif "Rate Limit" in reason:
+                                turn_warnings.append(ERR_RATE_LIMIT)
+                            else:
+                                if fallback_model_name and primary_model != fallback_model_name:
+                                    turn_warnings.append(WARN_BOTH_MODELS_FAILED.format(reason=reason))
+                                else:
+                                    turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=reason))
+                            
                             was_blocked = True
                         else:
                             try:
@@ -2282,19 +2327,31 @@ class ServicesMixin:
                                 
                                 # [UPDATED] Differentiated error messaging for spammed vs empty content
                                 if response_text == "[REPETITIVE_CONTENT_ERROR]":
-                                    reason = "Repetitive Content Filter (Model Collapse)"
-                                    custom_main = p_settings.get("error_response", "An error has occurred.")
-                                    response_text = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
+                                    custom_main = p_settings.get("error_response", ERR_GENERAL_ERROR)
+                                    response_text = custom_main
+                                    warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
+                                    turn_warnings.append(warn_tmp.format(reason=ERR_REASON_REPETITIVE_CONTENT))
                                     was_blocked = True
                                 elif not response_text:
-                                    reason = "Empty Response (AI produced no text content)"
-                                    custom_main = p_settings.get("error_response", "An error has occurred.")
-                                    response_text = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
+                                    custom_main = p_settings.get("error_response", ERR_GENERAL_ERROR)
+                                    response_text = custom_main
+                                    warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
+                                    turn_warnings.append(warn_tmp.format(reason=ERR_REASON_EMPTY_RESPONSE))
                                     was_blocked = True
+                                
                             except ValueError:
-                                reason = response.candidates[0].finish_reason.name
-                                response_text = f"My response was blocked due to: **{reason.replace('_', ' ').title()}**. Please rephrase or try a different topic."
+                                reason = response.candidates[0].finish_reason.name.replace('_', ' ').title()
+                                response_text = p_settings.get("error_response", ERR_GENERAL_ERROR)
+                                turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=reason))
                                 was_blocked = True
+
+                        if fallback_used and p_settings.get("show_fallback_indicator", True):
+                            turn_warnings.append(WARN_FALLBACK_USED)
+                            turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=main_api_error))
+                            
+                        # --- Placeholder Update & Sending ---
+                        if not was_blocked:
+                            await self._update_sending_placeholder(channel, participant.get('method', 'webhook'), participant.get('bot_id'), state_container, t1_start_mono)
 
                         t2_end_mono = time.monotonic()
                         duration = t2_end_mono - t1_start_mono
@@ -2369,9 +2426,6 @@ class ServicesMixin:
                     thought_file_to_send = None
                     if thought_text and p_settings.get("thinking_summary_visible") == "on":
                         thought_file_to_send = discord.File(io.BytesIO(thought_text.encode('utf-8')), filename="thinking_summary.txt")
-
-                    if fallback_used and p_settings.get("show_fallback_indicator", True):
-                        display_text += f"\n\n-# Fallback Model Used **({blocked_reason_override})**."
 
                     sources_text = None
                     if participant_key == grounding_profile_key and grounding_mode_for_citator == "on+" and grounding_sources:
@@ -2529,6 +2583,8 @@ class ServicesMixin:
                                 if audio_mode == "audio-only":
                                     # Use zero-width space to hide text while keeping message valid
                                     display_text = ""
+                        else:
+                            turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(reason="API Error or Unknown"))
 
                     # [FIXED] Non-exclusive media selection: prioritize image as primary, audio as follow-up
                     file_to_send = None
@@ -2691,6 +2747,17 @@ class ServicesMixin:
                                     bypass_typing=True # Skip delay
                                 )
                     
+                    # --- Dispatch Warnings and Clean Up Placeholders ---
+                    if state_container:
+                        if state_container.get('sending_task'):
+                            state_container['sending_task'].cancel()
+                        await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
+                        await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
+                        state_container['msg_a_id'] = None
+                        state_container['msg_b_id'] = None
+                        
+                    await self._dispatch_warnings(channel, participant.get('method', 'webhook'), participant.get('bot_id'), turn_warnings, owner_id, profile_name, session, turn_object)
+                    
                     user_content_obj = {'role': 'user', 'parts': [history_line]}
                     for key, other_chat_session in session['chat_sessions'].items():
                         if key != participant_key and other_chat_session is not None:
@@ -2749,7 +2816,7 @@ class ServicesMixin:
                                     url_media_batch = []
                                     
                                     if any_url_enabled_batch:
-                                        url_text_list, url_media = await self._process_urls_in_content(content, trigger.guild.id, {"url_fetching_enabled": True})
+                                        url_text_list, url_media = await self._process_urls_in_content(content, trigger.guild.id, {"url_fetching_enabled": True}, warning_channel=channel)
                                         if url_text_list: url_text_batch = "\n".join(url_text_list)
                                         url_media_batch = url_media
 
@@ -3065,30 +3132,41 @@ class ServicesMixin:
                                         parts.append({"mime_type": ctype, "data": ref_image_data})
 
                                 status = "api_error"
+                                response = None
                                 try:
                                     response = await image_model.generate_content_async([{'role': 'user', 'parts': parts}])
                                     status = "blocked_by_safety" if not response.candidates else "success"
+                                except Exception as e:
+                                    failure_reason = self._format_api_error(e)
+                                    status = "api_error"
                                 finally:
                                     self._log_api_call(user_id=package['author_id'], guild_id=package['guild_id'], context="image_generation_jit", model_used=image_model.model_name, status=status)
                                 
                                 # No PIL cleanup needed
                                 del parts
 
-                                if not response.candidates:
-                                    reason = "Safety Filter";
-                                    if response.prompt_feedback and response.prompt_feedback.block_reason: reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
-                                    failure_reason = f"the safety filter ({reason})"
-                                else:
-                                    candidate = response.candidates[0]
-                                    if candidate.finish_reason.name != 'STOP': failure_reason = f"the process being stopped for reason: **{candidate.finish_reason.name.replace('_', ' ').title()}**"
+                                if response:
+                                    if not response.candidates:
+                                        reason = "Safety Filter";
+                                        if response.prompt_feedback and response.prompt_feedback.block_reason: reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
+                                        failure_reason = f"the safety filter ({reason})"
                                     else:
-                                        image_bytes = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
-                                        if not image_bytes: failure_reason = "an unknown issue (the model returned no image data)"
-                            except Exception as e: failure_reason = f"an unexpected error: `{e}`"
+                                        candidate = response.candidates[0]
+                                        if candidate.finish_reason.name != 'STOP': failure_reason = f"the process being stopped for reason: **{candidate.finish_reason.name.replace('_', ' ').title()}**"
+                                        else:
+                                            image_bytes = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
+                                            if not image_bytes: failure_reason = "an unknown issue (the model returned no image data)"
+                            except Exception as e: 
+                                if not failure_reason: failure_reason = f"an unexpected error: `{e}`"
+                            
                             package['generated_image_bytes'] = image_bytes
                             package['failure_reason'] = failure_reason
                         
                         # --- Text Generation ---
+                        turn_warnings = []
+                        if package.get('failure_reason'):
+                            turn_warnings.append(WARN_IMAGE_GEN_FAILED.format(reason=package['failure_reason']))
+                            
                         text_model, _, temp, top_p, top_k, _, _ = await self._get_or_create_model_for_channel(package['channel_id'], package['author_id'], package['guild_id'], profile_owner_override=package['effective_profile_owner_id'], profile_name_override=package['effective_profile_name'])
                         
                         model_cache_key = (package['channel_id'], package['effective_profile_owner_id'], package['effective_profile_name'])
@@ -3108,7 +3186,11 @@ class ServicesMixin:
                             
                             user_turn = {'role': 'user', 'parts': final_user_parts}
                         else:
-                            user_turn = {'role': 'user', 'parts': [package['prompt_text']]}
+                            if package.get('failure_reason'):
+                                system_note = f"<image_context>Your attempt to generate an image based on the prompt '{package['prompt_text']}' failed due to: {package['failure_reason']}. Comment on this failure in character.</image_context>"
+                                user_turn = {'role': 'user', 'parts': [system_note]}
+                            else:
+                                user_turn = {'role': 'user', 'parts': [package['prompt_text']]}
                         
                         contents_for_api_call.append(user_turn)
                         gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
@@ -3116,18 +3198,31 @@ class ServicesMixin:
                         text_response = await text_model.generate_content_async(contents_for_api_call, generation_config=gen_config)
                         
                         response_text = "Here is the image you requested."
+                        was_blocked = False
                         if not text_response or not text_response.candidates:
                             reason = "Safety Filter"
                             if text_response and text_response.prompt_feedback and text_response.prompt_feedback.block_reason:
                                 reason = text_response.prompt_feedback.block_reason.name.replace('_', ' ').title()
                             
-                            custom_main = profile_settings.get("error_response", "An error has occurred.")
-                            response_text = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
+                            custom_main = profile_settings.get("error_response", ERR_GENERAL_ERROR)
+                            response_text = custom_main
+                            turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=reason))
+                            was_blocked = True
                         elif text_response.candidates[0].finish_reason.name == 'STOP':
                             raw_text = getattr(text_response, 'text', "")
                             response_text = self._deduplicate_response(self._scrub_response_text(raw_text.strip(), participant_names=[package['bot_display_name']]))
+                            if not response_text:
+                                custom_main = profile_settings.get("error_response", ERR_GENERAL_ERROR)
+                                response_text = custom_main
+                                turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=ERR_REASON_EMPTY_RESPONSE))
+                                was_blocked = True
                         
                         model_turn = {'role': 'model', 'parts': [response_text]}; chat.history.extend([user_turn, model_turn])
+
+                        # --- Update Placeholder ---
+                        if not was_blocked and not is_child_bot and placeholder_message:
+                            try: await placeholder_message.edit(content="-# Sending... (Uploading Media)")
+                            except: pass
 
                         # --- Final Message Sending ---
                         if package['generated_image_bytes'] and not package['failure_reason']:
@@ -3241,6 +3336,8 @@ class ServicesMixin:
                                     profile_name_for_appearance=package['effective_profile_name'],
                                     reply_to=None
                                 )
+                                
+                    await self._dispatch_warnings(channel, 'child_bot' if is_child_bot else 'webhook', package.get('bot_id'), turn_warnings, package['effective_profile_owner_id'], package['effective_profile_name'])
 
                 # --- Aggressive Memory Cleanup ---
                 if image_file_to_send:
@@ -3527,7 +3624,7 @@ class ServicesMixin:
             print(f"Embedding err for '{text[:30]}...': {e}")
             return None
         
-    async def _generate_ltm_data_from_history(self, hist:list, user_dn:str, gen_config_params: Dict[str, Any], model_name_to_use: str, guild_id: Optional[int], bot_dn: str = "Bot", profile_owner_id: int = None, profile_name: str = None) -> Optional[str]:
+    async def _generate_ltm_data_from_history(self, hist:list, user_dn:str, gen_config_params: Dict[str, Any], model_name_to_use: str, guild_id: Optional[int], bot_dn: str = "Bot", profile_owner_id: int = None, profile_name: str = None, warning_channel: Optional[discord.abc.Messageable] = None) -> Optional[str]:
         if not hist or len(hist) < MIN_HISTORY_FOR_LTM_CREATION: return None
         
         # [UPDATED] Standardize history for the LTM Summarizer
@@ -3629,6 +3726,8 @@ class ServicesMixin:
         except Exception as e: 
             print(f"LTM Gen err {user_dn}: {e}")
             traceback.print_exc()
+            if warning_channel:
+                await self._send_session_warning(warning_channel, f"Long-Term Memory creation failed ({self._format_api_error(e)})")
         return None
     
     async def _maybe_create_ltm(self, context_obj: Union[discord.Message, discord.abc.Messageable], author_dn: str, hist: list, profile_owner_id: int, profile_name: str, gen_config_params: Dict[str, Any], force_user_scope: bool = False, triggering_user_id_override: Optional[int] = None):
@@ -3693,8 +3792,10 @@ class ServicesMixin:
             appearance = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
             if appearance.get("custom_display_name"):
                 bot_display_name = appearance["custom_display_name"]
+            
+            warning_target = context_obj.channel if isinstance(context_obj, discord.Message) else context_obj
 
-            summary = await self._generate_ltm_data_from_history(sanitized_history, sanitized_author, effective_gen_config, fallback_model, guild_id, bot_dn=bot_display_name, profile_owner_id=profile_owner_id, profile_name=profile_name)
+            summary = await self._generate_ltm_data_from_history(sanitized_history, sanitized_author, effective_gen_config, fallback_model, guild_id, bot_dn=bot_display_name, profile_owner_id=profile_owner_id, profile_name=profile_name, warning_channel=warning_target)
             if summary:
                 summary_embedding = await self._get_embedding(summary, guild_id, task_type="RETRIEVAL_DOCUMENT")
                 if summary_embedding:
@@ -4839,7 +4940,8 @@ class ServicesMixin:
                 history_for_grounding = chat.history if chat else []
                 
                 mapping_key = self._get_mapping_key_for_session(session_key, 'single')
-                grounding_result = await self._get_hybrid_grounding_context(prompt_text, guild_id, history_for_grounding, mapping_key, is_for_image=True)
+                ch_obj = self.bot.get_channel(channel_id)
+                grounding_result = await self._get_hybrid_grounding_context(prompt_text, guild_id, history_for_grounding, mapping_key, is_for_image=True, warning_channel=ch_obj)
                 if grounding_result:
                     grounding_context, sources, _ = grounding_result
                     if grounding_context:
@@ -5131,7 +5233,7 @@ class ServicesMixin:
             "4. **Robotic Transitions:** Target phrases like 'noted', 'acknowledged', 'remains to provide', 'evaluating inputs', or 'operate within parameters'.\n\n"
             "OUTPUT RULES:\n"
             "- If no significant repetition is found, respond with ONLY 'PASS'.\n"
-            "- Do NOT provide negative constraints for special formatting that appears to be intentional, such as lines beginning with '-# ', '# ', etc.\n"
+            "- Do NOT provide negative constraints for intentional formatting, such as lines of text following '-# ', '# ', '*', etc.\n"
             "- If repetition is found, provide a strict negative constraint. Examples:\n"
             "  * 'Do not acknowledge or reference the user's frustration or feedback.'\n"
             "  * 'Do not mention Melbourne Central or Miyama in this response.'\n"
@@ -5144,7 +5246,7 @@ class ServicesMixin:
         
         try:
             # Configure thinking model for reasoning phase
-            t_params = {"thinking_budget": 1024, "thinking_summary_visible": "off", "thinking_level": "low"}
+            t_params = {"thinking_budget": 512, "thinking_summary_visible": "off", "thinking_level": "low"}
             model = GoogleGenAIModel(api_key=api_key, model_name='gemini-flash-lite-latest', system_instruction=system_instruction, thinking_params=t_params)
             
             critic_cfg = {"temperature": 0.0, "top_p": 0.95}
@@ -5238,6 +5340,7 @@ class ServicesMixin:
                 user_message_formatted = self._format_history_entry(author_display_name, datetime.datetime.now(datetime.timezone.utc), prompt_content)
                 
                 final_prompt_parts = [history_for_prompt]
+                turn_warnings = []
                 
                 # Conditional Metadata Injection
                 if ltm_recall_text: final_prompt_parts.append(ltm_recall_text)
@@ -5247,7 +5350,8 @@ class ServicesMixin:
                 p_settings = self._get_profile_config(profile_owner_id, profile_name, p_is_b) or {}
                 
                 if p_settings.get("url_fetching_enabled", True):
-                    u_t, _ = await self._process_urls_in_content(prompt_content, channel.guild.id, {"url_fetching_enabled": True})
+                    u_t, _, u_w = await self._process_urls_in_content(prompt_content, channel.guild.id, {"url_fetching_enabled": True})
+                    turn_warnings.extend(u_w)
                     if u_t: final_prompt_parts.append(f"<document_context>\n" + "\n".join(u_t) + "\n</document_context>")
 
                 final_prompt_parts.append(user_message_formatted)
@@ -5255,6 +5359,9 @@ class ServicesMixin:
                 gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
                 
                 state_container = None
+                api_error_reason = None
+                main_api_error = None
+                
                 try:
                     response, state_container = await self._generate_with_heartbeat(
                         model, [{'role': 'user', 'parts': final_prompt_parts}], gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar
@@ -5272,13 +5379,11 @@ class ServicesMixin:
                     return []
                 except Exception as e:
                     is_timeout_main = isinstance(e, TimeoutError)
+                    main_api_error = self._format_api_error(e)
                     if hasattr(e, 'state_container'): state_container = e.state_container
 
                     if not fallback_model_name or primary_model == fallback_model_name:
-                        if is_timeout_main:
-                            blocked_reason_override = "Took longer than 4 minutes (No Fallback)"
-                        else:
-                            blocked_reason_override = f"Failed generation ({self._format_api_error(e)})"
+                        api_error_reason = main_api_error
                     else:
                         try:
                             # Re-construct instructions for the fallback model
@@ -5339,7 +5444,6 @@ class ServicesMixin:
                                 raise ValueError("Empty Response (AI produced no text content)")
 
                             fallback_used = True
-                            blocked_reason_override = "Main model failed"
                             status = "success"
                             self._log_api_call(user_id=triggering_user_id or 0, guild_id=channel.guild.id, context="freewill_fallback", model_used=fb_name, status="success")
 
@@ -5351,41 +5455,53 @@ class ServicesMixin:
                             if hasattr(retry_e, 'state_container'): state_container = retry_e.state_container
                             
                             if is_timeout_main and is_timeout_fallback:
-                                blocked_reason_override = "Took longer than 7 minutes (Fallback failed)"
-                            elif is_timeout_fallback:
-                                blocked_reason_override = "Took longer than 3 minutes (Fallback failed)"
+                                api_error_reason = ERR_REASON_TIMEOUT_BOTH
                             else:
-                                blocked_reason_override = "Failed generation (Both models failed)"
+                                api_error_reason = self._format_api_error(retry_e)
                             status = "api_error"
                 except (genai.errors.APIError) as e:
+                    api_error_reason = self._format_api_error(e)
                     status = "api_error"
                 finally:
                     # Always log the primary model's final status
                     self._log_api_call(user_id=triggering_user_id or 0, guild_id=channel.guild.id, context="freewill", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
             else:
-                blocked_reason_override = warning_message or "API Error: Model failed to load."
-
-            if state_container:
-                await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
-                await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
+                api_error_reason = warning_message or "API Error: Model failed to load."
 
             response_text = ""
+            was_blocked = False
             if response and response.candidates:
                 candidate = response.candidates[0]
                 if candidate.content and candidate.content.parts:
                     response_text = getattr(response, 'text', "").strip()
 
             if not response_text.strip():
-                reason = blocked_reason_override or "Unknown Error"
+                reason = api_error_reason or "Unknown Error"
+                is_safety = False
                 if response and response.prompt_feedback and response.prompt_feedback.block_reason:
                      reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
+                     is_safety = True
                 
-                if reason == "Rate Limit":
-                    response_text = "My response was blocked due to: **API Rate Limit**. Please try again later or use paid tier API."
+                response_text = p_settings.get("error_response", ERR_GENERAL_ERROR)
+                
+                if is_safety:
+                    turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=reason))
+                elif "Rate Limit" in reason:
+                    turn_warnings.append(ERR_RATE_LIMIT)
                 else:
-                    response_text = f"My response was blocked due to: **{reason}**."
+                    if fallback_model_name and primary_model != fallback_model_name:
+                        turn_warnings.append(WARN_BOTH_MODELS_FAILED.format(reason=reason))
+                    else:
+                        turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=reason))
+                was_blocked = True
 
             response_text = self._deduplicate_response(response_text)
+            
+            if response_text == "[REPETITIVE_CONTENT_ERROR]":
+                response_text = p_settings.get("error_response", ERR_GENERAL_ERROR)
+                warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
+                turn_warnings.append(warn_tmp.format(reason=ERR_REASON_REPETITIVE_CONTENT))
+                was_blocked = True
 
             p_index = self._get_user_index(profile_owner_id)
             p_is_b = profile_name in p_index.get("borrowed", [])
@@ -5404,7 +5520,21 @@ class ServicesMixin:
             
             # Check profile setting for fallback indicator
             if fallback_used and p_settings.get("show_fallback_indicator", True):
-                text_to_send += f"\n\n-# Fallback Model Used **({blocked_reason_override})**."
+                turn_warnings.append(WARN_FALLBACK_USED)
+                turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=main_api_error))
+
+            if not was_blocked:
+                # We do not track start time precisely in Freewill yet, so use a simple estimation logic or None.
+                # However, updating the placeholder guarantees visual consistency if TTS is added to Freewill.
+                await self._update_sending_placeholder(channel, method, bot_id, state_container, time.monotonic() - 10)
+
+            if state_container:
+                if state_container.get('sending_task'):
+                    state_container['sending_task'].cancel()
+                await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
+                await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
+                state_container['msg_a_id'] = None
+                state_container['msg_b_id'] = None
 
             if method == 'child_bot' and bot_id:
                 correlation_id = str(uuid.uuid4())
@@ -5428,8 +5558,10 @@ class ServicesMixin:
                     channel, text_to_send, target_message_to_edit=None,
                     profile_owner_id_for_appearance=profile_owner_id, profile_name_for_appearance=profile_name
                 )
+                
+            await self._dispatch_warnings(channel, method, bot_id, turn_warnings, profile_owner_id, profile_name)
 
-            if sent_messages and not response_text.startswith("An error has occurred"):
+            if sent_messages and not response_text.startswith(p_settings.get("error_response", ERR_GENERAL_ERROR)):
                 # Standardize the turn_info structure to match single-profile and child bot replies
                 turn_info = (('freewill', channel.id), user_content_obj, model_content_obj, profile_owner_id, profile_name)
                 for msg in sent_messages:
@@ -5551,17 +5683,17 @@ class ServicesMixin:
         except Exception as e:
             await interaction.followup.send(f"❌ **Analysis Failed:** {e}", ephemeral=True)
 
-    async def _process_urls_in_content(self, content: str, guild_id: int, profile_settings: Dict[str, Any]) -> Tuple[List[str], List[Dict]]:
-        # This guard is now bypassed by the "Research Once" phase which passes a dummy object with enabled=True
+    async def _process_urls_in_content(self, content: str, guild_id: int, profile_settings: Dict[str, Any], warning_channel: Optional[discord.abc.Messageable] = None) -> Tuple[List[str], List[Dict], List[str]]:
+        warnings = []
         if not profile_settings.get("url_fetching_enabled", False):
-            return [], []
+            return [], [], warnings
 
         text_contexts = []
         media_parts = []
         url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
         found_urls = re.findall(url_pattern, content)
         if not found_urls:
-            return [], []
+            return [], [], warnings
 
         async with httpx.AsyncClient() as client:
             for url in found_urls[:2]:
@@ -5608,18 +5740,19 @@ class ServicesMixin:
                         text_contexts.append(url_context)
 
                 except Exception as e:
-                    pass
+                    warnings.append(WARN_URL_FETCHING_FAILED.format(reason=self._format_api_error(e)))
         
-        return text_contexts, media_parts
+        return text_contexts, media_parts, warnings
 
-    async def _get_hybrid_grounding_context(self, user_query: str, guild_id: int, conversation_history: List, mapping_key: Any, safety_settings: Optional[Dict] = None, is_for_image: bool = False) -> Optional[Tuple[str, List[Dict], bool]]:
+    async def _get_hybrid_grounding_context(self, user_query: str, guild_id: int, conversation_history: List, mapping_key: Any, safety_settings: Optional[Dict] = None, is_for_image: bool = False, warning_channel: Optional[discord.abc.Messageable] = None) -> Optional[Tuple[str, List[Dict], bool, Optional[str]]]:
         effective_guild_id = guild_id or 0
         api_key = self._get_api_key_for_guild(effective_guild_id)
         if not api_key:
-            return None
+            return None, [], False, None
 
         status = "api_error"
-        model_name = 'gemini-2.0-flash' # Use a single, tool-capable model
+        warning_str = None
+        model_name = 'gemini-flash-lite-latest' # Use a single, tool-capable model
         try:
             # Check for grounding checkpoint in the session log rather than a separate mapping
             checkpoint = None
@@ -5708,48 +5841,38 @@ class ServicesMixin:
                 f"<user_query>\n{user_query}\n</user_query>"
             )
 
-            client = genai.Client(api_key=api_key)
             grounding_tool = types.Tool(
                 google_search=types.GoogleSearch()
             )
             
-            g_safety_settings = []
-            if safety_settings:
-                for cat, thresh in safety_settings.items():
-                    g_safety_settings.append(types.SafetySetting(
-                        category=cat.name,
-                        threshold=thresh.name
-                    ))
-
-            config = types.GenerateContentConfig(
-                tools=[grounding_tool],
-                temperature=0.1,
-                top_p=0.9,
+            t_params = {"thinking_budget": 512, "thinking_summary_visible": "off", "thinking_level": "low"}
+            
+            model = GoogleGenAIModel(
+                api_key=api_key,
+                model_name=model_name,
                 system_instruction=system_instruction,
-                safety_settings=g_safety_settings if g_safety_settings else None
+                safety_settings=safety_settings,
+                thinking_params=t_params,
+                tools=[grounding_tool]
             )
 
-            func = functools.partial(
-                client.models.generate_content,
-                model=f'models/{model_name}',
-                contents=user_prompt,
-                config=config
-            )
-            grounding_response = await self.bot.loop.run_in_executor(None, func)
+            gen_config = {"temperature": 0.1, "top_p": 0.95}
+            
+            grounding_response = await model.generate_content_async([user_prompt], generation_config=gen_config)
             status = "success"
 
             if not grounding_response.text:
-                return None, [], False
+                return None, [], False, None
 
             lines = grounding_response.text.strip().split('\n')
             decision = lines[0].strip().lower()
 
             if decision != 'yes':
-                return None, [], False
+                return None, [], False, None
 
             summary = "\n".join(lines[1:]).strip()
             if not summary:
-                return None, [], False
+                return None, [], False, None
 
             truncated_summary = self._truncate_text_by_char(summary, MAX_URL_CONTEXT_CHARACTERS)
             
@@ -5763,22 +5886,20 @@ class ServicesMixin:
                 )
             
             sources = []
-            if grounding_response.candidates and hasattr(grounding_response.candidates[0], 'grounding_metadata'):
-                metadata = grounding_response.candidates[0].grounding_metadata
+            if grounding_response.candidates and hasattr(grounding_response.raw.candidates[0], 'grounding_metadata'):
+                metadata = grounding_response.raw.candidates[0].grounding_metadata
                 if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
                     for chunk in metadata.grounding_chunks:
                         if hasattr(chunk, 'web'):
                             sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
             
-            # If we got this far, a search was performed, so we should set a checkpoint.
-            return summary_context, sources, True
+            return summary_context, sources, True, None
 
         except Exception as e:
-            # Catch-all for grounding errors. Fail open (no grounding) rather than crashing the bot.
-            print(f"Hybrid grounding failed (Code: {status}): {e}")
-            return None, [], False
+            status = "api_error"
+            warning_str = WARN_GROUNDING_FAILED.format(reason=self._format_api_error(e))
+            return None, [], False, warning_str
         finally:
-            # Log a single call for the combined operation
             self._log_api_call(user_id=0, guild_id=guild_id, context="grounding_combined", model_used=model_name, status=status)
 
     def _get_image_gen_system_instruction(self, owner_id: int, profile_name: str) -> Optional[str]:
@@ -6055,7 +6176,7 @@ class ServicesMixin:
                 history_for_grounding = chat.history[-(grounding_stm * 2):] if chat and grounding_stm > 0 else []
                 
                 mapping_key = self._get_mapping_key_for_session(session_key, 'single')
-                grounding_result = await self._get_hybrid_grounding_context(prompt_text, guild_id, history_for_grounding, mapping_key, safety_settings=dynamic_safety_settings, is_for_image=True)
+                grounding_result = await self._get_hybrid_grounding_context(prompt_text, guild_id, history_for_grounding, mapping_key, safety_settings=dynamic_safety_settings, is_for_image=True, warning_channel=message.channel)
                 if grounding_result:
                     grounding_context, sources, _ = grounding_result
                     if grounding_context:
@@ -6133,7 +6254,9 @@ class ServicesMixin:
                     return wav_io
             return None
         except Exception as e:
-            print(f"Google TTS Error: {e}")
+            err_msg = self._format_api_error(e)
+            if "404" not in err_msg:
+                print(f"Google TTS Error: {err_msg}")
             return None
 
     def _stitch_wav_segments(self, segments: List[io.BytesIO]) -> io.BytesIO:
@@ -6375,6 +6498,12 @@ class ServicesMixin:
             app_name, app_avatar = self._resolve_appearance_data(p_owner_id, p_name)
             state_container = None
             status = "api_error"
+            was_blocked = False
+            turn_warnings = []
+            api_error_reason = None
+            main_api_error = None
+            response = None
+            fallback_used = False
             
             try:
                 response, state_container = await self._generate_with_heartbeat(
@@ -6394,10 +6523,11 @@ class ServicesMixin:
                 return
             except Exception as e:
                 is_timeout_main = isinstance(e, TimeoutError)
+                main_api_error = self._format_api_error(e)
                 if hasattr(e, 'state_container'): state_container = e.state_container
                 
                 if not fallback_model_name or primary_model == fallback_model_name:
-                    print(f"Regen primary failed: {e}")
+                    api_error_reason = main_api_error
                 else:
                     try:
                         fb_name = fallback_model_name
@@ -6433,22 +6563,68 @@ class ServicesMixin:
                         if re.search(r'(.)\1{999,}', fb_raw_check):
                             raise ValueError("[REPETITIVE_CONTENT_ERROR]")
 
+                        fallback_used = True
                     except asyncio.CancelledError:
                         session['is_regenerating'] = False
                         return
                     except Exception as retry_e:
-                        print(f"Regen fallback failed: {retry_e}")
-                        pass
+                        is_timeout_fallback = isinstance(retry_e, TimeoutError)
+                        if hasattr(retry_e, 'state_container'): state_container = retry_e.state_container
+                        
+                        if is_timeout_main and is_timeout_fallback:
+                            api_error_reason = ERR_REASON_TIMEOUT_BOTH
+                        else:
+                            api_error_reason = self._format_api_error(retry_e)
             
-            if state_container:
-                await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
-
             if not response or not response.candidates:
-                new_text = "I'm sorry, I encountered an issue while trying to regenerate that response."
+                new_text = p_profile.get("error_response", ERR_GENERAL_ERROR)
+                was_blocked = True
+                
+                reason = api_error_reason or "Unknown Error"
+                is_safety = False
+                if response and hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
+                    reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
+                    is_safety = True
+                    
+                if is_safety:
+                    turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=reason))
+                elif "Rate Limit" in reason: 
+                    turn_warnings.append(ERR_RATE_LIMIT)
+                else:
+                    if fallback_model_name and primary_model != fallback_model_name:
+                        turn_warnings.append(WARN_BOTH_MODELS_FAILED.format(reason=reason))
+                    else:
+                        turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=reason))
             else:
                 raw_text = getattr(response, 'text', "").strip()
                 new_text = self._deduplicate_response(self._scrub_response_text(raw_text))
+                
+                if new_text == "[REPETITIVE_CONTENT_ERROR]":
+                    new_text = p_profile.get("error_response", ERR_GENERAL_ERROR)
+                    warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
+                    turn_warnings.append(warn_tmp.format(reason=ERR_REASON_REPETITIVE_CONTENT))
+                    was_blocked = True
+                elif not new_text:
+                    new_text = p_profile.get("error_response", ERR_GENERAL_ERROR)
+                    warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
+                    turn_warnings.append(warn_tmp.format(reason=ERR_REASON_EMPTY_RESPONSE))
+                    was_blocked = True
+
+            if fallback_used and p_profile.get("show_fallback_indicator", True):
+                turn_warnings.append(WARN_FALLBACK_USED)
+                turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=main_api_error))
+                
+            if turn_warnings:
+                warning_str = "\n\n" + "\n".join([f"-# {i+1}. {w}" for i, w in enumerate(turn_warnings)])
+                new_text += warning_str
             
+            if state_container:
+                await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
+                state_container['msg_b_id'] = None
+            
+            if not was_blocked:
+                await self._update_sending_placeholder(channel, participant.get('method', 'webhook'), participant.get('bot_id'), state_container, time.monotonic() - 15)
+
             # 5. Apply Changes
             sent_timestamp = datetime.datetime.now(datetime.timezone.utc)
             p_index = self._get_user_index(p_owner_id)
@@ -6480,6 +6656,9 @@ class ServicesMixin:
             else:
                 final_target_turn.pop('thought_signature', None)
             
+            if state_container and state_container.get('sending_task'):
+                state_container['sending_task'].cancel()
+            
             if participant.get('method') == 'child_bot':
                 await self.manager_queue.put({
                     "action": "send_to_child", "bot_id": participant['bot_id'],
@@ -6508,6 +6687,105 @@ class ServicesMixin:
             print(f"Regeneration failed: {e}")
         finally:
             session['is_regenerating'] = False
+
+    async def _update_sending_placeholder(self, channel, participant_method, bot_id, state_container, start_time_mono):
+        if not state_container: return
+        
+        async def heartbeat_loop():
+            try:
+                # Immediate initial update
+                elapsed = time.monotonic() - start_time_mono
+                mins = int(elapsed) // 60
+                secs = int(elapsed) % 60
+                time_str = f"{mins}:{secs:02d}"
+                sending_text = f"-# Sending... ({time_str})"
+                
+                async def do_update(text):
+                    if state_container.get('message_type') == 'embed' and state_container.get('placeholder_msg'):
+                        try:
+                            msg_obj = state_container['placeholder_msg']
+                            if msg_obj and msg_obj.embeds:
+                                embed = msg_obj.embeds[0]
+                                embed.description = f"{state_container.get('custom_emoji', PLACEHOLDER_EMOJI)}\n\n{text}"
+                                await msg_obj.edit(embed=embed)
+                        except Exception: pass
+                        return
+
+                    target_msg_id = state_container.get('msg_b_id') or state_container.get('msg_a_id')
+                    if not target_msg_id: return
+                    
+                    try:
+                        if participant_method == 'child_bot' and bot_id:
+                            await self.manager_queue.put({
+                                "action": "send_to_child", "bot_id": bot_id,
+                                "payload": {
+                                    "action": "regenerate_message", "channel_id": channel.id,
+                                    "message_id": target_msg_id, "content": text
+                                }
+                            })
+                        else:
+                            wh = await self._get_or_create_webhook(channel)
+                            if wh:
+                                await wh.edit_message(target_msg_id, content=text)
+                    except Exception:
+                        pass
+
+                await do_update(sending_text)
+
+                # Loop to tick exactly on every 10s interval
+                while True:
+                    elapsed = time.monotonic() - start_time_mono
+                    next_tick = ((int(elapsed) // 10) + 1) * 10
+                    sleep_time = next_tick - elapsed
+                    
+                    if sleep_time > 0:
+                        await asyncio.sleep(sleep_time)
+                        
+                    elapsed = time.monotonic() - start_time_mono
+                    mins = int(elapsed) // 60
+                    secs = int(elapsed) % 60
+                    time_str = f"{mins}:{secs:02d}"
+                    sending_text = f"-# Sending... ({time_str})"
+                    
+                    await do_update(sending_text)
+
+            except asyncio.CancelledError:
+                pass
+
+        state_container['sending_task'] = asyncio.create_task(heartbeat_loop())
+
+    async def _dispatch_warnings(self, channel, participant_method, bot_id, warnings, owner_id, profile_name, session=None, turn_object=None):
+        if not warnings: return
+        warning_text = "\n".join([f"-# {i+1}. {w}" for i, w in enumerate(warnings)])
+        try:
+            if participant_method == 'child_bot' and bot_id:
+                corr_id = str(uuid.uuid4())
+                if turn_object and session:
+                    self.pending_child_confirmations[corr_id] = {
+                        "event": asyncio.Event(), "type": "multi_profile", "participant": {"bot_id": bot_id},
+                        "channel_id": channel.id, "turn_id": turn_object["turn_id"]
+                    }
+                await self.manager_queue.put({
+                    "action": "send_to_child", "bot_id": bot_id,
+                    "payload": {
+                        "action": "send_message", "channel_id": channel.id,
+                        "content": warning_text, "realistic_typing": False,
+                        "reply_to_id": None, "ping": False,
+                        "correlation_id": corr_id if (turn_object and session) else None
+                    }
+                })
+            else:
+                sent_msgs = await self._send_channel_message(
+                    channel, warning_text,
+                    profile_owner_id_for_appearance=owner_id,
+                    profile_name_for_appearance=profile_name,
+                    bypass_typing=True
+                )
+                if sent_msgs and turn_object and session:
+                    turn_object.setdefault("message_ids", []).extend([m.id for m in sent_msgs])
+                    await self._save_session_to_disk((channel.id, None, None), session.get("type", "multi"), session.get("unified_log", []))
+        except Exception as e:
+            print(f"Failed to dispatch warnings: {e}")
 
     def _format_api_error(self, error: Exception) -> str:
         """Analyses API exceptions to provide specific, user-friendly diagnostic strings."""
@@ -6545,15 +6823,15 @@ class ServicesMixin:
                 pass
         
         # 2. Standard HTTP Status Codes
-        if "429" in error_str: return "Rate Limit (429)"
-        if "402" in error_str: return "Insufficient Credits (402)"
-        if "401" in error_str: return "Invalid API Key (401)"
+        if "429" in error_str: return "Rate Limited"
+        if "402" in error_str: return "Insufficient Credits"
+        if "401" in error_str: return "Invalid API Key"
         if "404" in error_str: 
             if "no endpoints found" in error_str.lower():
-                return "Capability Mismatch (404 - Check model features)"
-            return "Model Not Found (404)"
-        if "403" in error_str: return "Access Forbidden/Moderated (403)"
-        if "413" in error_str: return "File Too Large (413)"
+                return "Capability Mismatch"
+            return "Model Not Found"
+        if "403" in error_str: return "Access Forbidden/Moderated"
+        if "413" in error_str: return "File Too Large"
         
         # 3. Fallback to truncated raw error with brackets stripped for aesthetic safety
         clean_err = error_str.replace('"', "'").replace('{', '').replace('}', '').replace('\n', ' ')
