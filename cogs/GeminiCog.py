@@ -1083,6 +1083,13 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         if session.get('worker_task'):
             self._safe_cancel_task(session['worker_task'])
             session['worker_task'] = None
+            
+        while not session['task_queue'].empty():
+            try:
+                session['task_queue'].get_nowait()
+                session['task_queue'].task_done()
+            except asyncio.QueueEmpty:
+                break
         
         await interaction.followup.send("The session memory for this channel has been cleared. The conversation will start from scratch.", ephemeral=True)
 

@@ -2207,11 +2207,15 @@ class ServicesMixin:
                                     
                                 status = "success"
                             except asyncio.CancelledError:
+                                if state_container:
+                                    if state_container.get('sending_task'): state_container['sending_task'].cancel()
+                                    await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
+                                    await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
                                 if 'contents_for_api_call' in locals():
                                     contents_for_api_call.clear()
                                     del contents_for_api_call
                                 gc.collect()
-                                continue
+                                raise
                             except Exception as e:
                                 is_timeout_main = isinstance(e, TimeoutError)
                                 main_api_error = self._format_api_error(e)
@@ -2256,11 +2260,15 @@ class ServicesMixin:
                                         fallback_used = True
                                         self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile_fallback", model_used=fb_name, status="success")
                                     except asyncio.CancelledError:
+                                        if state_container:
+                                            if state_container.get('sending_task'): state_container['sending_task'].cancel()
+                                            await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
+                                            await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
                                         if 'contents_for_api_call' in locals():
                                             contents_for_api_call.clear()
                                             del contents_for_api_call
                                         gc.collect()
-                                        continue
+                                        raise
                                     except Exception as retry_e:
                                         is_timeout_fallback = isinstance(retry_e, TimeoutError)
                                         if hasattr(retry_e, 'state_container'): state_container = retry_e.state_container
@@ -5376,6 +5384,10 @@ class ServicesMixin:
 
                     status = "success"
                 except asyncio.CancelledError:
+                    if state_container:
+                        if state_container.get('sending_task'): state_container['sending_task'].cancel()
+                        await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
+                        await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
                     return []
                 except Exception as e:
                     is_timeout_main = isinstance(e, TimeoutError)
@@ -5448,6 +5460,10 @@ class ServicesMixin:
                             self._log_api_call(user_id=triggering_user_id or 0, guild_id=channel.guild.id, context="freewill_fallback", model_used=fb_name, status="success")
 
                         except asyncio.CancelledError:
+                            if state_container:
+                                if state_container.get('sending_task'): state_container['sending_task'].cancel()
+                                await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
+                                await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
                             return []
                         except Exception as retry_e:
                             print(f"Freewill fallback retry failed: {retry_e}")
@@ -6519,6 +6535,10 @@ class ServicesMixin:
                     raise ValueError("[REPETITIVE_CONTENT_ERROR]")
                     
             except asyncio.CancelledError:
+                if state_container:
+                    if state_container.get('sending_task'): state_container['sending_task'].cancel()
+                    await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
+                    await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
                 session['is_regenerating'] = False
                 return
             except Exception as e:
@@ -6565,6 +6585,10 @@ class ServicesMixin:
 
                         fallback_used = True
                     except asyncio.CancelledError:
+                        if state_container:
+                            if state_container.get('sending_task'): state_container['sending_task'].cancel()
+                            await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
+                            await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
                         session['is_regenerating'] = False
                         return
                     except Exception as retry_e:
