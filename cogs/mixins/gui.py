@@ -16,6 +16,7 @@ from collections import OrderedDict
 import asyncio
 import orjson as json
 from typing import TYPE_CHECKING, List, Dict, Tuple, Set, Literal, Any, Optional, Union, get_args
+from .constants import IMAGE_MODELS, AUDIO_MODELS
 from .storage import (
     _quantize_embedding, 
 )
@@ -310,10 +311,10 @@ class GlobalChatPlayView(ui.View):
 class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
     model_id_input = ui.TextInput(label="Model ID", placeholder="e.g. anthropic/claude-3", required=True)
 
-    def __init__(self, view: 'ModelApplyView', select_type: str):
+    def __init__(self, view: 'SingleProfileModelView', target_config_key: str):
         super().__init__()
         self.parent_view = view
-        self.select_type = select_type
+        self.target_config_key = target_config_key
 
     async def on_submit(self, interaction: discord.Interaction):
         value = self.model_id_input.value.strip()
@@ -330,10 +331,7 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
         # Always prepend the prefix
         value = prefix + value
         
-        if self.select_type == 'primary':
-            self.parent_view.primary_model = value
-        else:
-            self.parent_view.fallback_model = value
+        self.parent_view._save_changes(self.target_config_key, value)
         
         self.parent_view._build_view()
         await interaction.response.edit_message(content=self.parent_view._get_selection_feedback_message(), view=self.parent_view)
@@ -971,15 +969,8 @@ class ProfileSpeechSettingsModal(ui.Modal, title="Speech & Voice Settings"):
             required=False,
             max_length=40
         )
-        self.model_input = ui.TextInput(
-            label="Speech Model ID", 
-            default=str(current_params.get("speech_model", "gemini-2.5-flash-preview-tts")), 
-            placeholder="Model used for synthesis",
-            required=False,
-            max_length=80
-        )
         self.temp_input = ui.TextInput(
-            label="Speech Temp / Prosody (0.0 - 2.0)", 
+            label="Temperature (0.0 - 2.0)", 
             default=str(current_params.get("speech_temperature", 1.0)), 
             placeholder="1.0 = Default, 2.0 = High Expression",
             required=False,
@@ -987,14 +978,12 @@ class ProfileSpeechSettingsModal(ui.Modal, title="Speech & Voice Settings"):
         )
         
         self.add_item(self.voice_input)
-        self.add_item(self.model_input)
         self.add_item(self.temp_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         
         voice = self.voice_input.value.strip() or "Aoede"
-        model = self.model_input.value.strip() or "gemini-2.5-flash-preview-tts"
         
         try:
             temp_raw = self.temp_input.value.strip()
@@ -1006,7 +995,6 @@ class ProfileSpeechSettingsModal(ui.Modal, title="Speech & Voice Settings"):
 
         new_params = {
             "speech_voice": voice,
-            "speech_model": model,
             "speech_temperature": temp,
         }
 
@@ -1121,12 +1109,12 @@ class ProfileManageView(ui.View):
             options.append(discord.SelectOption(label="Set Generation Parameters & STM", value="gen_params", description="Set Temp, Top P, Top K, and STM Length."))
             options.append(discord.SelectOption(label="Set Advanced Parameters (OPENROUTER)", value="adv_params", description="Set penalties, Min P, and Top A."))
             options.append(discord.SelectOption(label="Set Thinking Parameters", value="thinking_params", description="Set thinking persistence, level, and budget."))
-            options.append(discord.SelectOption(label="Set Speech & Voice Settings", value="speech_settings", description="Set TTS voice, model, and prosody."))
+            options.append(discord.SelectOption(label="Set Speech & Voice Settings", value="speech_settings", description="Set TTS voice, model, and temperature."))
 
         elif self.current_tab == "tools":
             options.append(discord.SelectOption(label="Toggle Image Generation", value="image_toggle", description="Allow this profile to generate images via !image/!imagine."))
-            options.append(discord.SelectOption(label="Toggle Grounding (Web Search)", value="grounding", description="Cycle grounding: Off -> On -> On+."))
-            options.append(discord.SelectOption(label="Toggle URL Context Fetching", value="url_toggle", description="Allow this profile to fetch content from links in messages."))
+            options.append(discord.SelectOption(label="Toggle Grounding (Web Search)", value="grounding", description="Cycle Grounding: OFF -> NATIVE -> RAG."))
+            options.append(discord.SelectOption(label="Toggle URL Context Fetching", value="url_toggle", description="Cycle URL Context: OFF -> NATIVE -> RAG."))
             options.append(discord.SelectOption(label="Cycle Response Mode", value="cycle_response", description="Cycle: Regular -> Mention -> Reply -> Mention Reply."))
             options.append(discord.SelectOption(label="Set Time & Timezone", value="time", description="Enable time awareness and set the profile's timezone."))
             options.append(discord.SelectOption(label="Toggle Generation Metadata", value="metadata_toggle", description="Show/hide generation time in context."))
@@ -1300,12 +1288,18 @@ class ProfileManageView(ui.View):
             await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice == "grounding":
             current_mode = profile.get("grounding_mode", "off")
-            if isinstance(current_mode, bool): current_mode = "on" if current_mode else "off"
-            cycle_map = {"off": "on", "on": "on+", "on+": "off"}
+            if isinstance(current_mode, bool): current_mode = "rag" if current_mode else "off"
+            elif current_mode == "on" or current_mode == "on+": current_mode = "rag" # Legacy migration
+            cycle_map = {"off": "native", "native": "rag", "rag": "off"}
             profile["grounding_mode"] = cycle_map.get(current_mode, "off")
             await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice == "url_toggle":
-            profile["url_fetching_enabled"] = not profile.get("url_fetching_enabled", False)
+            current_mode = profile.get("url_mode", "off")
+            if "url_mode" not in profile:
+                current_mode = "rag" if profile.get("url_fetching_enabled", False) else "off"
+            cycle_map = {"off": "native", "native": "rag", "rag": "off"}
+            profile["url_mode"] = cycle_map.get(current_mode, "off")
+            profile["url_fetching_enabled"] = (profile["url_mode"] == "rag") # Legacy support
             await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice == "time":
             await self._handle_timezone(interaction, profile, self.is_borrowed)
@@ -3055,9 +3049,6 @@ class ProfileImageGenSettingsModal(ui.Modal, title="Image Generation Settings"):
         status_val = "on" if current_params.get("image_generation_enabled", False) else "off"
         self.add_item(ui.TextInput(label="Enable Image Gen (on/off)", custom_id="enabled", default=status_val, required=True))
         
-        model_val = current_params.get("image_generation_model", "gemini-2.5-flash-image")
-        self.add_item(ui.TextInput(label="Model (Google Gemini Only)", custom_id="model", default=model_val, required=True))
-        
         if not self.is_borrowed:
             enc_prompt = current_params.get("image_generation_prompt")
             prompt_val = self.cog._decrypt_data(enc_prompt) if enc_prompt else ""
@@ -3070,10 +3061,6 @@ class ProfileImageGenSettingsModal(ui.Modal, title="Image Generation Settings"):
             def gv(cid): return next((c.value for c in self.children if c.custom_id == cid), None)
             en_val = gv("enabled").strip().lower()
             new_params["image_generation_enabled"] = (en_val == "on")
-            
-            mod_val = gv("model").strip()
-            if not mod_val: mod_val = "gemini-2.5-flash-image"
-            new_params["image_generation_model"] = mod_val
             
             if not self.is_borrowed:
                 pr_val = gv("prompt")
@@ -3436,50 +3423,21 @@ class SingleProfileModelView(ui.View):
         self.user_id = interaction.user.id
         self.profile_name = profile_name
         self.view_mode = 'google'
+        self.category = 'response' # 'response', 'media', 'tools', 'ltm'
 
         index = self.cog._get_user_index(self.user_id)
-        is_borrowed = profile_name in index.get("borrowed", [])
-        self.profile_data = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed) or {}
-        
-        self._primary_model = self.profile_data.get("primary_model", PRIMARY_MODEL_NAME)
-        self._fallback_model = self.profile_data.get("fallback_model", FALLBACK_MODEL_NAME)
+        self.is_borrowed = profile_name in index.get("borrowed", [])
         
         self._build_view()
 
-    @property
-    def primary_model(self):
-        return self._primary_model
+    def _get_current_profile_data(self) -> Dict[str, Any]:
+        return self.cog._get_profile_config(self.user_id, self.profile_name, self.is_borrowed) or {}
 
-    @primary_model.setter
-    def primary_model(self, value):
-        self._primary_model = value
-        self._save_changes("primary_model", value)
-
-    @property
-    def fallback_model(self):
-        return self._fallback_model
-
-    @fallback_model.setter
-    def fallback_model(self, value):
-        self._fallback_model = value
-        self._save_changes("fallback_model", value)
-
-    @property
-    def show_fallback_indicator(self):
-        return self.profile_data.get("show_fallback_indicator", True)
-
-    @show_fallback_indicator.setter
-    def show_fallback_indicator(self, value):
-        self._save_changes("show_fallback_indicator", value)
-
-    def _save_changes(self, key, value):
-        index = self.cog._get_user_index(self.user_id)
-        is_borrowed = self.profile_name in index.get("borrowed", [])
-        target_dict = self.cog._get_profile_config(self.user_id, self.profile_name, is_borrowed)
-        
-        if target_dict:
+    def _save_changes(self, key: str, value: Any):
+        target_dict = self._get_current_profile_data()
+        if target_dict is not None:
             target_dict[key] = value
-            self.cog._save_profile_config(self.user_id, self.profile_name, target_dict, is_borrowed)
+            self.cog._save_profile_config(self.user_id, self.profile_name, target_dict, self.is_borrowed)
             
             # Clear model cache for this user
             keys_to_delete = []
@@ -3499,12 +3457,41 @@ class SingleProfileModelView(ui.View):
                 self.cog.channel_model_last_profile_key.pop(k, None)
 
     def _get_selection_feedback_message(self) -> str:
-        p_clean = self.primary_model.replace("GOOGLE/", "").replace("OPENROUTER/", "")
-        f_clean = self.fallback_model.replace("GOOGLE/", "").replace("OPENROUTER/", "")
-        fb_status = "ON" if self.show_fallback_indicator else "OFF"
-        return f"**Profile:** `{self.profile_name}`\n**Primary:** `{p_clean}`\n**Fallback:** `{f_clean}`\n**Fallback Indicator:** `{fb_status}`\n"
+        data = self._get_current_profile_data()
+        
+        def clean(val):
+            if not val: return "None"
+            return str(val).replace("GOOGLE/", "").replace("OPENROUTER/", "")
+            
+        msg = f"**Profile:** `{self.profile_name}`\n"
+        if self.view_mode == 'openrouter':
+            msg += "⚠️ **Note:** OpenRouter / Custom models require **RAG Mode** for Grounding and URL Context.\n\n"
+        
+        if self.category == 'response':
+            p_clean = clean(data.get("primary_model", PRIMARY_MODEL_NAME))
+            f_clean = clean(data.get("fallback_model", FALLBACK_MODEL_NAME))
+            fb_status = "ON" if data.get("show_fallback_indicator", True) else "OFF"
+            msg += f"**Primary:** `{p_clean}`\n**Fallback:** `{f_clean}`\n**Fallback Indicator:** `{fb_status}`\n"
+        elif self.category == 'media':
+            i_clean = clean(data.get("image_generation_model", "gemini-2.5-flash-image"))
+            t_clean = clean(data.get("speech_model", "gemini-2.5-flash-preview-tts"))
+            msg += f"**Image Generation:** `{i_clean}`\n**Text-to-Speech:** `{t_clean}`\n"
+        elif self.category == 'tools':
+            g_clean = clean(data.get("grounding_rag_model", FALLBACK_MODEL_NAME))
+            c_clean = clean(data.get("critic_model", FALLBACK_MODEL_NAME))
+            msg += f"**Grounding RAG:** `{g_clean}`\n**Anti-Repetition Critic:** `{c_clean}`\n"
+        elif self.category == 'ltm':
+            l_clean = clean(data.get("ltm_model", FALLBACK_MODEL_NAME))
+            msg += f"**LTM Summariser:** `{l_clean}`\n"
+            
+        return msg
 
-    def _get_top_models(self, provider: str) -> List[str]:
+    def _get_top_models(self, provider: str, target_config_key: str) -> List[str]:
+        if target_config_key == 'image_generation_model':
+            return list(get_args(IMAGE_MODELS))
+        if target_config_key == 'speech_model':
+            return list(get_args(AUDIO_MODELS))
+            
         if provider == 'google':
             return list(get_args(ALLOWED_MODELS))
 
@@ -3521,75 +3508,127 @@ class SingleProfileModelView(ui.View):
         sorted_models = sorted(data.items(), key=lambda x: x[1], reverse=True)
         return [m[0] for m in sorted_models]
 
+    class GenericModelSelect(ui.Select):
+        def __init__(self, placeholder: str, options: list, row: int, target_config_key: str):
+            super().__init__(placeholder=placeholder, options=options, row=row)
+            self.target_config_key = target_config_key
+
+        async def callback(self, interaction: discord.Interaction):
+            view: SingleProfileModelView = self.view
+            if self.values[0] == "custom_option":
+                await interaction.response.send_modal(CustomModelModal(view, self.target_config_key))
+            else: 
+                view._save_changes(self.target_config_key, self.values[0])
+                view._build_view()
+                await interaction.response.edit_message(content=view._get_selection_feedback_message(), view=view)
+
+    def _create_model_options(self, current_val: str, target_config_key: str) -> List[discord.SelectOption]:
+        top_models = self._get_top_models(self.view_mode, target_config_key)
+        opts = [discord.SelectOption(label="Custom Model...", value="custom_option", description="Enter manually via modal")]
+        
+        if current_val:
+            # We do NOT strip the prefix here so the user always sees the exact provider routing for the active model.
+            opts.append(discord.SelectOption(label=f"Current: {current_val}", value=current_val, default=True))
+        
+        prefix = "OPENROUTER/" if self.view_mode == 'openrouter' else "GOOGLE/"
+        if target_config_key in ['image_generation_model', 'speech_model']:
+            prefix = "GOOGLE/" # Enforce Google prefix for media
+            
+        added = len(opts)
+        for m in top_models:
+            if added >= 25: break
+            val = f"{prefix}{m}"
+            if current_val != val:
+                opts.append(discord.SelectOption(label=m[:100], value=val))
+                added += 1
+        return opts
+
     def _build_view(self):
         self.clear_items()
-        top_models = self._get_top_models(self.view_mode)
+        data = self._get_current_profile_data()
         
-        def create_model_options(current_val):
-            opts = [discord.SelectOption(label="Custom Model...", value="custom_option", description="Enter manually via modal")]
+        # Enforce Google Mode for Media
+        if self.category == 'media':
+            self.view_mode = 'google'
             
-            if current_val:
-                label = current_val
-                if self.view_mode == 'google' and label.upper().startswith("GOOGLE/"): label = label[7:]
-                elif self.view_mode == 'openrouter' and label.upper().startswith("OPENROUTER/"): label = label[11:]
-                opts.append(discord.SelectOption(label=f"Current: {label}", value=current_val, default=True))
+        # --- Row 0 & 1: Dropdowns ---
+        if self.category == 'response':
+            p_val = data.get("primary_model", PRIMARY_MODEL_NAME)
+            f_val = data.get("fallback_model", FALLBACK_MODEL_NAME)
+            self.add_item(self.GenericModelSelect("Select Primary Model...", self._create_model_options(p_val, "primary_model"), 0, "primary_model"))
+            self.add_item(self.GenericModelSelect("Select Fallback Model...", self._create_model_options(f_val, "fallback_model"), 1, "fallback_model"))
             
-            prefix = "OPENROUTER/" if self.view_mode == 'openrouter' else "GOOGLE/"
-            added = len(opts)
-            for m in top_models:
-                if added >= 25: break
-                val = f"{prefix}{m}"
-                if current_val != val:
-                    opts.append(discord.SelectOption(label=m[:100], value=val))
-                    added += 1
-            return opts
+        elif self.category == 'media':
+            i_val = data.get("image_generation_model", "GOOGLE/gemini-2.5-flash-image")
+            t_val = data.get("speech_model", "GOOGLE/gemini-2.5-flash-preview-tts")
+            self.add_item(self.GenericModelSelect("Select Image Gen Model...", self._create_model_options(i_val, "image_generation_model"), 0, "image_generation_model"))
+            self.add_item(self.GenericModelSelect("Select Text-to-Speech Model...", self._create_model_options(t_val, "speech_model"), 1, "speech_model"))
+            
+        elif self.category == 'tools':
+            g_val = data.get("grounding_rag_model", FALLBACK_MODEL_NAME)
+            c_val = data.get("critic_model", FALLBACK_MODEL_NAME)
+            self.add_item(self.GenericModelSelect("Select Grounding RAG Model...", self._create_model_options(g_val, "grounding_rag_model"), 0, "grounding_rag_model"))
+            self.add_item(self.GenericModelSelect("Select Critic Model...", self._create_model_options(c_val, "critic_model"), 1, "critic_model"))
+            
+        elif self.category == 'ltm':
+            l_val = data.get("ltm_model", FALLBACK_MODEL_NAME)
+            self.add_item(self.GenericModelSelect("Select LTM Summariser Model...", self._create_model_options(l_val, "ltm_model"), 0, "ltm_model"))
 
-        self.add_item(self.PrimaryModelSelect(create_model_options(self.primary_model)))
-        self.add_item(self.FallbackModelSelect(create_model_options(self.fallback_model)))
-
+        # --- Row 2: Provider & Specific Toggles ---
         style_g = discord.ButtonStyle.primary if self.view_mode == 'google' else discord.ButtonStyle.secondary
         style_o = discord.ButtonStyle.primary if self.view_mode == 'openrouter' else discord.ButtonStyle.secondary
         
         btn_google = ui.Button(label="Google Models", style=style_g, row=2, custom_id="mode_google")
-        btn_open = ui.Button(label="OpenRouter Models", style=style_o, row=2, custom_id="mode_openrouter")
-        
-        # New Fallback MSG Toggle
-        fb_label = "Fallback Indicator: ON" if self.show_fallback_indicator else "Fallback Indicator: OFF"
-        fb_style = discord.ButtonStyle.success if self.show_fallback_indicator else discord.ButtonStyle.secondary
-        btn_fallback = ui.Button(label=fb_label, style=fb_style, row=2, custom_id="toggle_fallback")
+        btn_open = ui.Button(label="OpenRouter Models", style=style_o, row=2, custom_id="mode_openrouter", disabled=(self.category == 'media'))
         
         async def mode_cb(i: discord.Interaction):
             self.view_mode = 'google' if i.data['custom_id'] == 'mode_google' else 'openrouter'
             self._build_view()
-            await i.response.edit_message(view=self)
-        
-        async def fallback_cb(i: discord.Interaction):
-            self.show_fallback_indicator = not self.show_fallback_indicator
-            self._build_view()
             await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+            
+        btn_google.callback = mode_cb
+        btn_open.callback = mode_cb
+        self.add_item(btn_google)
+        self.add_item(btn_open)
         
-        btn_google.callback = mode_cb; btn_open.callback = mode_cb; btn_fallback.callback = fallback_cb
-        self.add_item(btn_google); self.add_item(btn_open); self.add_item(btn_fallback)
+        # Specific Category Toggles
+        if self.category == 'response':
+            show_fb = data.get("show_fallback_indicator", True)
+            fb_label = "Fallback Indicator: ON" if show_fb else "Fallback Indicator: OFF"
+            fb_style = discord.ButtonStyle.success if show_fb else discord.ButtonStyle.secondary
+            btn_fallback = ui.Button(label=fb_label, style=fb_style, row=2)
+            
+            async def fallback_cb(i: discord.Interaction):
+                curr = self._get_current_profile_data().get("show_fallback_indicator", True)
+                self._save_changes("show_fallback_indicator", not curr)
+                self._build_view()
+                await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+                
+            btn_fallback.callback = fallback_cb
+            self.add_item(btn_fallback)
 
-    class PrimaryModelSelect(ui.Select):
-        def __init__(self, options): super().__init__(placeholder="Select Primary Model...", options=options, row=0)
-        async def callback(self, interaction):
-            view = self.view
-            if self.values[0] == "custom_option": await interaction.response.send_modal(CustomModelModal(view, 'primary'))
-            else: 
-                view.primary_model = self.values[0]
-                view._build_view()
-                await interaction.response.edit_message(content=view._get_selection_feedback_message(), view=view)
-
-    class FallbackModelSelect(ui.Select):
-        def __init__(self, options): super().__init__(placeholder="Select Fallback Model...", options=options, row=1)
-        async def callback(self, interaction):
-            view = self.view
-            if self.values[0] == "custom_option": await interaction.response.send_modal(CustomModelModal(view, 'fallback'))
-            else: 
-                view.fallback_model = self.values[0]
-                view._build_view()
-                await interaction.response.edit_message(content=view._get_selection_feedback_message(), view=view)
+        # --- Row 4: Category Navigation ---
+        cats = [
+            ("Response", "response"),
+            ("Media", "media"),
+            ("Tools", "tools"),
+            ("LTM", "ltm")
+        ]
+        
+        for label, val in cats:
+            btn_style = discord.ButtonStyle.primary if self.category == val else discord.ButtonStyle.secondary
+            btn = ui.Button(label=label, style=btn_style, row=4, disabled=(self.category == val))
+            
+            # Closure for callback
+            def make_nav_cb(target_cat):
+                async def nav_cb(i: discord.Interaction):
+                    self.category = target_cat
+                    self._build_view()
+                    await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+                return nav_cb
+                
+            btn.callback = make_nav_cb(val)
+            self.add_item(btn)
 
 class ModelApplyView(ui.View):
     def __init__(self, cog: 'GeminiAgent', user_id: int, interaction: discord.Interaction):
@@ -3991,9 +4030,9 @@ class BulkGroundingView(BaseBulkProfileView):
     def _build_view(self):
         self.clear_items()
         mode_options = [
-            discord.SelectOption(label="Off", value="off", default=(self.grounding_mode == "off")),
-            discord.SelectOption(label="On (Summarize)", value="on", default=(self.grounding_mode == "on")),
-            discord.SelectOption(label="On+ (Summarize & Cite)", value="on+", default=(self.grounding_mode == "on+"))
+            discord.SelectOption(label="Off", value="off", description="Disable Grounding entirely.", default=(self.grounding_mode == "off")),
+            discord.SelectOption(label="Native", value="native", description="Uses Google's internal web search tool (Google Gemini Only).", default=(self.grounding_mode == "native")),
+            discord.SelectOption(label="RAG", value="rag", description="Model-agnostic. Works with all models.", default=(self.grounding_mode == "rag"))
         ]
         mode_select = ui.Select(placeholder="Choose a grounding mode...", options=mode_options, row=0)
         mode_select.callback = self.mode_callback
@@ -4026,7 +4065,7 @@ class BulkGroundingView(BaseBulkProfileView):
                 self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
                 updated_count += 1
         
-        display_mode = {"off": "Off", "on": "On", "on+": "On+"}.get(self.grounding_mode)
+        display_mode = {"off": "Off", "native": "Native", "rag": "RAG"}.get(self.grounding_mode)
         await interaction.edit_original_response(content=f"Grounding has been set to **{display_mode}** for {updated_count} profile(s).", view=None)
 
 class BulkResponseModeView(BaseBulkProfileView):
@@ -4081,16 +4120,17 @@ class BulkResponseModeView(BaseBulkProfileView):
 class BulkURLContextView(BaseBulkProfileView):
     def __init__(self, cog: 'GeminiAgent', user_id: int):
         super().__init__(cog, user_id, include_borrowed=True)
-        self.toggle_choice = None
+        self.url_mode = None
         self._build_view()
 
     def _build_view(self):
         self.clear_items()
         opts = [
-            discord.SelectOption(label="Enable URL Context", value="enable", default=(self.toggle_choice is True)),
-            discord.SelectOption(label="Disable URL Context", value="disable", default=(self.toggle_choice is False))
+            discord.SelectOption(label="Off", value="off", description="Disable link reading entirely.", default=(self.url_mode == "off")),
+            discord.SelectOption(label="Native)", value="native", description="Uses Google's internal URL tool (Google Gemini Only).", default=(self.url_mode == "native")),
+            discord.SelectOption(label="RAG", value="rag", description="Model-agnostic scraper. Works with all models.", default=(self.url_mode == "rag"))
         ]
-        select = ui.Select(placeholder="Choose an action...", options=opts, row=0)
+        select = ui.Select(placeholder="Choose a URL context mode...", options=opts, row=0)
         select.callback = self.choice_callback
         self.add_item(select)
         self._build_profile_select_ui(row=1)
@@ -4099,14 +4139,14 @@ class BulkURLContextView(BaseBulkProfileView):
         self.add_item(apply_btn)
 
     async def choice_callback(self, interaction: discord.Interaction):
-        self.toggle_choice = (interaction.data['values'][0] == "enable")
+        self.url_mode = interaction.data['values'][0]
         self._build_view()
         await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
 
     async def apply_action(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        if self.toggle_choice is None or not self.selected_profiles:
-            await interaction.edit_original_response(content="Select an action and at least one profile.", view=None); return
+        if not self.url_mode or not self.selected_profiles:
+            await interaction.edit_original_response(content="Select a mode and at least one profile.", view=None); return
 
         updated_count = 0
         index = self.cog._get_user_index(self.user_id)
@@ -4114,7 +4154,9 @@ class BulkURLContextView(BaseBulkProfileView):
             is_borrowed = name in index.get("borrowed", [])
             p = self.cog._get_profile_config(self.user_id, name, is_borrowed)
             if p: 
-                p["url_fetching_enabled"] = self.toggle_choice
+                p["url_mode"] = self.url_mode
+                # Fallback for old toggle to prevent logic breaking
+                p["url_fetching_enabled"] = (self.url_mode == "rag")
                 self.cog._save_profile_config(self.user_id, name, p, is_borrowed)
                 updated_count += 1
         
@@ -4122,8 +4164,8 @@ class BulkURLContextView(BaseBulkProfileView):
             keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.user_id]
             for k in keys: self.cog.channel_models.pop(k, None); self.cog.chat_sessions.pop(k, None)
 
-        status = "ENABLED" if self.toggle_choice else "DISABLED"
-        await interaction.edit_original_response(content=f"URL Context Fetching has been **{status}** for {updated_count} profiles.", view=None)
+        display_mode = {"off": "Off", "native": "Native", "rag": "RAG"}.get(self.url_mode)
+        await interaction.edit_original_response(content=f"URL Context Fetching has been set to **{display_mode}** for {updated_count} profiles.", view=None)
 
 class BulkTimezoneModal(ui.Modal, title="Enter Custom Timezone"):
     tz_input = ui.TextInput(label="IANA Timezone ID", placeholder="e.g. Asia/Tokyo or America/New_York", required=True)

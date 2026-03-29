@@ -16,6 +16,14 @@ ALLOWED_MODELS = Literal[
     'gemini-2.0-flash', 'gemini-2.0-flash-lite'
 ]
 
+IMAGE_MODELS = Literal[
+    'gemini-3.1-flash-image-preview', 'gemini-3-pro-image-preview', 'gemini-2.5-flash-image'
+]
+
+AUDIO_MODELS = Literal[
+    'gemini-2.5-pro-preview-tts', 'gemini-2.5-flash-preview-tts'
+]
+
 COGS_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DATA_DIR = os.path.join(COGS_BASE, "data")

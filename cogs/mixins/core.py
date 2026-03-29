@@ -1001,7 +1001,11 @@ class CoreMixin:
             if ltm_recall_text:
                 final_user_parts.append(ltm_recall_text)
             
-            if profile_data.get('url_fetching_enabled', False):
+            url_mode = profile_data.get('url_mode', 'off')
+            if 'url_mode' not in profile_data:
+                url_mode = 'rag' if profile_data.get('url_fetching_enabled', False) else 'off'
+                
+            if url_mode == 'rag':
                 u_text, _, u_warn = await self._process_urls_in_content(combined_prompt_text, 0, {"url_fetching_enabled": True})
                 turn_warnings.extend(u_warn)
                 if u_text:
@@ -1112,7 +1116,31 @@ class CoreMixin:
                                     "thinking_level": p_data_f.get("thinking_level", "high"),
                                     "thinking_budget": p_data_f.get("thinking_budget", -1)
                                 }
-                                fallback_instance = GoogleGenAIModel(api_key=user_key, model_name=fb_name, system_instruction=sys_instr, safety_settings=d_safe, thinking_params=t_params_f)
+                                
+                                grounding_mode_native = p_data_f.get("grounding_mode", "off")
+                                if isinstance(grounding_mode_native, bool): grounding_mode_native = "rag" if grounding_mode_native else "off"
+                                elif grounding_mode_native in ["on", "on+"]: grounding_mode_native = "rag"
+                                
+                                url_mode_native = p_data_f.get("url_mode", "off")
+                                if "url_mode" not in p_data_f:
+                                    url_mode_native = "rag" if p_data_f.get("url_fetching_enabled", False) else "off"
+
+                                model_tools_list = []
+                                if grounding_mode_native == "native":
+                                    model_tools_list.append({"google_search": {}})
+                                if url_mode_native == "native":
+                                    model_tools_list.append({"url_context": {}})
+                                    
+                                model_tools = model_tools_list if model_tools_list else None
+                                
+                                fallback_instance = GoogleGenAIModel(
+                                    api_key=user_key, 
+                                    model_name=fb_name, 
+                                    system_instruction=sys_instr, 
+                                    safety_settings=d_safe, 
+                                    thinking_params=t_params_f,
+                                    tools=model_tools
+                                )
                             else:
                                 raise ValueError("No Google key for fallback")
 
@@ -1168,9 +1196,37 @@ class CoreMixin:
                 await self._dispatch_warnings(interaction.channel, 'webhook', None, turn_warnings, host_user_id, profile_name)
                 return
 
-            raw_text = getattr(response, 'text', "").strip()
+            raw_text = getattr(response, 'text', "")
+            if hasattr(response, 'raw') and response.raw.candidates and hasattr(response.raw.candidates[0], 'grounding_metadata'):
+                raw_text = self._add_inline_citations(raw_text, response.raw.candidates[0].grounding_metadata)
+            raw_text = raw_text.strip()
 
-            model_content_obj_for_turn = {'role': 'model', 'parts': [raw_text]}
+            # Apply filters
+            scrubbed_text = self._scrub_response_text(raw_text, participant_names=[display_name])
+            response_text = self._deduplicate_response(scrubbed_text)
+
+            if response_text and response_text != "[REPETITIVE_CONTENT_ERROR]":
+                grounding_sources = []
+                if hasattr(response, 'raw') and response.raw.candidates:
+                    if hasattr(response.raw.candidates[0], 'grounding_metadata'):
+                        metadata = response.raw.candidates[0].grounding_metadata
+                        if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
+                            for chunk in metadata.grounding_chunks:
+                                if hasattr(chunk, 'web'):
+                                    grounding_sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
+                    
+                    if hasattr(response.raw.candidates[0], 'url_context_metadata'):
+                        url_metadata = response.raw.candidates[0].url_context_metadata
+                        if hasattr(url_metadata, 'url_metadata') and url_metadata.url_metadata is not None:
+                            for u in url_metadata.url_metadata:
+                                if hasattr(u, 'retrieved_url') and u.retrieved_url:
+                                    grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
+                                    
+                sources_text = self._format_citation_subtext(grounding_sources)
+                if sources_text:
+                    response_text += f"\n\n{sources_text}"
+
+            model_content_obj_for_turn = {'role': 'model', 'parts': [response_text]}
             chat.history.extend([user_content_obj_for_turn, model_content_obj_for_turn])
 
             if len(chat.history) > STM_LIMIT_MAX * 2:
@@ -1394,16 +1450,39 @@ class CoreMixin:
             await placeholder_msg.edit(embed=err_embed)
             return
         elif response.candidates:
-            response_text = getattr(response, 'text', "...").strip()
+            response_text = getattr(response, 'text', "...")
+            if hasattr(response, 'raw') and response.raw.candidates and hasattr(response.raw.candidates[0], 'grounding_metadata'):
+                response_text = self._add_inline_citations(response_text, response.raw.candidates[0].grounding_metadata)
+            response_text = response_text.strip()
 
         # PREVENT GLOBAL XML SCRUBBER FROM DELETING THE RESPONSE
-        # If the AI mimics the history format and wraps its reply in tags, we strip the tags but KEEP the text.
         response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
         response_text = re.sub(r'</?whisper_context>', '', response_text, flags=re.IGNORECASE)
         response_text = re.sub(r'</?private_context>', '', response_text, flags=re.IGNORECASE)
 
         scrubbed_text = self._scrub_response_text(response_text, participant_names=[display_name])
         response_text = self._deduplicate_response(scrubbed_text)
+        
+        if response_text != "[REPETITIVE_CONTENT_ERROR]":
+            grounding_sources = []
+            if hasattr(response, 'raw') and response.raw.candidates:
+                if hasattr(response.raw.candidates[0], 'grounding_metadata'):
+                    metadata = response.raw.candidates[0].grounding_metadata
+                    if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
+                        for chunk in metadata.grounding_chunks:
+                            if hasattr(chunk, 'web'):
+                                grounding_sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
+                
+                if hasattr(response.raw.candidates[0], 'url_context_metadata'):
+                    url_metadata = response.raw.candidates[0].url_context_metadata
+                    if hasattr(url_metadata, 'url_metadata') and url_metadata.url_metadata is not None:
+                        for u in url_metadata.url_metadata:
+                            if hasattr(u, 'retrieved_url') and u.retrieved_url:
+                                grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
+                                
+            sources_text = self._format_citation_subtext(grounding_sources)
+            if sources_text:
+                response_text += f"\n\n{sources_text}"
 
         whisper_turn_id = str(uuid.uuid4())
         user_hash = self._get_user_hash(interaction.user.id)
@@ -2299,11 +2378,26 @@ class CoreMixin:
         # Invisible Separator
         embed.add_field(name="\u200b", value="\u200b", inline=False)
 
-        embed.add_field(name="Primary Model", value=f"`{prim_model}`", inline=True)
-        embed.add_field(name="Fallback Model", value=f"`{fall_model}`", inline=True)
+        def clean_m(m_str):
+            if not m_str: return "None"
+            return str(m_str).replace("GOOGLE/", "").replace("OPENROUTER/", "")
 
-        # Invisible Separator
-        embed.add_field(name="\u200b", value="\u200b", inline=False)
+        img_model = source_profile_data.get("image_generation_model", "gemini-2.5-flash-image")
+        aud_model = source_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts")
+        grd_model = source_profile_data.get("grounding_rag_model", FALLBACK_MODEL_NAME)
+        crt_model = source_profile_data.get("critic_model", FALLBACK_MODEL_NAME)
+        ltm_model = source_profile_data.get("ltm_model", FALLBACK_MODEL_NAME)
+
+        models_val = (
+            f"Primary: `{clean_m(prim_model)}`\n"
+            f"Fallback: `{clean_m(fall_model)}`\n"
+            f"Image: `{clean_m(img_model)}`\n"
+            f"Audio: `{clean_m(aud_model)}`\n"
+            f"Grounding: `{clean_m(grd_model)}`\n"
+            f"Critic: `{clean_m(crt_model)}`\n"
+            f"LTM: `{clean_m(ltm_model)}`"
+        )
+        embed.add_field(name="Models", value=models_val, inline=False)
 
         # 2. Generation Parameters Section
         stm_length = source_profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
@@ -2331,25 +2425,38 @@ class CoreMixin:
         )
         embed.add_field(name="Advanced (OpenRouter Only)", value=adv_val, inline=True)
 
-        # 4. Tools Section
+        # 5. [NEW] Thinking Section (Placed to the right of Tools)
+        t_summary = source_profile_data.get("thinking_summary_visible", "off").upper()
+        t_level = source_profile_data.get("thinking_level", "high").title()
+        t_budget = source_profile_data.get("thinking_budget", -1)
+        budget_display = "Dynamic (-1)" if t_budget == -1 else f"{t_budget}"
+
+        thinking_val = (
+            f"Summary: **`{t_summary}`**\n"
+            f"Effort: `{t_level}`\n"
+            f"Budget: `{budget_display}`"
+        )
+        embed.add_field(name="Thinking/Reasoning", value=thinking_val, inline=True)
+
+        # 4. Tools Section (Change to inline)
         img_gen = "**`ON`**" if source_profile_data.get("image_generation_enabled", False) else "`OFF`"
         
         raw_ground_mode = source_profile_data.get("grounding_mode", "off")
-        if isinstance(raw_ground_mode, bool): raw_ground_mode = "on" if raw_ground_mode else "off"
-        grounding_display = {"off": "`OFF`", "on": "**`ON`**", "on+": "**`ON+`**"}.get(raw_ground_mode, "`OFF`")
+        if isinstance(raw_ground_mode, bool): raw_ground_mode = "rag" if raw_ground_mode else "off"
+        elif raw_ground_mode in ["on", "on+"]: raw_ground_mode = "rag"
+        grounding_display = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(raw_ground_mode, "`OFF`")
         
-        url_ctx = "**`ON`**" if source_profile_data.get("url_fetching_enabled", False) else "`OFF`"
+        raw_url_mode = source_profile_data.get("url_mode", "off")
+        if "url_mode" not in source_profile_data:
+            raw_url_mode = "rag" if source_profile_data.get("url_fetching_enabled", False) else "off"
+        url_ctx = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(raw_url_mode, "`OFF`")
+        
         timezone = source_profile_data.get("timezone", "UTC")
         typing = "**`ON`**" if source_profile_data.get("realistic_typing_enabled", False) else "`OFF`"
-        critic = "**`ON`**" if source_profile_data.get("critic_enabled", False) else "`OFF`"
         critic = "**`ON`**" if source_profile_data.get("critic_enabled", False) else "`OFF`"
         metadata_vis = "**`ON`**" if source_profile_data.get("generation_metadata_enabled", False) else "`OFF`"
         resp_mode = source_profile_data.get("response_mode", "regular").replace('_', ' ').title()
 
-        # Invisible Separator to push the next row down
-        embed.add_field(name="\u200b", value="\u200b", inline=False)
-
-        # 4. Tools Section (Change to inline)
         ph_text = f"{source_profile_data.get('placeholder_emoji') or 'Default'}"
         
         tools_val = (
@@ -2365,19 +2472,6 @@ class CoreMixin:
         )
         embed.add_field(name="Tools", value=tools_val, inline=True)
 
-        # 5. [NEW] Thinking Section (Placed to the right of Tools)
-        t_summary = source_profile_data.get("thinking_summary_visible", "off").upper()
-        t_level = source_profile_data.get("thinking_level", "high").title()
-        t_budget = source_profile_data.get("thinking_budget", -1)
-        budget_display = "Dynamic (-1)" if t_budget == -1 else f"{t_budget}"
-
-        thinking_val = (
-            f"Summary: **`{t_summary}`**\n"
-            f"Effort: `{t_level}`\n"
-            f"Budget: `{budget_display}`"
-        )
-        embed.add_field(name="Thinking/Reasoning", value=thinking_val, inline=True)
-
         s_voice = source_profile_data.get("speech_voice", "Aoede")
         s_model = source_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts")
         s_temp = source_profile_data.get("speech_temperature", 1.0)
@@ -2385,10 +2479,11 @@ class CoreMixin:
         
         speech_val = (
             f"Voice: `{s_voice}`\n"
-            f"Model: `{s_model_disp}`\n"
-            f"Prosody: `{s_temp}`"
+            f"Temperature: `{s_temp}`"
         )
         embed.add_field(name="Speech TTS", value=speech_val, inline=True)
+
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
 
         # 5. Training & Memory Section (Same Row)
         train_val = (

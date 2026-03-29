@@ -109,7 +109,7 @@ class OpenRouterChatSession:
 
 class OpenRouterModel:
     def __init__(self, model_name, api_key, system_instruction=None, thinking_params=None, **kwargs):
-        self.model_name = model_name
+        self.model_name = model_name.replace("OPENROUTER/", "").replace("GOOGLE/", "")
         self.api_key = api_key
         self.system_instruction = system_instruction
         self.thinking_params = thinking_params or {} # [NEW]
@@ -247,7 +247,7 @@ class GoogleGenAIModel:
             api_key=api_key, 
             http_options=types.HttpOptions(api_version='v1beta')
         )
-        self.model_name = model_name
+        self.model_name = model_name.replace("OPENROUTER/", "").replace("GOOGLE/", "")
         self.system_instruction = system_instruction
         self.safety_settings = safety_settings
         self.thinking_params = thinking_params or {}
@@ -484,13 +484,30 @@ class ServicesMixin:
 
         model_to_create = primary_model
         
-        # [NEW] Extract parameters once for either provider
+        # Extract parameters once for either provider
         p_sett_thinking = self._get_profile_config(profile_owner_id_for_instructions, profile_name_for_instructions, is_borrowed) or {}
         t_params = {
             "thinking_summary_visible": p_sett_thinking.get("thinking_summary_visible", "off"),
             "thinking_level": p_sett_thinking.get("thinking_level", "high"),
             "thinking_budget": p_sett_thinking.get("thinking_budget", -1)
         }
+
+        # [NEW] Native Tool Construction
+        grounding_mode = p_sett_thinking.get("grounding_mode", "off")
+        if isinstance(grounding_mode, bool): grounding_mode = "rag" if grounding_mode else "off"
+        elif grounding_mode in ["on", "on+"]: grounding_mode = "rag"
+        
+        url_mode = p_sett_thinking.get("url_mode", "off")
+        if "url_mode" not in p_sett_thinking:
+            url_mode = "rag" if p_sett_thinking.get("url_fetching_enabled", False) else "off"
+
+        model_tools_list = []
+        if grounding_mode == "native":
+            model_tools_list.append({"google_search": {}})
+        if url_mode == "native":
+            model_tools_list.append({"url_context": {}})
+            
+        model_tools = model_tools_list if model_tools_list else None
 
         def create_model_instance(name, system_instr, safety):
             name_upper = name.upper()
@@ -506,11 +523,9 @@ class ServicesMixin:
             if is_openrouter:
                 or_key = self._get_api_key_for_guild(guild_id, provider="openrouter")
                 if not or_key: raise ValueError("OpenRouter API Key not found.")
-                # [UPDATED] Pass thinking_params to OpenRouter
                 return OpenRouterModel(actual_name, api_key=or_key, system_instruction=system_instr, thinking_params=t_params)
             else:
-                # [UPDATED] Pass thinking_params to Google wrapper
-                return GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instr, safety_settings=safety, thinking_params=t_params)
+                return GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instr, safety_settings=safety, thinking_params=t_params, tools=model_tools)
 
         try:
             model_instance = create_model_instance(model_to_create, current_instructions, dynamic_safety_settings)
@@ -749,8 +764,25 @@ class ServicesMixin:
                     "thinking_level": profile_data.get("thinking_level", "high"),
                     "thinking_budget": profile_data.get("thinking_budget", -1)
                 }
-                # [NEW] Use the GoogleGenAIModel wrapper for SDK v2
-                model = GoogleGenAIModel(api_key=user_api_key, model_name=actual_model_name, system_instruction=system_instructions, safety_settings=safety_settings, thinking_params=t_params)
+                
+                # [NEW] Native Tool Construction
+                grounding_mode = profile_data.get("grounding_mode", "off")
+                if isinstance(grounding_mode, bool): grounding_mode = "rag" if grounding_mode else "off"
+                elif grounding_mode in ["on", "on+"]: grounding_mode = "rag"
+                
+                url_mode = profile_data.get("url_mode", "off")
+                if "url_mode" not in profile_data:
+                    url_mode = "rag" if profile_data.get("url_fetching_enabled", False) else "off"
+
+                model_tools_list = []
+                if grounding_mode == "native":
+                    model_tools_list.append({"google_search": {}})
+                if url_mode == "native":
+                    model_tools_list.append({"url_context": {}})
+                    
+                model_tools = model_tools_list if model_tools_list else None
+                    
+                model = GoogleGenAIModel(api_key=user_api_key, model_name=actual_model_name, system_instruction=system_instructions, safety_settings=safety_settings, thinking_params=t_params, tools=model_tools)
             
             return model, temp, top_p, top_k, warning_message, fallback_model
         except Exception as e:
@@ -1177,17 +1209,25 @@ class ServicesMixin:
                         
                         # [NEW] URL Context Logic: Enforce Profile Setting & Separation
                         any_url_enabled = False
+                        any_url_rag = False
                         for p in session['profiles']:
                             p_index = self._get_user_index(p['owner_id'])
                             p_is_b = p['profile_name'] in p_index.get("borrowed", [])
                             p_settings = self._get_profile_config(p['owner_id'], p['profile_name'], p_is_b) or {}
-                            if p_settings.get("url_fetching_enabled", False):
-                                any_url_enabled = True; break
+                            
+                            u_mode = p_settings.get("url_mode", "off")
+                            if "url_mode" not in p_settings:
+                                u_mode = "rag" if p_settings.get("url_fetching_enabled", False) else "off"
+                                
+                            if u_mode != "off":
+                                any_url_enabled = True
+                            if u_mode == "rag":
+                                any_url_rag = True
                         
                         url_text_content = None
                         trigger_media_parts = []
                         
-                        if any_url_enabled:
+                        if any_url_enabled and any_url_rag:
                             url_text_list, url_media, url_warnings = await self._process_urls_in_content(content, trigger_obj['guild_id'] if is_child_mention else trigger_obj.guild.id, {"url_fetching_enabled": True})
                             pre_generation_warnings.extend(url_warnings)
                             if url_text_list:
@@ -1596,10 +1636,12 @@ class ServicesMixin:
                     g_profile_settings = self._get_profile_config(g_owner_id, g_profile_name, g_is_borrowed) or {}
                     
                     grounding_mode = g_profile_settings.get("grounding_mode", "off")
-                    if isinstance(grounding_mode, bool): grounding_mode = "on" if grounding_mode else "off"
+                    if isinstance(grounding_mode, bool): grounding_mode = "rag" if grounding_mode else "off"
+                    elif grounding_mode in ["on", "on+"]: grounding_mode = "rag"
+                    
                     grounding_mode_for_citator = grounding_mode
 
-                    if grounding_mode in ["on", "on+"]:
+                    if grounding_mode == "rag":
                         g_participant_key = (g_owner_id, g_profile_name)
                         g_chat_session = session['chat_sessions'].get(g_participant_key)
                         history_for_grounding = []
@@ -1618,7 +1660,7 @@ class ServicesMixin:
                         grounding_query = image_gen_prompt if is_image_gen_round else initial_round_context
 
                         mapping_key = (session.get("type", "multi"), channel.id)
-                        grounding_result = await self._get_hybrid_grounding_context(grounding_query, channel.guild.id, history_for_grounding, mapping_key, safety_settings=g_dynamic_safety_settings, is_for_image=is_for_image_flag)
+                        grounding_result = await self._get_hybrid_grounding_context(grounding_query, channel.guild.id, history_for_grounding, mapping_key, safety_settings=g_dynamic_safety_settings, is_for_image=is_for_image_flag, warning_channel=channel)
                         if grounding_result:
                             g_context, g_sources, should_set_checkpoint, g_warning = grounding_result
                             if g_warning:
@@ -1654,7 +1696,7 @@ class ServicesMixin:
                     if p_settings.get("url_fetching_enabled", False):
                         any_url_enabled = True; break
                 
-                if any_url_enabled and batched_url_research_content:
+                if any_url_enabled and batched_url_research_content and any_url_rag:
                     print(f"[DEBUG: URL-Multi] Performing round research on {len(batched_url_research_content)} items.")
                     for content_str, g_id in batched_url_research_content:
                         u_t, _, u_w = await self._process_urls_in_content(content_str, g_id, {"url_fetching_enabled": True})
@@ -2077,6 +2119,23 @@ class ServicesMixin:
                             "thinking_level": p_settings.get("thinking_level", "high"),
                             "thinking_budget": p_settings.get("thinking_budget", -1)
                         }
+                        
+                        # [NEW] Re-evaluate Tools for internal model reconstruction
+                        grounding_mode_native = p_settings.get("grounding_mode", "off")
+                        if isinstance(grounding_mode_native, bool): grounding_mode_native = "rag" if grounding_mode_native else "off"
+                        elif grounding_mode_native in ["on", "on+"]: grounding_mode_native = "rag"
+                        
+                        url_mode_native = p_settings.get("url_mode", "off")
+                        if "url_mode" not in p_settings:
+                            url_mode_native = "rag" if p_settings.get("url_fetching_enabled", False) else "off"
+
+                        model_tools_list = []
+                        if grounding_mode_native == "native":
+                            model_tools_list.append({"google_search": {}})
+                        if url_mode_native == "native":
+                            model_tools_list.append({"url_context": {}})
+                            
+                        model_tools = model_tools_list if model_tools_list else None
 
                         if is_openrouter:
                             or_key = self._get_api_key_for_guild(channel.guild.id, provider="openrouter")
@@ -2087,13 +2146,14 @@ class ServicesMixin:
                                 warning_message = f"API Configuration Error: OpenRouter API Key missing for this server. Cannot load model '{primary_model}'."
                         else:
                             try:
-                                # [NEW] Pass thinking_params here
+                                # [NEW] Pass thinking_params and tools here
                                 model = GoogleGenAIModel(
                                     api_key=api_key, 
                                     model_name=actual_name, 
                                     system_instruction=full_system_instruction, 
                                     safety_settings=dynamic_safety_settings,
-                                    thinking_params=t_params_worker
+                                    thinking_params=t_params_worker,
+                                    tools=model_tools
                                 )
                             except Exception as e:
                                 warning_message = f"Model Initialization Error: Failed to instantiate Google model '{actual_name}'. {e}"
@@ -2107,8 +2167,10 @@ class ServicesMixin:
 
                         # Check if the last turn was from this model itself
                         if contents_for_api_call and contents_for_api_call[-1].get('role', contents_for_api_call[-1].get('role', 'user')) == 'model':
-                            pseudo_user_turn = {'role': 'user', 'parts': ["<internal_note>No response from anyone OR no user is present.</internal_note>"]}
-                            contents_for_api_call.append(pseudo_user_turn)
+                            last_model_text = "".join(p if isinstance(p, str) else p.get('text', '') for p in contents_for_api_call[-1].get('parts', []))
+                            if "<private_response>" not in last_model_text:
+                                pseudo_user_turn = {'role': 'user', 'parts': ["<internal_note>No response from anyone OR no user is present.</internal_note>"]}
+                                contents_for_api_call.append(pseudo_user_turn)
 
                         # Collect all supplementary context to inject into the final user turn
                         supplementary_parts = []
@@ -2166,6 +2228,10 @@ class ServicesMixin:
                                 contents_for_api_call[-1]['parts'].extend(supplementary_parts)
                             else:
                                 contents_for_api_call.append({'role': 'user', 'parts': supplementary_parts})
+                                
+                        # [NEW] Failsafe for alternating roles
+                        if contents_for_api_call[-1].get('role') == 'model':
+                            contents_for_api_call.append({'role': 'user', 'parts': ["<internal_note>Continue the conversation.</internal_note>"]})
 
                         # [NEW] Advanced Params Injection
                         p_index = self._get_user_index(owner_id)
@@ -2243,7 +2309,14 @@ class ServicesMixin:
                                             else:
                                                 raise ValueError("No OpenRouter key for fallback")
                                         else:
-                                            fallback_instance = GoogleGenAIModel(api_key=api_key, model_name=fb_name, system_instruction=full_system_instruction, safety_settings=dynamic_safety_settings, thinking_params=t_params_worker)
+                                            fallback_instance = GoogleGenAIModel(
+                                                api_key=api_key, 
+                                                model_name=fb_name, 
+                                                system_instruction=full_system_instruction, 
+                                                safety_settings=dynamic_safety_settings, 
+                                                thinking_params=t_params_worker,
+                                                tools=model_tools
+                                            )
                                         
                                         response, state_container = await self._generate_with_heartbeat(
                                             fallback_instance, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
@@ -2308,7 +2381,10 @@ class ServicesMixin:
                         else:
                             try:
                                 # Use the filtered text attribute from the model wrapper to exclude thoughts
-                                raw_text = getattr(response, 'text', "").strip()
+                                raw_text = getattr(response, 'text', "")
+                                if hasattr(response, 'raw') and response.raw.candidates and hasattr(response.raw.candidates[0], 'grounding_metadata'):
+                                    raw_text = self._add_inline_citations(raw_text, response.raw.candidates[0].grounding_metadata)
+                                raw_text = raw_text.strip()
                                 
                                 all_participant_names = []
                                 for p_data in session.get("profiles", []):
@@ -2333,6 +2409,27 @@ class ServicesMixin:
                                 scrubbed_text = self._scrub_response_text(raw_text, participant_names=all_participant_names)
                                 response_text = self._deduplicate_response(scrubbed_text)
                                 
+                                # Extract Native grounding sources & URL context
+                                if response_text and response_text != "[REPETITIVE_CONTENT_ERROR]":
+                                    if hasattr(response, 'raw') and response.raw.candidates:
+                                        if hasattr(response.raw.candidates[0], 'grounding_metadata'):
+                                            metadata = response.raw.candidates[0].grounding_metadata
+                                            if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
+                                                for chunk in metadata.grounding_chunks:
+                                                    if hasattr(chunk, 'web'):
+                                                        grounding_sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
+                                        
+                                        if hasattr(response.raw.candidates[0], 'url_context_metadata'):
+                                            url_metadata = response.raw.candidates[0].url_context_metadata
+                                            if hasattr(url_metadata, 'url_metadata') and url_metadata.url_metadata is not None:
+                                                for u in url_metadata.url_metadata:
+                                                    if hasattr(u, 'retrieved_url') and u.retrieved_url:
+                                                        grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
+                                                        
+                                    sources_text = self._format_citation_subtext(grounding_sources)
+                                    if sources_text:
+                                        response_text += f"\n\n{sources_text}"
+                                
                                 # [UPDATED] Differentiated error messaging for spammed vs empty content
                                 if response_text == "[REPETITIVE_CONTENT_ERROR]":
                                     custom_main = p_settings.get("error_response", ERR_GENERAL_ERROR)
@@ -2356,6 +2453,9 @@ class ServicesMixin:
                         if fallback_used and p_settings.get("show_fallback_indicator", True):
                             turn_warnings.append(WARN_FALLBACK_USED)
                             turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=main_api_error))
+                            
+                        # --- Native Tool Extraction (Citations) ---
+                        # Native citations are now handled inline directly in the text response above.
                             
                         # --- Placeholder Update & Sending ---
                         if not was_blocked:
@@ -2436,7 +2536,7 @@ class ServicesMixin:
                         thought_file_to_send = discord.File(io.BytesIO(thought_text.encode('utf-8')), filename="thinking_summary.txt")
 
                     sources_text = None
-                    if participant_key == grounding_profile_key and grounding_mode_for_citator == "on+" and grounding_sources:
+                    if grounding_mode_for_citator == "rag" and grounding_sources:
                         source_links = []
                         for i, source in enumerate(grounding_sources):
                             domain = source.get('title')
@@ -2737,24 +2837,6 @@ class ServicesMixin:
                             
                             await self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
                     
-                    if sources_text:
-                        for line in sources_text.split('\n'):
-                            if not line.strip(): continue
-                            if participant.get('method') == 'child_bot':
-                                source_payload = {
-                                    "action": "send_message", "channel_id": channel.id,
-                                    "content": line, "realistic_typing": False, # Instant for child
-                                    "reply_to_id": None, "ping": False
-                                }
-                                await self.manager_queue.put({"action": "send_to_child", "bot_id": participant['bot_id'], "payload": source_payload})
-                            else: # Webhook
-                                await self._send_channel_message(
-                                    channel, line,
-                                    profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name,
-                                    reply_to=None,
-                                    bypass_typing=True # Skip delay
-                                )
-                    
                     # --- Dispatch Warnings and Clean Up Placeholders ---
                     if state_container:
                         if state_container.get('sending_task'):
@@ -2817,7 +2899,12 @@ class ServicesMixin:
                                         p_index_batch = self._get_user_index(p['owner_id'])
                                         p_is_b_batch = p['profile_name'] in p_index_batch.get("borrowed", [])
                                         p_settings_batch = self._get_profile_config(p['owner_id'], p['profile_name'], p_is_b_batch) or {}
-                                        if p_settings_batch.get("url_fetching_enabled", False):
+                                        
+                                        u_mode = p_settings_batch.get("url_mode", "off")
+                                        if "url_mode" not in p_settings_batch:
+                                            u_mode = "rag" if p_settings_batch.get("url_fetching_enabled", False) else "off"
+                                            
+                                        if u_mode == "rag":
                                             any_url_enabled_batch = True; break
                                     
                                     url_text_batch = None
@@ -3123,9 +3210,12 @@ class ServicesMixin:
                                 api_key = self._get_api_key_for_guild(package['guild_id'])
                                 if not api_key: raise ValueError("Server API key not configured.")
                                 
+                                img_model_name = package.get("image_generation_model", "GOOGLE/gemini-2.5-flash-image")
+                                if img_model_name.upper().startswith("GOOGLE/"): img_model_name = img_model_name[7:]
+                                
                                 image_model = GoogleGenAIModel(
                                     api_key=api_key,
-                                    model_name=package.get("image_generation_model", "gemini-2.5-flash-image"), 
+                                    model_name=img_model_name, 
                                     system_instruction=package['system_instruction'], 
                                     safety_settings=package['safety_settings']
                                 )
@@ -3218,12 +3308,35 @@ class ServicesMixin:
                             was_blocked = True
                         elif text_response.candidates[0].finish_reason.name == 'STOP':
                             raw_text = getattr(text_response, 'text', "")
+                            if hasattr(text_response, 'raw') and text_response.raw.candidates and hasattr(text_response.raw.candidates[0], 'grounding_metadata'):
+                                raw_text = self._add_inline_citations(raw_text, text_response.raw.candidates[0].grounding_metadata)
                             response_text = self._deduplicate_response(self._scrub_response_text(raw_text.strip(), participant_names=[package['bot_display_name']]))
+                            
                             if not response_text:
                                 custom_main = profile_settings.get("error_response", ERR_GENERAL_ERROR)
                                 response_text = custom_main
                                 turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=ERR_REASON_EMPTY_RESPONSE))
                                 was_blocked = True
+                            else:
+                                grounding_sources = package.get("grounding_sources") or []
+                                if hasattr(text_response, 'raw') and text_response.raw.candidates:
+                                    if hasattr(text_response.raw.candidates[0], 'grounding_metadata'):
+                                        metadata = text_response.raw.candidates[0].grounding_metadata
+                                        if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
+                                            for chunk in metadata.grounding_chunks:
+                                                if hasattr(chunk, 'web'):
+                                                    grounding_sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
+                                    
+                                    if hasattr(text_response.raw.candidates[0], 'url_context_metadata'):
+                                        url_metadata = text_response.raw.candidates[0].url_context_metadata
+                                        if hasattr(url_metadata, 'url_metadata') and url_metadata.url_metadata is not None:
+                                            for u in url_metadata.url_metadata:
+                                                if hasattr(u, 'retrieved_url') and u.retrieved_url:
+                                                    grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
+                                                    
+                                sources_text = self._format_citation_subtext(grounding_sources)
+                                if sources_text:
+                                    response_text += f"\n\n{sources_text}"
                         
                         model_turn = {'role': 'model', 'parts': [response_text]}; chat.history.extend([user_turn, model_turn])
 
@@ -3305,7 +3418,7 @@ class ServicesMixin:
                         
                     grounding_sources = package.get("grounding_sources")
                     grounding_mode = package.get("grounding_mode")
-                    if grounding_mode == "on+" and grounding_sources:
+                    if grounding_mode == "rag" and grounding_sources:
                         source_links = []
                         for i, source in enumerate(grounding_sources):
                             domain = source.get('title')
@@ -3338,12 +3451,12 @@ class ServicesMixin:
                                 await self.manager_queue.put({"action": "send_to_child", "bot_id": package['bot_id'], "payload": source_payload})
                             else:
                                 # [UPDATED] Standard source message for images (no Response Mode)
-                                await self._send_channel_message(
-                                    channel, sources_text,
-                                    profile_owner_id_for_appearance=package['effective_profile_owner_id'],
-                                    profile_name_for_appearance=package['effective_profile_name'],
-                                    reply_to=None
-                                )
+                                sent_messages = await self._send_channel_message(
+                            channel, final_response_text, target_message_to_edit=placeholder_message, 
+                            profile_owner_id_for_appearance=package['effective_profile_owner_id'], 
+                            profile_name_for_appearance=package['effective_profile_name'], 
+                            file=image_file_to_send, reply_to=anchor_msg
+                        )
                                 
                     await self._dispatch_warnings(channel, 'child_bot' if is_child_bot else 'webhook', package.get('bot_id'), turn_warnings, package['effective_profile_owner_id'], package['effective_profile_name'])
 
@@ -3399,9 +3512,12 @@ class ServicesMixin:
                     api_key = self._get_api_key_for_guild(request_data['guild_id'])
                     if not api_key: raise ValueError("Server API key is not configured.")
                     
+                    img_model_name = request_data.get("image_generation_model", "GOOGLE/gemini-2.5-flash-image")
+                    if img_model_name.upper().startswith("GOOGLE/"): img_model_name = img_model_name[7:]
+                    
                     image_model = GoogleGenAIModel(
                         api_key=api_key,
-                        model_name=request_data.get("image_generation_model", "gemini-2.5-flash-image"), 
+                        model_name=img_model_name, 
                         system_instruction=request_data['system_instruction'], 
                         safety_settings=request_data['safety_settings']
                     )
@@ -3691,12 +3807,12 @@ class ServicesMixin:
         instructions = DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS
         if profile_owner_id and profile_name:
             index = self._get_user_index(profile_owner_id)
-            is_borrowed = profile_name in index.get("borrowed", [])
+            is_borrowed = profile_name in index.get("borrowed",[])
+            params_source = self._get_profile_config(profile_owner_id, profile_name, is_borrowed) or {}
 
             if is_borrowed:
-                borrowed_data = self._get_profile_config(profile_owner_id, profile_name, True) or {}
-                source_owner_id = int(borrowed_data.get("original_owner_id", profile_owner_id))
-                source_profile_name = borrowed_data.get("original_profile_name", profile_name)
+                source_owner_id = int(params_source.get("original_owner_id", profile_owner_id))
+                source_profile_name = params_source.get("original_profile_name", profile_name)
                 prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
             else:
                 prompts = self._get_profile_prompts(profile_owner_id, profile_name) or {}
@@ -3705,21 +3821,36 @@ class ServicesMixin:
             instructions = self._decrypt_data(encrypted_instructions)
 
         cfg = {"temperature": 0.2}
-        ltm_model_name = 'gemini-flash-lite-latest'
         
-        # Use provided guild_id, or fallback to 0 (DM context)
+        # [NEW] Utility Routing Logic for LTM
+        ltm_model_raw = FALLBACK_MODEL_NAME
+        if profile_owner_id and profile_name:
+            ltm_model_raw = params_source.get("ltm_model", FALLBACK_MODEL_NAME) if 'params_source' in locals() else FALLBACK_MODEL_NAME
+            
+        is_or = False
+        actual_model_name = ltm_model_raw
+        if ltm_model_raw.upper().startswith("OPENROUTER/"):
+            actual_model_name = ltm_model_raw[11:]
+            is_or = True
+        elif ltm_model_raw.upper().startswith("GOOGLE/"):
+            actual_model_name = ltm_model_raw[7:]
+            is_or = False
+        elif "/" in ltm_model_raw:
+            is_or = True
+            
         effective_guild_id = guild_id or 0
-        api_key = self._get_api_key_for_guild(effective_guild_id) if effective_guild_id else self._get_api_key_for_user(profile_owner_id)
-        if not api_key: return None
-
+        
         status = "api_error"
         try:
-            m = GoogleGenAIModel(
-                api_key=api_key,
-                model_name=ltm_model_name,
-                system_instruction=instructions,
-                safety_settings=DEFAULT_SAFETY_SETTINGS
-            )
+            if is_or:
+                api_key = self._get_api_key_for_guild(effective_guild_id, "openrouter") if effective_guild_id else self._get_api_key_for_user(profile_owner_id, "openrouter")
+                if not api_key: return None
+                m = OpenRouterModel(actual_model_name, api_key=api_key, system_instruction=instructions, thinking_params={})
+            else:
+                api_key = self._get_api_key_for_guild(effective_guild_id) if effective_guild_id else self._get_api_key_for_user(profile_owner_id)
+                if not api_key: return None
+                m = GoogleGenAIModel(api_key=api_key, model_name=actual_model_name, system_instruction=instructions, safety_settings=DEFAULT_SAFETY_SETTINGS)
+
             r = await m.generate_content_async([f"<target_transcript>\n{convo}\n</target_transcript>"], generation_config=cfg)
             status = "blocked_by_safety" if not r.candidates else "success"
             
@@ -5249,15 +5380,49 @@ class ServicesMixin:
             "  * 'Avoid using a clinical or corporate tone; stop explaining your purpose.'"
         )
         
-        api_key = self._get_api_key_for_guild(guild_id)
-        if not api_key: return None
+        # [NEW] Route to profile's defined critic model
+        # We need the profile to fetch the setting, pass via kwargs or fetch via guild context.
+        # For simplicity since this is called mid-generation, we will rely on the Fallback model if we can't find the profile context easily here, 
+        # but we should pass profile data.
+        
+        # Since _run_critic signature is (_run_critic(self, history: list, char_name: str, guild_id: int)), 
+        # we will use the fallback model for now to keep the signature clean, or fetch it via active session.
+        # To perfectly align, let's fetch it via the active session in this guild.
+        critic_model_raw = FALLBACK_MODEL_NAME
+        session = self.multi_profile_channels.get(guild_id) # guild_id is actually channel_id in the _multi_profile_worker call
+        if session:
+            for p in session.get("profiles", []):
+                if p["profile_name"] == char_name or self.user_appearances.get(str(p["owner_id"]), {}).get(p["profile_name"], {}).get("custom_display_name") == char_name:
+                    p_index = self._get_user_index(p["owner_id"])
+                    p_is_b = p["profile_name"] in p_index.get("borrowed", [])
+                    p_config = self._get_profile_config(p["owner_id"], p["profile_name"], p_is_b) or {}
+                    critic_model_raw = p_config.get("critic_model", FALLBACK_MODEL_NAME)
+                    break
+        
+        is_or = False
+        actual_model_name = critic_model_raw
+        if critic_model_raw.upper().startswith("OPENROUTER/"):
+            actual_model_name = critic_model_raw[11:]
+            is_or = True
+        elif critic_model_raw.upper().startswith("GOOGLE/"):
+            actual_model_name = critic_model_raw[7:]
+            is_or = False
+        elif "/" in critic_model_raw:
+            is_or = True
         
         try:
-            # Configure thinking model for reasoning phase
             t_params = {"thinking_budget": 512, "thinking_summary_visible": "off", "thinking_level": "low"}
-            model = GoogleGenAIModel(api_key=api_key, model_name='gemini-flash-lite-latest', system_instruction=system_instruction, thinking_params=t_params)
+            critic_cfg = {"temperature": 0.1, "top_p": 0.95}
             
-            critic_cfg = {"temperature": 0.0, "top_p": 0.95}
+            if is_or:
+                api_key = self._get_api_key_for_guild(guild_id, "openrouter")
+                if not api_key: return None
+                model = OpenRouterModel(actual_model_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params)
+            else:
+                api_key = self._get_api_key_for_guild(guild_id)
+                if not api_key: return None
+                model = GoogleGenAIModel(api_key=api_key, model_name=actual_model_name, system_instruction=system_instruction, thinking_params=t_params)
+            
             resp = await model.generate_content_async([f"Transcript:\n{transcript}"], generation_config=critic_cfg)
 
             if resp.text:
@@ -5357,7 +5522,11 @@ class ServicesMixin:
                 p_is_b = profile_name in p_index.get("borrowed", [])
                 p_settings = self._get_profile_config(profile_owner_id, profile_name, p_is_b) or {}
                 
-                if p_settings.get("url_fetching_enabled", True):
+                url_mode = p_settings.get('url_mode', 'off')
+                if 'url_mode' not in p_settings:
+                    url_mode = 'rag' if p_settings.get('url_fetching_enabled', False) else 'off'
+                    
+                if url_mode == 'rag':
                     u_t, _, u_w = await self._process_urls_in_content(prompt_content, channel.guild.id, {"url_fetching_enabled": True})
                     turn_warnings.extend(u_w)
                     if u_t: final_prompt_parts.append(f"<document_context>\n" + "\n".join(u_t) + "\n</document_context>")
@@ -5443,7 +5612,31 @@ class ServicesMixin:
                                 guild_api_key = self._get_api_key_for_guild(channel.guild.id)
                                 if not guild_api_key:
                                     raise ValueError("No Google key for fallback")
-                                fallback_instance = GoogleGenAIModel(api_key=guild_api_key, model_name=fb_name, system_instruction=sys_instr, safety_settings=dyn_safe, thinking_params=t_params_worker)
+                                    
+                                grounding_mode_native = p_settings.get("grounding_mode", "off")
+                                if isinstance(grounding_mode_native, bool): grounding_mode_native = "rag" if grounding_mode_native else "off"
+                                elif grounding_mode_native in ["on", "on+"]: grounding_mode_native = "rag"
+                                
+                                url_mode_native = p_settings.get("url_mode", "off")
+                                if "url_mode" not in p_settings:
+                                    url_mode_native = "rag" if p_settings.get("url_fetching_enabled", False) else "off"
+
+                                model_tools_list = []
+                                if grounding_mode_native == "native":
+                                    model_tools_list.append({"google_search": {}})
+                                if url_mode_native == "native":
+                                    model_tools_list.append({"url_context": {}})
+                                    
+                                model_tools = model_tools_list if model_tools_list else None
+                                
+                                fallback_instance = GoogleGenAIModel(
+                                    api_key=guild_api_key, 
+                                    model_name=fb_name, 
+                                    system_instruction=sys_instr, 
+                                    safety_settings=dyn_safe, 
+                                    thinking_params=t_params_worker,
+                                    tools=model_tools
+                                )
 
                             response, state_container = await self._generate_with_heartbeat(
                                 fallback_instance, [{'role': 'user', 'parts': final_prompt_parts}], gen_config, channel, participant, msg_a_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
@@ -5489,7 +5682,10 @@ class ServicesMixin:
             if response and response.candidates:
                 candidate = response.candidates[0]
                 if candidate.content and candidate.content.parts:
-                    response_text = getattr(response, 'text', "").strip()
+                    response_text = getattr(response, 'text', "")
+                    if hasattr(response, 'raw') and response.raw.candidates and hasattr(response.raw.candidates[0], 'grounding_metadata'):
+                        response_text = self._add_inline_citations(response_text, response.raw.candidates[0].grounding_metadata)
+                    response_text = response_text.strip()
 
             if not response_text.strip():
                 reason = api_error_reason or "Unknown Error"
@@ -5518,6 +5714,26 @@ class ServicesMixin:
                 warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
                 turn_warnings.append(warn_tmp.format(reason=ERR_REASON_REPETITIVE_CONTENT))
                 was_blocked = True
+            else:
+                grounding_sources = []
+                if hasattr(response, 'raw') and response.raw.candidates:
+                    if hasattr(response.raw.candidates[0], 'grounding_metadata'):
+                        metadata = response.raw.candidates[0].grounding_metadata
+                        if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
+                            for chunk in metadata.grounding_chunks:
+                                if hasattr(chunk, 'web'):
+                                    grounding_sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
+                    
+                    if hasattr(response.raw.candidates[0], 'url_context_metadata'):
+                        url_metadata = response.raw.candidates[0].url_context_metadata
+                        if hasattr(url_metadata, 'url_metadata') and url_metadata.url_metadata is not None:
+                            for u in url_metadata.url_metadata:
+                                if hasattr(u, 'retrieved_url') and u.retrieved_url:
+                                    grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
+                                    
+                sources_text = self._format_citation_subtext(grounding_sources)
+                if sources_text:
+                    response_text += f"\n\n{sources_text}"
 
             p_index = self._get_user_index(profile_owner_id)
             p_is_b = profile_name in p_index.get("borrowed", [])
@@ -5699,6 +5915,67 @@ class ServicesMixin:
         except Exception as e:
             await interaction.followup.send(f"❌ **Analysis Failed:** {e}", ephemeral=True)
 
+    def _add_inline_citations(self, text: str, grounding_metadata) -> str:
+        if not grounding_metadata: return text
+        supports = getattr(grounding_metadata, 'grounding_supports', None)
+        chunks = getattr(grounding_metadata, 'grounding_chunks', None)
+        if not supports or not chunks: return text
+
+        # Sort descending to avoid shifting indices when inserting text
+        sorted_supports = sorted(supports, key=lambda s: getattr(s.segment, 'end_index', 0), reverse=True)
+
+        for support in sorted_supports:
+            end_index = getattr(support.segment, 'end_index', None)
+            indices = getattr(support, 'grounding_chunk_indices', [])
+            if end_index is None or not indices: continue
+            
+            citation_links = []
+            for i in indices:
+                if i < len(chunks):
+                    citation_links.append(f"**[{i + 1}]**")
+            
+            if citation_links:
+                citation_string = " " + ", ".join(citation_links)
+                text = text[:end_index] + citation_string + text[end_index:]
+        return text
+
+    def _format_citation_subtext(self, grounding_sources: List[Dict]) -> Optional[str]:
+        if not grounding_sources: return None
+        source_links = []
+        
+        # Deduplicate by URI to prevent redundant footnotes
+        seen_uris = set()
+        deduped_sources = []
+        for s in grounding_sources:
+            uri = s.get('uri')
+            if uri and uri not in seen_uris:
+                seen_uris.add(uri)
+                deduped_sources.append(s)
+
+        for i, source in enumerate(deduped_sources):
+            domain = source.get('title')
+            if not domain or domain == 'URL Context' or domain == 'User Provided Link':
+                try:
+                    from urllib.parse import urlparse
+                    domain = urlparse(source['uri']).netloc
+                    if domain.startswith('www.'): domain = domain[4:]
+                except Exception:
+                    domain = "source"
+            import re
+            domain = re.sub(r'\s+', ' ', domain).strip()
+            source_links.append(f"**[{i+1}]** [{domain}](<{source['uri']}>)")
+        
+        links_per_line = 5
+        chunked_links = [source_links[i:i + links_per_line] for i in range(0, len(source_links), links_per_line)]
+        
+        formatted_lines = []
+        if chunked_links:
+            formatted_lines.append(f"> -# Sources:  {'  '.join(chunked_links[0])}")
+            for chunk in chunked_links[1:]:
+                formatted_lines.append(f"> -# {'  '.join(chunk)}")
+        
+        return "\n".join(formatted_lines)
+
     async def _process_urls_in_content(self, content: str, guild_id: int, profile_settings: Dict[str, Any], warning_channel: Optional[discord.abc.Messageable] = None) -> Tuple[List[str], List[Dict], List[str]]:
         warnings = []
         if not profile_settings.get("url_fetching_enabled", False):
@@ -5861,11 +6138,41 @@ class ServicesMixin:
                 google_search=types.GoogleSearch()
             )
             
+            # [NEW] Utility Routing Logic for Grounding RAG
+            rag_model_raw = FALLBACK_MODEL_NAME
+            session_id = mapping_key[1] if isinstance(mapping_key, tuple) else None
+            if session_id:
+                session = self.multi_profile_channels.get(session_id)
+                if session:
+                    # Just grab the first profile's settings for the RAG model to keep it simple
+                    first_p = session.get("profiles", [])[0] if session.get("profiles") else None
+                    if first_p:
+                        p_idx = self._get_user_index(first_p["owner_id"])
+                        is_b = first_p["profile_name"] in p_idx.get("borrowed", [])
+                        p_cfg = self._get_profile_config(first_p["owner_id"], first_p["profile_name"], is_b) or {}
+                        rag_model_raw = p_cfg.get("grounding_rag_model", FALLBACK_MODEL_NAME)
+            
+            is_or = False
+            actual_model_name = rag_model_raw
+            if rag_model_raw.upper().startswith("OPENROUTER/"):
+                actual_model_name = rag_model_raw[11:]
+                is_or = True
+            elif rag_model_raw.upper().startswith("GOOGLE/"):
+                actual_model_name = rag_model_raw[7:]
+                is_or = False
+            elif "/" in rag_model_raw:
+                is_or = True
+
             t_params = {"thinking_budget": 512, "thinking_summary_visible": "off", "thinking_level": "low"}
             
+            if is_or:
+                # OpenRouter doesn't support the Google Search Tool natively yet in our adapter
+                # We will fall back to Google for the RAG phase if they attempt to route grounding to OpenRouter
+                actual_model_name = FALLBACK_MODEL_NAME
+                
             model = GoogleGenAIModel(
                 api_key=api_key,
-                model_name=model_name,
+                model_name=actual_model_name,
                 system_instruction=system_instruction,
                 safety_settings=safety_settings,
                 thinking_params=t_params,
@@ -5880,7 +6187,12 @@ class ServicesMixin:
             if not grounding_response.text:
                 return None, [], False, None
 
-            lines = grounding_response.text.strip().split('\n')
+            # [NEW] Apply inline citations to the RAG model's text before passing it to the profile
+            rag_text = grounding_response.text
+            if hasattr(grounding_response, 'raw') and grounding_response.raw.candidates and hasattr(grounding_response.raw.candidates[0], 'grounding_metadata'):
+                rag_text = self._add_inline_citations(rag_text, grounding_response.raw.candidates[0].grounding_metadata)
+
+            lines = rag_text.strip().split('\n')
             decision = lines[0].strip().lower()
 
             if decision != 'yes':
@@ -5897,6 +6209,7 @@ class ServicesMixin:
             else:
                 summary_context = (
                     f"<external_context>\n"
+                    f"FOOTNOTES (e.g. **[1]** **[2]**) MUST BE INCLUDED IN YOUR TEXT; DO NOT INCLUDE URLS.\n"
                     f"{truncated_summary}\n"
                     f"</external_context>"
                 )
@@ -6220,7 +6533,7 @@ class ServicesMixin:
             await message.reply(f"An error occurred while queueing your request: {e}", delete_after=10)
             traceback.print_exc()
 
-    async def _generate_google_tts(self, text: str, guild_id: int, model_id: str = "gemini-2.5-flash-preview-tts", voice_name: str = "Aoede", temperature: float = 1.0) -> Optional[io.BytesIO]:
+    async def _generate_google_tts(self, text: str, guild_id: int, model_id: str = "GOOGLE/gemini-2.5-flash-preview-tts", voice_name: str = "Aoede", temperature: float = 1.0) -> Optional[io.BytesIO]:
         """Generates a playable WAV audio stream utilising Google Gemini Speech Generation models."""
         import wave
         api_key = self._get_api_key_for_guild(guild_id)
@@ -6228,6 +6541,8 @@ class ServicesMixin:
             return None
 
         try:
+            if model_id.upper().startswith("GOOGLE/"): model_id = model_id[7:]
+            
             client = genai.Client(
                 api_key=api_key, 
                 http_options=types.HttpOptions(api_version='v1beta')
@@ -6569,7 +6884,31 @@ class ServicesMixin:
                                 raise ValueError("No OpenRouter key for fallback")
                         else:
                             api_key = self._get_api_key_for_guild(channel.guild.id)
-                            fallback_instance = GoogleGenAIModel(api_key=api_key, model_name=fb_name, system_instruction=full_system_instruction, safety_settings=dynamic_safety_settings, thinking_params=t_params_worker)
+                            
+                            grounding_mode_native = p_profile.get("grounding_mode", "off")
+                            if isinstance(grounding_mode_native, bool): grounding_mode_native = "rag" if grounding_mode_native else "off"
+                            elif grounding_mode_native in ["on", "on+"]: grounding_mode_native = "rag"
+                            
+                            url_mode_native = p_profile.get("url_mode", "off")
+                            if "url_mode" not in p_profile:
+                                url_mode_native = "rag" if p_profile.get("url_fetching_enabled", False) else "off"
+
+                            model_tools_list = []
+                            if grounding_mode_native == "native":
+                                model_tools_list.append({"google_search": {}})
+                            if url_mode_native == "native":
+                                model_tools_list.append({"url_context": {}})
+                                
+                            model_tools = model_tools_list if model_tools_list else None
+                            
+                            fallback_instance = GoogleGenAIModel(
+                                api_key=api_key, 
+                                model_name=fb_name, 
+                                system_instruction=full_system_instruction, 
+                                safety_settings=dynamic_safety_settings, 
+                                thinking_params=t_params_worker,
+                                tools=model_tools
+                            )
                         
                         response, state_container = await self._generate_with_heartbeat(
                             fallback_instance, participant_history, gen_config, channel, participant, payload.message_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
@@ -6620,7 +6959,10 @@ class ServicesMixin:
                     else:
                         turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=reason))
             else:
-                raw_text = getattr(response, 'text', "").strip()
+                raw_text = getattr(response, 'text', "")
+                if hasattr(response, 'raw') and response.raw.candidates and hasattr(response.raw.candidates[0], 'grounding_metadata'):
+                    raw_text = self._add_inline_citations(raw_text, response.raw.candidates[0].grounding_metadata)
+                raw_text = raw_text.strip()
                 new_text = self._deduplicate_response(self._scrub_response_text(raw_text))
                 
                 if new_text == "[REPETITIVE_CONTENT_ERROR]":
@@ -6633,6 +6975,26 @@ class ServicesMixin:
                     warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
                     turn_warnings.append(warn_tmp.format(reason=ERR_REASON_EMPTY_RESPONSE))
                     was_blocked = True
+                else:
+                    grounding_sources = []
+                    if hasattr(response, 'raw') and response.raw.candidates:
+                        if hasattr(response.raw.candidates[0], 'grounding_metadata'):
+                            metadata = response.raw.candidates[0].grounding_metadata
+                            if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
+                                for chunk in metadata.grounding_chunks:
+                                    if hasattr(chunk, 'web'):
+                                        grounding_sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
+                        
+                        if hasattr(response.raw.candidates[0], 'url_context_metadata'):
+                            url_metadata = response.raw.candidates[0].url_context_metadata
+                            if hasattr(url_metadata, 'url_metadata') and url_metadata.url_metadata is not None:
+                                for u in url_metadata.url_metadata:
+                                    if hasattr(u, 'retrieved_url') and u.retrieved_url:
+                                        grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
+                                        
+                    sources_text = self._format_citation_subtext(grounding_sources)
+                    if sources_text:
+                        new_text += f"\n\n{sources_text}"
 
             if fallback_used and p_profile.get("show_fallback_indicator", True):
                 turn_warnings.append(WARN_FALLBACK_USED)
