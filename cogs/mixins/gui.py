@@ -4127,7 +4127,7 @@ class BulkURLContextView(BaseBulkProfileView):
         self.clear_items()
         opts = [
             discord.SelectOption(label="Off", value="off", description="Disable link reading entirely.", default=(self.url_mode == "off")),
-            discord.SelectOption(label="Native)", value="native", description="Uses Google's internal URL tool (Google Gemini Only).", default=(self.url_mode == "native")),
+            discord.SelectOption(label="Native", value="native", description="Uses Google's internal URL tool (Google Gemini Only).", default=(self.url_mode == "native")),
             discord.SelectOption(label="RAG", value="rag", description="Model-agnostic scraper. Works with all models.", default=(self.url_mode == "rag"))
         ]
         select = ui.Select(placeholder="Choose a URL context mode...", options=opts, row=0)

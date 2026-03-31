@@ -1202,7 +1202,7 @@ class CoreMixin:
             raw_text = raw_text.strip()
 
             # Apply filters
-            scrubbed_text = self._scrub_response_text(raw_text, participant_names=[display_name])
+            scrubbed_text = self._scrub_response_text(raw_text, participant_names=[app_name])
             response_text = self._deduplicate_response(scrubbed_text)
 
             if response_text and response_text != "[REPETITIVE_CONTENT_ERROR]":
@@ -1222,9 +1222,9 @@ class CoreMixin:
                                 if hasattr(u, 'retrieved_url') and u.retrieved_url:
                                     grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
                                     
-                sources_text = self._format_citation_subtext(grounding_sources)
-                if sources_text:
-                    response_text += f"\n\n{sources_text}"
+                sources_text_list = self._format_citation_subtext(grounding_sources)
+                if sources_text_list:
+                    response_text += "\n\n" + "\n".join(sources_text_list)
 
             model_content_obj_for_turn = {'role': 'model', 'parts': [response_text]}
             chat.history.extend([user_content_obj_for_turn, model_content_obj_for_turn])
@@ -1235,16 +1235,6 @@ class CoreMixin:
             current_log = session_data.get('unified_log', [])
             if len(current_log) > STM_LIMIT_MAX * 2:
                 session_data['unified_log'] = current_log[-(STM_LIMIT_MAX * 2):]
-            
-            # Apply filters
-            display_name = source_profile_name
-            avatar_url = self.bot.user.display_avatar.url
-            if appearance:
-                display_name = appearance.get("custom_display_name") or display_name
-                avatar_url = appearance.get("custom_avatar_url") or avatar_url
-
-            scrubbed_text = self._scrub_response_text(raw_text, participant_names=[display_name])
-            response_text = self._deduplicate_response(scrubbed_text)
 
             # --- Turn Logging ---
             for turn in queued_turns:
@@ -1287,7 +1277,7 @@ class CoreMixin:
             await self._update_sending_placeholder(interaction.channel, 'webhook', None, state_container, t1_start_mono)
 
             embed = discord.Embed(description=text_for_embed, color=discord.Color.blue())
-            embed.set_author(name=display_name, icon_url=avatar_url)
+            embed.set_author(name=app_name, icon_url=app_avatar or self.bot.user.display_avatar.url)
             embed.set_footer(text=combined_footer_text[:1000], icon_url=interaction.user.display_avatar.url)
             
             if state_container and state_container.get('sending_task'):
@@ -1301,7 +1291,7 @@ class CoreMixin:
             
             timezone_str = profile_data.get("timezone", "UTC")
             profile_id = self._get_profile_id(source_owner_id, source_profile_name)
-            main_history_line = self._format_history_entry(display_name, response_message.created_at, response_text, timezone_str, entity_id=profile_id)
+            main_history_line = self._format_history_entry(app_name, response_message.created_at, response_text, timezone_str, entity_id=profile_id)
             
             if profile_data.get("generation_metadata_enabled", False):
                 try:
@@ -1480,9 +1470,9 @@ class CoreMixin:
                             if hasattr(u, 'retrieved_url') and u.retrieved_url:
                                 grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
                                 
-            sources_text = self._format_citation_subtext(grounding_sources)
-            if sources_text:
-                response_text += f"\n\n{sources_text}"
+            sources_text_list = self._format_citation_subtext(grounding_sources)
+            if sources_text_list:
+                response_text += "\n\n" + "\n".join(sources_text_list)
 
         whisper_turn_id = str(uuid.uuid4())
         user_hash = self._get_user_hash(interaction.user.id)
@@ -2142,8 +2132,6 @@ class CoreMixin:
         # 3. Remove from in-memory caches
         self.multi_profile_channels.pop(channel_id, None)
         self.session_last_accessed.pop(channel_id, None)
-        mapping_key = (session_type, channel_id)
-        self.mapping_caches.pop(mapping_key, None)
 
         # 4. Persist the removal of the session from the server index
         channel = self.bot.get_channel(channel_id)
@@ -3244,16 +3232,6 @@ class CoreMixin:
                     # For multi-profile, the session_key is just the channel_id for path generation
                     dummy_session_key = (ch_id, None, None)
                     await self._save_session_to_disk(dummy_session_key, session_type, unified_log)
-                
-                # Also save the corresponding mapping file atomically with the session log
-                mapping_key = (session_type, ch_id)
-                if mapping_key in self.mapping_caches:
-                    self._save_mapping_to_disk(mapping_key, self.mapping_caches[mapping_key])
-
-        # Save any remaining mappings that are not for multi-profile sessions
-        for mapping_key, mapping_data in self.mapping_caches.items():
-            if mapping_key[0] not in ['multi', 'freewill']:
-                self._save_mapping_to_disk(mapping_key, mapping_data)
 
     async def _patch_profile_ids(self):
         """One-time patch to remove 'pid' fields and standardise 'profile_id' to 8 characters."""

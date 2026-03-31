@@ -1662,7 +1662,7 @@ class ServicesMixin:
                         mapping_key = (session.get("type", "multi"), channel.id)
                         grounding_result = await self._get_hybrid_grounding_context(grounding_query, channel.guild.id, history_for_grounding, mapping_key, safety_settings=g_dynamic_safety_settings, is_for_image=is_for_image_flag, warning_channel=channel)
                         if grounding_result:
-                            g_context, g_sources, should_set_checkpoint, g_warning = grounding_result
+                            g_context, g_sources, _, g_warning = grounding_result
                             if g_warning:
                                 pre_generation_warnings.append(g_warning)
                             
@@ -1682,8 +1682,6 @@ class ServicesMixin:
 
                                 grounding_sources = g_sources
                             grounding_profile_key = (g_owner_id, g_profile_name)
-                            if should_set_checkpoint:
-                                session["grounding_checkpoint"] = turn_id
 
                 ## [NEW] Phase: Research Once (URL Context)
                 round_url_text_contexts = []
@@ -1715,6 +1713,10 @@ class ServicesMixin:
                     is_generator = False
                     p_settings = {}
                     participant_key = (participant['owner_id'], participant['profile_name'])
+                    turn_grounding_sources = []
+                    if participant_key == grounding_profile_key:
+                        turn_grounding_sources.extend(grounding_sources)
+                    sources_text_list = []
                     contents_for_api_call = [] 
                     fallback_used = False
                     response_text = ""
@@ -2417,18 +2419,16 @@ class ServicesMixin:
                                             if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
                                                 for chunk in metadata.grounding_chunks:
                                                     if hasattr(chunk, 'web'):
-                                                        grounding_sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
+                                                        turn_grounding_sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
                                         
                                         if hasattr(response.raw.candidates[0], 'url_context_metadata'):
                                             url_metadata = response.raw.candidates[0].url_context_metadata
                                             if hasattr(url_metadata, 'url_metadata') and url_metadata.url_metadata is not None:
                                                 for u in url_metadata.url_metadata:
                                                     if hasattr(u, 'retrieved_url') and u.retrieved_url:
-                                                        grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
+                                                        turn_grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
                                                         
-                                    sources_text = self._format_citation_subtext(grounding_sources)
-                                    if sources_text:
-                                        response_text += f"\n\n{sources_text}"
+                                    sources_text_list = self._format_citation_subtext(turn_grounding_sources)
                                 
                                 # [UPDATED] Differentiated error messaging for spammed vs empty content
                                 if response_text == "[REPETITIVE_CONTENT_ERROR]":
@@ -2535,34 +2535,6 @@ class ServicesMixin:
                     if thought_text and p_settings.get("thinking_summary_visible") == "on":
                         thought_file_to_send = discord.File(io.BytesIO(thought_text.encode('utf-8')), filename="thinking_summary.txt")
 
-                    sources_text = None
-                    if grounding_mode_for_citator == "rag" and grounding_sources:
-                        source_links = []
-                        for i, source in enumerate(grounding_sources):
-                            domain = source.get('title')
-                            if not domain:
-                                try:
-                                    domain = urlparse(source['uri']).netloc
-                                    if domain.startswith('www.'):
-                                        domain = domain[4:]
-                                except Exception:
-                                    domain = "source"
-                            domain = re.sub(r'\s+', ' ', domain).strip()
-                            source_links.append(f"{i+1}. [{domain}](<{source['uri']}>)")
-                        
-                        links_per_line = 5
-                        chunked_links = [source_links[i:i + links_per_line] for i in range(0, len(source_links), links_per_line)]
-                        
-                        formatted_lines = []
-                        if chunked_links:
-                            # Format the first line with the "Sources:" prefix
-                            formatted_lines.append(f"> -# Sources:  {'  '.join(chunked_links[0])}")
-                            # Format any subsequent lines
-                            for chunk in chunked_links[1:]:
-                                formatted_lines.append(f"> -# {'  '.join(chunk)}")
-                        
-                        sources_text = "\n".join(formatted_lines)
-                    
                     t2_end_mono = time.monotonic()
                     duration = t2_end_mono - t1_start_mono
                     sent_timestamp = datetime.datetime.now(datetime.timezone.utc) 
@@ -2756,6 +2728,26 @@ class ServicesMixin:
                         try: await asyncio.wait_for(confirmation_event.wait(), timeout=45.0)
                         except asyncio.TimeoutError: self.pending_child_confirmations.pop(correlation_id, None)
 
+                        # Dispatch sources for Child Bot
+                        if sources_text_list:
+                            for source_msg in sources_text_list:
+                                s_corr_id = str(uuid.uuid4())
+                                s_conf_event = asyncio.Event()
+                                self.pending_child_confirmations[s_corr_id] = {
+                                    "event": s_conf_event, "type": "multi_profile", "participant": participant,
+                                    "history_line": history_line, "channel_id": channel.id, "turn_id": turn_id
+                                }
+                                await self.manager_queue.put({
+                                    "action": "send_to_child", "bot_id": participant['bot_id'],
+                                    "payload": {
+                                        "action": "send_message", "channel_id": channel.id, 
+                                        "content": source_msg, "realistic_typing": False, "correlation_id": s_corr_id,
+                                        "ping": False
+                                    }
+                                })
+                                try: await asyncio.wait_for(s_conf_event.wait(), timeout=45.0)
+                                except asyncio.TimeoutError: self.pending_child_confirmations.pop(s_corr_id, None)
+
                         # [NEW] Dispatch extra audio follow-up for Child Bot
                         if extra_audio_file:
                             a_corr_id = str(uuid.uuid4())
@@ -2811,6 +2803,14 @@ class ServicesMixin:
                             profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name,
                             file=file_to_send, reply_to=(anchor_message if i == 0 else None)
                         )
+                        
+                        if sources_text_list:
+                            for source_msg in sources_text_list:
+                                s_msgs = await self._send_channel_message(
+                                    channel, source_msg, bypass_typing=True,
+                                    profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name
+                                )
+                                if s_msgs: sent_messages.extend(s_msgs)
                         
                         # [NEW] Dispatch extra audio follow-up for Webhook
                         if extra_audio_file:
@@ -3174,6 +3174,7 @@ class ServicesMixin:
                     placeholder_message = package.get("placeholder_message")
                     final_response_text = "An error occurred."
                     image_file_to_send = None
+                    sources_text_list = []
                     
                     is_child_bot = package.get("is_child_bot", False)
                     channel = self.bot.get_channel(package['channel_id'])
@@ -3334,9 +3335,7 @@ class ServicesMixin:
                                                 if hasattr(u, 'retrieved_url') and u.retrieved_url:
                                                     grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
                                                     
-                                sources_text = self._format_citation_subtext(grounding_sources)
-                                if sources_text:
-                                    response_text += f"\n\n{sources_text}"
+                                sources_text_list = self._format_citation_subtext(grounding_sources)
                         
                         model_turn = {'role': 'model', 'parts': [response_text]}; chat.history.extend([user_turn, model_turn])
 
@@ -3413,50 +3412,20 @@ class ServicesMixin:
                             file=image_file_to_send, reply_to=anchor_msg
                         )
                         
-                        # [NEW] Find the turn in chat history (for single-profile) or session log and attach message IDs
-                        # Since single-profile sessions are also pivoting, we assume 'package' contains the turn info.
-                        
-                    grounding_sources = package.get("grounding_sources")
-                    grounding_mode = package.get("grounding_mode")
-                    if grounding_mode == "rag" and grounding_sources:
-                        source_links = []
-                        for i, source in enumerate(grounding_sources):
-                            domain = source.get('title')
-                            if not domain:
-                                try:
-                                    domain = urlparse(source['uri']).netloc
-                                    if domain.startswith('www.'):
-                                        domain = domain[4:]
-                                except Exception:
-                                    domain = "source"
-                            domain = re.sub(r'\s+', ' ', domain).strip()
-                            source_links.append(f"{i+1}. [{domain}](<{source['uri']}>)")
-                        
-                        links_per_line = 5
-                        chunked_links = [source_links[i:i + links_per_line] for i in range(0, len(source_links), links_per_line)]
-                        
-                        for i, chunk in enumerate(chunked_links):
-                            if i == 0:
-                                sources_text = f"> -# Sources:  {'  '.join(chunk)}"
-                            else:
-                                sources_text = f"> -# {'  '.join(chunk)}"
-                            
-                            if is_child_bot:
-                                # [UPDATED] Standard source payload for images (no Response Mode)
-                                source_payload = {
-                                    "action": "send_message", "channel_id": channel.id,
-                                    "content": sources_text, "realistic_typing": False,
-                                    "reply_to_id": None, "ping": False
-                                }
-                                await self.manager_queue.put({"action": "send_to_child", "bot_id": package['bot_id'], "payload": source_payload})
-                            else:
-                                # [UPDATED] Standard source message for images (no Response Mode)
-                                sent_messages = await self._send_channel_message(
-                            channel, final_response_text, target_message_to_edit=placeholder_message, 
-                            profile_owner_id_for_appearance=package['effective_profile_owner_id'], 
-                            profile_name_for_appearance=package['effective_profile_name'], 
-                            file=image_file_to_send, reply_to=anchor_msg
-                        )
+                    for source_msg in sources_text_list:
+                        if is_child_bot:
+                            source_payload = {
+                                "action": "send_message", "channel_id": channel.id,
+                                "content": source_msg, "realistic_typing": False,
+                                "reply_to_id": None, "ping": False
+                            }
+                            await self.manager_queue.put({"action": "send_to_child", "bot_id": package['bot_id'], "payload": source_payload})
+                        else:
+                            await self._send_channel_message(
+                                channel, source_msg, target_message_to_edit=None, bypass_typing=True,
+                                profile_owner_id_for_appearance=package['effective_profile_owner_id'], 
+                                profile_name_for_appearance=package['effective_profile_name']
+                            )
                                 
                     await self._dispatch_warnings(channel, 'child_bot' if is_child_bot else 'webhook', package.get('bot_id'), turn_warnings, package['effective_profile_owner_id'], package['effective_profile_name'])
 
@@ -5082,7 +5051,7 @@ class ServicesMixin:
                 ch_obj = self.bot.get_channel(channel_id)
                 grounding_result = await self._get_hybrid_grounding_context(prompt_text, guild_id, history_for_grounding, mapping_key, is_for_image=True, warning_channel=ch_obj)
                 if grounding_result:
-                    grounding_context, sources, _ = grounding_result
+                    grounding_context, sources, *_ = grounding_result
                     if grounding_context:
                         final_prompt_text = f"{prompt_text}\n\nUse this information to help generate the image:\n{grounding_context}"
                         grounding_sources = sources
@@ -5204,10 +5173,6 @@ class ServicesMixin:
 
         # 2. Clear all caches and delete the on-disk session file
         session_key = (channel_id, owner_id, profile_name)
-        
-        mapping_key = self._get_mapping_key_for_session(session_key, 'single')
-        if mapping_key in self.mapping_caches:
-            self.mapping_caches[mapping_key].pop('grounding_checkpoint', None)
         
         self.chat_sessions.pop(session_key, None)
         self.channel_models.pop(session_key, None)
@@ -5709,6 +5674,7 @@ class ServicesMixin:
 
             response_text = self._deduplicate_response(response_text)
             
+            sources_text_list = []
             if response_text == "[REPETITIVE_CONTENT_ERROR]":
                 response_text = p_settings.get("error_response", ERR_GENERAL_ERROR)
                 warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
@@ -5731,9 +5697,7 @@ class ServicesMixin:
                                 if hasattr(u, 'retrieved_url') and u.retrieved_url:
                                     grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
                                     
-                sources_text = self._format_citation_subtext(grounding_sources)
-                if sources_text:
-                    response_text += f"\n\n{sources_text}"
+                sources_text_list = self._format_citation_subtext(grounding_sources)
 
             p_index = self._get_user_index(profile_owner_id)
             p_is_b = profile_name in p_index.get("borrowed", [])
@@ -5784,12 +5748,28 @@ class ServicesMixin:
                         "realistic_typing": False, "correlation_id": correlation_id
                     }
                 })
+                if sources_text_list:
+                    for source_msg in sources_text_list:
+                        await self.manager_queue.put({
+                            "action": "send_to_child", "bot_id": bot_id,
+                            "payload": {
+                                "action": "send_message", "channel_id": channel.id, "content": source_msg,
+                                "realistic_typing": False
+                            }
+                        })
                 sent_messages = []
             else:
                 sent_messages = await self._send_channel_message(
                     channel, text_to_send, target_message_to_edit=None,
                     profile_owner_id_for_appearance=profile_owner_id, profile_name_for_appearance=profile_name
                 )
+                if sources_text_list:
+                    for source_msg in sources_text_list:
+                        s_msgs = await self._send_channel_message(
+                            channel, source_msg, bypass_typing=True,
+                            profile_owner_id_for_appearance=profile_owner_id, profile_name_for_appearance=profile_name
+                        )
+                        if s_msgs: sent_messages.extend(s_msgs)
                 
             await self._dispatch_warnings(channel, method, bot_id, turn_warnings, profile_owner_id, profile_name)
 
@@ -5939,8 +5919,8 @@ class ServicesMixin:
                 text = text[:end_index] + citation_string + text[end_index:]
         return text
 
-    def _format_citation_subtext(self, grounding_sources: List[Dict]) -> Optional[str]:
-        if not grounding_sources: return None
+    def _format_citation_subtext(self, grounding_sources: List[Dict]) -> List[str]:
+        if not grounding_sources: return []
         source_links = []
         
         # Deduplicate by URI to prevent redundant footnotes
@@ -5962,19 +5942,21 @@ class ServicesMixin:
                 except Exception:
                     domain = "source"
             import re
+            domain = re.sub(r'\[|\]', '', domain)
             domain = re.sub(r'\s+', ' ', domain).strip()
             source_links.append(f"**[{i+1}]** [{domain}](<{source['uri']}>)")
         
         links_per_line = 5
         chunked_links = [source_links[i:i + links_per_line] for i in range(0, len(source_links), links_per_line)]
         
-        formatted_lines = []
-        if chunked_links:
-            formatted_lines.append(f"> -# Sources:  {'  '.join(chunked_links[0])}")
-            for chunk in chunked_links[1:]:
-                formatted_lines.append(f"> -# {'  '.join(chunk)}")
+        messages = []
+        for i, chunk in enumerate(chunked_links):
+            if i == 0:
+                messages.append(f"> -# Sources:  {'  '.join(chunk)}")
+            else:
+                messages.append(f"> -# {'  '.join(chunk)}")
         
-        return "\n".join(formatted_lines)
+        return messages
 
     async def _process_urls_in_content(self, content: str, guild_id: int, profile_settings: Dict[str, Any], warning_channel: Optional[discord.abc.Messageable] = None) -> Tuple[List[str], List[Dict], List[str]]:
         warnings = []
@@ -6047,27 +6029,7 @@ class ServicesMixin:
         warning_str = None
         model_name = 'gemini-flash-lite-latest' # Use a single, tool-capable model
         try:
-            # Check for grounding checkpoint in the session log rather than a separate mapping
-            checkpoint = None
-            session_id = mapping_key[1] if isinstance(mapping_key, tuple) else None
-            if session_id:
-                session = self.multi_profile_channels.get(session_id)
-                if session:
-                    checkpoint = session.get("grounding_checkpoint")
-
             history_for_decision = conversation_history
-            if checkpoint is not None:
-                # For multi-profile, checkpoint is a turn_id string
-                if isinstance(checkpoint, str):
-                    try:
-                        start_index = next(i for i, turn in enumerate(conversation_history) if turn.get('parts') and isinstance(turn['parts'][0], str) and checkpoint in turn['parts'][0]) + 1
-                        history_for_decision = conversation_history[start_index:]
-                    except (StopIteration, IndexError):
-                        pass # Checkpoint not found, use full history
-                # For single-profile, checkpoint is a turn index integer
-                elif isinstance(checkpoint, int):
-                    if checkpoint < len(conversation_history):
-                        history_for_decision = conversation_history[checkpoint:]
 
             # [UPDATED] Standardize history for the Grounding Model
             # Omit technical metadata and recalled memories, but ALLOW previous search summaries
@@ -6507,7 +6469,7 @@ class ServicesMixin:
                 mapping_key = self._get_mapping_key_for_session(session_key, 'single')
                 grounding_result = await self._get_hybrid_grounding_context(prompt_text, guild_id, history_for_grounding, mapping_key, safety_settings=dynamic_safety_settings, is_for_image=True, warning_channel=message.channel)
                 if grounding_result:
-                    grounding_context, sources, _ = grounding_result
+                    grounding_context, sources, *_ = grounding_result
                     if grounding_context:
                         final_prompt_text = f"{prompt_text}\n\nUse this information to help generate the image:\n{grounding_context}"
                         grounding_sources = sources
@@ -6992,9 +6954,9 @@ class ServicesMixin:
                                     if hasattr(u, 'retrieved_url') and u.retrieved_url:
                                         grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
                                         
-                    sources_text = self._format_citation_subtext(grounding_sources)
-                    if sources_text:
-                        new_text += f"\n\n{sources_text}"
+                    sources_text_list = self._format_citation_subtext(grounding_sources)
+                    if sources_text_list:
+                        new_text += "\n\n" + "\n".join(sources_text_list)
 
             if fallback_used and p_profile.get("show_fallback_indicator", True):
                 turn_warnings.append(WARN_FALLBACK_USED)
