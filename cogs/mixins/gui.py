@@ -311,7 +311,7 @@ class GlobalChatPlayView(ui.View):
 class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
     model_id_input = ui.TextInput(label="Model ID", placeholder="e.g. anthropic/claude-3", required=True)
 
-    def __init__(self, view: 'SingleProfileModelView', target_config_key: str):
+    def __init__(self, view: Any, target_config_key: str):
         super().__init__()
         self.parent_view = view
         self.target_config_key = target_config_key
@@ -3636,12 +3636,21 @@ class ModelApplyView(ui.View):
         self.cog = cog
         self.user_id = user_id
         self.interaction = interaction
-        self.primary_model: Optional[str] = None
-        self.fallback_model: Optional[str] = None
         self.target_profiles: Set[str] = set()
         self.current_page = 0
         self.view_mode = 'google' 
-        self.show_fallback_indicator: bool = True 
+        self.category = 'response'
+        self.show_fallback_indicator: Optional[bool] = None 
+        
+        self.models_state = {
+            'primary_model': None,
+            'fallback_model': None,
+            'image_generation_model': None,
+            'speech_model': None,
+            'grounding_rag_model': None,
+            'critic_model': None,
+            'ltm_model': None
+        }
 
         # [UPDATED] Load ALL profiles (Personal + Borrowed)
         index = self.cog._get_user_index(self.user_id)
@@ -3651,19 +3660,57 @@ class ModelApplyView(ui.View):
         
         self._build_view()
 
+    def _save_changes(self, key: str, value: Any):
+        if key == "show_fallback_indicator":
+            self.show_fallback_indicator = value
+        else:
+            self.models_state[key] = value
+
     def _get_selection_feedback_message(self) -> str:
         count = len(self.target_profiles)
+        
+        def clean(val):
+            if not val: return "Unchanged"
+            return str(val).replace("GOOGLE/", "").replace("OPENROUTER/", "")
+            
+        msg = f"**Category:** `{self.category.title()}`\n"
+        if self.view_mode == 'openrouter':
+            msg += "⚠️ **Note:** OpenRouter / Custom models require **RAG Mode** for Grounding and URL Context.\n\n"
+        
+        if self.category == 'response':
+            p_clean = clean(self.models_state['primary_model'])
+            f_clean = clean(self.models_state['fallback_model'])
+            fb_status = "Unchanged" if self.show_fallback_indicator is None else ("ON" if self.show_fallback_indicator else "OFF")
+            msg += f"**Primary:** `{p_clean}`\n**Fallback:** `{f_clean}`\n**Fallback Indicator:** `{fb_status}`\n\n"
+        elif self.category == 'media':
+            i_clean = clean(self.models_state['image_generation_model'])
+            t_clean = clean(self.models_state['speech_model'])
+            msg += f"**Image Generation:** `{i_clean}`\n**Text-to-Speech:** `{t_clean}`\n\n"
+        elif self.category == 'tools':
+            g_clean = clean(self.models_state['grounding_rag_model'])
+            c_clean = clean(self.models_state['critic_model'])
+            msg += f"**Grounding RAG:** `{g_clean}`\n**Anti-Repetition Critic:** `{c_clean}`\n\n"
+        elif self.category == 'ltm':
+            l_clean = clean(self.models_state['ltm_model'])
+            msg += f"**LTM Summariser:** `{l_clean}`\n\n"
+            
         if count == 0:
-            return "Use the dropdowns below to select models and the profiles to apply them to."
+            msg += "Use the dropdowns below to select models and the profiles to apply them to."
+            return msg
         
         profile_list = sorted(list(self.target_profiles))
-        message = f"**Selected Profiles ({count}):**\n"
-        message += "\n".join(f"- `{name}`" for name in profile_list[:10])
+        msg += f"**Selected Profiles ({count}):**\n"
+        msg += "\n".join(f"- `{name}`" for name in profile_list[:10])
         if count > 10:
-            message += f"\n...and {count - 10} more."
-        return message
+            msg += f"\n...and {count - 10} more."
+        return msg
 
-    def _get_top_models(self, provider: str) -> List[str]:
+    def _get_top_models(self, provider: str, target_config_key: str) -> List[str]:
+        if target_config_key == 'image_generation_model':
+            return list(get_args(IMAGE_MODELS))
+        if target_config_key == 'speech_model':
+            return list(get_args(AUDIO_MODELS))
+            
         if provider == 'google':
             return list(get_args(ALLOWED_MODELS))
 
@@ -3681,55 +3728,114 @@ class ModelApplyView(ui.View):
         sorted_models = sorted(data.items(), key=lambda x: x[1], reverse=True)
         return [m[0] for m in sorted_models]
 
+    class GenericBulkModelSelect(ui.Select):
+        def __init__(self, placeholder: str, options: list, row: int, target_config_key: str):
+            super().__init__(placeholder=placeholder, options=options, row=row)
+            self.target_config_key = target_config_key
+
+        async def callback(self, interaction: discord.Interaction):
+            view = self.view
+            if self.values[0] == "custom_option":
+                await interaction.response.send_modal(CustomModelModal(view, self.target_config_key))
+            else: 
+                view._save_changes(self.target_config_key, self.values[0])
+                view._build_view()
+                await interaction.response.edit_message(content=view._get_selection_feedback_message(), view=view)
+
+    def _create_model_options(self, current_val: str, target_config_key: str) -> List[discord.SelectOption]:
+        top_models = self._get_top_models(self.view_mode, target_config_key)
+        opts = [discord.SelectOption(label="Custom Model...", value="custom_option", description="Enter manually via modal")]
+        
+        if current_val:
+            opts.append(discord.SelectOption(label=f"Current: {current_val}", value=current_val, default=True))
+        
+        prefix = "OPENROUTER/" if self.view_mode == 'openrouter' else "GOOGLE/"
+        if target_config_key in ['image_generation_model', 'speech_model']:
+            prefix = "GOOGLE/"
+            
+        added = len(opts)
+        for m in top_models:
+            if added >= 25: break
+            val = f"{prefix}{m}"
+            if current_val != val:
+                opts.append(discord.SelectOption(label=m[:100], value=val))
+                added += 1
+        return opts
+
     def _build_view(self):
         self.clear_items()
-        top_models = self._get_top_models(self.view_mode)
         
-        def create_model_options(current_val):
-            opts = [discord.SelectOption(label="Custom Model...", value="custom_option", description="Enter manually via modal")]
+        # Enforce Google Mode for Media
+        if self.category == 'media':
+            self.view_mode = 'google'
             
-            if current_val:
-                label = current_val
-                if self.view_mode == 'google' and label.upper().startswith("GOOGLE/"): label = label[7:]
-                elif self.view_mode == 'openrouter' and label.upper().startswith("OPENROUTER/"): label = label[11:]
-                opts.append(discord.SelectOption(label=f"Current: {label}", value=current_val, default=True))
+        # --- Row 0 & 1: Dropdowns ---
+        if self.category == 'response':
+            p_val = self.models_state["primary_model"]
+            f_val = self.models_state["fallback_model"]
+            self.add_item(self.GenericBulkModelSelect("Select Primary Model...", self._create_model_options(p_val, "primary_model"), 0, "primary_model"))
+            self.add_item(self.GenericBulkModelSelect("Select Fallback Model...", self._create_model_options(f_val, "fallback_model"), 1, "fallback_model"))
             
-            prefix = "OPENROUTER/" if self.view_mode == 'openrouter' else "GOOGLE/"
-            added = len(opts)
-            for m in top_models:
-                if added >= 25: break
-                val = f"{prefix}{m}"
-                if current_val != val:
-                    opts.append(discord.SelectOption(label=m[:100], value=val))
-                    added += 1
-            return opts
+        elif self.category == 'media':
+            i_val = self.models_state["image_generation_model"]
+            t_val = self.models_state["speech_model"]
+            self.add_item(self.GenericBulkModelSelect("Select Image Gen Model...", self._create_model_options(i_val, "image_generation_model"), 0, "image_generation_model"))
+            self.add_item(self.GenericBulkModelSelect("Select Text-to-Speech Model...", self._create_model_options(t_val, "speech_model"), 1, "speech_model"))
+            
+        elif self.category == 'tools':
+            g_val = self.models_state["grounding_rag_model"]
+            c_val = self.models_state["critic_model"]
+            self.add_item(self.GenericBulkModelSelect("Select Grounding RAG Model...", self._create_model_options(g_val, "grounding_rag_model"), 0, "grounding_rag_model"))
+            self.add_item(self.GenericBulkModelSelect("Select Critic Model...", self._create_model_options(c_val, "critic_model"), 1, "critic_model"))
+            
+        elif self.category == 'ltm':
+            l_val = self.models_state["ltm_model"]
+            self.add_item(self.GenericBulkModelSelect("Select LTM Summariser Model...", self._create_model_options(l_val, "ltm_model"), 0, "ltm_model"))
 
-        self.add_item(self.PrimaryModelSelect(create_model_options(self.primary_model)))
-        self.add_item(self.FallbackModelSelect(create_model_options(self.fallback_model)))
-
-        # Row 2: Provider Toggles + Fallback MSG Toggle
+        # Row 2: Provider Toggles + Category Cycle + Fallback Indicator
         style_g = discord.ButtonStyle.primary if self.view_mode == 'google' else discord.ButtonStyle.secondary
         style_o = discord.ButtonStyle.primary if self.view_mode == 'openrouter' else discord.ButtonStyle.secondary
         
-        btn_google = ui.Button(label="Google Models", style=style_g, row=2, custom_id="mode_google")
-        btn_open = ui.Button(label="OpenRouter Models", style=style_o, row=2, custom_id="mode_openrouter")
-        
-        fb_label = "Fallback Indicator: ON" if self.show_fallback_indicator else "Fallback Indicator: OFF"
-        fb_style = discord.ButtonStyle.success if self.show_fallback_indicator else discord.ButtonStyle.secondary
-        btn_fallback = ui.Button(label=fb_label, style=fb_style, row=2, custom_id="toggle_fallback")
+        btn_google = ui.Button(label="Google", style=style_g, row=2, custom_id="mode_google")
+        btn_open = ui.Button(label="OpenRouter", style=style_o, row=2, custom_id="mode_openrouter", disabled=(self.category == 'media'))
         
         async def mode_cb(i: discord.Interaction):
             self.view_mode = 'google' if i.data['custom_id'] == 'mode_google' else 'openrouter'
             self._build_view()
-            await i.response.edit_message(view=self)
-        
-        async def fallback_cb(i: discord.Interaction):
-            self.show_fallback_indicator = not self.show_fallback_indicator
+            await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+            
+        btn_google.callback = mode_cb
+        btn_open.callback = mode_cb
+        self.add_item(btn_google)
+        self.add_item(btn_open)
+
+        # Cycle Category Button
+        categories = ['response', 'media', 'tools', 'ltm']
+        cat_labels = {'response': 'Response', 'media': 'Media', 'tools': 'Tools', 'ltm': 'LTM'}
+        btn_cat = ui.Button(label=f"Category: {cat_labels[self.category]}", style=discord.ButtonStyle.blurple, row=2)
+        async def cat_cb(i: discord.Interaction):
+            next_idx = (categories.index(self.category) + 1) % len(categories)
+            self.category = categories[next_idx]
             self._build_view()
-            await i.response.edit_message(view=self)
-        
-        btn_google.callback = mode_cb; btn_open.callback = mode_cb; btn_fallback.callback = fallback_cb
-        self.add_item(btn_google); self.add_item(btn_open); self.add_item(btn_fallback)
+            await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+        btn_cat.callback = cat_cb
+        self.add_item(btn_cat)
+
+        if self.category == 'response':
+            fb_label = "Fallback Indicator: Unchanged" if self.show_fallback_indicator is None else ("Fallback Indicator: ON" if self.show_fallback_indicator else "Fallback Indicator: OFF")
+            fb_style = discord.ButtonStyle.success if self.show_fallback_indicator else (discord.ButtonStyle.secondary if self.show_fallback_indicator is None else discord.ButtonStyle.danger)
+            btn_fallback = ui.Button(label=fb_label, style=fb_style, row=2, custom_id="toggle_fallback")
+            async def fallback_cb(i: discord.Interaction):
+                if self.show_fallback_indicator is None:
+                    self.show_fallback_indicator = True
+                elif self.show_fallback_indicator:
+                    self.show_fallback_indicator = False
+                else:
+                    self.show_fallback_indicator = None
+                self._build_view()
+                await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+            btn_fallback.callback = fallback_cb
+            self.add_item(btn_fallback)
 
         # Row 3: Profile Select (Paginated)
         num_pages = (len(self.all_profiles) - 1) // DROPDOWN_MAX_OPTIONS + 1
@@ -3783,34 +3889,52 @@ class ModelApplyView(ui.View):
         self._build_view()
         await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
 
-    class PrimaryModelSelect(ui.Select):
-        def __init__(self, options): super().__init__(placeholder="Select Primary Model...", options=options, row=0)
-        async def callback(self, interaction):
-            view = self.view
-            if self.values[0] == "custom_option": await interaction.response.send_modal(CustomModelModal(view, 'primary'))
-            else: view.primary_model = self.values[0]; view._build_view(); await interaction.response.edit_message(view=view)
-
-    class FallbackModelSelect(ui.Select):
-        def __init__(self, options): super().__init__(placeholder="Select Fallback Model...", options=options, row=1)
-        async def callback(self, interaction):
-            view = self.view
-            if self.values[0] == "custom_option": await interaction.response.send_modal(CustomModelModal(view, 'fallback'))
-            else: view.fallback_model = self.values[0]; view._build_view(); await interaction.response.edit_message(view=view)
-
     async def apply_settings(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        if (not self.primary_model and not self.fallback_model) or not self.target_profiles:
-            await interaction.followup.send("Please select at least one model (Primary or Fallback) and at least one profile.", ephemeral=True)
+        
+        has_any_model = any(v is not None for v in self.models_state.values())
+        if not has_any_model and self.show_fallback_indicator is None:
+            await interaction.followup.send("Please select at least one setting to change.", ephemeral=True)
+            return
+            
+        if not self.target_profiles:
+            await interaction.followup.send("Please select at least one profile.", ephemeral=True)
             return
 
         success_count = 0
         index = self.cog._get_user_index(self.user_id)
         for profile_name in self.target_profiles:
             is_borrowed = profile_name in index.get("borrowed", [])
-            if await self.cog.update_profile_models(self.user_id, profile_name, self.primary_model, self.fallback_model, is_borrowed, self.interaction.channel_id, show_fallback_indicator=self.show_fallback_indicator):
+            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
+            if profile:
+                for k, v in self.models_state.items():
+                    if v is not None:
+                        profile[k] = v
+                        
+                if self.show_fallback_indicator is not None:
+                    profile["show_fallback_indicator"] = self.show_fallback_indicator
+                    
+                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
                 success_count += 1
-        
-        msg = f"Updated {success_count} profiles." if success_count else "No profiles updated."
+                
+        if success_count > 0:
+            keys_to_delete = []
+            for k in list(self.cog.channel_models.keys()):
+                key_user_id = None
+                if isinstance(k, tuple) and len(k) == 3:
+                    key_user_id = k[1]
+                elif isinstance(k, tuple) and len(k) == 2:
+                    key_user_id = k[1]
+                
+                if key_user_id == self.user_id:
+                    keys_to_delete.append(k)
+
+            for k in keys_to_delete:
+                self.cog.channel_models.pop(k, None)
+                self.cog.chat_sessions.pop(k, None)
+                self.cog.channel_model_last_profile_key.pop(k, None)
+
+        msg = f"Updated models for {success_count} profiles." if success_count else "No profiles updated."
         await interaction.edit_original_response(content=msg, view=None)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: ui.Item):
