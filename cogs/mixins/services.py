@@ -2911,7 +2911,7 @@ class ServicesMixin:
                                     url_media_batch = []
                                     
                                     if any_url_enabled_batch:
-                                        url_text_list, url_media = await self._process_urls_in_content(content, trigger.guild.id, {"url_fetching_enabled": True}, warning_channel=channel)
+                                        url_text_list, url_media, _ = await self._process_urls_in_content(content, trigger.guild.id, {"url_fetching_enabled": True}, warning_channel=channel)
                                         if url_text_list: url_text_batch = "\n".join(url_text_list)
                                         url_media_batch = url_media
 
