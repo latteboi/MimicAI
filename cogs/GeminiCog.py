@@ -1727,24 +1727,54 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     @app_commands.dm_only()
     @is_owner_in_dm_check()
     async def top_servers_slash(self, interaction: discord.Interaction):
-        # Sort guilds by the join date of the bot user within that guild
+        await interaction.response.defer(ephemeral=True)
+
         guilds_sorted = sorted(
             self.bot.guilds, 
             key=lambda g: g.me.joined_at if (g.me and g.me.joined_at) else datetime.datetime.now(datetime.timezone.utc)
         )
-        top_10 = guilds_sorted[:10]
         
-        embed = discord.Embed(title="Top 10 Servers by date:", color=discord.Color.gold())
-        description = ""
+        server_pages = {}
+        if not guilds_sorted:
+            server_pages["Page 1"] = "No server data available."
+        else:
+            for i in range(0, len(guilds_sorted), 25):
+                chunk = guilds_sorted[i:i + 25]
+                page_num = (i // 25) + 1
+                lines = []
+                for j, guild in enumerate(chunk, start=i + 1):
+                    join_str = guild.me.joined_at.strftime("%d/%m/%Y") if (guild.me and guild.me.joined_at) else "Unknown"
+                    lines.append(f"{j}. **{guild.name}** (`{guild.id}`) — Joined: `{join_str}`")
+                server_pages[f"Page {page_num} ({i + 1}-{i + len(chunk)})"] = "\n".join(lines)
+
+        user_stats = []
+        if os.path.isdir(self.USERS_DIR):
+            for user_id_str in os.listdir(self.USERS_DIR):
+                if user_id_str.isdigit():
+                    user_id = int(user_id_str)
+                    index = self._get_user_index(user_id)
+                    profile_count = len(index.get("personal", []))
+                    user_obj = self.bot.get_user(user_id)
+                    user_name = user_obj.name if user_obj else "Unknown User"
+                    user_stats.append({"id": user_id, "name": user_name, "count": profile_count})
         
-        for i, guild in enumerate(top_10, 1):
-            join_str = "Unknown"
-            if guild.me and guild.me.joined_at:
-                join_str = guild.me.joined_at.strftime("%d/%m/%Y")
-            description += f"{i}. **{guild.name}** — Joined: `{join_str}`\n"
+        user_stats.sort(key=lambda x: x["count"], reverse=True)
         
-        embed.description = description if description else "No guild data available."
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        user_pages = {}
+        if not user_stats:
+            user_pages["Page 1"] = "No user data available."
+        else:
+            for i in range(0, len(user_stats), 25):
+                chunk = user_stats[i:i + 25]
+                page_num = (i // 25) + 1
+                lines = []
+                for j, u_stat in enumerate(chunk, start=i + 1):
+                    lines.append(f"{j}. **{u_stat['name']}** (`{u_stat['id']}`) — Personal Profiles: `{u_stat['count']}`")
+                user_pages[f"Page {page_num} ({i + 1}-{i + len(chunk)})"] = "\n".join(lines)
+
+        content_dict = {"Servers": server_pages, "Users": user_pages}
+        view = DropdownContentView(content_dict, "MimicAI Statistics")
+        await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(GeminiAgent(bot))
