@@ -139,6 +139,7 @@ TERMS_CATEGORIES_SELF_HOSTED = {
             "**1. Self-Hosted Instance:** This instance of MimicAI is self-hosted. The developers of the MimicAI software are not responsible for the management, data retention, or uptime of this specific bot.\n\n"
             "**2. Software License:** This software is provided under the Prosperity Public License 3.0.0. Unauthorized commercial use is prohibited.\n\n"
             "**3. Universal Disclaimers:** By using this software, you acknowledge that AI-generated content can be unpredictable and the software developers are not liable for any output produced by the underlying models.\n\n"
+            "**4. Administrative Oversight:** The owner of this self-hosted instance possesses absolute oversight of all created profiles and conversational metadata. Through the `/mod` dashboard, they have the authority to modify or delete any profile, view instance-wide usage statistics, and blacklist users from interacting with the bot at their sole discretion.\n\n"
             "-# For more information, visit the website below."
         )
     }
@@ -150,6 +151,7 @@ TERMS_CATEGORIES_OFFICIAL = {
             "**1. Official Instance:** This is the official, public instance of MimicAI.\n\n"
             "**2. Data & Privacy:** By interacting with this bot, you acknowledge and agree to our data retention and privacy policies. We do not use your conversations to train underlying AI models.\n\n"
             "**3. Universal Disclaimers:** AI-generated content can be unpredictable. The developers of MimicAI are not liable for any output produced by the models.\n\n"
+            "**4. Administrative Oversight:** The owner of this official instance possesses absolute oversight of all created profiles and conversational metadata. Through the `/mod` dashboard, they have the authority to modify or delete any profile, view instance-wide usage statistics, and blacklist users from interacting with the bot at their sole discretion.\n\n"
             "-# For more information, visit the website below."
         )
     }

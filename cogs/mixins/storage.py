@@ -123,6 +123,16 @@ class IOManager:
 
 class StorageMixin:
 
+    def _load_global_prompts(self):
+        self.global_prompts = {}
+        if os.path.exists(GLOBAL_PROMPTS_FILE_PATH):
+            data = IOManager.read_json(GLOBAL_PROMPTS_FILE_PATH)
+            if data:
+                self.global_prompts = data
+
+    def _save_global_prompts(self):
+        _atomic_json_save(self.global_prompts, GLOBAL_PROMPTS_FILE_PATH)
+
     def _get_server_index(self, server_id_str: str) -> Dict[str, Any]:
         if hasattr(self, 'server_indices') and server_id_str in self.server_indices:
             return self.server_indices[server_id_str]

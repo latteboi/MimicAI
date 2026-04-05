@@ -1352,13 +1352,7 @@ class CoreMixin:
         user_hash = self._get_user_hash(interaction.user.id)
         whisper_content = self._format_history_entry(interaction.user.name, interaction.created_at, whisper_message, entity_id=user_hash)
         
-        api_whisper_prompt = (
-            f"<whisper_context>\n"
-            f"SYSTEM NOTE: The following is a private whisper directed exclusively to you. "
-            f"You MUST reply directly to this whisper. It will NOT be seen by other users.\n\n"
-            f"{whisper_content.strip()}\n"
-            f"</whisper_context>\n"
-        )
+        api_whisper_prompt = self.global_prompts.get("WHISPER_INJECTION", DEFAULT_WHISPER_INJECTION).format(whisper_content=whisper_content.strip())
         
         import copy
         contents_for_api_call = copy.deepcopy(chat_session.history)
@@ -2504,8 +2498,8 @@ class CoreMixin:
 
         return embed
     
-    async def _build_profile_manage_embed(self, interaction: discord.Interaction, profile_name: str) -> discord.Embed:
-        return await self._build_profile_embed(interaction.user.id, profile_name, interaction.channel_id)
+    async def _build_profile_manage_embed(self, interaction: discord.Interaction, profile_name: str, target_user_id: Optional[int] = None) -> discord.Embed:
+        return await self._build_profile_embed(target_user_id or interaction.user.id, profile_name, interaction.channel_id)
     
     async def _build_server_manage_embed(self, interaction: discord.Interaction) -> discord.Embed:
         guild = interaction.guild

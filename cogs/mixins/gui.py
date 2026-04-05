@@ -889,11 +889,12 @@ class WhisperActionView(ui.View):
         await self.cog._execute_whisper_regeneration(interaction, self.whisper_turn_id, self.response_turn_id, self.target_participant, self.whisper_message)
 
 class ProfileDirectorDeskModal(ui.Modal, title="Director's Desk: TTS Instructions"):
-    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], callback=None):
+    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], callback=None, target_user_id: Optional[int] = None):
         super().__init__()
         self.cog = cog
         self.profile_name = profile_name
         self.callback = callback
+        self.target_user_id = target_user_id
 
         self.archetype_input = ui.TextInput(
             label="Archetype (Who)", 
@@ -943,7 +944,7 @@ class ProfileDirectorDeskModal(ui.Modal, title="Director's Desk: TTS Instruction
             "speech_pacing": self.pacing_input.value.strip()
         }
 
-        user_id = interaction.user.id
+        user_id = getattr(self, "target_user_id", None) or interaction.user.id
         index = self.cog._get_user_index(user_id)
         is_borrowed = self.profile_name in index.get("borrowed", [])
         profile = self.cog._get_profile_config(user_id, self.profile_name, is_borrowed)
@@ -1066,52 +1067,74 @@ class DropdownContentView(ui.View):
         return embed
 
 class ProfileManageView(ui.View):
-    def __init__(self, cog: 'GeminiAgent', original_interaction: discord.Interaction, profile_name: str, is_borrowed: bool):
+    def __init__(self, cog: 'GeminiAgent', original_interaction: discord.Interaction, profile_name: str, is_borrowed: bool, target_user_id: Optional[int] = None, is_mod_view: bool = False):
         super().__init__(timeout=600)
         self.cog = cog
         self.original_interaction = original_interaction
-        self.user_id = original_interaction.user.id
+        self.target_user_id = target_user_id or original_interaction.user.id
+        self.user_id = self.target_user_id
         self.profile_name = profile_name
         self.is_borrowed = is_borrowed
+        self.is_mod_view = is_mod_view
         self.current_tab = "home"
         self._build_view()
 
     def _build_view(self):
         self.clear_items()
-        
+        is_mod = getattr(self, 'is_mod_view', False)
+
+        def tab_has_options(tab: str) -> bool:
+            if tab == "home":
+                if not is_mod: return True
+                return self.profile_name != DEFAULT_PROFILE_NAME
+            elif tab == "persona":
+                return not self.is_borrowed
+            elif tab in ["params", "tools", "memory"]:
+                return not is_mod
+            return False
+
+        valid_tabs = [t for t in ["home", "persona", "params", "tools", "memory"] if tab_has_options(t)]
+        if self.current_tab not in valid_tabs and valid_tabs:
+            self.current_tab = valid_tabs[0]
+            
+        if not valid_tabs:
+            if is_mod: ModBaseView.add_nav_to_other_view(self, self.cog, self.original_interaction, "profiles")
+            return
+
         # --- 1. Category Dropdown (Row 0) ---
         options = []
         if self.current_tab == "home":
-            if self.profile_name != DEFAULT_PROFILE_NAME:
-                options.append(discord.SelectOption(label="Rename Profile", value="rename", description="Change the local name of this profile."))
-            
-            if not self.is_borrowed:
-                options.append(discord.SelectOption(label="Duplicate Profile", value="duplicate", description="Create a new profile from a copy of this one."))
-                options.append(discord.SelectOption(label="Share Profile", value="share", description="Share this profile with others or publish it."))
-                options.append(discord.SelectOption(label="Custom Error Message", value="error_response", description="Set the message shown when generation fails."))
-                options.append(discord.SelectOption(label="Generation Visual", value="generation_visual", description="Set custom placeholder emoji and child bot behavior."))
-            
-            options.append(discord.SelectOption(label="Cycle Content Safety Level", value="safety_level", description="Cycle: Low -> Medium -> High -> Unrestricted 18+."))
+            if not is_mod:
+                if self.profile_name != DEFAULT_PROFILE_NAME:
+                    options.append(discord.SelectOption(label="Rename Profile", value="rename", description="Change the local name of this profile."))
+                
+                if not self.is_borrowed:
+                    options.append(discord.SelectOption(label="Duplicate Profile", value="duplicate", description="Create a new profile from a copy of this one."))
+                    options.append(discord.SelectOption(label="Share Profile", value="share", description="Share this profile with others or publish it."))
+                    options.append(discord.SelectOption(label="Custom Error Message", value="error_response", description="Set the message shown when generation fails."))
+                    options.append(discord.SelectOption(label="Generation Visual", value="generation_visual", description="Set custom placeholder emoji and child bot behavior."))
+                
+                options.append(discord.SelectOption(label="Cycle Content Safety Level", value="safety_level", description="Cycle: Low -> Medium -> High -> Unrestricted 18+."))
             
             if self.profile_name != DEFAULT_PROFILE_NAME:
                 label = "Remove Borrowed Profile" if self.is_borrowed else "Delete Profile"
                 options.append(discord.SelectOption(label=label, value="delete", description="Permanently remove this profile and its data."))
 
         elif self.current_tab == "persona":
-            # Tab hidden for borrowed, but kept for logic safety
             options.append(discord.SelectOption(label="Edit Persona", value="edit_persona", description="Edit backstory, traits, likes, dislikes, and appearance."))
             options.append(discord.SelectOption(label="Edit Instructions", value="edit_instructions", description="Edit specific AI behavioral instructions."))
             options.append(discord.SelectOption(label="TTS Instructions", value="tts_instructions", description="Configure the 'Director's Desk' for vocal performance."))
-            options.append(discord.SelectOption(label="Edit Appearance", value="edit_appearance", description="Edit the custom Webhook name and avatar."))
+            if not is_mod:
+                options.append(discord.SelectOption(label="Edit Appearance", value="edit_appearance", description="Edit the custom Webhook name and avatar."))
 
-        elif self.current_tab == "params":
+        elif self.current_tab == "params" and not is_mod:
             options.append(discord.SelectOption(label="Set Models", value="models", description="Choose Primary and Fallback AI models."))
             options.append(discord.SelectOption(label="Set Generation Parameters & STM", value="gen_params", description="Set Temp, Top P, Top K, and STM Length."))
             options.append(discord.SelectOption(label="Set Advanced Parameters (OPENROUTER)", value="adv_params", description="Set penalties, Min P, and Top A."))
             options.append(discord.SelectOption(label="Set Thinking Parameters", value="thinking_params", description="Set thinking persistence, level, and budget."))
             options.append(discord.SelectOption(label="Set Speech & Voice Settings", value="speech_settings", description="Set TTS voice, model, and temperature."))
 
-        elif self.current_tab == "tools":
+        elif self.current_tab == "tools" and not is_mod:
             options.append(discord.SelectOption(label="Toggle Image Generation", value="image_toggle", description="Allow this profile to generate images via !image/!imagine."))
             options.append(discord.SelectOption(label="Toggle Grounding (Web Search)", value="grounding", description="Cycle Grounding: OFF -> NATIVE -> RAG."))
             options.append(discord.SelectOption(label="Toggle URL Context Fetching", value="url_toggle", description="Cycle URL Context: OFF -> NATIVE -> RAG."))
@@ -1121,7 +1144,7 @@ class ProfileManageView(ui.View):
             options.append(discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable a human-like delay when the bot sends messages."))
             options.append(discord.SelectOption(label="Toggle Anti-Repetition Critic", value="critic", description="Enable semantic repetition analysis (Adds latency)."))
 
-        elif self.current_tab == "memory":
+        elif self.current_tab == "memory" and not is_mod:
             options.append(discord.SelectOption(label="Manage Data (LTM & Training)", value="data", description="Add, list, edit, or delete memories and examples."))
             if not self.is_borrowed:
                 options.append(discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training context size and relevance threshold."))
@@ -1137,19 +1160,18 @@ class ProfileManageView(ui.View):
             self.add_item(select)
 
         # --- 2. Navigation Buttons (Row 1) ---
-        tabs = ["home", "persona", "params", "tools", "memory"]
-        if self.is_borrowed: tabs.remove("persona")
-        
-        for tab in tabs:
+        for tab in valid_tabs:
             btn = ui.Button(
                 label=tab.title(), 
                 style=discord.ButtonStyle.primary if self.current_tab == tab else discord.ButtonStyle.secondary, 
                 row=1, 
                 disabled=(self.current_tab == tab)
             )
-            # Use a wrapper to capture tab name
             btn.callback = self.create_nav_callback(tab)
             self.add_item(btn)
+
+        if is_mod:
+            ModBaseView.add_nav_to_other_view(self, self.cog, self.original_interaction, "profiles")
 
     def create_nav_callback(self, tab_name):
         async def callback(interaction: discord.Interaction):
@@ -1227,9 +1249,9 @@ class ProfileManageView(ui.View):
             await interaction.response.send_modal(modal)
         elif choice == "tts_instructions":
             async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog._build_profile_manage_embed(modal_interaction, profile_name)
+                new_embed = await self.cog._build_profile_manage_embed(modal_interaction, profile_name, target_user_id=self.user_id)
                 await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileDirectorDeskModal(self.cog, profile_name, profile, callback=refresh_cb)
+            modal = ProfileDirectorDeskModal(self.cog, profile_name, profile, callback=refresh_cb, target_user_id=self.user_id)
             await interaction.response.send_modal(modal)
         elif choice == "edit_appearance":
             await self._handle_appearance(interaction)
@@ -6830,3 +6852,428 @@ class BulkExportView(BaseBulkProfileView):
             return
         
         await self.cog._execute_export(interaction, list(self.selected_profiles), self.export_filters)
+
+class ModBaseView(ui.View):
+    def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, current_tab: str):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.original_interaction = interaction
+        self.current_tab = current_tab
+        self._add_nav_buttons()
+
+    def _add_nav_buttons(self):
+        btn_stats = ui.Button(label="Stats", style=discord.ButtonStyle.primary if self.current_tab == "stats" else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab=="stats"))
+        btn_prof = ui.Button(label="Profiles", style=discord.ButtonStyle.primary if self.current_tab == "profiles" else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab=="profiles"))
+        btn_prompts = ui.Button(label="Prompts", style=discord.ButtonStyle.primary if self.current_tab == "prompts" else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab=="prompts"))
+        btn_bl = ui.Button(label="Blacklist", style=discord.ButtonStyle.primary if self.current_tab == "blacklist" else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab=="blacklist"))
+
+        btn_stats.callback = self.nav_stats
+        btn_prof.callback = self.nav_profiles
+        btn_prompts.callback = self.nav_prompts
+        btn_bl.callback = self.nav_blacklist
+
+        self.add_item(btn_stats)
+        self.add_item(btn_prof)
+        self.add_item(btn_prompts)
+        self.add_item(btn_bl)
+
+    async def nav_stats(self, i: discord.Interaction):
+        await i.response.defer(); view = ModStatsView(self.cog, self.original_interaction); await view.update_display()
+
+    async def nav_profiles(self, i: discord.Interaction):
+        await i.response.defer(); view = ModProfilesView(self.cog, self.original_interaction); await view.update_display()
+
+    async def nav_prompts(self, i: discord.Interaction):
+        await i.response.defer(); view = ModPromptsView(self.cog, self.original_interaction); await view.update_display()
+        
+    async def nav_blacklist(self, i: discord.Interaction):
+        await i.response.defer(); view = ModBlacklistView(self.cog, self.original_interaction); await view.update_display()
+        
+    @staticmethod
+    def add_nav_to_other_view(target_view, cog, interaction, current_tab):
+        btn_stats = ui.Button(label="Stats", style=discord.ButtonStyle.primary if current_tab == "stats" else discord.ButtonStyle.secondary, row=4, disabled=(current_tab=="stats"))
+        btn_prof = ui.Button(label="Profiles", style=discord.ButtonStyle.primary if current_tab == "profiles" else discord.ButtonStyle.secondary, row=4, disabled=(current_tab=="profiles"))
+        btn_prompts = ui.Button(label="Prompts", style=discord.ButtonStyle.primary if current_tab == "prompts" else discord.ButtonStyle.secondary, row=4, disabled=(current_tab=="prompts"))
+        btn_bl = ui.Button(label="Blacklist", style=discord.ButtonStyle.primary if current_tab == "blacklist" else discord.ButtonStyle.secondary, row=4, disabled=(current_tab=="blacklist"))
+
+        async def nav_stats(i: discord.Interaction):
+            await i.response.defer(); view = ModStatsView(cog, interaction); await view.update_display()
+        async def nav_profiles(i: discord.Interaction):
+            await i.response.defer(); view = ModProfilesView(cog, interaction); await view.update_display()
+        async def nav_prompts(i: discord.Interaction):
+            await i.response.defer(); view = ModPromptsView(cog, interaction); await view.update_display()
+        async def nav_blacklist(i: discord.Interaction):
+            await i.response.defer(); view = ModBlacklistView(cog, interaction); await view.update_display()
+
+        btn_stats.callback = nav_stats
+        btn_prof.callback = nav_profiles
+        btn_prompts.callback = nav_prompts
+        btn_bl.callback = nav_blacklist
+
+        target_view.add_item(btn_stats)
+        target_view.add_item(btn_prof)
+        target_view.add_item(btn_prompts)
+        target_view.add_item(btn_bl)
+
+class ModBlacklistModal(ui.Modal, title="Enter User ID"):
+    user_id_input = ui.TextInput(label="Discord User ID", required=True)
+    def __init__(self, view):
+        super().__init__()
+        self.parent_view = view
+        
+    async def on_submit(self, i: discord.Interaction):
+        uid_str = self.user_id_input.value.strip()
+        if not uid_str.isdigit():
+            await i.response.send_message("Invalid ID. Must be numeric.", ephemeral=True)
+            return
+            
+        uid = int(uid_str)
+        if uid not in self.parent_view.cog.global_blacklist:
+            self.parent_view.cog.global_blacklist.add(uid)
+            self.parent_view.cog._save_blacklist()
+            
+        self.parent_view.selected_user_id = uid
+        self.parent_view._build_view()
+        await i.response.edit_message(embed=self.parent_view._get_embed(), view=self.parent_view)
+
+class ModBlacklistView(ModBaseView):
+    def __init__(self, cog, interaction):
+        super().__init__(cog, interaction, "blacklist")
+        self.selected_user_id = None
+        self.current_page = 0
+        self._build_view()
+
+    def _build_view(self):
+        self.clear_items()
+        
+        blacklist = sorted(list(self.cog.global_blacklist))
+        
+        btn_enter = ui.Button(label="Enter User ID", style=discord.ButtonStyle.primary, row=0)
+        async def enter_cb(i: discord.Interaction):
+            await i.response.send_modal(ModBlacklistModal(self))
+        btn_enter.callback = enter_cb
+        self.add_item(btn_enter)
+        
+        btn_remove = ui.Button(label="Remove", style=discord.ButtonStyle.danger, disabled=(self.selected_user_id is None), row=0)
+        async def remove_cb(i: discord.Interaction):
+            if self.selected_user_id in self.cog.global_blacklist:
+                self.cog.global_blacklist.discard(self.selected_user_id)
+                self.cog._save_blacklist()
+            self.selected_user_id = None
+            self._build_view()
+            await i.response.edit_message(embed=self._get_embed(), view=self)
+        btn_remove.callback = remove_cb
+        self.add_item(btn_remove)
+        
+        if blacklist:
+            num_pages = (len(blacklist) - 1) // DROPDOWN_MAX_OPTIONS + 1
+            if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
+            
+            start = self.current_page * DROPDOWN_MAX_OPTIONS
+            page_items = blacklist[start : start + DROPDOWN_MAX_OPTIONS]
+            
+            options = []
+            for uid in page_items:
+                user = self.cog.bot.get_user(uid)
+                uname = user.name if user else "Unknown User"
+                options.append(discord.SelectOption(label=f"{uname} ({uid})", value=str(uid), default=(self.selected_user_id == uid)))
+                
+            sel = ui.Select(placeholder="Select a blacklisted user...", options=options, row=1)
+            
+            async def sel_cb(i: discord.Interaction):
+                self.selected_user_id = int(i.data['values'][0])
+                self._build_view()
+                await i.response.edit_message(embed=self._get_embed(), view=self)
+            
+            sel.callback = sel_cb
+            self.add_item(sel)
+
+            if num_pages > 1:
+                prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page == 0), row=2)
+                page_lbl = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, disabled=True, row=2)
+                next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page >= num_pages - 1), row=2)
+                
+                async def p_cb(i: discord.Interaction):
+                    self.current_page -= 1
+                    self._build_view()
+                    await i.response.edit_message(embed=self._get_embed(), view=self)
+                async def n_cb(i: discord.Interaction):
+                    self.current_page += 1
+                    self._build_view()
+                    await i.response.edit_message(embed=self._get_embed(), view=self)
+                    
+                prev_btn.callback = p_cb
+                next_btn.callback = n_cb
+                self.add_item(prev_btn)
+                self.add_item(page_lbl)
+                self.add_item(next_btn)
+
+        self._add_nav_buttons()
+
+    def _get_embed(self):
+        embed = discord.Embed(title="Global Blacklist", color=discord.Color.dark_red())
+        if self.selected_user_id:
+            user = self.cog.bot.get_user(self.selected_user_id)
+            uname = user.name if user else "Unknown User"
+            embed.description = f"Selected User: **{uname}** (`{self.selected_user_id}`)\nClick 'Remove' to pardon them."
+        else:
+            embed.description = f"Total Blacklisted Users: **{len(self.cog.global_blacklist)}**\nEnter a User ID to add them to the blacklist, or select an existing one below to remove them."
+        return embed
+
+    async def update_display(self):
+        await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
+
+class ModStatsView(ModBaseView):
+    def __init__(self, cog, interaction):
+        super().__init__(cog, interaction, "stats")
+        self.selected_category = "Servers"
+        self.current_page = 0
+        self.content_dict = {}
+        self._load_data()
+        self._build_view()
+
+    def _load_data(self):
+        guilds_sorted = sorted(self.cog.bot.guilds, key=lambda g: g.me.joined_at if (g.me and g.me.joined_at) else datetime.datetime.now(datetime.timezone.utc))
+        
+        servers_pages = []
+        if not guilds_sorted:
+            servers_pages.append("No server data available.")
+        else:
+            for i in range(0, len(guilds_sorted), 25):
+                chunk = guilds_sorted[i:i + 25]
+                lines = []
+                for j, guild in enumerate(chunk, start=i + 1):
+                    join_str = guild.me.joined_at.strftime("%d/%m/%Y") if (guild.me and guild.me.joined_at) else "Unknown"
+                    lines.append(f"{j}. **{guild.name}** (`{guild.id}`) — Joined: `{join_str}`")
+                servers_pages.append("\n".join(lines))
+        
+        user_stats = []
+        if os.path.isdir(self.cog.USERS_DIR):
+            for user_id_str in os.listdir(self.cog.USERS_DIR):
+                if user_id_str.isdigit():
+                    user_id = int(user_id_str)
+                    index = self.cog._get_user_index(user_id)
+                    profile_count = len(index.get("personal", []))
+                    user_obj = self.cog.bot.get_user(user_id)
+                    user_name = user_obj.name if user_obj else "Unknown User"
+                    user_stats.append({"id": user_id, "name": user_name, "count": profile_count})
+        
+        user_stats.sort(key=lambda x: x["count"], reverse=True)
+        
+        users_pages = []
+        if not user_stats:
+            users_pages.append("No user data available.")
+        else:
+            for i in range(0, len(user_stats), 25):
+                chunk = user_stats[i:i + 25]
+                lines = []
+                for j, u_stat in enumerate(chunk, start=i + 1):
+                    lines.append(f"{j}. **{u_stat['name']}** (`{u_stat['id']}`) — Personal Profiles: `{u_stat['count']}`")
+                users_pages.append("\n".join(lines))
+
+        self.content_dict = {"Servers": servers_pages, "Users": users_pages}
+
+    def _build_view(self):
+        self.clear_items()
+
+        cat_opts = [discord.SelectOption(label=cat, value=cat, default=(cat == self.selected_category)) for cat in self.content_dict.keys()]
+        cat_sel = ui.Select(placeholder="Select Category...", options=cat_opts, row=0)
+        async def cat_cb(i: discord.Interaction):
+            self.selected_category = i.data['values'][0]
+            self.current_page = 0
+            self._build_view()
+            await i.response.edit_message(embed=self._get_embed(), view=self)
+        cat_sel.callback = cat_cb
+        self.add_item(cat_sel)
+
+        pages = self.content_dict[self.selected_category]
+        num_pages = len(pages)
+        if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
+
+        prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page == 0), row=1)
+        page_lbl = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, disabled=True, row=1)
+        next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page >= num_pages - 1), row=1)
+        
+        async def p_cb(i: discord.Interaction):
+            self.current_page -= 1
+            self._build_view()
+            await i.response.edit_message(embed=self._get_embed(), view=self)
+        async def n_cb(i: discord.Interaction):
+            self.current_page += 1
+            self._build_view()
+            await i.response.edit_message(embed=self._get_embed(), view=self)
+
+        prev_btn.callback = p_cb
+        next_btn.callback = n_cb
+        
+        self.add_item(prev_btn)
+        self.add_item(page_lbl)
+        self.add_item(next_btn)
+
+        self._add_nav_buttons()
+
+    def _get_embed(self):
+        embed = discord.Embed(title="MimicAI Statistics", color=discord.Color.gold())
+        pages = self.content_dict[self.selected_category]
+        embed.description = pages[self.current_page]
+        return embed
+
+    async def update_display(self):
+        await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
+
+class ModProfilesModal(ui.Modal, title="Enter User ID"):
+    user_id_input = ui.TextInput(label="Discord User ID", required=True)
+    def __init__(self, view):
+        super().__init__()
+        self.parent_view = view
+    async def on_submit(self, i: discord.Interaction):
+        uid_str = self.user_id_input.value.strip()
+        if not uid_str.isdigit():
+            await i.response.send_message("Invalid ID.", ephemeral=True)
+            return
+        self.parent_view.target_user_id = int(uid_str)
+        self.parent_view._build_view()
+        await i.response.edit_message(embed=self.parent_view._get_embed(), view=self.parent_view)
+
+class ModProfilesView(ModBaseView):
+    def __init__(self, cog, interaction):
+        super().__init__(cog, interaction, "profiles")
+        self.target_user_id = None
+        self.current_page = 0
+        self._build_view()
+
+    def _build_view(self):
+        self.clear_items()
+        
+        btn_enter = ui.Button(label="Enter User ID", style=discord.ButtonStyle.success, row=0)
+        async def enter_cb(i: discord.Interaction):
+            await i.response.send_modal(ModProfilesModal(self))
+        btn_enter.callback = enter_cb
+        self.add_item(btn_enter)
+        
+        if self.target_user_id:
+            index = self.cog._get_user_index(self.target_user_id)
+            profiles = list(index.get("personal", [])) + list(index.get("borrowed", []))
+            profiles.sort()
+            
+            if profiles:
+                num_pages = (len(profiles) - 1) // DROPDOWN_MAX_OPTIONS + 1
+                if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
+                
+                start = self.current_page * DROPDOWN_MAX_OPTIONS
+                page_items = profiles[start : start + DROPDOWN_MAX_OPTIONS]
+                
+                options = [discord.SelectOption(label=p[:100], value=p[:100]) for p in page_items]
+                sel = ui.Select(placeholder="Select a profile to manage...", options=options, row=1)
+                
+                async def sel_cb(i: discord.Interaction):
+                    pname = i.data['values'][0]
+                    is_b = pname in index.get("borrowed", [])
+                    await i.response.defer()
+                    pm_view = ProfileManageView(self.cog, self.original_interaction, pname, is_b, target_user_id=self.target_user_id, is_mod_view=True)
+                    embed = await self.cog._build_profile_manage_embed(self.original_interaction, pname, target_user_id=self.target_user_id)
+                    await self.original_interaction.edit_original_response(embed=embed, view=pm_view)
+                
+                sel.callback = sel_cb
+                self.add_item(sel)
+
+                if num_pages > 1:
+                    prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page == 0), row=2)
+                    page_lbl = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, disabled=True, row=2)
+                    next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page >= num_pages - 1), row=2)
+                    
+                    async def p_cb(i: discord.Interaction):
+                        self.current_page -= 1
+                        self._build_view()
+                        await i.response.edit_message(embed=self._get_embed(), view=self)
+                    async def n_cb(i: discord.Interaction):
+                        self.current_page += 1
+                        self._build_view()
+                        await i.response.edit_message(embed=self._get_embed(), view=self)
+                        
+                    prev_btn.callback = p_cb
+                    next_btn.callback = n_cb
+                    self.add_item(prev_btn)
+                    self.add_item(page_lbl)
+                    self.add_item(next_btn)
+
+        self._add_nav_buttons()
+
+    def _get_embed(self):
+        embed = discord.Embed(title="Moderator Profile Dashboard", color=discord.Color.red())
+        if self.target_user_id:
+            user = self.cog.bot.get_user(self.target_user_id)
+            uname = user.name if user else "Unknown"
+            embed.description = f"Managing User: **{uname}** (`{self.target_user_id}`)\nSelect a profile below."
+        else:
+            embed.description = "Click the button below to enter a User ID to manage."
+        return embed
+
+    async def update_display(self):
+        await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
+
+class ModPromptModal(ui.Modal, title="Edit Global Prompt"):
+    def __init__(self, view, key, default_text):
+        super().__init__()
+        self.parent_view = view
+        self.key = key
+        
+        curr_val = self.parent_view.cog.global_prompts.get(key, default_text)
+        self.prompt_input = ui.TextInput(
+            label="Prompt (Blank to reset to default)", 
+            style=discord.TextStyle.paragraph, 
+            default=curr_val, 
+            required=False,
+            max_length=4000
+        )
+        self.add_item(self.prompt_input)
+
+    async def on_submit(self, i: discord.Interaction):
+        val = self.prompt_input.value.strip()
+        if val:
+            self.parent_view.cog.global_prompts[self.key] = val
+        else:
+            self.parent_view.cog.global_prompts.pop(self.key, None)
+        
+        self.parent_view.cog._save_global_prompts()
+        await i.response.send_message(f"Updated `{self.key}` successfully.", ephemeral=True)
+
+class ModPromptsView(ModBaseView):
+    def __init__(self, cog, interaction):
+        super().__init__(cog, interaction, "prompts")
+        self._build_view()
+
+    def _build_view(self):
+        self.clear_items()
+        
+        prompt_keys = [
+            ("LTM Summarization", "LTM_SUMMARIZATION_INSTRUCTIONS", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS),
+            ("Context Rules", "CONTEXT_RULES", DEFAULT_CONTEXT_RULES),
+            ("Training Data Injection", "TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION),
+            ("Auto-Moderator Critic", "AUTO_MODERATOR", DEFAULT_AUTO_MODERATOR_PROMPT),
+            ("Anti-Repetition Critic", "ANTI_REPETITION", DEFAULT_ANTI_REPETITION_PROMPT),
+            ("Web Grounding (Text)", "WEB_GROUNDING_TEXT", DEFAULT_WEB_GROUNDING_TEXT),
+            ("Web Grounding (Visual)", "WEB_GROUNDING_VISUAL", DEFAULT_WEB_GROUNDING_VISUAL),
+            ("Profile Generator", "PROFILE_GENERATOR", DEFAULT_PROFILE_GENERATOR_PROMPT),
+            ("Training Analyst", "TRAINING_ANALYST", DEFAULT_TRAINING_ANALYST_PROMPT),
+            ("Whisper Injection", "WHISPER_INJECTION", DEFAULT_WHISPER_INJECTION)
+        ]
+        
+        options = [discord.SelectOption(label=lbl, value=key) for lbl, key, _ in prompt_keys]
+        sel = ui.Select(placeholder="Select a prompt to edit...", options=options, row=0)
+        
+        async def sel_cb(i: discord.Interaction):
+            key = i.data['values'][0]
+            default_text = next(d for l, k, d in prompt_keys if k == key)
+            await i.response.send_modal(ModPromptModal(self, key, default_text))
+            
+        sel.callback = sel_cb
+        self.add_item(sel)
+        self._add_nav_buttons()
+
+    def _get_embed(self):
+        embed = discord.Embed(title="Global System Prompts", description="Modify the internal hardcoded instructions. Leave a prompt completely blank to revert to its default value.", color=discord.Color.purple())
+        return embed
+
+    async def update_display(self):
+        await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)

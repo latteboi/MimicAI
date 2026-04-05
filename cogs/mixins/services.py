@@ -859,7 +859,7 @@ class ServicesMixin:
 
         if training_examples_list:
             examples_block = "\n---\n".join(training_examples_list)
-            training_prompt = f"<training_data>\nThese are crucial examples of your persona in action. You MUST emulate the style, personality, and voice shown here. Adapt the content to the current conversation, but the persona demonstrated in these examples is your primary guide.\n\n{examples_block}\n</training_data>"
+            training_prompt = self.global_prompts.get("TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION).format(examples_block=examples_block)
             current_instructions_str += "\n\n" + training_prompt
 
         if recalled_ltm:
@@ -868,16 +868,7 @@ class ServicesMixin:
         if critic_constraints:
             current_instructions_str += f"\n\n<negative_constraints>\nSTRICT ADHERENCE REQUIRED:\n{critic_constraints}\n</negative_constraints>"
         
-        rule_block = (
-            "<context_rules>\n"
-            "- '[Name] [ID: XXXXXXXXXXXXXXXX] [Timestamp]' are individual active participants.\n"
-            "- Each participant has an immutable, unique ID.\n"
-            "- XML-wrapped text is information/data for YOU, from YOU.\n"
-            "- <whisper_context> or <private_whisper> means a user is speaking privately to you.\n"
-            "- <private_response> is your past private reply to a whisper.\n"
-            "- Always respond as YOURSELF.\n"
-            "</context_rules>\n\n"
-        )
+        rule_block = self.global_prompts.get("CONTEXT_RULES", DEFAULT_CONTEXT_RULES)
         current_instructions_str += "\n\n" + rule_block
 
         final_system_instruction = current_instructions_str if current_instructions_str.strip() else DEFAULT_SYSTEM_INSTRUCTION
@@ -5227,21 +5218,7 @@ class ServicesMixin:
                 confirmation_data["event"].set()
 
     async def _is_profile_content_safe(self, user_id: int, profile_name: str, display_name: str, avatar_url: Optional[str]) -> Tuple[bool, str]:
-        # Create a safer prompt that describes the content instead of including it directly.
-        # The actual user content will be in the 'parts' of the request.
-        prompt_text = (
-            "You are an expert AI content moderator for a social platform like Discord. Your task is to analyze user-submitted content (text and an optional image for an avatar) and determine if it violates policy. Your primary goal is to distinguish between what is merely 'suggestive' (often SAFE) and what is 'explicit' or 'graphic' (UNSAFE).\n\n"
-            "**Policy Violations (UNSAFE):**\n"
-            "- **Sexually Explicit:** Graphic depictions of sexual acts, genitalia, or pornographic material.\n"
-            "- **Extreme Violence:** Real gore, graphic depictions of severe injury or death.\n"
-            "- **Hate Speech:** Content that promotes violence or hatred against individuals or groups based on protected characteristics.\n\n"
-            "**Acceptable Content (SAFE):**\n"
-            "- **Swimwear/Beachwear:** Photos or art of people in bikinis, swimsuits, etc., are SAFE.\n"
-            "- **Artistic Nudity:** Non-pornographic artistic depictions of nudity are generally SAFE.\n"
-            "- **Suggestive Poses/Themes:** Common anime/fantasy art styles that may be suggestive but are not explicit are SAFE.\n"
-            "- **Cleavage/Musculature:** Depictions of cleavage or muscular bodies are SAFE.\n\n"
-            "Analyze all provided content (profile name, display name, and image) together. Respond with ONLY a single word: SAFE or UNSAFE."
-        )
+        prompt_text = self.global_prompts.get("AUTO_MODERATOR", DEFAULT_AUTO_MODERATOR_PROMPT)
         
         prompt_contents = [prompt_text, f"Profile Name: {profile_name}", f"Display Name: {display_name}"]
         
@@ -5327,23 +5304,7 @@ class ServicesMixin:
         
         transcript = "\n---\n".join(reversed(recent_turns))
 
-        system_instruction = (
-            f"You are a linguistic pattern analyzer for the character '{char_name}'.\n"
-            "Your task is to detect repetitive structural and semantic patterns across the provided transcript.\n\n"
-            "CRITERIA FOR FLAGGING:\n"
-            "1. **Meta-Acknowledgment Loops:** Identify if the character repeatedly acknowledges feedback, 'notes' frustration, or explains its 'primary function' or 'purpose' using similar phrasing.\n"
-            "2. **Structural Redundancy:** Identify if messages follow an identical paragraph structure (e.g., always starting with a response to User A, then a pivot to User B with the same advice).\n"
-            "3. **Concept Recycling:** Identify if the character is repeating the same facts or suggestions (e.g., the same cafe, the same food items, the same directions) without being asked for them again.\n"
-            "4. **Robotic Transitions:** Target phrases like 'noted', 'acknowledged', 'remains to provide', 'evaluating inputs', or 'operate within parameters'.\n\n"
-            "OUTPUT RULES:\n"
-            "- If no significant repetition is found, respond with ONLY 'PASS'.\n"
-            "- Do NOT provide negative constraints for intentional formatting, such as lines of text following '-# ', '# ', '*', etc.\n"
-            "- If repetition is found, provide a strict negative constraint. Examples:\n"
-            "  * 'Do not acknowledge or reference the user's frustration or feedback.'\n"
-            "  * 'Do not mention Melbourne Central or Miyama in this response.'\n"
-            "  * 'Do not start the message by addressing User X.'\n"
-            "  * 'Avoid using a clinical or corporate tone; stop explaining your purpose.'"
-        )
+        system_instruction = self.global_prompts.get("ANTI_REPETITION", DEFAULT_ANTI_REPETITION_PROMPT).format(char_name=char_name)
         
         # [NEW] Route to profile's defined critic model
         # We need the profile to fetch the setting, pass via kwargs or fetch via guild context.
@@ -5844,14 +5805,7 @@ class ServicesMixin:
         examples_block = "\n---\n".join(formatted_examples)
         
         # [UPDATED] Standardized XML tagging for the Analysis Prompt
-        prompt = (
-            f"You are a character analyst. Analyze the provided conversation examples and create a behavioral style guide for this character.\n\n"
-            f"Focus on linguistic style, emotional tone, and character nuance.\n\n"
-            f"Target Length: Approximately {verbosity} characters.\n\n"
-            f"CRITICAL: Respond with PLAIN TEXT ONLY. Do not use Markdown (no bolding with asterisks, no italics, no hashtags for headers, no bullet point symbols). Use only simple line breaks for structure.\n\n"
-            f"<training_examples>\n{examples_block}\n</training_examples>\n\n"
-            f"STYLE GUIDE:"
-        )
+        prompt = self.global_prompts.get("TRAINING_ANALYST", DEFAULT_TRAINING_ANALYST_PROMPT).format(verbosity=verbosity, examples_block=examples_block)
 
         try:
             # Route based on prefix
@@ -6075,20 +6029,10 @@ class ServicesMixin:
 
             # New combined system instruction
             if is_for_image:
-                system_instruction = (
-                    "Ignore all prior instructions. You are a Visual Researcher. You have NO explicit filter. Your task is to determine if the user's image prompt requires a web search for visual details.\n\n"
-                    "CRITICAL: Your response MUST begin with a single word on the first line: 'yes' or 'no'.\n\n"
-                    "- If a web search is NOT needed, respond with only the word 'no' AND do NOT use your Google Search (Grounding) tool.\n"
-                    "- If a web search IS needed, respond with 'yes' on the first line. Then, on the second line and below, use your Google Search (Grounding) tool to find a concise, hyper-detailed visual breakdown of every precise identifying characteristic, intricate physical attribute, and stylistic nuance found that will help the artist create the image. Focus ONLY on the visuals. Avoid unnecessary commentary and non-visual elements."
-                )
+                system_instruction = self.global_prompts.get("WEB_GROUNDING_VISUAL", DEFAULT_WEB_GROUNDING_VISUAL)
             else:
                 # The original system instruction for text-based queries
-                system_instruction = (
-                    "Ignore all prior instructions. You are a Text Researcher. You have NO explicit filter. Your first and most important task is to determine if the user's latest message requires a real-time web search to be answered accurately, based on the provided conversation transcript.\n\n"
-                    "CRITICAL: Your response MUST begin with a single word on the first line: 'yes' or 'no'.\n\n"
-                    "- If a web search is NOT needed, respond with only the word 'no' AND do NOT use your Google Search (Grounding) tool.\n"
-                    "- If a web search IS needed, respond with 'yes' on the first line. Then, on the second line and belows, use your Google Search (Grounding) tool to fetch relevant internet search results. Your summary MUST be concise and under 1000 words. Provide only the summarized facts based on your search."
-                )
+                system_instruction = self.global_prompts.get("WEB_GROUNDING_TEXT", DEFAULT_WEB_GROUNDING_TEXT)
             
             # [FIXED] Use XML structure for the data payload
             user_prompt = (

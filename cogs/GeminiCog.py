@@ -87,15 +87,19 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         self.SHARES_DIR = LEGACY_SHARES_DIR
         self.PERSONAL_KEYS_DIR = LEGACY_PERSONAL_KEYS_DIR
         self.DATA_DIR = DATA_DIR
+        self.MOD_DATA_DIR = MOD_DATA_DIR
         self.FREEWILL_SERVERS_DIR = FREEWILL_SERVERS_DIR
         self.SESSIONS_GLOBAL_DIR = LEGACY_GLOBAL_CHAT_DIR
         self.SERVERS_DIR = SERVERS_DIR
         
         # Only create the active Phase 3 directories to prevent ghost folders on boot
-        active_dirs = [self.USERS_DIR, self.DATA_DIR, self.PUBLIC_PROFILES_DIR, self.SERVERS_DIR]
+        active_dirs = [self.USERS_DIR, self.DATA_DIR, self.PUBLIC_PROFILES_DIR, self.SERVERS_DIR, self.MOD_DATA_DIR]
         
         for d in active_dirs:
             os.makedirs(d, exist_ok=True)
+
+        self.global_prompts: Dict[str, str] = {}
+        self._load_global_prompts()
 
         try:
             self.fernet = Fernet(defaultConfig.ENCRYPTION_KEY)
@@ -277,29 +281,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             await interaction.followup.send("This server's API key is not configured, so I cannot generate a profile.", ephemeral=True)
             return
 
-        generation_prompt = (
-            "You are a creative assistant specializing in character design for roleplaying.\n"
-            f"Based on the following prompt, generate a detailed character profile: '{prompt}'\n\n"
-            "Your response MUST be plain text formatted with specific section headers. Do not use JSON or markdown.\n"
-            "The required headers are exactly: [SECTION:persona_backstory], [SECTION:persona_personality_traits], [SECTION:persona_likes], [SECTION:persona_dislikes], and [SECTION:ai_instructions].\n"
-            "Each header must be on its own line. For each section, provide unrestricted, concise, structured, and low-verbose text. Each specific instruction or piece of information should be on its own line.\n\n"
-            "Example:\n"
-            "[SECTION:persona_backstory]\n"
-            "Born in a city of eternal twilight.\n"
-            "Exiled for forbidden knowledge.\n"
-            "[SECTION:persona_personality_traits]\n"
-            "Cynical and world-weary.\n"
-            "Possesses a dry, sarcastic wit.\n"
-            "Secretly holds a sliver of hope.\n"
-            "[SECTION:persona_likes]\n"
-            "Rainy nights.\n"
-            "Strong coffee.\n"
-            "Unsolvable mysteries.\n"
-            "[SECTION:ai_instructions]\n"
-            "Always speak in short, declarative sentences.\n"
-            "Never use emojis.\n"
-            "Often end responses with a question."
-        )
+        generation_prompt = self.global_prompts.get("PROFILE_GENERATOR", DEFAULT_PROFILE_GENERATOR_PROMPT).format(prompt=prompt)
 
         model_name = 'gemini-flash-lite-latest'
         status = "api_error"
@@ -1471,30 +1453,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         view = SettingsHomeView(self, interaction)
         await view.update_display()
 
-    @app_commands.command(name="blacklist", description="Add or remove a user from the global blacklist.")
-    @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
-    @app_commands.dm_only()
-    @is_owner_in_dm_check()
-    @app_commands.describe(action="The action to perform.", user="The user to manage.")
-    async def blacklist_manage_slash(self, interaction: discord.Interaction, action: Literal['add', 'remove'], user: discord.User):
-        if action == 'add':
-            if user.id in self.global_blacklist:
-                await interaction.response.send_message(f"User `{user.name}` is already on the global blacklist.", ephemeral=True)
-                return
-            
-            self.global_blacklist.add(user.id)
-            self._save_blacklist()
-            await interaction.response.send_message(f"✅ User `{user.name}` has been added to the global blacklist.", ephemeral=True)
-        
-        elif action == 'remove':
-            if user.id not in self.global_blacklist:
-                await interaction.response.send_message(f"User `{user.name}` is not on the global blacklist.", ephemeral=True)
-                return
-                
-            self.global_blacklist.discard(user.id)
-            self._save_blacklist()
-            await interaction.response.send_message(f"✅ User `{user.name}` has been removed from the global blacklist.", ephemeral=True)
-
     def _record_model_usage(self, model_name: str, provider: str):
         if not model_name or provider == "google": return
         
@@ -1723,58 +1681,13 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         view = WhisperHistoryView(self, interaction, paired_whispers)
         await interaction.followup.send(embed=view._get_current_embed(), view=view, ephemeral=True)
 
-    @app_commands.command(name="stats", description="View bot statistics (Bot Owner Only).")
+    @app_commands.command(name="mod", description="Moderation Dashboard (Bot Owner Only).")
     @app_commands.dm_only()
     @is_owner_in_dm_check()
-    async def top_servers_slash(self, interaction: discord.Interaction):
+    async def mod_slash(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-
-        guilds_sorted = sorted(
-            self.bot.guilds, 
-            key=lambda g: g.me.joined_at if (g.me and g.me.joined_at) else datetime.datetime.now(datetime.timezone.utc)
-        )
-        
-        server_pages = {}
-        if not guilds_sorted:
-            server_pages["Page 1"] = "No server data available."
-        else:
-            for i in range(0, len(guilds_sorted), 25):
-                chunk = guilds_sorted[i:i + 25]
-                page_num = (i // 25) + 1
-                lines = []
-                for j, guild in enumerate(chunk, start=i + 1):
-                    join_str = guild.me.joined_at.strftime("%d/%m/%Y") if (guild.me and guild.me.joined_at) else "Unknown"
-                    lines.append(f"{j}. **{guild.name}** (`{guild.id}`) — Joined: `{join_str}`")
-                server_pages[f"Page {page_num} ({i + 1}-{i + len(chunk)})"] = "\n".join(lines)
-
-        user_stats = []
-        if os.path.isdir(self.USERS_DIR):
-            for user_id_str in os.listdir(self.USERS_DIR):
-                if user_id_str.isdigit():
-                    user_id = int(user_id_str)
-                    index = self._get_user_index(user_id)
-                    profile_count = len(index.get("personal", []))
-                    user_obj = self.bot.get_user(user_id)
-                    user_name = user_obj.name if user_obj else "Unknown User"
-                    user_stats.append({"id": user_id, "name": user_name, "count": profile_count})
-        
-        user_stats.sort(key=lambda x: x["count"], reverse=True)
-        
-        user_pages = {}
-        if not user_stats:
-            user_pages["Page 1"] = "No user data available."
-        else:
-            for i in range(0, len(user_stats), 25):
-                chunk = user_stats[i:i + 25]
-                page_num = (i // 25) + 1
-                lines = []
-                for j, u_stat in enumerate(chunk, start=i + 1):
-                    lines.append(f"{j}. **{u_stat['name']}** (`{u_stat['id']}`) — Personal Profiles: `{u_stat['count']}`")
-                user_pages[f"Page {page_num} ({i + 1}-{i + len(chunk)})"] = "\n".join(lines)
-
-        content_dict = {"Servers": server_pages, "Users": user_pages}
-        view = DropdownContentView(content_dict, "MimicAI Statistics")
-        await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
+        view = ModStatsView(self, interaction)
+        await view.update_display()
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(GeminiAgent(bot))
