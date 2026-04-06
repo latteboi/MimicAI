@@ -172,14 +172,15 @@ class GlobalChatPlayView(ui.View):
         deadline = session_data.get("lock_deadline", 0)
         now = time.time()
         
-        is_locked = len(active_typers) > 0 and now < deadline
+        is_typing_locked = len(active_typers) > 0 and now < deadline
+        is_session_locked = session_data.get("is_locked", True)
         
         reply_btn = ui.Button(label="Reply", style=discord.ButtonStyle.primary, row=0)
         reply_btn.callback = self.reply_callback
         self.add_item(reply_btn)
         
         if queue:
-            if is_locked:
+            if is_typing_locked:
                 play_btn = ui.Button(label="Waiting for writers...", style=discord.ButtonStyle.secondary, disabled=True, row=0)
             else:
                 play_btn = ui.Button(label=f"Play ({len(queue)})", style=discord.ButtonStyle.success, disabled=False, row=0)
@@ -188,6 +189,12 @@ class GlobalChatPlayView(ui.View):
             
         play_btn.callback = self.play_callback
         self.add_item(play_btn)
+
+        lock_style = discord.ButtonStyle.danger if is_session_locked else discord.ButtonStyle.success
+        lock_emoji = "🔒" if is_session_locked else "🔓"
+        lock_btn = ui.Button(style=lock_style, emoji=lock_emoji, row=0)
+        lock_btn.callback = self.lock_callback
+        self.add_item(lock_btn)
         
     def get_embed(self):
         session_data = self.cog.global_chat_sessions.get(self.session_key, {})
@@ -248,8 +255,23 @@ class GlobalChatPlayView(ui.View):
                 except Exception:
                     pass
 
+    async def lock_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Only the session owner can lock or unlock this session.", ephemeral=True)
+            return
+        
+        session_data = self.cog.global_chat_sessions.setdefault(self.session_key, {'chat_session': GoogleGenAIChatSession(history=[]), 'unified_log': []})
+        session_data["is_locked"] = not session_data.get("is_locked", True)
+        self._build_view()
+        await interaction.response.edit_message(view=self)
+
     async def reply_callback(self, interaction: discord.Interaction):
         session_data = self.cog.global_chat_sessions.setdefault(self.session_key, {'chat_session': GoogleGenAIChatSession(history=[]), 'unified_log': []})
+        
+        if session_data.get("is_locked", True) and interaction.user.id != self.user_id:
+            await interaction.response.send_message("This session is currently locked by the host.", ephemeral=True)
+            return
+            
         now = time.time()
         
         deadline = session_data.get("lock_deadline", 0)
@@ -287,6 +309,10 @@ class GlobalChatPlayView(ui.View):
     async def play_callback(self, interaction: discord.Interaction):
         session_data = self.cog.global_chat_sessions.get(self.session_key)
         if not session_data: return
+        
+        if session_data.get("is_locked", True) and interaction.user.id != self.user_id:
+            await interaction.response.send_message("This session is currently locked by the host.", ephemeral=True)
+            return
         
         queue = session_data.get("pending_queue", {})
         if not queue: return

@@ -1,3 +1,14 @@
+# --- MimicAI & Assistant Workflow Documentation ---
+# The development workflow with the AI assistant for MimicAI is strictly modular and compliance-based.
+# 1. No Interpretation: The assistant must not guess intent, refactor existing stable code, or add unsolicited features.
+# 2. Strict Scope: Only the exact requested logic is to be modified. Large rewrites of functions are NOT recommended.
+# 3. Literal Formatting: The exact spacing, capitalization, and naming conventions must be matched flawlessly.
+# 4. Ephemeral Edit Location Reporting: Code replacements are provided in isolated blocks wrapped with precise
+#    "Location of change:" identifiers (e.g., `Class.method` or specific code anchors) to allow rapid copy-pasting.
+# 5. Technical Debt Avoidance: Band-aid fixes are rejected in favor of addressing the root mechanical failure.
+# This workflow guarantees stable iterations without breaking the complex asynchronous state management of the bot.
+# --------------------------------------------------
+
 import os
 import sys
 from dotenv import load_dotenv

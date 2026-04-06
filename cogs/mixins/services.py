@@ -1018,6 +1018,22 @@ class ServicesMixin:
                     try: all_triggers_for_round.append(session['task_queue'].get_nowait())
                     except asyncio.QueueEmpty: break
                 
+                # [NEW] Filter out cancelled reaction triggers
+                valid_triggers =[]
+                for t in all_triggers_for_round:
+                    if isinstance(t, tuple) and t[0] in ['reaction', 'reaction_single']:
+                        cancellation_key = (t[1].message_id, str(t[1].emoji))
+                        if cancellation_key in session.get('cancelled_reaction_triggers', set()):
+                            session['cancelled_reaction_triggers'].remove(cancellation_key)
+                            continue
+                    valid_triggers.append(t)
+                
+                all_triggers_for_round = valid_triggers
+
+                if not all_triggers_for_round and not is_proactive_auto_round:
+                    session['is_running'] = False
+                    continue
+                
                 # [NEW] Pre-Round Hydration: Ensure all participant sessions are ready BEFORE processing triggers
                 
                 # We re-verify hydration here to catch sessions that were dehydrated during the await queue.get()
@@ -1121,8 +1137,20 @@ class ServicesMixin:
                         if isinstance(trigger, tuple):
                             if trigger[0] == 'reply':
                                 _, message_trigger, starting_profile_override = trigger
-                            elif trigger[0] == 'reaction': _, reaction_trigger, starting_profile_override = trigger
-                            elif trigger[0] == 'reaction_single': _, reaction_trigger, starting_profile_override = trigger
+                            elif trigger[0] == 'reaction': 
+                                _, reaction_trigger, starting_profile_override = trigger
+                                try:
+                                    ch = self.bot.get_channel(reaction_trigger.channel_id)
+                                    msg_obj = await ch.fetch_message(reaction_trigger.message_id)
+                                    await msg_obj.clear_reaction(reaction_trigger.emoji)
+                                except: pass
+                            elif trigger[0] == 'reaction_single': 
+                                _, reaction_trigger, starting_profile_override = trigger
+                                try:
+                                    ch = self.bot.get_channel(reaction_trigger.channel_id)
+                                    msg_obj = await ch.fetch_message(reaction_trigger.message_id)
+                                    await msg_obj.clear_reaction(reaction_trigger.emoji)
+                                except: pass
                             elif trigger[0] == 'child_mention': _, message_payload, starting_profile_override = trigger
                             elif trigger[0] == 'ad_hoc_mention': _, message_trigger, starting_profile_override = trigger
                         elif isinstance(trigger, discord.RawReactionActionEvent): reaction_trigger = trigger

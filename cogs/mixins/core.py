@@ -421,6 +421,11 @@ class CoreMixin:
                 await self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
                 session["is_hydrated"] = False
                 await self._ensure_session_hydrated(channel_id, session_type)
+                try:
+                    channel = self.bot.get_channel(payload.channel_id)
+                    msg = await channel.fetch_message(payload.message_id)
+                    await msg.add_reaction(payload.emoji)
+                except: pass
                 return
 
             if turn_object.get("is_user") is True:
@@ -436,30 +441,46 @@ class CoreMixin:
             
             if reacted_to_participant:
                 if is_regen:
-                    # [NEW] Immediate reaction cleanup
+                    is_busy = session.get('is_running') or session.get('is_regenerating') or session.get('is_purging')
+                    msg_ref = None
                     try:
                         channel = self.bot.get_channel(payload.channel_id)
                         if channel:
-                            msg = await channel.fetch_message(payload.message_id)
-                            await msg.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
+                            msg_ref = await channel.fetch_message(payload.message_id)
+                            if is_busy:
+                                await msg_ref.add_reaction(payload.emoji)
+                            else:
+                                await msg_ref.clear_reaction(payload.emoji)
                     except: pass
 
-                    # [NEW] Queue Mechanism for Regeneration
                     async def queue_regeneration():
+                        was_busy = is_busy
                         while session.get('is_running') or session.get('is_regenerating') or session.get('is_purging'):
                             await asyncio.sleep(1)
                         
-                        # Verify the turn hasn't been deleted while waiting
-                        still_exists = any(t.get("turn_id") == turn_id_to_find for t in session.get("unified_log", []))
+                        session.get('regen_tasks', {}).pop(payload.message_id, None)
+                        
+                        if was_busy and msg_ref:
+                            try:
+                                await msg_ref.clear_reaction(payload.emoji)
+                            except: pass
+                        
+                        still_exists = any(t.get("turn_id") == turn_id_to_find for t in session.get("unified_log",[]))
                         if still_exists:
                             await self._execute_regeneration(payload, session, turn_id_to_find, reacted_to_participant)
 
-                    asyncio.create_task(queue_regeneration())
+                    task = asyncio.create_task(queue_regeneration())
+                    session.setdefault('regen_tasks', {})[payload.message_id] = task
                     return
                 
                 if is_skip:
                     reacted_to_participant["is_skipped"] = True
                     self._save_multi_profile_sessions()
+                    try:
+                        channel = self.bot.get_channel(payload.channel_id)
+                        msg = await channel.fetch_message(payload.message_id)
+                        await msg.add_reaction(payload.emoji)
+                    except: pass
                     return
 
                 try:
@@ -467,8 +488,7 @@ class CoreMixin:
                     last_speaker_key = session.get('last_speaker_key')
                     reacted_to_key = (reacted_to_participant['owner_id'], reacted_to_participant['profile_name'])
 
-                    if is_continue:
-                        # Original logic: popcorn continues the round
+                    if is_continue or is_next:
                         if reacted_to_key == last_speaker_key:
                             session_mode = session.get("session_mode", "sequential")
                             if session_mode == 'sequential':
@@ -487,18 +507,6 @@ class CoreMixin:
                             reacted_to_index = session['profiles'].index(reacted_to_participant)
                             next_speaker_index = (reacted_to_index + 1) % len(session['profiles'])
                             next_participant = session['profiles'][next_speaker_index]
-                    
-                    elif is_next:
-                        if reacted_to_key == last_speaker_key:
-                            try:
-                                last_speaker_index = next(i for i, p in enumerate(session['profiles']) if (p['owner_id'], p['profile_name']) == last_speaker_key)
-                                next_speaker_index = (last_speaker_index + 1) % len(session['profiles'])
-                                next_participant = session['profiles'][next_speaker_index]
-                            except: pass
-                        else:
-                            reacted_to_index = session['profiles'].index(reacted_to_participant)
-                            next_speaker_index = (reacted_to_index + 1) % len(session['profiles'])
-                            next_participant = session['profiles'][next_speaker_index]
 
                     if next_participant:
                         session_mode = session.get("session_mode", "sequential")
@@ -510,6 +518,16 @@ class CoreMixin:
                                 self._save_multi_profile_sessions()
                             except ValueError:
                                 pass
+
+                        is_busy = session.get('is_running') or session.get('is_regenerating') or session.get('is_purging')
+                        try:
+                            channel = self.bot.get_channel(payload.channel_id)
+                            msg_ref = await channel.fetch_message(payload.message_id)
+                            if is_busy:
+                                await msg_ref.add_reaction(payload.emoji)
+                            else:
+                                await msg_ref.clear_reaction(payload.emoji)
+                        except: pass
 
                         trigger_type = 'reaction_single' if is_next else 'reaction'
                         reaction_trigger = (trigger_type, payload, next_participant)
@@ -528,8 +546,11 @@ class CoreMixin:
         emoji_str = str(payload.emoji)
         is_mute = (emoji_str in MUTE_TURN_EMOJI)
         is_skip = (emoji_str in SKIP_PARTICIPANT_EMOJI)
+        is_regen = (emoji_str == REGENERATE_EMOJI)
+        is_next = (emoji_str == NEXT_SPEAKER_EMOJI)
+        is_continue = (emoji_str == CONTINUE_ROUND_EMOJI)
         
-        if not is_mute and not is_skip: return
+        if not any([is_mute, is_skip, is_regen, is_next, is_continue]): return
 
         channel_id = payload.channel_id
         session = self.multi_profile_channels.get(channel_id)
@@ -541,17 +562,42 @@ class CoreMixin:
         if not session: return
 
         turn_object = None
-        for turn in session.get("unified_log", []):
-            if payload.message_id in turn.get("message_ids", []):
+        for turn in session.get("unified_log",[]):
+            if payload.message_id in turn.get("message_ids",[]):
                 turn_object = turn
                 break
 
         if turn_object:
-            if is_mute:
+            if is_regen:
+                regen_task = session.get('regen_tasks', {}).pop(payload.message_id, None)
+                if regen_task and not regen_task.done():
+                    regen_task.cancel()
+                    try:
+                        channel = self.bot.get_channel(payload.channel_id)
+                        msg = await channel.fetch_message(payload.message_id)
+                        await msg.clear_reaction(payload.emoji)
+                    except: pass
+                return
+            
+            elif is_continue or is_next:
+                session.setdefault('cancelled_reaction_triggers', set()).add((payload.message_id, emoji_str))
+                try:
+                    channel = self.bot.get_channel(payload.channel_id)
+                    msg = await channel.fetch_message(payload.message_id)
+                    await msg.clear_reaction(payload.emoji)
+                except: pass
+                return
+                
+            elif is_mute:
                 turn_object["is_hidden"] = False
                 await self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
                 session["is_hydrated"] = False
                 await self._ensure_session_hydrated(channel_id, session_type)
+                try:
+                    channel = self.bot.get_channel(payload.channel_id)
+                    msg = await channel.fetch_message(payload.message_id)
+                    await msg.remove_reaction(payload.emoji, self.bot.user)
+                except: pass
                 return
             
             elif is_skip and turn_object.get("is_user") is False:
@@ -560,6 +606,11 @@ class CoreMixin:
                 if participant:
                     participant["is_skipped"] = False
                     self._save_multi_profile_sessions()
+                    try:
+                        channel = self.bot.get_channel(payload.channel_id)
+                        msg = await channel.fetch_message(payload.message_id)
+                        await msg.remove_reaction(payload.emoji, self.bot.user)
+                    except: pass
             
     @commands.Cog.listener()
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
