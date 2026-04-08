@@ -1176,7 +1176,6 @@ class ProfileManageView(ui.View):
                 options.append(discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training context size and relevance threshold."))
             options.append(discord.SelectOption(label="Toggle LTM Auto-Creation", value="ltm_creation", description="Automatically create memories from conversations."))
             options.append(discord.SelectOption(label="Set LTM Parameters", value="ltm_params", description="Set frequency, context, and recall settings."))
-            options.append(discord.SelectOption(label="Cycle LTM Scope", value="ltm_scope", description="Cycle visibility: Global -> Server -> User."))
             if not self.is_borrowed:
                 options.append(discord.SelectOption(label="Set LTM Summarization Prompt", value="ltm_summarization", description="Customize how the AI creates memories."))
 
@@ -1375,10 +1374,6 @@ class ProfileManageView(ui.View):
             await interaction.response.defer()
         elif choice == "ltm_creation":
             profile["ltm_creation_enabled"] = not profile.get("ltm_creation_enabled", False)
-            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
-        elif choice == "ltm_scope":
-            scope_cycle = {'global': 'server', 'server': 'user', 'user': 'global'}
-            profile['ltm_scope'] = scope_cycle.get(profile.get('ltm_scope', 'server'), 'server')
             await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice == "ltm_params":
             async def refresh_cb(i):
@@ -4818,35 +4813,20 @@ class DataManageView(ui.View):
             self.displayed_data_list = self.full_data_list
         else: # ltm
             ltm_shard = self.cog._load_ltm_shard(user_id_str, self.profile_name)
-            # All LTMs are currently guild-based, so we always load from the "guild" key.
-            self.full_data_list = ltm_shard.get("guild", []) if ltm_shard else []
+            self.full_data_list = ltm_shard.get("guild", []) if ltm_shard else[]
             title_prefix = "Long-Term Memories"
 
-            # Build filter options and filter the list
             server_filters = {}
-            has_user_exclusive = False
-            has_global = False
             for item in self.full_data_list:
-                scope = item.get('scope')
-                if scope == 'server':
-                    server_id = item.get('context_id')
-                    if server_id and server_id not in server_filters:
-                        try:
-                            guild = self.cog.bot.get_guild(int(server_id))
-                            server_filters[server_id] = guild.name if guild else f"Server ID: {server_id}"
-                        except (ValueError, TypeError):
-                            print(f"WARNING: Corrupted LTM entry found for user '{user_id_str}', profile '{self.profile_name}'. Skipping. Corrupted item: {item}")
-                            continue
-                elif scope == 'user':
-                    has_user_exclusive = True
-                elif scope == 'global':
-                    has_global = True
+                server_id = item.get('context_id')
+                if server_id and server_id not in server_filters:
+                    try:
+                        guild = self.cog.bot.get_guild(int(server_id))
+                        server_filters[server_id] = guild.name if guild else f"Server ID: {server_id}"
+                    except (ValueError, TypeError):
+                        continue
             
             ltm_filter_options.append(discord.SelectOption(label="All Memories", value="all"))
-            if has_user_exclusive:
-                ltm_filter_options.append(discord.SelectOption(label="User-Exclusive Memories", value="user"))
-            if has_global:
-                ltm_filter_options.append(discord.SelectOption(label="Global Memories", value="global"))
             for server_id, server_name in sorted(server_filters.items(), key=lambda item: item[1]):
                 ltm_filter_options.append(discord.SelectOption(label=f"Server: {server_name}", value=f"server_{server_id}"))
 
@@ -4856,11 +4836,9 @@ class DataManageView(ui.View):
 
             if self.ltm_filter == "all":
                 self.displayed_data_list = self.full_data_list
-            elif self.ltm_filter == "user" or self.ltm_filter == "global":
-                self.displayed_data_list = [item for item in self.full_data_list if item.get('scope') == self.ltm_filter]
             elif self.ltm_filter and self.ltm_filter.startswith("server_"):
                 filter_server_id = self.ltm_filter.split("_", 1)[1]
-                self.displayed_data_list = [item for item in self.full_data_list if item.get('scope') == 'server' and str(item.get('context_id')) == filter_server_id]
+                self.displayed_data_list =[item for item in self.full_data_list if str(item.get('context_id')) == filter_server_id]
             else:
                 self.displayed_data_list = self.full_data_list
 
@@ -4925,13 +4903,12 @@ class DataManageView(ui.View):
                 embed.add_field(name="Bot Response:", value=bot_response, inline=False)
             else: # ltm
                 content = self.cog._decrypt_data(item.get('sum', ''))
-                scope = item.get('scope', 'unknown').title()
                 
                 display_content = content
                 if len(content) > 950:
                     display_content = content[:950] + "... (truncated)"
 
-                embed.add_field(name=f"ID: `{item_id}` | Scope: {scope}{ts_display}", value=f"**Summary:**\n{display_content}", inline=False)
+                embed.add_field(name=f"ID: `{item_id}`{ts_display}", value=f"**Summary:**\n{display_content}", inline=False)
         
         return embed, page_items, ltm_filter_options
 
@@ -4956,14 +4933,9 @@ class DataManageView(ui.View):
         next_button.callback = self.next_page_callback
         self.add_item(next_button)
 
-        if self.mode == 'ltm' and page_items:
-            current_scope = page_items[0].get('scope', 'server')
-            scope_button = ui.Button(label=f"Scope: {current_scope.title()}", style=discord.ButtonStyle.secondary, custom_id="cycle_scope", row=0)
-            scope_button.callback = self.cycle_scope_callback
-            self.add_item(scope_button)
-        
         # [NEW] Move Analyse button to Row 0 (Only visible in training mode)
         if self.mode == 'training' and not self.is_borrowed:
+            analyse_button = ui.Button(label="Analyse", style=discord.ButtonStyle.blurple, row=0)
             analyse_button = ui.Button(label="Analyse", style=discord.ButtonStyle.blurple, row=0)
             async def analyse_cb(i): await i.response.send_modal(AnalyseExamplesModal(self))
             analyse_button.callback = analyse_cb
@@ -5083,55 +5055,6 @@ class DataManageView(ui.View):
             view=confirm_view,
             ephemeral=True
         )
-
-    async def cycle_scope_callback(self, interaction: discord.Interaction):
-        if not self.current_item_id or self.mode != 'ltm':
-            await interaction.response.defer()
-            return
-
-        owner_id_str = str(self.effective_owner_id)
-        ltm_data = self.cog._load_ltm_shard(owner_id_str, self.profile_name)
-        if not ltm_data:
-            await interaction.response.defer()
-            return
-        
-        context_type: Literal["guild", "dm"] = "guild" if self.guild_id else "dm"
-        ltm_list = ltm_data.get(context_type, [])
-        
-        item_found = False
-        for i, item in enumerate(ltm_list):
-            if item.get("id") == self.current_item_id:
-                current_scope = item.get('scope', 'server')
-                
-                if self.guild_id: # In a server, cycle through all three
-                    scope_cycle = {'server': 'user', 'user': 'global', 'global': 'server'}
-                    new_scope = scope_cycle.get(current_scope, 'server')
-                else: # In a DM, skip the 'server' option
-                    scope_cycle_dm = {'server': 'user', 'user': 'global', 'global': 'user'}
-                    new_scope = scope_cycle_dm.get(current_scope, 'user')
-
-                item['scope'] = new_scope
-                
-                if new_scope == 'global':
-                    item['context_id'] = None
-                elif new_scope == 'user':
-                    item['context_id'] = str(self.effective_owner_id)
-                elif new_scope == 'server':
-                    # If the current context_id is not a valid server ID (e.g., from 'global' or 'user'),
-                    # assign the current server's ID. Otherwise, preserve the original server ID.
-                    current_context = item.get('context_id')
-                    if not current_context or not str(current_context).isdigit():
-                        item['context_id'] = str(self.guild_id)
-
-                ltm_data[context_type][i] = item
-                self.cog._save_ltm_shard(owner_id_str, self.profile_name, ltm_data)
-                item_found = True
-                break
-        
-        if item_found:
-            await self._update_view(interaction)
-        else:
-            await interaction.response.defer()
 
 
     async def ltm_filter_callback(self, interaction: discord.Interaction):
@@ -6485,7 +6408,6 @@ class BulkManageView(ui.View):
             discord.SelectOption(label="Toggle Critic (Anti-Repetition)", value="critic", description="Enable or disable the critic for multiple profiles."),
             discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable or disable realistic typing for multiple profiles."),
             discord.SelectOption(label="Set Safety Level", value="safety_level", description="Apply a content safety level to multiple profiles."),
-            discord.SelectOption(label="Set LTM Scope", value="ltm_scope", description="Apply an LTM scope to multiple profiles."),
             discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training settings to multiple personal profiles."),
             discord.SelectOption(label="Set LTM Parameters", value="ltm_params", description="Apply LTM settings to multiple personal profiles."),
             discord.SelectOption(label="Set LTM Summarization Prompt", value="ltm_summarization", description="Apply a custom LTM summarization prompt."),
@@ -6699,23 +6621,54 @@ class BulkManageView(ui.View):
             view = BulkDeleteView(self.cog, self.user_id)
             await self.original_interaction.edit_original_response(content="Select profiles to delete:", view=view)
 
-        elif choice == "ltm_scope":
-            await interaction.response.defer()
-            view = BulkLtmScopeView(self.cog, self.user_id)
-            await self.original_interaction.edit_original_response(content="Select scope and profiles:", view=view)
-
         elif choice == "safety_level":
             await interaction.response.defer()
             view = BulkSafetyLevelView(self.cog, self.user_id)
             await self.original_interaction.edit_original_response(content=view._get_selection_feedback_message(), view=view)
+
+class PrivacyDashboardView(ui.View):
+    def __init__(self, cog: 'GeminiAgent', user_id: int):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.user_id = user_id
+
+    @ui.button(label="Request Data Export", style=discord.ButtonStyle.blurple, emoji="📥")
+    async def export_data(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.cog._execute_privacy_export(self.user_id, interaction)
+
+    @ui.button(label="Delete My Account", style=discord.ButtonStyle.danger, emoji="⚠️")
+    async def delete_account(self, interaction: discord.Interaction, button: ui.Button):
+        modal = AccountDeleteModal(self.cog, self.user_id)
+        await interaction.response.send_modal(modal)
+
+class AccountDeleteModal(ui.Modal, title="Permanently Delete Account"):
+    confirm_input = ui.TextInput(label="Type 'DELETE' to confirm", placeholder="DELETE", required=True, max_length=6)
+
+    def __init__(self, cog: 'GeminiAgent', user_id: int):
+        super().__init__()
+        self.cog = cog
+        self.user_id = user_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if self.confirm_input.value != "DELETE":
+            await interaction.response.send_message("❌ Deletion cancelled. You must type 'DELETE' exactly.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.cog._execute_account_deletion(self.user_id, interaction)
 
 class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
     def __init__(self, cog: 'GeminiAgent', view: 'SettingsChildBotView'):
         super().__init__()
         self.cog = cog
         self.parent_view = view
-        self.profile_id_input = ui.TextInput(label="Personal Profile ID (A-Class PID)", placeholder="e.g. A1B2C3D4E5F6789", required=True, min_length=16, max_length=16)
-        self.token_input = ui.TextInput(label="Bot Token", placeholder="Paste the token from the Discord Developer Portal.", style=discord.TextStyle.paragraph, required=True)
+        self.profile_id_input = ui.TextInput(label="Personal Profile ID", placeholder="e.g. A1B2C3D4E5F6789", required=True, min_length=16, max_length=16)
+        self.token_input = ui.TextInput(
+            label="Bot Token", 
+            placeholder="Applications -> Bot -> Token", 
+            style=discord.TextStyle.paragraph, 
+            required=True
+        )
         self.add_item(self.profile_id_input)
         self.add_item(self.token_input)
 

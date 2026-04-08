@@ -31,28 +31,16 @@ MOD_DATA_DIR = os.path.join(DATA_DIR, "mod")
 
 SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")
 SESSIONS_GLOBAL_DIR = os.path.join(SESSIONS_DIR, "global_chat")
-SESSIONS_SERVERS_DIR = os.path.join(SESSIONS_DIR, "servers") # Legacy path kept for migration
 
 SERVERS_DIR = os.path.join(DATA_DIR, "servers")
 FREEWILL_SERVERS_DIR = SERVERS_DIR # Alias for backwards compatibility during transition
 
-LEGACY_PROFILES_DIR = os.path.join(DATA_DIR, "profiles")
-LEGACY_LTM_DIR = os.path.join(DATA_DIR, "ltm")
-LEGACY_TRAINING_DIR = os.path.join(DATA_DIR, "training")
-LEGACY_CHILD_BOTS_DIR = os.path.join(DATA_DIR, "child_bots")
-LEGACY_GLOBAL_CHAT_DIR = os.path.join(SESSIONS_DIR, "global_chat")
-
 PUBLIC_PROFILES_DIR = os.path.join(DATA_DIR, "public_profiles")
-FREEWILL_SERVERS_DIR = os.path.join(DATA_DIR, "servers")
 CHILD_BOTS_DIR = os.path.join(DATA_DIR, "child_bots")
 COG_LOCK_FILE_PATH = os.path.join(os.path.dirname(__file__), "gemini_agent.lock")  
 USERS_DIR = os.path.join(DATA_DIR, "users")
-APPEARANCES_DIR = os.path.join(USERS_DIR, "appearances") # Retained temporarily for Phase 3 migration
 BLACKLIST_FILE_PATH = os.path.join(MOD_DATA_DIR, "blacklist.json")
 GLOBAL_PROMPTS_FILE_PATH = os.path.join(MOD_DATA_DIR, "system_prompts.json")
-
-LEGACY_SHARES_DIR = os.path.join(USERS_DIR, "shares")
-LEGACY_PERSONAL_KEYS_DIR = os.path.join(USERS_DIR, "personal_keys")
 
 COG_LOCK_FILE_PATH = os.path.join(COGS_BASE, "gemini_agent.lock")
 

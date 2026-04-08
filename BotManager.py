@@ -73,7 +73,11 @@ async def ipc_server_handler(websocket, path=None):
                         "action": "launch",
                         "bot_id": bot_id,
                         "token": token,
-                        "parent_id": bot.user.id
+                        "parent_id": bot.user.id,
+                        "parent_name": bot.user.name,
+                        "owner_id": config.get("owner_id"),
+                        "profile_name": config.get("profile_name"),
+                        "profile_id": config.get("pid")
                     }))
                 except Exception as e:
                     print(f"Failed to launch {bot_id}: {e}")
@@ -116,7 +120,11 @@ async def manager_task():
                     "action": "launch",
                     "bot_id": bot_id,
                     "token": token,
-                    "parent_id": bot.user.id
+                    "parent_id": bot.user.id,
+                    "parent_name": bot.user.name,
+                    "owner_id": config.get("owner_id"),
+                    "profile_name": config.get("profile_name"),
+                    "profile_id": config.get("pid")
                 }))
 
         elif action == 'shutdown_bot':
@@ -299,6 +307,11 @@ async def main():
                             bot_data = json.loads(f.read())
                         if "bot_id" in bot_data:
                             bot_data["owner_id"] = int(user_id_str)
+                            bot_data["pid"] = pid_folder
+                            name_file = os.path.join(profiles_dir, pid_folder, "name.txt")
+                            if os.path.exists(name_file):
+                                with open(name_file, 'r', encoding='utf-8') as nf:
+                                    bot_data["profile_name"] = nf.read().strip()
                             bot.child_bot_config[bot_data["bot_id"]] = bot_data
                     except Exception as e:
                         print(f"Failed to load child bot for {pid_folder}: {e}")

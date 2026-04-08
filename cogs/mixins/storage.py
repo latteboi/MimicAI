@@ -296,7 +296,14 @@ class StorageMixin:
     def _load_ltm_shard(self, user_id: str, profile_name: str) -> Optional[Dict[str, List[Dict]]]:
         pid = self._get_pid_from_name_any(int(user_id), profile_name)
         file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "ltm.json.gz")
-        return self._load_json_gzip(file_path)
+        data = self._load_json_gzip(file_path)
+        if data:
+            # Purge legacy non-server memories upon load
+            guild_ltms =[item for item in data.get("guild", []) if item.get("scope") == "server"]
+            data["guild"] = guild_ltms
+            if "dm" in data:
+                del data["dm"]
+        return data
 
     def _save_ltm_shard(self, user_id: str, profile_name: str, data: Dict[str, List[Dict]]):
         pid = self._get_pid_from_name_any(int(user_id), profile_name)
@@ -321,41 +328,22 @@ class StorageMixin:
             import shutil
             shutil.copy2(source_path, new_path)
 
-    def _add_ltm(self, profile_owner_id: int, profile_name: str, summary: str, summary_embedding: List[float], guild_id: Optional[int], triggering_user_id: int, user_dn: Optional[str] = None, force_user_scope: bool = False):
+    def _add_ltm(self, profile_owner_id: int, profile_name: str, summary: str, summary_embedding: List[float], guild_id: Optional[int], triggering_user_id: int, user_dn: Optional[str] = None):
+        if not guild_id: return
+        
         owner_id_str = str(profile_owner_id)
-        
-        index = self._get_user_index(profile_owner_id)
-        is_borrowed = profile_name in index.get("borrowed", [])
-        profile_settings = self._get_profile_config(profile_owner_id, profile_name, is_borrowed) or {}
-        
-        ltm_scope = profile_settings.get('ltm_scope', 'server')
-        
-        if force_user_scope:
-            ltm_scope = 'user'
-
-        context_id = None
-        if ltm_scope == 'server':
-            context_id = guild_id
-        elif ltm_scope == 'user':
-            context_id = profile_owner_id
-
         ltm_data = self._load_ltm_shard(owner_id_str, profile_name)
         if ltm_data is None:
-            ltm_data = {"guild": [], "dm": []}
+            ltm_data = {"guild":[]}
         
         context_type = "guild"
-        ltm_list = ltm_data.get(context_type, [])
+        ltm_list = ltm_data.get(context_type,[])
 
-        # [NEW] Non-Destructive Rolling Window
         is_premium = self.is_user_premium(profile_owner_id)
         limit = defaultConfig.LIMIT_LTM_PREMIUM if is_premium else defaultConfig.LIMIT_LTM_FREE
         
-        # Sort oldest -> newest to ensure we pop the correct one
         ltm_list.sort(key=lambda x: x.get('created_ts', x.get('ts')))
         
-        # CRITICAL FIX: Use 'if' instead of 'while'. 
-        # This ensures we only remove ONE memory to make room for the NEW one.
-        # This preserves legacy data (e.g., if user has 250/50, they stay at 250).
         if len(ltm_list) >= limit:
             ltm_list.pop(0)
 
@@ -367,15 +355,12 @@ class StorageMixin:
             "sum": summary.strip(),
             "s_emb": summary_embedding,
             "usr": user_dn,
-            "scope": ltm_scope,
-            "context_id": str(context_id) if context_id else None
+            "scope": "server",
+            "context_id": str(guild_id)
         }
         ltm_list.append(entry)
         
-        # Ensure we don't accidentally truncate with the global max clamp either
-        # We use the larger of (current count) or (premium max) to ensure data safety
         max_safe_clamp = max(len(ltm_list), defaultConfig.LIMIT_LTM_PREMIUM)
-        
         ltm_data[context_type] = sorted(ltm_list, key=lambda x: x.get('created_ts', x.get('ts')))[-max_safe_clamp:]
         self._save_ltm_shard(owner_id_str, profile_name, ltm_data)
 
@@ -385,17 +370,16 @@ class StorageMixin:
         if not ltm_data:
             return False
 
-        for context_type in ["guild", "dm"]:
-            ltm_list = ltm_data.get(context_type, [])
-            for i, ltm_entry in enumerate(ltm_list):
-                if ltm_entry.get("id") == ltm_id:
-                    ltm_data[context_type][i]["sum"] = new_summary.strip()
-                    ltm_data[context_type][i]["s_emb"] = new_embedding
-                    ltm_data[context_type][i]["modified_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                    if "kw" in ltm_data[context_type][i]:
-                        del ltm_data[context_type][i]["kw"]
-                    self._save_ltm_shard(owner_id_str, profile_name, ltm_data)
-                    return True
+        ltm_list = ltm_data.get("guild",[])
+        for i, ltm_entry in enumerate(ltm_list):
+            if ltm_entry.get("id") == ltm_id:
+                ltm_data["guild"][i]["sum"] = new_summary.strip()
+                ltm_data["guild"][i]["s_emb"] = new_embedding
+                ltm_data["guild"][i]["modified_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                if "kw" in ltm_data["guild"][i]:
+                    del ltm_data["guild"][i]["kw"]
+                self._save_ltm_shard(owner_id_str, profile_name, ltm_data)
+                return True
         return False
     
     def _load_training_shard(self, user_id: str, profile_name: str) -> Optional[List[Dict]]:
@@ -436,159 +420,6 @@ class StorageMixin:
         channel = self.bot.get_channel(channel_id)
         server_id = channel.guild.id if channel and channel.guild else "dm"
         return pathlib.Path(SERVERS_DIR) / str(server_id) / "sessions" / str(channel_id) / session_type
-
-    def _migrate_servers_directory(self):
-        old_sessions_dir = pathlib.Path(SESSIONS_SERVERS_DIR)
-        new_servers_dir = pathlib.Path(SERVERS_DIR)
-        
-        if not old_sessions_dir.exists():
-            return
-            
-        print("Phase 1 Migration: Consolidating Server Sessions...")
-        try:
-            for server_dir in old_sessions_dir.iterdir():
-                if not server_dir.is_dir():
-                    continue
-                    
-                target_sessions_dir = new_servers_dir / server_dir.name / "sessions"
-                target_sessions_dir.mkdir(parents=True, exist_ok=True)
-                
-                for channel_dir in server_dir.iterdir():
-                    if channel_dir.is_dir():
-                        target_channel_dir = target_sessions_dir / channel_dir.name
-                        if not target_channel_dir.exists():
-                            import shutil
-                            shutil.move(str(channel_dir), str(target_channel_dir))
-            
-            import shutil
-            shutil.rmtree(str(old_sessions_dir), ignore_errors=True)
-            print("Phase 1 Migration complete. Old sessions directory removed.")
-        except Exception as e:
-            print(f"Error during Phase 1 Migration: {e}")
-
-    def _migrate_users_root_directory(self):
-        legacy_shares = pathlib.Path(LEGACY_SHARES_DIR)
-        legacy_keys = pathlib.Path(LEGACY_PERSONAL_KEYS_DIR)
-        users_dir = pathlib.Path(self.USERS_DIR)
-        
-        migrated_anything = False
-        
-        if legacy_keys.exists():
-            print("Phase 2 Migration: Consolidating Personal API Keys...")
-            for file_path in legacy_keys.iterdir():
-                if file_path.name.endswith(".json.gz"):
-                    user_id_str = file_path.name[:-len(".json.gz")]
-                    target_dir = users_dir / user_id_str
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    import shutil
-                    shutil.move(str(file_path), str(target_dir / "keys.json.gz"))
-            import shutil
-            shutil.rmtree(str(legacy_keys), ignore_errors=True)
-            migrated_anything = True
-
-        if legacy_shares.exists():
-            print("Phase 2 Migration: Consolidating Profile Shares...")
-            for file_path in legacy_shares.iterdir():
-                if file_path.name.endswith(".json.gz"):
-                    user_id_str = file_path.name[:-len(".json.gz")]
-                    target_dir = users_dir / user_id_str
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    import shutil
-                    shutil.move(str(file_path), str(target_dir / "shares.json.gz"))
-            import shutil
-            shutil.rmtree(str(legacy_shares), ignore_errors=True)
-            migrated_anything = True
-            
-        if migrated_anything:
-                print("Phase 2 Migration complete.")
-
-    def _migrate_profiles_directory(self):
-        legacy_profiles = pathlib.Path(LEGACY_PROFILES_DIR)
-        if not legacy_profiles.exists(): return
-        
-        print("Phase 3 Migration: Splitting Monolithic Profiles & Consolidating Data...")
-        users_dir = pathlib.Path(self.USERS_DIR)
-        
-        try:
-            for profile_file in legacy_profiles.iterdir():
-                if not profile_file.name.endswith(".json.gz"): continue
-                user_id_str = profile_file.name[:-len(".json.gz")]
-                user_target_dir = users_dir / user_id_str
-                user_target_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Load monoliths
-                user_data = self._load_json_gzip(str(profile_file))
-                if not user_data: continue
-                
-                app_data = IOManager.read_json_gzip(os.path.join(self.APPEARANCES_DIR, f"{user_id_str}.json.gz"), self.fernet) or {}
-                bot_data = IOManager.read_json_gzip(os.path.join(LEGACY_CHILD_BOTS_DIR, f"{user_id_str}.json.gz"), encrypted=False) or {}
-                
-                # 1. Create Lightweight Index
-                index_data = {
-                    "personal": list(user_data.get("profiles", {}).keys()),
-                    "borrowed": list(user_data.get("borrowed_profiles", {}).keys())
-                }
-                IOManager.write_json(index_data, str(user_target_dir / "index.json"))
-                
-                # 2. Split Personal Profiles
-                for pname, pdata in user_data.get("profiles", {}).items():
-                    p_dir = user_target_dir / "profiles" / pname
-                    p_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Separate Prompts
-                    prompts = {
-                        "persona": pdata.pop("persona", {}),
-                        "ai_instructions": pdata.pop("ai_instructions", ["", "", "", ""]),
-                        "image_generation_prompt": pdata.pop("image_generation_prompt", None),
-                        "ltm_summarization_instructions": pdata.pop("ltm_summarization_instructions", self._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS))
-                    }
-                    IOManager.write_json_gzip(prompts, str(p_dir / "prompts.json.gz"), self.fernet)
-                    
-                    # Merge Appearance into Config
-                    if pname in app_data: pdata.update(app_data[pname])
-                    IOManager.write_json_gzip(pdata, str(p_dir / "config.json.gz"), self.fernet)
-                    
-                    # Move LTM, Training, Global Chat
-                    import shutil
-                    ltm_path = pathlib.Path(LEGACY_LTM_DIR) / user_id_str / f"{pname}.json.gz"
-                    if ltm_path.exists(): shutil.move(str(ltm_path), str(p_dir / "ltm.json.gz"))
-                    
-                    train_path = pathlib.Path(LEGACY_TRAINING_DIR) / user_id_str / f"{pname}.json.gz"
-                    if train_path.exists(): shutil.move(str(train_path), str(p_dir / "training.json.gz"))
-                    
-                    gc_path = pathlib.Path(LEGACY_GLOBAL_CHAT_DIR) / user_id_str / f"{pname}.json.gz"
-                    if gc_path.exists(): shutil.move(str(gc_path), str(p_dir / "global_chat.json.gz"))
-                    
-                    # Move Child Bot Token
-                    for bid, bconfig in bot_data.items():
-                        if bconfig.get("profile_name") == pname:
-                            bconfig["bot_id"] = bid
-                            IOManager.write_json_gzip(bconfig, str(p_dir / "child_bot.json.gz"), encrypted=False)
-                            break
-
-                # 3. Split Borrowed Profiles
-                for bname, bdata in user_data.get("borrowed_profiles", {}).items():
-                    p_dir = user_target_dir / "profiles" / bname
-                    p_dir.mkdir(parents=True, exist_ok=True)
-                    IOManager.write_json_gzip(bdata, str(p_dir / "borrowed_config.json.gz"), self.fernet)
-                    
-                    gc_path = pathlib.Path(LEGACY_GLOBAL_CHAT_DIR) / user_id_str / f"{bname}.json.gz"
-                    if gc_path.exists(): 
-                        import shutil
-                        shutil.move(str(gc_path), str(p_dir / "global_chat.json.gz"))
-
-            # 4. Clean up legacy roots
-            import shutil
-            shutil.rmtree(str(legacy_profiles), ignore_errors=True)
-            shutil.rmtree(self.APPEARANCES_DIR, ignore_errors=True)
-            shutil.rmtree(LEGACY_LTM_DIR, ignore_errors=True)
-            shutil.rmtree(LEGACY_TRAINING_DIR, ignore_errors=True)
-            shutil.rmtree(LEGACY_CHILD_BOTS_DIR, ignore_errors=True)
-            shutil.rmtree(LEGACY_GLOBAL_CHAT_DIR, ignore_errors=True)
-            
-            print("Phase 3 Migration complete. Profiles successfully split and consolidated into entity folders.")
-        except Exception as e:
-            print(f"Error during Phase 3 Migration: {e}")
 
     def _get_session_path(self, session_key: Any, session_type: str) -> pathlib.Path:
         if session_type == 'global_chat':

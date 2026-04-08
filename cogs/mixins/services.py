@@ -3581,7 +3581,7 @@ class ServicesMixin:
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         session_cooldown_history = self.ltm_recall_history.get(session_key, {})
         
-        candidate_ltms = []
+        candidate_ltms =[]
         for ltm in all_profile_ltms:
             ltm_id = ltm.get('id')
             if ltm_id in session_cooldown_history:
@@ -3590,17 +3590,8 @@ class ServicesMixin:
                 if current_turn - last_turn < dynamic_cooldown:
                     continue
 
-            scope = ltm.get('scope')
             context_id = str(ltm.get('context_id')) if ltm.get('context_id') is not None else None
-            is_valid_scope = False
-            if scope == 'global':
-                is_valid_scope = True
-            elif scope == 'server' and context_id == str(guild_id):
-                is_valid_scope = True
-            elif scope == 'user' and context_id == str(profile_owner_id) and triggering_user_id == profile_owner_id:
-                is_valid_scope = True
-            
-            if not is_valid_scope:
+            if context_id != str(guild_id):
                 continue
 
             if "s_emb" in ltm and ltm["s_emb"]:
@@ -3857,19 +3848,18 @@ class ServicesMixin:
                 await self._send_session_warning(warning_channel, f"Long-Term Memory creation failed ({self._format_api_error(e)})")
         return None
     
-    async def _maybe_create_ltm(self, context_obj: Union[discord.Message, discord.abc.Messageable], author_dn: str, hist: list, profile_owner_id: int, profile_name: str, gen_config_params: Dict[str, Any], force_user_scope: bool = False, triggering_user_id_override: Optional[int] = None):
+    async def _maybe_create_ltm(self, context_obj: Union[discord.Message, discord.abc.Messageable], author_dn: str, hist: list, profile_owner_id: int, profile_name: str, gen_config_params: Dict[str, Any], triggering_user_id_override: Optional[int] = None):
         guild = getattr(context_obj, 'guild', None)
+        if not guild: return
         
         index = self._get_user_index(profile_owner_id)
-        is_borrowed = profile_name in index.get("borrowed", [])
+        is_borrowed = profile_name in index.get("borrowed",[])
         profile_settings = self._get_profile_config(profile_owner_id, profile_name, is_borrowed) or {}
         
         if not profile_settings.get("ltm_creation_enabled", False):
             return
-
-        context_type: Literal["guild", "dm"] = "guild" if guild else "dm"
         
-        ltm_counter_key = (profile_owner_id, profile_name, context_type)
+        ltm_counter_key = (profile_owner_id, profile_name, "guild")
         # 1 exchange = 1 increment
         self.message_counters_for_ltm[ltm_counter_key] = self.message_counters_for_ltm.get(ltm_counter_key, 0) + 1
         
@@ -3927,7 +3917,7 @@ class ServicesMixin:
                 summary_embedding = await self._get_embedding(summary, guild_id, task_type="RETRIEVAL_DOCUMENT")
                 if summary_embedding:
                     quantized_embedding = _quantize_embedding(summary_embedding)
-                    self._add_ltm(profile_owner_id, profile_name, summary, quantized_embedding, guild.id if guild else None, triggering_user_id, sanitized_author, force_user_scope=force_user_scope)
+                    self._add_ltm(profile_owner_id, profile_name, summary, quantized_embedding, guild.id if guild else None, triggering_user_id, sanitized_author)
 
     async def _send_channel_message(self, 
                                    channel: discord.abc.Messageable, 
@@ -4804,6 +4794,41 @@ class ServicesMixin:
             self._save_channel_settings()
             self._save_multi_profile_sessions()
             log.append(f"🧹 Removed settings for {cleaned_channel_settings} deleted channels from config files.")
+
+        # --- 10. Inactive Session File Cleanup (30-Day TTL) ---
+        cleaned_session_files_ttl = 0
+        thirty_days_ago = time.time() - (30 * 86400)
+        
+        # Check Server Sessions
+        if servers_path.is_dir():
+            for server_dir in list(servers_path.iterdir()):
+                if not server_dir.is_dir(): continue
+                sessions_dir = server_dir / "sessions"
+                if not sessions_dir.is_dir(): continue
+                for channel_dir in list(sessions_dir.iterdir()):
+                    if not channel_dir.is_dir(): continue
+                    for session_type in ["multi", "freewill"]:
+                        type_dir = channel_dir / session_type
+                        log_file = type_dir / "session_log.json.gz"
+                        if log_file.exists() and log_file.stat().st_mtime < thirty_days_ago:
+                            _delete_file_shard(str(log_file))
+                            cleaned_session_files_ttl += 1
+        
+        # Check Global Sessions
+        if users_path.is_dir():
+            for user_dir in list(users_path.iterdir()):
+                if not user_dir.is_dir() or not user_dir.name.isdigit(): continue
+                profiles_dir = user_dir / "profiles"
+                if not profiles_dir.is_dir(): continue
+                for pid_dir in list(profiles_dir.iterdir()):
+                    if not pid_dir.is_dir(): continue
+                    gc_file = pid_dir / "global_chat.json.gz"
+                    if gc_file.exists() and gc_file.stat().st_mtime < thirty_days_ago:
+                        _delete_file_shard(str(gc_file))
+                        cleaned_session_files_ttl += 1
+
+        if cleaned_session_files_ttl > 0:
+            log.append(f"🧹 Removed {cleaned_session_files_ttl} inactive session logs (30-day TTL expired).")
 
         log.append("\nCleanup complete.")
         print("\n".join(log).replace("**", ""))

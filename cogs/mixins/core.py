@@ -25,15 +25,7 @@ class CoreMixin:
 
     @commands.Cog.listener()
     async def on_ready(self):
-        self._migrate_servers_directory()
-        self._migrate_users_root_directory()
-        self._migrate_profiles_directory()
-        self._migrate_to_pid_v2()
-        
-        # [NEW] Patch legacy ID fields and standardise to 8-character PIDs
-        await self._patch_profile_ids()
-        
-        # [FIXED] Reload appearances into memory AFTER the migration scripts move the files
+        # [FIXED] Reload appearances into memory
         self._load_user_appearances()
         
         if not self.sessions_loaded:
@@ -650,10 +642,6 @@ class CoreMixin:
                                 break
                         
                         if turn_id_to_delete:
-                            ltm_counter_key = (user_id, p_name, "dm")
-                            if ltm_counter_key in self.message_counters_for_ltm:
-                                self.message_counters_for_ltm[ltm_counter_key] = max(0, self.message_counters_for_ltm[ltm_counter_key] - 1)
-
                             original_len = len(session_data['unified_log'])
                             session_data['unified_log'] = [t for t in session_data['unified_log'] if t.get('turn_id') != turn_id_to_delete]
 
@@ -1028,10 +1016,8 @@ class CoreMixin:
             combined_prompt_text = "\n\n".join([f"{t['display_name']}: {t['content']}" for t in queued_turns])
             combined_footer_text = " ".join([f"{t['display_name']}: {t['content']}" for t in queued_turns])
 
-            ltm_recall_text = await self._get_relevant_ltm_for_prompt(model_cache_key, chat.history, host_user_id, profile_name, combined_prompt_text, interaction.user.display_name, guild_id=None, triggering_user_id=interaction.user.id)
-            
             user_index = self._get_user_index(host_user_id)
-            is_borrowed = profile_name in user_index.get("borrowed", [])
+            is_borrowed = profile_name in user_index.get("borrowed",[])
             source_owner_id = host_user_id
             source_profile_name = profile_name
             if is_borrowed:
@@ -1044,13 +1030,11 @@ class CoreMixin:
             if appearance and appearance.get("custom_display_name"):
                 bot_display_name = appearance.get("custom_display_name")
 
-            contents_for_api_call = []
+            contents_for_api_call =[]
             
             user_tz = profile_data.get("timezone", "UTC")
             final_user_parts = []
-            turn_warnings = []
-            if ltm_recall_text:
-                final_user_parts.append(ltm_recall_text)
+            turn_warnings =[]
             
             url_mode = profile_data.get('url_mode', 'off')
             if 'url_mode' not in profile_data:
@@ -1362,12 +1346,6 @@ class CoreMixin:
                 chat.history[-1] = new_turn
 
             await self._save_session_to_disk(model_cache_key, 'global_chat', session_data)
-
-            await self._maybe_create_ltm(
-                interaction.channel, interaction.user.display_name, chat.history, host_user_id, profile_name,
-                {"temperature": temp, "top_p": top_p, "top_k": top_k},
-                force_user_scope=True
-            )
 
         except Exception as e:
             await interaction.followup.send(f"An error occurred during the global chat: {e}", ephemeral=True)
@@ -1724,11 +1702,11 @@ class CoreMixin:
             p_prompts = self._get_profile_prompts(user_id, name) or {}
 
             keys_by_filter = {
-                "core": ["primary_model", "fallback_model", "show_fallback_indicator", "temperature", "top_p", "top_k", "stm_length", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a"],
-                "thinking": ["thinking_summary_visible", "thinking_level", "thinking_budget", "thinking_signatures_enabled"],
-                "tools": ["grounding_enabled", "grounding_mode", "image_generation_enabled", "url_fetching_enabled", "critic_enabled", "generation_metadata_enabled", "time_tracking_enabled", "timezone", "realistic_typing_enabled", "response_mode"],
-                "voice": ["speech_voice", "speech_model", "speech_temperature", "speech_archetype", "speech_accent", "speech_dynamics", "speech_style", "speech_pacing"],
-                "memory_params": ["training_context_size", "training_relevance_threshold", "ltm_context_size", "ltm_relevance_threshold", "ltm_creation_interval", "ltm_summarization_context"]
+                "core":["primary_model", "fallback_model", "show_fallback_indicator", "temperature", "top_p", "top_k", "stm_length", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a"],
+                "thinking":["thinking_summary_visible", "thinking_level", "thinking_budget", "thinking_signatures_enabled"],
+                "tools":["grounding_enabled", "grounding_mode", "image_generation_enabled", "url_fetching_enabled", "critic_enabled", "generation_metadata_enabled", "time_tracking_enabled", "timezone", "realistic_typing_enabled", "response_mode"],
+                "voice":["speech_voice", "speech_model", "speech_temperature", "speech_archetype", "speech_accent", "speech_dynamics", "speech_style", "speech_pacing"],
+                "memory_params":["training_context_size", "training_relevance_threshold", "ltm_context_size", "ltm_relevance_threshold", "ltm_creation_interval", "ltm_summarization_context"]
             }
             
             p_config_out = {}
@@ -1738,8 +1716,11 @@ class CoreMixin:
                         if k in p_config:
                             p_config_out[k] = p_config[k]
                             
-            if "memory_params" in filters and "image_generation_prompt" in p_prompts:
-                p_config_out["image_generation_prompt"] = p_prompts["image_generation_prompt"]
+            if "memory_params" in filters:
+                if "image_generation_prompt" in p_prompts:
+                    p_config_out["image_generation_prompt"] = self._decrypt_data(p_prompts["image_generation_prompt"])
+                if "ltm_summarization_instructions" in p_prompts:
+                    p_config_out["ltm_summarization_instructions"] = self._decrypt_data(p_prompts["ltm_summarization_instructions"])
 
             p_entry = {
                 "pid": self._get_pid_from_name_any(user_id, name),
@@ -1767,11 +1748,10 @@ class CoreMixin:
             if "ltm" in filters:
                 ltm_shard = self._load_ltm_shard(user_id_str, name)
                 if ltm_shard:
-                    for entry in ltm_shard.get("guild", []):
+                    for entry in ltm_shard.get("guild",[]):
                         p_entry["ltm"].append({
                             "sum": self._decrypt_data(entry.get("sum", "")),
                             "s_emb": entry.get("s_emb"),
-                            "scope": entry.get("scope", "server"),
                             "ts": entry.get("created_ts", entry.get("ts"))
                         })
 
@@ -1830,6 +1810,9 @@ class CoreMixin:
                 
                 config.update(p_data.get("config", {}))
                 
+                img_gen = config.pop("image_generation_prompt", None)
+                ltm_sum = config.pop("ltm_summarization_instructions", None)
+                
                 # Import original PID if valid, otherwise keep the newly generated one
                 imported_pid = p_data.get("pid")
                 if imported_pid and len(imported_pid) == 16 and imported_pid.startswith("A"):
@@ -1840,6 +1823,8 @@ class CoreMixin:
                 
                 prompts["persona"] = clean_persona
                 prompts["ai_instructions"] = clean_instr
+                prompts["image_generation_prompt"] = self._encrypt_data(img_gen) if img_gen else None
+                prompts["ltm_summarization_instructions"] = self._encrypt_data(ltm_sum) if ltm_sum else self._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
                 
                 self._save_profile_config(user_id, local_name, config, False)
                 self._save_profile_prompts(user_id, local_name, prompts)
@@ -1851,10 +1836,10 @@ class CoreMixin:
                         now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
                         ltm_list.append({
                             "id": uuid.uuid4().hex[:8], "sum": self._encrypt_data(entry["sum"]),
-                            "s_emb": entry["s_emb"], "scope": entry.get("scope", "server"),
+                            "s_emb": entry["s_emb"], "scope": "server",
                             "created_ts": entry.get("ts", now_ts), "modified_ts": now_ts
                         })
-                    self._save_ltm_shard(user_id_str, local_name, {"guild": ltm_list, "dm": []})
+                    self._save_ltm_shard(user_id_str, local_name, {"guild": ltm_list})
 
                 # 3. Encrypt and save Training
                 if p_data.get("training"):
@@ -1881,6 +1866,134 @@ class CoreMixin:
 
         except Exception as e:
             await interaction.followup.send(f"❌ **Import Failed:** {e}", ephemeral=True)
+
+    async def _execute_privacy_export(self, user_id: int, interaction: discord.Interaction):
+        user_id_str = str(user_id)
+        user_dir = os.path.join(self.USERS_DIR, user_id_str)
+        
+        if not os.path.exists(user_dir):
+            await interaction.followup.send("No data found for your account.", ephemeral=True)
+            return
+            
+        import tempfile
+        import shutil
+        import orjson as json
+        
+        def decrypt_payload(data):
+            if isinstance(data, dict):
+                return {k: decrypt_payload(v) for k, v in data.items()}
+            elif isinstance(data, list):
+                return[decrypt_payload(i) for i in data]
+            elif isinstance(data, str):
+                if data.startswith("gAAAAA"):
+                    return self._decrypt_data(data)
+                return data
+            else:
+                return data
+
+        def make_zip():
+            temp_d = tempfile.mkdtemp()
+            export_base = os.path.join(temp_d, f"mimicai_data_{user_id_str}")
+            os.makedirs(export_base)
+            
+            for root, dirs, files in os.walk(user_dir):
+                rel_path = os.path.relpath(root, user_dir)
+                target_dir = os.path.join(export_base, rel_path) if rel_path != '.' else export_base
+                os.makedirs(target_dir, exist_ok=True)
+                
+                for file in files:
+                    src_file = os.path.join(root, file)
+                    
+                    if file.endswith('.json.gz'):
+                        is_encrypted = file != 'child_bot.json.gz'
+                        data = self._load_json_gzip(src_file, encrypted=is_encrypted)
+                        
+                        if data is not None:
+                            decrypted_data = decrypt_payload(data)
+                            target_file = os.path.join(target_dir, file[:-3]) 
+                            with open(target_file, 'wb') as f:
+                                f.write(json.dumps(decrypted_data, option=json.OPT_INDENT_2))
+                    
+                    elif file.endswith('.json') or file.endswith('.txt'):
+                        target_file = os.path.join(target_dir, file)
+                        shutil.copy2(src_file, target_file)
+            
+            zip_base = os.path.join(temp_d, f"mimicai_data_{user_id_str}")
+            shutil.make_archive(zip_base, 'zip', export_base)
+            return temp_d, f"{zip_base}.zip"
+            
+        temp_dir, zip_path = await asyncio.to_thread(make_zip)
+        
+        try:
+            file = discord.File(zip_path, filename=f"privacy_export_{user_id_str}.zip")
+            await interaction.followup.send("Here is your complete data export. This archive contains your profiles, API keys, and memory data in unencrypted, uncompressed JSON format.", file=file, ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"Failed to send export file: {e}", ephemeral=True)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    async def _execute_account_deletion(self, user_id: int, interaction: discord.Interaction):
+        user_id_str = str(user_id)
+        
+        # 1. Shutdown Child Bots
+        child_bots_to_kill =[bot_id for bot_id, data in self.child_bots.items() if str(data.get("owner_id")) == user_id_str]
+        for bot_id in child_bots_to_kill:
+            await self.manager_queue.put({"action": "shutdown_bot", "bot_id": bot_id})
+            self.child_bots.pop(bot_id, None)
+            
+        # 2. Scrub from Public Hub
+        pids_to_unpublish =[pid for pid, info in self.public_profiles.items() if str(info.get("owner_id")) == user_id_str]
+        for pid in pids_to_unpublish:
+            self.public_profiles.pop(pid, None)
+        if pids_to_unpublish:
+            self._save_public_index()
+            
+        # 3. Scrub from Server Key Pools & Primary Keys
+        keys_changed = False
+        for guild_id_str, submissions in list(self.key_submissions.items()):
+            original_len = len(submissions)
+            self.key_submissions[guild_id_str] =[s for s in submissions if str(s.get("submitter_id")) != user_id_str]
+            if len(self.key_submissions[guild_id_str]) < original_len:
+                keys_changed = True
+                
+        for guild_id_str, primary_data in list(self.server_api_keys.items()):
+            if isinstance(primary_data, dict) and str(primary_data.get("submitter_id")) == user_id_str:
+                self.server_api_keys.pop(guild_id_str, None)
+                keys_changed = True
+                
+        if keys_changed:
+            self._save_key_submissions()
+            
+        # 4. Scrub from Freewill
+        freewill_changed = False
+        for guild_id_str, srv_data in list(self.freewill_participation.items()):
+            for channel_id_str, ch_data in list(srv_data.items()):
+                if user_id_str in ch_data:
+                    del ch_data[user_id_str]
+                    freewill_changed = True
+            if freewill_changed:
+                self._save_freewill_for_server(int(guild_id_str))
+                
+        # 5. Delete Core User Directory
+        import shutil
+        user_dir = os.path.join(self.USERS_DIR, user_id_str)
+        if os.path.exists(user_dir):
+            shutil.rmtree(user_dir, ignore_errors=True)
+            
+        # 6. Remove from In-Memory Dicts
+        self.user_indices.pop(user_id_str, None)
+        self.user_appearances.pop(user_id_str, None)
+        self.profile_shares.pop(user_id_str, None)
+        self.personal_api_keys.pop(user_id_str, None)
+        
+        # 7. Cancel/Delete active global chat sessions
+        keys_to_del =[k for k in self.global_chat_sessions.keys() if isinstance(k, tuple) and len(k) == 3 and k[0] == 'global' and k[1] == user_id]
+        for k in keys_to_del:
+            self.global_chat_sessions.pop(k, None)
+            self.session_last_accessed.pop(k, None)
+            self.ltm_recall_history.pop(k, None)
+
+        await interaction.followup.send("✅ **Account Deleted.** All your profiles, memories, and settings have been permanently erased from this instance.", ephemeral=True)
 
     def _try_acquire_lock(self):
         try:
@@ -2342,7 +2455,7 @@ class CoreMixin:
         embed.add_field(name="Train Count", value=f"`{training_count}`", inline=True)
         embed.add_field(name="LTM Ctx", value=f"`{ltm_ctx}`", inline=True)
         embed.add_field(name="LTM Rel", value=f"`{ltm_rel}`", inline=True)
-        embed.add_field(name="LTM Info", value=f"Count: `{ltm_count}`\nScope: `{ltm_scope}`\nAuto-Creation: {ltm_creation_status}", inline=True)
+        embed.add_field(name="LTM Info", value=f"Count: `{ltm_count}`\nAuto-Creation: {ltm_creation_status}", inline=True)
         
         if appearance.get("custom_avatar_url"):
             embed.set_thumbnail(url=appearance["custom_avatar_url"])
@@ -2503,7 +2616,7 @@ class CoreMixin:
             f"Critic: {critic}\n"
             f"Placeholder: {ph_text}"
         )
-        embed.add_field(name="Tools", value=tools_val, inline=True)
+        embed.add_field(name="Tools", value=tools_val, inline=False)
 
         s_voice = source_profile_data.get("speech_voice", "Aoede")
         s_model = source_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts")
@@ -2516,8 +2629,6 @@ class CoreMixin:
         )
         embed.add_field(name="Speech TTS", value=speech_val, inline=True)
 
-        embed.add_field(name="\u200b", value="\u200b", inline=True)
-
         # 5. Training & Memory Section (Same Row)
         train_val = (
             f"Count: `{train_count}`\n"
@@ -2528,7 +2639,6 @@ class CoreMixin:
 
         ltm_ctx = source_profile_data.get("ltm_context_size", 3)
         ltm_rel = source_profile_data.get("ltm_relevance_threshold", 0.75)
-        ltm_scope = source_profile_data.get("ltm_scope", "server").title()
         ltm_status = "**`ON`**" if source_profile_data.get("ltm_creation_enabled", False) else "`OFF`"
         ltm_inv = source_profile_data.get("ltm_creation_interval", 10)
         ltm_s_ctx = source_profile_data.get("ltm_summarization_context", 10)
@@ -2536,7 +2646,6 @@ class CoreMixin:
         ltm_val = (
             f"Auto-Creation: {ltm_status}\n"
             f"Count: `{ltm_count}`\n"
-            f"Scope: `{ltm_scope}`\n"
             f"Creation Interval: `{ltm_inv}`\n"
             f"Summ Context: `{ltm_s_ctx}`\n"
             f"Context Size: `{ltm_ctx}`\n"

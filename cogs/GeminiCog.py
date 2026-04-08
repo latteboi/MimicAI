@@ -77,23 +77,16 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         
         print(f"GeminiAgent Init. Models: Primary='{PRIMARY_MODEL_NAME}', Fallback='{FALLBACK_MODEL_NAME}'.")
 
-        self.PROFILES_DIR = LEGACY_PROFILES_DIR
-        self.LTM_DIR = LEGACY_LTM_DIR
-        self.TRAINING_DIR = LEGACY_TRAINING_DIR
         self.PUBLIC_PROFILES_DIR = PUBLIC_PROFILES_DIR
-        self.CHILD_BOTS_DIR = LEGACY_CHILD_BOTS_DIR
         self.USERS_DIR = USERS_DIR
-        self.APPEARANCES_DIR = APPEARANCES_DIR
-        self.SHARES_DIR = LEGACY_SHARES_DIR
-        self.PERSONAL_KEYS_DIR = LEGACY_PERSONAL_KEYS_DIR
         self.DATA_DIR = DATA_DIR
         self.MOD_DATA_DIR = MOD_DATA_DIR
         self.FREEWILL_SERVERS_DIR = FREEWILL_SERVERS_DIR
-        self.SESSIONS_GLOBAL_DIR = LEGACY_GLOBAL_CHAT_DIR
+        self.SESSIONS_GLOBAL_DIR = SESSIONS_GLOBAL_DIR
         self.SERVERS_DIR = SERVERS_DIR
         
         # Only create the active Phase 3 directories to prevent ghost folders on boot
-        active_dirs = [self.USERS_DIR, self.DATA_DIR, self.PUBLIC_PROFILES_DIR, self.SERVERS_DIR, self.MOD_DATA_DIR]
+        active_dirs =[self.USERS_DIR, self.DATA_DIR, self.PUBLIC_PROFILES_DIR, self.SERVERS_DIR, self.MOD_DATA_DIR]
         
         for d in active_dirs:
             os.makedirs(d, exist_ok=True)
@@ -455,6 +448,18 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         
         await interaction.response.defer(ephemeral=True, thinking=True)
         await self._execute_import(interaction, file)
+
+    @app_commands.command(name="privacy", description="Manage your data privacy and account deletion.")
+    @app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
+    async def privacy_slash(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        view = PrivacyDashboardView(self, interaction.user.id)
+        embed = discord.Embed(
+            title="Privacy & Data Dashboard",
+            description="Request a full export of your data or permanently delete your account and all associated profiles, memories, and settings.",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="debug", description="Toggle debug mode to see the bot's context for all scopes in your DMs (DM-Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)

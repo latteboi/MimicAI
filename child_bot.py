@@ -70,7 +70,7 @@ class HiveMind:
 
         self.typing_tasks[task_key] = asyncio.create_task(typing_loop())
 
-    async def launch_bot(self, bot_id, token, parent_id):
+    async def launch_bot(self, bot_id, token, parent_id, parent_name="MimicAI", owner_id=None, profile_name=None, profile_id=None):
         if bot_id in self.clients: return
 
         # Minimal Intents: Blind & Deaf (No Message Content)
@@ -88,12 +88,43 @@ class HiveMind:
         async def whoami(interaction: discord.Interaction):
             embed = discord.Embed(
                 title=f"Bot Identity: {bot.user.name}",
-                description="I am a Child Bot managed by MimicAI.",
+                description=f"Managed by {parent_name}.",
                 color=discord.Color.blue()
             )
             embed.set_thumbnail(url=bot.user.display_avatar.url)
-            embed.add_field(name="Bot ID", value=str(bot.user.id), inline=True)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            
+            owner_mention = f"<@{owner_id}>" if owner_id else "Unknown"
+            embed.add_field(name="Profile Owner", value=owner_mention, inline=True)
+            embed.add_field(name="Profile ID", value=str(profile_id) if profile_id else "Unknown", inline=True)
+            embed.add_field(name="Profile Name", value=str(profile_name) if profile_name else "Unknown", inline=True)
+            
+            if owner_id and interaction.user.id == int(owner_id):
+                class StatusView(discord.ui.View):
+                    def __init__(self):
+                        super().__init__(timeout=120)
+                    
+                    @discord.ui.select(
+                        placeholder="Change bot status...",
+                        options=[
+                            discord.SelectOption(label="Online", value="online", emoji="🟢"),
+                            discord.SelectOption(label="Idle", value="idle", emoji="🌙"),
+                            discord.SelectOption(label="Do Not Disturb", value="dnd", emoji="⛔"),
+                            discord.SelectOption(label="Invisible", value="invisible", emoji="🔘")
+                        ]
+                    )
+                    async def select_callback(self, select_interaction: discord.Interaction, select: discord.ui.Select):
+                        status_map = {
+                            "online": discord.Status.online,
+                            "idle": discord.Status.idle,
+                            "dnd": discord.Status.dnd,
+                            "invisible": discord.Status.invisible
+                        }
+                        await bot.change_presence(status=status_map[select.values[0]])
+                        await select_interaction.response.send_message(f"Status changed to **{select.values[0].title()}**.", ephemeral=True)
+
+                await interaction.response.send_message(embed=embed, view=StatusView(), ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=embed, ephemeral=True)
 
         @bot.tree.command(name="toggle", description="Toggles this bot's participation in this channel (Admin Only).")
         @app_commands.checks.has_permissions(administrator=True)
@@ -124,12 +155,32 @@ class HiveMind:
         async def runner():
             try:
                 await bot.login(token)
-                # We must use connect() directly or start() to run.
-                # Since we have multiple bots, we need to schedule them.
-                # bot.start() blocks. We need to create a task.
-                # However, bot.login + bot.connect is the breakdown of start.
-                # To sync commands, we need to be logged in.
                 
+                # --- Enforce Bio/About Me for Child Bots (Continuous Watchdog) ---
+                async def enforce_bio_loop():
+                    await bot.wait_until_ready()
+                    while not bot.is_closed():
+                        try:
+                            app_info = await bot.application_info()
+                            sig = f"Managed by {parent_name}."
+                            
+                            if not app_info.description or sig not in app_info.description:
+                                new_desc = (app_info.description or "")
+                                if len(new_desc) + len(sig) > 400: # Discord bio limit
+                                    new_desc = new_desc[:400 - len(sig)]
+                                new_desc += sig
+                                
+                                # Patching the application directly
+                                await bot.http.request(discord.http.Route('PATCH', '/applications/@me'), json={'description': new_desc})
+                                print(f"[Hive] Enforced bio for {bot.user.name} to identify parent.")
+                        except Exception as e:
+                            print(f"[Hive] Could not enforce bio for {bot_id}: {e}")
+                        
+                        await asyncio.sleep(3600) # Check every hour
+
+                bot.loop.create_task(enforce_bio_loop())
+                # -----------------------------------------------------------------
+
                 # Background task to sync once ready
                 async def on_ready_sync():
                     await bot.wait_until_ready()
@@ -371,7 +422,15 @@ class HiveMind:
                         
                         # Manager Commands
                         if action == "launch":
-                            await self.launch_bot(str(data.get("bot_id")), data.get("token"), data.get("parent_id"))
+                            await self.launch_bot(
+                                str(data.get("bot_id")), 
+                                data.get("token"), 
+                                data.get("parent_id"), 
+                                data.get("parent_name", "MimicAI"),
+                                data.get("owner_id"),
+                                data.get("profile_name"),
+                                data.get("profile_id")
+                            )
                         elif action == "shutdown":
                             await self.shutdown_bot(str(data.get("bot_id")))
                         
