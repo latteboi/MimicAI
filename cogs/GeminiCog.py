@@ -346,15 +346,12 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         index = self._get_user_index(interaction.user.id)
         is_personal = profile_name in index.get("personal", [])
         is_borrowed = profile_name in index.get("borrowed", [])
-        is_default = profile_name == DEFAULT_PROFILE_NAME
 
-        if not is_personal and not is_borrowed and not is_default:
+        if not is_personal and not is_borrowed:
             await interaction.followup.send(f"Profile '{profile_name}' not found.", ephemeral=True)
             return
             
         is_view_borrowed = is_borrowed
-        if is_default and interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
-            is_view_borrowed = True
         
         embed = await self._build_profile_manage_embed(interaction, profile_name)
         view = ProfileManageView(self, interaction, profile_name, is_view_borrowed)
@@ -484,27 +481,21 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         
         profile_name = profile_name.lower().strip()
         index = self._get_user_index(interaction.user.id)
-        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
 
         is_borrowed = profile_name in index.get("borrowed", [])
         is_personal = profile_name in index.get("personal", [])
         
-        can_manage = is_personal or is_borrowed or profile_name == DEFAULT_PROFILE_NAME
+        can_manage = is_personal or is_borrowed
         if not can_manage:
             await interaction.response.send_message(f"You do not have a profile named '{profile_name}'.", ephemeral=True)
             return
 
         is_view_borrowed = is_borrowed
-        if profile_name == DEFAULT_PROFILE_NAME and interaction.user.id != owner_id:
-            is_view_borrowed = True
 
         effective_owner_id = interaction.user.id
         if is_view_borrowed:
-            if profile_name == DEFAULT_PROFILE_NAME:
-                effective_owner_id = owner_id
-            else:
-                b_config = self._get_profile_config(interaction.user.id, profile_name, True) or {}
-                effective_owner_id = int(b_config.get("original_owner_id", 0))
+            b_config = self._get_profile_config(interaction.user.id, profile_name, True) or {}
+            effective_owner_id = int(b_config.get("original_owner_id", 0))
 
         await interaction.response.defer(ephemeral=True)
         view = DataManageView(self, interaction, profile_name, is_borrowed=is_view_borrowed, effective_owner_id=effective_owner_id)

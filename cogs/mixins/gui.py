@@ -1111,8 +1111,7 @@ class ProfileManageView(ui.View):
 
         def tab_has_options(tab: str) -> bool:
             if tab == "home":
-                if not is_mod: return True
-                return self.profile_name != DEFAULT_PROFILE_NAME
+                return True
             elif tab == "persona":
                 return not self.is_borrowed
             elif tab in ["params", "tools", "memory"]:
@@ -1131,8 +1130,7 @@ class ProfileManageView(ui.View):
         options = []
         if self.current_tab == "home":
             if not is_mod:
-                if self.profile_name != DEFAULT_PROFILE_NAME:
-                    options.append(discord.SelectOption(label="Rename Profile", value="rename", description="Change the local name of this profile."))
+                options.append(discord.SelectOption(label="Rename Profile", value="rename", description="Change the local name of this profile."))
                 
                 if not self.is_borrowed:
                     options.append(discord.SelectOption(label="Duplicate Profile", value="duplicate", description="Create a new profile from a copy of this one."))
@@ -1142,9 +1140,8 @@ class ProfileManageView(ui.View):
                 
                 options.append(discord.SelectOption(label="Cycle Content Safety Level", value="safety_level", description="Cycle: Low -> Medium -> High -> Unrestricted 18+."))
             
-            if self.profile_name != DEFAULT_PROFILE_NAME:
-                label = "Remove Borrowed Profile" if self.is_borrowed else "Delete Profile"
-                options.append(discord.SelectOption(label=label, value="delete", description="Permanently remove this profile and its data."))
+            label = "Remove Borrowed Profile" if self.is_borrowed else "Delete Profile"
+            options.append(discord.SelectOption(label=label, value="delete", description="Permanently remove this profile and its data."))
 
         elif self.current_tab == "persona":
             options.append(discord.SelectOption(label="Edit Persona", value="edit_persona", description="Edit backstory, traits, likes, dislikes, and appearance."))
@@ -1362,13 +1359,10 @@ class ProfileManageView(ui.View):
 
         # --- Memory Tab Logic ---
         elif choice == "data":
-            owner_id_config = int(defaultConfig.DISCORD_OWNER_ID)
             effective_owner_id = user_id
             if self.is_borrowed:
-                if profile_name == DEFAULT_PROFILE_NAME: effective_owner_id = owner_id_config
-                else:
-                    borrow_data = self.cog._get_profile_config(user_id, profile_name, True) or {}
-                    effective_owner_id = int(borrow_data.get("original_owner_id", user_id))
+                borrow_data = self.cog._get_profile_config(user_id, profile_name, True) or {}
+                effective_owner_id = int(borrow_data.get("original_owner_id", user_id))
             view = DataManageView(self.cog, self.original_interaction, profile_name, self.is_borrowed, effective_owner_id)
             await view.start()
             await interaction.response.defer()
@@ -1441,8 +1435,6 @@ class ProfileManageView(ui.View):
             if not is_valid:
                 await self.original_interaction.edit_original_response(content=f"Rename failed: {err_msg}", view=None, embed=None); return
                 
-            if old_name == DEFAULT_PROFILE_NAME:
-                await self.original_interaction.edit_original_response(content=f"Rename failed: '{DEFAULT_PROFILE_NAME}' cannot be renamed.", view=None, embed=None); return
             if not new_name or new_name.lower() == 'clyde':
                 await self.original_interaction.edit_original_response(content="Rename failed: Invalid name.", view=None, embed=None); return
             user_index = self.cog._get_user_index(self.user_id)
@@ -1563,8 +1555,6 @@ class ProfileManageView(ui.View):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     async def _handle_delete(self, interaction):
-        if self.profile_name == DEFAULT_PROFILE_NAME:
-            await interaction.response.send_message("The default profile cannot be deleted.", ephemeral=True); return
         confirm_view = ui.View(timeout=60)
         async def confirm_delete(i: discord.Interaction):
             await i.response.defer()
@@ -4703,11 +4693,6 @@ class BulkLtmScopeView(BaseBulkProfileView):
 class BulkDeleteView(BaseBulkProfileView):
     def __init__(self, cog: 'GeminiAgent', user_id: int):
         super().__init__(cog, user_id, include_borrowed=True)
-        # Filter out default profile from lists in base class logic? 
-        # Base class loads all. We filter default profile for display logic in callback.
-        # But cleaner to filter source lists directly.
-        if "mimic" in self.personal_profiles: self.personal_profiles.remove("mimic")
-        if "mimic" in self.borrowed_profiles: self.borrowed_profiles.remove("mimic")
         self._build_view()
 
     def _build_view(self):

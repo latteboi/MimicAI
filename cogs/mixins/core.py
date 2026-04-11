@@ -35,6 +35,8 @@ class CoreMixin:
         self.all_bot_ids = {self.bot.user.id} | {int(bot_id) for bot_id in self.child_bots.keys()}
 
         if self.has_lock:
+            self._purge_legacy_default_profile()
+            
             if not self.freewill_task.is_running():
                 self.freewill_task.start()
             
@@ -111,9 +113,6 @@ class CoreMixin:
 
         # --- 2. Standalone Child Bot Detection ---
         mentioned_child_ids = []
-        for user in message.mentions:
-            if str(user.id) in self.child_bots:
-                mentioned_child_ids.append(str(user.id))
         
         ref_msg = None
         if message.reference:
@@ -191,30 +190,12 @@ class CoreMixin:
         is_main_bot_mention = self.bot.user and self.bot.user.mentioned_in(message)
         session = self.multi_profile_channels.get(message.channel.id)
 
-        # Handle Stateless Image Generation (Mentioned when no session exists)
-        if is_main_bot_mention and not session:
-            content_to_process = message.clean_content.replace(f"<@{self.bot.user.id}>", "").strip()
-            content_lower = content_to_process.lower()
-            image_prefixes = ("!image", "!imagine")
-            if any(content_lower.startswith(p) for p in image_prefixes):
-                # Check active profile settings for the user
-                eff_uid = message.author.id
-                eff_pname = self._get_active_user_profile_name_for_channel(eff_uid, message.channel.id)
-                eff_index = self._get_user_index(eff_uid)
-                eff_is_b = eff_pname in eff_index.get("borrowed", [])
-                eff_profile = self._get_profile_config(eff_uid, eff_pname, eff_is_b) or {}
-                
-                if eff_profile.get("image_generation_enabled", True):
-                    await self._handle_image_generation_request(message, content_to_process)
-                    return
-
         # --- Freewill Trigger Logic ---
         guild_id_str = str(message.guild.id)
         fw_config = self.freewill_config.get(guild_id_str, {})
         triggered_profile = None
 
         # Ensure we don't interrupt a manual multi-profile session with freewill logic
-        session = self.multi_profile_channels.get(message.channel.id)
         is_freewill_compatible = not session or session.get("type") == "freewill"
 
         if fw_config.get("enabled", False) and is_freewill_compatible:
@@ -315,25 +296,6 @@ class CoreMixin:
                 if is_main_bot_mention:
                     return
             
-            # If Regular Multi session is active and parent bot is mentioned
-            if is_main_bot_mention and session.get("type") == "multi":
-                owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-                profile_name = DEFAULT_PROFILE_NAME
-                
-                # Check if parent bot is already a participant
-                is_participant = any(p['owner_id'] == owner_id and p['profile_name'] == profile_name for p in session['profiles'])
-                
-                if not is_participant:
-                    # Ad-hoc injection
-                    participant = {"owner_id": owner_id, "profile_name": profile_name, "method": "webhook", "ephemeral": True}
-                    trigger = ('ad_hoc_mention', message, participant)
-                    await session['task_queue'].put(trigger)
-                    if not session.get('worker_task') or session['worker_task'].done():
-                        task = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
-                        session['worker_task'] = task
-                        self.background_tasks.add(task)
-                    return
-
             await session['task_queue'].put(message)
             if not session.get('worker_task') or session['worker_task'].done():
                 task = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
@@ -342,34 +304,9 @@ class CoreMixin:
             return
         
         # Check for Freewill configuration to prevent overriding with a new manual session
-        fw_config = self.freewill_config.get(guild_id_str, {})
         if message.channel.id in fw_config.get("living_channel_ids", []) or message.channel.id in fw_config.get("lurking_channel_ids", []):
             return
 
-        # --- New Session Creation Logic (Main Bot Mention) ---
-        if is_main_bot_mention:
-            owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-            profile_name = DEFAULT_PROFILE_NAME
-            participant = {"owner_id": owner_id, "profile_name": profile_name, "method": "webhook", "ephemeral": True}
-            
-            if not session:
-                session = {
-                    "type": "multi", "profiles": [], "chat_sessions": {},
-                    "unified_log": [], "is_hydrated": False, "last_bot_message_id": None,
-                    "owner_id": message.author.id, "is_running": False, "task_queue": asyncio.Queue(),
-                    "worker_task": None, "turns_since_last_ltm": 0, "session_prompt": None,
-                    "session_mode": "sequential"
-                }
-                self.multi_profile_channels[message.channel.id] = session
-            
-            trigger = ('ad_hoc_mention', message, participant)
-            await session['task_queue'].put(trigger)
-            if not session.get('worker_task') or session['worker_task'].done():
-                task = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
-                session['worker_task'] = task
-                self.background_tasks.add(task)
-            return
-        
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         if payload.user_id in self.global_blacklist:
@@ -2409,14 +2346,8 @@ class CoreMixin:
             except: pass
 
         # Profile Type Logic
-        owner_id_config = int(defaultConfig.DISCORD_OWNER_ID)
         profile_type = "Personal"
-        if profile_name == DEFAULT_PROFILE_NAME:
-            if owner_id == owner_id_config:
-                profile_type = "Personal (Global Default)"
-            else:
-                profile_type = "Global Default (Borrowed)"
-        elif is_borrowed:
+        if is_borrowed:
             owner_user = self.bot.get_user(effective_owner_id)
             owner_name = owner_user.name if owner_user else "Unknown User"
             profile_type = f"Borrowed (from {owner_name})"
@@ -2471,16 +2402,8 @@ class CoreMixin:
         effective_owner_id = user_id
         effective_profile_name = profile_name
         profile_type = "Personal"
-        owner_id_config = int(defaultConfig.DISCORD_OWNER_ID)
 
-        if profile_name == DEFAULT_PROFILE_NAME:
-            if user_id == owner_id_config:
-                profile_type = "Personal (Global Default)"
-            else:
-                profile_type = "Global Default (Borrowed)"
-                effective_owner_id = owner_id_config
-                effective_profile_name = DEFAULT_PROFILE_NAME
-        elif is_borrowed:
+        if is_borrowed:
             borrowed_data = self._get_profile_config(user_id, profile_name, True) or {}
             effective_owner_id = int(borrowed_data.get("original_owner_id", user_id))
             effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
@@ -3235,6 +3158,7 @@ class CoreMixin:
     async def _validate_active_profile(self, user_id: int, channel: discord.abc.Messageable) -> bool:
         index = self._get_user_index(user_id)
         active_profile_name = self._get_active_user_profile_name_for_channel(user_id, channel.id)
+        if not active_profile_name: return True
 
         if active_profile_name in index.get("borrowed", []):
             borrowed_data = self._get_profile_config(user_id, active_profile_name, True) or {}
@@ -3254,14 +3178,15 @@ class CoreMixin:
                 channel_obj = self.bot.get_channel(channel.id) if hasattr(channel, 'id') else channel
                 server_id_str = str(channel_obj.guild.id) if channel_obj and getattr(channel_obj, 'guild', None) else "dm"
                 server_index = self._get_server_index(server_id_str)
-                server_index.setdefault("user_active_profiles", {}).setdefault(str(user_id), {})[str(channel.id)] = DEFAULT_PROFILE_NAME
+                if str(channel.id) in server_index.setdefault("user_active_profiles", {}).setdefault(str(user_id), {}):
+                    del server_index["user_active_profiles"][str(user_id)][str(channel.id)]
                 self._save_server_index(server_id_str, server_index)
                 
                 try:
                     import shutil
                     p_dir = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid)
                     shutil.rmtree(p_dir, ignore_errors=True)
-                    await channel.send(f"<@{user_id}>, the borrowed profile '{active_profile_name}' is broken because the original was deleted or renamed. It has been removed from your list and your active profile in this channel has been reset to '{DEFAULT_PROFILE_NAME}'.")
+                    await channel.send(f"<@{user_id}>, the borrowed profile '{active_profile_name}' is broken because the original was deleted or renamed. It has been removed from your list and your active profile in this channel has been reset.")
                 except discord.Forbidden:
                     pass
                 return False

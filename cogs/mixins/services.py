@@ -1152,7 +1152,6 @@ class ServicesMixin:
                                     await msg_obj.clear_reaction(reaction_trigger.emoji)
                                 except: pass
                             elif trigger[0] == 'child_mention': _, message_payload, starting_profile_override = trigger
-                            elif trigger[0] == 'ad_hoc_mention': _, message_trigger, starting_profile_override = trigger
                         elif isinstance(trigger, discord.RawReactionActionEvent): reaction_trigger = trigger
                         elif isinstance(trigger, str):
                             # Handle string prompts
@@ -1529,7 +1528,7 @@ class ServicesMixin:
                 # --- Ephemeral Participant Injection ---
                 ephemeral_participant = None
                 if isinstance(initial_trigger, tuple):
-                    if initial_trigger[0] in ['child_mention', 'ad_hoc_mention']:
+                    if initial_trigger[0] in ['child_mention']:
                         _, _, ephemeral_participant = initial_trigger
                     elif initial_trigger[0] == 'reply' and starting_profile_override and starting_profile_override.get('ephemeral'):
                         ephemeral_participant = starting_profile_override
@@ -3995,7 +3994,7 @@ class ServicesMixin:
                     avatar_index = hash(effective_profile_name) % 6
                     custom_avatar_url_to_use = f"https://cdn.discordapp.com/embed/avatars/{avatar_index}.png"
                     
-            elif profile_name_for_appearance != DEFAULT_PROFILE_NAME:
+            elif profile_name_for_appearance:
                 use_webhook = True
                 custom_display_name_to_use = profile_name_for_appearance
                 avatar_index = hash(profile_name_for_appearance) % 6
@@ -4712,7 +4711,7 @@ class ServicesMixin:
             index = self.cog._get_user_index(int(user_id_str))
             
             # [FIXED] Correctly resolve valid PIDs from the index (Personal only)
-            valid_pids = {DEFAULT_PROFILE_NAME}
+            valid_pids = set()
             personal_entry = index.get("personal", {})
             if isinstance(personal_entry, dict):
                 valid_pids.update(personal_entry.values())

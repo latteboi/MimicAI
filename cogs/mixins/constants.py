@@ -6,7 +6,6 @@ from google.genai.types import HarmCategory, HarmBlockThreshold
 PRIMARY_MODEL_NAME = 'gemini-flash-latest'
 FALLBACK_MODEL_NAME = 'gemini-flash-lite-latest'
 DEFAULT_SYSTEM_INSTRUCTION = "."
-DEFAULT_PROFILE_NAME = "mimic"
 
 # Define the allowed models for the new command
 ALLOWED_MODELS = Literal[

@@ -166,6 +166,60 @@ class StorageMixin:
         if hasattr(self, 'server_indices'):
             self.server_indices[server_id_str] = data
 
+    def _purge_legacy_default_profile(self):
+        import shutil
+        users_path = pathlib.Path(self.USERS_DIR)
+        if not users_path.exists(): return
+        
+        for user_dir in users_path.iterdir():
+            if not user_dir.is_dir() or not user_dir.name.isdigit(): continue
+            
+            profiles_dir = user_dir / "profiles"
+            if profiles_dir.exists():
+                for p_dir in list(profiles_dir.iterdir()):
+                    if p_dir.is_dir() and p_dir.name.lower() == "mimic":
+                        shutil.rmtree(str(p_dir), ignore_errors=True)
+            
+            index_path = user_dir / "index.json"
+            if index_path.exists():
+                index = IOManager.read_json(str(index_path))
+                if index:
+                    changed = False
+                    for key in ["personal", "borrowed"]:
+                        mapping = index.get(key, {})
+                        to_remove = []
+                        if isinstance(mapping, dict):
+                            for k, v in mapping.items():
+                                if k.lower() == "mimic":
+                                    to_remove.append(k)
+                            for k in to_remove:
+                                pid = mapping.pop(k)
+                                changed = True
+                                shutil.rmtree(str(profiles_dir / pid), ignore_errors=True)
+                        elif isinstance(mapping, list):
+                            new_mapping = []
+                            for k in mapping:
+                                if k.lower() == "mimic":
+                                    changed = True
+                                else:
+                                    new_mapping.append(k)
+                            index[key] = new_mapping
+                    
+                    if changed:
+                        IOManager.write_json(index, str(index_path))
+            
+            # --- Cleanup Empty Folders ---
+            has_profiles = False
+            if profiles_dir.exists():
+                has_profiles = any(p.is_dir() for p in profiles_dir.iterdir())
+                
+            if not has_profiles:
+                # If they have no valid profiles, keys, or shares, nuke the entire user ID folder
+                has_keys = (user_dir / "keys.json.gz").exists()
+                has_shares = (user_dir / "shares.json.gz").exists()
+                if not has_keys and not has_shares:
+                    shutil.rmtree(str(user_dir), ignore_errors=True)
+
     def _migrate_to_pid_v2(self):
         users_dir = pathlib.Path(self.USERS_DIR)
         if not users_dir.exists(): return
@@ -192,10 +246,6 @@ class StorageMixin:
                 if isinstance(p_data, list):
                     new_dict = {}
                     for pname in p_data:
-                        if pname == DEFAULT_PROFILE_NAME:
-                            new_dict[pname] = pname
-                            continue
-                        
                         pid = f"{prefix}{uuid.uuid4().hex[:15].upper()}"
                         new_dict[pname] = pid
                         
@@ -216,7 +266,6 @@ class StorageMixin:
             print("Phase 4 Migration complete. Immutable PID directories created and legacy keys purged.")
 
     def _get_pid_from_name(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> str:
-        if profile_name == DEFAULT_PROFILE_NAME: return DEFAULT_PROFILE_NAME
         index = self._get_user_index(user_id)
         key = "borrowed" if is_borrowed else "personal"
         mapping = index.get(key, {})
@@ -225,7 +274,6 @@ class StorageMixin:
         return profile_name
 
     def _get_pid_from_name_any(self, user_id: int, profile_name: str) -> str:
-        if profile_name == DEFAULT_PROFILE_NAME: return DEFAULT_PROFILE_NAME
         index = self._get_user_index(user_id)
         if isinstance(index.get("personal"), dict) and profile_name in index["personal"]:
             return index["personal"][profile_name]
@@ -234,7 +282,6 @@ class StorageMixin:
         return profile_name
 
     def _get_name_from_pid(self, user_id: int, target_pid: str) -> Optional[str]:
-        if target_pid == DEFAULT_PROFILE_NAME: return DEFAULT_PROFILE_NAME
         index = self._get_user_index(user_id)
         personal = index.get("personal", {})
         if isinstance(personal, dict):
@@ -249,7 +296,7 @@ class StorageMixin:
             return False, "Profile name must be 30 characters or fewer."
         if not re.match(r'^[a-zA-Z0-9_-]+$', name):
             return False, "Profile name can only contain letters, numbers, underscores, and hyphens (no spaces)."
-        if name.lower() in ["mimic", "clyde", "system", "user", "none", "all"]:
+        if name.lower() in ["clyde", "system", "user", "none", "all"]:
             return False, "This name is a reserved system keyword and cannot be used."
         return True, ""
 
@@ -1093,28 +1140,9 @@ class StorageMixin:
 
     def _get_user_profile_for_model(self, user_id: int, channel_id: int, profile_name_override: Optional[str] = None) -> Tuple[Dict[str, List[str]], str, bool, float, float, int, int, float, str, str]:
         active_profile_name = profile_name_override if profile_name_override else self._get_active_user_profile_name_for_channel(user_id, channel_id)
-        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
 
-        if active_profile_name == DEFAULT_PROFILE_NAME and user_id != owner_id:
-            owner_config = self._get_profile_config(owner_id, DEFAULT_PROFILE_NAME)
-            if not owner_config:
-                self._get_or_create_user_profile(owner_id, DEFAULT_PROFILE_NAME)
-                owner_config = self._get_profile_config(owner_id, DEFAULT_PROFILE_NAME) or {}
-            
-            owner_prompts = self._get_profile_prompts(owner_id, DEFAULT_PROFILE_NAME) or {}
-
-            persona = owner_prompts.get("persona", {})
-            ai_instructions = owner_prompts.get("ai_instructions", "")
-            grounding_enabled = owner_config.get("grounding_enabled", False)
-            temperature = owner_config.get("temperature", defaultConfig.GEMINI_TEMPERATURE)
-            top_p = owner_config.get("top_p", defaultConfig.GEMINI_TOP_P)
-            top_k = owner_config.get("top_k", defaultConfig.GEMINI_TOP_K)
-            training_context_size = owner_config.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE)
-            training_relevance_threshold = owner_config.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD)
-            primary_model = owner_config.get("primary_model", PRIMARY_MODEL_NAME)
-            fallback_model = owner_config.get("fallback_model", FALLBACK_MODEL_NAME)
-            
-            return (persona, ai_instructions, grounding_enabled, float(temperature), float(top_p), int(top_k), int(training_context_size), float(training_relevance_threshold), primary_model, fallback_model)
+        if not active_profile_name:
+            return {}, "", False, defaultConfig.GEMINI_TEMPERATURE, defaultConfig.GEMINI_TOP_P, defaultConfig.GEMINI_TOP_K, defaultConfig.TRAINING_CONTEXT_SIZE, defaultConfig.TRAINING_RELEVANCE_THRESHOLD, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME
 
         index = self._get_user_index(user_id)
         is_borrowed = active_profile_name in index.get("borrowed", [])
@@ -1124,8 +1152,8 @@ class StorageMixin:
             return {}, "", False, defaultConfig.GEMINI_TEMPERATURE, defaultConfig.GEMINI_TOP_P, defaultConfig.GEMINI_TOP_K, defaultConfig.TRAINING_CONTEXT_SIZE, defaultConfig.TRAINING_RELEVANCE_THRESHOLD, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME
 
         if is_borrowed:
-            source_owner_id = int(config.get("original_owner_id", owner_id))
-            source_profile_name = config.get("original_profile_name", DEFAULT_PROFILE_NAME)
+            source_owner_id = int(config.get("original_owner_id", user_id))
+            source_profile_name = config.get("original_profile_name", active_profile_name)
             source_config = self._get_profile_config(source_owner_id, source_profile_name, False) or {}
             prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
         else:
@@ -1149,15 +1177,11 @@ class StorageMixin:
     
     def _get_or_create_user_profile(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
         profile_name = profile_name.lower().strip()
-        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-
-        if profile_name == DEFAULT_PROFILE_NAME and user_id != owner_id:
-            return None
 
         index = self._get_user_index(user_id)
         
         if profile_name not in index.get("personal", []):
-            if len(index.get("personal", [])) >= MAX_USER_PROFILES and profile_name != DEFAULT_PROFILE_NAME:
+            if len(index.get("personal", [])) >= MAX_USER_PROFILES:
                 return None 
             
             index.setdefault("personal", []).append(profile_name)
@@ -1192,19 +1216,29 @@ class StorageMixin:
             
         return {"config": self._get_profile_config(user_id, profile_name), "prompts": self._get_profile_prompts(user_id, profile_name)}
     
-    def _get_active_user_profile_name_for_channel(self, user_id: int, channel_id: int) -> str:
+    def _get_active_user_profile_name_for_channel(self, user_id: int, channel_id: int) -> Optional[str]:
+        channel = self.bot.get_channel(channel_id)
+        server_id_str = str(channel.guild.id) if channel and getattr(channel, 'guild', None) else "dm"
+        server_index = self._get_server_index(server_id_str)
+        active = server_index.get("user_active_profiles", {}).get(str(user_id), {}).get(str(channel_id))
+        if active: return active
+        
         index = self._get_user_index(user_id)
-        return index.get("channel_active_profiles", {}).get(str(channel_id), DEFAULT_PROFILE_NAME)
+        personal = index.get("personal", [])
+        if personal:
+            return next(iter(personal))
+        borrowed = index.get("borrowed", [])
+        if borrowed:
+            return next(iter(borrowed))
+        return None
 
     def _get_active_user_profile_data(self, user_id: int, channel_id: int) -> Optional[Dict[str, Any]]:
         active_profile_name = self._get_active_user_profile_name_for_channel(user_id, channel_id)
+        if not active_profile_name: return None
         index = self._get_user_index(user_id)
         
         is_borrowed = active_profile_name in index.get("borrowed", [])
         config = self._get_profile_config(user_id, active_profile_name, is_borrowed)
-        
-        if not config and active_profile_name != DEFAULT_PROFILE_NAME: 
-            config = self._get_profile_config(user_id, DEFAULT_PROFILE_NAME, False)
         
         if config: 
             config.setdefault("grounding_enabled", False)
@@ -1269,31 +1303,9 @@ class StorageMixin:
                 else:
                     index["personal"][p_name] = pid_folder
 
-        # Enforce Default Profile Injection for non-owners
-        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-        if user_id != owner_id and DEFAULT_PROFILE_NAME not in index["personal"] and DEFAULT_PROFILE_NAME not in index["borrowed"]:
-            index["borrowed"][DEFAULT_PROFILE_NAME] = DEFAULT_PROFILE_NAME
+            if index.get("personal") or index.get("borrowed"):
+                self._save_user_index(user_id, index)
             
-            # Recreate the default borrowed config and folder structure if it's entirely missing
-            b_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles", DEFAULT_PROFILE_NAME)
-            b_config_path = os.path.join(b_dir, "borrowed_config.json.gz")
-            if not os.path.exists(b_config_path):
-                os.makedirs(b_dir, exist_ok=True)
-                owner_config = self._get_profile_config(owner_id, DEFAULT_PROFILE_NAME, False) or {}
-                self._save_profile_config(user_id, DEFAULT_PROFILE_NAME, {
-                    "original_owner_id": str(owner_id),
-                    "original_profile_name": DEFAULT_PROFILE_NAME,
-                    "borrowed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    "grounding_enabled": owner_config.get("grounding_enabled", False),
-                    "realistic_typing_enabled": owner_config.get("realistic_typing_enabled", False),
-                    "time_tracking_enabled": owner_config.get("time_tracking_enabled", False),
-                    "timezone": owner_config.get("timezone", "UTC")
-                }, is_borrowed=True)
-                
-                with open(os.path.join(b_dir, "name.txt"), "w", encoding="utf-8") as f:
-                    f.write(DEFAULT_PROFILE_NAME)
-
-        self._save_user_index(user_id, index)
         return index
 
     def _get_user_index(self, user_id: int) -> Dict[str, Any]:
@@ -1374,10 +1386,6 @@ class StorageMixin:
 
     def _get_or_create_user_profile(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
         profile_name = profile_name.lower().strip()
-        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-
-        if profile_name == DEFAULT_PROFILE_NAME and user_id != owner_id:
-            return None
 
         index = self._get_user_index(user_id)
         
@@ -1385,7 +1393,7 @@ class StorageMixin:
             is_premium = self.is_user_premium(user_id)
             limit = defaultConfig.LIMIT_PROFILES_PREMIUM if is_premium else defaultConfig.LIMIT_PROFILES_FREE
             
-            if len(index.get("personal", [])) >= limit and profile_name != DEFAULT_PROFILE_NAME:
+            if len(index.get("personal", [])) >= limit:
                 return None 
             
             if isinstance(index.get("personal"), dict):
@@ -1425,19 +1433,13 @@ class StorageMixin:
             return {"config": config, "prompts": prompts}
             
         return {"config": self._get_profile_config(user_id, profile_name), "prompts": self._get_profile_prompts(user_id, profile_name)}
-    
-    def _get_active_user_profile_name_for_channel(self, user_id: int, channel_id: int) -> str:
-        channel = self.bot.get_channel(channel_id)
-        server_id_str = str(channel.guild.id) if channel and getattr(channel, 'guild', None) else "dm"
-        server_index = self._get_server_index(server_id_str)
-        return server_index.get("user_active_profiles", {}).get(str(user_id), {}).get(str(channel_id), DEFAULT_PROFILE_NAME)
 
     async def _set_active_user_profile_for_channel(self, user_id: int, channel_id: int, profile_name: str, interaction_for_feedback: Optional[discord.Interaction] = None) -> bool:
         index = self._get_user_index(user_id)
         profile_name = profile_name.lower().strip()
         is_borrowed = profile_name in index.get("borrowed", [])
 
-        if not is_borrowed and profile_name != DEFAULT_PROFILE_NAME and profile_name not in index.get("personal", []): 
+        if not is_borrowed and profile_name not in index.get("personal", []): 
             if interaction_for_feedback:
                 await interaction_for_feedback.followup.send(f"Your profile '{profile_name}' not found. Cannot activate.", ephemeral=True)
             return False
@@ -1446,7 +1448,7 @@ class StorageMixin:
         server_id_str = str(channel.guild.id) if channel and getattr(channel, 'guild', None) else "dm"
         server_index = self._get_server_index(server_id_str)
         
-        old_profile_name = server_index.get("user_active_profiles", {}).get(str(user_id), {}).get(str(channel_id), DEFAULT_PROFILE_NAME)
+        old_profile_name = server_index.get("user_active_profiles", {}).get(str(user_id), {}).get(str(channel_id))
         server_index.setdefault("user_active_profiles", {}).setdefault(str(user_id), {})[str(channel_id)] = profile_name
         self._save_server_index(server_id_str, server_index)
         
@@ -1465,9 +1467,6 @@ class StorageMixin:
             
             embed_title = f"Your Profile Preference Swapped to: '{profile_name}'"
             embed_desc = f"Your individual preferred profile in {channel_mention} is now '{profile_name}'."
-            if profile_name == DEFAULT_PROFILE_NAME:
-                embed_title = "Your Profile Preference Reverted to Default"
-                embed_desc = f"Your individual preferred profile in {channel_mention} has been reverted to your '{DEFAULT_PROFILE_NAME}' profile."
 
             embed = discord.Embed(title=embed_title, description=embed_desc, color=discord.Color.green())
             
