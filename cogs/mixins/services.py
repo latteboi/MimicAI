@@ -6180,6 +6180,10 @@ class ServicesMixin:
                         if hasattr(chunk, 'web'):
                             sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
             
+            if not sources:
+                warning_str = WARN_GROUNDING_FAILED.format(reason="The AI hallucinated a response without retrieving valid web citations.")
+                return None, [], False, warning_str
+
             return summary_context, sources, True, None
 
         except Exception as e:
@@ -6661,7 +6665,14 @@ class ServicesMixin:
                 turn_type = turn.get("type")
                 if not turn_type:
                     role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
-                    participant_history.append({'role': role, 'parts': [turn.get("content")]})
+                    parts = [turn.get("content")]
+                    if role == 'user':
+                        if turn.get("url_context") and p_profile.get("url_fetching_enabled", False):
+                            parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
+                        if turn.get("grounding_context") and p_profile.get("grounding_mode", "off") != "off":
+                            parts.append(f"\n<external_context>\n{turn.get('grounding_context')}\n</external_context>")
+                            
+                    participant_history.append({'role': role, 'parts': parts})
                     if role == 'model':
                         pending_whispers_for_regen.clear()
                 elif turn_type == "whisper":
@@ -6933,26 +6944,6 @@ class ServicesMixin:
                     warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
                     turn_warnings.append(warn_tmp.format(reason=ERR_REASON_EMPTY_RESPONSE))
                     was_blocked = True
-                else:
-                    grounding_sources = []
-                    if hasattr(response, 'raw') and response.raw.candidates:
-                        if hasattr(response.raw.candidates[0], 'grounding_metadata'):
-                            metadata = response.raw.candidates[0].grounding_metadata
-                            if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
-                                for chunk in metadata.grounding_chunks:
-                                    if hasattr(chunk, 'web'):
-                                        grounding_sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
-                        
-                        if hasattr(response.raw.candidates[0], 'url_context_metadata'):
-                            url_metadata = response.raw.candidates[0].url_context_metadata
-                            if hasattr(url_metadata, 'url_metadata') and url_metadata.url_metadata is not None:
-                                for u in url_metadata.url_metadata:
-                                    if hasattr(u, 'retrieved_url') and u.retrieved_url:
-                                        grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
-                                        
-                    sources_text_list = self._format_citation_subtext(grounding_sources)
-                    if sources_text_list:
-                        new_text += "\n\n" + "\n".join(sources_text_list)
 
             if fallback_used and p_profile.get("show_fallback_indicator", True):
                 turn_warnings.append(WARN_FALLBACK_USED)
@@ -6966,9 +6957,6 @@ class ServicesMixin:
                 await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
                 state_container['msg_b_id'] = None
             
-            if not was_blocked:
-                await self._update_sending_placeholder(channel, participant.get('method', 'webhook'), participant.get('bot_id'), state_container, time.monotonic() - 15)
-
             # 5. Apply Changes
             sent_timestamp = datetime.datetime.now(datetime.timezone.utc)
             p_index = self._get_user_index(p_owner_id)
@@ -7003,12 +6991,17 @@ class ServicesMixin:
             if state_container and state_container.get('sending_task'):
                 state_container['sending_task'].cancel()
             
+            # Truncate text strictly for Discord's 2000 character limit on edits
+            safe_text = new_text
+            if len(safe_text) > 2000:
+                safe_text = safe_text[:1997] + "..."
+
             if participant.get('method') == 'child_bot':
                 await self.manager_queue.put({
                     "action": "send_to_child", "bot_id": participant['bot_id'],
                     "payload": {
                         "action": "regenerate_message", "channel_id": channel.id,
-                        "message_id": payload.message_id, "content": new_text
+                        "message_id": payload.message_id, "content": safe_text
                     }
                 })
             else:
@@ -7017,7 +7010,7 @@ class ServicesMixin:
                     try:
                         msg = await channel.fetch_message(payload.message_id)
                         kept_atts = [a for a in msg.attachments if a.content_type and a.content_type.startswith("image/")]
-                        await wh.edit_message(payload.message_id, content=new_text, attachments=kept_atts)
+                        await wh.edit_message(payload.message_id, content=safe_text, attachments=kept_atts)
                     except: pass
 
             # Re-sync memory and save final state
