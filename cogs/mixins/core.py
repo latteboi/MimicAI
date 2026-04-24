@@ -37,8 +37,8 @@ class CoreMixin:
         if self.has_lock:
             self._purge_legacy_default_profile()
             
-            if not self.freewill_task.is_running():
-                self.freewill_task.start()
+            if not self.proactive_session_task.is_running():
+                self.proactive_session_task.start()
             
             if not self.weekly_cleanup_task.is_running():
                 print("Performing initial data cleanup on boot...")
@@ -186,125 +186,15 @@ class CoreMixin:
                         await self.handle_child_bot_event(event_data)
             return
 
-        # --- 3. Normal Session Triggering (Main Bot Mention / React / Freewill) ---
-        is_main_bot_mention = self.bot.user and self.bot.user.mentioned_in(message)
+        # --- 3. Normal Session Triggering ---
         session = self.multi_profile_channels.get(message.channel.id)
 
-        # --- Freewill Trigger Logic ---
-        guild_id_str = str(message.guild.id)
-        fw_config = self.freewill_config.get(guild_id_str, {})
-        triggered_profile = None
-
-        # Ensure we don't interrupt a manual multi-profile session with freewill logic
-        is_freewill_compatible = not session or session.get("type") == "freewill"
-
-        if fw_config.get("enabled", False) and is_freewill_compatible:
-            is_living = message.channel.id in fw_config.get("living_channel_ids", [])
-            is_lurking = message.channel.id in fw_config.get("lurking_channel_ids", [])
-            
-            if is_living or is_lurking:
-                content_lower = message.content.lower()
-                image_prefixes = ("!image", "!imagine")
-                is_image_gen_trigger = content_lower.startswith(image_prefixes)
-                
-                server_participation = self.freewill_participation.get(str(message.guild.id), {})
-                channel_participants = server_participation.get(str(message.channel.id), {})
-                
-                valid_participants_wakeword = []
-                valid_participants_image = []
-                valid_participants_rng = []
-
-                for user_id_str, profiles in channel_participants.items():
-                    member = message.guild.get_member(int(user_id_str))
-                    if not member: continue
-
-                    for profile_name, settings in profiles.items():
-                        # Wakeword check
-                        if any(w.lower() in content_lower for w in settings.get("wakewords", [])):
-                            p_dict = self._build_freewill_participant_dict(int(user_id_str), profile_name, message.channel)
-                            if p_dict: valid_participants_wakeword.append(p_dict)
-                        
-                        # Image Gen capability check
-                        if settings.get("personality", "off") != "off":
-                            if is_image_gen_trigger:
-                                p_dict = self._build_freewill_participant_dict(int(user_id_str), profile_name, message.channel)
-                                if p_dict: valid_participants_image.append(p_dict)
-                            
-                            # RNG check preparation
-                            personality = settings.get("personality", "off")
-                            valid_participants_rng.append((personality, int(user_id_str), profile_name))
-
-                # Priority: Wakeword > Image Gen > RNG
-                if valid_participants_wakeword:
-                    triggered_profile = random.choice(valid_participants_wakeword)
-                elif is_image_gen_trigger and valid_participants_image:
-                    triggered_profile = random.choice(valid_participants_image)
-                elif not is_image_gen_trigger and valid_participants_rng:
-                    personality_chances = {"introverted": 0.03, "regular": 0.10, "outgoing": 0.30}
-                    possible_rolls = []
-                    for personality, uid, pname in valid_participants_rng:
-                        if personality in personality_chances and random.random() <= personality_chances[personality]:
-                            p_dict = self._build_freewill_participant_dict(uid, pname, message.channel)
-                            if p_dict: possible_rolls.append(p_dict)
-                    if possible_rolls:
-                        triggered_profile = random.choice(possible_rolls)
-
-        if triggered_profile:
-            # Ensure session exists or is created
-            if not session:
-                all_opted_in = [] # Populate with all potential participants for context
-                server_participation = self.freewill_participation.get(str(message.guild.id), {})
-                channel_participants = server_participation.get(str(message.channel.id), {})
-                
-                for user_id_str, profiles in channel_participants.items():
-                    member = message.guild.get_member(int(user_id_str))
-                    if member:
-                        for profile_name, settings in profiles.items():
-                            if settings.get("personality", "off") != "off":
-                                p_dict = self._build_freewill_participant_dict(int(user_id_str), profile_name, message.channel)
-                                if p_dict: all_opted_in.append(p_dict)
-                
-                chat_sessions = { (p['owner_id'], p['profile_name']): None for p in all_opted_in }
-                session = {
-                    "type": "freewill", "freewill_mode": "reactive", "chat_sessions": chat_sessions,
-                    "initial_channel_history": await self._build_freewill_history(message.channel, message),
-                    "initial_turn_taken": set(), "last_bot_message_id": None, "owner_id": message.author.id,
-                    "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
-                    "turns_since_last_ltm": 0, "session_prompt": None, "profiles": all_opted_in,
-                    "is_hydrated": False 
-                }
-                self.multi_profile_channels[message.channel.id] = session
-                self._save_multi_profile_sessions()
-
-            # Important: Ensure the triggered profile is actually in the session profiles list (handling drift)
-            p_key_check = (triggered_profile['owner_id'], triggered_profile['profile_name'])
-            if not any((p['owner_id'], p['profile_name']) == p_key_check for p in session['profiles']):
-                session['profiles'].append(triggered_profile)
-                session['chat_sessions'][p_key_check] = None
-
-            trigger_tuple = ('initial_reactive_turn', message, triggered_profile)
-            await session['task_queue'].put(trigger_tuple)
-            
-            if not session.get('is_running'):
-                session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
-            return
-
-        # --- Generic Session Interaction Logic ---
         if session:
-            # If Freewill session is active, block mentions of the parent bot
-            if session.get("type") == "freewill":
-                if is_main_bot_mention:
-                    return
-            
             await session['task_queue'].put(message)
             if not session.get('worker_task') or session['worker_task'].done():
                 task = self.bot.loop.create_task(self._multi_profile_worker(message.channel.id))
                 session['worker_task'] = task
                 self.background_tasks.add(task)
-            return
-        
-        # Check for Freewill configuration to prevent overriding with a new manual session
-        if message.channel.id in fw_config.get("living_channel_ids", []) or message.channel.id in fw_config.get("lurking_channel_ids", []):
             return
 
     @commands.Cog.listener()
@@ -2097,9 +1987,8 @@ class CoreMixin:
                             "owner_id": session_config.get("owner_id"),
                             "session_prompt": session_config.get("session_prompt"),
                             "session_mode": session_config.get("session_mode", "sequential"),
-                            "audio_mode": session_config.get("audio_mode", "text-only"),
-                            "type": session_config.get("type", "multi"),
-                            "freewill_mode": session_config.get("freewill_mode"),
+                            "type": "multi",
+                            "proactivity": session_config.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
                             "task_queue": asyncio.Queue(),
                             "is_running": False
                         }
@@ -2110,9 +1999,8 @@ class CoreMixin:
                         session["owner_id"] = session_config.get("owner_id")
                         session["session_prompt"] = session_config.get("session_prompt")
                         session["session_mode"] = session_config.get("session_mode", "sequential")
-                        session["audio_mode"] = session_config.get("audio_mode", "text-only")
-                        session["type"] = session_config.get("type", "multi")
-                        session["freewill_mode"] = session_config.get("freewill_mode")
+                        session["type"] = "multi"
+                        session["proactivity"] = session_config.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."})
 
         if not session: return None
 
@@ -2495,13 +2383,14 @@ class CoreMixin:
         embed.add_field(name="Advanced (OpenRouter Only)", value=adv_val, inline=True)
 
         # 5. [NEW] Thinking Section (Placed to the right of Tools)
-        t_summary = source_profile_data.get("thinking_summary_visible", "off").upper()
+        t_summary_raw = source_profile_data.get("thinking_summary_visible", "off").lower()
+        t_summary = "**`ON`**" if t_summary_raw == "on" else "`OFF`"
         t_level = source_profile_data.get("thinking_level", "high").title()
         t_budget = source_profile_data.get("thinking_budget", -1)
         budget_display = "Dynamic (-1)" if t_budget == -1 else f"{t_budget}"
 
         thinking_val = (
-            f"Summary: **`{t_summary}`**\n"
+            f"Summary: {t_summary}\n"
             f"Effort: `{t_level}`\n"
             f"Budget: `{budget_display}`"
         )
@@ -2544,9 +2433,11 @@ class CoreMixin:
         s_voice = source_profile_data.get("speech_voice", "Aoede")
         s_model = source_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts")
         s_temp = source_profile_data.get("speech_temperature", 1.0)
+        s_enabled = "**`ON`**" if source_profile_data.get("speech_tts_enabled", False) else "`OFF`"
         s_model_disp = s_model.replace("gemini-", "").replace("-preview-tts", "").title()
         
         speech_val = (
+            f"Enabled: {s_enabled}\n"
             f"Voice: `{s_voice}`\n"
             f"Temperature: `{s_temp}`"
         )

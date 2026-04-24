@@ -913,9 +913,8 @@ class StorageMixin:
                         "turns_since_last_ltm": 0,
                         "session_prompt": session_data.get("session_prompt"),
                         "session_mode": session_data.get("session_mode", "sequential"),
-                        "audio_mode": session_data.get("audio_mode", "text-only"),
                         "type": session_data.get("type", "multi"),
-                        "freewill_mode": session_data.get("freewill_mode")
+                        "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 20, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."})
                     }
                 except Exception as e:
                     print(f"Unexpected error reloading multi-profile sessions for server {server_id_str}, channel {ch_id_str}: {e}")
@@ -941,7 +940,9 @@ class StorageMixin:
                         "owner_id": p["owner_id"],
                         "method": p.get("method", "webhook"),
                         "bot_id": p.get("bot_id"),
-                        "ephemeral": p.get("ephemeral", False)
+                        "ephemeral": p.get("ephemeral", False),
+                        "chance": p.get("chance", 100),
+                        "wakewords": p.get("wakewords", [])
                     })
 
                 blueprint = {
@@ -949,9 +950,8 @@ class StorageMixin:
                     "profiles": profiles_to_save,
                     "session_prompt": session_data.get("session_prompt"),
                     "session_mode": session_data.get("session_mode", "sequential"),
-                    "audio_mode": session_data.get("audio_mode", "text-only"),
-                    "type": s_type,
-                    "freewill_mode": session_data.get("freewill_mode")
+                    "type": "multi",
+                    "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."})
                 }
                 
                 current_server_sessions[server_id_str][category][str(channel_id)] = blueprint
@@ -1426,7 +1426,7 @@ class StorageMixin:
                 "image_generation_enabled": False, "image_generation_model": "gemini-2.5-flash-image",
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
                 "thinking_level": "high", "thinking_budget": -1, "thinking_signatures_enabled": "off",
-                "error_response": "An error has occurred.", "speech_voice": "Aoede",
+                "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": "Aoede",
                 "speech_model": "gemini-2.5-flash-preview-tts", "speech_temperature": 1.0,
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }

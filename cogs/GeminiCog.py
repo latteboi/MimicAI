@@ -519,14 +519,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
     session_group = app_commands.Group(name="session", description="Manage chat sessions.", guild_only=True)
 
-    @session_group.command(name="config", description="Configure a chat session (Regular or Freewill).")
-    @app_commands.describe(mode="The type of session interface to open.")
-    @app_commands.choices(mode=[
-        app_commands.Choice(name="Regular", value="regular"),
-        app_commands.Choice(name="Freewill", value="freewill")
-    ])
+    @session_group.command(name="config", description="Configure the unified chat session in this channel.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
-    async def session_config_slash(self, interaction: discord.Interaction, mode: str):
+    async def session_config_slash(self, interaction: discord.Interaction):
         if not self.has_lock: return
         
         # [NEW] Global Admin Check for all session config modes
@@ -541,136 +536,51 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             except Exception:
                 pass
 
-        if mode == "freewill":
-            # [NEW] Immediate Premium Gate
-            if not self.is_user_premium(interaction.user.id):
-                await interaction.response.send_message(
-                    "**Premium Required.**\n\n"
-                    "The Freewill System allows profiles to act autonomously and react to server events.\n"
-                    "This is a Premium feature. Use `/subscription` to upgrade.",
-                    ephemeral=True
-                )
-                return
-
-            # Teardown any existing regular (multi) session
-            session = self.multi_profile_channels.get(interaction.channel_id)
-            if session and session.get("type") == "multi":
-                for participant in session.get("profiles", []):
-                    if participant.get("method") == "child_bot":
-                        bot_id = participant.get("bot_id")
-                        if bot_id:
-                            await self.manager_queue.put({
-                                "action": "send_to_child", "bot_id": bot_id,
-                                "payload": {"action": "session_update_remove", "channel_id": interaction.channel_id}
-                            })
-                            await self.manager_queue.put({
-                                "action": "send_to_child", "bot_id": bot_id,
-                                "payload": {"action": "stop_typing", "channel_id": interaction.channel_id}
-                            })
-                if session.get('worker_task'): self._safe_cancel_task(session['worker_task'])
-                self.multi_profile_channels.pop(interaction.channel_id, None)
-                self._save_multi_profile_sessions()
-
-            try:
-                import shutil
-                dummy_key = (interaction.channel_id, None, None)
-                multi_path = self._get_session_dir_path(dummy_key, "multi")
-                if multi_path.exists():
-                    shutil.rmtree(multi_path)
-            except Exception as e:
-                print(f"Error cleaning up multi session dir: {e}")
-
-            # Initialize an empty Freewill session immediately to block child bot interactions
-            self.multi_profile_channels[interaction.channel_id] = {
-                "type": "freewill", "freewill_mode": "reactive", "chat_sessions": {},
-                "unified_log": [], "is_hydrated": True, "owner_id": interaction.user.id,
-                "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
-                "profiles": [],
-                "turns_since_last_ltm": 0
-            }
-
-            # Default to Reactive if not already in a list
-            config = self.freewill_config.setdefault(str(interaction.guild.id), {})
-            lid = config.setdefault("living_channel_ids", [])
-            lud = config.setdefault("lurking_channel_ids", [])
-            
-            if interaction.channel_id not in lid and interaction.channel_id not in lud:
-                lud.append(interaction.channel_id)
-                self._save_channel_settings()
-
-            await interaction.response.defer(ephemeral=True)
-            view = FreewillHomeView(self, interaction)
-            self.active_session_config_views[interaction.user.id] = view
-            await view.update_display()
-            return
+        ch_id = interaction.channel_id
         
-        if mode == "regular":
-            try:
-                import shutil
-                dummy_key = (interaction.channel_id, None, None)
-                fw_path = self._get_session_dir_path(dummy_key, "freewill")
-                if fw_path.exists():
-                    shutil.rmtree(fw_path)
-            except Exception as e:
-                print(f"Error cleaning up freewill session dir: {e}")
+        # Cleanup legacy freewill
+        session = self.multi_profile_channels.get(ch_id)
+        if session and session.get("type") == "freewill":
+            self._cleanup_freewill_session(ch_id)
+            session = None
 
-            index = self._get_user_index(interaction.user.id)
-            personal_profiles = index.get("personal", [])
-            borrowed_profiles = index.get("borrowed", [])
-            all_selectable_profiles = list(personal_profiles) + list(borrowed_profiles)
-
-            if len(all_selectable_profiles) < 1:
-                await interaction.response.send_message("You must have at least one personal or borrowed profile to start a session.", ephemeral=True)
-                return
+        if not session:
+            # Check for suspended blueprint
+            server_id_str = str(interaction.guild.id)
+            server_index = self._get_server_index(server_id_str)
+            session_config = server_index.get("active_sessions", {}).get("regular", {}).get(str(ch_id))
             
-            ch_id = interaction.channel_id
-            guild_id_str = str(interaction.guild.id)
-
-            # Teardown any existing freewill session with child bot notification
-            session = self.multi_profile_channels.get(ch_id)
-            if session and session.get("type") == "freewill":
-                for participant in session.get("profiles", []):
-                    if participant.get("method") == "child_bot":
-                        bot_id = participant.get("bot_id")
-                        if bot_id:
-                            await self.manager_queue.put({
-                                "action": "send_to_child", "bot_id": bot_id,
-                                "payload": {"action": "session_update_remove", "channel_id": ch_id}
-                            })
-                self._cleanup_freewill_session(ch_id)
-
-            self.last_freewill_event.pop(ch_id, None)
-            self.last_freewill_message_info.pop(ch_id, None)
+            DEFAULT_DIRECTOR_PROMPT = "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."
+            proactivity_defaults = {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": DEFAULT_DIRECTOR_PROMPT}
             
-            fw_config = self.freewill_config.get(guild_id_str, {})
-            fw_changed = False
-            if ch_id in fw_config.get("living_channel_ids", []):
-                fw_config["living_channel_ids"].remove(ch_id)
-                fw_changed = True
-            if ch_id in fw_config.get("lurking_channel_ids", []):
-                fw_config["lurking_channel_ids"].remove(ch_id)
-                fw_changed = True
-            
-            if fw_changed:
-                self._save_channel_settings()
+            if session_config:
+                # Wake it up as a dehydrated shell
+                session = {
+                    "type": "multi", "profiles": session_config.get("profiles", []),
+                    "chat_sessions": {}, "unified_log": [], "is_hydrated": False,
+                    "owner_id": session_config.get("owner_id", interaction.user.id),
+                    "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
+                    "session_prompt": session_config.get("session_prompt"),
+                    "session_mode": session_config.get("session_mode", "sequential"),
+                    "proactivity": session_config.get("proactivity", proactivity_defaults)
+                }
+                self.multi_profile_channels[ch_id] = session
+            else:
+                # Blank session
+                session = {
+                    "type": "multi", "profiles": [],
+                    "chat_sessions": {}, "unified_log": [], "is_hydrated": False,
+                    "owner_id": interaction.user.id,
+                    "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
+                    "session_prompt": None, "session_mode": "sequential",
+                    "proactivity": proactivity_defaults
+                }
+                self.multi_profile_channels[ch_id] = session
 
-            current_profiles = []
-            current_prompt = None
-            current_mode = 'sequential'
-            current_audio_mode = 'text-only'
-            
-            if ch_id in self.multi_profile_channels:
-                session = self.multi_profile_channels[ch_id]
-                if session.get("type") in ["multi", None]:
-                    current_profiles = list(session.get("profiles", []))
-                    current_prompt = session.get("session_prompt")
-                    current_mode = session.get("session_mode", "sequential")
-                    current_audio_mode = session.get("audio_mode", "text-only")
-
-            view = MultiProfileSelectView(self, interaction.user.id, as_admin_scope=True, current_profiles=current_profiles, current_prompt=current_prompt, current_mode=current_mode, current_audio_mode=current_audio_mode)
-            self.active_session_config_views[interaction.user.id] = view
-            
-            await interaction.response.send_message(view.get_ordered_list_message(), view=view, ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        view = SessionConfigView(self, interaction, session)
+        self.active_session_config_views[interaction.user.id] = view
+        await view.update_display()
 
     @session_group.command(name="swap", description="Swaps, adds, or removes a profile from the current session.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -686,10 +596,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         await interaction.response.defer(ephemeral=True)
         session = self.multi_profile_channels.get(interaction.channel_id)
 
-        if session and session.get("type") == "freewill":
-            await interaction.followup.send("This command is disabled for sessions in Freewill mode. Manage participants via the Freewill dashboard.", ephemeral=True)
-            return
-
         if not profile_name and not slot:
             server_id_str = str(interaction.guild_id) if interaction.guild_id else "dm"
             server_index = self._get_server_index(server_id_str)
@@ -699,8 +605,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             session_data_idx = {}
             if isinstance(active_sessions, dict):
                 session_data_idx = active_sessions.get("regular", {}).get(channel_str)
-                if not session_data_idx:
-                    session_data_idx = active_sessions.get("freewill", {}).get(channel_str)
 
             if not session_data_idx or not session_data_idx.get("profiles"):
                 await interaction.followup.send("There is no active session in this channel.", ephemeral=True)
@@ -918,10 +822,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             await interaction.followup.send("No active session found in this channel.", ephemeral=True)
             return
 
-        if session.get("type") == "freewill":
-            await interaction.followup.send("Manual triggers are disabled for Freewill sessions.", ephemeral=True)
-            return
-
         if session.get("owner_id") != interaction.user.id and not interaction.user.guild_permissions.administrator:
             await interaction.followup.send("Only the session owner or a server administrator can trigger a round.", ephemeral=True)
             return
@@ -946,47 +846,22 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         
         active_sessions = server_index.get("active_sessions", {})
         session_data_idx = None
-        is_freewill = False
         
         if isinstance(active_sessions, dict):
-            if channel_str in active_sessions.get("freewill", {}):
-                session_data_idx = active_sessions["freewill"][channel_str]
-                is_freewill = True
-            elif channel_str in active_sessions.get("regular", {}):
+            if channel_str in active_sessions.get("regular", {}):
                 session_data_idx = active_sessions["regular"][channel_str]
 
         if not session_data_idx:
             await interaction.response.send_message("No active session in this channel.", ephemeral=True)
             return
 
-        type_display = "Freewill (Proactive/Reactive)" if is_freewill else "Regular (Multi-Profile)"
+        type_display = "Chat Session"
         
         owner_id = session_data_idx.get("owner_id")
         owner = self.bot.get_user(owner_id)
         owner_name = owner.name if owner else f"ID: {owner_id}"
         
-        profiles_for_display = []
-        
-        if is_freewill:
-            # For Freewill, show all opted-in profiles regardless of current scene status
-            server_data = self.freewill_participation.get(str(interaction.guild.id), {})
-            channel_data = server_data.get(str(interaction.channel.id), {})
-            
-            for user_id_str, user_profiles in channel_data.items():
-                member = interaction.guild.get_member(int(user_id_str))
-                if not member: continue
-
-                for profile_name, settings in user_profiles.items():
-                    if settings.get("personality", "off") != "off":
-                        # Pass the channel object to the helper
-                        p_dict = self._build_freewill_participant_dict(int(user_id_str), profile_name, interaction.channel)
-                        if p_dict:
-                            p_dict['pid'] = self._get_pid_from_name_any(int(user_id_str), profile_name)
-                            profiles_for_display.append(p_dict)
-        else:
-            # For Regular, use the session's profile list from the index
-            profiles_for_display = session_data_idx.get("profiles", [])
-
+        profiles_for_display = session_data_idx.get("profiles", [])
         participant_count = len(profiles_for_display)
         
         embed = discord.Embed(title=f"Session Info: #{interaction.channel.name}", color=discord.Color.gold())
@@ -996,11 +871,14 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         
         if session_data_idx.get("session_prompt"):
             prompt_val = session_data_idx["session_prompt"]
-            embed.add_field(name="Prompt", value=prompt_val[:200] + "..." if len(prompt_val) > 200 else prompt_val, inline=False)
+            embed.add_field(name="Master Prompt", value=prompt_val[:200] + "..." if len(prompt_val) > 200 else prompt_val, inline=False)
 
-        # Create a temporary session dict for the View to use
+        pro = session_data_idx.get("proactivity", {})
+        if pro.get("enabled"):
+            embed.add_field(name="Proactivity", value=f"**ON** | Chance: {pro.get('chance')}% | Cooldown: {pro.get('cooldown')}s", inline=False)
+
         session_view_data = {
-            "type": "freewill" if is_freewill else "multi",
+            "type": "multi",
             "owner_id": owner_id,
             "profiles": profiles_for_display
         }
@@ -1093,25 +971,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         
         ch_id = interaction.channel_id
         session = self.multi_profile_channels.pop(ch_id, None)
-        
-        # Also remove from Freewill config to prevent auto-restart
-        guild_id_str = str(interaction.guild.id)
-        fw_config = self.freewill_config.get(guild_id_str, {})
-        fw_changed = False
-        if ch_id in fw_config.get("living_channel_ids", []):
-            fw_config["living_channel_ids"].remove(ch_id)
-            fw_changed = True
-        if ch_id in fw_config.get("lurking_channel_ids", []):
-            fw_config["lurking_channel_ids"].remove(ch_id)
-            fw_changed = True
-        if fw_changed:
-            self._save_channel_settings()
 
         if not session:
-            if fw_changed:
-                await interaction.followup.send("No active session was found, but Freewill has been disabled for this channel.", ephemeral=True)
-            else:
-                await interaction.followup.send("There is no active session in this channel to suspend.", ephemeral=True)
+            await interaction.followup.send("There is no active session in this channel to suspend.", ephemeral=True)
             return
 
         # [NEW] Robust Counter Cleanup

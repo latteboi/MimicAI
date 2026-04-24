@@ -989,6 +989,14 @@ class ProfileSpeechSettingsModal(ui.Modal, title="Speech & Voice Settings"):
         self.is_borrowed = is_borrowed
         self.callback = callback
 
+        toggle_val = "on" if current_params.get("speech_tts_enabled", False) else "off"
+        self.toggle_input = ui.TextInput(
+            label="Enable TTS (on/off)", 
+            default=toggle_val, 
+            placeholder="on or off",
+            required=True,
+            max_length=10
+        )
         self.voice_input = ui.TextInput(
             label="Voice Name (Aoede, Charon, Puck, Kore, etc)", 
             default=str(current_params.get("speech_voice", "Aoede")), 
@@ -1004,12 +1012,14 @@ class ProfileSpeechSettingsModal(ui.Modal, title="Speech & Voice Settings"):
             max_length=5
         )
         
+        self.add_item(self.toggle_input)
         self.add_item(self.voice_input)
         self.add_item(self.temp_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         
+        tts_enabled = self.toggle_input.value.strip().lower() == "on"
         voice = self.voice_input.value.strip() or "Aoede"
         
         try:
@@ -1021,6 +1031,7 @@ class ProfileSpeechSettingsModal(ui.Modal, title="Speech & Voice Settings"):
             return
 
         new_params = {
+            "speech_tts_enabled": tts_enabled,
             "speech_voice": voice,
             "speech_temperature": temp,
         }
@@ -3152,301 +3163,260 @@ class ProfileMetadataModal(ui.Modal, title="Set Generation Metadata"):
         else:
             await interaction.followup.send("❌ Profile not found.", ephemeral=True)
 
-class SessionPromptModal(ui.Modal, title="Set Multi-Profile Session Prompt"):
-    prompt_input = ui.TextInput(
-        label="Scene Prompt / Director's Note",
-        style=discord.TextStyle.paragraph,
-        placeholder="e.g., The scene is a rainy night at a bus stop. The last bus just left...",
-        required=False,
-        max_length=1500
-    )
-
-    def __init__(self, parent_view: 'MultiProfileSelectView', current_prompt: Optional[str]):
+class SessionPromptModal(ui.Modal, title="Set Master Prompt"):
+    prompt_input = ui.TextInput(label="Master Prompt / Director's Note", style=discord.TextStyle.paragraph, placeholder="The persistent background instruction to set the scene...", required=False, max_length=1500)
+    def __init__(self, view: 'SessionConfigView'):
         super().__init__()
-        self.parent_view = parent_view
-        if current_prompt:
-            self.prompt_input.default = current_prompt
-
+        self.view = view
+        if view.session.get("session_prompt"):
+            self.prompt_input.default = view.session.get("session_prompt")
     async def on_submit(self, interaction: discord.Interaction):
-        self.parent_view.session_prompt = self.prompt_input.value or None
-        await interaction.response.send_message("Session prompt has been updated.", ephemeral=True, delete_after=5)
+        self.view.session["session_prompt"] = self.prompt_input.value or None
+        self.view.cog._save_multi_profile_sessions()
+        await interaction.response.defer()
+        await self.view.update_display()
 
-class MultiProfileSelectView(ui.View):
-    def __init__(self, cog: 'GeminiAgent', user_id: int, as_admin_scope: bool, current_profiles: List[Dict] = [], current_prompt: Optional[str] = None, current_mode: str = 'sequential', current_audio_mode: str = 'text-only'):
+class ReactivitySettingsModal(ui.Modal, title="Set Reactivity"):
+    chance_input = ui.TextInput(label="Chance to Respond (0-100)", placeholder="Default: 100", required=True, max_length=3)
+    keywords_input = ui.TextInput(label="Wakewords (comma-separated)", style=discord.TextStyle.paragraph, placeholder="e.g. hey bot, look at this", required=False, max_length=500)
+    def __init__(self, view: 'SessionConfigView', participant: dict):
+        super().__init__()
+        self.view = view
+        self.participant = participant
+        self.chance_input.default = str(participant.get("chance", 100))
+        self.keywords_input.default = ", ".join(participant.get("wakewords", []))
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            val = int(self.chance_input.value)
+            self.participant["chance"] = max(0, min(100, val))
+            self.participant["wakewords"] = [w.strip().lower() for w in self.keywords_input.value.split(',') if w.strip()]
+            self.view.cog._save_multi_profile_sessions()
+            await interaction.response.defer()
+            await self.view.update_display()
+        except ValueError:
+            await interaction.response.send_message("Invalid chance percentage.", ephemeral=True)
+
+DEFAULT_DIRECTOR_PROMPT = "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."
+
+class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
+    chance_input = ui.TextInput(label="Trigger Chance (0-100%)", placeholder="Default: 10", required=True, max_length=3)
+    cooldown_input = ui.TextInput(label="Cooldown (Seconds)", placeholder="Default: 300", required=True, max_length=5)
+    model_input = ui.TextInput(label="Director Model (on/off or Model ID)", placeholder="Default: off", required=False, max_length=100)
+    instructions_input = ui.TextInput(label="Director Instructions (Blank = Default)", style=discord.TextStyle.paragraph, required=False, max_length=1000)
+    def __init__(self, view: 'SessionConfigView'):
+        super().__init__()
+        self.view = view
+        pro = view.session.get("proactivity", {})
+        self.chance_input.default = str(pro.get("chance", 10))
+        self.cooldown_input.default = str(pro.get("cooldown", 300))
+        self.model_input.default = pro.get("director_model", "off")
+        self.instructions_input.default = pro.get("director_instructions", DEFAULT_DIRECTOR_PROMPT)
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            pro = self.view.session.setdefault("proactivity", {})
+            pro["chance"] = max(0, min(100, int(self.chance_input.value)))
+            pro["cooldown"] = max(60, int(self.cooldown_input.value))
+            
+            model_val = self.model_input.value.strip().lower()
+            if model_val in ["", "off"]:
+                pro["director_model"] = "off"
+            elif model_val == "on":
+                pro["director_model"] = "GOOGLE/gemini-flash-lite-latest"
+            else:
+                model_val_orig = self.model_input.value.strip()
+                if not (model_val_orig.upper().startswith("GOOGLE/") or model_val_orig.upper().startswith("OPENROUTER/")):
+                    model_val_orig = "GOOGLE/" + model_val_orig
+                pro["director_model"] = model_val_orig
+            
+            ins_val = self.instructions_input.value.strip()
+            pro["director_instructions"] = ins_val if ins_val else DEFAULT_DIRECTOR_PROMPT
+            
+            self.view.cog._save_multi_profile_sessions()
+            await interaction.response.defer()
+            await self.view.update_display()
+        except ValueError:
+            await interaction.response.send_message("Invalid chance or cooldown.", ephemeral=True)
+
+class SessionConfigView(ui.View):
+    def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, session: dict):
         super().__init__(timeout=600)
         self.cog = cog
-        self.user_id = user_id
-        self.as_admin_scope = as_admin_scope
-        self.session_prompt = current_prompt
-        self.session_mode = current_mode
-        self.session_audio_mode = current_audio_mode
-        
-        self.selection_order = OrderedDict()
-        for p_data in current_profiles:
-            if p_data.get('method') == 'child_bot':
-                key = f"child_{str(p_data['bot_id'])}"
-            else:
-                key = p_data['profile_name']
-            self.selection_order[key] = p_data
-
-        self.view_source: Literal['personal', 'borrowed', 'child_bot'] = 'personal'
+        self.original_interaction = interaction
+        self.session = session
+        self.current_tab = "cast"
+        self.view_source = 'personal'
         self.current_page = 0
-        
-        index = self.cog._get_user_index(self.user_id)
+        self._load_lists()
+
+    def _load_lists(self):
+        user_id = self.original_interaction.user.id
+        index = self.cog._get_user_index(user_id)
         self.lists = {
             'personal': sorted(list(index.get("personal", []))),
             'borrowed': sorted(list(index.get("borrowed", []))),
-            'child_bot': sorted(
-                [b for b_id, b in self.cog.child_bots.items() if b['owner_id'] == self.user_id],
-                key=lambda x: x.get('profile_name', '')
-            )
+            'child_bot': sorted([b for b in self.cog.child_bots.values() if b['owner_id'] == user_id], key=lambda x: x.get('profile_name', ''))
         }
-        # Map child bot objects back to IDs for the key generation
-        self.child_bot_map = {b['profile_name']: b_id for b_id, b in self.cog.child_bots.items() if b['owner_id'] == self.user_id}
 
-        self._build_view()
+    def _add_nav_buttons(self):
+        tabs = ["cast", "config", "reactivity", "proactivity"]
+        for tab in tabs:
+            btn = ui.Button(label=tab.title(), style=discord.ButtonStyle.primary if self.current_tab == tab else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab == tab))
+            def make_cb(t):
+                async def cb(i: discord.Interaction):
+                    self.current_tab = t; self.current_page = 0
+                    await i.response.defer(); await self.update_display()
+                return cb
+            btn.callback = make_cb(tab)
+            self.add_item(btn)
 
-    def _get_active_list(self):
-        return self.lists[self.view_source]
-
-    def _build_view(self):
+    async def update_display(self):
         self.clear_items()
-        
-        active_list = self._get_active_list()
-        num_pages = (len(active_list) - 1) // DROPDOWN_MAX_OPTIONS + 1
-        if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
-        start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_items = active_list[start : start + DROPDOWN_MAX_OPTIONS]
+        self._add_nav_buttons()
+        embed = discord.Embed(title=f"Chat Session: #{self.original_interaction.channel.name}", color=discord.Color.gold())
 
-        # --- Dropdown ---
-        options = []
-        if page_items:
-            for item in page_items:
-                if self.view_source == 'child_bot':
-                    # item is dict
-                    p_name = item.get('profile_name')
-                    bot_user_id = next((bid for bid, b in self.cog.child_bots.items() if b is item), None)
-                    label = f"Child Bot ({p_name})"
-                    value = f"child_{bot_user_id}"
-                else:
-                    # item is string name
-                    label = item
-                    value = item
-                
-                is_selected = value in self.selection_order
-                options.append(discord.SelectOption(label=label, value=value, default=is_selected))
-        else:
-            options.append(discord.SelectOption(label="No profiles found in this source", value="none"))
+        if self.current_tab == "cast":
+            embed.description = "Add or remove participants. This controls who is actively in the channel."
+            active_list = self.lists[self.view_source]
+            
+            num_pages = max(1, (len(active_list) - 1) // DROPDOWN_MAX_OPTIONS + 1)
+            start = self.current_page * DROPDOWN_MAX_OPTIONS
+            page_items = active_list[start : start + DROPDOWN_MAX_OPTIONS]
 
-        placeholder = f"Select {self.view_source.replace('_', ' ')} profiles..."
-        select = ui.Select(placeholder=placeholder, min_values=0, max_values=len(options) if page_items else 1, options=options, row=0, disabled=(not page_items))
-        select.callback = self.select_callback
-        self.add_item(select)
-
-        # --- Navigation Row (1) ---
-        
-        # Source Toggle
-        source_labels = {'personal': 'Personal', 'borrowed': 'Borrowed', 'child_bot': 'Child Bots'}
-        source_styles = {'personal': discord.ButtonStyle.blurple, 'borrowed': discord.ButtonStyle.green, 'child_bot': discord.ButtonStyle.primary}
-        
-        btn_source = ui.Button(label=f"Source: {source_labels[self.view_source]}", style=source_styles[self.view_source], row=1)
-        btn_source.callback = self.toggle_source
-        self.add_item(btn_source)
-
-        # Pagination
-        if num_pages > 1:
-            btn_prev = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page == 0), row=1)
-            btn_prev.callback = self.prev_page
-            self.add_item(btn_prev)
-
-            btn_page = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, disabled=True, row=1)
-            self.add_item(btn_page)
-
-            btn_next = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page >= num_pages - 1), row=1)
-            btn_next.callback = self.next_page
-            self.add_item(btn_next)
-
-        # Clear Selection
-        btn_clear = ui.Button(label="Clear All", style=discord.ButtonStyle.danger, row=1)
-        btn_clear.callback = self.clear_selection
-        self.add_item(btn_clear)
-
-        # --- Configuration Row (2) ---
-        
-        btn_mode = ui.Button(label=f"Mode: {self.session_mode.title()}", style=discord.ButtonStyle.secondary, row=2)
-        btn_mode.callback = self.toggle_mode
-        self.add_item(btn_mode)
-
-        audio_labels = {
-            "text-only": "Audio: Text-Only",
-            "audio+text": "Audio: Audio + Text",
-            "audio-only": "Audio: Audio-Only",
-            "multi-audio": "Audio: Multi-Audio"
-        }
-        btn_audio = ui.Button(label=audio_labels.get(self.session_audio_mode, "Audio: Text-Only"), style=discord.ButtonStyle.secondary, row=2)
-        btn_audio.callback = self.toggle_audio_mode
-        self.add_item(btn_audio)
-
-        btn_prompt = ui.Button(label="Set Director's Note", style=discord.ButtonStyle.secondary, row=2)
-        btn_prompt.callback = self.set_prompt
-        self.add_item(btn_prompt)
-
-        # --- Action Row (3) ---
-        
-        btn_start = ui.Button(label="Start / Update Session", style=discord.ButtonStyle.success, row=3)
-        btn_start.callback = self.start_session
-        self.add_item(btn_start)
-
-    async def toggle_source(self, i: discord.Interaction):
-        cycle = ['personal', 'borrowed', 'child_bot']
-        curr_idx = cycle.index(self.view_source)
-        self.view_source = cycle[(curr_idx + 1) % len(cycle)]
-        self.current_page = 0
-        self._build_view()
-        await i.response.edit_message(view=self)
-
-    async def prev_page(self, i: discord.Interaction):
-        self.current_page -= 1
-        self._build_view()
-        await i.response.edit_message(view=self)
-
-    async def next_page(self, i: discord.Interaction):
-        self.current_page += 1
-        self._build_view()
-        await i.response.edit_message(view=self)
-
-    async def clear_selection(self, i: discord.Interaction):
-        self.selection_order.clear()
-        self._build_view()
-        await i.response.edit_message(content=self.get_ordered_list_message(), view=self)
-
-    async def toggle_mode(self, i: discord.Interaction):
-        self.session_mode = 'random' if self.session_mode == 'sequential' else 'sequential'
-        self._build_view()
-        await i.response.edit_message(view=self)
-
-    async def toggle_audio_mode(self, i: discord.Interaction):
-        modes = ["text-only", "audio+text", "audio-only", "multi-audio"]
-        curr_idx = modes.index(self.session_audio_mode)
-        self.session_audio_mode = modes[(curr_idx + 1) % len(modes)]
-        self._build_view()
-        await i.response.edit_message(view=self)
-
-    async def set_prompt(self, i: discord.Interaction):
-        modal = SessionPromptModal(self, self.session_prompt)
-        await i.response.send_modal(modal)
-
-    async def select_callback(self, i: discord.Interaction):
-        if "none" in i.data['values']: 
-            await i.response.defer()
-            return
-
-        current_values = set(i.data['values'])
-        
-        # Determine which items were on the current page to handle deselection
-        active_list = self._get_active_list()
-        start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_items = active_list[start : start + DROPDOWN_MAX_OPTIONS]
-        
-        page_values = set()
-        for item in page_items:
-            if self.view_source == 'child_bot':
-                # Reconstruct key for logic
-                # item is dict, find ID
-                b_id = next((bid for bid, b in self.cog.child_bots.items() if b is item), None)
-                if b_id: page_values.add(f"child_{b_id}")
+            options = []
+            if page_items:
+                for item in page_items:
+                    if self.view_source == 'child_bot':
+                        p_name = item.get('profile_name')
+                        bid = next((k for k, v in self.cog.child_bots.items() if v is item), None)
+                        val = f"child_{bid}"
+                        lbl = f"Child Bot ({p_name})"
+                        
+                        is_sel = any(p.get('method') == 'child_bot' and str(p.get('bot_id')) == str(bid) for p in self.session.get('profiles', []))
+                    else:
+                        val = item
+                        lbl = item
+                        
+                        is_sel = any(p.get('method') != 'child_bot' and p.get('profile_name') == val for p in self.session.get('profiles', []))
+                    
+                    options.append(discord.SelectOption(label=lbl[:100], value=val[:100], default=is_sel))
             else:
-                page_values.add(item)
+                options.append(discord.SelectOption(label="No profiles found", value="none"))
 
-        # Logic: 
-        # 1. Keep items in selection_order that are NOT on this page.
-        # 2. Keep items in selection_order that ARE on this page AND are in current_values.
-        # 3. Add items from current_values that are NOT in selection_order (append to end).
-        
-        new_order = OrderedDict()
-        
-        # Step 1 & 2: Filter existing
-        for key, val in self.selection_order.items():
-            if key not in page_values:
-                new_order[key] = val
-            elif key in current_values:
-                new_order[key] = val
-        
-        # Step 3: Add new
-        for key in i.data['values']:
-            if key not in self.selection_order:
-                # Build entry
-                entry = None
-                if key.startswith("child_"):
-                    bot_id = key.split("_")[1]
-                    bot_config = self.cog.child_bots.get(bot_id)
-                    if bot_config:
-                        entry = {
-                            "owner_id": bot_config['owner_id'],
-                            "profile_name": bot_config['profile_name'],
-                            "method": "child_bot",
-                            "bot_id": bot_id
-                        }
-                else:
-                    entry = {
-                        "owner_id": self.user_id,
-                        "profile_name": key,
-                        "method": "webhook"
-                    }
-
-                if entry:
-                    # Identity Guard: Prevent same Owner + Name combo
-                    is_duplicate = any(
-                        p['owner_id'] == entry['owner_id'] and p['profile_name'] == entry['profile_name']
-                        for p in self.selection_order.values()
-                    )
-                    if not is_duplicate:
-                        new_order[key] = entry
-
-        self.selection_order = new_order
-        self._build_view()
-        await i.response.edit_message(content=self.get_ordered_list_message(), view=self)
-
-    def get_ordered_list_message(self) -> str:
-        ordered_list = list(self.selection_order.values())
-        msg = "**Session Configuration**\nUse the dropdowns to build your cast. The order below determines the speaking order in 'Sequential' mode.\n\n**Cast:**\n"
-        if not ordered_list:
-            msg += "*No participants selected.*"
-        else:
-            lines = []
-            for i, p_data in enumerate(ordered_list):
-                name = p_data['profile_name']
+            sel = ui.Select(placeholder=f"Select {self.view_source.replace('_', ' ')} profiles...", min_values=0, max_values=len(options) if page_items else 1, options=options, row=0, disabled=(not page_items))
+            async def cast_cb(i: discord.Interaction):
+                if "none" in i.data['values']: await i.response.defer(); return
+                raw_vals = i.data['values']
+                curr_vals = set(raw_vals)
+                page_vals = set([o.value for o in options])
                 
-                if p_data.get('method') == 'child_bot':
-                    method = "Child Bot"
-                elif name in self.lists['borrowed']:
-                    method = "Borrowed"
-                else:
-                    method = "Personal"
+                self.session['profiles'] = [p for p in self.session['profiles'] if not (
+                    (f"child_{p.get('bot_id')}" in page_vals and f"child_{p.get('bot_id')}" not in curr_vals) or
+                    (p.get('method') != 'child_bot' and p['profile_name'] in page_vals and p['profile_name'] not in curr_vals)
+                )]
                 
-                lines.append(f"{i+1}. `{name}` ({method})")
-            msg += "\n".join(lines)
-        return msg
+                for val in raw_vals:
+                    if val.startswith("child_"):
+                        bid = val.split("_")[1]
+                        if not any(p.get('bot_id') == bid for p in self.session['profiles']):
+                            bc = self.cog.child_bots.get(bid)
+                            if bc: self.session['profiles'].append({"owner_id": bc['owner_id'], "profile_name": bc['profile_name'], "method": "child_bot", "bot_id": bid, "chance": 100, "wakewords": []})
+                    else:
+                        if not any(p.get('profile_name') == val and p.get('method') != 'child_bot' for p in self.session['profiles']):
+                            self.session['profiles'].append({"owner_id": self.original_interaction.user.id, "profile_name": val, "method": "webhook", "chance": 100, "wakewords": []})
+                
+                self.cog._save_multi_profile_sessions()
+                await i.response.defer(); await self.update_display()
+            sel.callback = cast_cb
+            self.add_item(sel)
 
-    async def start_session(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        ordered_participants = list(self.selection_order.values())
-        
-        if not (1 <= len(ordered_participants) <= MAX_MULTI_PROFILES):
-            await interaction.followup.send(
-                f"You must select between 1 and {MAX_MULTI_PROFILES} participants. You selected {len(ordered_participants)}.",
-                ephemeral=True
-            )
-            return
+            source_btn = ui.Button(label=f"Source: {self.view_source.title().replace('_', ' ')}", style=discord.ButtonStyle.blurple, row=1)
+            async def src_cb(i): 
+                cycle = ['personal', 'borrowed', 'child_bot']
+                self.view_source = cycle[(cycle.index(self.view_source) + 1) % 3]
+                self.current_page = 0
+                await i.response.defer(); await self.update_display()
+            source_btn.callback = src_cb
+            self.add_item(source_btn)
 
-        await self.cog.setup_multi_profile_session(
-            interaction, 
-            ordered_participants, 
-            self.session_prompt, 
-            self.session_mode, 
-            as_admin_scope=self.as_admin_scope,
-            audio_mode=self.session_audio_mode
-        )
+            if num_pages > 1:
+                prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page==0), row=1)
+                async def p_cb(i): self.current_page -= 1; await i.response.defer(); await self.update_display()
+                prev_btn.callback = p_cb; self.add_item(prev_btn)
+                
+                page_btn = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, disabled=True, row=1)
+                self.add_item(page_btn)
+                
+                next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page>=num_pages-1), row=1)
+                async def n_cb(i): self.current_page += 1; await i.response.defer(); await self.update_display()
+                next_btn.callback = n_cb; self.add_item(next_btn)
+
+            cast_list = "\n".join(f"{idx+1}. `{p['profile_name']}`" for idx, p in enumerate(self.session['profiles'])) or "*No participants*"
+            embed.add_field(name="Current Cast", value=cast_list, inline=False)
+
+        elif self.current_tab == "config":
+            embed.description = "Configure session-wide behavior."
+            embed.add_field(name="Execution Mode", value=f"`{self.session.get('session_mode', 'sequential').title()}`", inline=True)
+            mp = self.session.get("session_prompt")
+            embed.add_field(name="Master Prompt", value=f"```{mp[:500]}```" if mp else "`None`", inline=False)
+
+            mode_btn = ui.Button(label="Toggle Mode (Seq/Random)", style=discord.ButtonStyle.secondary, row=0)
+            async def mode_cb(i):
+                self.session["session_mode"] = "random" if self.session.get("session_mode", "sequential") == "sequential" else "sequential"
+                self.cog._save_multi_profile_sessions()
+                await i.response.defer(); await self.update_display()
+            mode_btn.callback = mode_cb
+            self.add_item(mode_btn)
+
+            prompt_btn = ui.Button(label="Edit Master Prompt", style=discord.ButtonStyle.primary, row=0)
+            async def pr_cb(i): await i.response.send_modal(SessionPromptModal(self))
+            prompt_btn.callback = pr_cb
+            self.add_item(prompt_btn)
+
+        elif self.current_tab == "reactivity":
+            embed.description = "Manage how likely participants are to respond to messages."
+            opts = [discord.SelectOption(label=f"{p['profile_name']} (Chance: {p.get('chance', 100)}%)", value=str(idx)) for idx, p in enumerate(self.session['profiles'])]
+            
+            if opts:
+                sel = ui.Select(placeholder="Select a participant to edit reactivity...", options=opts[:25], row=0)
+                async def react_cb(i: discord.Interaction):
+                    idx = int(i.data['values'][0])
+                    await i.response.send_modal(ReactivitySettingsModal(self, self.session['profiles'][idx]))
+                sel.callback = react_cb
+                self.add_item(sel)
+                
+                react_list = "\n".join(f"{idx+1}. **{p['profile_name']}**: {p.get('chance', 100)}% (Wakewords: {', '.join(p.get('wakewords', [])) or 'None'})" for idx, p in enumerate(self.session['profiles']))
+                embed.add_field(name="Reactivity Stats", value=react_list, inline=False)
+            else:
+                embed.add_field(name="Reactivity Stats", value="*Add profiles in the Cast tab first.*", inline=False)
+
+        elif self.current_tab == "proactivity":
+            pro = self.session.get("proactivity", {})
+            enabled = pro.get("enabled", False)
+            embed.description = "Allow the session to start conversations autonomously based on a timer."
+            embed.add_field(name="Status", value="**`ON`**" if enabled else "`OFF`", inline=True)
+            embed.add_field(name="Chance & Cooldown", value=f"`{pro.get('chance', 10)}%` every `{pro.get('cooldown', 300)}s`", inline=True)
+            
+            dir_mod = pro.get("director_model", "GOOGLE/gemini-flash-lite-latest")
+            dir_ins = pro.get("director_instructions", "(Default)") or "(Default)"
+            embed.add_field(name="AI Director", value=f"Model: `{dir_mod}`\nInstructions: ```{dir_ins[:200]}```", inline=False)
+
+            tgl_btn = ui.Button(label="Toggle Proactivity", style=discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger, row=0)
+            async def tgl_cb(i):
+                self.session.setdefault("proactivity", {})["enabled"] = not enabled
+                self.cog._save_multi_profile_sessions()
+                await i.response.defer(); await self.update_display()
+            tgl_btn.callback = tgl_cb
+            self.add_item(tgl_btn)
+
+            edit_btn = ui.Button(label="Edit Settings & AI Director", style=discord.ButtonStyle.primary, row=0)
+            async def edit_cb(i): await i.response.send_modal(ProactivitySettingsModal(self))
+            edit_btn.callback = edit_cb
+            self.add_item(edit_btn)
+
+        try:
+            await self.original_interaction.edit_original_response(embed=embed, view=self)
+        except Exception as e:
+            print(f"Error updating SessionConfigView: {e}")
 
 class SingleProfileModelView(ui.View):
     def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, profile_name: str):
@@ -5658,422 +5628,6 @@ class WakewordsModal(ui.Modal, title="Manage Wakewords"):
     def __init__(self, current_wakewords: List[str]):
         super().__init__()
         self.wakewords_input.default = ", ".join(current_wakewords)
-
-class FreewillChanceModal(ui.Modal, title="Set Response Chance"):
-    chance_input = ui.TextInput(label="Probability (0-100%)", placeholder="e.g. 15", required=True, max_length=3)
-
-    def __init__(self, cog, guild_id, channel_id, user_id, profile_name, view):
-        super().__init__()
-        self.cog = cog
-        self.guild_id = guild_id
-        self.channel_id = channel_id
-        self.user_id = user_id
-        self.profile_name = profile_name
-        self.view = view
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            val = int(self.chance_input.value)
-            val = max(0, min(100, val))
-        except ValueError:
-            await interaction.response.send_message("Invalid input. Please enter a whole number between 0 and 100.", ephemeral=True); return
-
-        await interaction.response.defer()
-        
-        # Save logic
-        g_str, c_str, u_str = str(self.guild_id), str(self.channel_id), str(self.user_id)
-        if self.profile_name in self.cog.freewill_participation.get(g_str, {}).get(c_str, {}).get(u_str, {}):
-            self.cog.freewill_participation[g_str][c_str][u_str][self.profile_name]["personality"] = val
-            self.cog._save_freewill_for_server(self.guild_id)
-        
-        await self.view.refresh_state(interaction)
-
-class FreewillChannelChanceModal(ui.Modal, title="Set Channel Event Chance"):
-    chance_input = ui.TextInput(label="Probability (0-100%)", placeholder="e.g. 5", required=True, max_length=3)
-
-    def __init__(self, cog, guild_id, channel_id, view):
-        super().__init__()
-        self.cog = cog
-        self.guild_id = guild_id
-        self.channel_id = channel_id
-        self.view = view
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            val = int(self.chance_input.value)
-            val = max(0, min(100, val))
-        except ValueError:
-            await interaction.response.send_message("Invalid input.", ephemeral=True); return
-
-        msg = f"Channel Event Chance set to **{val}%**."
-        if val > 50: msg += "\n⚠️ **Warning:** High frequency."
-
-        config = self.cog.freewill_config.setdefault(str(self.guild_id), {})
-        ch_settings = config.setdefault("channel_settings", {})
-        ch_settings.setdefault(str(self.channel_id), {})["event_chance"] = val
-        
-        self.cog._save_channel_settings()
-        
-        await interaction.response.send_message(msg, ephemeral=True)
-        await self.view.update_display()
-
-class FreewillCooldownModal(ui.Modal, title="Set Event Cooldown"):
-    cd_input = ui.TextInput(label="Cooldown (Minutes)", placeholder="e.g. 30", required=True, max_length=4)
-
-    def __init__(self, cog, guild_id, channel_id, view):
-        super().__init__()
-        self.cog = cog
-        self.guild_id = guild_id
-        self.channel_id = channel_id
-        self.view = view
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            val = int(self.cd_input.value)
-            val = max(1, min(1440, val)) # 1 min to 24 hours
-        except ValueError:
-            await interaction.response.send_message("Invalid input.", ephemeral=True); return
-
-        seconds = val * 60
-        config = self.cog.freewill_config.setdefault(str(self.guild_id), {})
-        ch_settings = config.setdefault("channel_settings", {})
-        ch_settings.setdefault(str(self.channel_id), {})["event_cooldown"] = seconds
-        
-        self.cog._save_channel_settings()
-        
-        await interaction.response.send_message(f"Event Cooldown set to **{val} minutes**.", ephemeral=True)
-        await self.view.update_display()
-
-class FreewillBaseView(ui.View):
-    def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, current_tab: str):
-        super().__init__(timeout=600)
-        self.cog = cog
-        self.original_interaction = interaction
-        self.user_id = interaction.user.id
-        self.guild_id = interaction.guild_id
-        self.channel_id = interaction.channel_id
-        self.current_tab = current_tab
-        self._add_nav_buttons()
-
-    def _add_nav_buttons(self):
-        # Navigation Row (Row 4)
-        style_home = discord.ButtonStyle.primary if self.current_tab == "home" else discord.ButtonStyle.secondary
-        style_part = discord.ButtonStyle.primary if self.current_tab == "participants" else discord.ButtonStyle.secondary
-        style_conf = discord.ButtonStyle.primary if self.current_tab == "config" else discord.ButtonStyle.secondary
-
-        b1 = ui.Button(label="Home", style=style_home, row=4, disabled=(self.current_tab=="home"))
-        b2 = ui.Button(label="Participants", style=style_part, row=4, disabled=(self.current_tab=="participants"))
-        b3 = ui.Button(label="Config", style=style_conf, row=4, disabled=(self.current_tab=="config"))
-
-        b1.callback = self.nav_home
-        b2.callback = self.nav_part
-        b3.callback = self.nav_conf
-        
-        self.add_item(b1); self.add_item(b2); self.add_item(b3)
-
-    async def nav_home(self, i: discord.Interaction):
-        await i.response.defer()
-        view = FreewillHomeView(self.cog, self.original_interaction)
-        await view.update_display()
-
-    async def nav_part(self, i: discord.Interaction):
-        await i.response.defer()
-        view = FreewillParticipantsView(self.cog, self.original_interaction)
-        await view.update_display()
-
-    async def nav_conf(self, i: discord.Interaction):
-        await i.response.defer()
-        view = FreewillConfigView(self.cog, self.original_interaction)
-        await view.update_display()
-
-class FreewillHomeView(FreewillBaseView):
-    def __init__(self, cog, interaction):
-        super().__init__(cog, interaction, "home")
-
-    async def update_display(self):
-        config = self.cog.freewill_config.get(str(self.guild_id), {})
-        
-        living = config.get("living_channel_ids", [])
-        lurking = config.get("lurking_channel_ids", [])
-        
-        ch_status = "Reactive (Lurking)" # Default
-        ch_color = discord.Color.gold()
-        if self.channel_id in living: 
-            ch_status, ch_color = "Proactive (Living)", discord.Color.green()
-
-        # Count participants
-        count = 0
-        srv_data = self.cog.freewill_participation.get(str(self.guild_id), {})
-        ch_data = srv_data.get(str(self.channel_id), {})
-        for u_dict in ch_data.values(): count += len(u_dict)
-
-        embed = discord.Embed(title="Freewill System: Home", color=ch_color)
-        embed.add_field(name="Channel Mode", value=f"**{ch_status}**", inline=True)
-        embed.add_field(name="Participants", value=str(count), inline=True)
-        embed.set_footer(text=f"Server Active Channels: {len(living)} Living | {len(lurking)} Lurking")
-
-        self.clear_items()
-        self._add_nav_buttons()
-        
-        mode_btn = ui.Button(label="Toggle Mode (Living/Lurking)", style=discord.ButtonStyle.primary, row=0)
-        mode_btn.callback = self.toggle_channel
-        self.add_item(mode_btn)
-
-        await self.original_interaction.edit_original_response(embed=embed, view=self)
-
-    async def toggle_channel(self, i: discord.Interaction):
-        await i.response.defer()
-        conf = self.cog.freewill_config.setdefault(str(self.guild_id), {})
-        lid = conf.setdefault("living_channel_ids", [])
-        lud = conf.setdefault("lurking_channel_ids", [])
-        cid = self.channel_id
-        
-        if cid in lid:
-            lid.remove(cid)
-            lud.append(cid)
-        else:
-            if cid in lud: lud.remove(cid)
-            lid.append(cid)
-        
-        self.cog._save_channel_settings()
-        await self.update_display()
-
-class FreewillParticipantsView(FreewillBaseView):
-    def __init__(self, cog, interaction):
-        super().__init__(cog, interaction, "participants")
-        self.selected_user_id = None
-        self.selected_profile_name = None
-
-    async def update_display(self):
-        srv_data = self.cog.freewill_participation.get(str(self.guild_id), {})
-        ch_data = srv_data.get(str(self.channel_id), {})
-        
-        all_participants = []
-        for uid, profiles in ch_data.items():
-            for pname, settings in profiles.items():
-                # Lazy load legacy conversion for display
-                p_val = settings.get("personality", 10)
-                if isinstance(p_val, str):
-                    p_val = {"introverted": 10, "regular": 50, "outgoing": 90, "off": 0}.get(p_val, 10)
-                
-                label = f"[{p_val}%] {pname}"
-                all_participants.append({"label": label, "value": f"{uid}:{pname}", "uid": uid, "name": pname, "chance": p_val, "settings": settings})
-        
-        all_participants.sort(key=lambda x: x['name'])
-
-        self.clear_items()
-        self._add_nav_buttons()
-
-        embed = discord.Embed(title="Freewill: Participants", color=discord.Color.blue())
-
-        if self.selected_profile_name:
-            # Selected State
-            p_data = next((p for p in all_participants if p['uid'] == self.selected_user_id and p['name'] == self.selected_profile_name), None)
-            if p_data:
-                settings = p_data['settings']
-                embed.description = f"Managing **{p_data['name']}** (User ID: {p_data['uid']})"
-                embed.add_field(name="Response Chance", value=f"`{p_data['chance']}%`", inline=True)
-                embed.add_field(name="Method", value=f"`{settings.get('method', 'webhook')}`", inline=True)
-                wakes = ", ".join(settings.get("wakewords", [])) or "None"
-                if len(wakes) > 50: wakes = wakes[:47] + "..."
-                embed.add_field(name="Wakewords", value=f"`{wakes}`", inline=False)
-
-                btn_chance = ui.Button(label="Set Chance %", style=discord.ButtonStyle.primary, row=1)
-                btn_chance.callback = self.set_chance_cb
-                self.add_item(btn_chance)
-
-                btn_wake = ui.Button(label="Edit Wakewords", style=discord.ButtonStyle.secondary, row=1)
-                btn_wake.callback = self.edit_wake_cb
-                self.add_item(btn_wake)
-
-                btn_method = ui.Button(label="Toggle Method", style=discord.ButtonStyle.secondary, row=1)
-                btn_method.callback = self.toggle_method_cb
-                self.add_item(btn_method)
-
-                btn_rem = ui.Button(label="Remove", style=discord.ButtonStyle.danger, row=1)
-                btn_rem.callback = self.remove_cb
-                self.add_item(btn_rem)
-                
-                btn_back = ui.Button(label="Back to List", style=discord.ButtonStyle.grey, row=2)
-                btn_back.callback = self.back_cb
-                self.add_item(btn_back)
-            else:
-                self.selected_profile_name = None
-                await self.update_display(); return
-        else:
-            # List State
-            embed.description = f"Total Participants: **{len(all_participants)}**\nSelect a profile to manage details."
-            
-            if all_participants:
-                # Limit to 25 for dropdown
-                options = [discord.SelectOption(label=p['label'], value=p['value']) for p in all_participants[:25]]
-                sel = ui.Select(placeholder="Select a profile...", options=options, row=0)
-                sel.callback = self.select_cb
-                self.add_item(sel)
-
-            btn_add = ui.Button(label="Add Profile", style=discord.ButtonStyle.success, row=1)
-            btn_add.callback = self.add_profile_cb
-            self.add_item(btn_add)
-
-            if all_participants:
-                btn_clear = ui.Button(label="Release All", style=discord.ButtonStyle.danger, row=1)
-                btn_clear.callback = self.release_all_cb
-                self.add_item(btn_clear)
-
-        await self.original_interaction.edit_original_response(embed=embed, view=self)
-
-    async def select_cb(self, i: discord.Interaction):
-        await i.response.defer()
-        uid, pname = i.data['values'][0].split(":", 1)
-        self.selected_user_id = uid
-        self.selected_profile_name = pname
-        await self.update_display()
-
-    async def back_cb(self, i: discord.Interaction):
-        await i.response.defer()
-        self.selected_profile_name = None
-        await self.update_display()
-
-    async def set_chance_cb(self, i: discord.Interaction):
-        modal = FreewillChanceModal(self.cog, self.guild_id, self.channel_id, self.selected_user_id, self.selected_profile_name, self)
-        await i.response.send_modal(modal)
-
-    async def refresh_state(self, i: discord.Interaction):
-        # Callback for modal to refresh UI without full rebuild
-        await self.update_display()
-
-    async def edit_wake_cb(self, i: discord.Interaction):
-        # Reuse existing logic via modal
-        srv = self.cog.freewill_participation.get(str(self.guild_id), {})
-        chn = srv.get(str(self.channel_id), {})
-        usr = chn.get(str(self.selected_user_id), {})
-        prof = usr.get(self.selected_profile_name, {})
-        
-        modal = WakewordsModal(prof.get("wakewords", []))
-        async def modal_callback(mi: discord.Interaction):
-            await mi.response.defer()
-            words = [w.strip().lower() for w in modal.wakewords_input.value.split(',') if w.strip()]
-            self.cog.freewill_participation[str(self.guild_id)][str(self.channel_id)][str(self.selected_user_id)][self.selected_profile_name]["wakewords"] = words
-            self.cog._save_freewill_for_server(self.guild_id)
-            await self.update_display()
-        modal.on_submit = modal_callback
-        await i.response.send_modal(modal)
-
-    async def toggle_method_cb(self, i: discord.Interaction):
-        await i.response.defer()
-        # Toggle Webhook <-> Child Bot
-        # Note: Doesn't verify if child bot exists, Admin is responsible
-        srv = self.cog.freewill_participation[str(self.guild_id)][str(self.channel_id)]
-        curr = srv[str(self.selected_user_id)][self.selected_profile_name].get("method", "webhook")
-        new_m = "child_bot" if curr == "webhook" else "webhook"
-        srv[str(self.selected_user_id)][self.selected_profile_name]["method"] = new_m
-        self.cog._save_freewill_for_server(self.guild_id)
-        await self.update_display()
-
-    async def remove_cb(self, i: discord.Interaction):
-        await i.response.defer()
-        del self.cog.freewill_participation[str(self.guild_id)][str(self.channel_id)][str(self.selected_user_id)][self.selected_profile_name]
-        self.cog._save_freewill_for_server(self.guild_id)
-        self.selected_profile_name = None
-        await self.update_display()
-
-    async def release_all_cb(self, i: discord.Interaction):
-        await i.response.defer()
-        del self.cog.freewill_participation[str(self.guild_id)][str(self.channel_id)]
-        self.cog._save_freewill_for_server(self.guild_id)
-        self.selected_profile_name = None
-        await self.update_display()
-
-    async def add_profile_cb(self, i: discord.Interaction):
-        # We call the new paginated UI instead of the old temporary select
-        view = FreewillAddProfileView(self.cog, i.user.id, self.guild_id, self.channel_id, self)
-        
-        if not view.personal_profiles:
-            await i.response.send_message("All of your profiles are already participating in this channel.", ephemeral=True)
-            return
-            
-        await i.response.send_message("### Add Profiles to Freewill\nSelect your personal profiles to enable them for autonomous interaction in this channel.", view=view, ephemeral=True)
-
-class FreewillConfigView(FreewillBaseView):
-    def __init__(self, cog, interaction):
-        super().__init__(cog, interaction, "config")
-
-    async def update_display(self):
-        conf = self.cog.freewill_config.get(str(self.guild_id), {})
-        ch_settings = conf.get("channel_settings", {}).get(str(self.channel_id), {})
-        
-        # Default to 0 (Manual) if not set for this channel
-        chance = ch_settings.get("event_chance", 0)
-        
-        # Default to 300s (5m) if not set for this channel
-        cd = ch_settings.get("event_cooldown", 300)
-        cd_min = cd // 60
-
-        embed = discord.Embed(title="Freewill: Configuration", color=discord.Color.dark_grey())
-        embed.add_field(name="Channel Event Chance", value=f"`{chance}%`", inline=True)
-        embed.add_field(name="Event Cooldown", value=f"`{cd_min} minutes`", inline=True)
-        embed.description = f"These settings apply **only** to <#{self.channel_id}>."
-
-        self.clear_items()
-        self._add_nav_buttons()
-
-        b1 = ui.Button(label="Set Event Chance", style=discord.ButtonStyle.primary, row=0)
-        b1.callback = self.set_chance
-        self.add_item(b1)
-
-        b2 = ui.Button(label="Set Cooldown", style=discord.ButtonStyle.primary, row=0)
-        b2.callback = self.set_cooldown
-        self.add_item(b2)
-
-        await self.original_interaction.edit_original_response(embed=embed, view=self)
-
-    async def set_chance(self, i: discord.Interaction):
-        modal = FreewillChannelChanceModal(self.cog, self.guild_id, self.channel_id, self)
-        await i.response.send_modal(modal)
-
-    async def set_cooldown(self, i: discord.Interaction):
-        modal = FreewillCooldownModal(self.cog, self.guild_id, self.channel_id, self)
-        await i.response.send_modal(modal)
-
-class FreewillAddProfileView(BaseBulkProfileView):
-    def __init__(self, cog, user_id, guild_id, channel_id, parent_view):
-        super().__init__(cog, user_id, include_borrowed=False)
-        self.guild_id = guild_id
-        self.channel_id = channel_id
-        self.parent_view = parent_view
-        self._build_view()
-
-    def _build_view(self):
-        self.clear_items()
-        # Filter: Only show profiles NOT already participating in this channel
-        curr_part = self.cog.freewill_participation.get(str(self.guild_id), {}).get(str(self.channel_id), {}).get(str(self.user_id), {})
-        self.personal_profiles = [p for p in self.personal_profiles if p not in curr_part]
-        
-        if not self.personal_profiles:
-            self.add_item(ui.Button(label="No available profiles", disabled=True, row=0))
-            return
-
-        self._build_profile_select_ui(row=0)
-        add_btn = ui.Button(label="Add Selected Profiles", style=discord.ButtonStyle.success, row=2)
-        add_btn.callback = self.add_callback
-        self.add_item(add_btn)
-
-    async def add_callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        if not self.selected_profiles:
-            await interaction.followup.send("Please select at least one profile.", ephemeral=True)
-            return
-
-        g, c, u = str(self.guild_id), str(self.channel_id), str(self.user_id)
-        for pname in self.selected_profiles:
-            self.cog.freewill_participation.setdefault(g, {}).setdefault(c, {}).setdefault(u, {})[pname] = {
-                "personality": 10, "wakewords": [], "method": "webhook"
-            }
-        
-        self.cog._save_freewill_for_server(self.guild_id)
-        # Update the main Participants list UI
-        await self.parent_view.update_display()
-        await interaction.followup.send(f"Successfully added {len(self.selected_profiles)} profile(s) to Freewill.", ephemeral=True)
 
 class TypingManageView(BaseBulkProfileView):
     def __init__(self, cog: 'GeminiAgent', user_id: int):

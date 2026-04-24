@@ -1030,6 +1030,34 @@ class ServicesMixin:
                 
                 all_triggers_for_round = valid_triggers
 
+                is_proactive_auto_round = False
+                for i, t in enumerate(all_triggers_for_round):
+                    if isinstance(t, tuple) and t[0] == 'proactive_trigger':
+                        is_proactive_auto_round = True
+                        pro = session.get("proactivity", {})
+                        director_prompt = None
+                        model_raw = pro.get("director_model", "off")
+                        
+                        if model_raw.lower() != "off":
+                            sys_instr = pro.get("director_instructions")
+                            if sys_instr:
+                                try:
+                                    is_or = model_raw.upper().startswith("OPENROUTER/")
+                                    model_name = model_raw[11:] if is_or else (model_raw[7:] if model_raw.upper().startswith("GOOGLE/") else model_raw)
+                                    channel = self.bot.get_channel(channel_id)
+                                    guild_id = channel.guild.id if channel and getattr(channel, 'guild', None) else 0
+                                    api_key = self._get_api_key_for_guild(guild_id, "openrouter" if is_or else "gemini")
+                                    if api_key:
+                                        if is_or: m = OpenRouterModel(model_name, api_key=api_key, system_instruction=sys_instr, thinking_params={})
+                                        else: m = GoogleGenAIModel(api_key=api_key, model_name=model_name, system_instruction=sys_instr)
+                                        hist_text = ""
+                                        for ht in session.get("unified_log", [])[-10:]:
+                                            hist_text += f"{ht.get('content', '')}\n"
+                                        resp = await m.generate_content_async([f"Recent History:\n{hist_text}\n\nGenerate your Director's prompt."])
+                                        if resp and resp.text: director_prompt = f"<internal_note>Director's Note: {resp.text.strip()}</internal_note>"
+                                except Exception as e: print(f"AI Director failed: {e}")
+                        all_triggers_for_round[i] = director_prompt
+
                 if not all_triggers_for_round and not is_proactive_auto_round:
                     session['is_running'] = False
                     continue
@@ -1127,8 +1155,6 @@ class ServicesMixin:
 
                 for i, trigger in enumerate(all_triggers_for_round):
                     if not trigger:
-                        if i == 0 and not is_proactive_auto_round:
-                            new_round_turn_data.append(("<internal_note>No response from anyone OR no user is present.</internal_note>", None, []))
                         continue
 
                     message_trigger, reaction_trigger, message_payload = None, None, None
@@ -1396,7 +1422,6 @@ class ServicesMixin:
                     pass
 
                 profile_order = []
-                freewill_mode = session.get("freewill_mode")
                 session_mode = session.get("session_mode", "sequential")
                 channel = self.bot.get_channel(channel_id)
 
@@ -1404,126 +1429,65 @@ class ServicesMixin:
                 if isinstance(initial_trigger, tuple) and initial_trigger[0] == 'reaction_single':
                     is_single_turn_only = True
 
-                if freewill_mode == 'reactive':
-                    if starting_profile_override:
-                        profile_order = [starting_profile_override]
+                trigger_content_lower = ""
+                for t in all_triggers_for_round:
+                    if isinstance(t, discord.Message): trigger_content_lower += t.clean_content.lower() + " "
+                    elif isinstance(t, tuple) and len(t) > 1:
+                        if isinstance(t[1], discord.Message): trigger_content_lower += t[1].clean_content.lower() + " "
+                        elif isinstance(t[1], dict) and 'content' in t[1]: trigger_content_lower += t[1]['content'].lower() + " "
+                    elif isinstance(t, str): trigger_content_lower += t.lower() + " "
+
+                active_participants = []
+                for p in session['profiles']:
+                    if p.get('is_skipped', False): continue
+                    chance = p.get('chance', 100)
+                    wakewords = p.get('wakewords', [])
+                    will_respond = False
+                    if wakewords and any(w.lower() in trigger_content_lower for w in wakewords if w.strip()):
+                        will_respond = True
                     else:
-                        initial_turn_profile = None
-                        if isinstance(initial_trigger, tuple) and initial_trigger[0] == 'initial_reactive_turn':
-                            _, message_trigger, initial_turn_profile = initial_trigger
-                        else:
-                            message_trigger = initial_trigger if isinstance(initial_trigger, discord.Message) else None
+                        will_respond = (random.randint(1, 100) <= chance)
 
-                        if message_trigger:
-                            content_lower = message_trigger.content.lower()
-                            wakeword_triggers = []
-                            server_participation = self.freewill_participation.get(str(channel.guild.id), {})
-                            channel_participants = server_participation.get(str(channel.id), {})
-                            
-                            for p in session['profiles']:
-                                user_profiles = channel_participants.get(str(p['owner_id']), {})
-                                profile_settings = user_profiles.get(p['profile_name'], {})
-                                if any(w.lower() in content_lower for w in profile_settings.get("wakewords", [])):
-                                    wakeword_triggers.append(p)
+                    if will_respond: active_participants.append(p)
 
-                            if wakeword_triggers:
-                                profile_order = [random.choice(wakeword_triggers)]
-                            else:
-                                # [UPDATED] Numeric Chance Logic
-                                participants_for_roll = []
-                                weights = []
-                                highest_chance = 0.0
+                if not active_participants:
+                    for trigger in all_triggers_for_round:
+                        if trigger is not None: session['task_queue'].task_done()
+                    session['is_running'] = False
+                    continue
 
-                                for p in session['profiles']:
-                                    user_profiles = channel_participants.get(str(p['owner_id']), {})
-                                    profile_settings = user_profiles.get(p['profile_name'], {})
-                                    
-                                    pers = profile_settings.get("personality", "off")
-                                    chance = 0.0
-                                    
-                                    if isinstance(pers, int):
-                                        chance = pers / 100.0
-                                    else:
-                                        chance = {"introverted": 0.03, "regular": 0.10, "outgoing": 0.30}.get(pers, 0.0)
-                                    
-                                    if chance > 0:
-                                        participants_for_roll.append(p)
-                                        weights.append(chance)
-                                        if chance > highest_chance: highest_chance = chance
-                                
-                                if highest_chance > 0 and random.random() <= highest_chance:
-                                    if participants_for_roll and any(w > 0 for w in weights):
-                                        profile_order = random.choices(participants_for_roll, weights=weights, k=1)
+                if starting_profile_override:
+                    start_p = starting_profile_override
+                    if start_p.get('is_skipped') or start_p not in active_participants:
+                        start_p = active_participants[0]
 
-                        if initial_turn_profile and not profile_order:
-                            profile_order = [initial_turn_profile]
-                
-                else: # Standard multi-profile or proactive freewill
-                    if starting_profile_override:
-                        start_p = starting_profile_override
-                        
-                        session_mode = session.get("session_mode", "sequential")
-                        if session_mode == 'sequential':
-                            try:
-                                # Find the index of the profile we are starting with
-                                start_idx = session['profiles'].index(start_p)
-                                # Rotate the list to make that profile the first element
-                                new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
-                                session['profiles'] = new_order
-                                self._save_multi_profile_sessions()
-                            except ValueError:
-                                # The starting profile wasn't in the list, this shouldn't happen but handle gracefully
-                                pass
+                    if session_mode == 'sequential':
+                        try:
+                            start_idx = session['profiles'].index(start_p)
+                            new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
+                            session['profiles'] = new_order
+                            self._save_multi_profile_sessions()
+                        except ValueError: pass
 
-                     # Filter profiles that are marked as skipped via reaction
-                    active_participants = [p for p in session['profiles'] if not p.get('is_skipped', False)]
-                    
-                    if not active_participants:
-                        # If everyone is skipped, mark triggers as done and wait for next input
-                        for trigger in all_triggers_for_round:
-                            if trigger is not None: session['task_queue'].task_done()
-                        continue
-
-                    if starting_profile_override:
-                        # Ensure the override profile isn't skipped; if it is, fall back to first active
-                        if starting_profile_override.get('is_skipped'):
-                            start_p = active_participants[0]
-                        else:
-                            start_p = starting_profile_override
-                        
-                        session_mode = session.get("session_mode", "sequential")
-                        if session_mode == 'sequential':
-                            try:
-                                start_idx = session['profiles'].index(start_p)
-                                new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
-                                session['profiles'] = new_order
-                                self._save_multi_profile_sessions()
-                            except ValueError: pass
-
-                        if is_single_turn_only:
-                            profile_order = [start_p]
-                        else:
-                            profile_order = [p for p in session['profiles'] if p in active_participants]
-                            if session_mode == 'random':
-                                if start_p in profile_order: profile_order.remove(start_p)
-                                random.shuffle(profile_order)
-                                profile_order.insert(0, start_p)
-
+                    if is_single_turn_only:
+                        profile_order = [start_p]
                     else:
-                        session_mode = session.get("session_mode", "sequential")
                         profile_order = [p for p in session['profiles'] if p in active_participants]
-                        
                         if session_mode == 'random':
+                            if start_p in profile_order: profile_order.remove(start_p)
                             random.shuffle(profile_order)
-                        elif session.get('last_speaker_key'):
-                            try:
-                                # Rotate based on the full list to maintain sequence logic
-                                last_speaker_index = next(i for i, p in enumerate(session['profiles']) if (p['owner_id'], p['profile_name']) == session['last_speaker_key'])
-                                start_index = (last_speaker_index + 1) % len(session['profiles'])
-                                rotated = session['profiles'][start_index:] + session['profiles'][:start_index]
-                                # But only include those not skipped
-                                profile_order = [p for p in rotated if p in active_participants]
-                            except (ValueError, StopIteration): pass
+                            profile_order.insert(0, start_p)
+                else:
+                    profile_order = [p for p in session['profiles'] if p in active_participants]
+                    if session_mode == 'random':
+                        random.shuffle(profile_order)
+                    elif session.get('last_speaker_key'):
+                        try:
+                            last_speaker_index = next(i for i, p in enumerate(session['profiles']) if (p['owner_id'], p['profile_name']) == session['last_speaker_key'])
+                            start_index = (last_speaker_index + 1) % len(session['profiles'])
+                            rotated = session['profiles'][start_index:] + session['profiles'][:start_index]
+                            profile_order = [p for p in rotated if p in active_participants]
+                        except (ValueError, StopIteration): pass
 
                 # --- Ephemeral Participant Injection ---
                 ephemeral_participant = None
@@ -2248,10 +2212,6 @@ class ServicesMixin:
                                 contents_for_api_call[-1]['parts'].extend(supplementary_parts)
                             else:
                                 contents_for_api_call.append({'role': 'user', 'parts': supplementary_parts})
-                                
-                        # [NEW] Failsafe for alternating roles
-                        if contents_for_api_call[-1].get('role') == 'model':
-                            contents_for_api_call.append({'role': 'user', 'parts': ["<internal_note>Continue the conversation.</internal_note>"]})
 
                         # [NEW] Advanced Params Injection
                         p_index = self._get_user_index(owner_id)
@@ -2608,83 +2568,63 @@ class ServicesMixin:
 
                     is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
 
-                    # [NEW] Unified Synthesis Logic for all Audio Modes
-                    audio_mode = session.get("audio_mode", "text-only")
+                    # [NEW] Unified Synthesis Logic
                     audio_file_for_send = None
                     
-                    if audio_mode in ["audio+text", "audio-only", "multi-audio"]:
-                        # 1. Build Contextual Round Transcript
-                        round_transcript = ""
-                        for idx, prev_resp in enumerate(responses_this_round[:-1]):
-                            prev_p = profile_order[idx]
-                            prev_app = self.user_appearances.get(str(prev_p['owner_id']), {}).get(prev_p['profile_name'], {})
-                            prev_name = prev_app.get("custom_display_name") or prev_p['profile_name']
-                            round_transcript += f"{prev_name}: {prev_resp}\n\n"
+                    if profile_settings.get("speech_tts_enabled", False):
+                        s_voice = profile_settings.get("speech_voice", "Aoede")
+                        s_model = profile_settings.get("speech_model")
+                        if s_model and "none" not in s_model.lower():
+                            # 1. Build Contextual Round Transcript
+                            round_transcript = ""
+                            for idx, prev_resp in enumerate(responses_this_round[:-1]):
+                                prev_p = profile_order[idx]
+                                prev_app = self.user_appearances.get(str(prev_p['owner_id']), {}).get(prev_p['profile_name'], {})
+                                prev_name = prev_app.get("custom_display_name") or prev_p['profile_name']
+                                round_transcript += f"{prev_name}: {prev_resp}\n\n"
 
-                        # 2. Resolve Profile Speech Settings and Director's Desk
-                        s_voice = p_settings.get("speech_voice", "Aoede")
-                        s_model = p_settings.get("speech_model", "gemini-2.5-flash-preview-tts")
-                        s_temp = float(p_settings.get("speech_temperature", 1.0))
-                        
-                        s_arch = p_settings.get("speech_archetype", "")
-                        s_acc = p_settings.get("speech_accent", "")
-                        s_dyn = p_settings.get("speech_dynamics", "")
-                        s_styl = p_settings.get("speech_style", "")
-                        s_pace = p_settings.get("speech_pacing", "")
+                            # 2. Construct Conditional Markdown Prompt
+                            s_temp = float(profile_settings.get("speech_temperature", 1.0))
+                            s_arch = profile_settings.get("speech_archetype", "")
+                            s_acc = profile_settings.get("speech_accent", "")
+                            s_dyn = profile_settings.get("speech_dynamics", "")
+                            s_styl = profile_settings.get("speech_style", "")
+                            s_pace = profile_settings.get("speech_pacing", "")
 
-                        # 3. Construct Conditional Markdown Prompt
-                        prompt_parts = []
-                        
-                        # Section: Audio Profile
-                        if s_arch or s_acc:
-                            part = f"# AUDIO PROFILE: {speaker_display_name}\n"
-                            if s_arch: part += f"Archetype: {s_arch}\n"
-                            if s_acc: part += f"Accent: {s_acc}\n"
-                            prompt_parts.append(part.strip())
+                            prompt_parts = []
+                            if s_arch or s_acc:
+                                part = f"# AUDIO PROFILE: {speaker_display_name}\n"
+                                if s_arch: part += f"Archetype: {s_arch}\n"
+                                if s_acc: part += f"Accent: {s_acc}\n"
+                                prompt_parts.append(part.strip())
+                            if s_dyn:
+                                part = f"## THE SCENE\nDynamics: {s_dyn}\nAction: Fluid conversation."
+                                prompt_parts.append(part.strip())
+                            if s_styl or s_pace:
+                                part = "### DIRECTOR'S NOTES\n"
+                                if s_styl: part += f"Style: {s_styl}\n"
+                                if s_pace: part += f"Pacing: {s_pace}\n"
+                                prompt_parts.append(part.strip())
+                            if round_transcript:
+                                prompt_parts.append(f"#### SAMPLE CONTEXT\nPrevious turn flow:\n{round_transcript.strip()}")
+                            prompt_parts.append(f"#### TRANSCRIPT\n{speaker_display_name}: {response_text}")
 
-                        # Section: The Scene
-                        if s_dyn:
-                            part = f"## THE SCENE\nDynamics: {s_dyn}\nAction: Fluid conversation."
-                            prompt_parts.append(part.strip())
-
-                        # Section: Director's Notes
-                        if s_styl or s_pace:
-                            part = "### DIRECTOR'S NOTES\n"
-                            if s_styl: part += f"Style: {s_styl}\n"
-                            if s_pace: part += f"Pacing: {s_pace}\n"
-                            prompt_parts.append(part.strip())
-
-                        # Section: Context & Transcript
-                        if round_transcript:
-                            prompt_parts.append(f"#### SAMPLE CONTEXT\nPrevious turn flow:\n{round_transcript.strip()}")
-                        
-                        prompt_parts.append(f"#### TRANSCRIPT\n{speaker_display_name}: {response_text}")
-
-                        tts_priming_prompt = "\n\n".join(prompt_parts)
-                        
-                        # 4. Synthesise Audio
-                        turn_audio_stream = await self._generate_google_tts(
-                            tts_priming_prompt, 
-                            channel.guild.id, 
-                            model_id=s_model, 
-                            voice_name=s_voice, 
-                            temperature=s_temp
-                        )
-                        
-                        if turn_audio_stream:
-                            if audio_mode == "multi-audio":
-                                # Store for round-end stitching
-                                round_audio_segments.append(turn_audio_stream)
-                            else:
-                                # Prepare for immediate delivery with this turn
+                            tts_priming_prompt = "\n\n".join(prompt_parts)
+                            
+                            # 3. Synthesise Audio
+                            turn_audio_stream = await self._generate_google_tts(
+                                tts_priming_prompt, 
+                                channel.guild.id, 
+                                model_id=s_model, 
+                                voice_name=s_voice, 
+                                temperature=s_temp
+                            )
+                            
+                            if turn_audio_stream:
                                 audio_file_for_send = discord.File(turn_audio_stream, filename=f"voice_{turn_id[:4]}.wav")
-                                if audio_mode == "audio-only":
-                                    # Use zero-width space to hide text while keeping message valid
-                                    display_text = ""
-                        else:
-                            turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(reason="API Error or Unknown"))
+                            else:
+                                turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(reason="API Error or Unknown"))
 
-                    # [FIXED] Non-exclusive media selection: prioritize image as primary, audio as follow-up
                     file_to_send = None
                     extra_audio_file = None
                     if is_generator and generated_image_bytes_for_round:
@@ -3008,25 +2948,6 @@ class ServicesMixin:
                 for trigger in all_triggers_for_round:
                     if trigger is not None:
                         session['task_queue'].task_done()
-
-                # [NEW] Multi-Audio Final Delivery
-                if session.get("audio_mode") == "multi-audio" and round_audio_segments:
-                    placeholders = await self._send_channel_message(channel, f"{PLACEHOLDER_EMOJI}")
-                    master_placeholder = placeholders[0] if placeholders else None
-
-                    master_stream = self._stitch_wav_segments(round_audio_segments)
-                    
-                    if master_stream.getbuffer().nbytes > 0:
-                        master_file = discord.File(master_stream, filename="round_master.wav")
-                        await self._send_channel_message(
-                            channel, 
-                            "-# **Round Audio Summary**", 
-                            target_message_to_edit=master_placeholder,
-                            file=master_file,
-                            bypass_typing=True
-                        )
-                    elif master_placeholder:
-                        await master_placeholder.delete()
 
                 # [FIXED] Round-End Memory Purge: Purge all generated and context data after all participants finish
                 if 'new_round_turn_data' in locals():
@@ -3840,11 +3761,13 @@ class ServicesMixin:
 
             if response_text and response_text.upper() != "NO_SUMMARY":
                 return response_text
-        except Exception as e: 
-            print(f"LTM Gen err {user_dn}: {e}")
-            traceback.print_exc()
-            if warning_channel:
-                await self._send_session_warning(warning_channel, f"Long-Term Memory creation failed ({self._format_api_error(e)})")
+        except Exception as e:
+            err_str = str(e)
+            if "429" not in err_str and "RESOURCE_EXHAUSTED" not in err_str:
+                print(f"LTM Gen err {user_dn}: {e}")
+                traceback.print_exc()
+                if warning_channel:
+                    await self._send_session_warning(warning_channel, f"Long-Term Memory creation failed ({self._format_api_error(e)})")
         return None
     
     async def _maybe_create_ltm(self, context_obj: Union[discord.Message, discord.abc.Messageable], author_dn: str, hist: list, profile_owner_id: int, profile_name: str, gen_config_params: Dict[str, Any], triggering_user_id_override: Optional[int] = None):
@@ -4327,144 +4250,28 @@ class ServicesMixin:
             
         return f"{display_name} [ID: {entity_id}] {time_str}:\n{content}\n"
     
-    @tasks.loop(minutes=1.0)
-    async def freewill_task(self):
-        if not self.has_lock:
-            return
-
-        for guild_id_str, config in self.freewill_config.items():
-            guild = self.bot.get_guild(int(guild_id_str))
-            if not guild: continue
-
-            # Combine living channels list. We only process 'Living' channels for proactive events.
-            living_channels = config.get("living_channel_ids", [])
-            channel_settings_map = config.get("channel_settings", {})
-
-            for channel_id in living_channels:
-                # 1. Check Cooldown
-                ch_settings = channel_settings_map.get(str(channel_id), {})
-                cooldown = ch_settings.get("event_cooldown", 300) # Default 5 mins
-                if time.time() - self.last_freewill_event.get(channel_id, 0) < cooldown:
-                    continue
-
-                # 2. Check Chance
-                ev_chance = ch_settings.get("event_chance", 0) # Default 0 (Manual only)
-                if ev_chance <= 0:
-                    continue
-                
-                threshold = ev_chance / 100.0
-                if random.random() > threshold:
-                    continue
-
-                # 3. Execution Logic
-                channel = guild.get_channel(channel_id)
-                if not channel or not isinstance(channel, discord.TextChannel): continue
-                
-                session = self.multi_profile_channels.get(channel.id)
-                if session and session.get("type") != "freewill": continue
-                if session and session.get('is_running'): continue
-                
-                if session and not session.get("is_hydrated"):
-                    session = await self._ensure_session_hydrated(channel.id, "freewill")
-                    
-                opted_in_profiles = []
-                server_participation = self.freewill_participation.get(str(guild.id), {})
-                channel_participants = server_participation.get(str(channel.id), {})
-
-                for user_id_str, profiles in channel_participants.items():
-                    if not self.is_user_premium(int(user_id_str)): continue
-
-                    member = guild.get_member(int(user_id_str))
-                    if member:
-                        for profile_name, settings in profiles.items():
-                            pers = settings.get("personality", "off")
-                            is_active = False
-                            if isinstance(pers, int): is_active = pers > 0
-                            else: is_active = pers != "off"
-
-                            if is_active:
-                                participant_dict = self._build_freewill_participant_dict(int(user_id_str), profile_name, channel)
-                                if participant_dict:
-                                    opted_in_profiles.append(participant_dict)
-                
-                if len(opted_in_profiles) < 2: continue
-                
-                self.last_freewill_event[channel.id] = time.time()
-                
-                cast_size = random.choices([2, 3], weights=[0.8, 0.2], k=1)[0]
-                if len(opted_in_profiles) < cast_size: cast_size = len(opted_in_profiles)
-                cast = random.sample(opted_in_profiles, k=cast_size)
-                session_owner_id = cast[0]['owner_id']
-
-                if not session:
-                    chat_sessions = {}
-                    for p in cast:
-                        chat_sessions[(p['owner_id'], p['profile_name'])] = GoogleGenAIChatSession(history=[])
-
-                    session = {
-                        "type": "freewill", "freewill_mode": "proactive",
-                        "proactive_initial_rounds": 2, "proactive_cooldown": cooldown,
-                        "chat_sessions": chat_sessions, "unified_log": [],
-                        "initial_channel_history": await self._build_freewill_history(channel),
-                        "initial_turn_taken": set(), "last_bot_message_id": None,
-                        "owner_id": session_owner_id, "is_running": False,
-                        "task_queue": asyncio.Queue(), "worker_task": None,
-                        "turns_since_last_ltm": 0, "session_prompt": None,
-                        "profiles": cast, "is_hydrated": True
-                    }
-                    self.multi_profile_channels[channel.id] = session
-                else:
-                    session['profiles'] = cast 
-                    session['freewill_mode'] = "proactive"
-                    session['proactive_initial_rounds'] = 2
-                    session['proactive_cooldown'] = cooldown
-                    session['initial_channel_history'] = await self._build_freewill_history(channel)
-                    session['initial_turn_taken'] = set()
-                    
-                    if 'chat_sessions' not in session: session['chat_sessions'] = {}
-                    chat_sessions = session['chat_sessions']
-                    
-                    for p in cast:
-                        p_key = (p['owner_id'], p['profile_name'])
-                        if p_key not in chat_sessions or chat_sessions[p_key] is None:
-                            chat_sessions[p_key] = GoogleGenAIChatSession(history=[])
-
-                self._save_multi_profile_sessions()
-                
-                dummy_session_key = (channel.id, None, None)
-                await self._save_session_to_disk(dummy_session_key, "freewill", session.get("unified_log", []))
-
-                target_participant = cast[1]
-                target_id = target_participant['owner_id']
-                target_profile = target_participant['profile_name']
-                
-                target_index = self._get_user_index(target_id)
-                target_appearance_name = target_profile
-                if target_profile in target_index.get("borrowed", []):
-                    borrowed_data = self._get_profile_config(target_id, target_profile, True) or {}
-                    target_appearance_name = borrowed_data.get("original_profile_name", target_profile)
-                
-                target_display_name = target_appearance_name
-                if str(target_id) in self.user_appearances and target_appearance_name in self.user_appearances[str(target_id)]:
-                    appearance = self.user_appearances[str(target_id)][target_appearance_name]
-                    if appearance.get("custom_display_name"):
-                        target_display_name = appearance["custom_display_name"]
-
-                scene_starters = [
-                    "You see {target} walk into the room. What do you say or do?",
-                    "The topic of {topic} comes to mind. You decide to bring it up with {target}.",
-                    "You notice {target} seems lost in thought. You approach them.",
-                    "You and {target} are the only two left in the channel. The silence is getting awkward. You decide to break it."
-                ]
-                topics = ["the weather", "a recent rumor", "a strange noise", "an old memory", "a new idea"]
-                prompt_template = random.choice(scene_starters)
-                director_prompt = prompt_template.format(target=target_display_name, topic=random.choice(topics))
-
-                await session['task_queue'].put(director_prompt)
-                
-                if not session.get('is_running'):
-                    session['is_running'] = True 
-                    session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(channel.id))
+    @tasks.loop(seconds=60.0)
+    async def proactive_session_task(self):
+        if not self.has_lock: return
+        now = time.time()
+        for channel_id, session in list(self.multi_profile_channels.items()):
+            pro = session.get("proactivity", {})
+            if not pro.get("enabled"): continue
+            
+            last_event = session.setdefault("last_proactive_event", 0)
+            cooldown = pro.get("cooldown", 300)
+            if now - last_event < cooldown: continue
+            
+            chance = pro.get("chance", 10) / 100.0
+            if random.random() > chance: continue
+            
+            session["last_proactive_event"] = now
+            
+            await session['task_queue'].put(('proactive_trigger', None))
+            if not session.get('is_running') and (not session.get('worker_task') or session['worker_task'].done()):
+                task = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
+                session['worker_task'] = task
+                self.background_tasks.add(task)
 
     @tasks.loop(seconds=60.0)
     async def evict_inactive_sessions_task(self):
