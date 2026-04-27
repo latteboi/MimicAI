@@ -615,11 +615,8 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 p_name = p_data.get('profile_name')
                 pid = p_data.get('pid', 'Unknown PID')
                 
-                if p_data.get('method') == 'child_bot':
-                    display = f"Child Bot ({p_name})"
-                else:
-                    display = p_name
-                profile_list.append(f"**{i+1}.** `{display}` [PID: {pid}]")
+                method_str = "Child Bot" if p_data.get('method') == 'child_bot' else "Webhook"
+                profile_list.append(f"**{i+1}.** `{p_name}` ({method_str}) [PID: {pid}]")
             
             owner_user = self.bot.get_user(session_data_idx.get('owner_id'))
             admin_name = owner_user.name if owner_user else "Unknown Admin"

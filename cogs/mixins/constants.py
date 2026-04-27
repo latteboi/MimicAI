@@ -163,6 +163,7 @@ DEFAULT_TRAINING_DATA_INJECTION = (
 DEFAULT_CONTEXT_RULES = (
     "<context_rules>\n"
     "- '[Name] [ID: XXXXXXXXXXXXXXXX] [Timestamp]' are individual active participants.\n"
+    "- Your ID is {profile_id_placeholder}.\n"
     "- Each participant has an immutable, unique ID.\n"
     "- XML-wrapped text is information/data for YOU, from YOU.\n"
     "- <whisper_context> or <private_whisper> means a user is speaking privately to you.\n"

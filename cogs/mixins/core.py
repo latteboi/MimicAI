@@ -827,7 +827,7 @@ class CoreMixin:
                     if t.get('url_context') and profile_data.get('url_fetching_enabled', False):
                         parts.append(f"\n<document_context>\n{t.get('url_context')}\n</document_context>")
                     if t.get('grounding_context') and profile_data.get('grounding_mode', 'off') != 'off':
-                        parts.append(f"\n<external_context>\n{t.get('grounding_context')}\n</external_context>")
+                        parts.append(f"\n{t.get('grounding_context')}")
                 
                 content_obj = {'role': t_role, 'parts': parts}
                 if t_role == 'model' and t.get('thought_signature'):
@@ -1876,7 +1876,7 @@ class CoreMixin:
                 return new_name
             counter += 1
 
-    async def setup_multi_profile_session(self, interaction: discord.Interaction, participants: List[Dict], session_prompt: Optional[str], session_mode: str, as_admin_scope: bool = False, audio_mode: str = "text-only"):
+    async def setup_multi_profile_session(self, interaction: discord.Interaction, participants: List[Dict], session_prompt: Optional[str], session_mode: str, as_admin_scope: bool = False, audio_mode: str = "off"):
         user_id = interaction.user.id
         is_update = interaction.channel_id in self.multi_profile_channels
 
@@ -1917,7 +1917,7 @@ class CoreMixin:
                 "session_mode": "sequential",
                 "pending_image_gen_data": None,
                 "pending_whispers": {},
-                "audio_mode": "text-only"
+                "audio_mode": "off"
             }
             self.multi_profile_channels[interaction.channel_id] = session
 
@@ -2069,7 +2069,7 @@ class CoreMixin:
                     if role == 'user' and turn.get("url_context") and p_profile_settings.get("url_fetching_enabled", False):
                         parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
                     if role == 'user' and turn.get("grounding_context") and p_profile_settings.get("grounding_mode", "off") != "off":
-                        parts.append(f"\n<external_context>\n{turn.get('grounding_context')}\n</external_context>")
+                        parts.append(f"\n{turn.get('grounding_context')}")
 
                     participant_history.append({'role': role, 'parts': parts})
                 elif turn_type == "whisper":

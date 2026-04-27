@@ -869,6 +869,11 @@ class ServicesMixin:
             current_instructions_str += f"\n\n<negative_constraints>\nSTRICT ADHERENCE REQUIRED:\n{critic_constraints}\n</negative_constraints>"
         
         rule_block = self.global_prompts.get("CONTEXT_RULES", DEFAULT_CONTEXT_RULES)
+        
+        # [NEW] Dynamically inject the profile's ID into the context rules
+        profile_id_val = self._get_profile_id(profile_owner_id, profile_name_to_use)
+        rule_block = rule_block.format(profile_id_placeholder=profile_id_val)
+        
         current_instructions_str += "\n\n" + rule_block
 
         final_system_instruction = current_instructions_str if current_instructions_str.strip() else DEFAULT_SYSTEM_INSTRUCTION
@@ -2571,7 +2576,7 @@ class ServicesMixin:
                     # [NEW] Unified Synthesis Logic
                     audio_file_for_send = None
                     
-                    if profile_settings.get("speech_tts_enabled", False):
+                    if profile_settings.get("speech_tts_enabled", False) and session.get("audio_mode", "off") == "on":
                         s_voice = profile_settings.get("speech_voice", "Aoede")
                         s_model = profile_settings.get("speech_model")
                         if s_model and "none" not in s_model.lower():
@@ -4928,6 +4933,7 @@ class ServicesMixin:
     async def handle_child_bot_toggle(self, event_data: Dict):
         bot_id = str(event_data.get("bot_id")) # Ensure string
         channel_id = event_data.get("channel_id")
+        correlation_id = event_data.get("correlation_id")
         
         bot_config = self.child_bots.get(bot_id)
         if not bot_config: return
@@ -4937,11 +4943,18 @@ class ServicesMixin:
         # Block toggling in Freewill sessions
         if session and session.get("type") == "freewill":
             channel = self.bot.get_channel(channel_id)
-            if channel:
-                await channel.send("You cannot use this command in Freewill sessions. You can add child bots through the Freewill UI.")
+            if correlation_id:
+                await self.manager_queue.put({
+                    "action": "send_to_child", "bot_id": bot_id,
+                    "payload": {"action": "toggle_result", "correlation_id": correlation_id, "result": "You cannot use this command in Freewill sessions. You can add child bots through the Freewill UI."}
+                })
+            else:
+                if channel:
+                    await channel.send("You cannot use this command in Freewill sessions. You can add child bots through the Freewill UI.")
             return
 
         action_taken = None
+        result_msg = ""
 
         if not session:
             # If no session, create one and add the bot.
@@ -4956,10 +4969,11 @@ class ServicesMixin:
                 "owner_id": event_data.get("user_id"), "is_running": False,
                 "task_queue": asyncio.Queue(),
                 "worker_task": None, "turns_since_last_ltm": 0, "session_prompt": None,
-                "session_mode": "sequential"
+                "session_mode": "sequential", "audio_mode": "off"
             }
             self.multi_profile_channels[channel_id] = session
             action_taken = "add"
+            result_msg = "Created a new Chat Session."
         else:
             # Session exists, check if bot is already a participant
             participant_index = -1
@@ -4973,10 +4987,19 @@ class ServicesMixin:
                 removed_p = session['profiles'].pop(participant_index)
                 session['chat_sessions'].pop((removed_p['owner_id'], removed_p['profile_name']), None)
                 action_taken = "remove"
+                result_msg = "Removed from the current Chat Session."
                 
                 if not session['profiles']:
                     self.multi_profile_channels.pop(channel_id, None)
             else:
+                if len(session['profiles']) >= 10:
+                    if correlation_id:
+                        await self.manager_queue.put({
+                            "action": "send_to_child", "bot_id": bot_id,
+                            "payload": {"action": "toggle_result", "correlation_id": correlation_id, "result": "The current Chat Session contains the maximum of 10 participating profiles. Please remove a profile and try again."}
+                        })
+                    return
+
                 # Add it
                 participant = {
                     "owner_id": bot_config['owner_id'], "profile_name": bot_config['profile_name'],
@@ -4986,6 +5009,7 @@ class ServicesMixin:
                 # Also create the placeholder for the chat session
                 session['chat_sessions'][(participant['owner_id'], participant['profile_name'])] = None
                 action_taken = "add"
+                result_msg = "Added to the current Chat Session."
         
         self._save_multi_profile_sessions()
 
@@ -4999,6 +5023,12 @@ class ServicesMixin:
                 await self.manager_queue.put({
                     "action": "send_to_child", "bot_id": bot_id,
                     "payload": {"action": "stop_typing", "channel_id": channel_id}
+                })
+            
+            if correlation_id:
+                await self.manager_queue.put({
+                    "action": "send_to_child", "bot_id": bot_id,
+                    "payload": {"action": "toggle_result", "correlation_id": correlation_id, "result": result_msg}
                 })
 
     async def handle_child_bot_refresh(self, command_data: Dict):
@@ -6477,7 +6507,7 @@ class ServicesMixin:
                         if turn.get("url_context") and p_profile.get("url_fetching_enabled", False):
                             parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
                         if turn.get("grounding_context") and p_profile.get("grounding_mode", "off") != "off":
-                            parts.append(f"\n<external_context>\n{turn.get('grounding_context')}\n</external_context>")
+                            parts.append(f"\n{turn.get('grounding_context')}")
                             
                     participant_history.append({'role': role, 'parts': parts})
                     if role == 'model':

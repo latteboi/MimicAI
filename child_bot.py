@@ -8,6 +8,7 @@ import sys
 import base64
 import io
 import aiohttp
+import uuid
 from PIL import Image
 
 # Global State
@@ -44,6 +45,7 @@ class HiveMind:
         asyncio.set_event_loop(self.loop)
         self.ws = None
         self.typing_tasks = {} # { (bot_id, channel_id): asyncio.Task }
+        self.pending_toggles = {}
 
     async def execute_typing(self, bot_id, payload):
         bot = self.clients.get(bot_id)
@@ -142,15 +144,31 @@ class HiveMind:
                 await interaction.response.send_message("An error occurred while verifying parent bot presence.", ephemeral=True)
                 return
 
+            await interaction.response.defer(ephemeral=True)
+
+            correlation_id = str(uuid.uuid4())
+            toggle_event = asyncio.Event()
+            self.pending_toggles[correlation_id] = {"event": toggle_event, "result": None}
+
             toggle_data = {
                 "action": "toggle_session_participation",
                 "bot_id": bot_id,
                 "channel_id": interaction.channel_id,
                 "guild_id": interaction.guild_id,
-                "user_id": interaction.user.id
+                "user_id": interaction.user.id,
+                "correlation_id": correlation_id
             }
             await self.ws.send(json.dumps(toggle_data))
-            await interaction.response.send_message("Added to this session.", ephemeral=True)
+            
+            try:
+                await asyncio.wait_for(toggle_event.wait(), timeout=10.0)
+                res = self.pending_toggles[correlation_id]["result"]
+            except asyncio.TimeoutError:
+                res = "Action timed out."
+            finally:
+                self.pending_toggles.pop(correlation_id, None)
+
+            await interaction.followup.send(res or "No response from Manager.", ephemeral=True)
 
         async def runner():
             try:
@@ -454,6 +472,12 @@ class HiveMind:
                                     del self.typing_tasks[t_key]
                             elif child_action in ["update_username", "update_avatar"]:
                                 asyncio.create_task(self.update_appearance(target_id, child_payload))
+                            elif child_action == "toggle_result":
+                                corr_id = child_payload.get("correlation_id")
+                                res = child_payload.get("result")
+                                if corr_id in self.pending_toggles:
+                                    self.pending_toggles[corr_id]["result"] = res
+                                    self.pending_toggles[corr_id]["event"].set()
 
             except (websockets.exceptions.ConnectionClosed, ConnectionRefusedError):
                 print("[Hive] Connection lost. Reconnecting in 5s...")

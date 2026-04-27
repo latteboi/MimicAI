@@ -3275,7 +3275,7 @@ class SessionConfigView(ui.View):
         embed = discord.Embed(title=f"Chat Session: #{self.original_interaction.channel.name}", color=discord.Color.gold())
 
         if self.current_tab == "cast":
-            embed.description = "Add or remove participants. This controls who is actively in the channel."
+            embed.description = "Add or remove participants (10 max). This controls who is actively in the channel."
             active_list = self.lists[self.view_source]
             
             num_pages = max(1, (len(active_list) - 1) // DROPDOWN_MAX_OPTIONS + 1)
@@ -3289,7 +3289,7 @@ class SessionConfigView(ui.View):
                         p_name = item.get('profile_name')
                         bid = next((k for k, v in self.cog.child_bots.items() if v is item), None)
                         val = f"child_{bid}"
-                        lbl = f"Child Bot ({p_name})"
+                        lbl = p_name
                         
                         is_sel = any(p.get('method') == 'child_bot' and str(p.get('bot_id')) == str(bid) for p in self.session.get('profiles', []))
                     else:
@@ -3318,10 +3318,12 @@ class SessionConfigView(ui.View):
                     if val.startswith("child_"):
                         bid = val.split("_")[1]
                         if not any(p.get('bot_id') == bid for p in self.session['profiles']):
+                            if len(self.session['profiles']) >= 10: break
                             bc = self.cog.child_bots.get(bid)
                             if bc: self.session['profiles'].append({"owner_id": bc['owner_id'], "profile_name": bc['profile_name'], "method": "child_bot", "bot_id": bid, "chance": 100, "wakewords": []})
                     else:
                         if not any(p.get('profile_name') == val and p.get('method') != 'child_bot' for p in self.session['profiles']):
+                            if len(self.session['profiles']) >= 10: break
                             self.session['profiles'].append({"owner_id": self.original_interaction.user.id, "profile_name": val, "method": "webhook", "chance": 100, "wakewords": []})
                 
                 self.cog._save_multi_profile_sessions()
@@ -3350,7 +3352,7 @@ class SessionConfigView(ui.View):
                 async def n_cb(i): self.current_page += 1; await i.response.defer(); await self.update_display()
                 next_btn.callback = n_cb; self.add_item(next_btn)
 
-            cast_list = "\n".join(f"{idx+1}. `{p['profile_name']}`" for idx, p in enumerate(self.session['profiles'])) or "*No participants*"
+            cast_list = "\n".join(f"{idx+1}. `{p['profile_name']}` ({'Child Bot' if p.get('method') == 'child_bot' else 'Webhook'})" for idx, p in enumerate(self.session['profiles'])) or "*No participants*"
             embed.add_field(name="Current Cast", value=cast_list, inline=False)
 
         elif self.current_tab == "config":
@@ -3371,6 +3373,15 @@ class SessionConfigView(ui.View):
             async def pr_cb(i): await i.response.send_modal(SessionPromptModal(self))
             prompt_btn.callback = pr_cb
             self.add_item(prompt_btn)
+
+            audio_val = self.session.get("audio_mode", "off")
+            audio_btn = ui.Button(label=f"Toggle Audio: {'ON' if audio_val == 'on' else 'OFF'}", style=discord.ButtonStyle.success if audio_val == 'on' else discord.ButtonStyle.secondary, row=0)
+            async def audio_cb(i):
+                self.session["audio_mode"] = "off" if self.session.get("audio_mode", "off") == "on" else "on"
+                self.cog._save_multi_profile_sessions()
+                await i.response.defer(); await self.update_display()
+            audio_btn.callback = audio_cb
+            self.add_item(audio_btn)
 
         elif self.current_tab == "reactivity":
             embed.description = "Manage how likely participants are to respond to messages."
