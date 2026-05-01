@@ -1035,6 +1035,9 @@ class ServicesMixin:
                 
                 all_triggers_for_round = valid_triggers
 
+                # [NEW] Record the start of this batch for Hybrid STM
+                batch_start_index = len(session.get("unified_log", []))
+
                 is_proactive_auto_round = False
                 for i, t in enumerate(all_triggers_for_round):
                     if isinstance(t, tuple) and t[0] == 'proactive_trigger':
@@ -2150,9 +2153,48 @@ class ServicesMixin:
                         contents_for_api_call = []
                         session_key = (channel.id, owner_id, profile_name)
 
-                       # Start with a deep copy of the session's history to avoid mutating RAM
-                        import copy
-                        contents_for_api_call = copy.deepcopy(chat_session.history)
+                        # [NEW] Hybrid STM: Rebuild history dynamically from unified_log
+                        # Past history is governed by STM. Current round context bypasses STM.
+                        unified_log = session.get("unified_log", [])
+                        past_log = unified_log[:batch_start_index]
+                        current_batch_log = unified_log[batch_start_index:]
+                        
+                        stm_length = int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
+                        if stm_length > 0:
+                            past_log = past_log[-(stm_length * 2):]
+                        else:
+                            past_log = []
+                            
+                        combined_log = past_log + current_batch_log
+                        bot_pid = self._get_pid_from_name_any(owner_id, profile_name)
+                        
+                        for turn in combined_log:
+                            if turn.get("is_hidden"): continue
+                            
+                            turn_type = turn.get("type")
+                            if not turn_type:
+                                role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
+                                parts = [turn.get("content")]
+                                if role == 'user' and turn.get("url_context") and p_settings.get("url_fetching_enabled", False):
+                                    parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
+                                if role == 'user' and turn.get("grounding_context") and p_settings.get("grounding_mode", "off") != "off":
+                                    parts.append(f"\n{turn.get('grounding_context')}")
+                                contents_for_api_call.append({'role': role, 'parts': parts})
+                            elif turn_type == "whisper":
+                                if turn.get("target_pid") == bot_pid:
+                                    clean_content = turn.get("content")
+                                    header, body = clean_content.split('\n', 1)
+                                    wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
+                                    contents_for_api_call.append({'role': 'user', 'parts': [wrapped]})
+                            elif turn_type == "private_response":
+                                if turn.get("speaker_pid") == bot_pid:
+                                    clean_content = turn.get("content")
+                                    header, body = clean_content.split('\n', 1)
+                                    wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
+                                    obj = {'role': 'model', 'parts': [wrapped]}
+                                    if turn.get('thought_signature'):
+                                        obj['thought_signature'] = turn.get('thought_signature')
+                                    contents_for_api_call.append(obj)
 
                         # Check if the last turn was from this model itself
                         if contents_for_api_call and contents_for_api_call[-1].get('role', contents_for_api_call[-1].get('role', 'user')) == 'model':
@@ -2258,10 +2300,10 @@ class ServicesMixin:
                                     
                                 status = "success"
                             except asyncio.CancelledError:
-                                if state_container:
-                                    if state_container.get('sending_task'): state_container['sending_task'].cancel()
-                                    await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
-                                    await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
+                                if state_container and state_container.get('sending_task'):
+                                    state_container['sending_task'].cancel()
+                                await self._safe_delete_placeholder(channel, state_container.get('msg_a_id') if state_container else msg_a_id)
+                                await self._safe_delete_placeholder(channel, state_container.get('msg_b_id') if state_container else None)
                                 if 'contents_for_api_call' in locals():
                                     contents_for_api_call.clear()
                                     del contents_for_api_call
@@ -2318,10 +2360,10 @@ class ServicesMixin:
                                         fallback_used = True
                                         self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile_fallback", model_used=fb_name, status="success")
                                     except asyncio.CancelledError:
-                                        if state_container:
-                                            if state_container.get('sending_task'): state_container['sending_task'].cancel()
-                                            await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
-                                            await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
+                                        if state_container and state_container.get('sending_task'):
+                                            state_container['sending_task'].cancel()
+                                        await self._safe_delete_placeholder(channel, state_container.get('msg_a_id') if state_container else msg_a_id)
+                                        await self._safe_delete_placeholder(channel, state_container.get('msg_b_id') if state_container else None)
                                         if 'contents_for_api_call' in locals():
                                             contents_for_api_call.clear()
                                             del contents_for_api_call
@@ -2801,11 +2843,16 @@ class ServicesMixin:
                             await self._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
                     
                     # --- Dispatch Warnings and Clean Up Placeholders ---
+                    if state_container and state_container.get('sending_task'):
+                        state_container['sending_task'].cancel()
+                        
+                    msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
+                    msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
+
+                    await self._safe_delete_placeholder(channel, msg_a_to_delete)
+                    await self._safe_delete_placeholder(channel, msg_b_to_delete)
+
                     if state_container:
-                        if state_container.get('sending_task'):
-                            state_container['sending_task'].cancel()
-                        await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
-                        await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
                         state_container['msg_a_id'] = None
                         state_container['msg_b_id'] = None
                         
@@ -5368,10 +5415,10 @@ class ServicesMixin:
 
                     status = "success"
                 except asyncio.CancelledError:
-                    if state_container:
-                        if state_container.get('sending_task'): state_container['sending_task'].cancel()
-                        await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
-                        await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
+                    if state_container and state_container.get('sending_task'):
+                        state_container['sending_task'].cancel()
+                    await self._safe_delete_placeholder(channel, state_container.get('msg_a_id') if state_container else msg_a_id)
+                    await self._safe_delete_placeholder(channel, state_container.get('msg_b_id') if state_container else None)
                     return []
                 except Exception as e:
                     is_timeout_main = isinstance(e, TimeoutError)
@@ -5574,11 +5621,16 @@ class ServicesMixin:
                 # However, updating the placeholder guarantees visual consistency if TTS is added to Freewill.
                 await self._update_sending_placeholder(channel, method, bot_id, state_container, time.monotonic() - 10)
 
+            if state_container and state_container.get('sending_task'):
+                state_container['sending_task'].cancel()
+                
+            msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
+            msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
+
+            await self._safe_delete_placeholder(channel, msg_a_to_delete)
+            await self._safe_delete_placeholder(channel, msg_b_to_delete)
+
             if state_container:
-                if state_container.get('sending_task'):
-                    state_container['sending_task'].cancel()
-                await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
-                await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
                 state_container['msg_a_id'] = None
                 state_container['msg_b_id'] = None
 
@@ -6493,9 +6545,27 @@ class ServicesMixin:
             # 3. History Slicing (Time Travel)
             sliced_unified_log = session["unified_log"][:actual_turn_index]
             
+            # [NEW] Hybrid STM for Regeneration
+            batch_start_index = 0
+            for i in range(len(sliced_unified_log) - 1, -1, -1):
+                if sliced_unified_log[i].get("is_user") is True:
+                    batch_start_index = i
+                    break
+                    
+            past_log = sliced_unified_log[:batch_start_index]
+            current_batch_log = sliced_unified_log[batch_start_index:]
+            
+            stm_length = int(p_profile.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
+            if stm_length > 0:
+                past_log = past_log[-(stm_length * 2):]
+            else:
+                past_log = []
+                
+            combined_log = past_log + current_batch_log
+            
             participant_history = []
             pending_whispers_for_regen = []
-            for turn in sliced_unified_log:
+            for turn in combined_log:
                 if turn.get("is_hidden", False):
                     continue
                 

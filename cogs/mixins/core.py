@@ -924,6 +924,10 @@ class CoreMixin:
 
                 status = "success"
             except asyncio.CancelledError:
+                if state_container and state_container.get('sending_task'):
+                    state_container['sending_task'].cancel()
+                msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
+                await self._safe_delete_placeholder(interaction.channel, msg_b_to_delete)
                 return
             except Exception as e:
                 is_timeout_main = isinstance(e, TimeoutError)
@@ -1054,6 +1058,13 @@ class CoreMixin:
                 err_embed = placeholder_msg.embeds[0]
                 err_embed.description = custom_main
                 await placeholder_msg.edit(embed=err_embed)
+                
+                if state_container and state_container.get('sending_task'):
+                    state_container['sending_task'].cancel()
+                msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
+                await self._safe_delete_placeholder(interaction.channel, msg_b_to_delete)
+                if state_container:
+                    state_container['msg_b_id'] = None
                 
                 await self._dispatch_warnings(interaction.channel, 'webhook', None, turn_warnings, host_user_id, profile_name)
                 return
@@ -1448,14 +1459,38 @@ class CoreMixin:
             await interaction.followup.send("Original response not found in log.", ephemeral=True)
             return
 
+        # [NEW] Hybrid STM for Whisper Regeneration
+        batch_start_index = 0
+        for i in range(len(sliced_log) - 1, -1, -1):
+            if sliced_log[i].get("is_user") is True:
+                batch_start_index = i
+                break
+                
+        past_log = sliced_log[:batch_start_index]
+        current_batch_log = sliced_log[batch_start_index:]
+        
+        stm_length = int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
+        if stm_length > 0:
+            past_log = past_log[-(stm_length * 2):]
+        else:
+            past_log = []
+            
+        combined_log = past_log + current_batch_log
+
         participant_history = []
         bot_pid = self._get_pid_from_name_any(owner_id, profile_name)
-        for turn in sliced_log:
+        for turn in combined_log:
             if turn.get("is_hidden"): continue
             turn_type = turn.get("type")
             if not turn_type:
                 role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
-                participant_history.append({'role': role, 'parts': [turn.get("content")]})
+                parts = [turn.get("content")]
+                if role == 'user':
+                    if turn.get("url_context") and p_settings.get("url_fetching_enabled", False):
+                        parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
+                    if turn.get("grounding_context") and p_settings.get("grounding_mode", "off") != "off":
+                        parts.append(f"\n{turn.get('grounding_context')}")
+                participant_history.append({'role': role, 'parts': parts})
             elif turn_type == "whisper" and turn.get("target_pid") == bot_pid:
                 header, body = turn.get("content").split('\n', 1)
                 wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
