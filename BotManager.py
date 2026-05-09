@@ -353,7 +353,7 @@ async def main():
     finally:
         # Graceful shutdown
         print("Shutting down main bot and child processes...")
-        if not ipc_server.is_serving():
+        if ipc_server.is_serving():
             ipc_server.close()
             await ipc_server.wait_closed()
         

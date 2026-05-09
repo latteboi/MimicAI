@@ -1421,7 +1421,7 @@ class StorageMixin:
                 "ltm_context_size": 3, "ltm_relevance_threshold": 0.75, "ltm_creation_interval": 10,
                 "ltm_summarization_context": 10, "ltm_scope": "server", "safety_level": "low",
                 "primary_model": PRIMARY_MODEL_NAME, "fallback_model": FALLBACK_MODEL_NAME,
-                "time_tracking_enabled": True, "timezone": "UTC", "generation_metadata_enabled": False,
+                "time_tracking_enabled": True, "timezone": "UTC",
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
                 "image_generation_enabled": False, "image_generation_model": "gemini-2.5-flash-image",
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",

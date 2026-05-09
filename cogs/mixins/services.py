@@ -573,16 +573,34 @@ class ServicesMixin:
 
     async def _safe_delete_placeholder(self, channel, message_id):
         if not message_id: return
-        try:
-            webhook = await self._get_or_create_webhook(channel)
-            if webhook:
-                await webhook.delete_message(message_id)
+        
+        max_retries = 3
+        backoff = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                webhook = await self._get_or_create_webhook(channel)
+                if webhook:
+                    await webhook.delete_message(message_id)
+                    return
+            except Exception:
+                # If the message was sent by a Child Bot, the webhook will throw an error (usually NotFound).
+                # We must pass here to ensure we fall through to the standard client deletion below.
+                pass 
+                
+            try:
+                msg = await channel.fetch_message(message_id)
+                await msg.delete()
                 return
-        except Exception: pass
-        try:
-            msg = await channel.fetch_message(message_id)
-            await msg.delete()
-        except Exception: pass
+            except discord.NotFound:
+                return # The message genuinely no longer exists in the channel
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"Failed to delete placeholder {message_id} after {max_retries} attempts: {e}")
+                    return
+            
+            await asyncio.sleep(backoff)
+            backoff *= 2.0
 
     async def _send_child_bot_placeholder(self, bot_id: str, channel_id: int, custom_emoji: str) -> Optional[int]:
         corr_id = str(uuid.uuid4())
@@ -2569,29 +2587,24 @@ class ServicesMixin:
                     main_history_line = self._format_history_entry(speaker_display_name, sent_timestamp, response_text, timezone_str, entity_id=profile_id)
                     
                     history_line = main_history_line
-                    # Transcript metadata injection (hidden from visual UI but available for context)
-                    if profile_settings.get("generation_metadata_enabled", False):
-                        try:
-                            t1_formatted = t1_start_utc.astimezone(ZoneInfo(timezone_str)).strftime('%I:%M:%S %p %Z')
-                        except Exception:
-                            t1_formatted = t1_start_utc.strftime('%I:%M:%S %p UTC')
-                        metadata_line = f"(Thought Initiated: {t1_formatted} | Duration: {duration:.2f}s)"
-                        history_line = f"{main_history_line.strip()}\n{metadata_line}\n"
-
-                    # UI Subtext delivery
-                    ui_meta = []
-                    if profile_settings.get("generation_metadata_enabled", False):
-                        ui_meta.append(f"Dur: {duration:.2f}s")
-                    if profile_settings.get("id_metadata_enabled", False):
-                        ui_meta.append(f"PID: {profile_id}")
-                    
-                    if ui_meta:
-                        display_text += f"\n\n-# { ' | '.join(ui_meta) }"
-                    else:
-                        history_line = main_history_line
 
                     turn_id = str(uuid.uuid4())
                     bot_pid = self._get_pid_from_name_any(owner_id, profile_name)
+                    
+                    # [NEW] Meta collection for App Context Menu tracing
+                    meta = {
+                        "duration": round(duration, 2),
+                        "model": model.model_name.replace("models/", "").replace("OPENROUTER/", "").replace("GOOGLE/", "") if hasattr(model, 'model_name') else fallback_model_name,
+                        "fallback": fallback_used,
+                        "training_recalled": len(training_examples_list) if 'training_examples_list' in locals() and training_examples_list else 0,
+                        "grounding_sources": [s.get('uri') for s in turn_grounding_sources if isinstance(s, dict) and s.get('uri')] if 'turn_grounding_sources' in locals() and turn_grounding_sources else [],
+                        "ltms_recalled": []
+                    }
+                    if 'ltm_recall_text' in locals() and ltm_recall_text:
+                        lines = ltm_recall_text.split('\n')
+                        clean_lines = [l.strip() for l in lines if l.strip() and not l.startswith("<")]
+                        meta["ltms_recalled"] = [l[:100] + "..." if len(l) > 100 else l for l in clean_lines]
+
                     turn_object = {
                         "turn_id": turn_id,
                         "is_user": False,
@@ -2599,7 +2612,8 @@ class ServicesMixin:
                         "owner_id": owner_id,
                         "profile_name": profile_name,
                         "message_ids": [],
-                        "content": history_line
+                        "content": history_line,
+                        "meta": meta
                     }
                     if profile_settings.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
                         sig = response.thought_signature
@@ -3058,6 +3072,12 @@ class ServicesMixin:
                                     if summary_embedding:
                                         quantized_embedding = _quantize_embedding(summary_embedding)
                                         self._add_ltm(owner_id, profile_name, ltm_d, quantized_embedding, guild_id, triggering_user_id, round_author_name)
+                                        
+                                        # [NEW] Link LTM creation to the turn metadata for trace transparency
+                                        bot_pid = self._get_pid_from_name_any(owner_id, profile_name)
+                                        last_turn = next((t for t in reversed(session.get("unified_log", [])) if t.get("speaker_pid") == bot_pid), None)
+                                        if last_turn and "meta" in last_turn:
+                                            last_turn["meta"]["ltm_created"] = True
                             
                             participant['ltm_counter'] = 0
 
@@ -6712,6 +6732,7 @@ class ServicesMixin:
             response = None
             fallback_used = False
             
+            t_start_regen = time.monotonic()
             try:
                 response, state_container = await self._generate_with_heartbeat(
                     model, participant_history, gen_config, channel, participant, payload.message_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state={"custom_emoji": custom_emoji}
@@ -6886,6 +6907,26 @@ class ServicesMixin:
             final_target_turn["content"] = new_history_line
             final_target_turn["timestamp"] = sent_timestamp.isoformat()
             final_target_turn["message_ids"] = [payload.message_id]
+            
+            regen_grounding_sources = []
+            if response and hasattr(response, 'raw') and response.raw.candidates:
+                if hasattr(response.raw.candidates[0], 'grounding_metadata'):
+                    metadata = response.raw.candidates[0].grounding_metadata
+                    if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
+                        for chunk in metadata.grounding_chunks:
+                            if hasattr(chunk, 'web'):
+                                regen_grounding_sources.append(chunk.web.uri)
+
+            # [NEW] Meta collection for regeneration
+            meta = {
+                "duration": round(time.monotonic() - t_start_regen, 2) if 't_start_regen' in locals() else 0.0,
+                "model": model.model_name.replace("models/", "").replace("OPENROUTER/", "").replace("GOOGLE/", "") if hasattr(model, 'model_name') else fallback_model_name,
+                "fallback": fallback_used,
+                "training_recalled": len(training_examples) if 'training_examples' in locals() and training_examples else 0,
+                "grounding_sources": regen_grounding_sources,
+                "ltms_recalled": [] # Context carries over natively; we don't re-query LTMs on regen
+            }
+            final_target_turn["meta"] = meta
             
             if p_profile.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
                 sig = response.thought_signature

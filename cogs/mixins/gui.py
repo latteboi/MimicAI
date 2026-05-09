@@ -1174,7 +1174,6 @@ class ProfileManageView(ui.View):
             options.append(discord.SelectOption(label="Toggle URL Context Fetching", value="url_toggle", description="Cycle URL Context: OFF -> NATIVE -> RAG."))
             options.append(discord.SelectOption(label="Cycle Response Mode", value="cycle_response", description="Cycle: Regular -> Mention -> Reply -> Mention Reply."))
             options.append(discord.SelectOption(label="Set Time & Timezone", value="time", description="Enable time awareness and set the profile's timezone."))
-            options.append(discord.SelectOption(label="Toggle Generation Metadata", value="metadata_toggle", description="Show/hide generation time in context."))
             options.append(discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable a human-like delay when the bot sends messages."))
             options.append(discord.SelectOption(label="Toggle Anti-Repetition Critic", value="critic", description="Enable semantic repetition analysis (Adds latency)."))
 
@@ -1358,12 +1357,6 @@ class ProfileManageView(ui.View):
             await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice == "time":
             await self._handle_timezone(interaction, profile, self.is_borrowed)
-        elif choice == "metadata_toggle":
-            async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog._build_profile_manage_embed(modal_interaction, profile_name)
-                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileMetadataModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb)
-            await interaction.response.send_modal(modal)
         elif choice == "critic":
             profile["critic_enabled"] = not profile.get("critic_enabled", False)
             await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
@@ -1722,7 +1715,6 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
                 "image_generation_model": owner_profile_data.get("image_generation_model", "gemini-2.5-flash-image"),
                 "url_fetching_enabled": owner_profile_data.get("url_fetching_enabled", False),
                 "critic_enabled": owner_profile_data.get("critic_enabled", False),
-                "generation_metadata_enabled": owner_profile_data.get("generation_metadata_enabled", False),
                 "speech_voice": owner_profile_data.get("speech_voice", "Aoede"),
                 "speech_model": owner_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts"),
                 "speech_temperature": owner_profile_data.get("speech_temperature", 1.0),
@@ -2516,7 +2508,7 @@ class ShutdownConfirmView(ui.View):
             for bot_id in list(self.cog.bot.child_bot_config.keys()):
                 await self.cog.manager_queue.put({"action": "shutdown_bot", "bot_id": bot_id})
         
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
 
         # 2. Flush all in-memory sessions to disk
         for session_key, chat_session in self.cog.global_chat_sessions.items():
@@ -2537,6 +2529,7 @@ class ShutdownConfirmView(ui.View):
                     os.remove(COG_LOCK_FILE_PATH)
             except: pass
         
+        await self.cog.bot.change_presence(status=discord.Status.offline)
         await self.cog.bot.close()
 
     async def on_timeout(self):
@@ -4154,8 +4147,6 @@ class BulkActionView(BaseBulkProfileView):
             final_message = await self.cog.bulk_apply_image_settings(self.user_id, target_profiles_list, self.params)
         elif self.action == "apply_generation_visual":
             final_message = await self.cog.bulk_apply_generation_visual(self.user_id, target_profiles_list, self.params)
-        elif self.action == "apply_metadata":
-            final_message = await self.cog.bulk_apply_metadata_settings(self.user_id, target_profiles_list, self.params)
         
         await interaction.edit_original_response(content=final_message, view=None)
 
@@ -4464,53 +4455,6 @@ class ProfileGenerationVisualModal(ui.Modal, title="Generation Visual"):
             if self.callback: await self.callback(interaction)
         else:
             await interaction.followup.send("❌ Profile not found.", ephemeral=True)
-
-class BulkMetadataView(BaseBulkProfileView):
-    def __init__(self, cog: 'GeminiAgent', user_id: int):
-        super().__init__(cog, user_id, include_borrowed=True)
-        self.toggle_choice = None
-        self._build_view()
-
-    def _build_view(self):
-        self.clear_items()
-        
-        toggle_options = [
-            discord.SelectOption(label="Enable Generation Metadata", value="enable", default=(self.toggle_choice is True)),
-            discord.SelectOption(label="Disable Generation Metadata", value="disable", default=(self.toggle_choice is False))
-        ]
-        toggle_select = ui.Select(placeholder="Choose an action...", options=toggle_options, row=0)
-        toggle_select.callback = self.toggle_callback
-        self.add_item(toggle_select)
-
-        self._build_profile_select_ui(row=1)
-        
-        apply_btn = ui.Button(label="Apply Action", style=discord.ButtonStyle.green, row=3)
-        apply_btn.callback = self.apply_action
-        self.add_item(apply_btn)
-
-    async def toggle_callback(self, interaction: discord.Interaction):
-        self.toggle_choice = interaction.data['values'][0] == "enable"
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def apply_action(self, interaction: discord.Interaction, button: ui.Button = None):
-        await interaction.response.defer()
-        target_profiles = list(self.selected_profiles)
-        if self.toggle_choice is None or not target_profiles:
-            await interaction.edit_original_response(content="Please select an action and at least one profile.", view=None); return
-
-        updated_count = 0
-        index = self.cog._get_user_index(self.user_id)
-        for profile_name in target_profiles:
-            is_borrowed = profile_name in index.get("borrowed", [])
-            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
-            if profile:
-                profile["generation_metadata_enabled"] = self.toggle_choice
-                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
-                updated_count += 1
-        
-        status = "ENABLED" if self.toggle_choice else "DISABLED"
-        await interaction.edit_original_response(content=f"Generation metadata has been set to **{status}** for {updated_count} profile(s).", view=None)
 
 class BulkResetView(BaseBulkProfileView):
     def __init__(self, cog: 'GeminiAgent', user_id: int):
@@ -5953,7 +5897,6 @@ class BulkManageView(ui.View):
             discord.SelectOption(label="Configure Image Generation", value="image_gen", description="Setup models, prompts, and toggles for multiple profiles."),
             discord.SelectOption(label="Toggle URL Context Fetching", value="url_context", description="Enable or disable link scraping for multiple profiles."),
             discord.SelectOption(label="Set Time & Timezone", value="timezone", description="Enable time-awareness and set a specific timezone."),
-            discord.SelectOption(label="Set Profile Metadata", value="metadata_toggle", description="Configure visual ID and Duration metadata."),
             discord.SelectOption(label="Set Generation Visual", value="generation_visual", description="Apply custom placeholder emoji to multiple profiles."),
             discord.SelectOption(label="Toggle Critic (Anti-Repetition)", value="critic", description="Enable or disable the critic for multiple profiles."),
             discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable or disable realistic typing for multiple profiles."),
@@ -6134,14 +6077,6 @@ class BulkManageView(ui.View):
             await interaction.response.defer()
             view = BulkTimezoneView(self.cog, self.user_id)
             await self.original_interaction.edit_original_response(content="Select a timezone and the profiles to apply it to:", view=view)
-            
-        elif choice == "metadata_toggle":
-            modal = ProfileMetadataModal(self.cog, "BULK_APPLY", {}, False)
-            async def modal_callback(i: discord.Interaction, params: Dict):
-                view = BulkActionView(self.cog, self.user_id, "apply_metadata", "Select profiles to apply metadata settings to...", params=params, include_borrowed=True)
-                await self.original_interaction.edit_original_response(content="Metadata settings validated. Select the profiles to apply them to:", view=view)
-            modal.callback = modal_callback
-            await interaction.response.send_modal(modal)
             
         elif choice == "generation_visual":
             modal = ProfileGenerationVisualModal(self.cog, "BULK_APPLY", {}, False)

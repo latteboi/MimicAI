@@ -179,6 +179,12 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         # Model Stats Initialization
         self.MODELS_DATA_DIR = os.path.join(DATA_DIR, "models")
         os.makedirs(self.MODELS_DATA_DIR, exist_ok=True)
+        
+        self.trace_ctx_menu = app_commands.ContextMenu(
+            name="View Generation Trace",
+            callback=self.view_generation_trace
+        )
+        self.bot.tree.add_command(self.trace_ctx_menu)
 
     profile_group = app_commands.Group(name="profile", description="Manage your personal bot profiles (persona, instructions).")
 
@@ -1117,6 +1123,68 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         finally:
             if session_lock:
                 session_lock['is_purging'] = False
+
+    @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
+    async def view_generation_trace(self, interaction: discord.Interaction, message: discord.Message):
+        if not self.has_lock: return
+        await interaction.response.defer(ephemeral=True)
+            
+        channel_id = message.channel.id
+        session = self.multi_profile_channels.get(channel_id)
+        unified_log = None
+        
+        if session and session.get("is_hydrated"):
+            unified_log = session.get("unified_log")
+        else:
+            # Check disk for dehydrated sessions
+            for s_type in ["multi", "freewill"]:
+                dummy_key = (channel_id, None, None)
+                disk_log = await self._load_session_from_disk(dummy_key, s_type)
+                if disk_log:
+                    unified_log = disk_log
+                    break
+                    
+        if not unified_log:
+            await interaction.followup.send("Could not find session data for this channel.", ephemeral=True)
+            return
+            
+        target_turn = next((t for t in unified_log if message.id in t.get("message_ids", [])), None)
+        
+        if not target_turn or target_turn.get("is_user") is not False:
+            await interaction.followup.send("This command can only be used on generated bot messages.", ephemeral=True)
+            return
+            
+        meta = target_turn.get("meta")
+        if not meta:
+            await interaction.followup.send("No generation trace data is available for this older message.", ephemeral=True)
+            return
+            
+        embed = discord.Embed(title="Generation Trace", color=discord.Color.blurple())
+        
+        model_str = f"`{meta.get('model', 'Unknown')}`"
+        if meta.get("fallback"):
+            model_str += " *(Fallback)*"
+        embed.add_field(name="Model", value=model_str, inline=True)
+        
+        embed.add_field(name="Duration", value=f"`{meta.get('duration', 0.0)}s`", inline=True)
+        
+        if meta.get("ltm_created"):
+            embed.add_field(name="Memory Event", value="`Memory Created`", inline=True)
+            
+        ltm_count = len(meta.get("ltms_recalled", []))
+        embed.add_field(name="Memories Recalled", value=f"`{ltm_count}`", inline=True)
+            
+        train_count = meta.get("training_recalled", 0)
+        embed.add_field(name="Training Examples Recalled", value=f"`{train_count}`", inline=True)
+            
+        urls = meta.get("grounding_sources", [])
+        if urls:
+            unique_urls = set([u for u in urls if u])
+            embed.add_field(name="Web Grounding", value=f"`Yes ({len(unique_urls)} Sources)`", inline=True)
+        else:
+            embed.add_field(name="Web Grounding", value="`No`", inline=True)
+            
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @profile_group.command(name="global_chat", description="Have a persistent, private conversation with a profile.")
     @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)

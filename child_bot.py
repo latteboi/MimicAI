@@ -221,6 +221,7 @@ class HiveMind:
     async def shutdown_bot(self, bot_id):
         if bot_id in self.clients:
             print(f"[Hive] Shutting down bot {bot_id}")
+            await self.clients[bot_id].change_presence(status=discord.Status.offline)
             await self.clients[bot_id].close()
             del self.clients[bot_id]
 

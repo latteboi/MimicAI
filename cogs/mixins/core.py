@@ -1129,15 +1129,6 @@ class CoreMixin:
             session_data.setdefault('unified_log', []).append(model_log)
 
             text_for_embed = response_text
-                
-            ui_meta = []
-            if profile_data.get("generation_metadata_enabled", False):
-                ui_meta.append(f"Dur: {time.monotonic() - t1_start_mono:.2f}s")
-            if profile_data.get("id_metadata_enabled", False):
-                ui_meta.append(f"PID: {self._get_profile_id(source_owner_id, source_profile_name)}")
-                
-            if ui_meta:
-                text_for_embed += f"\n\n-# { ' | '.join(ui_meta) }"
 
             if fallback_used and profile_data.get("show_fallback_indicator", True):
                 turn_warnings.append(WARN_FALLBACK_USED)
@@ -1166,15 +1157,7 @@ class CoreMixin:
             profile_id = self._get_profile_id(source_owner_id, source_profile_name)
             main_history_line = self._format_history_entry(app_name, response_message.created_at, response_text, timezone_str, entity_id=profile_id)
             
-            if profile_data.get("generation_metadata_enabled", False):
-                try:
-                    t1_formatted = t1_start_utc.astimezone(ZoneInfo(timezone_str)).strftime('%I:%M:%S %p %Z')
-                except Exception:
-                    t1_formatted = t1_start_utc.strftime('%I:%M:%S %p UTC')
-                metadata_line = f"(Thought Initiated: {t1_formatted} | Duration: {duration:.2f}s)"
-                bot_response_formatted = f"{main_history_line.strip()}\n{metadata_line}\n"
-            else:
-                bot_response_formatted = main_history_line
+            bot_response_formatted = main_history_line
             
             if chat.history and chat.history[-1].get('role', 'user') == 'model':
                 old_turn = chat.history[-1]
@@ -2447,7 +2430,6 @@ class CoreMixin:
         timezone = source_profile_data.get("timezone", "UTC")
         typing = "**`ON`**" if source_profile_data.get("realistic_typing_enabled", False) else "`OFF`"
         critic = "**`ON`**" if source_profile_data.get("critic_enabled", False) else "`OFF`"
-        metadata_vis = "**`ON`**" if source_profile_data.get("generation_metadata_enabled", False) else "`OFF`"
         resp_mode = source_profile_data.get("response_mode", "regular").replace('_', ' ').title()
 
         ph_text = f"{source_profile_data.get('placeholder_emoji') or 'Default'}"
@@ -2458,7 +2440,6 @@ class CoreMixin:
             f"URL Context: {url_ctx}\n"
             f"Response Mode: `{resp_mode}`\n"
             f"Timezone: `{timezone}`\n"
-            f"Gen Metadata: {metadata_vis}\n"
             f"Realistic Typing: {typing}\n"
             f"Critic: {critic}\n"
             f"Placeholder: {ph_text}"
@@ -3026,7 +3007,6 @@ class CoreMixin:
             "image_generation_model": owner_profile_data.get("image_generation_model", "gemini-2.5-flash-image"),
             "url_fetching_enabled": owner_profile_data.get("url_fetching_enabled", False),
             "critic_enabled": owner_profile_data.get("critic_enabled", False),
-            "generation_metadata_enabled": owner_profile_data.get("generation_metadata_enabled", False),
             "speech_voice": owner_profile_data.get("speech_voice", "Aoede"),
             "speech_model": owner_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts"),
             "speech_temperature": owner_profile_data.get("speech_temperature", 1.0),
@@ -3211,6 +3191,9 @@ class CoreMixin:
                 print(f"OSError releasing lock file: {e}")
             except Exception as e:
                 print(f"Unexpected error releasing lock file: {e}")
+        
+        self.bot.tree.remove_command(self.trace_ctx_menu.name, type=self.trace_ctx_menu.type)
+        
         self.refresh_lock_task.cancel()
         self.evict_inactive_sessions_task.cancel()
         self.weekly_cleanup_task.cancel()

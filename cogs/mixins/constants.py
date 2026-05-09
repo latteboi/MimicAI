@@ -10,7 +10,7 @@ DEFAULT_SYSTEM_INSTRUCTION = "."
 # Define the allowed models for the new command
 ALLOWED_MODELS = Literal[
     'gemini-pro-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest',
-    'gemini-3.1-pro-preview', 'gemini-3.1-flash-lite-preview', 'gemini-3-flash-preview', 'gemini-2.5-flash-preview-09-2025', 'gemini-2.5-flash-lite-preview-09-2025',
+    'gemini-3.1-pro-preview', 'gemini-3.1-flash-lite', 'gemini-3-flash-preview', 'gemini-robotics-er-1.6-preview',
     'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite',
     'gemini-2.0-flash', 'gemini-2.0-flash-lite'
 ]
@@ -20,7 +20,7 @@ IMAGE_MODELS = Literal[
 ]
 
 AUDIO_MODELS = Literal[
-    'gemini-2.5-pro-preview-tts', 'gemini-2.5-flash-preview-tts'
+    'gemini-3.1-flash-tts-preview', 'gemini-2.5-pro-preview-tts', 'gemini-2.5-flash-preview-tts'
 ]
 
 COGS_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
