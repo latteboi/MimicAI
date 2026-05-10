@@ -3220,7 +3220,7 @@ class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
             if model_val in ["", "off"]:
                 pro["director_model"] = "off"
             elif model_val == "on":
-                pro["director_model"] = "GOOGLE/gemini-flash-lite-latest"
+                pro["director_model"] = "GOOGLE/gemini-2.5-flash-lite"
             else:
                 model_val_orig = self.model_input.value.strip()
                 if not (model_val_orig.upper().startswith("GOOGLE/") or model_val_orig.upper().startswith("OPENROUTER/")):
@@ -3406,7 +3406,7 @@ class SessionConfigView(ui.View):
             embed.add_field(name="Status", value="**`ON`**" if enabled else "`OFF`", inline=True)
             embed.add_field(name="Chance & Cooldown", value=f"`{pro.get('chance', 10)}%` every `{pro.get('cooldown', 300)}s`", inline=True)
             
-            dir_mod = pro.get("director_model", "GOOGLE/gemini-flash-lite-latest")
+            dir_mod = pro.get("director_model", "GOOGLE/gemini-2.5-flash-lite")
             dir_ins = pro.get("director_instructions", "(Default)") or "(Default)"
             embed.add_field(name="AI Director", value=f"Model: `{dir_mod}`\nInstructions: ```{dir_ins[:200]}```", inline=False)
 
@@ -5082,7 +5082,7 @@ class AnalyseExamplesModal(ui.Modal, title="Analyse Training Examples"):
         self.parent_view = parent_view
         self.count_input = ui.TextInput(label="Number of Examples to Process", placeholder="Default: 10", default="10", required=True, min_length=1, max_length=3)
         self.verbosity_input = ui.TextInput(label="Target Verbosity (50 - 3000 chars)", placeholder="Default: 800", default="800", required=True, min_length=2, max_length=4)
-        self.model_input = ui.TextInput(label="Analysis Model", placeholder="Default: GOOGLE/gemini-flash-lite-latest", default="GOOGLE/gemini-flash-lite-latest", required=True)
+        self.model_input = ui.TextInput(label="Analysis Model", placeholder="Default: GOOGLE/gemini-2.5-flash-lite", default="GOOGLE/gemini-2.5-flash-lite", required=True)
         self.add_item(self.count_input)
         self.add_item(self.verbosity_input)
         self.add_item(self.model_input)

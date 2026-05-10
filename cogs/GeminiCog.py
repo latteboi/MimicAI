@@ -282,7 +282,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         generation_prompt = self.global_prompts.get("PROFILE_GENERATOR", DEFAULT_PROFILE_GENERATOR_PROMPT).format(prompt=prompt)
 
-        model_name = 'gemini-flash-lite-latest'
+        model_name = 'gemini-2.5-flash-lite'
         status = "api_error"
         try:
             model = GoogleGenAIModel(api_key=api_key, model_name=model_name, safety_settings=DEFAULT_SAFETY_SETTINGS)

@@ -5570,7 +5570,7 @@ class ServicesMixin:
 
         status = "api_error"
         warning_str = None
-        model_name = 'gemini-flash-lite-latest' # Use a single, tool-capable model
+        model_name = 'gemini-2.5-flash-lite' # Use a single, tool-capable model
         try:
             history_for_decision = conversation_history
 
