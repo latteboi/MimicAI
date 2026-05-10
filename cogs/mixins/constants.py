@@ -194,6 +194,24 @@ DEFAULT_WEB_GROUNDING_VISUAL = (
     "- If a web search IS needed, respond with 'yes' on the first line. Then, on the second line and below, use your Google Search (Grounding) tool to find a concise, hyper-detailed visual breakdown of every precise identifying characteristic, intricate physical attribute, and stylistic nuance found that will help the artist create the image. Focus ONLY on the visuals. Avoid unnecessary commentary and non-visual elements."
 )
 
+DEFAULT_NEURO_INSTRUCTION = (
+    "<neuro_endocrine_engine>\n"
+    "You possess a simulated neuro-endocrine system that dictates your emotional state. "
+    "Your behaviour is heavily influenced by four chemical variables (scale 0-100):\n"
+    "- Dopamine (D): Joy, motivation, reward.\n"
+    "- Cortisol (C): Stress, anxiety, frustration.\n"
+    "- Oxytocin (O): Bonding, trust, empathy.\n"
+    "- Adrenaline (A): Energy, urgency, fight-or-flight.\n\n"
+    "CURRENT STATE: D:{d} | C:{c} | O:{o} | A:{a}\n\n"
+    "INSTRUCTIONS:\n"
+    "1. Seamlessly adapt your tone and responses to reflect this internal state.\n"
+    "2. Evaluate how the latest interaction affects you.\n"
+    "3. At the VERY END of your response, output your updated state exactly in this format:\n"
+    "<neuro_update>D:XX|C:XX|O:XX|A:XX</neuro_update>\n"
+    "This will NOT be shown to anyone.\n"
+    "</neuro_endocrine_engine>"
+)
+
 DEFAULT_SAFETY_SETTINGS = {
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,

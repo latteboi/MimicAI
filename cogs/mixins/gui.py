@@ -1176,6 +1176,7 @@ class ProfileManageView(ui.View):
             options.append(discord.SelectOption(label="Set Time & Timezone", value="time", description="Enable time awareness and set the profile's timezone."))
             options.append(discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable a human-like delay when the bot sends messages."))
             options.append(discord.SelectOption(label="Toggle Anti-Repetition Critic", value="critic", description="Enable semantic repetition analysis (Adds latency)."))
+            options.append(discord.SelectOption(label="Toggle Neuro-Endocrine Engine", value="neuro", description="Simulate hormonal states for dynamic emotions."))
 
         elif self.current_tab == "memory" and not is_mod:
             options.append(discord.SelectOption(label="Manage Data (LTM & Training)", value="data", description="Add, list, edit, or delete memories and examples."))
@@ -1359,6 +1360,11 @@ class ProfileManageView(ui.View):
             await self._handle_timezone(interaction, profile, self.is_borrowed)
         elif choice == "critic":
             profile["critic_enabled"] = not profile.get("critic_enabled", False)
+            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
+        elif choice == "neuro":
+            profile["neuro_engine_enabled"] = not profile.get("neuro_engine_enabled", False)
+            if profile["neuro_engine_enabled"] and "neuro_state" not in profile:
+                profile["neuro_state"] = {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20}
             await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
 
         # --- Memory Tab Logic ---
@@ -5899,6 +5905,7 @@ class BulkManageView(ui.View):
             discord.SelectOption(label="Set Time & Timezone", value="timezone", description="Enable time-awareness and set a specific timezone."),
             discord.SelectOption(label="Set Generation Visual", value="generation_visual", description="Apply custom placeholder emoji to multiple profiles."),
             discord.SelectOption(label="Toggle Critic (Anti-Repetition)", value="critic", description="Enable or disable the critic for multiple profiles."),
+            discord.SelectOption(label="Toggle Neuro-Endocrine Engine", value="neuro", description="Enable or disable hormonal simulation for multiple profiles."),
             discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable or disable realistic typing for multiple profiles."),
             discord.SelectOption(label="Set Safety Level", value="safety_level", description="Apply a content safety level to multiple profiles."),
             discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training settings to multiple personal profiles."),
@@ -6090,6 +6097,11 @@ class BulkManageView(ui.View):
             await interaction.response.defer()
             view = BulkCriticView(self.cog, self.user_id)
             await self.original_interaction.edit_original_response(content="Select critic action and profiles:", view=view)
+
+        elif choice == "neuro":
+            await interaction.response.defer()
+            view = BulkNeuroView(self.cog, self.user_id)
+            await self.original_interaction.edit_original_response(content="Select neuro-endocrine action and profiles:", view=view)
 
         elif choice == "typing":
             await interaction.response.defer()
@@ -6710,7 +6722,7 @@ class ModPromptsView(ModBaseView):
     def _build_view(self):
         self.clear_items()
         
-        prompt_keys = [
+        prompt_keys =[
             ("LTM Summarization", "LTM_SUMMARIZATION_INSTRUCTIONS", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS),
             ("Context Rules", "CONTEXT_RULES", DEFAULT_CONTEXT_RULES),
             ("Training Data Injection", "TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION),
@@ -6720,7 +6732,8 @@ class ModPromptsView(ModBaseView):
             ("Web Grounding (Visual)", "WEB_GROUNDING_VISUAL", DEFAULT_WEB_GROUNDING_VISUAL),
             ("Profile Generator", "PROFILE_GENERATOR", DEFAULT_PROFILE_GENERATOR_PROMPT),
             ("Training Analyst", "TRAINING_ANALYST", DEFAULT_TRAINING_ANALYST_PROMPT),
-            ("Whisper Injection", "WHISPER_INJECTION", DEFAULT_WHISPER_INJECTION)
+            ("Whisper Injection", "WHISPER_INJECTION", DEFAULT_WHISPER_INJECTION),
+            ("Neuro-Endocrine Engine", "NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION)
         ]
         
         options = [discord.SelectOption(label=lbl, value=key) for lbl, key, _ in prompt_keys]
@@ -6741,3 +6754,52 @@ class ModPromptsView(ModBaseView):
 
     async def update_display(self):
         await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
+
+class BulkNeuroView(BaseBulkProfileView):
+    def __init__(self, cog: 'GeminiAgent', user_id: int):
+        super().__init__(cog, user_id, include_borrowed=True)
+        self.toggle_choice = None
+        self._build_view()
+
+    def _build_view(self):
+        self.clear_items()
+        
+        toggle_options =[
+            discord.SelectOption(label="Enable Neuro Engine", value="enable", default=(self.toggle_choice is True)),
+            discord.SelectOption(label="Disable Neuro Engine", value="disable", default=(self.toggle_choice is False))
+        ]
+        toggle_select = ui.Select(placeholder="Choose an action...", options=toggle_options, row=0)
+        toggle_select.callback = self.toggle_callback
+        self.add_item(toggle_select)
+
+        self._build_profile_select_ui(row=1)
+        
+        apply_btn = ui.Button(label="Apply Action", style=discord.ButtonStyle.green, row=3)
+        apply_btn.callback = self.apply_action
+        self.add_item(apply_btn)
+
+    async def toggle_callback(self, interaction: discord.Interaction):
+        self.toggle_choice = interaction.data['values'][0] == "enable"
+        self._build_view()
+        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+
+    async def apply_action(self, interaction: discord.Interaction, button: ui.Button = None):
+        await interaction.response.defer()
+        target_profiles = list(self.selected_profiles)
+        if self.toggle_choice is None or not target_profiles:
+            await interaction.edit_original_response(content="Please select an action and at least one profile.", view=None); return
+
+        updated_count = 0
+        index = self.cog._get_user_index(self.user_id)
+        for profile_name in target_profiles:
+            is_borrowed = profile_name in index.get("borrowed",[])
+            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
+            if profile:
+                profile["neuro_engine_enabled"] = self.toggle_choice
+                if self.toggle_choice and "neuro_state" not in profile:
+                    profile["neuro_state"] = {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20}
+                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
+                updated_count += 1
+        
+        status = "ENABLED" if self.toggle_choice else "DISABLED"
+        await interaction.edit_original_response(content=f"Neuro-Endocrine Engine has been set to **{status}** for {updated_count} profile(s).", view=None)

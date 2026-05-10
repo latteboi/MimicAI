@@ -1073,6 +1073,8 @@ class CoreMixin:
             if hasattr(response, 'raw') and response.raw.candidates and hasattr(response.raw.candidates[0], 'grounding_metadata'):
                 raw_text = self._add_inline_citations(raw_text, response.raw.candidates[0].grounding_metadata)
             raw_text = raw_text.strip()
+            
+            raw_text, _ = self._extract_and_apply_neuro_state(raw_text, host_user_id, profile_name)
 
             # Apply filters
             scrubbed_text = self._scrub_response_text(raw_text, participant_names=[app_name])
@@ -1288,6 +1290,8 @@ class CoreMixin:
             if hasattr(response, 'raw') and response.raw.candidates and hasattr(response.raw.candidates[0], 'grounding_metadata'):
                 response_text = self._add_inline_citations(response_text, response.raw.candidates[0].grounding_metadata)
             response_text = response_text.strip()
+
+        response_text, _ = self._extract_and_apply_neuro_state(response_text, owner_id, profile_name)
 
         # PREVENT GLOBAL XML SCRUBBER FROM DELETING THE RESPONSE
         response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
@@ -1507,6 +1511,8 @@ class CoreMixin:
             return
 
         response_text = getattr(response, 'text', "...").strip()
+        response_text, _ = self._extract_and_apply_neuro_state(response_text, owner_id, profile_name)
+        
         response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
         response_text = self._deduplicate_response(self._scrub_response_text(response_text, participant_names=[display_name]))
 
@@ -2430,6 +2436,8 @@ class CoreMixin:
         timezone = source_profile_data.get("timezone", "UTC")
         typing = "**`ON`**" if source_profile_data.get("realistic_typing_enabled", False) else "`OFF`"
         critic = "**`ON`**" if source_profile_data.get("critic_enabled", False) else "`OFF`"
+        neuro = "**`ON`**" if source_profile_data.get("neuro_engine_enabled", False) else "`OFF`"
+        metadata_vis = "**`ON`**" if source_profile_data.get("generation_metadata_enabled", False) else "`OFF`"
         resp_mode = source_profile_data.get("response_mode", "regular").replace('_', ' ').title()
 
         ph_text = f"{source_profile_data.get('placeholder_emoji') or 'Default'}"
@@ -2440,8 +2448,10 @@ class CoreMixin:
             f"URL Context: {url_ctx}\n"
             f"Response Mode: `{resp_mode}`\n"
             f"Timezone: `{timezone}`\n"
+            f"Gen Metadata: {metadata_vis}\n"
             f"Realistic Typing: {typing}\n"
             f"Critic: {critic}\n"
+            f"Neuro Engine: {neuro}\n"
             f"Placeholder: {ph_text}"
         )
         embed.add_field(name="Tools", value=tools_val, inline=False)

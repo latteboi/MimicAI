@@ -1184,6 +1184,16 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         else:
             embed.add_field(name="Web Grounding", value="`No`", inline=True)
             
+        neuro_state = meta.get("neuro_state")
+        if neuro_state:
+            neuro_str = (
+                f"Dopamine (D): `{neuro_state.get('dopamine', 0)}`\n"
+                f"Cortisol (C): `{neuro_state.get('cortisol', 0)}`\n"
+                f"Oxytocin (O): `{neuro_state.get('oxytocin', 0)}`\n"
+                f"Adrenaline (A): `{neuro_state.get('adrenaline', 0)}`"
+            )
+            embed.add_field(name="Neuro Engine", value=neuro_str, inline=False)
+            
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @profile_group.command(name="global_chat", description="Have a persistent, private conversation with a profile.")

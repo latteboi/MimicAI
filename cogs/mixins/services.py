@@ -818,10 +818,12 @@ class ServicesMixin:
         fallback_model = FALLBACK_MODEL_NAME
         time_tracking_enabled = False
         timezone_str = "UTC"
+        neuro_enabled = False
+        neuro_state = {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20}
 
         if profile_owner_id is not None: 
             user_index = self._get_user_index(profile_owner_id)
-            is_borrowed = profile_name_to_use in user_index.get("borrowed", [])
+            is_borrowed = profile_name_to_use in user_index.get("borrowed",[])
             profile_data = self._get_profile_config(profile_owner_id, profile_name_to_use, is_borrowed) or {}
 
             persona_data, ai_instr_str, grounding_enabled, temperature, top_p, top_k, _, _, primary_model, fallback_model = self._get_user_profile_for_model(profile_owner_id, channel_id, profile_name_to_use)
@@ -829,13 +831,24 @@ class ServicesMixin:
         if profile_data:
             time_tracking_enabled = profile_data.get("time_tracking_enabled", False)
             timezone_str = profile_data.get("timezone", "UTC")
+            neuro_enabled = profile_data.get("neuro_engine_enabled", False)
+            neuro_state = profile_data.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
 
-        final_instr_parts = []
+        final_instr_parts =[]
         
         if is_multi_profile:
             session = self.multi_profile_channels.get(channel_id)
             if session and session.get("session_prompt"):
                 final_instr_parts.append(f"<scene_prompt>\n{session['session_prompt']}\n</scene_prompt>")
+                
+        if neuro_enabled:
+            neuro_block = self.global_prompts.get("NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION).format(
+                d=neuro_state.get('dopamine', 50),
+                c=neuro_state.get('cortisol', 20),
+                o=neuro_state.get('oxytocin', 50),
+                a=neuro_state.get('adrenaline', 20)
+            )
+            final_instr_parts.append(neuro_block)
 
         if time_tracking_enabled:
             try:
@@ -2431,7 +2444,9 @@ class ServicesMixin:
                                     raw_text = self._add_inline_citations(raw_text, response.raw.candidates[0].grounding_metadata)
                                 raw_text = raw_text.strip()
                                 
-                                all_participant_names = []
+                                raw_text, parsed_neuro_state = self._extract_and_apply_neuro_state(raw_text, p_owner_id, p_name)
+                                
+                                all_participant_names =[]
                                 for p_data in session.get("profiles", []):
                                     p_owner_id_temp = p_data['owner_id']
                                     p_name_temp = p_data['profile_name']
@@ -2597,13 +2612,16 @@ class ServicesMixin:
                         "model": model.model_name.replace("models/", "").replace("OPENROUTER/", "").replace("GOOGLE/", "") if hasattr(model, 'model_name') else fallback_model_name,
                         "fallback": fallback_used,
                         "training_recalled": len(training_examples_list) if 'training_examples_list' in locals() and training_examples_list else 0,
-                        "grounding_sources": [s.get('uri') for s in turn_grounding_sources if isinstance(s, dict) and s.get('uri')] if 'turn_grounding_sources' in locals() and turn_grounding_sources else [],
-                        "ltms_recalled": []
+                        "grounding_sources":[s.get('uri') for s in turn_grounding_sources if isinstance(s, dict) and s.get('uri')] if 'turn_grounding_sources' in locals() and turn_grounding_sources else [],
+                        "ltms_recalled":[]
                     }
                     if 'ltm_recall_text' in locals() and ltm_recall_text:
                         lines = ltm_recall_text.split('\n')
                         clean_lines = [l.strip() for l in lines if l.strip() and not l.startswith("<")]
                         meta["ltms_recalled"] = [l[:100] + "..." if len(l) > 100 else l for l in clean_lines]
+                        
+                    if 'parsed_neuro_state' in locals() and parsed_neuro_state:
+                        meta["neuro_state"] = parsed_neuro_state
 
                     turn_object = {
                         "turn_id": turn_id,
@@ -3171,6 +3189,46 @@ class ServicesMixin:
         if session.get('worker_task') == ctask:
             session['worker_task'] = None
 
+    def _extract_and_apply_neuro_state(self, raw_text: str, owner_id: int, profile_name: str) -> Tuple[str, Optional[Dict[str, int]]]:
+        pattern = r'<neuro_update>\s*(.*?)\s*</neuro_update>'
+        match = re.search(pattern, raw_text, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return raw_text, None
+
+        data_str = match.group(1)
+        new_state = {}
+        parts = data_str.split('|')
+        for p in parts:
+            kv = p.split(':')
+            if len(kv) == 2:
+                k = kv[0].strip().upper()
+                try:
+                    v = int(kv[1].strip())
+                    v = max(0, min(100, v))
+                    if k == 'D': new_state['dopamine'] = v
+                    elif k == 'C': new_state['cortisol'] = v
+                    elif k == 'O': new_state['oxytocin'] = v
+                    elif k == 'A': new_state['adrenaline'] = v
+                except ValueError:
+                    pass
+
+        clean_text = re.sub(pattern, '', raw_text, flags=re.IGNORECASE | re.DOTALL).strip()
+        
+        final_state = None
+        if new_state:
+            index = self._get_user_index(owner_id)
+            is_borrowed = profile_name in index.get("borrowed",[])
+            p_config = self._get_profile_config(owner_id, profile_name, is_borrowed)
+            
+            if p_config and p_config.get("neuro_engine_enabled"):
+                current_state = p_config.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20}).copy()
+                current_state.update(new_state)
+                p_config["neuro_state"] = current_state
+                self._save_profile_config(owner_id, profile_name, p_config, is_borrowed)
+                final_state = current_state
+
+        return clean_text, final_state
+
     async def _image_finisher_worker(self):
         """Consumes generated images, generates text, and sends the final message."""
         while True:
@@ -3322,6 +3380,9 @@ class ServicesMixin:
                             raw_text = getattr(text_response, 'text', "")
                             if hasattr(text_response, 'raw') and text_response.raw.candidates and hasattr(text_response.raw.candidates[0], 'grounding_metadata'):
                                 raw_text = self._add_inline_citations(raw_text, text_response.raw.candidates[0].grounding_metadata)
+                            
+                            raw_text, _ = self._extract_and_apply_neuro_state(raw_text, package['effective_profile_owner_id'], package['effective_profile_name'])
+                            
                             response_text = self._deduplicate_response(self._scrub_response_text(raw_text.strip(), participant_names=[package['bot_display_name']]))
                             
                             if not response_text:
@@ -5314,439 +5375,6 @@ class ServicesMixin:
             print(f"Critic error: {e}")
         return None
     
-    async def _execute_freewill_turn(self, channel: discord.TextChannel, participant: Dict, prompt_content: str, author_display_name: str, triggering_user_id: Optional[int] = None, anchor_message: Optional[discord.Message] = None) -> List[discord.Message]:
-        profile_owner_id = participant['owner_id']
-        profile_name = participant['profile_name']
-        method = participant['method']
-        bot_id = participant.get('bot_id')
-
-        if not self._check_unrestricted_safety_policy(profile_owner_id, profile_name, channel):
-            return [] # Fails silently in freewill context
-
-        placeholder_message = None
-        sent_messages = []
-        try:
-            model, _, temp, top_p, top_k, warning_message, fallback_model_name = await self._get_or_create_model_for_channel(
-                channel.id, triggering_user_id or self.bot.user.id, channel.guild.id,
-                profile_owner_override=profile_owner_id, profile_name_override=profile_name,
-                prompt_content=prompt_content
-            )
-            
-            # [FIXED] Define missing variable for Fallback logic
-            p_index = self._get_user_index(profile_owner_id)
-            p_is_b = profile_name in p_index.get("borrowed", [])
-            p_settings = self._get_profile_config(profile_owner_id, profile_name, p_is_b) or {}
-            primary_model = p_settings.get("primary_model", PRIMARY_MODEL_NAME)
-            
-            status = "api_error"
-            response = None
-            fallback_used = False
-            blocked_reason_override = None
-
-            history_lines = await self._build_freewill_history(channel, anchor_message)
-            history_for_turn = [{'role': 'user', 'parts': [line]} for line in history_lines]
-            
-            chat = GoogleGenAIChatSession(history=history_for_turn)
-
-            if len(chat.history) > self.max_history_items * 2:
-                chat.history = chat.history[-(self.max_history_items * 2):]
-
-            msg_a_id = None
-            app_name, app_avatar = self._resolve_appearance_data(profile_owner_id, profile_name)
-
-            if method == 'webhook':
-                thinking_messages = await self._send_channel_message(
-                    channel, f"{PLACEHOLDER_EMOJI}",
-                    profile_owner_id_for_appearance=profile_owner_id, profile_name_for_appearance=profile_name
-                )
-                if thinking_messages: msg_a_id = thinking_messages[0].id
-            else:
-                if p_settings.get("child_bot_placeholder", False):
-                    custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
-                    msg_a_id = await self._send_child_bot_placeholder(bot_id, channel.id, custom_emoji)
-                else:
-                    await self.manager_queue.put({
-                        "action": "send_to_child", "bot_id": bot_id,
-                        "payload": {"action": "start_typing", "channel_id": channel.id}
-                    })
-
-            if model:
-                ltm_recall_text = await self._get_relevant_ltm_for_prompt(profile_owner_id, profile_name, prompt_content, author_display_name, channel.guild.id, triggering_user_id or self.bot.user.id)
-                
-                bot_display_name = profile_name
-                appearance_data = self.user_appearances.get(str(profile_owner_id), {}).get(profile_name, {})
-                if appearance_data.get("custom_display_name"):
-                    bot_display_name = appearance_data["custom_display_name"]
-
-                history_for_prompt_parts = []
-                for turn in chat.history:
-                    role = turn.get('role', 'user')
-                    parts = turn.get('parts', [])
-                    text = parts[0] if parts and isinstance(parts[0], str) else (parts[0].get('text', '') if parts else "")
-                    history_for_prompt_parts.append(
-                        self._format_history_entry(
-                            "A user" if role == 'user' else bot_display_name,
-                            datetime.datetime.now(datetime.timezone.utc),
-                            text
-                        )
-                    )
-                history_for_prompt = "".join(history_for_prompt_parts)
-                
-                user_message_formatted = self._format_history_entry(author_display_name, datetime.datetime.now(datetime.timezone.utc), prompt_content)
-                
-                final_prompt_parts = [history_for_prompt]
-                turn_warnings = []
-                
-                # Conditional Metadata Injection
-                if ltm_recall_text: final_prompt_parts.append(ltm_recall_text)
-                
-                p_index = self._get_user_index(profile_owner_id)
-                p_is_b = profile_name in p_index.get("borrowed", [])
-                p_settings = self._get_profile_config(profile_owner_id, profile_name, p_is_b) or {}
-                
-                url_mode = p_settings.get('url_mode', 'off')
-                if 'url_mode' not in p_settings:
-                    url_mode = 'rag' if p_settings.get('url_fetching_enabled', False) else 'off'
-                    
-                if url_mode == 'rag':
-                    u_t, _, u_w = await self._process_urls_in_content(prompt_content, channel.guild.id, {"url_fetching_enabled": True})
-                    turn_warnings.extend(u_w)
-                    if u_t: final_prompt_parts.append(f"<document_context>\n" + "\n".join(u_t) + "\n</document_context>")
-
-                final_prompt_parts.append(user_message_formatted)
-                
-                gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
-                
-                state_container = None
-                api_error_reason = None
-                main_api_error = None
-                
-                try:
-                    response, state_container = await self._generate_with_heartbeat(
-                        model, [{'role': 'user', 'parts': final_prompt_parts}], gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar
-                    )
-                        
-                    if not response or not response.candidates:
-                        raise ValueError("Response blocked or empty")
-                    
-                    raw_text_check = getattr(response, 'text', "").strip()
-                    if not raw_text_check:
-                        raise ValueError("Empty Response (AI produced no text content)")
-
-                    status = "success"
-                except asyncio.CancelledError:
-                    if state_container and state_container.get('sending_task'):
-                        state_container['sending_task'].cancel()
-                    await self._safe_delete_placeholder(channel, state_container.get('msg_a_id') if state_container else msg_a_id)
-                    await self._safe_delete_placeholder(channel, state_container.get('msg_b_id') if state_container else None)
-                    return []
-                except Exception as e:
-                    is_timeout_main = isinstance(e, TimeoutError)
-                    main_api_error = self._format_api_error(e)
-                    if hasattr(e, 'state_container'): state_container = e.state_container
-
-                    if not fallback_model_name or primary_model == fallback_model_name:
-                        api_error_reason = main_api_error
-                    else:
-                        try:
-                            # Re-construct instructions for the fallback model
-                            sys_instr, _, _, _, _, _, _, _ = self._construct_system_instructions(
-                                profile_owner_id, profile_name, channel.id, is_multi_profile=False
-                            )
-                            
-                            # Re-calculate safety settings locally
-                            p_index = self._get_user_index(profile_owner_id)
-                            p_is_b = profile_name in p_index.get("borrowed", [])
-                            p_settings = self._get_profile_config(profile_owner_id, profile_name, p_is_b) or {}
-                            
-                            safe_lvl = p_settings.get("safety_level", "low")
-                            safe_thresh = HarmBlockThreshold.BLOCK_ONLY_HIGH
-                            if safe_lvl == "medium": safe_thresh = HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE
-                            elif safe_lvl == "high": safe_thresh = HarmBlockThreshold.BLOCK_LOW_AND_ABOVE
-                            
-                            dyn_safe = { cat: safe_thresh for cat in get_args(HarmCategory) }
-
-                            t_params_worker = {
-                                "thinking_summary_visible": p_settings.get("thinking_summary_visible", "off"),
-                                "thinking_level": p_settings.get("thinking_level", "high"),
-                                "thinking_budget": p_settings.get("thinking_budget", -1)
-                            }
-
-                            fb_name = fallback_model_name
-                            fb_is_or = False
-                            
-                            if fb_name.upper().startswith("GOOGLE/"):
-                                fb_name = fb_name[7:]
-                                fb_is_or = False
-                            elif fb_name.upper().startswith("OPENROUTER/"):
-                                fb_name = fb_name[11:]
-                                fb_is_or = True
-                            elif "/" in fb_name:
-                                fb_is_or = True
-                            
-                            if fb_is_or:
-                                or_key = self._get_api_key_for_guild(channel.guild.id, provider="openrouter")
-                                if or_key:
-                                    fallback_instance = OpenRouterModel(fb_name, api_key=or_key, system_instruction=sys_instr, thinking_params=t_params_worker)
-                                else:
-                                    raise ValueError("No OR key for fallback")
-                            else:
-                                guild_api_key = self._get_api_key_for_guild(channel.guild.id)
-                                if not guild_api_key:
-                                    raise ValueError("No Google key for fallback")
-                                    
-                                grounding_mode_native = p_settings.get("grounding_mode", "off")
-                                if isinstance(grounding_mode_native, bool): grounding_mode_native = "rag" if grounding_mode_native else "off"
-                                elif grounding_mode_native in ["on", "on+"]: grounding_mode_native = "rag"
-                                
-                                url_mode_native = p_settings.get("url_mode", "off")
-                                if "url_mode" not in p_settings:
-                                    url_mode_native = "rag" if p_settings.get("url_fetching_enabled", False) else "off"
-
-                                model_tools_list = []
-                                if grounding_mode_native == "native":
-                                    model_tools_list.append({"google_search": {}})
-                                if url_mode_native == "native":
-                                    model_tools_list.append({"url_context": {}})
-                                    
-                                model_tools = model_tools_list if model_tools_list else None
-                                
-                                fallback_instance = GoogleGenAIModel(
-                                    api_key=guild_api_key, 
-                                    model_name=fb_name, 
-                                    system_instruction=sys_instr, 
-                                    safety_settings=dyn_safe, 
-                                    thinking_params=t_params_worker,
-                                    tools=model_tools
-                                )
-
-                            response, state_container = await self._generate_with_heartbeat(
-                                fallback_instance, [{'role': 'user', 'parts': final_prompt_parts}], gen_config, channel, participant, msg_a_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
-                            )
-                                
-                            if not response or not response.candidates:
-                                raise ValueError("Response blocked or empty")
-                            fb_raw_check = getattr(response, 'text', "").strip()
-                            if not fb_raw_check:
-                                raise ValueError("Empty Response (AI produced no text content)")
-
-                            fallback_used = True
-                            status = "success"
-                            self._log_api_call(user_id=triggering_user_id or 0, guild_id=channel.guild.id, context="freewill_fallback", model_used=fb_name, status="success")
-
-                        except asyncio.CancelledError:
-                            if state_container:
-                                if state_container.get('sending_task'): state_container['sending_task'].cancel()
-                                await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
-                                await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
-                            return []
-                        except Exception as retry_e:
-                            print(f"Freewill fallback retry failed: {retry_e}")
-                            is_timeout_fallback = isinstance(retry_e, TimeoutError)
-                            if hasattr(retry_e, 'state_container'): state_container = retry_e.state_container
-                            
-                            if is_timeout_main and is_timeout_fallback:
-                                api_error_reason = ERR_REASON_TIMEOUT_BOTH
-                            else:
-                                api_error_reason = self._format_api_error(retry_e)
-                            status = "api_error"
-                except (genai.errors.APIError) as e:
-                    api_error_reason = self._format_api_error(e)
-                    status = "api_error"
-                finally:
-                    # Always log the primary model's final status
-                    self._log_api_call(user_id=triggering_user_id or 0, guild_id=channel.guild.id, context="freewill", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
-            else:
-                api_error_reason = warning_message or "API Error: Model failed to load."
-
-            response_text = ""
-            was_blocked = False
-            if response and response.candidates:
-                candidate = response.candidates[0]
-                if candidate.content and candidate.content.parts:
-                    response_text = getattr(response, 'text', "")
-                    if hasattr(response, 'raw') and response.raw.candidates and hasattr(response.raw.candidates[0], 'grounding_metadata'):
-                        response_text = self._add_inline_citations(response_text, response.raw.candidates[0].grounding_metadata)
-                    response_text = response_text.strip()
-
-            if not response_text.strip():
-                reason = api_error_reason or "Unknown Error"
-                is_safety = False
-                if response and response.prompt_feedback and response.prompt_feedback.block_reason:
-                     reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
-                     is_safety = True
-                
-                response_text = p_settings.get("error_response", ERR_GENERAL_ERROR)
-                
-                if is_safety:
-                    turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=reason))
-                elif "Rate Limit" in reason:
-                    turn_warnings.append(ERR_RATE_LIMIT)
-                else:
-                    if fallback_model_name and primary_model != fallback_model_name:
-                        turn_warnings.append(WARN_BOTH_MODELS_FAILED.format(reason=reason))
-                    else:
-                        turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=reason))
-                was_blocked = True
-
-            response_text = self._deduplicate_response(response_text)
-            
-            sources_text_list = []
-            if response_text == "[REPETITIVE_CONTENT_ERROR]":
-                response_text = p_settings.get("error_response", ERR_GENERAL_ERROR)
-                warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
-                turn_warnings.append(warn_tmp.format(reason=ERR_REASON_REPETITIVE_CONTENT))
-                was_blocked = True
-            else:
-                grounding_sources = []
-                if hasattr(response, 'raw') and response.raw.candidates:
-                    if hasattr(response.raw.candidates[0], 'grounding_metadata'):
-                        metadata = response.raw.candidates[0].grounding_metadata
-                        if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
-                            for chunk in metadata.grounding_chunks:
-                                if hasattr(chunk, 'web'):
-                                    grounding_sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
-                    
-                    if hasattr(response.raw.candidates[0], 'url_context_metadata'):
-                        url_metadata = response.raw.candidates[0].url_context_metadata
-                        if hasattr(url_metadata, 'url_metadata') and url_metadata.url_metadata is not None:
-                            for u in url_metadata.url_metadata:
-                                if hasattr(u, 'retrieved_url') and u.retrieved_url:
-                                    grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
-                                    
-                sources_text_list = self._format_citation_subtext(grounding_sources)
-
-            p_index = self._get_user_index(profile_owner_id)
-            p_is_b = profile_name in p_index.get("borrowed", [])
-            p_settings = self._get_profile_config(profile_owner_id, profile_name, p_is_b) or {}
-
-            user_content_obj = {'role': 'user', 'parts': [prompt_content]}
-            model_content_obj = {'role': 'model', 'parts': [response_text]}
-            if p_settings.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
-                sig = response.thought_signature
-                if isinstance(sig, bytes):
-                    sig = base64.b64encode(sig).decode('utf-8')
-                model_content_obj['thought_signature'] = sig
-            chat.history.extend([user_content_obj, model_content_obj])
-
-            text_to_send = response_text
-            
-            # Check profile setting for fallback indicator
-            if fallback_used and p_settings.get("show_fallback_indicator", True):
-                turn_warnings.append(WARN_FALLBACK_USED)
-                turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=main_api_error))
-
-            if not was_blocked:
-                # We do not track start time precisely in Freewill yet, so use a simple estimation logic or None.
-                # However, updating the placeholder guarantees visual consistency if TTS is added to Freewill.
-                await self._update_sending_placeholder(channel, method, bot_id, state_container, time.monotonic() - 10)
-
-            if state_container and state_container.get('sending_task'):
-                state_container['sending_task'].cancel()
-                
-            msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
-            msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
-
-            await self._safe_delete_placeholder(channel, msg_a_to_delete)
-            await self._safe_delete_placeholder(channel, msg_b_to_delete)
-
-            if state_container:
-                state_container['msg_a_id'] = None
-                state_container['msg_b_id'] = None
-
-            if method == 'child_bot' and bot_id:
-                correlation_id = str(uuid.uuid4())
-                self.pending_child_confirmations[correlation_id] = {
-                    "type": "single_profile",
-                    "user_turn": user_content_obj,
-                    "model_turn": model_content_obj,
-                    "bot_id": bot_id,
-                    "channel_id": channel.id
-                }
-                await self.manager_queue.put({
-                    "action": "send_to_child", "bot_id": bot_id,
-                    "payload": {
-                        "action": "send_message", "channel_id": channel.id, "content": text_to_send,
-                        "realistic_typing": False, "correlation_id": correlation_id
-                    }
-                })
-                if sources_text_list:
-                    for source_msg in sources_text_list:
-                        await self.manager_queue.put({
-                            "action": "send_to_child", "bot_id": bot_id,
-                            "payload": {
-                                "action": "send_message", "channel_id": channel.id, "content": source_msg,
-                                "realistic_typing": False
-                            }
-                        })
-                sent_messages = []
-            else:
-                sent_messages = await self._send_channel_message(
-                    channel, text_to_send, target_message_to_edit=None,
-                    profile_owner_id_for_appearance=profile_owner_id, profile_name_for_appearance=profile_name
-                )
-                if sources_text_list:
-                    for source_msg in sources_text_list:
-                        s_msgs = await self._send_channel_message(
-                            channel, source_msg, bypass_typing=True,
-                            profile_owner_id_for_appearance=profile_owner_id, profile_name_for_appearance=profile_name
-                        )
-                        if s_msgs: sent_messages.extend(s_msgs)
-                
-            await self._dispatch_warnings(channel, method, bot_id, turn_warnings, profile_owner_id, profile_name)
-
-            if sent_messages and not response_text.startswith(p_settings.get("error_response", ERR_GENERAL_ERROR)):
-                # Standardize the turn_info structure to match single-profile and child bot replies
-                turn_info = (('freewill', channel.id), user_content_obj, model_content_obj, profile_owner_id, profile_name)
-                for msg in sent_messages:
-                    self.message_to_history_turn[msg.id] = turn_info
-            
-            # [NEW] Persistence for standalone freewill turns
-            model_cache_key_fw = (channel.id, profile_owner_id, profile_name)
-            await self._save_session_to_disk(model_cache_key_fw, 'single', chat.history)
-            
-            await self._maybe_create_ltm(
-                sent_messages[0] if sent_messages else channel, 
-                author_display_name, chat.history, profile_owner_id, profile_name, 
-                {"temperature": temp, "top_p": top_p, "top_k": top_k}
-            )
-
-            if method == 'child_bot':
-                return [True]
-            return sent_messages
-
-        except Exception as e:
-            print(f"Error during freewill turn for {profile_name}: {e}")
-            if placeholder_message: await placeholder_message.delete()
-        return []
-    
-    def _build_freewill_participant_dict(self, owner_id: int, profile_name: str, channel: discord.TextChannel) -> Optional[Dict]:
-        server_participation = self.freewill_participation.get(str(channel.guild.id), {})
-        channel_participants = server_participation.get(str(channel.id), {})
-        user_profiles = channel_participants.get(str(owner_id), {})
-        profile_settings = user_profiles.get(profile_name)
-
-        if not profile_settings:
-            return None
-
-        method = profile_settings.get("method", "webhook")
-        
-        participant_dict = {
-            "owner_id": owner_id,
-            "profile_name": profile_name,
-            "method": method,
-            "bot_id": None
-        }
-
-        if method == "child_bot":
-            bot_id_found = next((bot_id for bot_id, data in self.child_bots.items() if data.get("owner_id") == owner_id and data.get("profile_name") == profile_name), None)
-            if bot_id_found and channel.guild.get_member(int(bot_id_found)):
-                participant_dict["bot_id"] = bot_id_found
-            else:
-                participant_dict["method"] = "webhook"
-        
-        return participant_dict
-    
     async def _execute_training_analysis(self, interaction: discord.Interaction, profile_name: str, count: int, verbosity: int, model_name: str):
         user_id = interaction.user.id
         user_id_str = str(user_id)
@@ -6860,6 +6488,9 @@ class ServicesMixin:
                 if hasattr(response, 'raw') and response.raw.candidates and hasattr(response.raw.candidates[0], 'grounding_metadata'):
                     raw_text = self._add_inline_citations(raw_text, response.raw.candidates[0].grounding_metadata)
                 raw_text = raw_text.strip()
+                
+                raw_text, parsed_neuro_state = self._extract_and_apply_neuro_state(raw_text, p_owner_id, p_name)
+                
                 new_text = self._deduplicate_response(self._scrub_response_text(raw_text))
                 
                 if new_text == "[REPETITIVE_CONTENT_ERROR]":
@@ -6924,8 +6555,11 @@ class ServicesMixin:
                 "fallback": fallback_used,
                 "training_recalled": len(training_examples) if 'training_examples' in locals() and training_examples else 0,
                 "grounding_sources": regen_grounding_sources,
-                "ltms_recalled": [] # Context carries over natively; we don't re-query LTMs on regen
+                "ltms_recalled":[] # Context carries over natively; we don't re-query LTMs on regen
             }
+            if 'parsed_neuro_state' in locals() and parsed_neuro_state:
+                meta["neuro_state"] = parsed_neuro_state
+                
             final_target_turn["meta"] = meta
             
             if p_profile.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:

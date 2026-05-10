@@ -1428,6 +1428,7 @@ class StorageMixin:
                 "thinking_level": "high", "thinking_budget": -1, "thinking_signatures_enabled": "off",
                 "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": "Aoede",
                 "speech_model": "gemini-2.5-flash-preview-tts", "speech_temperature": 1.0,
+                "neuro_engine_enabled": False, "neuro_state": {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20},
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }
             
