@@ -32,7 +32,6 @@ SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")
 SESSIONS_GLOBAL_DIR = os.path.join(SESSIONS_DIR, "global_chat")
 
 SERVERS_DIR = os.path.join(DATA_DIR, "servers")
-FREEWILL_SERVERS_DIR = SERVERS_DIR # Alias for backwards compatibility during transition
 
 PUBLIC_PROFILES_DIR = os.path.join(DATA_DIR, "public_profiles")
 CHILD_BOTS_DIR = os.path.join(DATA_DIR, "child_bots")

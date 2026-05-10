@@ -3125,43 +3125,6 @@ class ProfileImageGenSettingsModal(ui.Modal, title="Image Generation Settings"):
         else:
             await interaction.followup.send("❌ Profile not found.", ephemeral=True)
 
-class ProfileMetadataModal(ui.Modal, title="Set Generation Metadata"):
-    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
-        super().__init__()
-        self.cog = cog
-        self.profile_name = profile_name
-        self.is_borrowed = is_borrowed
-        self.callback = callback
-        
-        dur_val = "on" if current_params.get("generation_metadata_enabled", False) else "off"
-        self.add_item(ui.TextInput(label="Show Duration & Latency (on/off)", custom_id="duration", default=dur_val, required=True))
-        
-        id_val = "on" if current_params.get("id_metadata_enabled", False) else "off"
-        self.add_item(ui.TextInput(label="Show Profile ID (on/off)", custom_id="pid", default=id_val, required=True))
-        
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        new_params = {}
-        try:
-            def gv(cid): return next((c.value for c in self.children if c.custom_id == cid), None).strip().lower()
-            new_params["generation_metadata_enabled"] = (gv("duration") == "on")
-            new_params["id_metadata_enabled"] = (gv("pid") == "on")
-        except Exception:
-            await interaction.followup.send("Error parsing input.", ephemeral=True); return
-        
-        if self.profile_name == "BULK_APPLY":
-            if self.callback: await self.callback(interaction, new_params)
-            return
-            
-        target = self.cog._get_profile_config(interaction.user.id, self.profile_name, self.is_borrowed)
-        if target:
-            target.update(new_params)
-            self.cog._save_profile_config(interaction.user.id, self.profile_name, target, self.is_borrowed)
-            await interaction.followup.send("✅ Metadata settings updated.", ephemeral=True)
-            if self.callback: await self.callback(interaction)
-        else:
-            await interaction.followup.send("❌ Profile not found.", ephemeral=True)
-
 class SessionPromptModal(ui.Modal, title="Set Master Prompt"):
     prompt_input = ui.TextInput(label="Master Prompt / Director's Note", style=discord.TextStyle.paragraph, placeholder="The persistent background instruction to set the scene...", required=False, max_length=1500)
     def __init__(self, view: 'SessionConfigView'):

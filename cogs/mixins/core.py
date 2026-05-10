@@ -2118,78 +2118,6 @@ class CoreMixin:
         session["is_hydrated"] = True
         return session
     
-    def _cleanup_freewill_session(self, channel_id: int):
-        import shutil
-        # 1. Cancel in-memory tasks if session is loaded
-        session = self.multi_profile_channels.get(channel_id)
-        if session:
-            if session.get('worker_task'):
-                self._safe_cancel_task(session['worker_task'])
-
-        # 2. Delete all on-disk history files for this session by removing the directory
-        session_type = "freewill"
-        dummy_session_key = (channel_id, None, None)
-        try:
-            session_dir_path = self._get_session_dir_path(dummy_session_key, session_type)
-            if session_dir_path.exists():
-                shutil.rmtree(session_dir_path)
-        except Exception as e:
-            print(f"Error cleaning up freewill session directory for channel {channel_id}: {e}")
-
-        # 3. Remove from in-memory caches
-        self.multi_profile_channels.pop(channel_id, None)
-        self.session_last_accessed.pop(channel_id, None)
-
-        # 4. Persist the removal of the session from the server index
-        channel = self.bot.get_channel(channel_id)
-        server_id_str = str(channel.guild.id) if channel and getattr(channel, 'guild', None) else "dm"
-        
-        server_index = self._get_server_index(server_id_str)
-        ch_id_str = str(channel_id)
-        
-        modified = False
-        if isinstance(server_index.get("active_sessions"), dict):
-            if ch_id_str in server_index["active_sessions"].get("freewill", {}):
-                del server_index["active_sessions"]["freewill"][ch_id_str]
-                modified = True
-            if ch_id_str in server_index["active_sessions"].get("regular", {}):
-                del server_index["active_sessions"]["regular"][ch_id_str]
-                modified = True
-                
-        if modified:
-            self._save_server_index(server_id_str, server_index)
-
-    async def _build_freewill_history(self, channel: discord.TextChannel, anchor_message: Optional[discord.Message] = None) -> List[Tuple[int, str, datetime.datetime, str]]:
-        history_data = []
-        try:
-            limit = 20
-            
-            last_bot_message = None
-            # Look back from the anchor message (if provided) to find the last bot message
-            async for msg in channel.history(limit=100, before=anchor_message):
-                if msg.author.id in self.all_bot_ids:
-                    last_bot_message = msg
-                    break
-            
-            # Fetch messages after the last bot message, up to the anchor message
-            messages = [msg async for msg in channel.history(limit=limit, after=last_bot_message, before=anchor_message)]
-            messages.reverse() # Process from oldest to newest
-            
-            # Add the anchor message itself to the end of the context if it exists
-            if anchor_message:
-                messages.append(anchor_message)
-
-            for msg in messages:
-                history_data.append((msg.author.id, msg.author.display_name, msg.created_at, msg.clean_content))
-
-        except (discord.Forbidden, discord.HTTPException) as e:
-            print(f"Could not fetch history for freewill: {e}")
-            # Fallback to just the anchor message if history fetching fails
-            if not history_data and anchor_message:
-                 history_data.append((anchor_message.author.id, anchor_message.author.display_name, anchor_message.created_at, anchor_message.clean_content))
-        
-        return history_data
-    
     async def _build_participant_embed(self, participant: Dict, channel_id: int) -> discord.Embed:
         owner_id = participant['owner_id']
         profile_name = participant['profile_name']
@@ -2448,7 +2376,6 @@ class CoreMixin:
             f"URL Context: {url_ctx}\n"
             f"Response Mode: `{resp_mode}`\n"
             f"Timezone: `{timezone}`\n"
-            f"Gen Metadata: {metadata_vis}\n"
             f"Realistic Typing: {typing}\n"
             f"Critic: {critic}\n"
             f"Neuro Engine: {neuro}\n"
@@ -2529,7 +2456,7 @@ class CoreMixin:
         embed.add_field(name="⚙️ Global Feature Toggles", value=toggles_value, inline=False)
 
         # Model & Content Policy
-        allowed_models = self.server_allowed_models.get(guild.id, [])
+        allowed_models = self.server_allowed_models.get(guild.id,[])
         if not allowed_models:
             model_list_status = "Default Safe Models Active"
         else:
@@ -2538,13 +2465,6 @@ class CoreMixin:
                 model_list_status += "..."
         embed.add_field(name="🤖 Model & Content Policy", value=model_list_status, inline=False)
 
-        # Freewill System
-        fw_config = self.freewill_config.get(str(guild.id), {})
-        fw_living = len(fw_config.get("living_channel_ids", []))
-        fw_lurking = len(fw_config.get("lurking_channel_ids", []))
-        fw_value = f"**Active Channels:** {fw_living} Living / {fw_lurking} Lurking"
-        embed.add_field(name="🎭 Roleplay & Automation", value=fw_value, inline=False)
-        
         # Current Channel Defaults
         channel = interaction.channel
         activation_status = "**Active**" if channel.id in self.active_channels else "Inactive (Mention-Only)"

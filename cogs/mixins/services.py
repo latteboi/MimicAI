@@ -982,69 +982,18 @@ class ServicesMixin:
         
         while True:
             try:
-                if session.get("type") == "freewill" and session.get("freewill_mode") != "proactive":
-                    current_opted_in_dicts = []
-                    channel = self.bot.get_channel(channel_id)
-                    guild = channel.guild
-                    guild_id_str = str(guild.id)
-
-                    server_participation = self.freewill_participation.get(guild_id_str, {})
-                    channel_participants = server_participation.get(str(channel_id), {})
-                    for user_id_str, profiles in channel_participants.items():
-                        member = guild.get_member(int(user_id_str))
-                        if not member: continue
-
-                        for profile_name, settings in profiles.items():
-                            if settings.get("personality", "off") != "off":
-                                p_dict = self._build_freewill_participant_dict(int(user_id_str), profile_name, channel)
-                                if p_dict: current_opted_in_dicts.append(p_dict)
-
-                    session_participants_set = { (p['owner_id'], p['profile_name']) for p in session['profiles'] }
-                    master_participants_set = { (p['owner_id'], p['profile_name']) for p in current_opted_in_dicts }
-
-                    added_keys = master_participants_set - session_participants_set
-                    if added_keys:
-                        history_to_copy_obj = next(iter(session["chat_sessions"].values()), None)
-                        history_to_copy = history_to_copy_obj.history if history_to_copy_obj else []
-                        
-                        for p_dict in current_opted_in_dicts:
-                            if (p_dict['owner_id'], p_dict['profile_name']) in added_keys:
-                                session['profiles'].append(p_dict)
-                                # [FIXED] Initialise internal helper class directly instead of using legacy SDK methods
-                                session['chat_sessions'][(p_dict['owner_id'], p_dict['profile_name'])] = GoogleGenAIChatSession(history=list(history_to_copy))
-
-                    removed_keys = session_participants_set - master_participants_set
-                    if removed_keys:
-                        session['profiles'] = [p for p in session['profiles'] if (p['owner_id'], p['profile_name']) not in removed_keys]
-                        for key in removed_keys:
-                            session['chat_sessions'].pop(key, None)
-                            session.get('initial_turn_taken', set()).discard(key)
-
                 initial_trigger = None
                 is_proactive_auto_round = False
                 
-                timeout = None
-                if session.get("freewill_mode") == "proactive":
-                    timeout = float(session.get("proactive_cooldown", 300))
-                
                 try:
-                    initial_trigger = await asyncio.wait_for(session['task_queue'].get(), timeout=timeout)
+                    initial_trigger = await session['task_queue'].get()
                     
                     while session.get('is_purging') or session.get('is_regenerating'):
                         await asyncio.sleep(0.5)
                         
                     # Round has officially started
                     session['is_running'] = True
-                    if initial_trigger is None and session.get("freewill_mode") == "proactive":
-                        is_proactive_auto_round = True
 
-                except asyncio.TimeoutError:
-                    if session.get("type") == "freewill" and session.get("freewill_mode") == "proactive":
-                        break
-                    else:
-                        self.multi_profile_channels.pop(channel_id, None)
-                        self._save_multi_profile_sessions()
-                        break
                 except asyncio.CancelledError:
                     raise
 
@@ -3120,13 +3069,13 @@ class ServicesMixin:
                     bot_pid = self._get_pid_from_name_any(p_data['owner_id'], p_data['profile_name'])
                     
                     p_index = self._get_user_index(p_data['owner_id'])
-                    p_is_borrowed = p_data['profile_name'] in p_index.get("borrowed", [])
+                    p_is_borrowed = p_data['profile_name'] in p_index.get("borrowed",[])
                     p_profile_settings = self._get_profile_config(p_data['owner_id'], p_data['profile_name'], p_is_borrowed) or {}
                     stm_length = int(p_profile_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
 
                     history_slice = trimmed_unified_log[-(stm_length * 2):] if stm_length > 0 else []
                     
-                    participant_history = []
+                    participant_history =[]
                     for turn in history_slice:
                         turn_type = turn.get("type")
                         if not turn_type:
@@ -3151,7 +3100,7 @@ class ServicesMixin:
                                 clean_content = turn.get("content")
                                 header, body = clean_content.split('\n', 1)
                                 wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
-                                participant_history.append({'role': 'user', 'parts': [wrapped]})
+                                participant_history.append({'role': 'user', 'parts':[wrapped]})
                         elif turn_type == "private_response":
                             if turn.get("speaker_pid") == bot_pid:
                                 # [NEW] Apply dynamic XML wrapping during re-hydration
@@ -3163,16 +3112,6 @@ class ServicesMixin:
                                     obj['thought_signature'] = turn.get('thought_signature')
                                 participant_history.append(obj)
                     session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
-
-                # Handle Proactive Freewill Continuation
-                if session.get("type") == "freewill" and session.get("freewill_mode") == "proactive":
-                    rounds_left = session.get("proactive_initial_rounds", 0)
-                    if rounds_left > 0:
-                        session["proactive_initial_rounds"] -= 1
-                        # Schedule the next turn
-                        # We use a short delay to simulate natural pause before next "automatic" event
-                        await asyncio.sleep(2) 
-                        await session['task_queue'].put(None) # None trigger = "Continue conversation"
 
             except asyncio.CancelledError:
                 break
@@ -4781,17 +4720,6 @@ class ServicesMixin:
             channel_id = message_payload.get("channel_id")
             guild_id = message_payload.get("guild_id")
             
-            # Freewill Check: If this channel is configured for Freewill, ignore child bot mentions.
-            if guild_id:
-                fw_config = self.freewill_config.get(str(guild_id), {})
-                if channel_id in fw_config.get("living_channel_ids", []) or channel_id in fw_config.get("lurking_channel_ids", []):
-                    return
-
-            # Strict Session Check: If a Freewill session is active, ignore child bot mentions.
-            session = self.multi_profile_channels.get(channel_id)
-            if session and session.get("type") == "freewill":
-                return
-
             message_id = message_payload.get("id")
 
             if message_id:
@@ -5068,19 +4996,6 @@ class ServicesMixin:
 
         session = self.multi_profile_channels.get(channel_id)
         
-        # Block toggling in Freewill sessions
-        if session and session.get("type") == "freewill":
-            channel = self.bot.get_channel(channel_id)
-            if correlation_id:
-                await self.manager_queue.put({
-                    "action": "send_to_child", "bot_id": bot_id,
-                    "payload": {"action": "toggle_result", "correlation_id": correlation_id, "result": "You cannot use this command in Freewill sessions. You can add child bots through the Freewill UI."}
-                })
-            else:
-                if channel:
-                    await channel.send("You cannot use this command in Freewill sessions. You can add child bots through the Freewill UI.")
-            return
-
         action_taken = None
         result_msg = ""
 

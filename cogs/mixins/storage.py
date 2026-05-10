@@ -668,12 +668,9 @@ class StorageMixin:
                             "custom_avatar_url": data.get("custom_avatar_url")
                         }
 
-    def _save_user_appearance_shard(self, user_id_str: str, data: Dict):
-        pass # Deprecated in Phase 3. Handled directly via _save_profile_config.
-
     def _load_channel_webhooks(self):
         self.channel_webhooks = {}
-        servers_dir = self.FREEWILL_SERVERS_DIR # This is cogs/data/servers
+        servers_dir = self.SERVERS_DIR
         if not os.path.isdir(servers_dir):
             return
         
@@ -705,7 +702,7 @@ class StorageMixin:
                     server_grouped_webhooks[server_id][str(channel_id)] = webhook_data
 
             # Save each server's webhooks to its own file
-            servers_dir = self.FREEWILL_SERVERS_DIR
+            servers_dir = self.SERVERS_DIR
             for server_id, webhooks_for_server in server_grouped_webhooks.items():
                 server_path = os.path.join(servers_dir, str(server_id))
                 os.makedirs(server_path, exist_ok=True)
@@ -781,7 +778,7 @@ class StorageMixin:
 
     def _load_server_api_keys(self):
         self.server_api_keys = {}
-        servers_dir = self.FREEWILL_SERVERS_DIR
+        servers_dir = self.SERVERS_DIR
         if not os.path.isdir(servers_dir):
             return
         
@@ -796,7 +793,7 @@ class StorageMixin:
                         self.server_api_keys[server_id_str] = server_keys_data.get("primary")
 
     def _save_server_api_key_shard(self, server_id_str: str, primary_key_data: Optional[Dict], submissions_data: List):
-        server_path = os.path.join(self.FREEWILL_SERVERS_DIR, server_id_str)
+        server_path = os.path.join(self.SERVERS_DIR, server_id_str)
         os.makedirs(server_path, exist_ok=True)
         file_path = os.path.join(server_path, "api_keys.json.gz")
         
@@ -829,7 +826,7 @@ class StorageMixin:
 
     def _load_key_submissions(self):
         self.key_submissions = {}
-        servers_dir = self.FREEWILL_SERVERS_DIR # This is cogs/data/servers
+        servers_dir = self.SERVERS_DIR
         if not os.path.isdir(servers_dir):
             return
         
@@ -868,7 +865,7 @@ class StorageMixin:
     async def _load_multi_profile_sessions(self):
         await self.bot.wait_until_ready()
         
-        servers_dir = self.FREEWILL_SERVERS_DIR
+        servers_dir = self.SERVERS_DIR
         if not os.path.isdir(servers_dir):
             return
 
@@ -881,7 +878,7 @@ class StorageMixin:
             if isinstance(active_sessions, list):
                 continue
             
-            # Combine regular and freewill for memory loading
+            # Combine regular and legacy freewill for memory loading
             all_sessions = {**active_sessions.get("regular", {}), **active_sessions.get("freewill", {})}
 
             for ch_id_str, session_data in all_sessions.items():
@@ -891,7 +888,7 @@ class StorageMixin:
                     if not channel or not channel.guild: continue
                     
                     owner_id = session_data.get("owner_id")
-                    profiles_data = session_data.get("profiles", [])
+                    profiles_data = session_data.get("profiles",[])
 
                     if not owner_id or not profiles_data:
                         continue
@@ -913,7 +910,7 @@ class StorageMixin:
                         "turns_since_last_ltm": 0,
                         "session_prompt": session_data.get("session_prompt"),
                         "session_mode": session_data.get("session_mode", "sequential"),
-                        "type": session_data.get("type", "multi"),
+                        "type": "multi",
                         "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 20, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."})
                     }
                 except Exception as e:
@@ -922,17 +919,16 @@ class StorageMixin:
     def _save_multi_profile_sessions(self):
         try:
             import collections
-            current_server_sessions = collections.defaultdict(lambda: {"regular": {}, "freewill": {}})
+            current_server_sessions = collections.defaultdict(lambda: {"regular": {}})
             
             for channel_id, session_data in self.multi_profile_channels.items():
                 channel = self.bot.get_channel(channel_id)
                 server_id_str = str(channel.guild.id) if channel and getattr(channel, 'guild', None) else "dm"
                 
-                s_type = session_data.get("type", "multi")
-                category = "freewill" if s_type == "freewill" else "regular"
+                category = "regular"
                 
-                profiles_to_save = []
-                for p in session_data.get("profiles", []):
+                profiles_to_save =[]
+                for p in session_data.get("profiles",[]):
                     pid = self._get_pid_from_name_any(p["owner_id"], p["profile_name"])
                     profiles_to_save.append({
                         "pid": pid,
@@ -942,7 +938,7 @@ class StorageMixin:
                         "bot_id": p.get("bot_id"),
                         "ephemeral": p.get("ephemeral", False),
                         "chance": p.get("chance", 100),
-                        "wakewords": p.get("wakewords", [])
+                        "wakewords": p.get("wakewords",[])
                     })
 
                 blueprint = {
@@ -956,11 +952,11 @@ class StorageMixin:
                 
                 current_server_sessions[server_id_str][category][str(channel_id)] = blueprint
 
-            servers_dir = self.FREEWILL_SERVERS_DIR
+            servers_dir = self.SERVERS_DIR
             if os.path.exists(servers_dir):
                 for s_dir in os.listdir(servers_dir):
                     if os.path.isdir(os.path.join(servers_dir, s_dir)) and s_dir not in current_server_sessions:
-                        current_server_sessions[s_dir] = {"regular": {}, "freewill": {}}
+                        current_server_sessions[s_dir] = {"regular": {}}
 
             for server_id_str, sessions_for_server in current_server_sessions.items():
                 server_index = self._get_server_index(server_id_str)
@@ -974,100 +970,6 @@ class StorageMixin:
                     
         except Exception as e:
             print(f"Error saving sharded multi-profile sessions to index: {e}")
-
-    def _load_freewill_config(self):
-        self.freewill_config = {}
-        servers_dir = self.FREEWILL_SERVERS_DIR
-        if not os.path.isdir(servers_dir):
-            return
-
-        for server_id_str in os.listdir(servers_dir):
-            if not server_id_str.isdigit():
-                continue
-            
-            server_path = os.path.join(servers_dir, server_id_str)
-            settings_file = os.path.join(server_path, "settings.json.gz")
-            server_index = self._get_server_index(server_id_str)
-
-            # Auto-migrate legacy compressed settings to the server index
-            if os.path.exists(settings_file):
-                data = self._load_json_gzip(settings_file)
-                if data:
-                    fw_data = {
-                        "enabled": data.get("freewill_enabled", False),
-                        "living_channel_ids": data.get("freewill_living_channel_ids", []),
-                        "lurking_channel_ids": data.get("freewill_lurking_channel_ids", []),
-                        "event_chance": data.get("freewill_event_chance", "off"),
-                        "event_cooldown": data.get("freewill_event_cooldown", 300),
-                        "channel_settings": data.get("freewill_channel_settings", {})
-                    }
-                    server_index["freewill_config"] = fw_data
-                    self._save_server_index(server_id_str, server_index)
-                _delete_file_shard(settings_file)
-
-            if "freewill_config" in server_index and server_index["freewill_config"]:
-                self.freewill_config[server_id_str] = server_index["freewill_config"]
-
-    def _get_freewill_server_file_path(self, guild_id: int) -> str:
-        return os.path.join(self.FREEWILL_SERVERS_DIR, f"{guild_id}.json.gz")
-
-    def _load_freewill_participation(self):
-        self.freewill_participation = {}
-        if not os.path.isdir(self.FREEWILL_SERVERS_DIR):
-            return
-            
-        # 1. Load from legacy rogue files and migrate to indices
-        for filename in os.listdir(self.FREEWILL_SERVERS_DIR):
-            if filename.endswith(".json.gz") and filename[:-len(".json.gz")].isdigit():
-                guild_id_str = filename[:-len(".json.gz")]
-                file_path = os.path.join(self.FREEWILL_SERVERS_DIR, filename)
-                data = self._load_json_gzip(file_path)
-                if data:
-                    server_index = self._get_server_index(guild_id_str)
-                    server_index["freewill_participation"] = data
-                    self._save_server_index(guild_id_str, server_index)
-                _delete_file_shard(file_path)
-
-        # 2. Load into memory directly from indices
-        for server_id_str in os.listdir(self.FREEWILL_SERVERS_DIR):
-            if server_id_str.isdigit():
-                server_index = self._get_server_index(server_id_str)
-                part_data = server_index.get("freewill_participation", {})
-                if part_data:
-                    self.freewill_participation[server_id_str] = part_data
-
-    def _save_freewill_for_server(self, guild_id: int):
-        guild_id_str = str(guild_id)
-        server_data = self.freewill_participation.get(guild_id_str, {})
-        server_index = self._get_server_index(guild_id_str)
-        server_index["freewill_participation"] = server_data
-        self._save_server_index(guild_id_str, server_index)
-        
-        # Housekeeping safety net
-        legacy_path = os.path.join(self.FREEWILL_SERVERS_DIR, f"{guild_id_str}.json.gz")
-        if os.path.exists(legacy_path):
-            _delete_file_shard(legacy_path)
-
-    def _load_channel_settings(self):
-        pass # Deprecated. Handled by _load_freewill_config via Server Index.
-
-    def _save_channel_settings(self):
-        try:
-            for guild in self.bot.guilds:
-                server_id_str = str(guild.id)
-                fw_config = self.freewill_config.get(server_id_str, {})
-                if fw_config:
-                    settings_for_server = {
-                        "enabled": fw_config.get("enabled", False),
-                        "living_channel_ids": fw_config.get("living_channel_ids", []),
-                        "lurking_channel_ids": fw_config.get("lurking_channel_ids", []),
-                        "channel_settings": fw_config.get("channel_settings", {}),
-                    }
-                    server_index = self._get_server_index(server_id_str)
-                    server_index["freewill_config"] = settings_for_server
-                    self._save_server_index(server_id_str, server_index)
-        except Exception as e:
-            print(f"Error saving sharded channel settings to index: {e}"); traceback.print_exc()
 
     def _get_api_key_for_guild(self, guild_id: int, provider: str = "gemini") -> Optional[str]:
         if not self.fernet: return None
@@ -1623,7 +1525,7 @@ class StorageMixin:
             return ('global_chat', user_id)
         
         # All other session types are keyed by channel_id
-        elif session_type in ['multi', 'freewill']:
+        elif session_type in ['multi']:
             channel_id, _, _ = session_key
             return (session_type, channel_id)
         return None

@@ -81,7 +81,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         self.USERS_DIR = USERS_DIR
         self.DATA_DIR = DATA_DIR
         self.MOD_DATA_DIR = MOD_DATA_DIR
-        self.FREEWILL_SERVERS_DIR = FREEWILL_SERVERS_DIR
         self.SESSIONS_GLOBAL_DIR = SESSIONS_GLOBAL_DIR
         self.SERVERS_DIR = SERVERS_DIR
         
@@ -126,30 +125,20 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         self._load_profile_shares()
         self.public_profiles: Dict[str, Dict[str, Any]] = {}
         self._load_public_profiles()
-        self.freewill_config: Dict[str, Dict[str, Any]] = {}
-        self._load_freewill_config()
-        self.freewill_participation: Dict[str, Dict[str, Any]] = {}
-        self._load_freewill_participation()
         self.child_bots: Dict[str, Dict[str, Any]] = {}
         self._load_child_bots()
-        self.last_freewill_event: Dict[int, float] = {}
-        self.last_freewill_message_info: Dict[int, Dict[str, Any]] = {}
 
         self.channel_models: Dict[Any, Tuple[genai.GenerativeModel, bool, str]] = {} 
         self.channel_model_last_profile_key: Dict[Any, Tuple[Optional[int], str]] = {} 
 
         self.chat_sessions: LRUCache = LRUCache(max_size=CHAT_SESSION_CACHE_MAX_SIZE)
         self.max_history_items = defaultConfig.CHATBOT_MEMORY_LENGTH
-        
-        # Server settings (Freewill only)
-        self._load_channel_settings()
 
         self.message_counters_for_ltm: Dict[Tuple[int, str, Literal["guild", "dm"]], int] = {}
         
         self.model_override_warnings_sent: Set[Tuple[int, int, str]] = set()
         self.debug_users: Set[int] = set()
         self.global_chat_sessions: LRUCache = LRUCache(max_size=10)
-        self.freewill_busy_profiles: Set[Tuple[int, int, str]] = set()
         self.purged_message_ids: Set[int] = set()
         self.pending_child_confirmations: Dict[str, Any] = {}
         self.global_blacklist: Set[int] = set()
@@ -543,12 +532,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 pass
 
         ch_id = interaction.channel_id
-        
-        # Cleanup legacy freewill
         session = self.multi_profile_channels.get(ch_id)
-        if session and session.get("type") == "freewill":
-            self._cleanup_freewill_session(ch_id)
-            session = None
 
         if not session:
             # Check for suspended blueprint
@@ -1444,11 +1428,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         session_data = {}
         if isinstance(active_sessions, dict):
             session_data = active_sessions.get("regular", {}).get(channel_str)
-            if not session_data:
-                session_data = active_sessions.get("freewill", {}).get(channel_str)
 
         if not session_data:
-            return []
+            return[]
 
         choices = []
         current_lower = current.lower()
@@ -1540,8 +1522,8 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     )
     async def whisper_slash(self, interaction: discord.Interaction, profile: Optional[str] = None, message: Optional[str] = None):
         session = self.multi_profile_channels.get(interaction.channel_id)
-        if not session or session.get("type") not in ["multi", "freewill"]:
-            await interaction.response.send_message("This command can only be used in an active multi-profile or freewill session.", ephemeral=True)
+        if not session or session.get("type") != "multi":
+            await interaction.response.send_message("This command can only be used in an active multi-profile session.", ephemeral=True)
             return
 
         target_participant = None
