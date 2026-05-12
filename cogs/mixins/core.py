@@ -35,6 +35,12 @@ class CoreMixin:
         self.all_bot_ids = {self.bot.user.id} | {int(bot_id) for bot_id in self.child_bots.keys()}
 
         if self.has_lock:
+            presence = self._load_parent_presence()
+            status_val = presence.get("status", "online")
+            status_map = {"online": discord.Status.online, "idle": discord.Status.idle, "dnd": discord.Status.dnd, "invisible": discord.Status.invisible}
+            activity = self._build_activity_from_dict(presence)
+            await self.bot.change_presence(status=status_map.get(status_val, discord.Status.online), activity=activity)
+            
             self._purge_legacy_default_profile()
             
             if not self.proactive_session_task.is_running():

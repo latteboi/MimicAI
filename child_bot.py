@@ -72,7 +72,7 @@ class HiveMind:
 
         self.typing_tasks[task_key] = asyncio.create_task(typing_loop())
 
-    async def launch_bot(self, bot_id, token, parent_id, parent_name="MimicAI", owner_id=None, profile_name=None, profile_id=None):
+    async def launch_bot(self, bot_id, token, parent_id, parent_name="MimicAI", owner_id=None, profile_name=None, profile_id=None, presence=None):
         if bot_id in self.clients: return
 
         # Minimal Intents: Blind & Deaf (No Message Content)
@@ -101,30 +101,87 @@ class HiveMind:
             embed.add_field(name="Profile Name", value=str(profile_name) if profile_name else "Unknown", inline=True)
             
             if owner_id and interaction.user.id == int(owner_id):
-                class StatusView(discord.ui.View):
-                    def __init__(self):
+                class ChildPresenceView(discord.ui.View):
+                    def __init__(self, ws, b_id):
                         super().__init__(timeout=120)
-                    
-                    @discord.ui.select(
-                        placeholder="Change bot status...",
-                        options=[
+                        self.ws = ws
+                        self.b_id = b_id
+                        
+                        status_options =[
                             discord.SelectOption(label="Online", value="online", emoji="🟢"),
                             discord.SelectOption(label="Idle", value="idle", emoji="🌙"),
                             discord.SelectOption(label="Do Not Disturb", value="dnd", emoji="⛔"),
                             discord.SelectOption(label="Invisible", value="invisible", emoji="🔘")
                         ]
-                    )
-                    async def select_callback(self, select_interaction: discord.Interaction, select: discord.ui.Select):
-                        status_map = {
-                            "online": discord.Status.online,
-                            "idle": discord.Status.idle,
-                            "dnd": discord.Status.dnd,
-                            "invisible": discord.Status.invisible
-                        }
-                        await bot.change_presence(status=status_map[select.values[0]])
-                        await select_interaction.response.send_message(f"Status changed to **{select.values[0].title()}**.", ephemeral=True)
+                        self.status_select = discord.ui.Select(placeholder="Change Online Status...", options=status_options, row=0)
+                        self.status_select.callback = self.status_callback
+                        self.add_item(self.status_select)
 
-                await interaction.response.send_message(embed=embed, view=StatusView(), ephemeral=True)
+                        activity_options =[
+                            discord.SelectOption(label="Playing...", value="playing", emoji="🎮"),
+                            discord.SelectOption(label="Watching...", value="watching", emoji="📺"),
+                            discord.SelectOption(label="Listening to...", value="listening", emoji="🎧"),
+                            discord.SelectOption(label="Competing in...", value="competing", emoji="🏆"),
+                            discord.SelectOption(label="Streaming...", value="streaming", emoji="🟪")
+                        ]
+                        self.act_select = discord.ui.Select(placeholder="Set Activity Type...", options=activity_options, row=1)
+                        self.act_select.callback = self.act_callback
+                        self.add_item(self.act_select)
+
+                        clear_btn = discord.ui.Button(label="Clear Activity", style=discord.ButtonStyle.danger, row=2)
+                        clear_btn.callback = self.clear_callback
+                        self.add_item(clear_btn)
+
+                    async def status_callback(self, i: discord.Interaction):
+                        status_map = {"online": discord.Status.online, "idle": discord.Status.idle, "dnd": discord.Status.dnd, "invisible": discord.Status.invisible}
+                        val = self.status_select.values[0]
+                        act = bot.activity
+                        await bot.change_presence(status=status_map[val], activity=act)
+                        if self.ws:
+                            await self.ws.send(json.dumps({"action": "update_presence", "bot_id": self.b_id, "presence": {"status": val}}))
+                        await i.response.send_message(f"Status changed to **{val.title()}**.", ephemeral=True)
+
+                    async def act_callback(self, i: discord.Interaction):
+                        val = self.act_select.values[0]
+                        class ActModal(discord.ui.Modal, title="Set Activity Details"):
+                            text_in = discord.ui.TextInput(label="Activity Text", placeholder="e.g. the conversation", required=True, max_length=128)
+                            def __init__(self, ws, b_id, atype):
+                                super().__init__()
+                                self.ws = ws
+                                self.b_id = b_id
+                                self.atype = atype
+                                if atype == "streaming":
+                                    self.url_in = discord.ui.TextInput(label="Twitch/YouTube URL", placeholder="https://twitch.tv/example", required=True)
+                                    self.add_item(self.url_in)
+
+                            async def on_submit(self, mi: discord.Interaction):
+                                text = self.text_in.value.strip()
+                                url = getattr(self, "url_in", None)
+                                url_val = url.value.strip() if url else None
+                                
+                                act_classes = {"playing": discord.ActivityType.playing, "watching": discord.ActivityType.watching, "listening": discord.ActivityType.listening, "competing": discord.ActivityType.competing}
+                                
+                                if self.atype == "streaming":
+                                    act = discord.Streaming(name=text, url=url_val)
+                                else:
+                                    act = discord.Activity(type=act_classes[self.atype], name=text)
+                                
+                                stat = bot.status
+                                await bot.change_presence(status=stat, activity=act)
+                                if self.ws:
+                                    await self.ws.send(json.dumps({"action": "update_presence", "bot_id": self.b_id, "presence": {"activity_type": self.atype, "activity_text": text, "activity_url": url_val}}))
+                                await mi.response.send_message(f"Activity set to **{self.atype.title()} {text}**.", ephemeral=True)
+
+                        await i.response.send_modal(ActModal(self.ws, self.b_id, val))
+
+                    async def clear_callback(self, i: discord.Interaction):
+                        stat = bot.status
+                        await bot.change_presence(status=stat, activity=None)
+                        if self.ws:
+                            await self.ws.send(json.dumps({"action": "update_presence", "bot_id": self.b_id, "presence": {"activity_type": None, "activity_text": None, "activity_url": None}}))
+                        await i.response.send_message("Activity cleared.", ephemeral=True)
+
+                await interaction.response.send_message(embed=embed, view=ChildPresenceView(self.ws, bot_id), ephemeral=True)
             else:
                 await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -203,6 +260,20 @@ class HiveMind:
                 async def on_ready_sync():
                     await bot.wait_until_ready()
                     try:
+                        if presence:
+                            status_val = presence.get("status", "online")
+                            status_map = {"online": discord.Status.online, "idle": discord.Status.idle, "dnd": discord.Status.dnd, "invisible": discord.Status.invisible}
+                            atype = presence.get("activity_type")
+                            text = presence.get("activity_text")
+                            url = presence.get("activity_url")
+                            act = None
+                            if atype and text:
+                                act_classes = {"playing": discord.ActivityType.playing, "watching": discord.ActivityType.watching, "listening": discord.ActivityType.listening, "competing": discord.ActivityType.competing}
+                                if atype == "streaming": act = discord.Streaming(name=text, url=url)
+                                elif atype in act_classes: act = discord.Activity(type=act_classes[atype], name=text)
+                            
+                            await bot.change_presence(status=status_map.get(status_val, discord.Status.online), activity=act)
+
                         await bot.tree.sync()
                         print(f"[Hive] {bot.user.name} ({bot_id}) synced commands.")
                     except Exception as e:
@@ -448,7 +519,8 @@ class HiveMind:
                                 data.get("parent_name", "MimicAI"),
                                 data.get("owner_id"),
                                 data.get("profile_name"),
-                                data.get("profile_id")
+                                data.get("profile_id"),
+                                data.get("presence")
                             )
                         elif action == "shutdown":
                             await self.shutdown_bot(str(data.get("bot_id")))

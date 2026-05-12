@@ -77,7 +77,8 @@ async def ipc_server_handler(websocket, path=None):
                         "parent_name": bot.user.name,
                         "owner_id": config.get("owner_id"),
                         "profile_name": config.get("profile_name"),
-                        "profile_id": config.get("pid")
+                        "profile_id": config.get("pid"),
+                        "presence": config.get("presence")
                     }))
                 except Exception as e:
                     print(f"Failed to launch {bot_id}: {e}")
@@ -94,6 +95,8 @@ async def ipc_server_handler(websocket, path=None):
                         asyncio.create_task(gemini_cog.handle_child_bot_confirmation(event_data))
                     elif action == "toggle_session_participation":
                         asyncio.create_task(gemini_cog.handle_child_bot_toggle(event_data))
+                    elif action == "update_presence":
+                        asyncio.create_task(gemini_cog.handle_child_bot_presence(event_data))
 
     except websockets.exceptions.ConnectionClosed:
         print("IPC: Hive disconnected.")
@@ -124,7 +127,8 @@ async def manager_task():
                     "parent_name": bot.user.name,
                     "owner_id": config.get("owner_id"),
                     "profile_name": config.get("profile_name"),
-                    "profile_id": config.get("pid")
+                    "profile_id": config.get("pid"),
+                    "presence": config.get("presence")
                 }))
 
         elif action == 'shutdown_bot':

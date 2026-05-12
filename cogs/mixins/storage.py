@@ -1538,3 +1538,27 @@ class StorageMixin:
                 self._save_key_submissions_shard(server_id_str, submissions_data)
         except Exception as e:
             print(f"Error saving all key submission shards: {e}")
+
+    def _load_parent_presence(self) -> Dict[str, Any]:
+        path = os.path.join(self.MOD_DATA_DIR, "parent_presence.json")
+        data = IOManager.read_json(path)
+        return data if data else {}
+
+    def _save_parent_presence(self, data: Dict[str, Any]):
+        path = os.path.join(self.MOD_DATA_DIR, "parent_presence.json")
+        _atomic_json_save(data, path)
+
+    def _build_activity_from_dict(self, data: Dict[str, Any]) -> Optional[discord.Activity]:
+        atype = data.get("activity_type")
+        text = data.get("activity_text")
+        url = data.get("activity_url")
+        if atype and text:
+            act_classes = {
+                "playing": discord.ActivityType.playing, 
+                "watching": discord.ActivityType.watching, 
+                "listening": discord.ActivityType.listening, 
+                "competing": discord.ActivityType.competing
+            }
+            if atype == "streaming": return discord.Streaming(name=text, url=url)
+            elif atype in act_classes: return discord.Activity(type=act_classes[atype], name=text)
+        return None

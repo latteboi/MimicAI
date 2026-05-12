@@ -453,17 +453,25 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         )
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
-    @app_commands.command(name="debug", description="Toggle debug mode to see the bot's context for all scopes in your DMs (DM-Only).")
-    @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
-    @app_commands.dm_only()
-    @app_commands.describe(mode="Turn the debug view on or off.")
-    async def debug_slash(self, interaction: discord.Interaction, mode: Literal['on', 'off']):
-        if mode == 'on':
-            self.debug_users.add(interaction.user.id)
-            await interaction.response.send_message("Universal debug mode **ENABLED**. You will now receive the bot's context in your DMs when you trigger a turn in any scope.", ephemeral=True)
+    @app_commands.command(name="whoami", description="Displays information about this bot's identity.")
+    @app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
+    async def whoami_slash(self, interaction: discord.Interaction):
+        is_owner = interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)
+        embed = discord.Embed(
+            title=f"Bot Identity: {self.bot.user.name}",
+            description="Managed by MimicAI Core.",
+            color=discord.Color.blue()
+        )
+        embed.set_thumbnail(url=self.bot.user.display_avatar.url)
+        
+        embed.add_field(name="Version", value="v0.1.4 Beta", inline=True)
+        embed.add_field(name="Global Scope", value=f"{len(self.bot.guilds)} Servers", inline=True)
+
+        if is_owner:
+            view = ParentPresenceView(self)
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         else:
-            self.debug_users.discard(interaction.user.id)
-            await interaction.response.send_message("Universal debug mode **DISABLED**.", ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
     data_group = app_commands.Group(name="data", description="Manage LTM and Training data for your profiles.", parent=profile_group)
 

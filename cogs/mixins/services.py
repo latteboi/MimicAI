@@ -4712,6 +4712,8 @@ class ServicesMixin:
         print("\n".join(log).replace("**", ""))
 
     async def handle_child_bot_event(self, event_data: Dict):
+        if event_data.get("message", {}).get("author_id") in self.global_blacklist: return
+        
         event_type = event_data.get("event_type")
         bot_id = event_data.get("bot_id")
         
@@ -4805,7 +4807,30 @@ class ServicesMixin:
             if not session.get('is_running'):
                 session['worker_task'] = self.bot.loop.create_task(self._multi_profile_worker(channel_id))
 
+    async def handle_child_bot_presence(self, event_data: Dict):
+        bot_id = str(event_data.get("bot_id"))
+        presence_update = event_data.get("presence")
+        if not bot_id or not presence_update: return
+        
+        bot_config = self.child_bots.get(bot_id)
+        if bot_config:
+            owner_id = bot_config['owner_id']
+            pid = bot_config['pid']
+            bot_file = os.path.join(self.USERS_DIR, str(owner_id), "profiles", pid, "child_bot.json.gz")
+            
+            from .storage import IOManager
+            saved_config = IOManager.read_json_gzip(bot_file, encrypted=False) or {}
+            
+            current_presence = saved_config.get("presence", {})
+            current_presence.update(presence_update)
+            saved_config["presence"] = current_presence
+            
+            IOManager.write_json_gzip(saved_config, bot_file, encrypted=False)
+            bot_config["presence"] = current_presence
+
     async def handle_child_bot_image_request(self, event_data: Dict):
+        if event_data.get("message", {}).get("author_id") in self.global_blacklist: return
+        
         bot_id = event_data.get("bot_id")
         message_data = event_data.get("message", {})
         channel_id = message_data.get("channel_id")

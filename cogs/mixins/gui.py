@@ -6766,3 +6766,96 @@ class BulkNeuroView(BaseBulkProfileView):
         
         status = "ENABLED" if self.toggle_choice else "DISABLED"
         await interaction.edit_original_response(content=f"Neuro-Endocrine Engine has been set to **{status}** for {updated_count} profile(s).", view=None)
+
+class ParentActivityModal(ui.Modal):
+    def __init__(self, cog, act_type):
+        super().__init__(title="Set Activity Details")
+        self.cog = cog
+        self.act_type = act_type
+        
+        self.text_input = ui.TextInput(label="Activity Text", placeholder="e.g. the conversation", required=True, max_length=128)
+        self.add_item(self.text_input)
+        
+        if act_type == "streaming":
+            self.url_input = ui.TextInput(label="Twitch/YouTube URL", placeholder="https://twitch.tv/example", required=True)
+            self.add_item(self.url_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        text = self.text_input.value.strip()
+        url = getattr(self, "url_input", None)
+        url_val = url.value.strip() if url else None
+        
+        presence = self.cog._load_parent_presence()
+        presence["activity_type"] = self.act_type
+        presence["activity_text"] = text
+        presence["activity_url"] = url_val
+        self.cog._save_parent_presence(presence)
+        
+        status_val = presence.get("status", "online")
+        status_map = {"online": discord.Status.online, "idle": discord.Status.idle, "dnd": discord.Status.dnd, "invisible": discord.Status.invisible}
+        
+        activity = self.cog._build_activity_from_dict(presence)
+        await self.cog.bot.change_presence(status=status_map.get(status_val, discord.Status.online), activity=activity)
+        
+        await interaction.response.send_message(f"Activity set to **{self.act_type.title()} {text}**.", ephemeral=True)
+
+class ParentPresenceView(ui.View):
+    def __init__(self, cog):
+        super().__init__(timeout=300)
+        self.cog = cog
+        
+        status_options =[
+            discord.SelectOption(label="Online", value="online", emoji="🟢"),
+            discord.SelectOption(label="Idle", value="idle", emoji="🌙"),
+            discord.SelectOption(label="Do Not Disturb", value="dnd", emoji="⛔"),
+            discord.SelectOption(label="Invisible", value="invisible", emoji="🔘")
+        ]
+        self.status_select = ui.Select(placeholder="Change Online Status...", options=status_options, row=0)
+        self.status_select.callback = self.status_callback
+        self.add_item(self.status_select)
+
+        activity_options =[
+            discord.SelectOption(label="Playing...", value="playing", emoji="🎮"),
+            discord.SelectOption(label="Watching...", value="watching", emoji="📺"),
+            discord.SelectOption(label="Listening to...", value="listening", emoji="🎧"),
+            discord.SelectOption(label="Competing in...", value="competing", emoji="🏆"),
+            discord.SelectOption(label="Streaming...", value="streaming", emoji="🟪")
+        ]
+        self.activity_select = ui.Select(placeholder="Set Activity Type...", options=activity_options, row=1)
+        self.activity_select.callback = self.activity_callback
+        self.add_item(self.activity_select)
+
+        clear_btn = ui.Button(label="Clear Activity", style=discord.ButtonStyle.danger, row=2)
+        clear_btn.callback = self.clear_callback
+        self.add_item(clear_btn)
+
+    async def status_callback(self, interaction: discord.Interaction):
+        status_map = {
+            "online": discord.Status.online, "idle": discord.Status.idle,
+            "dnd": discord.Status.dnd, "invisible": discord.Status.invisible
+        }
+        status_val = self.status_select.values[0]
+        
+        presence = self.cog._load_parent_presence()
+        presence["status"] = status_val
+        self.cog._save_parent_presence(presence)
+        
+        activity = self.cog._build_activity_from_dict(presence)
+        await self.cog.bot.change_presence(status=status_map[status_val], activity=activity)
+        await interaction.response.send_message(f"Status changed to **{status_val.title()}**.", ephemeral=True)
+
+    async def activity_callback(self, interaction: discord.Interaction):
+        act_type = self.activity_select.values[0]
+        await interaction.response.send_modal(ParentActivityModal(self.cog, act_type))
+
+    async def clear_callback(self, interaction: discord.Interaction):
+        presence = self.cog._load_parent_presence()
+        presence["activity_type"] = None
+        presence["activity_text"] = None
+        presence["activity_url"] = None
+        self.cog._save_parent_presence(presence)
+        
+        status_val = presence.get("status", "online")
+        status_map = {"online": discord.Status.online, "idle": discord.Status.idle, "dnd": discord.Status.dnd, "invisible": discord.Status.invisible}
+        await self.cog.bot.change_presence(status=status_map.get(status_val, discord.Status.online), activity=None)
+        await interaction.response.send_message("Activity cleared.", ephemeral=True)
