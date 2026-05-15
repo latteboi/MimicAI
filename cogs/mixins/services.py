@@ -639,90 +639,103 @@ class ServicesMixin:
         start_time = time.time()
         last_interval = 0
         
-        # The Absolute Watchdog Loop
-        while not gen_task.done():
-            elapsed = time.time() - start_time
-            
-            if elapsed >= hard_timeout:
-                gen_task.cancel()
-                err = TimeoutError(f"Generation timed out after {hard_timeout} seconds")
-                err.state_container = state_container
-                raise err
-            
-            # Every 10 seconds, handle Message B
-            current_interval = int(elapsed // 10)
-            if current_interval > last_interval:
-                last_interval = current_interval
+        try:
+            # The Absolute Watchdog Loop
+            while not gen_task.done():
+                elapsed = time.time() - start_time
                 
-                mins = int(elapsed) // 60
-                secs = int(elapsed) % 60
-                time_str = f"{mins}:{secs:02d}"
+                if elapsed >= hard_timeout:
+                    gen_task.cancel()
+                    try:
+                        await gen_task
+                    except Exception:
+                        pass # Ignore exceptions from the forcibly killed task
+                    err = TimeoutError(f"Generation timed out after {hard_timeout} seconds")
+                    err.state_container = state_container
+                    raise err
                 
-                base_text = "Using fallback model" if is_fallback else "Still generating"
-                text = f"-# {base_text}... ({time_str})"
-                
-                msg_b_id = state_container.get('msg_b_id')
-                
-                try:
-                    if participant and participant.get('method') == 'child_bot':
-                        bot_id = participant.get('bot_id')
-                        if not msg_b_id:
-                            corr_id = str(uuid.uuid4())
-                            conf_event = asyncio.Event()
-                            conf_data_ref = {"event": conf_event, "type": "heartbeat_placeholder"}
-                            self.pending_child_confirmations[corr_id] = conf_data_ref
-                            
-                            await self.manager_queue.put({
-                                "action": "send_to_child", "bot_id": bot_id,
-                                "payload": {
-                                    "action": "send_message", "channel_id": channel.id,
-                                    "content": text, "realistic_typing": False, "correlation_id": corr_id
-                                }
-                            })
-                            try:
-                                await asyncio.wait_for(conf_event.wait(), timeout=5.0)
-                                msg_ids = conf_data_ref.get("message_ids", [])
-                                if msg_ids: state_container['msg_b_id'] = msg_ids[-1]
-                            except asyncio.TimeoutError: pass
-                            finally: self.pending_child_confirmations.pop(corr_id, None)
+                # Every 10 seconds, handle Message B
+                current_interval = int(elapsed // 10)
+                if current_interval > last_interval:
+                    last_interval = current_interval
+                    
+                    mins = int(elapsed) // 60
+                    secs = int(elapsed) % 60
+                    time_str = f"{mins}:{secs:02d}"
+                    
+                    base_text = "Using fallback model" if is_fallback else "Still generating"
+                    text = f"-# {base_text}... ({time_str})"
+                    
+                    msg_b_id = state_container.get('msg_b_id')
+                    
+                    try:
+                        if participant and participant.get('method') == 'child_bot':
+                            bot_id = participant.get('bot_id')
+                            if not msg_b_id:
+                                corr_id = str(uuid.uuid4())
+                                conf_event = asyncio.Event()
+                                conf_data_ref = {"event": conf_event, "type": "heartbeat_placeholder"}
+                                self.pending_child_confirmations[corr_id] = conf_data_ref
+                                
+                                await self.manager_queue.put({
+                                    "action": "send_to_child", "bot_id": bot_id,
+                                    "payload": {
+                                        "action": "send_message", "channel_id": channel.id,
+                                        "content": text, "realistic_typing": False, "correlation_id": corr_id
+                                    }
+                                })
+                                try:
+                                    await asyncio.wait_for(conf_event.wait(), timeout=5.0)
+                                    msg_ids = conf_data_ref.get("message_ids", [])
+                                    if msg_ids: state_container['msg_b_id'] = msg_ids[-1]
+                                except asyncio.TimeoutError: pass
+                                finally: self.pending_child_confirmations.pop(corr_id, None)
+                            else:
+                                await self.manager_queue.put({
+                                    "action": "send_to_child", "bot_id": bot_id,
+                                    "payload": {
+                                        "action": "regenerate_message", "channel_id": channel.id,
+                                        "message_id": msg_b_id, "content": text
+                                    }
+                                })
                         else:
-                            await self.manager_queue.put({
-                                "action": "send_to_child", "bot_id": bot_id,
-                                "payload": {
-                                    "action": "regenerate_message", "channel_id": channel.id,
-                                    "message_id": msg_b_id, "content": text
-                                }
-                            })
-                    else:
-                        if state_container.get('message_type') == "embed" and state_container.get('placeholder_msg'):
-                            try:
-                                msg_obj = state_container['placeholder_msg']
-                                if msg_obj and msg_obj.embeds:
-                                    embed = msg_obj.embeds[0]
-                                    embed.description = f"{state_container['custom_emoji']}\n\n-# {base_text}... ({time_str})"
-                                    await msg_obj.edit(embed=embed)
-                            except Exception: pass
-                        else:
-                            # Webhooks
-                            webhook = await self._get_or_create_webhook(channel)
-                            if webhook:
-                                if not msg_b_id:
-                                    sent_msg = await webhook.send(
-                                        content=text, 
-                                        username=state_container.get('app_name', 'Bot'), 
-                                        avatar_url=state_container.get('app_avatar'), 
-                                        wait=True
-                                    )
-                                    if sent_msg: state_container['msg_b_id'] = sent_msg.id
-                                else:
-                                    await webhook.edit_message(msg_b_id, content=text)
-                except Exception:
-                    pass
+                            if state_container.get('message_type') == "embed" and state_container.get('placeholder_msg'):
+                                try:
+                                    msg_obj = state_container['placeholder_msg']
+                                    if msg_obj and msg_obj.embeds:
+                                        embed = msg_obj.embeds[0]
+                                        embed.description = f"{state_container['custom_emoji']}\n\n{text}"
+                                        await msg_obj.edit(embed=embed)
+                                except Exception: pass
+                            else:
+                                # Webhooks
+                                webhook = await self._get_or_create_webhook(channel)
+                                if webhook:
+                                    if not msg_b_id:
+                                        sent_msg = await webhook.send(
+                                            content=text, 
+                                            username=state_container.get('app_name', 'Bot'), 
+                                            avatar_url=state_container.get('app_avatar'), 
+                                            wait=True
+                                        )
+                                        if sent_msg: state_container['msg_b_id'] = sent_msg.id
+                                    else:
+                                        await webhook.edit_message(msg_b_id, content=text)
+                    except Exception:
+                        pass
+                
+                # Check exactly every 1 second
+                await asyncio.sleep(1)
+                
+            return gen_task.result(), state_container
             
-            # Check exactly every 1 second
-            await asyncio.sleep(1)
-            
-        return gen_task.result(), state_container
+        except asyncio.CancelledError:
+            gen_task.cancel()
+            try:
+                await gen_task
+            except Exception:
+                pass
+            raise
 
     async def _get_or_create_model_for_global_chat(self, user_id: int, profile_name: str) -> Tuple[Optional[Any], float, float, int, Optional[str], Optional[str]]:
         index = self._get_user_index(user_id)
@@ -3129,34 +3142,51 @@ class ServicesMixin:
             session['worker_task'] = None
 
     def _extract_and_apply_neuro_state(self, raw_text: str, owner_id: int, profile_name: str) -> Tuple[str, Optional[Dict[str, int]]]:
-        pattern = r'<neuro_update>\s*(.*?)\s*</neuro_update>'
-        match = re.search(pattern, raw_text, flags=re.IGNORECASE | re.DOTALL)
-        if not match:
-            return raw_text, None
-
-        data_str = match.group(1)
-        new_state = {}
-        parts = data_str.split('|')
-        for p in parts:
-            kv = p.split(':')
-            if len(kv) == 2:
-                k = kv[0].strip().upper()
-                try:
-                    v = int(kv[1].strip())
-                    v = max(0, min(100, v))
-                    if k == 'D': new_state['dopamine'] = v
-                    elif k == 'C': new_state['cortisol'] = v
-                    elif k == 'O': new_state['oxytocin'] = v
-                    elif k == 'A': new_state['adrenaline'] = v
-                except ValueError:
-                    pass
-
-        clean_text = re.sub(pattern, '', raw_text, flags=re.IGNORECASE | re.DOTALL).strip()
+        # 1. Attempt strict XML tag extraction
+        xml_pattern = r'<neuro_update>\s*(.*?)\s*</neuro_update>'
+        match = re.search(xml_pattern, raw_text, flags=re.IGNORECASE | re.DOTALL)
         
+        data_str = None
+        clean_text = raw_text
+        
+        if match:
+            data_str = match.group(1)
+            clean_text = re.sub(xml_pattern, '', raw_text, flags=re.IGNORECASE | re.DOTALL)
+        else:
+            # 2. Relaxed Pattern Matcher (Fallback for XML-less output)
+            # Looks for the raw D:XX|C:XX|O:XX|A:XX pattern typically at the end of the response
+            relaxed_pattern = r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})'
+            match = re.search(relaxed_pattern, raw_text, flags=re.IGNORECASE)
+            if match:
+                data_str = match.group(0)
+                clean_text = re.sub(relaxed_pattern, '', raw_text, flags=re.IGNORECASE)
+
+        if not data_str:
+            return raw_text.strip(), None
+
+        new_state = {}
+        # Normalise separators for splitting
+        normalised_data = data_str.replace('|', ':').replace(' ', '')
+        kv_pairs = normalised_data.split(':')
+        
+        # Iterating pairs (K, V)
+        for i in range(0, len(kv_pairs) - 1, 2):
+            k = kv_pairs[i].strip().upper()
+            try:
+                v = int(kv_pairs[i+1].strip())
+                v = max(0, min(100, v))
+                if k == 'D': new_state['dopamine'] = v
+                elif k == 'C': new_state['cortisol'] = v
+                elif k == 'O': new_state['oxytocin'] = v
+                elif k == 'A': new_state['adrenaline'] = v
+            except (ValueError, IndexError):
+                continue
+
+        clean_text = clean_text.strip()
         final_state = None
         if new_state:
             index = self._get_user_index(owner_id)
-            is_borrowed = profile_name in index.get("borrowed",[])
+            is_borrowed = profile_name in index.get("borrowed", [])
             p_config = self._get_profile_config(owner_id, profile_name, is_borrowed)
             
             if p_config and p_config.get("neuro_engine_enabled"):

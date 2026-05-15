@@ -1307,6 +1307,13 @@ class CoreMixin:
         scrubbed_text = self._scrub_response_text(response_text, participant_names=[display_name])
         response_text = self._deduplicate_response(scrubbed_text)
         
+        # [NEW] Safety Fallback for empty responses
+        if not response_text or not response_text.strip():
+            p_index = self._get_user_index(owner_id)
+            p_is_borrowed = profile_name in p_index.get("borrowed", [])
+            p_settings = self._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
+            response_text = p_settings.get("error_response", "...")
+
         if response_text != "[REPETITIVE_CONTENT_ERROR]":
             grounding_sources = []
             if hasattr(response, 'raw') and response.raw.candidates:
@@ -1521,6 +1528,13 @@ class CoreMixin:
         
         response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
         response_text = self._deduplicate_response(self._scrub_response_text(response_text, participant_names=[display_name]))
+        
+        # [NEW] Safety Fallback for empty responses
+        if not response_text or not response_text.strip():
+            p_index = self._get_user_index(owner_id)
+            p_is_borrowed = profile_name in p_index.get("borrowed", [])
+            p_settings = self._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
+            response_text = p_settings.get("error_response", "...")
 
         # Update log
         profile_id = self._get_profile_id(effective_owner_id, effective_profile_name)

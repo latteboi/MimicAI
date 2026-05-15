@@ -1362,10 +1362,11 @@ class ProfileManageView(ui.View):
             profile["critic_enabled"] = not profile.get("critic_enabled", False)
             await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice == "neuro":
-            profile["neuro_engine_enabled"] = not profile.get("neuro_engine_enabled", False)
-            if profile["neuro_engine_enabled"] and "neuro_state" not in profile:
-                profile["neuro_state"] = {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20}
-            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
+            async def refresh_cb(modal_interaction: discord.Interaction):
+                new_embed = await self.cog._build_profile_manage_embed(modal_interaction, self.profile_name)
+                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
+            modal = ProfileNeuroModal(self.cog, self.profile_name, profile, self.is_borrowed, callback=refresh_cb)
+            await interaction.response.send_modal(modal)
 
         # --- Memory Tab Logic ---
         elif choice == "data":
@@ -4116,6 +4117,23 @@ class BulkActionView(BaseBulkProfileView):
             final_message = await self.cog.bulk_apply_image_settings(self.user_id, target_profiles_list, self.params)
         elif self.action == "apply_generation_visual":
             final_message = await self.cog.bulk_apply_generation_visual(self.user_id, target_profiles_list, self.params)
+        elif self.action == "apply_neuro_settings":
+            # Direct logic for neuro settings to maintain atomic state updates
+            updated_count = 0
+            index = self.cog._get_user_index(self.user_id)
+            for profile_name in target_profiles_list:
+                is_borrowed = profile_name in index.get("borrowed", [])
+                profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
+                if profile:
+                    if "neuro_engine_enabled" in self.params:
+                        profile["neuro_engine_enabled"] = self.params["neuro_engine_enabled"]
+                    if "neuro_state" in self.params:
+                        curr = profile.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
+                        curr.update(self.params["neuro_state"])
+                        profile["neuro_state"] = curr
+                    self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
+                    updated_count += 1
+            final_message = f"Applied neuro-endocrine settings to {updated_count} profile(s)."
         
         await interaction.edit_original_response(content=final_message, view=None)
 
@@ -4649,6 +4667,44 @@ class SearchDataModal(ui.Modal, title="Search Data"):
         self.parent_view.current_page = 1
         await self.parent_view._update_view(interaction)
 
+class SearchDataModal(ui.Modal, title="Search Data"):
+    search_input = ui.TextInput(label="Enter search term (leave blank to clear)", required=False, max_length=100)
+
+    def __init__(self, parent_view: 'DataManageView'):
+        super().__init__()
+        self.parent_view = parent_view
+        if self.parent_view.search_term:
+            self.search_input.default = self.parent_view.search_term
+
+    async def on_submit(self, interaction: discord.Interaction):
+        search_term = self.search_input.value.strip()
+        self.parent_view.search_term = search_term if search_term else None
+        self.parent_view.current_page = 1
+        await self.parent_view._update_view(interaction)
+
+class DataPageJumpModal(ui.Modal, title="Jump to Page"):
+    def __init__(self, parent_view: 'DataManageView'):
+        super().__init__()
+        self.parent_view = parent_view
+        self.page_input = ui.TextInput(
+            label="Page Number",
+            placeholder=f"Enter a number between 1 and {parent_view.max_pages}",
+            required=True,
+            min_length=1,
+            max_length=5
+        )
+        self.add_item(self.page_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            page_num = int(self.page_input.value.strip())
+            if page_num < 1 or page_num > self.parent_view.max_pages:
+                raise ValueError("Out of range")
+            self.parent_view.current_page = page_num
+            await self.parent_view._update_view(interaction)
+        except ValueError:
+            await interaction.response.send_message(f"❌ Please enter a valid number between 1 and {self.parent_view.max_pages}.", ephemeral=True)
+
 class DataManageView(ui.View):
     def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, profile_name: str, is_borrowed: bool, effective_owner_id: int):
         super().__init__(timeout=600)
@@ -4804,18 +4860,21 @@ class DataManageView(ui.View):
             ltm_button.callback = self.mode_button_callback
             self.add_item(ltm_button)
 
-        prev_button = ui.Button(label="◀", style=discord.ButtonStyle.blurple, disabled=(self.current_page <= 1), row=0)
+        prev_button = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page <= 1), row=0)
         prev_button.callback = self.prev_page_callback
         self.add_item(prev_button)
 
-        next_button = ui.Button(label="▶", style=discord.ButtonStyle.blurple, disabled=(self.current_page >= self.max_pages), row=0)
+        page_button = ui.Button(label=f"{self.current_page}/{self.max_pages}", style=discord.ButtonStyle.secondary, row=0)
+        page_button.callback = self.page_button_callback
+        self.add_item(page_button)
+
+        next_button = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page >= self.max_pages), row=0)
         next_button.callback = self.next_page_callback
         self.add_item(next_button)
 
-        # [NEW] Move Analyse button to Row 0 (Only visible in training mode)
+        # [NEW] Move Analyse button to Row 1 (Only visible in training mode)
         if self.mode == 'training' and not self.is_borrowed:
-            analyse_button = ui.Button(label="Analyse", style=discord.ButtonStyle.blurple, row=0)
-            analyse_button = ui.Button(label="Analyse", style=discord.ButtonStyle.blurple, row=0)
+            analyse_button = ui.Button(label="Analyse", style=discord.ButtonStyle.blurple, row=1)
             async def analyse_cb(i): await i.response.send_modal(AnalyseExamplesModal(self))
             analyse_button.callback = analyse_cb
             self.add_item(analyse_button)
@@ -4945,6 +5004,9 @@ class DataManageView(ui.View):
         self.mode = 'ltm' if interaction.data['custom_id'] == 'mode_ltm' else 'training'
         self.current_page = 1
         await self._update_view(interaction)
+
+    async def page_button_callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(DataPageJumpModal(self))
 
     async def prev_page_callback(self, interaction: discord.Interaction):
         if self.current_page > 1:
@@ -5849,6 +5911,75 @@ class AppearanceEditView(ui.View):
         confirm_view.add_item(confirm_button)
         await interaction.response.send_message(f"**Are you sure you want to delete the appearance for '{self.profile_name}'?**", view=confirm_view, ephemeral=True)
 
+class ProfileNeuroModal(ui.Modal, title="Neuro-Endocrine Engine Configuration"):
+    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+        super().__init__()
+        self.cog = cog
+        self.profile_name = profile_name
+        self.is_borrowed = is_borrowed
+        self.callback = callback
+
+        status_val = "on" if current_params.get("neuro_engine_enabled", False) else "off"
+        state = current_params.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
+
+        self.status_input = ui.TextInput(label="Engine Status (on/off)", default=status_val, required=False, placeholder="Enable or disable the engine.")
+        self.d_input = ui.TextInput(label="Dopamine (0-100)", default=str(state.get("dopamine", "")), required=False, placeholder="Motivation and joy.")
+        self.c_input = ui.TextInput(label="Cortisol (0-100)", default=str(state.get("cortisol", "")), required=False, placeholder="Stress and anxiety.")
+        self.o_input = ui.TextInput(label="Oxytocin (0-100)", default=str(state.get("oxytocin", "")), required=False, placeholder="Bonding and trust.")
+        self.a_input = ui.TextInput(label="Adrenaline (0-100)", default=str(state.get("adrenaline", "")), required=False, placeholder="Energy and urgency.")
+        
+        self.add_item(self.status_input)
+        self.add_item(self.d_input)
+        self.add_item(self.c_input)
+        self.add_item(self.o_input)
+        self.add_item(self.a_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        new_params = {}
+        
+        try:
+            status_raw = self.status_input.value.strip().lower()
+            if status_raw:
+                new_params["neuro_engine_enabled"] = (status_raw == "on")
+
+            def parse_val(val, name):
+                if not val.strip(): return None
+                res = int(val.strip())
+                if not (0 <= res <= 100): raise ValueError(f"{name} out of range.")
+                return res
+
+            parsed_state = {
+                "dopamine": parse_val(self.d_input.value, "Dopamine"),
+                "cortisol": parse_val(self.c_input.value, "Cortisol"),
+                "oxytocin": parse_val(self.o_input.value, "Oxytocin"),
+                "adrenaline": parse_val(self.a_input.value, "Adrenaline")
+            }
+            # Only include non-None values
+            new_params["neuro_state"] = {k: v for k, v in parsed_state.items() if v is not None}
+            
+        except ValueError as e:
+            await interaction.followup.send(f"❌ **Invalid Input:** {e}", ephemeral=True)
+            return
+
+        if self.profile_name == "BULK_APPLY":
+            if self.callback: await self.callback(interaction, new_params)
+            return
+
+        target = self.cog._get_profile_config(interaction.user.id, self.profile_name, self.is_borrowed)
+        if target:
+            if "neuro_engine_enabled" in new_params:
+                target["neuro_engine_enabled"] = new_params["neuro_engine_enabled"]
+            
+            if "neuro_state" in new_params:
+                current_state = target.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
+                current_state.update(new_params["neuro_state"])
+                target["neuro_state"] = current_state
+            
+            self.cog._save_profile_config(interaction.user.id, self.profile_name, target, self.is_borrowed)
+            await interaction.followup.send(f"✅ Neuro-Endocrine settings updated for '{self.profile_name}'.", ephemeral=True)
+            if self.callback: await self.callback(interaction)
+
 class BulkManageView(ui.View):
     def __init__(self, cog: 'GeminiAgent', original_interaction: discord.Interaction):
         super().__init__(timeout=600)
@@ -6062,9 +6193,12 @@ class BulkManageView(ui.View):
             await self.original_interaction.edit_original_response(content="Select critic action and profiles:", view=view)
 
         elif choice == "neuro":
-            await interaction.response.defer()
-            view = BulkNeuroView(self.cog, self.user_id)
-            await self.original_interaction.edit_original_response(content="Select neuro-endocrine action and profiles:", view=view)
+            modal = ProfileNeuroModal(self.cog, "BULK_APPLY", {}, False)
+            async def modal_callback(i: discord.Interaction, params: Dict):
+                view = BulkActionView(self.cog, self.user_id, "apply_neuro_settings", "Select profiles to apply neuro settings to...", params=params, include_borrowed=True)
+                await self.original_interaction.edit_original_response(content="Neuro settings validated. Select the profiles to apply them to:", view=view)
+            modal.callback = modal_callback
+            await interaction.response.send_modal(modal)
 
         elif choice == "typing":
             await interaction.response.defer()
