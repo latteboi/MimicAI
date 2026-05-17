@@ -148,7 +148,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         self.message_cooldown = commands.CooldownMapping.from_cooldown(5, 60.0, commands.BucketType.user)
         self.processed_child_messages: LRUCache = LRUCache(max_size=25)
         self.all_bot_ids: Set[int] = set()
-        self.image_gen_semaphore = asyncio.Semaphore(1)
+        self.image_gen_semaphore = asyncio.Semaphore(3)
         self.ltm_recall_history: Dict[Any, Dict[str, Tuple[int, float]]] = {}
         self.child_bot_edit_cooldowns: Dict[str, List[float]] = {}
 

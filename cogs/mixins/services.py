@@ -148,6 +148,10 @@ class OpenRouterModel:
                             message_parts.append({"type": "image_url", "image_url": {"url": data_uri}})
                         except Exception as e:
                             print(f"Error encoding legacy image for OpenRouter: {e}")
+                elif isinstance(p, dict) and 'url' in p:
+                    mime_type = p.get('mime_type', '')
+                    if mime_type.startswith("image/"):
+                        message_parts.append({"type": "image_url", "image_url": {"url": p['url']}})
 
             if message_parts:
                 if len(message_parts) == 1 and message_parts[0]["type"] == "text":
@@ -269,6 +273,8 @@ class GoogleGenAIModel:
                         parts.append(types.Part.from_text(text=p))
                     elif isinstance(p, dict) and 'mime_type' in p and 'data' in p:
                         parts.append(types.Part.from_bytes(data=p['data'], mime_type=p['mime_type']))
+                    elif isinstance(p, dict) and 'url' in p:
+                        parts.append(types.Part.from_uri(file_uri=p['url'], mime_type=p.get('mime_type')))
                 
                 if item.get('thought_signature') and parts:
                     sig = item['thought_signature']
@@ -1341,11 +1347,7 @@ class ServicesMixin:
                                     # Find the first image/audio/video attachment in the referenced message
                                     ref_media = next((a for a in ref_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))), None)
                                     if ref_media:
-                                        async with httpx.AsyncClient() as client:
-                                            resp = await client.get(ref_media.url)
-                                            if resp.status_code == 200:
-                                                media_data = await resp.aread()
-                                                new_message_parts.append({"mime_type": ref_media.content_type, "data": media_data})
+                                        new_message_parts.append({"url": ref_media.url, "mime_type": ref_media.content_type})
                             except Exception as e:
                                 print(f"Error fetching replied media: {e}")
 
@@ -1359,24 +1361,19 @@ class ServicesMixin:
                         ]
 
                         if attachments:
-                            async with httpx.AsyncClient() as client:
-                                for attachment in attachments:
-                                    try:
-                                        attachment_url = attachment['url'] if is_child_mention else attachment.url
-                                        response = await client.get(attachment_url)
-                                        response.raise_for_status()
-                                        media_data = await response.aread()
-                                        
-                                        ctype = response.headers.get("Content-Type", "image/png")
-                                        if not is_child_mention and attachment.content_type:
-                                            ctype = attachment.content_type
-                                        elif is_child_mention and isinstance(attachment, dict):
-                                            ctype = attachment.get('content_type', "image/png")
-                                        
-                                        new_message_parts.append({"mime_type": ctype, "data": media_data})
-                                        del media_data
-                                    except Exception as e:
-                                        print(f"Failed to process media attachment in multi-profile trigger: {e}")
+                            for attachment in attachments:
+                                try:
+                                    attachment_url = attachment['url'] if is_child_mention else attachment.url
+                                    
+                                    ctype = "image/png"
+                                    if not is_child_mention and attachment.content_type:
+                                        ctype = attachment.content_type
+                                    elif is_child_mention and isinstance(attachment, dict):
+                                        ctype = attachment.get('content_type', "image/png")
+                                    
+                                    new_message_parts.append({"url": attachment_url, "mime_type": ctype})
+                                except Exception as e:
+                                    print(f"Failed to process media attachment in multi-profile trigger: {e}")
 
                         # Combine standard attachments with URL-extracted media
                         trigger_media_parts.extend(new_message_parts)
@@ -1992,15 +1989,13 @@ class ServicesMixin:
                                             if fetch_channel:
                                                 ref_msg = await fetch_channel.fetch_message(ref_msg_id)
                                                 if ref_msg.attachments and ref_msg.attachments[0].content_type.startswith("image/"):
-                                                    image_data = await ref_msg.attachments[0].read()
-                                                    parts.append({"mime_type": ref_msg.attachments[0].content_type, "data": image_data})
-                                                    del image_data
+                                                    parts.append({"url": ref_msg.attachments[0].url, "mime_type": ref_msg.attachments[0].content_type})
                                         except Exception as e:
                                             print(f"Error fetching referenced image for generation: {e}")
                                     
-                                    # 2. Try to fetch from Current Attachments (fill remaining slots up to 2 images total)
-                                    # Note: parts[0] is text, so we check if len(parts) < 3 (1 text + 2 images)
-                                    if len(parts) < 3:
+                                    # 2. Try to fetch from Current Attachments (fill remaining slots up to 10 images total)
+                                    # Note: parts[0] is text, so we check if len(parts) < 11 (1 text + 10 images)
+                                    if len(parts) < 11:
                                         attachments_list = []
                                         if isinstance(image_gen_anchor_message, dict):
                                             attachments_list = image_gen_anchor_message.get('attachments', [])
@@ -2008,25 +2003,17 @@ class ServicesMixin:
                                             attachments_list = image_gen_anchor_message.attachments
 
                                         for attachment in attachments_list:
-                                            if len(parts) >= 3: break # Limit reached
+                                            if len(parts) >= 11: break # Limit reached
 
                                             is_dict = isinstance(attachment, dict)
                                             url = attachment['url'] if is_dict else attachment.url
+                                            ctype = attachment.get('content_type', 'image/png') if is_dict else attachment.content_type
                                             
                                             # Filter objects
-                                            if not is_dict and not (attachment.content_type and attachment.content_type.startswith("image/")):
+                                            if not is_dict and not (ctype and ctype.startswith("image/")):
                                                 continue
 
-                                            try:
-                                                async with httpx.AsyncClient() as client:
-                                                    resp = await client.get(url)
-                                                    resp.raise_for_status()
-                                                    image_data = await resp.aread()
-                                                    ctype = resp.headers.get("Content-Type", "image/jpeg")
-                                                    parts.append({"mime_type": ctype, "data": image_data})
-                                                    del image_data
-                                            except Exception as e:
-                                                print(f"Error fetching attached image for generation: {e}")
+                                            parts.append({"url": url, "mime_type": ctype})
                                 
                                 status = "api_error"
                                 response = None
@@ -2933,10 +2920,9 @@ class ServicesMixin:
                                     message_attachments = [a for a in trigger.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))]
                                     for attachment in message_attachments:
                                         try:
-                                            media_data = await attachment.read()
-                                            batch_msg_media.append({"mime_type": attachment.content_type, "data": media_data})
+                                            batch_msg_media.append({"url": attachment.url, "mime_type": attachment.content_type})
                                         except Exception as e:
-                                            print(f"Failed to read batched media attachment {attachment.filename}: {e}")
+                                            print(f"Failed to process batched media attachment {attachment.filename}: {e}")
 
                                     # [NEW] Conditional Injection into Chat Sessions
                                     for p_key, inner_chat_session in session['chat_sessions'].items():
@@ -3259,14 +3245,8 @@ class ServicesMixin:
                                     safety_settings=package['safety_settings']
                                 )
                                 parts = [package['prompt_text']]
-                                async with httpx.AsyncClient() as client:
-                                    for url in package.get("reference_image_urls", []):
-                                        response = await client.get(url); response.raise_for_status()
-                                        ref_image_data = await response.aread()
-                                        ctype = response.headers.get("Content-Type", "image/png")
-                                        
-                                        # FIXED: Direct pass-through of raw bytes.
-                                        parts.append({"mime_type": ctype, "data": ref_image_data})
+                                for ref in package.get("reference_image_urls", []):
+                                    parts.append({"url": ref["url"], "mime_type": ref.get("mime_type", "image/png")})
 
                                 status = "api_error"
                                 response = None
@@ -4216,7 +4196,7 @@ class ServicesMixin:
 
                 # 1. Global XML Tag Scrubber (Internal thoughts, metadata, and context)
                 scrubbed_text = re.sub(r'<([^>]+)>.*?</\1>', '', scrubbed_text, flags=re.DOTALL)
-                scrubbed_text = re.sub(r'<[^>]+>', '', scrubbed_text)
+                scrubbed_text = re.sub(r'<(?!@|#|a?:[a-zA-Z0-9_]+:|t:\d)[^>]+>', '', scrubbed_text)
                 
                 # 2. Simplified Header Scrubber
                 # This matches ANY line containing a bracketed block of 15+ characters (the timestamp signature)
@@ -4995,14 +4975,14 @@ class ServicesMixin:
             reference_image_urls = []
             replied_to_data = message_data.get("replied_to")
             if replied_to_data and replied_to_data.get("attachment_url"):
-                reference_image_urls.append(replied_to_data["attachment_url"])
+                reference_image_urls.append({"url": replied_to_data["attachment_url"], "mime_type": "image/png"})
 
             attachments_data = message_data.get("attachments", [])
-            if len(reference_image_urls) < 2 and attachments_data:
+            if len(reference_image_urls) < 10 and attachments_data:
                 for attachment in attachments_data:
                     if attachment.get("url"):
-                        reference_image_urls.append(attachment.get("url"))
-                        if len(reference_image_urls) >= 2: break
+                        reference_image_urls.append({"url": attachment.get("url"), "mime_type": attachment.get("content_type", "image/png")})
+                        if len(reference_image_urls) >= 10: break
 
             grounding_sources = []
             grounding_mode = profile_data.get("grounding_mode", "off")
@@ -5495,10 +5475,7 @@ class ServicesMixin:
 
                     # Strictly handle images and text
                     if content_type.startswith('image/'):
-                        async with client.stream("GET", url, follow_redirects=True, timeout=10.0) as get_response:
-                            get_response.raise_for_status()
-                            media_data = await get_response.aread()
-                            media_parts.append({"mime_type": content_type, "data": media_data})
+                        media_parts.append({"url": url, "mime_type": content_type})
                     
                     elif 'text/html' in content_type:
                         get_response = await client.get(url, follow_redirects=True, timeout=10.0)
@@ -5796,9 +5773,11 @@ class ServicesMixin:
         for part in content.parts:
             if hasattr(part, 'text'):
                 parts_list.append({'text': part.text})
-            elif hasattr(part, 'inline_data'):
+            elif hasattr(part, 'inline_data') and part.inline_data:
                 # Redact image data for brevity in debug logs
                 parts_list.append({'inline_data': {'mime_type': part.inline_data.mime_type, 'data': '[IMAGE_DATA]'}})
+            elif hasattr(part, 'file_data') and part.file_data:
+                parts_list.append({'file_data': {'file_uri': part.file_data.file_uri}})
             elif isinstance(part, Image.Image):
                 parts_list.append({'inline_data': {'mime_type': 'image/png', 'data': '[PIL_IMAGE_DATA]'}})
         
@@ -5946,14 +5925,14 @@ class ServicesMixin:
                 if ref_msg and isinstance(ref_msg, discord.Message):
                     for attachment in ref_msg.attachments:
                         if attachment.content_type and attachment.content_type.startswith("image/"):
-                            reference_image_urls.append(attachment.url)
+                            reference_image_urls.append({"url": attachment.url, "mime_type": attachment.content_type})
                             if len(reference_image_urls) >= 2: break
             
-            if len(reference_image_urls) < 2 and message.attachments:
+            if len(reference_image_urls) < 10 and message.attachments:
                 for attachment in message.attachments:
                     if attachment.content_type and attachment.content_type.startswith("image/"):
-                        reference_image_urls.append(attachment.url)
-                        if len(reference_image_urls) >= 2: break
+                        reference_image_urls.append({"url": attachment.url, "mime_type": attachment.content_type})
+                        if len(reference_image_urls) >= 10: break
 
             # Define local variables required for grounding logic
             guild_id = message.guild.id
@@ -6241,11 +6220,8 @@ class ServicesMixin:
                         # Recover standard attachments
                         attachments = [a for a in target_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))]
                         if attachments:
-                            async with httpx.AsyncClient() as client:
-                                for attachment in attachments:
-                                    response = await client.get(attachment.url)
-                                    response.raise_for_status()
-                                    recovered_media_parts.append({"mime_type": attachment.content_type, "data": await response.aread()})
+                            for attachment in attachments:
+                                recovered_media_parts.append({"url": attachment.url, "mime_type": attachment.content_type})
                         
                         # Recover replied-to media
                         if target_msg.reference and target_msg.reference.message_id:
@@ -6256,10 +6232,7 @@ class ServicesMixin:
                             if ref_msg and ref_msg.attachments:
                                 ref_media = next((a for a in ref_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))), None)
                                 if ref_media:
-                                    async with httpx.AsyncClient() as client:
-                                        resp = await client.get(ref_media.url)
-                                        if resp.status_code == 200:
-                                            recovered_media_parts.append({"mime_type": ref_media.content_type, "data": await resp.aread()})
+                                    recovered_media_parts.append({"url": ref_media.url, "mime_type": ref_media.content_type})
                     except Exception as e:
                         print(f"Failed to recover media for regeneration: {e}")
 
