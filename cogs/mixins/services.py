@@ -274,7 +274,19 @@ class GoogleGenAIModel:
                     elif isinstance(p, dict) and 'mime_type' in p and 'data' in p:
                         parts.append(types.Part.from_bytes(data=p['data'], mime_type=p['mime_type']))
                     elif isinstance(p, dict) and 'url' in p:
-                        parts.append(types.Part.from_uri(file_uri=p['url'], mime_type=p.get('mime_type')))
+                        url = p['url']
+                        mime_type = p.get('mime_type', '')
+                        if url.startswith(('http://', 'https://')):
+                            try:
+                                # Fetch HTTP URLs to bytes for Google SDK v2
+                                async with httpx.AsyncClient() as client:
+                                    resp = await client.get(url, follow_redirects=True, timeout=15.0)
+                                    resp.raise_for_status()
+                                    parts.append(types.Part.from_bytes(data=resp.content, mime_type=mime_type or 'image/png'))
+                            except Exception as e:
+                                print(f"Failed to fetch media from URL {url}: {e}")
+                        else:
+                            parts.append(types.Part.from_uri(file_uri=url, mime_type=mime_type))
                 
                 if item.get('thought_signature') and parts:
                     sig = item['thought_signature']
@@ -6684,16 +6696,19 @@ class ServicesMixin:
             except Exception:
                 pass
         
+        # Strip URLs to prevent Discord ID numbers (e.g. 429) from triggering false positives
+        error_str_clean = re.sub(r'https?://[^\s]+', '', error_str)
+        
         # 2. Standard HTTP Status Codes
-        if "429" in error_str: return "Rate Limited"
-        if "402" in error_str: return "Insufficient Credits"
-        if "401" in error_str: return "Invalid API Key"
-        if "404" in error_str: 
-            if "no endpoints found" in error_str.lower():
+        if "429" in error_str_clean: return "Rate Limited"
+        if "402" in error_str_clean: return "Insufficient Credits"
+        if "401" in error_str_clean: return "Invalid API Key"
+        if "404" in error_str_clean: 
+            if "no endpoints found" in error_str_clean.lower():
                 return "Capability Mismatch"
             return "Model Not Found"
-        if "403" in error_str: return "Access Forbidden/Moderated"
-        if "413" in error_str: return "File Too Large"
+        if "403" in error_str_clean: return "Access Forbidden/Moderated"
+        if "413" in error_str_clean: return "File Too Large"
         
         # 3. Fallback to truncated raw error with brackets stripped for aesthetic safety
         clean_err = error_str.replace('"', "'").replace('{', '').replace('}', '').replace('\n', ' ')
