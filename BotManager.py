@@ -9,6 +9,16 @@
 # This workflow guarantees stable iterations without breaking the complex asynchronous state management of the bot.
 # --------------------------------------------------
 
+import configs.DefaultConfig as defaultConfig
+import asyncio
+import discord
+from discord.ext import commands
+import subprocess
+import orjson as json
+from cryptography.fernet import Fernet
+import websockets
+import signal
+import platform
 import os
 import sys
 from dotenv import load_dotenv
@@ -22,16 +32,6 @@ if os.getenv("MANUAL_AUTH_MODE", "False").lower() == "true":
     if not os.getenv("DISCORD_OWNER_ID"): os.environ["DISCORD_OWNER_ID"] = "MANUAL_MODE_PENDING"
     if not os.getenv("ENCRYPTION_KEY"): os.environ["ENCRYPTION_KEY"] = "MANUAL_MODE_PENDING"
 
-import configs.DefaultConfig as defaultConfig
-import asyncio
-import discord
-from discord.ext import commands
-import subprocess
-import orjson as json
-from cryptography.fernet import Fernet
-import websockets
-import signal
-import platform
 
 # --- Global State for Orchestration ---
 load_dotenv()

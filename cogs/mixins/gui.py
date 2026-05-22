@@ -1,21 +1,18 @@
 from .constants import *
 from .storage import _quantize_embedding
 
+import collections
 import discord
 from discord import ui, app_commands
 import datetime
 import uuid
-import io
-import re
 import pathlib
 import traceback
 import time
-import copy
 from zoneinfo import ZoneInfo
-from collections import OrderedDict
 import asyncio
 import orjson as json
-from typing import TYPE_CHECKING, List, Dict, Tuple, Set, Literal, Any, Optional, Union, get_args
+from typing import TYPE_CHECKING, List, Dict, Tuple, Set, Literal, Any, Optional, get_args
 from .constants import IMAGE_MODELS, AUDIO_MODELS
 from .storage import (
     _quantize_embedding, 

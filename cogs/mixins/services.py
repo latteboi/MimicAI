@@ -1,3 +1,4 @@
+import collections
 import asyncio
 import discord
 from discord.ext import tasks
@@ -14,13 +15,10 @@ import base64
 import httpx
 import gc
 import pathlib
-import collections
 import orjson as json
-import functools
 from PIL import Image
-from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Tuple, Optional, Any, Literal, Set, Union, get_args
+from typing import List, Dict, Tuple, Optional, Any, Union, get_args
 from .constants import *
 from .constants import (
     WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED, WARN_BOTH_MODELS_FAILED,
@@ -40,7 +38,6 @@ from .storage import (
 
 from google import genai
 from google.genai import types
-from google.genai.errors import APIError
 
 class Timeout:
     def __init__(self, seconds=2, error_message='Function call timed out'):
@@ -1633,6 +1630,8 @@ class ServicesMixin:
                     
                     grounding_mode_for_citator = grounding_mode
 
+                    # Parallelise Grounding RAG and URL Research Context Fetching
+                    grounding_task = None
                     if grounding_mode == "rag":
                         g_participant_key = (g_owner_id, g_profile_name)
                         g_chat_session = session['chat_sessions'].get(g_participant_key)
@@ -1652,28 +1651,7 @@ class ServicesMixin:
                         grounding_query = image_gen_prompt if is_image_gen_round else initial_round_context
 
                         mapping_key = (session.get("type", "multi"), channel.id)
-                        grounding_result = await self._get_hybrid_grounding_context(grounding_query, channel.guild.id, history_for_grounding, mapping_key, safety_settings=g_dynamic_safety_settings, is_for_image=is_for_image_flag, warning_channel=channel)
-                        if grounding_result:
-                            g_context, g_sources, _, g_warning = grounding_result
-                            if g_warning:
-                                pre_generation_warnings.append(g_warning)
-                            
-                            if g_context:
-                                if is_image_gen_round:
-                                    image_gen_prompt = f"{image_gen_prompt}\n\nUse this information to help generate the image:\n{g_context}"
-                                else:
-                                    grounding_context = g_context
-                                    # [NEW] Sticky Grounding: Purge previous search results from history
-                                    for turn in session.get("unified_log", []):
-                                        if "grounding_context" in turn:
-                                            del turn["grounding_context"]
-                                    
-                                    # Attach new summary to the latest turn (the trigger)
-                                    if session.get("unified_log"):
-                                        session["unified_log"][-1]["grounding_context"] = g_context
-
-                                grounding_sources = g_sources
-                            grounding_profile_key = (g_owner_id, g_profile_name)
+                        grounding_task = self._get_hybrid_grounding_context(grounding_query, channel.guild.id, history_for_grounding, mapping_key, safety_settings=g_dynamic_safety_settings, is_for_image=is_for_image_flag, warning_channel=channel)
 
                 ## [NEW] Phase: Research Once (URL Context)
                 round_url_text_contexts = []
@@ -1686,12 +1664,57 @@ class ServicesMixin:
                     if p_settings.get("url_fetching_enabled", False):
                         any_url_enabled = True; break
                 
+                url_tasks = []
                 if any_url_enabled and batched_url_research_content and any_url_rag:
-                    print(f"[DEBUG: URL-Multi] Performing round research on {len(batched_url_research_content)} items.")
+                    print(f"[DEBUG: URL-Multi] Scheduling parallel round research on {len(batched_url_research_content)} items.")
                     for content_str, g_id in batched_url_research_content:
-                        u_t, _, u_w = await self._process_urls_in_content(content_str, g_id, {"url_fetching_enabled": True})
-                        pre_generation_warnings.extend(u_w)
-                        round_url_text_contexts.extend(u_t)
+                        url_tasks.append(self._process_urls_in_content(content_str, g_id, {"url_fetching_enabled": True}))
+
+                # Gather Grounding and URL tasks to run concurrently
+                tasks_to_gather = []
+                if grounding_task:
+                    tasks_to_gather.append(grounding_task)
+                for ut in url_tasks:
+                    tasks_to_gather.append(ut)
+
+                gathered_results = []
+                if tasks_to_gather:
+                    gathered_results = await asyncio.gather(*tasks_to_gather)
+
+                grounding_result = None
+                if grounding_task:
+                    grounding_result = gathered_results[0]
+                    url_results = gathered_results[1:]
+                else:
+                    url_results = gathered_results
+
+                # Unpack and apply Grounding results
+                if grounding_result:
+                    g_context, g_sources, _, g_warning = grounding_result
+                    if g_warning:
+                        pre_generation_warnings.append(g_warning)
+                    
+                    if g_context:
+                        if is_image_gen_round:
+                            image_gen_prompt = f"{image_gen_prompt}\n\nUse this information to help generate the image:\n{g_context}"
+                        else:
+                            grounding_context = g_context
+                            # [NEW] Sticky Grounding: Purge previous search results from history
+                            for turn in session.get("unified_log", []):
+                                if "grounding_context" in turn:
+                                    del turn["grounding_context"]
+                            
+                            # Attach new summary to the latest turn (the trigger)
+                            if session.get("unified_log"):
+                                session["unified_log"][-1]["grounding_context"] = g_context
+
+                        grounding_sources = g_sources
+                    grounding_profile_key = (g_owner_id, g_profile_name)
+
+                # Unpack and apply URL results
+                for u_t, _, u_w in url_results:
+                    pre_generation_warnings.extend(u_w)
+                    round_url_text_contexts.extend(u_t)
 
                 for i, participant in enumerate(profile_order):
                     turn_warnings = []
@@ -1811,6 +1834,8 @@ class ServicesMixin:
                     owner_id = participant['owner_id']
                     profile_name = participant['profile_name']
                     channel = self.bot.get_channel(channel_id)
+                    session_key = (channel_id, owner_id, profile_name)
+                    model = None
 
                     # [FIX] Initialize these before the try block to prevent UnboundLocalError
                     response = None
@@ -1914,6 +1939,9 @@ class ServicesMixin:
                                 if p_settings.get("child_bot_placeholder", False):
                                     custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
                                     msg_a_id = await self._send_child_bot_placeholder(participant['bot_id'], channel_id, custom_emoji)
+                                    if msg_a_id:
+                                        try: first_placeholder_message = await channel.fetch_message(msg_a_id)
+                                        except: pass
                                 else:
                                     await self.manager_queue.put({
                                         "action": "send_to_child", "bot_id": participant['bot_id'],
@@ -1925,6 +1953,17 @@ class ServicesMixin:
                                     profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name
                                 )
                                 if thinking_messages: msg_a_id = thinking_messages[0].id
+
+                        # Initialise the persistent state container before we generate any media
+                        custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+                        state_container = {
+                            'msg_a_id': msg_a_id,
+                            'msg_b_id': None,
+                            'app_name': app_name,
+                            'app_avatar': app_avatar,
+                            'message_type': "text",
+                            'custom_emoji': custom_emoji
+                        }
 
                         image_gen_error_msg = None
                         if is_generator and generated_image_bytes_for_round is None:
@@ -2030,7 +2069,9 @@ class ServicesMixin:
                                 status = "api_error"
                                 response = None
                                 try:
-                                    response = await image_model.generate_content_async([{'role': 'user', 'parts': parts}])
+                                    response, state_container = await self._generate_with_heartbeat(
+                                        image_model, [{'role': 'user', 'parts': parts}], None, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type="text"
+                                    )
                                     status = "blocked_by_safety" if not response.candidates else "success"
                                 except Exception as e:
                                     image_gen_error_msg = self._format_api_error(e)
@@ -2048,8 +2089,12 @@ class ServicesMixin:
                         round_context_text = "\n".join([t[0] for t in new_round_turn_data])
                         dynamic_context_for_turn = round_context_text + "\n" + "\n".join(responses_this_round)
 
-                        # [RESTORED] Training Example Injection
-                        training_examples_list = await self._get_relevant_training_examples(owner_id, profile_name, dynamic_context_for_turn, channel.guild.id)
+                        # Parallelise Training Examples and LTM retrieval to reduce physical latency
+                        ltm_task = self._get_relevant_ltm_for_prompt(session_key, chat_session.history, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id)
+                        training_task = self._get_relevant_training_examples(owner_id, profile_name, dynamic_context_for_turn, channel.guild.id)
+                        
+                        ltm_recall_text, training_examples_list = await asyncio.gather(ltm_task, training_task)
+
                         full_system_instruction, _, grounding_enabled, temp, top_p, top_k, primary_model, fallback_model_name = self._construct_system_instructions(
                             owner_id, profile_name, channel.id, is_multi_profile=True, training_examples_list=training_examples_list
                         )
@@ -2223,7 +2268,6 @@ class ServicesMixin:
                         if all_current_media:
                             supplementary_parts.extend(all_current_media)
 
-                        ltm_recall_text = await self._get_relevant_ltm_for_prompt(session_key, chat_session.history, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id)
                         if ltm_recall_text:
                             supplementary_parts.append(ltm_recall_text)
                         
@@ -2273,12 +2317,22 @@ class ServicesMixin:
                         fallback_used = False
                         api_error_reason = None
                         main_api_error = None
-                        state_container = None
+                        # Persist the existing state container populated during image generation
+                        if state_container is None:
+                            custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+                            state_container = {
+                                'msg_a_id': msg_a_id,
+                                'msg_b_id': None,
+                                'app_name': app_name,
+                                'app_avatar': app_avatar,
+                                'message_type': "text",
+                                'custom_emoji': custom_emoji
+                            }
                         
                         if model:
                             try:
                                 response, state_container = await self._generate_with_heartbeat(
-                                    model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar
+                                    model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
                                 )
 
                                 if not response or not response.candidates:
@@ -3263,7 +3317,24 @@ class ServicesMixin:
                                 status = "api_error"
                                 response = None
                                 try:
-                                    response = await image_model.generate_content_async([{'role': 'user', 'parts': parts}])
+                                    msg_a_id = placeholder_message.id if placeholder_message else None
+                                    app_name = package.get("bot_display_name", "Bot")
+                                    app_avatar = package.get("avatar_url")
+                                    
+                                    state_container = {
+                                        'msg_a_id': msg_a_id,
+                                        'msg_b_id': None,
+                                        'app_name': app_name,
+                                        'app_avatar': app_avatar,
+                                        'message_type': "embed" if is_child_bot else "text",
+                                        'custom_emoji': PLACEHOLDER_EMOJI
+                                    }
+                                    
+                                    participant = {"method": "child_bot", "bot_id": package.get("bot_id")} if is_child_bot else None
+                                    
+                                    response, state_container = await self._generate_with_heartbeat(
+                                        image_model, [{'role': 'user', 'parts': parts}], None, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type=state_container['message_type']
+                                    )
                                     status = "blocked_by_safety" if not response.candidates else "success"
                                 except Exception as e:
                                     failure_reason = self._format_api_error(e)
@@ -3271,7 +3342,6 @@ class ServicesMixin:
                                 finally:
                                     self._log_api_call(user_id=package['author_id'], guild_id=package['guild_id'], context="image_generation_jit", model_used=image_model.model_name, status=status)
                                 
-                                # No PIL cleanup needed
                                 del parts
 
                                 if response:
@@ -3324,7 +3394,24 @@ class ServicesMixin:
                         contents_for_api_call.append(user_turn)
                         gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
                         
-                        text_response = await text_model.generate_content_async(contents_for_api_call, generation_config=gen_config)
+                        msg_a_id = placeholder_message.id if placeholder_message else None
+                        app_name = package.get("bot_display_name", "Bot")
+                        app_avatar = package.get("avatar_url")
+                        
+                        participant = {"method": "child_bot", "bot_id": package.get("bot_id")} if is_child_bot else None
+                        
+                        state_container = {
+                            'msg_a_id': msg_a_id,
+                            'msg_b_id': state_container.get('msg_b_id') if 'state_container' in locals() and state_container else None,
+                            'app_name': app_name,
+                            'app_avatar': app_avatar,
+                            'message_type': "embed" if is_child_bot else "text",
+                            'custom_emoji': PLACEHOLDER_EMOJI
+                        }
+                        
+                        text_response, state_container = await self._generate_with_heartbeat(
+                            text_model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type=state_container['message_type']
+                        )
                         
                         response_text = "Here is the image you requested."
                         was_blocked = False
@@ -4185,18 +4272,28 @@ class ServicesMixin:
         if not getattr(parent_channel, 'guild', None):
             return None
             
-        if parent_channel.id in self.channel_webhooks:
-            try:
-                webhooks = await parent_channel.webhooks()
-                bot_webhook = next((wh for wh in webhooks if wh.user and wh.user.id == self.bot.user.id), None)
-                if not bot_webhook:
-                    bot_webhook = await parent_channel.create_webhook(name=f"{self.bot.user.name} Webhook", reason="For custom appearances")
-                
-                self.channel_webhooks[parent_channel.id] = {'url': bot_webhook.url}
-                self._save_channel_webhooks()
-                return bot_webhook
-            except Exception as e:
-                print(f"Failed to get/create webhook for {parent_channel.name}: {e}")
+        try:
+            # Check cached webhooks first
+            if parent_channel.id in self.channel_webhooks:
+                try:
+                    webhooks = await parent_channel.webhooks()
+                    bot_webhook = next((wh for wh in webhooks if wh.user and wh.user.id == self.bot.user.id), None)
+                    if bot_webhook:
+                        return bot_webhook
+                except Exception:
+                    pass
+
+            # If not cached or cached lookup failed, fetch or create a new webhook
+            webhooks = await parent_channel.webhooks()
+            bot_webhook = next((wh for wh in webhooks if wh.user and wh.user.id == self.bot.user.id), None)
+            if not bot_webhook:
+                bot_webhook = await parent_channel.create_webhook(name=f"{self.bot.user.name} Webhook", reason="For custom appearances")
+            
+            self.channel_webhooks[parent_channel.id] = {'url': bot_webhook.url}
+            self._save_channel_webhooks()
+            return bot_webhook
+        except Exception as e:
+            print(f"Failed to get/create webhook for {parent_channel.name}: {e}")
         return None
     
     def _scrub_response_text(self, text: str, participant_names: Optional[List[str]] = None) -> str:

@@ -1,6 +1,7 @@
 from .gui import *
 from .services import *
 
+import collections
 import discord
 from discord.ext import commands, tasks
 import asyncio
@@ -14,12 +15,11 @@ import io
 import re
 import traceback
 import orjson as json
-from zoneinfo import ZoneInfo, available_timezones
-from typing import List, Dict, Tuple, Set, Literal, Any, Optional, Union, get_args
+from zoneinfo import available_timezones
+from typing import List, Dict, Set, Any, Optional, get_args
 from .constants import *
 from .storage import _delete_file_shard, _atomic_json_save, _quantize_embedding, _dequantize_embedding
 from .services import GoogleGenAIChatSession
-from google import genai
 
 class CoreMixin:
 
@@ -69,6 +69,9 @@ class CoreMixin:
         
         if not message.guild or not self.has_lock or message.author.bot:
             return
+
+        # Validate the user's active profile in this channel first to prune dangling references
+        await self._validate_active_profile(message.author.id, message.channel)
 
         # --- 1. Session Reply Logic (Priority) ---
         if message.reference and message.reference.message_id:
@@ -2907,11 +2910,16 @@ class CoreMixin:
         
         # 2. Check mutual guilds for a server key
         user = self.bot.get_user(user_id)
-        if not user: return False
+        if not user:
+            try:
+                user = await self.bot.fetch_user(user_id)
+            except Exception:
+                return False
 
-        for guild in user.mutual_guilds:
-            if self._get_api_key_for_guild(guild.id, "gemini") or self._get_api_key_for_guild(guild.id, "openrouter"):
-                return True
+        if user:
+            for guild in user.mutual_guilds:
+                if self._get_api_key_for_guild(guild.id, "gemini") or self._get_api_key_for_guild(guild.id, "openrouter"):
+                    return True
         
         return False
     

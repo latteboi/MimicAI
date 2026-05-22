@@ -1,13 +1,13 @@
+import collections
 import os
 import re
 import gzip
 import pathlib
-import shutil
 import discord
 import uuid
 import datetime
 import orjson as json
-from typing import Dict, List, Any, Optional, Literal, Union, Tuple
+from typing import Dict, List, Any, Optional, Union, Tuple
 from cryptography.fernet import Fernet, InvalidToken
 import asyncio
 import traceback

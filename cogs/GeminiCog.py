@@ -6,38 +6,23 @@ from .mixins.core import *
 from .mixins.gui import *
 
 import configs.DefaultConfig as defaultConfig
-from discord.ext import commands, tasks
+from discord.ext import commands
 import discord
-from discord import Interaction, app_commands, ui
+from discord import app_commands, ui
 
-from cryptography.fernet import Fernet, InvalidToken
+import collections
+from cryptography.fernet import Fernet
 import asyncio
 import os
 import orjson as json
 import datetime
-import random
 import uuid
-from typing import List, Dict, Tuple, Set, Literal, Any, Optional, Union, get_args
-import numpy as np
-import copy 
+from typing import List, Dict, Tuple, Set, Literal, Any, Optional, get_args
 import traceback
 import time
 from collections import OrderedDict
-import collections
 import re
-import httpx
-import sqlite3
-from zoneinfo import ZoneInfo, available_timezones
-import functools
-import gzip
-from PIL import Image
-import io
-import gc
 import pathlib
-import signal
-import platform
-from urllib.parse import urlparse
-import base64
 
 class LRUCache(OrderedDict):
     def __init__(self, max_size, *args, **kwargs):
