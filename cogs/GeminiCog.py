@@ -349,50 +349,45 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     @profile_group.command(name="list", description="Lists all of your saved profile names.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     async def list_profiles_slash(self, interaction: discord.Interaction): 
-        if not self.has_lock and interaction.guild : return
+        if not self.has_lock and interaction.guild: return
         await interaction.response.defer(ephemeral=True)
         
         index = self._get_user_index(interaction.user.id)
-        if not index.get("personal") and not index.get("borrowed"):
+        
+        personal_dict = index.get("personal", {})
+        borrowed_dict = index.get("borrowed", {})
+        
+        personal_names = sorted(list(personal_dict.keys())) if isinstance(personal_dict, dict) else sorted(list(personal_dict))
+        borrowed_names = sorted(list(borrowed_dict.keys())) if isinstance(borrowed_dict, dict) else sorted(list(borrowed_dict))
+        
+        if not personal_names and not borrowed_names:
             await interaction.followup.send("You have no saved profiles yet.", ephemeral=True)
             return
         
-        personal_list_raw = index.get("personal", [])
-        borrowed_list_raw = index.get("borrowed", [])
+        embed = discord.Embed(title="Your Profiles", color=discord.Color.purple())
         
-        embed = discord.Embed(title=f"Your Profiles", color=discord.Color.purple())
-        
-        active_in_current_channel = self._get_active_user_profile_name_for_channel(interaction.user.id, interaction.channel_id)
-        channel_type_str = "this channel" if interaction.guild else "this DM"
-        
-        # Helper function to split a list for two columns
         def split_list_for_columns(data_list):
             midpoint = (len(data_list) + 1) // 2
             return data_list[:midpoint], data_list[midpoint:]
 
-        # Process Personal Profiles
-        personal_list = []
-        for name in sorted(personal_list_raw):
-            marker = f" (Active)" if name == active_in_current_channel else ""
-            personal_list.append(f"- `{name}`{marker}")
-        
+        personal_list = [f"- `{name}`" for name in personal_names]
         if personal_list:
             col1, col2 = split_list_for_columns(personal_list)
             embed.add_field(name="Personal Profiles", value="\n".join(col1) if col1 else "\u200b", inline=True)
             embed.add_field(name="\u200b", value="\n".join(col2) if col2 else "\u200b", inline=True)
 
-        # Process Borrowed Profiles
         borrowed_list = []
-        for name in sorted(borrowed_list_raw):
+        for name in borrowed_names:
             b_config = self._get_profile_config(interaction.user.id, name, True) or {}
             owner_id = int(b_config.get("original_owner_id", 0))
-            owner = self.bot.get_user(owner_id) or await self.bot.fetch_user(owner_id)
-            owner_name = owner.display_name if owner else "Unknown"
-            marker = f" (Active)" if name == active_in_current_channel else ""
-            borrowed_list.append(f"- `{name}` (from {owner_name}){marker}")
+            try:
+                owner = self.bot.get_user(owner_id) or await self.bot.fetch_user(owner_id)
+                owner_name = owner.display_name if owner else "Unknown"
+            except Exception:
+                owner_name = "Unknown"
+            borrowed_list.append(f"- `{name}` (from {owner_name})")
 
         if borrowed_list:
-            # Add a separator if there were personal profiles
             if personal_list:
                 embed.add_field(name="\u200b", value="\u200b", inline=False)
 
@@ -400,11 +395,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             embed.add_field(name="Borrowed Profiles", value="\n".join(col1) if col1 else "\u200b", inline=True)
             embed.add_field(name="\u200b", value="\n".join(col2) if col2 else "\u200b", inline=True)
 
-        if not personal_list and not borrowed_list:
-            embed.description = "You have no personal or borrowed profiles."
-        else:
-            embed.set_footer(text=f"The (Active) tag shows your active profile in {channel_type_str}.")
-            
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="export", description="Export selected profiles and memories to a plaintext file (DM Only).")
@@ -449,7 +439,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         )
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
         
-        embed.add_field(name="Version", value="v0.1.4 Beta", inline=True)
+        embed.add_field(name="Version", value="v0.2.1 Beta", inline=True)
         embed.add_field(name="Global Scope", value=f"{len(self.bot.guilds)} Servers", inline=True)
 
         if is_owner:

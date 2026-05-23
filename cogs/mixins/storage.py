@@ -378,15 +378,38 @@ class StorageMixin:
     def _add_ltm(self, profile_owner_id: int, profile_name: str, summary: str, summary_embedding: List[float], guild_id: Optional[int], triggering_user_id: int, user_dn: Optional[str] = None):
         if not guild_id: return
         
-        owner_id_str = str(profile_owner_id)
-        ltm_data = self._load_ltm_shard(owner_id_str, profile_name)
+        # Redirect LTM saves to the borrower's folder if running in a borrowed session
+        session_owner_id = None
+        for channel_id, session in self.multi_profile_channels.items():
+            for p in session.get("profiles", []):
+                if p.get("owner_id") == profile_owner_id and p.get("profile_name") == profile_name:
+                    session_owner_id = session.get("owner_id")
+                    break
+            if session_owner_id:
+                break
+
+        ltm_user_id = profile_owner_id
+        ltm_profile_name = profile_name
+
+        if session_owner_id and session_owner_id != profile_owner_id:
+            recip_index = self._get_user_index(session_owner_id)
+            current_pid = self._get_pid_from_name_any(profile_owner_id, profile_name)
+            for b_name in recip_index.get("borrowed", []):
+                b_config = self._get_profile_config(session_owner_id, b_name, True) or {}
+                if int(b_config.get("original_owner_id", 0)) == profile_owner_id and b_config.get("original_profile_id") == current_pid:
+                    ltm_user_id = session_owner_id
+                    ltm_profile_name = b_name
+                    break
+
+        owner_id_str = str(ltm_user_id)
+        ltm_data = self._load_ltm_shard(owner_id_str, ltm_profile_name)
         if ltm_data is None:
-            ltm_data = {"guild":[]}
+            ltm_data = {"guild": []}
         
         context_type = "guild"
-        ltm_list = ltm_data.get(context_type,[])
+        ltm_list = ltm_data.get(context_type, [])
 
-        is_premium = self.is_user_premium(profile_owner_id)
+        is_premium = self.is_user_premium(ltm_user_id)
         limit = defaultConfig.LIMIT_LTM_PREMIUM if is_premium else defaultConfig.LIMIT_LTM_FREE
         
         ltm_list.sort(key=lambda x: x.get('created_ts', x.get('ts')))
@@ -409,7 +432,7 @@ class StorageMixin:
         
         max_safe_clamp = max(len(ltm_list), defaultConfig.LIMIT_LTM_PREMIUM)
         ltm_data[context_type] = sorted(ltm_list, key=lambda x: x.get('created_ts', x.get('ts')))[-max_safe_clamp:]
-        self._save_ltm_shard(owner_id_str, profile_name, ltm_data)
+        self._save_ltm_shard(owner_id_str, ltm_profile_name, ltm_data)
 
     def update_ltm(self, profile_owner_id: int, profile_name: str, ltm_id: str, new_summary: str, new_embedding: List[float]) -> bool:
         owner_id_str = str(profile_owner_id)
@@ -731,14 +754,23 @@ class StorageMixin:
 
     def _load_public_profiles(self):
         self.public_profiles = {}
-        index_path = os.path.join(self.PUBLIC_PROFILES_DIR, "index.json.gz")
+        index_path = os.path.join(self.PUBLIC_PROFILES_DIR, "index.json")
         if os.path.exists(index_path):
-            data = self._load_json_gzip(index_path)
-            if data: self.public_profiles = data
+            try:
+                with open(index_path, "r", encoding="utf-8") as f:
+                    data = json.loads(f.read())
+                if data:
+                    self.public_profiles = data
+            except Exception as e:
+                print(f"Error loading public index: {e}")
 
     def _save_public_index(self):
-        index_path = os.path.join(self.PUBLIC_PROFILES_DIR, "index.json.gz")
-        self._atomic_json_save_gzip(self.public_profiles, index_path)
+        index_path = os.path.join(self.PUBLIC_PROFILES_DIR, "index.json")
+        try:
+            with open(index_path, "wb") as f:
+                f.write(json.dumps(self.public_profiles, option=json.OPT_INDENT_2))
+        except Exception as e:
+            print(f"Error saving public index: {e}")
 
     def _load_child_bots(self):
         self.child_bots = {}
@@ -1035,10 +1067,42 @@ class StorageMixin:
 
     def _is_profile_public(self, user_id: int, profile_name: str) -> bool:
         user_id_str = str(user_id)
+        local_pid = self._get_pid_from_name_any(user_id, profile_name)
+        target_pointer = f"{user_id_str}:{local_pid}"
+        
         for p_info in self.public_profiles.values():
-            if str(p_info.get("owner_id")) == user_id_str and p_info.get("original_profile_name") == profile_name:
-                return True
+            if isinstance(p_info, str):
+                if p_info == target_pointer:
+                    return True
+            elif isinstance(p_info, dict):
+                if str(p_info.get("owner_id")) == user_id_str and p_info.get("original_profile_name") == profile_name:
+                    return True
         return False
+
+    def _resolve_borrowed_pointer(self, pointer: str) -> Optional[Tuple[int, str]]:
+        if not pointer:
+            return None
+        if pointer.startswith("pub_"):
+            if not self.public_profiles:
+                self._load_public_profiles()
+            target = self.public_profiles.get(pointer)
+            if not target:
+                return None
+            if isinstance(target, str) and ":" in target:
+                pointer = target
+            elif isinstance(target, dict):
+                owner_id = target.get("owner_id")
+                pid = target.get("original_pid") or target.get("original_profile_id")
+                if owner_id and pid:
+                    return int(owner_id), pid
+        
+        if ":" in pointer:
+            try:
+                owner_id_str, pid = pointer.split(":", 1)
+                return int(owner_id_str), pid
+            except ValueError:
+                pass
+        return None
 
     def _get_user_profile_for_model(self, user_id: int, channel_id: int, profile_name_override: Optional[str] = None) -> Tuple[Dict[str, List[str]], str, bool, float, float, int, int, float, str, str]:
         active_profile_name = profile_name_override if profile_name_override else self._get_active_user_profile_name_for_channel(user_id, channel_id)
@@ -1054,18 +1118,27 @@ class StorageMixin:
             return {}, "", False, defaultConfig.GEMINI_TEMPERATURE, defaultConfig.GEMINI_TOP_P, defaultConfig.GEMINI_TOP_K, defaultConfig.TRAINING_CONTEXT_SIZE, defaultConfig.TRAINING_RELEVANCE_THRESHOLD, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME
 
         if is_borrowed:
-            source_owner_id = int(config.get("original_owner_id", user_id))
-            source_profile_name = config.get("original_profile_name", active_profile_name)
-            source_config = self._get_profile_config(source_owner_id, source_profile_name, False) or {}
-            prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
+            pointer = config.get("pointer")
+            resolved = self._resolve_borrowed_pointer(pointer)
+            if resolved:
+                source_owner_id, source_profile_id = resolved
+                cfg_path = os.path.join(self.USERS_DIR, str(source_owner_id), "profiles", source_profile_id, "config.json.gz")
+                source_config = self._load_json_gzip(cfg_path) or {}
+                
+                prompts_path = os.path.join(self.USERS_DIR, str(source_owner_id), "profiles", source_profile_id, "prompts.json.gz")
+                prompts = self._load_json_gzip(prompts_path) or {}
+            else:
+                source_owner_id = int(config.get("original_owner_id", user_id))
+                source_profile_name = config.get("original_profile_name", active_profile_name)
+                source_config = self._get_profile_config(source_owner_id, source_profile_name, False) or {}
+                prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
         else:
             source_config = config
             prompts = self._get_profile_prompts(user_id, active_profile_name) or {}
-            
+        
         persona = prompts.get("persona", {})
         ai_instructions = prompts.get("ai_instructions", "")
         
-        # Local overrides first, then source, then default
         training_context_size = config.get("training_context_size", source_config.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE))
         training_relevance_threshold = config.get("training_relevance_threshold", source_config.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD))
         temperature = config.get("temperature", source_config.get("temperature", defaultConfig.GEMINI_TEMPERATURE))
@@ -1205,10 +1278,23 @@ class StorageMixin:
                 else:
                     index["personal"][p_name] = pid_folder
 
-            if index.get("personal") or index.get("borrowed"):
-                self._save_user_index(user_id, index)
+            self._save_user_index(user_id, index)
+        else:
+            self._save_user_index(user_id, index)
             
         return index
+    
+    def _repair_all_user_indices(self):
+        """Scans the USERS_DIR for user folders and runs self-repair on each user's index.json."""
+        if not os.path.isdir(self.USERS_DIR):
+            return
+        for user_id_str in os.listdir(self.USERS_DIR):
+            if user_id_str.isdigit():
+                try:
+                    user_id = int(user_id_str)
+                    self._repair_user_index(user_id)
+                except Exception as e:
+                    print(f"Error repairing index for user {user_id_str}: {e}")
 
     def _get_user_index(self, user_id: int) -> Dict[str, Any]:
         user_id_str = str(user_id)
@@ -1483,6 +1569,22 @@ class StorageMixin:
     def _cascade_delete_borrowed_profiles(self, original_owner_id: int, deleted_pid: str, original_profile_name: str):
         """Instantly removes all borrowed variants linked to a deleted personal profile across the entire system."""
         owner_str = str(original_owner_id)
+        
+        # Proactively remove the deleted profile from the global public database index
+        public_ids_to_del = []
+        for pub_id, info in list(self.public_profiles.items()):
+            if isinstance(info, str) and ":" in info:
+                if info == f"{owner_str}:{deleted_pid}":
+                    public_ids_to_del.append(pub_id)
+            elif isinstance(info, dict) and str(info.get("owner_id")) == owner_str:
+                if info.get("original_pid") == deleted_pid or info.get("original_profile_name") == original_profile_name:
+                    public_ids_to_del.append(pub_id)
+        
+        if public_ids_to_del:
+            for pub_id in public_ids_to_del:
+                self.public_profiles.pop(pub_id, None)
+            self._save_public_index()
+
         if not os.path.isdir(self.USERS_DIR): return
         
         for user_id_str in os.listdir(self.USERS_DIR):

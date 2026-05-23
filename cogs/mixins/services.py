@@ -410,6 +410,11 @@ class GoogleGenAIModel:
     
 class ServicesMixin:
 
+    @tasks.loop(hours=1.0)
+    async def hourly_self_repair_task(self):
+        if self.has_lock:
+            await asyncio.to_thread(self._repair_all_user_indices)
+
     async def _get_or_create_model_for_channel(self, channel_id: int, actual_message_author_id: int, guild_id: int, profile_owner_override: Optional[int] = None, profile_name_override: Optional[str] = None, prompt_content: Optional[str] = None) -> Tuple[Optional[Any], bool, float, float, int, Optional[str], Optional[str]]:
         
         api_key = self._get_api_key_for_guild(guild_id)
@@ -560,22 +565,35 @@ class ServicesMixin:
         return model_instance, final_error_state, temperature, top_p, top_k, warning_message, fallback_model
 
     def _resolve_appearance_data(self, owner_id: int, profile_name: str) -> Tuple[str, str]:
-        p_index = self._get_user_index(owner_id)
-        is_borrowed = profile_name in p_index.get("borrowed", [])
-        effective_owner_id = owner_id
-        effective_profile_name = profile_name
+        index = self._get_user_index(owner_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
+        
+        display_name = profile_name
+        avatar_url = self.bot.user.display_avatar.url if self.bot.user else ""
+        
         if is_borrowed:
             borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
-            effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
-            effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
-        
-        display_name = effective_profile_name
-        avatar_url = self.bot.user.display_avatar.url if self.bot.user else ""
-        appearance = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
-        if appearance.get("custom_display_name"):
-            display_name = appearance["custom_display_name"]
-        if appearance.get("custom_avatar_url"):
-            avatar_url = appearance["custom_avatar_url"]
+            pointer = borrowed_data.get("pointer")
+            resolved = self._resolve_borrowed_pointer(pointer)
+            
+            if resolved:
+                orig_owner_id, orig_profile_id = resolved
+                path = os.path.join(self.USERS_DIR, str(orig_owner_id), "profiles", orig_profile_id, "config.json.gz")
+                orig_config = self._load_json_gzip(path) or {}
+                display_name = orig_config.get("custom_display_name") or borrowed_data.get("original_profile_name", profile_name)
+                avatar_url = orig_config.get("custom_avatar_url") or avatar_url
+            else:
+                orig_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
+                orig_name = borrowed_data.get("original_profile_name", profile_name)
+                appearance = self.user_appearances.get(str(orig_owner_id), {}).get(orig_name)
+                if appearance:
+                    display_name = appearance.get("custom_display_name") or display_name
+                    avatar_url = appearance.get("custom_avatar_url") or avatar_url
+        else:
+            appearance = self.user_appearances.get(str(owner_id), {}).get(profile_name)
+            if appearance:
+                display_name = appearance.get("custom_display_name") or display_name
+                avatar_url = appearance.get("custom_avatar_url") or avatar_url
         
         return display_name, avatar_url
 
@@ -3650,30 +3668,59 @@ class ServicesMixin:
         if is_borrowed:
             borrowed_data = self._get_profile_config(profile_owner_id, profile_name, True) or {}
             owner_id = int(borrowed_data.get("original_owner_id", profile_owner_id))
-            owner_profile_name = borrowed_data.get("original_profile_name", profile_name)
-            params_source = self._get_profile_config(owner_id, owner_profile_name, False) or {}
+            owner_profile_id = borrowed_data.get("original_profile_id")
+            
+            if owner_profile_id:
+                path = os.path.join(self.USERS_DIR, str(owner_id), "profiles", owner_profile_id, "config.json.gz")
+                params_source = self._load_json_gzip(path) or {}
+            else:
+                owner_profile_name = borrowed_data.get("original_profile_name", profile_name)
+                params_source = self._get_profile_config(owner_id, owner_profile_name, False) or {}
+            
+            params_to_use = borrowed_data
         else:
             params_source = self._get_profile_config(profile_owner_id, profile_name, False) or {}
+            params_to_use = params_source
 
         if not params_source:
             return None
 
-        ltm_context_size = int(params_source.get("ltm_context_size", 3))
-        ltm_relevance_threshold = float(params_source.get("ltm_relevance_threshold", 0.75))
+        ltm_context_size = int(params_to_use.get("ltm_context_size", params_source.get("ltm_context_size", 3)))
+        ltm_relevance_threshold = float(params_to_use.get("ltm_relevance_threshold", params_source.get("ltm_relevance_threshold", 0.75)))
 
         if ltm_context_size == 0:
             return None
 
-        owner_id_str = str(profile_owner_id)
+        # Redirect LTM loads to the borrower's local path if running in a borrowed session
+        session_owner_id = None
+        if isinstance(session_key, tuple) and len(session_key) > 0:
+            channel_id = session_key[0]
+            session = self.multi_profile_channels.get(channel_id)
+            if session:
+                session_owner_id = session.get("owner_id")
+
+        ltm_user_id = profile_owner_id
+        ltm_profile_name = profile_name
+
+        if session_owner_id and session_owner_id != profile_owner_id:
+            recip_index = self._get_user_index(session_owner_id)
+            current_pid = self._get_pid_from_name_any(profile_owner_id, profile_name)
+            for b_name in recip_index.get("borrowed", []):
+                b_config = self._get_profile_config(session_owner_id, b_name, True) or {}
+                if int(b_config.get("original_owner_id", 0)) == profile_owner_id and b_config.get("original_profile_id") == current_pid:
+                    ltm_user_id = session_owner_id
+                    ltm_profile_name = b_name
+                    break
+
+        owner_id_str = str(ltm_user_id)
         context_type = "guild"
-        ltm_data = self._load_ltm_shard(owner_id_str, profile_name)
+        ltm_data = self._load_ltm_shard(owner_id_str, ltm_profile_name)
         if not ltm_data:
             return None
         all_profile_ltms = ltm_data.get(context_type, [])
         if not all_profile_ltms:
             return None
 
-        # [NEW] matryoshka 256-dim embedding via SDK v2
         prompt_embedding = await self._get_embedding(msg_content, guild_id, task_type="RETRIEVAL_QUERY")
         if not prompt_embedding:
             return None
@@ -3682,7 +3729,7 @@ class ServicesMixin:
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         session_cooldown_history = self.ltm_recall_history.get(session_key, {})
         
-        candidate_ltms =[]
+        candidate_ltms = []
         for ltm in all_profile_ltms:
             ltm_id = ltm.get('id')
             if ltm_id in session_cooldown_history:
@@ -4553,11 +4600,10 @@ class ServicesMixin:
 
         # --- 2. Stale/Broken Profile Shares ---
         cleaned_shares = 0
-        shares_changed = False
         for recipient_id_str, shares in list(self.profile_shares.items()):
             if recipient_id_str not in all_bot_member_ids:
                 cleaned_shares += len(self.profile_shares.pop(recipient_id_str, []))
-                shares_changed = True
+                self._save_profile_share_shard(recipient_id_str, None)
                 continue
             
             original_len = len(shares)
@@ -4573,9 +4619,7 @@ class ServicesMixin:
             if len(valid_shares) < original_len:
                 self.profile_shares[recipient_id_str] = valid_shares
                 cleaned_shares += original_len - len(valid_shares)
-                shares_changed = True
-        if shares_changed:
-            self._save_profile_shares()
+                self._save_profile_share_shard(recipient_id_str, valid_shares)
         if cleaned_shares > 0:
             log.append(f"🧹 Removed {cleaned_shares} stale or broken profile share requests.")
 
@@ -4625,32 +4669,16 @@ class ServicesMixin:
 
         # --- 6. Full User Data Cleanup (for users no longer sharing any server with the bot) ---
         cleaned_users_count = 0
-        all_user_ids_in_shards = set()
-        if os.path.isdir(self.PROFILES_DIR): all_user_ids_in_shards.update(f[:-len(".json.gz")] for f in os.listdir(self.PROFILES_DIR) if f.endswith(".json.gz"))
-        if os.path.isdir(self.LTM_DIR): all_user_ids_in_shards.update(d for d in os.listdir(self.LTM_DIR) if os.path.isdir(os.path.join(self.LTM_DIR, d)))
-        if os.path.isdir(self.TRAINING_DIR): all_user_ids_in_shards.update(d for d in os.listdir(self.TRAINING_DIR) if os.path.isdir(os.path.join(self.TRAINING_DIR, d)))
-        all_user_ids = all_user_ids_in_shards | set(self.user_appearances.keys()) | set(self.profile_shares.keys())
-
-        for user_id_str in list(all_user_ids):
-            if user_id_str not in all_bot_member_ids:
-                paths_to_delete = [
-                    os.path.join(self.PROFILES_DIR, f"{user_id_str}.json.gz"),
-                    os.path.join(self.LTM_DIR, user_id_str),
-                    os.path.join(self.TRAINING_DIR, user_id_str),
-                    os.path.join(SESSIONS_GLOBAL_DIR, user_id_str)
-                ]
-                for path in paths_to_delete:
-                    if os.path.isfile(path): _delete_file_shard(path)
-                    elif os.path.isdir(path): shutil.rmtree(path, ignore_errors=True)
-                
-                self.user_profiles.pop(user_id_str, None)
-                self.user_appearances.pop(user_id_str, None)
-                self.profile_shares.pop(user_id_str, None)
-                cleaned_users_count += 1
+        if os.path.isdir(self.USERS_DIR):
+            for user_id_str in os.listdir(self.USERS_DIR):
+                if user_id_str.isdigit() and user_id_str not in all_bot_member_ids:
+                    user_dir = os.path.join(self.USERS_DIR, user_id_str)
+                    shutil.rmtree(user_dir, ignore_errors=True)
+                    self.user_appearances.pop(user_id_str, None)
+                    self.profile_shares.pop(user_id_str, None)
+                    cleaned_users_count += 1
         
         if cleaned_users_count > 0:
-            self._save_user_appearances()
-            self._save_profile_shares()
             log.append(f"🧹 Removed all data for {cleaned_users_count} users no longer sharing a server with the bot.")
 
         # --- 7. Detailed Per-User & Per-Server Integrity Check ---
@@ -4780,15 +4808,12 @@ class ServicesMixin:
 
         # --- 9. Final Config File Cleanup ---
         cleaned_channel_settings = 0
-        for ch_id in list(self.active_channels):
-            if ch_id not in all_bot_channel_ids: self.active_channels.discard(ch_id); cleaned_channel_settings += 1
-        for ch_id in list(self.channel_scoped_profiles.keys()):
-            if ch_id not in all_bot_channel_ids: del self.channel_scoped_profiles[ch_id]; cleaned_channel_settings += 1
         for ch_id in list(self.multi_profile_channels.keys()):
-            if ch_id not in all_bot_channel_ids: del self.multi_profile_channels[ch_id]; cleaned_channel_settings += 1
+            if ch_id not in all_bot_channel_ids:
+                del self.multi_profile_channels[ch_id]
+                cleaned_channel_settings += 1
         
         if cleaned_channel_settings > 0:
-            self._save_channel_settings()
             self._save_multi_profile_sessions()
             log.append(f"🧹 Removed settings for {cleaned_channel_settings} deleted channels from config files.")
 

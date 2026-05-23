@@ -43,6 +43,14 @@ class CoreMixin:
             
             self._purge_legacy_default_profile()
             
+            # Run index self-repair once immediately on boot
+            print("Running initial index.json self-repair on boot...")
+            await asyncio.to_thread(self._repair_all_user_indices)
+            print("Initial index.json self-repair complete.")
+            
+            if not self.hourly_self_repair_task.is_running():
+                self.hourly_self_repair_task.start()
+            
             if not self.proactive_session_task.is_running():
                 self.proactive_session_task.start()
             
@@ -1565,81 +1573,42 @@ class CoreMixin:
         user_id_str = str(user_id)
         
         export_data = {
-            "version": "1.0",
+            "version": "2.0",
             "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "profiles": {}
         }
 
         for name in profile_names:
-            p_config = self._get_profile_config(user_id, name, False)
-            if not p_config: continue
-            p_prompts = self._get_profile_prompts(user_id, name) or {}
+            pid = self._get_pid_from_name_any(user_id, name)
+            p_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles", pid)
+            if not os.path.exists(p_dir): continue
 
-            keys_by_filter = {
-                "core":["primary_model", "fallback_model", "show_fallback_indicator", "temperature", "top_p", "top_k", "stm_length", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a"],
-                "thinking":["thinking_summary_visible", "thinking_level", "thinking_budget", "thinking_signatures_enabled"],
-                "tools":["grounding_enabled", "grounding_mode", "image_generation_enabled", "url_fetching_enabled", "critic_enabled", "generation_metadata_enabled", "time_tracking_enabled", "timezone", "realistic_typing_enabled", "response_mode"],
-                "voice":["speech_voice", "speech_model", "speech_temperature", "speech_archetype", "speech_accent", "speech_dynamics", "speech_style", "speech_pacing"],
-                "memory_params":["training_context_size", "training_relevance_threshold", "ltm_context_size", "ltm_relevance_threshold", "ltm_creation_interval", "ltm_summarization_context"]
-            }
+            config_path = os.path.join(p_dir, "config.json.gz")
+            prompts_path = os.path.join(p_dir, "prompts.json.gz")
             
-            p_config_out = {}
-            for filter_key, conf_keys in keys_by_filter.items():
-                if filter_key in filters:
-                    for k in conf_keys:
-                        if k in p_config:
-                            p_config_out[k] = p_config[k]
-                            
-            if "memory_params" in filters:
-                if "image_generation_prompt" in p_prompts:
-                    p_config_out["image_generation_prompt"] = self._decrypt_data(p_prompts["image_generation_prompt"])
-                if "ltm_summarization_instructions" in p_prompts:
-                    p_config_out["ltm_summarization_instructions"] = self._decrypt_data(p_prompts["ltm_summarization_instructions"])
+            config = self._load_json_gzip(config_path) or {}
+            prompts = self._load_json_gzip(prompts_path) or {}
+
+            config.pop("profile_id", None)
 
             p_entry = {
-                "pid": self._get_pid_from_name_any(user_id, name),
-                "config": p_config_out,
-                "persona": {},
-                "ai_instructions": [],
-                "appearance": None,
+                "pid": pid,
+                "config": config,
+                "prompts": prompts,
                 "ltm": [],
                 "training": []
             }
 
-            if "persona" in filters:
-                p_entry["persona"] = {k: [self._decrypt_data(line) for line in v] for k, v in p_prompts.get("persona", {}).items()}
-            
-            if "instructions" in filters:
-                raw_instr = p_prompts.get("ai_instructions", ["", "", "", ""])
-                if isinstance(raw_instr, list):
-                    p_entry["ai_instructions"] = [self._decrypt_data(p) for p in raw_instr]
-                else:
-                    p_entry["ai_instructions"] = self._decrypt_data(raw_instr or "")
-
-            if "appearance" in filters:
-                p_entry["appearance"] = self.user_appearances.get(user_id_str, {}).get(name)
-
             if "ltm" in filters:
-                ltm_shard = self._load_ltm_shard(user_id_str, name)
-                if ltm_shard:
-                    for entry in ltm_shard.get("guild",[]):
-                        p_entry["ltm"].append({
-                            "sum": self._decrypt_data(entry.get("sum", "")),
-                            "s_emb": entry.get("s_emb"),
-                            "ts": entry.get("created_ts", entry.get("ts"))
-                        })
+                ltm_data = self._load_json_gzip(os.path.join(p_dir, "ltm.json.gz"))
+                if ltm_data:
+                    p_entry["ltm"] = ltm_data.get("guild", [])
 
             if "training" in filters:
-                train_shard = self._load_training_shard(user_id_str, name)
-                if train_shard:
-                    for entry in train_shard:
-                        p_entry["training"].append({
-                            "u_in": self._decrypt_data(entry.get("u_in", "")),
-                            "b_out": self._decrypt_data(entry.get("b_out", "")),
-                            "u_emb": entry.get("u_emb"),
-                            "ts": entry.get("created_ts", entry.get("ts"))
-                        })
-            
+                training_data = self._load_json_gzip(os.path.join(p_dir, "training.json.gz"))
+                if training_data:
+                    p_entry["training"] = training_data
+
             export_data["profiles"][name] = p_entry
 
         file_data = json.dumps(export_data, option=json.OPT_INDENT_2)
@@ -1668,73 +1637,45 @@ class CoreMixin:
                 if local_name in index.get("personal", []):
                     local_name = f"{name}_imported_{uuid.uuid4().hex[:4]}"
                 
-                # 1. Encrypt and save Profile
-                clean_persona = {k: [self._encrypt_data(line) for line in v] for k, v in p_data.get("persona", {}).items()}
-                
-                instr_raw = p_data.get("ai_instructions", "")
-                clean_instr = [self._encrypt_data(p) for p in instr_raw] if isinstance(instr_raw, list) else self._encrypt_data(instr_raw)
-                
-                new_profile_base = self._get_or_create_user_profile(user_id, local_name)
-                if not new_profile_base:
-                    import_log.append(f"❌ `{local_name}` (Failed to create)")
-                    continue
-                
-                config = new_profile_base["config"]
-                prompts = new_profile_base["prompts"]
-                
-                config.update(p_data.get("config", {}))
-                
-                img_gen = config.pop("image_generation_prompt", None)
-                ltm_sum = config.pop("ltm_summarization_instructions", None)
-                
-                # Import original PID if valid, otherwise keep the newly generated one
-                imported_pid = p_data.get("pid")
-                if imported_pid and len(imported_pid) == 16 and imported_pid.startswith("A"):
-                    config["profile_id"] = imported_pid
-                elif "profile_id" not in config or len(config["profile_id"]) != 16:
-                    import uuid
-                    config["profile_id"] = f"A{uuid.uuid4().hex[:15].upper()}"
-                
-                prompts["persona"] = clean_persona
-                prompts["ai_instructions"] = clean_instr
-                prompts["image_generation_prompt"] = self._encrypt_data(img_gen) if img_gen else None
-                prompts["ltm_summarization_instructions"] = self._encrypt_data(ltm_sum) if ltm_sum else self._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
-                
-                self._save_profile_config(user_id, local_name, config, False)
-                self._save_profile_prompts(user_id, local_name, prompts)
+                import uuid
+                new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
+                recip_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles", new_pid)
+                os.makedirs(recip_dir, exist_ok=True)
 
-                # 2. Encrypt and save LTM
-                if p_data.get("ltm"):
-                    ltm_list = []
-                    for entry in p_data["ltm"]:
-                        now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                        ltm_list.append({
-                            "id": uuid.uuid4().hex[:8], "sum": self._encrypt_data(entry["sum"]),
-                            "s_emb": entry["s_emb"], "scope": "server",
-                            "created_ts": entry.get("ts", now_ts), "modified_ts": now_ts
-                        })
-                    self._save_ltm_shard(user_id_str, local_name, {"guild": ltm_list})
+                config = p_data.get("config", {})
+                prompts = p_data.get("prompts", {})
 
-                # 3. Encrypt and save Training
-                if p_data.get("training"):
-                    train_list = []
-                    for entry in p_data["training"]:
-                        now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                        train_list.append({
-                            "id": uuid.uuid4().hex[:8], "u_in": self._encrypt_data(entry["u_in"]),
-                            "b_out": self._encrypt_data(entry["b_out"]), "u_emb": entry["u_emb"],
-                            "created_ts": entry.get("ts", now_ts), "modified_ts": now_ts
-                        })
-                    self._save_training_shard(user_id_str, local_name, train_list)
+                config["profile_id"] = new_pid
+                config["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-                # 4. Handle Appearance
-                if p_data.get("appearance"):
-                    self.user_appearances.setdefault(user_id_str, {})[local_name] = p_data["appearance"]
-                
+                self._atomic_json_save_gzip(config, os.path.join(recip_dir, "config.json.gz"))
+                self._atomic_json_save_gzip(prompts, os.path.join(recip_dir, "prompts.json.gz"))
+
+                ltm_list = p_data.get("ltm", [])
+                if ltm_list:
+                    self._atomic_json_save_gzip({"guild": ltm_list}, os.path.join(recip_dir, "ltm.json.gz"))
+
+                training_list = p_data.get("training", [])
+                if training_list:
+                    self._atomic_json_save_gzip(training_list, os.path.join(recip_dir, "training.json.gz"))
+
+                if config.get("custom_display_name") or config.get("custom_avatar_url"):
+                    self.user_appearances.setdefault(user_id_str, {})[local_name] = {
+                        "custom_display_name": config.get("custom_display_name"),
+                        "custom_avatar_url": config.get("custom_avatar_url")
+                    }
+
+                with open(os.path.join(recip_dir, "name.txt"), "w", encoding="utf-8") as f:
+                    f.write(local_name)
+
+                if isinstance(index.get("personal"), dict):
+                    index["personal"][local_name] = new_pid
+                else:
+                    index.setdefault("personal", []).append(local_name)
+
                 import_log.append(f"- `{local_name}`")
 
             self._save_user_index(user_id, index)
-            self._save_user_appearance_shard(user_id_str, self.user_appearances.get(user_id_str))
             
             await interaction.followup.send(f"### 📥 Import Successful\nThe following profiles have been added to your vault:\n" + "\n".join(import_log), ephemeral=True)
 
@@ -2001,6 +1942,44 @@ class CoreMixin:
     async def _ensure_session_hydrated(self, channel_id: int, session_type: str) -> Optional[Dict]:
         """Checks if a session is in memory and hydrated. If not, loads it from disk."""
         session = self.multi_profile_channels.get(channel_id)
+        
+        # Lazily validate and clean up all session participants if the session is engaged
+        if session and session.get("profiles"):
+            cleaned_any = False
+            valid_profiles = []
+            for p in list(session["profiles"]):
+                p_owner_id = p["owner_id"]
+                p_name = p["profile_name"]
+                
+                # Proactively scan and clean up this specific owner's borrowed profiles
+                await self._validate_and_clean_borrowed_profiles(p_owner_id)
+                
+                # Verify if the profile continues to exist for the owner
+                p_index = self._get_user_index(p_owner_id)
+                exists = (p_name in p_index.get("personal", {})) or (p_name in p_index.get("borrowed", {}))
+                
+                if exists:
+                    valid_profiles.append(p)
+                else:
+                    cleaned_any = True
+                    p_key = (p_owner_id, p_name)
+                    if "chat_sessions" in session:
+                        session["chat_sessions"].pop(p_key, None)
+                    if p.get("method") == "child_bot" and p.get("bot_id"):
+                        await self.manager_queue.put({
+                            "action": "send_to_child", "bot_id": p["bot_id"],
+                            "payload": {"action": "session_update_remove", "channel_id": channel_id}
+                        })
+            
+            if cleaned_any:
+                session["profiles"] = valid_profiles
+                self._save_multi_profile_sessions()
+                if not session["profiles"]:
+                    self.multi_profile_channels.pop(channel_id, None)
+                    dummy_session_key = (channel_id, None, None)
+                    await self._delete_session_from_disk(dummy_session_key, session_type)
+                    return None
+
         if session and session.get("is_hydrated"):
             return session
 
@@ -2145,7 +2124,6 @@ class CoreMixin:
         owner_id = participant['owner_id']
         profile_name = participant['profile_name']
         
-        # Fetch effective settings via the helper which handles overrides/defaults logic
         _, _, _, temp, topp, topk, training_ctx, training_rel, prim_model, fall_model = self._get_user_profile_for_model(
             owner_id, channel_id, profile_name_override=profile_name
         )
@@ -2153,15 +2131,11 @@ class CoreMixin:
         index = self._get_user_index(owner_id)
         is_borrowed = profile_name in index.get("borrowed", [])
         
-        # Determine source data
         if is_borrowed:
             borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
             effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
             effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
-            # Local overrides are in borrowed_data
             profile_data = borrowed_data
-            
-            # We need to fetch the source profile for some parameters that might fall back
             source_profile_data = self._get_profile_config(effective_owner_id, effective_profile_name, False) or {}
         else:
             effective_owner_id = owner_id
@@ -2169,33 +2143,25 @@ class CoreMixin:
             profile_data = self._get_profile_config(owner_id, profile_name, False) or {}
             source_profile_data = profile_data
 
-        # --- Data Gathering ---
-        
-        # Appearance
         appearance = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
         display_name = appearance.get("custom_display_name") or effective_profile_name
         appearance_text = f"`{effective_profile_name}`" if appearance else "None"
         
-        # Stats
         ltm_shard = self._load_ltm_shard(str(effective_owner_id), effective_profile_name)
         ltm_count = len(ltm_shard.get("guild", [])) if ltm_shard else 0
         training_shard = self._load_training_shard(str(effective_owner_id), effective_profile_name)
         training_count = len(training_shard) if training_shard else 0
 
-        # Settings from local profile_data (overrides) or source
         realistic_typing = profile_data.get("realistic_typing_enabled", False)
-        time_tracking = profile_data.get("time_tracking_enabled", False)
         timezone_str = profile_data.get("timezone", "UTC")
         
         grounding_mode = profile_data.get("grounding_mode", "off")
         if isinstance(grounding_mode, bool): grounding_mode = "on" if grounding_mode else "off"
-        grounding_display = {"off": "`OFF`", "on": "**`ON`**", "on+": "**`ON+`**"}.get(grounding_mode, "OFF")
+        grounding_display = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(grounding_mode, "OFF")
 
-        stm_length = source_profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
-        # Note: borrowed profiles might not have these keys locally, so we default or check source
-        ltm_ctx = source_profile_data.get("ltm_context_size", 3)
-        ltm_rel = source_profile_data.get("ltm_relevance_threshold", 0.75)
-        ltm_scope = profile_data.get("ltm_scope", "server").title()
+        stm_length = profile_data.get("stm_length", source_profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
+        ltm_ctx = profile_data.get("ltm_context_size", source_profile_data.get("ltm_context_size", 3))
+        ltm_rel = profile_data.get("ltm_relevance_threshold", source_profile_data.get("ltm_relevance_threshold", 0.75))
         safety_level = profile_data.get("safety_level", "low").title()
         ltm_creation_status = "**`ON`**" if profile_data.get("ltm_creation_enabled", False) else "`OFF`"
 
@@ -2208,23 +2174,29 @@ class CoreMixin:
                 created_display = f"<t:{ts}:D>\n(<t:{ts}:R>)"
             except: pass
 
-        # Profile Type Logic
         profile_type = "Personal"
         if is_borrowed:
             owner_user = self.bot.get_user(effective_owner_id)
             owner_name = owner_user.name if owner_user else "Unknown User"
             profile_type = f"Borrowed (from {owner_name})"
 
-        profile_id = self._get_profile_id(effective_owner_id, effective_profile_name)
-
-        # --- Embed Construction ---
         embed = discord.Embed(title=f"Participant: {display_name}", color=discord.Color.blue())
         
         embed.add_field(name="Profile Type", value=f"`{profile_type}`", inline=True)
         embed.add_field(name="Created", value=created_display, inline=True)
         embed.add_field(name="Display Name", value=f"`{display_name}`", inline=True)
         
-        embed.add_field(name="Profile ID (PID)", value=f"`{profile_id}`", inline=True)
+        if is_borrowed:
+            borrowed_config = self._get_profile_config(owner_id, profile_name, True) or {}
+            a_class_pid = borrowed_config.get("original_profile_id", "Unknown")
+            b_class_pid = self._get_pid_from_name_any(owner_id, profile_name)
+            embed.add_field(name="Profile ID (Source)", value=f"`{a_class_pid}`", inline=True)
+            embed.add_field(name="Profile ID (Local)", value=f"`{b_class_pid}`", inline=True)
+        else:
+            profile_id = self._get_profile_id(effective_owner_id, effective_profile_name)
+            embed.add_field(name="Profile ID (PID)", value=f"`{profile_id}`", inline=True)
+            embed.add_field(name="\u200b", value="\u200b", inline=True)
+
         embed.add_field(name="Safety Level", value=f"`{safety_level}`", inline=True)
         embed.add_field(name="\u200b", value="\u200b", inline=True) # Spacer for alignment
 
@@ -2276,8 +2248,8 @@ class CoreMixin:
         _, _, _, temp, top_p, top_k, train_ctx, train_rel, prim_model, fall_model = self._get_user_profile_for_model(user_id, channel_id, profile_name)
 
         source_profile_data = self._get_profile_config(effective_owner_id, effective_profile_name, False) or {}
+        config = self._get_profile_config(user_id, profile_name, is_borrowed) or {}
         
-        # --- Data Gathering ---
         ltm_shard = self._load_ltm_shard(str(effective_owner_id), effective_profile_name)
         ltm_count = len(ltm_shard.get("guild", [])) if ltm_shard else 0
         training_shard = self._load_training_shard(str(effective_owner_id), effective_profile_name)
@@ -2294,31 +2266,36 @@ class CoreMixin:
         
         appearance_data = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
         display_name = appearance_data.get("custom_display_name") or effective_profile_name
-        safety_level = source_profile_data.get("safety_level", "low").title()
+        safety_level = config.get("safety_level", source_profile_data.get("safety_level", "low")).title()
 
-        # 1. Top Section
-        profile_id = self._get_profile_id(effective_owner_id, effective_profile_name)
-        
         embed.add_field(name="Profile Type", value=f"`{profile_type}`", inline=True)
         embed.add_field(name="Created", value=created_display, inline=True)
         embed.add_field(name="Display Name", value=f"`{display_name}`", inline=True)
         
-        embed.add_field(name="Profile ID (PID)", value=f"`{profile_id}`", inline=True)
-        embed.add_field(name="Safety Level", value=f"`{safety_level}`", inline=True)
-        embed.add_field(name="\u200b", value="\u200b", inline=True) # Spacer for alignment
+        if is_borrowed:
+            borrowed_config = self._get_profile_config(user_id, profile_name, True) or {}
+            a_class_pid = borrowed_config.get("original_profile_id", "Unknown")
+            b_class_pid = self._get_pid_from_name_any(user_id, profile_name)
+            embed.add_field(name="Profile ID (Source)", value=f"`{a_class_pid}`", inline=True)
+            embed.add_field(name="Profile ID (Local)", value=f"`{b_class_pid}`", inline=True)
+        else:
+            profile_id = self._get_profile_id(effective_owner_id, effective_profile_name)
+            embed.add_field(name="Profile ID (PID)", value=f"`{profile_id}`", inline=True)
+            embed.add_field(name="\u200b", value="\u200b", inline=True)
 
-        # Invisible Separator
+        embed.add_field(name="Safety Level", value=f"`{safety_level}`", inline=True)
+
         embed.add_field(name="\u200b", value="\u200b", inline=False)
 
         def clean_m(m_str):
             if not m_str: return "None"
             return str(m_str).replace("GOOGLE/", "").replace("OPENROUTER/", "")
 
-        img_model = source_profile_data.get("image_generation_model", "gemini-2.5-flash-image")
-        aud_model = source_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts")
-        grd_model = source_profile_data.get("grounding_rag_model", FALLBACK_MODEL_NAME)
-        crt_model = source_profile_data.get("critic_model", FALLBACK_MODEL_NAME)
-        ltm_model = source_profile_data.get("ltm_model", FALLBACK_MODEL_NAME)
+        img_model = config.get("image_generation_model", source_profile_data.get("image_generation_model", "gemini-2.5-flash-image"))
+        aud_model = config.get("speech_model", source_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts"))
+        grd_model = config.get("grounding_rag_model", source_profile_data.get("grounding_rag_model", FALLBACK_MODEL_NAME))
+        crt_model = config.get("critic_model", source_profile_data.get("critic_model", FALLBACK_MODEL_NAME))
+        ltm_model = config.get("ltm_model", source_profile_data.get("ltm_model", FALLBACK_MODEL_NAME))
 
         models_val = (
             f"Primary: `{clean_m(prim_model)}`\n"
@@ -2331,8 +2308,7 @@ class CoreMixin:
         )
         embed.add_field(name="Models", value=models_val, inline=False)
 
-        # 2. Generation Parameters Section
-        stm_length = source_profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
+        stm_length = config.get("stm_length", source_profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
         gen_val = (
             f"Temp: `{temp}`\n"
             f"Top P: `{top_p}`\n"
@@ -2341,12 +2317,11 @@ class CoreMixin:
         )
         embed.add_field(name="\u200bGeneration Parameters", value=gen_val, inline=True)
 
-        # 3. Advanced Parameters Section
-        freq_p = source_profile_data.get("frequency_penalty", 0.0)
-        pres_p = source_profile_data.get("presence_penalty", 0.0)
-        rep_p = source_profile_data.get("repetition_penalty", 0.0)
-        min_p = source_profile_data.get("min_p", 0.0)
-        top_a = source_profile_data.get("top_a", 0.0)
+        freq_p = config.get("frequency_penalty", source_profile_data.get("frequency_penalty", 0.0))
+        pres_p = config.get("presence_penalty", source_profile_data.get("presence_penalty", 0.0))
+        rep_p = config.get("repetition_penalty", source_profile_data.get("repetition_penalty", 0.0))
+        min_p = config.get("min_p", source_profile_data.get("min_p", 0.0))
+        top_a = config.get("top_a", source_profile_data.get("top_a", 0.0))
 
         adv_val = (
             f"Freq P: `{freq_p}`\n"
@@ -2357,11 +2332,10 @@ class CoreMixin:
         )
         embed.add_field(name="Advanced (OpenRouter Only)", value=adv_val, inline=True)
 
-        # 5. [NEW] Thinking Section (Placed to the right of Tools)
-        t_summary_raw = source_profile_data.get("thinking_summary_visible", "off").lower()
+        t_summary_raw = config.get("thinking_summary_visible", source_profile_data.get("thinking_summary_visible", "off")).lower()
         t_summary = "**`ON`**" if t_summary_raw == "on" else "`OFF`"
-        t_level = source_profile_data.get("thinking_level", "high").title()
-        t_budget = source_profile_data.get("thinking_budget", -1)
+        t_level = config.get("thinking_level", source_profile_data.get("thinking_level", "high")).title()
+        t_budget = config.get("thinking_budget", source_profile_data.get("thinking_budget", -1))
         budget_display = "Dynamic (-1)" if t_budget == -1 else f"{t_budget}"
 
         thinking_val = (
@@ -2371,27 +2345,26 @@ class CoreMixin:
         )
         embed.add_field(name="Thinking/Reasoning", value=thinking_val, inline=True)
 
-        # 4. Tools Section (Change to inline)
-        img_gen = "**`ON`**" if source_profile_data.get("image_generation_enabled", False) else "`OFF`"
+        img_gen = "**`ON`**" if config.get("image_generation_enabled", source_profile_data.get("image_generation_enabled", False)) else "`OFF`"
         
-        raw_ground_mode = source_profile_data.get("grounding_mode", "off")
+        raw_ground_mode = config.get("grounding_mode", source_profile_data.get("grounding_mode", "off"))
         if isinstance(raw_ground_mode, bool): raw_ground_mode = "rag" if raw_ground_mode else "off"
         elif raw_ground_mode in ["on", "on+"]: raw_ground_mode = "rag"
         grounding_display = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(raw_ground_mode, "`OFF`")
         
-        raw_url_mode = source_profile_data.get("url_mode", "off")
-        if "url_mode" not in source_profile_data:
-            raw_url_mode = "rag" if source_profile_data.get("url_fetching_enabled", False) else "off"
+        raw_url_mode = config.get("url_mode", source_profile_data.get("url_mode", "off"))
+        if "url_mode" not in config:
+            raw_url_mode = "rag" if config.get("url_fetching_enabled", source_profile_data.get("url_fetching_enabled", False)) else "off"
         url_ctx = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(raw_url_mode, "`OFF`")
         
-        timezone = source_profile_data.get("timezone", "UTC")
-        typing = "**`ON`**" if source_profile_data.get("realistic_typing_enabled", False) else "`OFF`"
-        critic = "**`ON`**" if source_profile_data.get("critic_enabled", False) else "`OFF`"
-        neuro = "**`ON`**" if source_profile_data.get("neuro_engine_enabled", False) else "`OFF`"
-        metadata_vis = "**`ON`**" if source_profile_data.get("generation_metadata_enabled", False) else "`OFF`"
-        resp_mode = source_profile_data.get("response_mode", "regular").replace('_', ' ').title()
+        timezone = config.get("timezone", source_profile_data.get("timezone", "UTC"))
+        typing = "**`ON`**" if config.get("realistic_typing_enabled", source_profile_data.get("realistic_typing_enabled", False)) else "`OFF`"
+        critic = "**`ON`**" if config.get("critic_enabled", source_profile_data.get("critic_enabled", False)) else "`OFF`"
+        neuro = "**`ON`**" if config.get("neuro_engine_enabled", source_profile_data.get("neuro_engine_enabled", False)) else "`OFF`"
+        metadata_vis = "**`ON`**" if config.get("generation_metadata_enabled", source_profile_data.get("generation_metadata_enabled", False)) else "`OFF`"
+        resp_mode = config.get("response_mode", source_profile_data.get("response_mode", "regular")).replace('_', ' ').title()
 
-        ph_text = f"{source_profile_data.get('placeholder_emoji') or 'Default'}"
+        ph_text = f"{config.get('placeholder_emoji', source_profile_data.get('placeholder_emoji')) or 'Default'}"
         
         tools_val = (
             f"Image Gen: {img_gen}\n"
@@ -2406,10 +2379,10 @@ class CoreMixin:
         )
         embed.add_field(name="Tools", value=tools_val, inline=False)
 
-        s_voice = source_profile_data.get("speech_voice", "Aoede")
-        s_model = source_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts")
-        s_temp = source_profile_data.get("speech_temperature", 1.0)
-        s_enabled = "**`ON`**" if source_profile_data.get("speech_tts_enabled", False) else "`OFF`"
+        s_voice = config.get("speech_voice", source_profile_data.get("speech_voice", "Aoede"))
+        s_model = config.get("speech_model", source_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts"))
+        s_temp = config.get("speech_temperature", source_profile_data.get("speech_temperature", 1.0))
+        s_enabled = "**`ON`**" if config.get("speech_tts_enabled", source_profile_data.get("speech_tts_enabled", False)) else "`OFF`"
         s_model_disp = s_model.replace("gemini-", "").replace("-preview-tts", "").title()
         
         speech_val = (
@@ -2419,7 +2392,6 @@ class CoreMixin:
         )
         embed.add_field(name="Speech TTS", value=speech_val, inline=True)
 
-        # 5. Training & Memory Section (Same Row)
         train_val = (
             f"Count: `{train_count}`\n"
             f"Context Size: `{train_ctx}`\n"
@@ -2427,11 +2399,11 @@ class CoreMixin:
         )
         embed.add_field(name="Training Examples", value=train_val, inline=True)
 
-        ltm_ctx = source_profile_data.get("ltm_context_size", 3)
-        ltm_rel = source_profile_data.get("ltm_relevance_threshold", 0.75)
-        ltm_status = "**`ON`**" if source_profile_data.get("ltm_creation_enabled", False) else "`OFF`"
-        ltm_inv = source_profile_data.get("ltm_creation_interval", 10)
-        ltm_s_ctx = source_profile_data.get("ltm_summarization_context", 10)
+        ltm_ctx = config.get("ltm_context_size", source_profile_data.get("ltm_context_size", 3))
+        ltm_rel = config.get("ltm_relevance_threshold", source_profile_data.get("ltm_relevance_threshold", 0.75))
+        ltm_status = "**`ON`**" if config.get("ltm_creation_enabled", source_profile_data.get("ltm_creation_enabled", False)) else "`OFF`"
+        ltm_inv = config.get("ltm_creation_interval", source_profile_data.get("ltm_creation_interval", 10))
+        ltm_s_ctx = config.get("ltm_summarization_context", source_profile_data.get("ltm_summarization_context", 10))
 
         ltm_val = (
             f"Auto-Creation: {ltm_status}\n"
@@ -2932,9 +2904,8 @@ class CoreMixin:
             await interaction.followup.send("The shared profile seems to no longer exist.", ephemeral=True)
             return
 
-        # [NEW] Dynamic Limit Check
         index = self._get_user_index(interaction.user.id)
-        current_borrowed = len(index.get("borrowed",[]))
+        current_borrowed = len(index.get("borrowed", {})) if isinstance(index.get("borrowed"), dict) else len(index.get("borrowed", []))
         
         limit = defaultConfig.LIMIT_BORROWED_PREMIUM if self.is_user_premium(interaction.user.id) else defaultConfig.LIMIT_BORROWED_FREE
 
@@ -2943,11 +2914,20 @@ class CoreMixin:
             await interaction.followup.send(f"Limit Reached. You have {current_borrowed}/{limit} borrowed profiles ({tier_name} Tier).", ephemeral=True)
             return
 
+        target_original_pid = target_pid or owner_profile_data.get("profile_id", "00000000")
+        source_pointer = f"{sharer_id}:{target_original_pid}"
+        if is_public_borrow:
+            public_key = next((k for k, v in self.public_profiles.items() if v == source_pointer), None)
+            pointer_value = public_key if public_key else source_pointer
+        else:
+            pointer_value = source_pointer
+
         snapshot_data = {
             "original_owner_id": str(sharer_id),
-            "original_pid": target_pid or owner_profile_data.get("profile_id"),
+            "original_pid": target_original_pid,
             "original_profile_name": current_name,
-            "original_profile_id": owner_profile_data.get("profile_id", "00000000"),
+            "original_profile_id": target_original_pid,
+            "pointer": pointer_value,
             "borrowed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "grounding_enabled": owner_profile_data.get("grounding_enabled", False),
             "realistic_typing_enabled": owner_profile_data.get("realistic_typing_enabled", False),
@@ -2973,24 +2953,26 @@ class CoreMixin:
             "ltm_context_size": owner_profile_data.get("ltm_context_size", 3),
             "ltm_relevance_threshold": owner_profile_data.get("ltm_relevance_threshold", 0.75),
         }
-        
+
         for adv_k in ["frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a"]:
             if adv_k in owner_profile_data:
                 snapshot_data[adv_k] = owner_profile_data[adv_k]
+
+        import uuid
+        pid = f"B{uuid.uuid4().hex[:15].upper()}"
+
+        if "borrowed" not in index or not isinstance(index["borrowed"], dict):
+            index["borrowed"] = {}
         
-        if desired_name not in index.get("borrowed", {}):
-            if isinstance(index.get("borrowed"), dict):
-                import uuid
-                pid = f"B{uuid.uuid4().hex[:15].upper()}"
-                index["borrowed"][desired_name] = pid
-                p_dir = os.path.join(self.cog.USERS_DIR, str(interaction.user.id), "profiles", pid)
-                os.makedirs(p_dir, exist_ok=True)
-                with open(os.path.join(p_dir, "name.txt"), "w", encoding="utf-8") as f:
-                    f.write(desired_name)
-            else:
-                index.setdefault("borrowed",[]).append(desired_name)
-            self._save_user_index(interaction.user.id, index)
-            
+        index["borrowed"][desired_name] = pid
+        self._save_user_index(interaction.user.id, index)
+
+        p_dir = os.path.join(self.USERS_DIR, str(interaction.user.id), "profiles", pid)
+        os.makedirs(p_dir, exist_ok=True)
+        
+        with open(os.path.join(p_dir, "name.txt"), "w", encoding="utf-8") as f:
+            f.write(desired_name)
+
         self._save_profile_config(interaction.user.id, desired_name, snapshot_data, is_borrowed=True)
         
         if not is_public_borrow:
@@ -3154,6 +3136,7 @@ class CoreMixin:
         
         self.refresh_lock_task.cancel()
         self.evict_inactive_sessions_task.cancel()
+        self.hourly_self_repair_task.cancel()
         self.weekly_cleanup_task.cancel()
         self.child_bot_integrity_task.cancel()
 
@@ -3259,3 +3242,68 @@ class CoreMixin:
             print(f"Cleanup complete. Standardised IDs for {count} profile entities.")
         else:
             print("No legacy ID fields found. System is up to date.")
+
+    async def _execute_clone_handshake(self, owner_id: int, source_pid: str, recipient_id: int, desired_name: str) -> Tuple[bool, str]:
+        owner_id_str = str(owner_id)
+        recip_id_str = str(recipient_id)
+        
+        src_dir = os.path.join(self.USERS_DIR, owner_id_str, "profiles", source_pid)
+        
+        if not os.path.exists(src_dir):
+            return False, "Source profile data no longer exists."
+
+        index = self._get_user_index(recipient_id)
+        limit = defaultConfig.LIMIT_PROFILES_PREMIUM if self.is_user_premium(recipient_id) else defaultConfig.LIMIT_PROFILES_FREE
+        if len(index.get("personal", [])) >= limit:
+            return False, "You have reached your personal profile limit."
+
+        import uuid
+        new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
+        
+        recip_dir = os.path.join(self.USERS_DIR, recip_id_str, "profiles", new_pid)
+        os.makedirs(recip_dir, exist_ok=True)
+        
+        try:
+            src_prompts = os.path.join(src_dir, "prompts.json.gz")
+            if os.path.exists(src_prompts):
+                import shutil
+                shutil.copy2(src_prompts, os.path.join(recip_dir, "prompts.json.gz"))
+            
+            src_config_file = os.path.join(src_dir, "config.json.gz")
+            if os.path.exists(src_config_file):
+                config_data = self._load_json_gzip(src_config_file) or {}
+                
+                config_data["profile_id"] = new_pid
+                config_data["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                
+                self._atomic_json_save_gzip(config_data, os.path.join(recip_dir, "config.json.gz"))
+                
+                disp = config_data.get("custom_display_name")
+                ava = config_data.get("custom_avatar_url")
+                if disp or ava:
+                    self.user_appearances.setdefault(recip_id_str, {})[desired_name] = {
+                        "custom_display_name": disp,
+                        "custom_avatar_url": ava
+                    }
+                
+            with open(os.path.join(recip_dir, "name.txt"), "w", encoding="utf-8") as f:
+                f.write(desired_name)
+                
+            if not isinstance(index.get("personal"), dict):
+                legacy_personal = index.get("personal", [])
+                index["personal"] = {}
+                if isinstance(legacy_personal, list):
+                    for p_name in legacy_personal:
+                        index["personal"][p_name] = p_name
+                
+            index["personal"][desired_name] = new_pid
+                
+            self._save_user_index(recipient_id, index)
+            return True, f"✅ Profile cloned successfully as '{desired_name}'!"
+            
+        except Exception as e:
+            print(f"Error executing clone handshake: {e}")
+            traceback.print_exc()
+            import shutil
+            shutil.rmtree(recip_dir, ignore_errors=True)
+            return False, f"An unexpected error occurred during cloning: {e}"

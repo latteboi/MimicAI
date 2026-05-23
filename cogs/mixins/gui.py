@@ -1155,7 +1155,7 @@ class ProfileManageView(ui.View):
             options.append(discord.SelectOption(label="Edit Persona", value="edit_persona", description="Edit backstory, traits, likes, dislikes, and appearance."))
             options.append(discord.SelectOption(label="Edit Instructions", value="edit_instructions", description="Edit specific AI behavioral instructions."))
             options.append(discord.SelectOption(label="TTS Instructions", value="tts_instructions", description="Configure the 'Director's Desk' for vocal performance."))
-            if not is_mod:
+            if not is_mod and not self.is_borrowed:
                 options.append(discord.SelectOption(label="Edit Appearance", value="edit_appearance", description="Edit the custom Webhook name and avatar."))
 
         elif self.current_tab == "params" and not is_mod:
@@ -1511,12 +1511,15 @@ class ProfileManageView(ui.View):
             old_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", old_pid)
             
             import uuid
-            if isinstance(user_index.get("personal"), dict):
-                new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
-                user_index["personal"][new_name] = new_pid
-            else:
-                new_pid = new_name
-                user_index.setdefault("personal", []).append(new_name)
+            if not isinstance(user_index.get("personal"), dict):
+                legacy_personal = user_index.get("personal", [])
+                user_index["personal"] = {}
+                if isinstance(legacy_personal, list):
+                    for p_name in legacy_personal:
+                        user_index["personal"][p_name] = p_name
+            
+            new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
+            user_index["personal"][new_name] = new_pid
                 
             new_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", new_pid)
             
@@ -1635,6 +1638,7 @@ def is_owner_in_dm_check():
 
 class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
     share_code_input = ui.TextInput(label="Enter the share code", required=True, min_length=12, max_length=16)
+    name_input = ui.TextInput(label="Desired Profile/Internal Name (Optional)", required=False, placeholder="Leave blank to auto-generate.", max_length=30)
 
     def __init__(self, cog: 'GeminiAgent'):
         super().__init__()
@@ -1643,6 +1647,7 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         code = self.share_code_input.value.strip()
+        desired_name_raw = self.name_input.value.lower().strip() if self.name_input.value else ""
         
         share_data = self.cog.share_codes.get(code)
         if not share_data or time.time() > share_data["expires_at"]:
@@ -1650,8 +1655,8 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
             return
         
         owner_id_str = share_data["owner_id"]
-        pids_to_borrow = share_data.get("pids",[])
-        names_to_borrow = share_data.get("profile_names", share_data.get("profile_name",[]))
+        pids_to_borrow = share_data.get("pids", [])
+        names_to_borrow = share_data.get("profile_names", share_data.get("profile_name", []))
         if not isinstance(names_to_borrow, list):
             names_to_borrow = [names_to_borrow]
 
@@ -1662,9 +1667,19 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
         owner = await self.cog.bot.fetch_user(int(owner_id_str))
         sharer_name = owner.name if owner else "Unknown"
 
-        # [NEW] Dynamic Limit Check
         index = self.cog._get_user_index(interaction.user.id)
-        current_borrowed = len(index.get("borrowed",[]))
+        
+        if desired_name_raw:
+            is_valid, err_msg = self.cog._is_valid_profile_name(desired_name_raw)
+            if not is_valid:
+                await interaction.followup.send(f"❌ **Invalid Name:** {err_msg}", ephemeral=True)
+                return
+            if desired_name_raw in index.get("personal", []) or desired_name_raw in index.get("borrowed", []):
+                await interaction.followup.send("A profile with that name already exists.", ephemeral=True)
+                return
+
+        borrowed_field = index.get("borrowed", {})
+        current_borrowed = len(borrowed_field) if isinstance(borrowed_field, dict) else len(borrowed_field)
         
         is_premium = self.cog.is_user_premium(interaction.user.id)
         limit = defaultConfig.LIMIT_BORROWED_PREMIUM if is_premium else defaultConfig.LIMIT_BORROWED_FREE
@@ -1679,7 +1694,7 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
             )
             return
 
-        accepted_profiles =[]
+        accepted_profiles = []
         failed_profiles = {}
 
         for idx, fallback_name in enumerate(names_to_borrow):
@@ -1694,60 +1709,15 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
                 failed_profiles[fallback_name] = "Original profile deleted by owner."
                 continue
 
-            desired_name = self.cog._generate_unique_local_name(interaction.user.id, current_name, sharer_name)
-            final_pid = target_pid or owner_profile_data.get("profile_id", "00000000")
-
-            snapshot_data = {
-                "original_owner_id": owner_id_str,
-                "original_pid": final_pid,
-                "original_profile_name": current_name,
-                "original_profile_id": owner_profile_data.get("profile_id", "00000000"),
-                "borrowed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "grounding_enabled": owner_profile_data.get("grounding_enabled", False),
-                "realistic_typing_enabled": owner_profile_data.get("realistic_typing_enabled", False),
-                "time_tracking_enabled": owner_profile_data.get("time_tracking_enabled", False),
-                "timezone": owner_profile_data.get("timezone", "UTC"),
-                "ltm_creation_enabled": False, 
-                "ltm_scope": "server", 
-                "safety_level": "low",
-                "thinking_summary_visible": owner_profile_data.get("thinking_summary_visible", "off"),
-                "thinking_level": owner_profile_data.get("thinking_level", "high"),
-                "thinking_budget": owner_profile_data.get("thinking_budget", -1),
-                "thinking_signatures_enabled": owner_profile_data.get("thinking_signatures_enabled", "off"),
-                "stm_length": owner_profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH),
-                "image_generation_enabled": owner_profile_data.get("image_generation_enabled", False),
-                "image_generation_model": owner_profile_data.get("image_generation_model", "gemini-2.5-flash-image"),
-                "url_fetching_enabled": owner_profile_data.get("url_fetching_enabled", False),
-                "critic_enabled": owner_profile_data.get("critic_enabled", False),
-                "speech_voice": owner_profile_data.get("speech_voice", "Aoede"),
-                "speech_model": owner_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts"),
-                "speech_temperature": owner_profile_data.get("speech_temperature", 1.0),
-                "ltm_creation_interval": owner_profile_data.get("ltm_creation_interval", 10),
-                "ltm_summarization_context": owner_profile_data.get("ltm_summarization_context", 10),
-                "ltm_context_size": owner_profile_data.get("ltm_context_size", 3),
-                "ltm_relevance_threshold": owner_profile_data.get("ltm_relevance_threshold", 0.75),
-            }
-            for adv_k in["frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a"]:
-                if adv_k in owner_profile_data:
-                    snapshot_data[adv_k] = owner_profile_data[adv_k]
-
-            if desired_name not in index.get("borrowed", {}):
-                if isinstance(index.get("borrowed"), dict):
-                    import uuid
-                    pid = f"B{uuid.uuid4().hex[:15].upper()}"
-                    index["borrowed"][desired_name] = pid
-                    p_dir = os.path.join(self.cog.USERS_DIR, str(interaction.user.id), "profiles", pid)
-                    os.makedirs(p_dir, exist_ok=True)
-                    with open(os.path.join(p_dir, "name.txt"), "w", encoding="utf-8") as f:
-                        f.write(desired_name)
-                else:
-                    index.setdefault("borrowed",[]).append(desired_name)
-            self.cog._save_profile_config(interaction.user.id, desired_name, snapshot_data, True)
+            if desired_name_raw and len(names_to_borrow) == 1:
+                desired_name = desired_name_raw
+            else:
+                desired_name = self.cog._generate_unique_local_name(interaction.user.id, current_name, sharer_name)
+            
+            await self.cog._accept_share_request(interaction, int(owner_id_str), target_pid, current_name, desired_name, is_public_borrow=False)
             accepted_profiles.append(f"`{fallback_name}` (as `{desired_name}`)")
 
-        # Save and Delete Code
         if accepted_profiles:
-            self.cog._save_user_index(interaction.user.id, index)
             del self.cog.share_codes[code]
         
         message = ""
@@ -1759,7 +1729,6 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
         await interaction.followup.send(message, ephemeral=True)
 
 class HubBaseView(ui.View):
-    """Base class for all Hub views to maintain persistent navigation."""
     def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, current_tab: str):
         super().__init__(timeout=600)
         self.cog = cog
@@ -1769,9 +1738,6 @@ class HubBaseView(ui.View):
         self._add_nav_buttons()
 
     def _add_nav_buttons(self):
-        # Row 4 is reserved for Navigation
-        # Home | Library | Incoming | Share
-        
         btn_home = ui.Button(label="Home", style=discord.ButtonStyle.primary if self.current_tab == "home" else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab == "home"))
         btn_home.callback = self.nav_home
         
@@ -1784,10 +1750,14 @@ class HubBaseView(ui.View):
         btn_share = ui.Button(label="Manage My Shares", style=discord.ButtonStyle.primary if self.current_tab == "manage" else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab == "manage"))
         btn_share.callback = self.nav_manage
 
+        btn_clone = ui.Button(label="Profile Cloning", style=discord.ButtonStyle.primary if self.current_tab == "cloning" else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab == "cloning"))
+        btn_clone.callback = self.nav_cloning
+
         self.add_item(btn_home)
         self.add_item(btn_lib)
         self.add_item(btn_inc)
         self.add_item(btn_share)
+        self.add_item(btn_clone)
 
     async def nav_home(self, i: discord.Interaction):
         await i.response.defer()
@@ -1809,25 +1779,43 @@ class HubBaseView(ui.View):
         view = HubShareManagerView(self.cog, self.original_interaction)
         await view.update_display()
 
+    async def nav_cloning(self, i: discord.Interaction):
+        await i.response.defer()
+        view = HubCloningView(self.cog, self.original_interaction)
+        await view.update_display()
+
 class HubHomeView(HubBaseView):
     def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction):
         super().__init__(cog, interaction, "home")
 
     async def update_display(self):
-        # Logic to gather stats
         total_public = len(self.cog.public_profiles)
-        unique_creators = len(set(p['owner_id'] for p in self.cog.public_profiles.values()))
+        
+        unique_creators = set()
+        for p_info in self.cog.public_profiles.values():
+            if isinstance(p_info, str) and ":" in p_info:
+                try:
+                    owner_id_str, _ = p_info.split(":", 1)
+                    unique_creators.add(int(owner_id_str))
+                except: pass
+            elif isinstance(p_info, dict):
+                owner_id = p_info.get("owner_id")
+                if owner_id:
+                    unique_creators.add(int(owner_id))
+        unique_creators_count = len(unique_creators)
         
         index = self.cog._get_user_index(self.user_id)
-        user_owned = len(index.get("personal", []))
-        user_borrowed = len(index.get("borrowed", []))
+        
+        user_owned_dict = index.get("personal", {})
+        user_owned = len(user_owned_dict) if isinstance(user_owned_dict, dict) else len(user_owned_dict)
+        
+        user_borrowed_dict = index.get("borrowed", {})
+        user_borrowed = len(user_borrowed_dict) if isinstance(user_borrowed_dict, dict) else len(user_borrowed_dict)
         
         embed = discord.Embed(title="MimicAI Profile Hub", description=defaultConfig.MIMIC_NEWS, color=discord.Color.gold())
-        
-        # Use animated emote as the Hub icon
         embed.set_thumbnail(url="https://cdn.discordapp.com/emojis/1441750712160878643.gif")
         
-        embed.add_field(name="Global Stats", value=f"`{total_public} Public Profiles`\n`{unique_creators} Creators`", inline=True)
+        embed.add_field(name="Global Stats", value=f"`{total_public} Public Profiles`\n`{unique_creators_count} Creators`", inline=True)
         embed.add_field(name="Your Stats", value=f"`{user_owned} Personal Profiles`\n`{user_borrowed} Borrowed Profiles`", inline=True)
         
         embed.set_footer(text="Use the navigation buttons below to explore.")
@@ -1852,21 +1840,42 @@ class HubPublicLibraryView(HubBaseView):
 
     def _load_public_data(self):
         raw_list = []
-        # Iterate over the in-memory index
         for p_id, p_info in self.cog.public_profiles.items():
-            if p_info.get("status", "active") == "locked": continue
-            if not p_info.get("owner_id") or not p_info.get("original_profile_name"): continue
-            
-            # Use snapshot metadata if available, otherwise fallback (for old data)
-            raw_list.append({
-                "id": p_id,
-                "owner_id": p_info['owner_id'],
-                "original_pid": p_info.get("original_pid"),
-                "profile_name": p_info['original_profile_name'],
-                "published_at": p_info.get("published_at", ""),
-                "display_name": p_info.get("display_name", p_info['original_profile_name']),
-                "avatar_url": p_info.get("avatar_url")
-            })
+            if isinstance(p_info, str) and ":" in p_info:
+                try:
+                    owner_id_str, original_pid = p_info.split(":", 1)
+                    owner_id = int(owner_id_str)
+                    
+                    cfg_path = os.path.join(self.cog.USERS_DIR, owner_id_str, "profiles", original_pid, "config.json.gz")
+                    cfg_data = self.cog._load_json_gzip(cfg_path) or {}
+                    
+                    original_profile_name = "Unknown"
+                    name_path = os.path.join(self.cog.USERS_DIR, owner_id_str, "profiles", original_pid, "name.txt")
+                    if os.path.exists(name_path):
+                        with open(name_path, "r", encoding="utf-8") as nf:
+                            original_profile_name = nf.read().strip()
+
+                    raw_list.append({
+                        "id": p_id,
+                        "owner_id": owner_id,
+                        "original_pid": original_pid,
+                        "profile_name": original_profile_name,
+                        "published_at": cfg_data.get("created_at", ""),
+                        "display_name": cfg_data.get("custom_display_name", original_profile_name),
+                        "avatar_url": cfg_data.get("custom_avatar_url")
+                    })
+                except Exception as e:
+                    print(f"Error loading public entry {p_id}: {e}")
+            elif isinstance(p_info, dict):
+                raw_list.append({
+                    "id": p_id,
+                    "owner_id": p_info.get('owner_id'),
+                    "original_pid": p_info.get("original_pid"),
+                    "profile_name": p_info.get('original_profile_name', 'Unknown'),
+                    "published_at": p_info.get("published_at", ""),
+                    "display_name": p_info.get("display_name", p_info.get('original_profile_name', 'Unknown')),
+                    "avatar_url": p_info.get("avatar_url")
+                })
         
         raw_list.sort(key=lambda x: x['published_at'], reverse=True)
         self.all_public = raw_list
@@ -2157,13 +2166,15 @@ class HubIncomingView(HubBaseView):
         
         limit = defaultConfig.LIMIT_BORROWED_PREMIUM if self.cog.is_user_premium(self.user_id) else defaultConfig.LIMIT_BORROWED_FREE
         index = self.cog._get_user_index(self.user_id)
-        current_borrowed = len(index.get("borrowed", []))
+        
+        borrowed_field = index.get("borrowed", {})
+        current_borrowed = len(borrowed_field) if isinstance(borrowed_field, dict) else len(borrowed_field)
 
         if current_borrowed + len(shares) > limit:
             await i.followup.send(f"Limit Reached. Accepting these would exceed your limit of {limit} borrowed profiles.", ephemeral=True)
             return
 
-        accepted =[]
+        accepted = []
         sharer_user = self.cog.bot.get_user(sharer_id)
         sharer_name = sharer_user.name if sharer_user else "User"
 
@@ -2174,12 +2185,12 @@ class HubIncomingView(HubBaseView):
             if not current_name: current_name = fallback_name
 
             sharer_index = self.cog._get_user_index(sharer_id)
-            if current_name not in sharer_index.get("personal",[]):
+            if current_name not in sharer_index.get("personal", []):
                 await self.cog._reject_share_request(self.original_interaction, sharer_id, target_pid, fallback_name, notify_sharer=False)
                 continue
 
             local_name = self.cog._generate_unique_local_name(self.user_id, current_name, sharer_name)
-            await self.cog._accept_share_request(self.original_interaction, sharer_id, target_pid, current_name, local_name)
+            await self.cog._accept_share_request(self.original_interaction, sharer_id, target_pid, current_name, local_name, is_public_borrow=False)
             accepted.append(current_name)
         
         msg = f"Accepted: {', '.join(accepted)}" if accepted else "No valid profiles found."
@@ -2373,10 +2384,15 @@ class HubShareManagerView(HubBaseView):
         for recipient_id_str in self.selected_users:
             recipient_id = int(recipient_id_str)
             recipient = self.cog.bot.get_user(recipient_id)
+            if not recipient:
+                try:
+                    recipient = await self.cog.bot.fetch_user(recipient_id)
+                except Exception:
+                    pass
             if not recipient or recipient.bot or recipient.id == self.user_id: continue
 
-            self.cog.profile_shares.setdefault(str(recipient_id),[])
-            newly_shared =[]
+            self.cog.profile_shares.setdefault(str(recipient_id), [])
+            newly_shared = []
             for profile_name in self.selected_profiles:
                 pid = self.cog._get_pid_from_name_any(self.user_id, profile_name)
                 existing = next((s for s in self.cog.profile_shares[str(recipient_id)] if s['sharer_id'] == self.user_id and (s.get('original_pid') == pid or s.get('profile_name') == profile_name)), None)
@@ -2415,11 +2431,20 @@ class HubShareManagerView(HubBaseView):
         await i.response.edit_message(view=self)
 
         analysis_message = None
-        
         user_id_str = str(self.user_id)
+        
         current_public_set = set()
         for p_info in self.cog.public_profiles.values():
-            if str(p_info.get("owner_id")) == user_id_str:
+            if isinstance(p_info, str) and ":" in p_info:
+                try:
+                    owner_id_str, original_pid = p_info.split(":", 1)
+                    if owner_id_str == user_id_str:
+                        name_path = os.path.join(self.cog.USERS_DIR, owner_id_str, "profiles", original_pid, "name.txt")
+                        if os.path.exists(name_path):
+                            with open(name_path, "r", encoding="utf-8") as nf:
+                                current_public_set.add(nf.read().strip())
+                except: pass
+            elif isinstance(p_info, dict) and str(p_info.get("owner_id")) == user_id_str:
                 current_public_set.add(p_info['original_profile_name'])
         
         target_set = set(self.selected_profiles)
@@ -2437,7 +2462,7 @@ class HubShareManagerView(HubBaseView):
         failed_list = {}
 
         if to_publish:
-            analysis_message = await i.followup.send("🔍 Analyzing profiles for safety...", ephemeral=True)
+            analysis_message = await i.followup.send("🔍 Analysing profiles for safety...", ephemeral=True)
             for name in to_publish:
                 appearance_data = self.cog.user_appearances.get(user_id_str, {}).get(name, {})
                 disp = appearance_data.get("custom_display_name") or name
@@ -2448,20 +2473,14 @@ class HubShareManagerView(HubBaseView):
                     failed_list[name] = "Safety Level is 'Unrestricted 18+'. Only 'Low', 'Medium', or 'High' can be published."
                     continue
 
-                is_safe, reason = await self.cog._is_profile_content_safe(self.user_id, name, disp, ava)
+                try:
+                    is_safe, reason = await self.cog._is_profile_content_safe(self.user_id, name, disp, ava)
+                except Exception as safe_ex:
+                    is_safe, reason = False, f"Analysing failed with error: {safe_ex}"
+                
                 if is_safe:
                     pid_entry = f"pub_{uuid.uuid4().hex[:8]}"
-                    # Snapshot metadata for index
-                    data = {
-                        "owner_id": self.user_id, 
-                        "original_profile_name": name, 
-                        "original_pid": self.cog._get_pid_from_name_any(self.user_id, name),
-                        "published_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), 
-                        "status": "active",
-                        "display_name": disp,
-                        "avatar_url": ava
-                    }
-                    self.cog.public_profiles[pid_entry] = data
+                    self.cog.public_profiles[pid_entry] = f"{self.user_id}:{self.cog._get_pid_from_name_any(self.user_id, name)}"
                     published_list.append(name)
                 else:
                     failed_list[name] = reason
@@ -2471,8 +2490,16 @@ class HubShareManagerView(HubBaseView):
 
         unpublished_list = []
         for name in to_unpublish:
-            ids = [pid for pid, info in self.cog.public_profiles.items() if str(info.get("owner_id")) == user_id_str and info.get("original_profile_name") == name]
-            for pid in ids:
+            target_pid = self.cog._get_pid_from_name_any(self.user_id, name)
+            ids_to_del = []
+            for pid, info in self.cog.public_profiles.items():
+                if isinstance(info, str) and ":" in info:
+                    if info == f"{self.user_id}:{target_pid}":
+                        ids_to_del.append(pid)
+                elif isinstance(info, dict) and str(info.get("owner_id")) == user_id_str and info.get("original_profile_name") == name:
+                    ids_to_del.append(pid)
+                    
+            for pid in ids_to_del:
                 del self.cog.public_profiles[pid]
                 unpublished_list.append(name)
         
@@ -2497,6 +2524,153 @@ class HubShareManagerView(HubBaseView):
             await analysis_message.edit(content=None, embed=report_embed)
         else:
             await i.followup.send(embed=report_embed, ephemeral=True)
+
+class HubCloningView(HubBaseView):
+    def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction):
+        super().__init__(cog, interaction, "cloning")
+        self.selected_profile = None
+        self.current_page = 0
+        
+        index = self.cog._get_user_index(self.user_id)
+        self.personal_profiles = sorted(list(index.get("personal", [])))
+        self.setup_items()
+
+    def setup_items(self):
+        for item in self.children[:]:
+            if item.row != 4: self.remove_item(item)
+
+        num_pages = (len(self.personal_profiles) - 1) // DROPDOWN_MAX_OPTIONS + 1
+        if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
+        
+        start = self.current_page * DROPDOWN_MAX_OPTIONS
+        page_profiles = self.personal_profiles[start : start + DROPDOWN_MAX_OPTIONS]
+
+        options = []
+        for p in page_profiles:
+            options.append(discord.SelectOption(label=p, value=p, default=(p == self.selected_profile)))
+        
+        if options:
+            select = ui.Select(placeholder="Select a personal profile to clone...", options=options, row=0)
+            select.callback = self.select_profile_cb
+            self.add_item(select)
+
+        if num_pages > 1:
+            prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page == 0))
+            prev_btn.callback = self.prev_page
+            
+            page_lbl = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, row=1, disabled=True)
+            
+            next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page >= num_pages - 1))
+            next_btn.callback = self.next_page
+            
+            self.add_item(prev_btn)
+            self.add_item(page_lbl)
+            self.add_item(next_btn)
+
+        action_row = 2 if num_pages > 1 else 1
+        
+        btn_code = ui.Button(label="Generate Clone Code", style=discord.ButtonStyle.green, row=action_row, disabled=(not self.selected_profile))
+        btn_code.callback = self.generate_clone_code_cb
+        self.add_item(btn_code)
+
+        btn_redeem = ui.Button(label="Redeem Clone Code", style=discord.ButtonStyle.blurple, row=action_row)
+        btn_redeem.callback = self.redeem_clone_code_cb
+        self.add_item(btn_redeem)
+
+    async def update_display(self):
+        embed = discord.Embed(title="Profile Cloning", description="Clone profiles to create independent copies. Cloned profiles will not copy memories or child bot configurations.", color=discord.Color.dark_purple())
+        embed.add_field(name="Selected Profile", value=f"`{self.selected_profile or 'None'}`", inline=False)
+        await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
+
+    async def select_profile_cb(self, i: discord.Interaction):
+        self.selected_profile = i.data['values'][0]
+        self.setup_items()
+        await i.response.defer()
+        await self.update_display()
+
+    async def prev_page(self, i: discord.Interaction):
+        self.current_page -= 1
+        self.setup_items()
+        await i.response.defer()
+        await self.update_display()
+
+    async def next_page(self, i: discord.Interaction):
+        self.current_page += 1
+        self.setup_items()
+        await i.response.defer()
+        await self.update_display()
+
+    async def generate_clone_code_cb(self, i: discord.Interaction):
+        if not self.selected_profile: return
+        code = f"CLN-{uuid.uuid4().hex[:8].upper()}"
+        
+        pid = self.cog._get_pid_from_name_any(self.user_id, self.selected_profile)
+        
+        if not hasattr(self.cog, "clone_codes"):
+            self.cog.clone_codes = {}
+        
+        self.cog.clone_codes[code] = {
+            "owner_id": self.user_id,
+            "pid": pid,
+            "profile_name": self.selected_profile,
+            "expires_at": time.time() + 300
+        }
+        
+        await i.response.send_message(f"Clone Code Generated: `{code}`\nProvide this to another user. Valid for 5 minutes.", ephemeral=True)
+
+    async def redeem_clone_code_cb(self, i: discord.Interaction):
+        modal = RedeemCloneCodeModal(self.cog, self)
+        await i.response.send_modal(modal)
+
+class RedeemCloneCodeModal(ui.Modal, title="Redeem Clone Code"):
+    code_input = ui.TextInput(label="Enter Clone Code", required=True, min_length=12, max_length=16)
+    name_input = ui.TextInput(label="Local Profile Name", required=True, min_length=1, max_length=30)
+
+    def __init__(self, cog: 'GeminiAgent', parent_view: HubCloningView):
+        super().__init__()
+        self.cog = cog
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        code = self.code_input.value.strip()
+        desired_name = self.name_input.value.lower().strip()
+
+        is_valid, err_msg = self.cog._is_valid_profile_name(desired_name)
+        if not is_valid:
+            await interaction.followup.send(f"❌ **Invalid Name:** {err_msg}", ephemeral=True)
+            return
+
+        clone_codes = getattr(self.cog, "clone_codes", {})
+        share_data = clone_codes.get(code)
+        if not share_data or time.time() > share_data["expires_at"]:
+            await interaction.followup.send("This clone code is invalid or has expired.", ephemeral=True)
+            return
+
+        owner_id = share_data["owner_id"]
+        pid = share_data["pid"]
+        
+        if owner_id == interaction.user.id:
+            await interaction.followup.send("You cannot clone your own profile.", ephemeral=True)
+            return
+
+        index = self.cog._get_user_index(interaction.user.id)
+        if desired_name in index.get("personal", []) or desired_name in index.get("borrowed", []):
+            await interaction.followup.send("A profile with that name already exists.", ephemeral=True)
+            return
+
+        limit = defaultConfig.LIMIT_PROFILES_PREMIUM if self.cog.is_user_premium(interaction.user.id) else defaultConfig.LIMIT_PROFILES_FREE
+        if len(index.get("personal", [])) >= limit:
+            await interaction.followup.send(f"You have reached your personal profile limit of {limit}.", ephemeral=True)
+            return
+
+        success, msg = await self.cog._execute_clone_handshake(owner_id, pid, interaction.user.id, desired_name)
+        if success:
+            clone_codes.pop(code, None)
+            self.parent_view.setup_items()
+            await self.parent_view.update_display()
+        
+        await interaction.followup.send(msg, ephemeral=True)
 
 class ShutdownConfirmView(ui.View):
     def __init__(self, cog: 'GeminiAgent'):
@@ -3614,7 +3788,8 @@ class ModelApplyView(ui.View):
         self.current_page = 0
         self.view_mode = 'google' 
         self.category = 'response'
-        self.show_fallback_indicator: Optional[bool] = None 
+        self.show_fallback_indicator = None 
+        self.view_source = 'personal'
         
         self.models_state = {
             'primary_model': None,
@@ -3626,13 +3801,16 @@ class ModelApplyView(ui.View):
             'ltm_model': None
         }
 
-        # [UPDATED] Load ALL profiles (Personal + Borrowed)
-        index = self.cog._get_user_index(self.user_id)
-        personal = list(index.get("personal", []))
-        borrowed = list(index.get("borrowed", []))
-        self.all_profiles = sorted(personal + borrowed)
-        
+        self._load_lists()
         self._build_view()
+
+    def _load_lists(self):
+        index = self.cog._get_user_index(self.user_id)
+        self.personal_profiles = sorted(list(index.get("personal", {}).keys())) if isinstance(index.get("personal"), dict) else sorted(list(index.get("personal", [])))
+        self.borrowed_profiles = sorted(list(index.get("borrowed", {}).keys())) if isinstance(index.get("borrowed"), dict) else sorted(list(index.get("borrowed", [])))
+
+    def _get_active_list(self):
+        return self.personal_profiles if self.view_source == 'personal' else self.borrowed_profiles
 
     def _save_changes(self, key: str, value: Any):
         if key == "show_fallback_indicator":
@@ -3739,11 +3917,9 @@ class ModelApplyView(ui.View):
     def _build_view(self):
         self.clear_items()
         
-        # Enforce Google Mode for Media
         if self.category == 'media':
             self.view_mode = 'google'
             
-        # --- Row 0 & 1: Dropdowns ---
         if self.category == 'response':
             p_val = self.models_state["primary_model"]
             f_val = self.models_state["fallback_model"]
@@ -3766,24 +3942,37 @@ class ModelApplyView(ui.View):
             l_val = self.models_state["ltm_model"]
             self.add_item(self.GenericBulkModelSelect("Select LTM Summariser Model...", self._create_model_options(l_val, "ltm_model"), 0, "ltm_model"))
 
-        # Row 2: Provider Toggles + Category Cycle + Fallback Indicator
-        style_g = discord.ButtonStyle.primary if self.view_mode == 'google' else discord.ButtonStyle.secondary
-        style_o = discord.ButtonStyle.primary if self.view_mode == 'openrouter' else discord.ButtonStyle.secondary
+        active_list = self._get_active_list()
+        num_pages = (len(active_list) - 1) // DROPDOWN_MAX_OPTIONS + 1
+        if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
         
-        btn_google = ui.Button(label="Google", style=style_g, row=2, custom_id="mode_google")
-        btn_open = ui.Button(label="OpenRouter", style=style_o, row=2, custom_id="mode_openrouter", disabled=(self.category == 'media'))
+        start = self.current_page * DROPDOWN_MAX_OPTIONS
+        page_profiles = active_list[start : start + DROPDOWN_MAX_OPTIONS]
+
+        # Row 2 Settings & Actions
+        page_set = set(page_profiles)
+        page_selected = page_set.issubset(self.target_profiles) if page_profiles else False
+        page_label = "Unselect Page" if page_selected else "Select Page"
+        toggle_page_btn = ui.Button(label=page_label, style=discord.ButtonStyle.secondary, row=2)
+        toggle_page_btn.callback = self.toggle_page_callback
+        self.add_item(toggle_page_btn)
         
-        async def mode_cb(i: discord.Interaction):
-            self.view_mode = 'google' if i.data['custom_id'] == 'mode_google' else 'openrouter'
+        all_set = set(active_list)
+        all_selected = all_set.issubset(self.target_profiles) if active_list else False
+        all_label = "Unselect All" if all_selected else "Select All"
+        toggle_all_btn = ui.Button(label=all_label, style=discord.ButtonStyle.secondary, row=2)
+        toggle_all_btn.callback = self.toggle_all_callback
+        self.add_item(toggle_all_btn)
+
+        api_label = "API: Google" if self.view_mode == 'google' else "API: OpenRouter"
+        btn_api = ui.Button(label=api_label, style=discord.ButtonStyle.primary, row=2, disabled=(self.category == 'media'))
+        async def api_cb(i: discord.Interaction):
+            self.view_mode = 'openrouter' if self.view_mode == 'google' else 'google'
             self._build_view()
             await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-            
-        btn_google.callback = mode_cb
-        btn_open.callback = mode_cb
-        self.add_item(btn_google)
-        self.add_item(btn_open)
+        btn_api.callback = api_cb
+        self.add_item(btn_api)
 
-        # Cycle Category Button
         categories = ['response', 'media', 'tools', 'ltm']
         cat_labels = {'response': 'Response', 'media': 'Media', 'tools': 'Tools', 'ltm': 'LTM'}
         btn_cat = ui.Button(label=f"Category: {cat_labels[self.category]}", style=discord.ButtonStyle.blurple, row=2)
@@ -3810,56 +3999,77 @@ class ModelApplyView(ui.View):
                 await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
             btn_fallback.callback = fallback_cb
             self.add_item(btn_fallback)
-
-        # Row 3: Profile Select (Paginated)
-        num_pages = (len(self.all_profiles) - 1) // DROPDOWN_MAX_OPTIONS + 1
-        if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
-        
-        start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_profiles = self.all_profiles[start : start + DROPDOWN_MAX_OPTIONS]
         
         options = []
         for name in page_profiles:
             options.append(discord.SelectOption(label=name, value=name, default=(name in self.target_profiles)))
         
         if options:
-            profile_select = ui.Select(placeholder="Select profiles...", min_values=0, max_values=len(options), options=options, row=3)
+            profile_select = ui.Select(placeholder=f"Select {self.view_source} profiles...", min_values=0, max_values=len(options), options=options, row=3)
             profile_select.callback = self.profile_callback
             self.add_item(profile_select)
 
-        # Row 4: Navigation & Apply
-        if num_pages > 1:
-            prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page==0), row=4)
-            async def prev_cb(i): self.current_page -= 1; self._build_view(); await i.response.edit_message(view=self)
-            prev_btn.callback = prev_cb; self.add_item(prev_btn)
+        # Row 4 Pagination & Navigation
+        style_src = discord.ButtonStyle.blurple if self.view_source == 'personal' else discord.ButtonStyle.green
+        source_btn = ui.Button(label=f"Source: {self.view_source.title()}", style=style_src, row=4)
+        source_btn.callback = self.toggle_source_callback
+        self.add_item(source_btn)
 
-            page_btn = ui.Button(label=f"{self.current_page+1}/{num_pages}", style=discord.ButtonStyle.grey, disabled=True, row=4)
-            self.add_item(page_btn)
+        prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page==0), row=4)
+        prev_btn.callback = self.prev_page_callback
+        self.add_item(prev_btn)
 
-            next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page>=num_pages-1), row=4)
-            async def next_cb(i): self.current_page += 1; self._build_view(); await i.response.edit_message(view=self)
-            next_btn.callback = next_cb; self.add_item(next_btn)
+        page_btn = ui.Button(label=f"{self.current_page+1}/{num_pages}", style=discord.ButtonStyle.grey, disabled=True, row=4)
+        self.add_item(page_btn)
 
-            toggle_btn = ui.Button(label="Select Page", style=discord.ButtonStyle.secondary, row=4)
-            toggle_btn.callback = self.toggle_page_callback; self.add_item(toggle_btn)
+        next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page>=num_pages-1), row=4)
+        next_btn.callback = self.next_page_callback
+        self.add_item(next_btn)
 
         apply_btn = ui.Button(label="Apply", style=discord.ButtonStyle.success, row=4)
-        apply_btn.callback = self.apply_settings; self.add_item(apply_btn)
+        apply_btn.callback = self.apply_settings
+        self.add_item(apply_btn)
+
+    async def toggle_source_callback(self, interaction: discord.Interaction):
+        self.view_source = 'borrowed' if self.view_source == 'personal' else 'personal'
+        self.current_page = 0
+        self._build_view()
+        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+
+    async def prev_page_callback(self, interaction: discord.Interaction):
+        self.current_page -= 1
+        self._build_view()
+        await interaction.response.edit_message(view=self)
+
+    async def next_page_callback(self, interaction: discord.Interaction):
+        self.current_page += 1
+        self._build_view()
+        await interaction.response.edit_message(view=self)
 
     async def profile_callback(self, interaction: discord.Interaction):
+        active_list = self._get_active_list()
         start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_profiles = self.all_profiles[start : start + DROPDOWN_MAX_OPTIONS]
+        page_profiles = active_list[start : start + DROPDOWN_MAX_OPTIONS]
         self.target_profiles.difference_update(set(page_profiles))
         self.target_profiles.update(interaction.data['values'])
         self._build_view()
         await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
 
     async def toggle_page_callback(self, interaction: discord.Interaction):
+        active_list = self._get_active_list()
         start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_profiles = self.all_profiles[start : start + DROPDOWN_MAX_OPTIONS]
+        page_profiles = active_list[start : start + DROPDOWN_MAX_OPTIONS]
         page_set = set(page_profiles)
         if page_set.issubset(self.target_profiles): self.target_profiles.difference_update(page_set)
         else: self.target_profiles.update(page_set)
+        self._build_view()
+        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+
+    async def toggle_all_callback(self, interaction: discord.Interaction):
+        active_list = self._get_active_list()
+        all_set = set(active_list)
+        if all_set.issubset(self.target_profiles): self.target_profiles.difference_update(all_set)
+        else: self.target_profiles.update(all_set)
         self._build_view()
         await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
 
@@ -6377,7 +6587,7 @@ class SessionView(ui.View):
 class BulkExportView(BaseBulkProfileView):
     def __init__(self, cog: 'GeminiAgent', user_id: int):
         super().__init__(cog, user_id, include_borrowed=False)
-        self.export_filters = {"persona", "instructions", "ltm", "training", "appearance"}
+        self.export_filters = set()
         self._build_view()
 
     def _build_view(self):
@@ -6385,20 +6595,12 @@ class BulkExportView(BaseBulkProfileView):
         self._build_profile_select_ui(row=0)
         
         filter_options = [
-            discord.SelectOption(label="Persona", value="persona", description="Backstory, traits, likes/dislikes.", default="persona" in self.export_filters),
-            discord.SelectOption(label="AI Instructions", value="instructions", description="Core behavioral guidelines.", default="instructions" in self.export_filters),
-            discord.SelectOption(label="Core Settings", value="core", description="Models, STM, Gen Params, Advanced Params.", default="core" in self.export_filters),
-            discord.SelectOption(label="Thinking & Reasoning", value="thinking", description="Effort levels, budget, and signatures.", default="thinking" in self.export_filters),
-            discord.SelectOption(label="Tools & Modes", value="tools", description="Toggles, Image Gen, Timezone, Grounding.", default="tools" in self.export_filters),
-            discord.SelectOption(label="Voice & Speech", value="voice", description="TTS models, voice identities, and Director's Desk.", default="voice" in self.export_filters),
-            discord.SelectOption(label="Memory Tuning", value="memory_params", description="Context sizes and relevance thresholds.", default="memory_params" in self.export_filters),
-            discord.SelectOption(label="Long-Term Memories", value="ltm", description="AI-generated conversation summaries.", default="ltm" in self.export_filters),
-            discord.SelectOption(label="Training Examples", value="training", description="User-written input/output pairs.", default="training" in self.export_filters),
-            discord.SelectOption(label="Appearance", value="appearance", description="Custom name and avatar URL.", default="appearance" in self.export_filters)
+            discord.SelectOption(label="Long-Term Memories", value="ltm", description="Optional. Include compiled conversation memories.", default="ltm" in self.export_filters),
+            discord.SelectOption(label="Training Examples", value="training", description="Optional. Include training input/output style examples.", default="training" in self.export_filters)
         ]
         
         filter_select = ui.Select(
-            placeholder="Select components to include...",
+            placeholder="Optional. Select additional memories to export...",
             min_values=1,
             max_values=len(filter_options),
             options=filter_options,
