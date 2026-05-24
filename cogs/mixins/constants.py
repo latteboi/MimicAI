@@ -232,9 +232,9 @@ WARN_GROUNDING_FAILED = "**Grounding Failed** ({reason})"
 WARN_IMAGE_GEN_FAILED = "**Image Generation Failed** ({reason})"
 
 ERR_GENERAL_ERROR = "An error has occurred."
-ERR_SAFETY_BLOCK = "Safety Filter ({reason})"
-ERR_RATE_LIMIT = "API Rate Limit"
-ERR_UNKNOWN = "Unknown Error"
+ERR_SAFETY_BLOCK = "**Safety Filter** ({reason})"
+ERR_RATE_LIMIT = "**API Rate Limit**"
+ERR_UNKNOWN = "**Unknown Error**"
 
 ERR_REASON_UNSUPPORTED_IMAGE = "Images Unsupported"
 ERR_REASON_UNSUPPORTED_AUDIO = "Audio Unsupported"

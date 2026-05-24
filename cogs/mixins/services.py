@@ -978,7 +978,7 @@ class ServicesMixin:
                 # Step 2: Tier Detection (Does it have access to premium-only models?)
                 try:
                     await test_client.aio.models.generate_content(
-                        model='gemini-2.5-flash-image', 
+                        model='gemini-3.1-flash-image-preview', 
                         contents="ping",
                         config=types.GenerateContentConfig(max_output_tokens=1)
                     )
@@ -2461,7 +2461,7 @@ class ServicesMixin:
                             if is_safety:
                                 turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=reason))
                             elif "Rate Limit" in reason:
-                                turn_warnings.append(ERR_RATE_LIMIT)
+                                turn_warnings.append(reason)
                             else:
                                 if fallback_model_name and primary_model != fallback_model_name:
                                     turn_warnings.append(WARN_BOTH_MODELS_FAILED.format(reason=reason))
@@ -6822,7 +6822,12 @@ class ServicesMixin:
         error_str_clean = re.sub(r'https?://[^\s]+', '', error_str)
         
         # 2. Standard HTTP Status Codes
-        if "429" in error_str_clean: return "Rate Limited"
+        if "429" in error_str_clean or "resource_exhausted" in error_str_clean.lower():
+            if "openrouter" in error_str.lower() or "sk-or" in error_str.lower():
+                return "**OpenRouter Rate Limit:** Add credits to your OpenRouter account for increased RPM & RPD."
+            else:
+                return "**Gemini Rate Limit:** Set up billing in Google AI Studio for increased RPM & RPD (Paid Tier 1+)."
+
         if "402" in error_str_clean: return "Insufficient Credits"
         if "401" in error_str_clean: return "Invalid API Key"
         if "404" in error_str_clean: 

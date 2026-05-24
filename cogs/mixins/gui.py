@@ -3722,24 +3722,27 @@ class SingleProfileModelView(ui.View):
             l_val = data.get("ltm_model", FALLBACK_MODEL_NAME)
             self.add_item(self.GenericModelSelect("Select LTM Summariser Model...", self._create_model_options(l_val, "ltm_model"), 0, "ltm_model"))
 
-        # --- Row 2: Provider & Specific Toggles ---
-        style_g = discord.ButtonStyle.primary if self.view_mode == 'google' else discord.ButtonStyle.secondary
-        style_o = discord.ButtonStyle.primary if self.view_mode == 'openrouter' else discord.ButtonStyle.secondary
-        
-        btn_google = ui.Button(label="Google Models", style=style_g, row=2, custom_id="mode_google")
-        btn_open = ui.Button(label="OpenRouter Models", style=style_o, row=2, custom_id="mode_openrouter", disabled=(self.category == 'media'))
-        
-        async def mode_cb(i: discord.Interaction):
-            self.view_mode = 'google' if i.data['custom_id'] == 'mode_google' else 'openrouter'
+        # --- Row 2 Actions ---
+        api_label = "API: Google" if self.view_mode == 'google' else "API: OpenRouter"
+        btn_api = ui.Button(label=api_label, style=discord.ButtonStyle.primary, row=2, disabled=(self.category == 'media'))
+        async def api_cb(i: discord.Interaction):
+            self.view_mode = 'openrouter' if self.view_mode == 'google' else 'google'
             self._build_view()
             await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-            
-        btn_google.callback = mode_cb
-        btn_open.callback = mode_cb
-        self.add_item(btn_google)
-        self.add_item(btn_open)
-        
-        # Specific Category Toggles
+        btn_api.callback = api_cb
+        self.add_item(btn_api)
+
+        categories = ['response', 'media', 'tools', 'ltm']
+        cat_labels = {'response': 'Response', 'media': 'Media', 'tools': 'Tools', 'ltm': 'LTM'}
+        btn_cat = ui.Button(label=f"Category: {cat_labels[self.category]}", style=discord.ButtonStyle.blurple, row=2)
+        async def cat_cb(i: discord.Interaction):
+            next_idx = (categories.index(self.category) + 1) % len(categories)
+            self.category = categories[next_idx]
+            self._build_view()
+            await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+        btn_cat.callback = cat_cb
+        self.add_item(btn_cat)
+
         if self.category == 'response':
             show_fb = data.get("show_fallback_indicator", True)
             fb_label = "Fallback Indicator: ON" if show_fb else "Fallback Indicator: OFF"
@@ -5403,7 +5406,10 @@ class SubmitAPIKeyModal(ui.Modal, title="Edit API Key"):
             
             key_field = "key" if provider == "gemini" else "openrouter_key"
             existing_data[key_field] = encrypted_key
-            existing_data["tier"] = tier
+            if provider == "gemini":
+                existing_data["tier"] = tier
+            elif "tier" not in existing_data:
+                existing_data["tier"] = "free"
             self.cog._atomic_json_save_gzip(existing_data, path)
             self.cog.personal_api_keys[user_id_str] = existing_data.get("key") 
             
@@ -5417,7 +5423,10 @@ class SubmitAPIKeyModal(ui.Modal, title="Edit API Key"):
             key_field = "key" if provider == "gemini" else "openrouter_key"
             key_data[key_field] = encrypted_key
             key_data["submitter_id"] = interaction.user.id
-            key_data["tier"] = tier
+            if provider == "gemini":
+                key_data["tier"] = tier
+            elif "tier" not in key_data:
+                key_data["tier"] = "free"
             
             self.cog.server_api_keys[guild_id_str] = key_data
             submissions = self.cog.key_submissions.get(guild_id_str, [])
@@ -6825,10 +6834,11 @@ class ModStatsView(ModBaseView):
                 if user_id_str.isdigit():
                     user_id = int(user_id_str)
                     index = self.cog._get_user_index(user_id)
-                    profile_count = len(index.get("personal", []))
-                    user_obj = self.cog.bot.get_user(user_id)
-                    user_name = user_obj.name if user_obj else "Unknown User"
-                    user_stats.append({"id": user_id, "name": user_name, "count": profile_count})
+                    profile_count = len(index.get("personal", {}))
+                    if profile_count > 0:
+                        user_obj = self.cog.bot.get_user(user_id)
+                        user_name = user_obj.name if user_obj else "Unknown User"
+                        user_stats.append({"id": user_id, "name": user_name, "count": profile_count})
         
         user_stats.sort(key=lambda x: x["count"], reverse=True)
         

@@ -1065,7 +1065,7 @@ class CoreMixin:
                 if is_safety:
                     turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=reason))
                 elif "Rate Limit" in reason:
-                    turn_warnings.append(ERR_RATE_LIMIT)
+                    turn_warnings.append(reason)
                 else:
                     if fallback_model_name and primary_model != fallback_model_name:
                         turn_warnings.append(WARN_BOTH_MODELS_FAILED.format(reason=reason))
