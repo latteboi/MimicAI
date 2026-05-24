@@ -1757,7 +1757,14 @@ class CoreMixin:
             self.child_bots.pop(bot_id, None)
             
         # 2. Scrub from Public Hub
-        pids_to_unpublish =[pid for pid, info in self.public_profiles.items() if str(info.get("owner_id")) == user_id_str]
+        pids_to_unpublish = []
+        for pub_id, info in self.public_profiles.items():
+            if isinstance(info, str) and ":" in info:
+                if info.startswith(user_id_str + ":"):
+                    pids_to_unpublish.append(pub_id)
+            elif isinstance(info, dict) and str(info.get("owner_id")) == user_id_str:
+                pids_to_unpublish.append(pub_id)
+
         for pid in pids_to_unpublish:
             self.public_profiles.pop(pid, None)
         if pids_to_unpublish:

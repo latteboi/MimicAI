@@ -1826,6 +1826,32 @@ class HubHomeView(HubBaseView):
         modal = RedeemCodeModal(self.cog)
         await i.response.send_modal(modal)
 
+class HubPublicLibraryPageJumpModal(ui.Modal, title="Jump to Profile"):
+    def __init__(self, parent_view: 'HubPublicLibraryView'):
+        super().__init__()
+        self.parent_view = parent_view
+        self.max_pages = len(parent_view.filtered_list)
+        self.page_input = ui.TextInput(
+            label="Profile Number",
+            placeholder=f"Enter a number between 1 and {self.max_pages}",
+            required=True,
+            min_length=1,
+            max_length=5
+        )
+        self.add_item(self.page_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            page_num = int(self.page_input.value.strip())
+            if page_num < 1 or page_num > self.max_pages:
+                raise ValueError("Out of range")
+            self.parent_view.current_page = page_num - 1
+            self.parent_view.setup_items()
+            await interaction.response.defer()
+            await self.parent_view.update_display()
+        except ValueError:
+            await interaction.response.send_message(f"❌ Please enter a valid number between 1 and {self.max_pages}.", ephemeral=True)
+
 class HubPublicLibraryView(HubBaseView):
     def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, filtered_list=None):
         super().__init__(cog, interaction, "library")
@@ -1834,7 +1860,6 @@ class HubPublicLibraryView(HubBaseView):
         self.filtered_list = filtered_list if filtered_list is not None else self.all_public
         
         self.current_page = 0 
-        self.selected_index_on_page = 0
         
         self.setup_items()
 
@@ -1885,27 +1910,33 @@ class HubPublicLibraryView(HubBaseView):
             if item.row != 4: self.remove_item(item)
 
         if not self.filtered_list:
-            # If list is empty, still show Search button so user can reset/change filters
             search_btn = ui.Button(label="Search / Sort", style=discord.ButtonStyle.secondary, row=1)
             search_btn.callback = self.search_cb
             self.add_item(search_btn)
             return
 
-        num_pages = (len(self.filtered_list) - 1) // DROPDOWN_MAX_OPTIONS + 1
-        if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
+        num_profiles = len(self.filtered_list)
+        if self.current_page >= num_profiles: self.current_page = max(0, num_profiles - 1)
+        if self.current_page < 0: self.current_page = 0
         
-        start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_items = self.filtered_list[start : start + DROPDOWN_MAX_OPTIONS]
-        
-        # Row 0: Dropdown
+        window_size = 25
+        half_window = window_size // 2
+        start_slice = max(0, self.current_page - half_window)
+        end_slice = start_slice + window_size
+        if end_slice > num_profiles:
+            end_slice = num_profiles
+            start_slice = max(0, end_slice - window_size)
+
+        page_items = self.filtered_list[start_slice:end_slice]
+
         options = []
         for i, p in enumerate(page_items):
+            abs_index = start_slice + i
             owner = self.cog.bot.get_user(p['owner_id'])
             owner_name = owner.name if owner else "Unknown"
             label = f"{p['profile_name']} (by {owner_name})"[:100]
             
-            # Value is index on the page (0-24)
-            option = discord.SelectOption(label=label, value=str(i), default=(i == self.selected_index_on_page))
+            option = discord.SelectOption(label=label, value=str(abs_index), default=(abs_index == self.current_page))
             options.append(option)
 
         if options:
@@ -1913,39 +1944,35 @@ class HubPublicLibraryView(HubBaseView):
             select.callback = self.select_callback
             self.add_item(select)
 
-        # Row 1: Pagination + Actions
         prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page == 0))
         prev_btn.callback = self.prev_page_cb
         
-        page_lbl = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, row=1, disabled=True)
+        page_lbl = ui.Button(label=f"{self.current_page + 1}/{num_profiles}", style=discord.ButtonStyle.grey, row=1, disabled=False)
+        page_lbl.callback = self.page_jump_cb
         
-        next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page >= num_pages - 1))
+        next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page >= num_profiles - 1))
         next_btn.callback = self.next_page_cb
         
-        # Determine Borrow Button State
-        abs_index = (self.current_page * DROPDOWN_MAX_OPTIONS) + self.selected_index_on_page
+        p_info = self.filtered_list[self.current_page]
         
         borrow_label = "Borrow"
         borrow_style = discord.ButtonStyle.green
         borrow_disabled = False
 
-        if abs_index < len(self.filtered_list):
-            p_info = self.filtered_list[abs_index]
-            
-            if self.user_id == p_info['owner_id']:
-                borrow_label = "Own Profile"
-                borrow_style = discord.ButtonStyle.grey
-                borrow_disabled = True
-            else:
-                index = self.cog._get_user_index(self.user_id)
-                for b_name in index.get("borrowed", []):
-                    b_data = self.cog._get_profile_config(self.user_id, b_name, True)
-                    if b_data and int(b_data.get("original_owner_id", 0)) == p_info['owner_id'] and \
-                       b_data.get("original_profile_name") == p_info['profile_name']:
-                        borrow_label = "Borrowed"
-                        borrow_style = discord.ButtonStyle.grey
-                        borrow_disabled = True
-                        break
+        if self.user_id == p_info['owner_id']:
+            borrow_label = "Own Profile"
+            borrow_style = discord.ButtonStyle.grey
+            borrow_disabled = True
+        else:
+            index = self.cog._get_user_index(self.user_id)
+            for b_name in index.get("borrowed", []):
+                b_data = self.cog._get_profile_config(self.user_id, b_name, True)
+                if b_data and int(b_data.get("original_owner_id", 0)) == p_info['owner_id'] and \
+                   b_data.get("original_profile_name") == p_info['profile_name']:
+                    borrow_label = "Borrowed"
+                    borrow_style = discord.ButtonStyle.grey
+                    borrow_disabled = True
+                    break
 
         borrow_btn = ui.Button(label=borrow_label, style=borrow_style, row=1, disabled=borrow_disabled)
         borrow_btn.callback = self.borrow_cb
@@ -1965,52 +1992,49 @@ class HubPublicLibraryView(HubBaseView):
             await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
             return
 
-        abs_index = (self.current_page * DROPDOWN_MAX_OPTIONS) + self.selected_index_on_page
-        if abs_index >= len(self.filtered_list):
-            abs_index = 0
-            self.selected_index_on_page = 0
+        if self.current_page >= len(self.filtered_list):
+            self.current_page = 0
         
-        p_info = self.filtered_list[abs_index]
+        p_info = self.filtered_list[self.current_page]
         owner_id = p_info['owner_id']
         
         owner = self.cog.bot.get_user(owner_id) or await self.cog.bot.fetch_user(owner_id)
         owner_name = owner.name if owner else "Unknown"
         
-        # Use snapshot metadata directly
         disp_name = p_info.get("display_name")
         avatar_url = p_info.get("avatar_url")
 
         embed = discord.Embed(title=disp_name, description=f"Created by **{owner_name}**", color=discord.Color.random())
         if avatar_url: embed.set_image(url=avatar_url)
-        embed.set_footer(text=f"ID: {p_info['id']} | {abs_index + 1} of {len(self.filtered_list)}")
+        embed.set_footer(text=f"ID: {p_info['id']} | {self.current_page + 1} of {len(self.filtered_list)}")
         
         await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
 
     async def select_callback(self, i: discord.Interaction):
-        self.selected_index_on_page = int(i.data['values'][0])
+        self.current_page = int(i.data['values'][0])
         self.setup_items()
         await i.response.defer()
         await self.update_display()
 
     async def prev_page_cb(self, i: discord.Interaction):
         self.current_page -= 1
-        self.selected_index_on_page = 0
         self.setup_items()
         await i.response.defer()
         await self.update_display()
 
     async def next_page_cb(self, i: discord.Interaction):
         self.current_page += 1
-        self.selected_index_on_page = 0
         self.setup_items()
         await i.response.defer()
         await self.update_display()
 
+    async def page_jump_cb(self, i: discord.Interaction):
+        await i.response.send_modal(HubPublicLibraryPageJumpModal(self))
+
     async def borrow_cb(self, i: discord.Interaction):
-        abs_index = (self.current_page * DROPDOWN_MAX_OPTIONS) + self.selected_index_on_page
-        if abs_index >= len(self.filtered_list): return
+        if self.current_page >= len(self.filtered_list): return
         
-        p_info = self.filtered_list[abs_index]
+        p_info = self.filtered_list[self.current_page]
         if i.user.id == p_info['owner_id']:
             await i.response.send_message("You cannot borrow your own profile.", ephemeral=True)
             return
@@ -2035,7 +2059,6 @@ class HubPublicLibraryView(HubBaseView):
             if term:
                 self.filtered_list = [p for p in self.all_public if term in p['profile_name'].lower()]
                 self.current_page = 0
-                self.selected_index_on_page = 0
             else:
                 self.filtered_list = self.all_public
             self.setup_items()
@@ -2306,10 +2329,17 @@ class HubShareManagerView(HubBaseView):
             public_names = []
             user_id_str = str(self.user_id)
             for p_info in self.cog.public_profiles.values():
-                if str(p_info.get("owner_id")) == user_id_str:
+                if isinstance(p_info, str) and ":" in p_info:
+                    try:
+                        owner_id_str, original_pid = p_info.split(":", 1)
+                        if owner_id_str == user_id_str:
+                            p_name = self.cog._get_name_from_pid(self.user_id, original_pid)
+                            if p_name: public_names.append(p_name)
+                    except: pass
+                elif isinstance(p_info, dict) and str(p_info.get("owner_id")) == user_id_str:
                     status = p_info.get("status", "active")
                     suffix = " (Locked)" if status == "locked" else ""
-                    public_names.append(f"{p_info['original_profile_name']}{suffix}")
+                    public_names.append(f"{p_info.get('original_profile_name', 'Unknown')}{suffix}")
             
             val = ", ".join(public_names) if public_names else "None"
             if len(val) > 1024: val = val[:1021] + "..."
@@ -2324,8 +2354,15 @@ class HubShareManagerView(HubBaseView):
             user_id_str = str(self.user_id)
             published = []
             for p_info in self.cog.public_profiles.values():
-                if str(p_info.get("owner_id")) == user_id_str:
-                    published.append(p_info['original_profile_name'])
+                if isinstance(p_info, str) and ":" in p_info:
+                    try:
+                        owner_id_str, original_pid = p_info.split(":", 1)
+                        if owner_id_str == user_id_str:
+                            p_name = self.cog._get_name_from_pid(self.user_id, original_pid)
+                            if p_name: published.append(p_name)
+                    except: pass
+                elif isinstance(p_info, dict) and str(p_info.get("owner_id")) == user_id_str:
+                    published.append(p_info.get('original_profile_name', 'Unknown'))
             self.selected_profiles = published
         else:
             self.mode = "private"
@@ -2463,24 +2500,30 @@ class HubShareManagerView(HubBaseView):
 
         if to_publish:
             analysis_message = await i.followup.send("🔍 Analysing profiles for safety...", ephemeral=True)
-            for name in to_publish:
+            
+            async def evaluate_profile(name: str):
                 appearance_data = self.cog.user_appearances.get(user_id_str, {}).get(name, {})
                 disp = appearance_data.get("custom_display_name") or name
                 ava = appearance_data.get("custom_avatar_url")
                 
                 p_data = self.cog._get_profile_config(self.user_id, name, False) or {}
                 if p_data.get("safety_level") == "unrestricted":
-                    failed_list[name] = "Safety Level is 'Unrestricted 18+'. Only 'Low', 'Medium', or 'High' can be published."
-                    continue
+                    return name, False, "Safety Level is 'Unrestricted 18+'. Only 'Low', 'Medium', or 'High' can be published."
 
                 try:
                     is_safe, reason = await self.cog._is_profile_content_safe(self.user_id, name, disp, ava)
+                    return name, is_safe, reason
                 except Exception as safe_ex:
-                    is_safe, reason = False, f"Analysing failed with error: {safe_ex}"
-                
+                    return name, False, f"Analysing failed with error: {safe_ex}"
+
+            # Run all evaluations concurrently for speed
+            tasks = [evaluate_profile(name) for name in to_publish]
+            results = await asyncio.gather(*tasks)
+
+            for name, is_safe, reason in results:
                 if is_safe:
-                    pid_entry = f"pub_{uuid.uuid4().hex[:8]}"
-                    self.cog.public_profiles[pid_entry] = f"{self.user_id}:{self.cog._get_pid_from_name_any(self.user_id, name)}"
+                    pid_entry = self.cog._get_pid_from_name_any(self.user_id, name)
+                    self.cog.public_profiles[pid_entry] = f"{self.user_id}:{pid_entry}"
                     published_list.append(name)
                 else:
                     failed_list[name] = reason

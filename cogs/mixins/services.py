@@ -5321,22 +5321,21 @@ class ServicesMixin:
     async def _is_profile_content_safe(self, user_id: int, profile_name: str, display_name: str, avatar_url: Optional[str]) -> Tuple[bool, str]:
         prompt_text = self.global_prompts.get("AUTO_MODERATOR", DEFAULT_AUTO_MODERATOR_PROMPT)
         
-        prompt_contents = [prompt_text, f"Profile Name: {profile_name}", f"Display Name: {display_name}"]
+        image_data = None
+        content_type = "image/png"
         
         if avatar_url:
             try:
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
                 async with httpx.AsyncClient() as client:
-                    response = await client.get(avatar_url, follow_redirects=True, timeout=10.0)
+                    response = await client.get(avatar_url, follow_redirects=True, timeout=10.0, headers=headers)
                     response.raise_for_status()
                     image_data = await response.aread()
-                    
-                    # FIXED: Direct pass-through. No PIL/PNG conversion.
                     content_type = response.headers.get("Content-Type", "image/png")
-                    prompt_contents.append({"mime_type": content_type, "data": image_data})
-            except httpx.RequestError:
-                return False, "Could not download the avatar image from the provided URL."
-            except Exception:
-                return False, "An error occurred while processing the avatar URL."
+            except httpx.RequestError as e:
+                return False, f"Could not download the avatar image from the provided URL: {e}"
+            except Exception as e:
+                return False, f"An error occurred while processing the avatar URL: {e}"
 
         try:
             api_key = self._get_api_key_for_user(user_id)
@@ -5353,16 +5352,14 @@ class ServicesMixin:
                     system_instruction=prompt_text,
                     safety_settings=DEFAULT_SAFETY_SETTINGS
                 )
-                # The prompt now only contains the user-submitted content to evaluate
                 eval_payload = [
                     f"<target_content>\nProfile Name: {profile_name}\nDisplay Name: {display_name}\n</target_content>"
                 ]
-                if avatar_url:
-                    # Logic for image fetching remains the same
-                    pass 
+                if image_data:
+                    eval_payload.append({"mime_type": content_type, "data": image_data})
 
-                # Pass the cleaned payload instead of the original prompt_contents
-                response = await model.generate_content_async(eval_payload)
+                gen_cfg = {"temperature": 0.0, "top_k": 1, "top_p": 0.9}
+                response = await model.generate_content_async(eval_payload, generation_config=gen_cfg)
                 status = "blocked_by_safety" if not response.candidates else "success"
             finally:
                 self._log_api_call(user_id=0, guild_id=None, context="moderation_check", model_used=model_name, status=status)

@@ -1082,19 +1082,18 @@ class StorageMixin:
     def _resolve_borrowed_pointer(self, pointer: str) -> Optional[Tuple[int, str]]:
         if not pointer:
             return None
-        if pointer.startswith("pub_"):
+        if pointer.startswith("pub_") or pointer.startswith("A"):
             if not self.public_profiles:
                 self._load_public_profiles()
             target = self.public_profiles.get(pointer)
-            if not target:
-                return None
-            if isinstance(target, str) and ":" in target:
-                pointer = target
-            elif isinstance(target, dict):
-                owner_id = target.get("owner_id")
-                pid = target.get("original_pid") or target.get("original_profile_id")
-                if owner_id and pid:
-                    return int(owner_id), pid
+            if target:
+                if isinstance(target, str) and ":" in target:
+                    pointer = target
+                elif isinstance(target, dict):
+                    owner_id = target.get("owner_id")
+                    pid = target.get("original_pid") or target.get("original_profile_id")
+                    if owner_id and pid:
+                        return int(owner_id), pid
         
         if ":" in pointer:
             try:
