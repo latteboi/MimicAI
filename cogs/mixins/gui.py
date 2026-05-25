@@ -1367,11 +1367,7 @@ class ProfileManageView(ui.View):
 
         # --- Memory Tab Logic ---
         elif choice == "data":
-            effective_owner_id = user_id
-            if self.is_borrowed:
-                borrow_data = self.cog._get_profile_config(user_id, profile_name, True) or {}
-                effective_owner_id = int(borrow_data.get("original_owner_id", user_id))
-            view = DataManageView(self.cog, self.original_interaction, profile_name, self.is_borrowed, effective_owner_id)
+            view = DataManageView(self.cog, self.original_interaction, profile_name, self.is_borrowed)
             await view.start()
             await interaction.response.defer()
         elif choice == "ltm_creation":
@@ -4959,12 +4955,11 @@ class DataPageJumpModal(ui.Modal, title="Jump to Page"):
             await interaction.response.send_message(f"❌ Please enter a valid number between 1 and {self.parent_view.max_pages}.", ephemeral=True)
 
 class DataManageView(ui.View):
-    def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, profile_name: str, is_borrowed: bool, effective_owner_id: int):
+    def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, profile_name: str, is_borrowed: bool):
         super().__init__(timeout=600)
         self.cog = cog
         self.original_interaction = interaction
         self.user_id = interaction.user.id
-        self.effective_owner_id = effective_owner_id
         self.guild_id = interaction.guild_id
         self.profile_name = profile_name
         self.is_borrowed = is_borrowed
@@ -4991,7 +4986,7 @@ class DataManageView(ui.View):
             await interaction.response.edit_message(embed=embed, view=self)
 
     async def _build_embed(self) -> Tuple[discord.Embed, List[Dict], List[discord.SelectOption]]:
-        user_id_str = str(self.effective_owner_id)
+        user_id_str = str(self.user_id)
         title_prefix = ""
         ltm_filter_options = []
 
@@ -5001,7 +4996,7 @@ class DataManageView(ui.View):
             self.displayed_data_list = self.full_data_list
         else: # ltm
             ltm_shard = self.cog._load_ltm_shard(user_id_str, self.profile_name)
-            self.full_data_list = ltm_shard.get("guild", []) if ltm_shard else[]
+            self.full_data_list = ltm_shard.get("guild", []) if ltm_shard else []
             title_prefix = "Long-Term Memories"
 
             server_filters = {}
@@ -5197,7 +5192,6 @@ class DataManageView(ui.View):
         delete_all_button.callback = self.delete_all_callback
         self.add_item(delete_all_button)
 
-    # Callbacks
     async def delete_all_callback(self, interaction: discord.Interaction):
         if not (self.mode == 'ltm' and self.ltm_filter and self.ltm_filter.startswith("server_")):
             await interaction.response.send_message("This action is only available when filtering LTMs by a specific server.", ephemeral=True)
@@ -5210,7 +5204,7 @@ class DataManageView(ui.View):
 
         confirm_view = ui.View(timeout=60)
         async def confirm_action(i: discord.Interaction):
-            owner_id_str = str(self.effective_owner_id)
+            owner_id_str = str(self.user_id)
             ltm_data = self.cog._load_ltm_shard(owner_id_str, self.profile_name)
             if not ltm_data:
                 await i.response.edit_message(content="Could not load LTM data.", view=None)

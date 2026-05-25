@@ -1138,14 +1138,14 @@ class StorageMixin:
         persona = prompts.get("persona", {})
         ai_instructions = prompts.get("ai_instructions", "")
         
-        training_context_size = config.get("training_context_size", source_config.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE))
-        training_relevance_threshold = config.get("training_relevance_threshold", source_config.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD))
-        temperature = config.get("temperature", source_config.get("temperature", defaultConfig.GEMINI_TEMPERATURE))
-        top_p = config.get("top_p", source_config.get("top_p", defaultConfig.GEMINI_TOP_P))
-        top_k = config.get("top_k", source_config.get("top_k", defaultConfig.GEMINI_TOP_K))
-        primary_model = config.get("primary_model", source_config.get("primary_model", PRIMARY_MODEL_NAME))
-        fallback_model = config.get("fallback_model", source_config.get("fallback_model", FALLBACK_MODEL_NAME))
-        grounding_enabled = config.get("grounding_enabled", source_config.get("grounding_enabled", False))
+        training_context_size = config.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE)
+        training_relevance_threshold = config.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD)
+        temperature = config.get("temperature", defaultConfig.GEMINI_TEMPERATURE)
+        top_p = config.get("top_p", defaultConfig.GEMINI_TOP_P)
+        top_k = config.get("top_k", defaultConfig.GEMINI_TOP_K)
+        primary_model = config.get("primary_model", PRIMARY_MODEL_NAME)
+        fallback_model = config.get("fallback_model", FALLBACK_MODEL_NAME)
+        grounding_enabled = config.get("grounding_enabled", False)
 
         return (persona, ai_instructions, grounding_enabled, float(temperature), float(top_p), int(top_k), int(training_context_size), float(training_relevance_threshold), primary_model, fallback_model)
     
@@ -1324,15 +1324,18 @@ class StorageMixin:
         if not pid: return None
         filename = "borrowed_config.json.gz" if is_borrowed else "config.json.gz"
         path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, filename)
-        data = IOManager.read_json_gzip(path, self.fernet)
+        local_data = IOManager.read_json_gzip(path, self.fernet)
         
-        if data is not None:
-            if not is_borrowed and "profile_id" not in data:
+        if local_data is not None:
+            if not is_borrowed and "profile_id" not in local_data:
                 import uuid
-                data["profile_id"] = str(uuid.uuid4().hex[:8].upper())
-                self._save_profile_config(user_id, profile_name, data, False)
-            self.profile_configs[cache_key] = data
-        return data
+                local_data["profile_id"] = str(uuid.uuid4().hex[:8].upper())
+                IOManager.write_json_gzip(local_data, path, self.fernet)
+                
+            self.profile_configs[cache_key] = local_data
+            return local_data
+            
+        return None
 
     def _save_profile_config(self, user_id: int, profile_name: str, data: Dict[str, Any], is_borrowed: bool = False):
         if not profile_name: return
@@ -1347,7 +1350,6 @@ class StorageMixin:
         IOManager.write_json_gzip(data, path, self.fernet)
         self.profile_configs[cache_key] = data
 
-        # Safety net: Ensure name.txt exists for recovery
         name_file = os.path.join(p_dir, "name.txt")
         if not os.path.exists(name_file):
             try:

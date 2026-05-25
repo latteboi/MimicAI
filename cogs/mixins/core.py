@@ -2156,7 +2156,7 @@ class CoreMixin:
         display_name = appearance.get("custom_display_name") or effective_profile_name
         appearance_text = f"`{effective_profile_name}`" if appearance else "None"
         
-        ltm_shard = self._load_ltm_shard(str(effective_owner_id), effective_profile_name)
+        ltm_shard = self._load_ltm_shard(str(owner_id), profile_name)
         ltm_count = len(ltm_shard.get("guild", [])) if ltm_shard else 0
         training_shard = self._load_training_shard(str(effective_owner_id), effective_profile_name)
         training_count = len(training_shard) if training_shard else 0
@@ -2168,13 +2168,13 @@ class CoreMixin:
         if isinstance(grounding_mode, bool): grounding_mode = "on" if grounding_mode else "off"
         grounding_display = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(grounding_mode, "OFF")
 
-        stm_length = profile_data.get("stm_length", source_profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
-        ltm_ctx = profile_data.get("ltm_context_size", source_profile_data.get("ltm_context_size", 3))
-        ltm_rel = profile_data.get("ltm_relevance_threshold", source_profile_data.get("ltm_relevance_threshold", 0.75))
+        stm_length = profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
+        ltm_ctx = profile_data.get("ltm_context_size", 3)
+        ltm_rel = profile_data.get("ltm_relevance_threshold", 0.75)
         safety_level = profile_data.get("safety_level", "low").title()
         ltm_creation_status = "**`ON`**" if profile_data.get("ltm_creation_enabled", False) else "`OFF`"
 
-        created_str = source_profile_data.get('created_at')
+        created_str = profile_data.get('created_at')
         created_display = "Unknown"
         if created_str:
             try:
@@ -2259,12 +2259,12 @@ class CoreMixin:
         source_profile_data = self._get_profile_config(effective_owner_id, effective_profile_name, False) or {}
         config = self._get_profile_config(user_id, profile_name, is_borrowed) or {}
         
-        ltm_shard = self._load_ltm_shard(str(effective_owner_id), effective_profile_name)
+        ltm_shard = self._load_ltm_shard(str(user_id), profile_name)
         ltm_count = len(ltm_shard.get("guild", [])) if ltm_shard else 0
         training_shard = self._load_training_shard(str(effective_owner_id), effective_profile_name)
         train_count = len(training_shard) if training_shard else 0
 
-        created_str = source_profile_data.get('created_at')
+        created_str = config.get('created_at')
         created_display = "Unknown"
         if created_str:
             try:
@@ -2275,7 +2275,7 @@ class CoreMixin:
         
         appearance_data = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
         display_name = appearance_data.get("custom_display_name") or effective_profile_name
-        safety_level = config.get("safety_level", source_profile_data.get("safety_level", "low")).title()
+        safety_level = config.get("safety_level", "low").title()
 
         embed.add_field(name="Profile Type", value=f"`{profile_type}`", inline=True)
         embed.add_field(name="Created", value=created_display, inline=True)
@@ -2300,11 +2300,11 @@ class CoreMixin:
             if not m_str: return "None"
             return str(m_str).replace("GOOGLE/", "").replace("OPENROUTER/", "")
 
-        img_model = config.get("image_generation_model", source_profile_data.get("image_generation_model", "gemini-2.5-flash-image"))
-        aud_model = config.get("speech_model", source_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts"))
-        grd_model = config.get("grounding_rag_model", source_profile_data.get("grounding_rag_model", FALLBACK_MODEL_NAME))
-        crt_model = config.get("critic_model", source_profile_data.get("critic_model", FALLBACK_MODEL_NAME))
-        ltm_model = config.get("ltm_model", source_profile_data.get("ltm_model", FALLBACK_MODEL_NAME))
+        img_model = config.get("image_generation_model", "gemini-2.5-flash-image")
+        aud_model = config.get("speech_model", "gemini-2.5-flash-preview-tts")
+        grd_model = config.get("grounding_rag_model", FALLBACK_MODEL_NAME)
+        crt_model = config.get("critic_model", FALLBACK_MODEL_NAME)
+        ltm_model = config.get("ltm_model", FALLBACK_MODEL_NAME)
 
         models_val = (
             f"Primary: `{clean_m(prim_model)}`\n"
@@ -2317,7 +2317,7 @@ class CoreMixin:
         )
         embed.add_field(name="Models", value=models_val, inline=False)
 
-        stm_length = config.get("stm_length", source_profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
+        stm_length = config.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
         gen_val = (
             f"Temp: `{temp}`\n"
             f"Top P: `{top_p}`\n"
@@ -2326,11 +2326,11 @@ class CoreMixin:
         )
         embed.add_field(name="\u200bGeneration Parameters", value=gen_val, inline=True)
 
-        freq_p = config.get("frequency_penalty", source_profile_data.get("frequency_penalty", 0.0))
-        pres_p = config.get("presence_penalty", source_profile_data.get("presence_penalty", 0.0))
-        rep_p = config.get("repetition_penalty", source_profile_data.get("repetition_penalty", 0.0))
-        min_p = config.get("min_p", source_profile_data.get("min_p", 0.0))
-        top_a = config.get("top_a", source_profile_data.get("top_a", 0.0))
+        freq_p = config.get("frequency_penalty", 0.0)
+        pres_p = config.get("presence_penalty", 0.0)
+        rep_p = config.get("repetition_penalty", 0.0)
+        min_p = config.get("min_p", 0.0)
+        top_a = config.get("top_a", 0.0)
 
         adv_val = (
             f"Freq P: `{freq_p}`\n"
@@ -2341,10 +2341,10 @@ class CoreMixin:
         )
         embed.add_field(name="Advanced (OpenRouter Only)", value=adv_val, inline=True)
 
-        t_summary_raw = config.get("thinking_summary_visible", source_profile_data.get("thinking_summary_visible", "off")).lower()
+        t_summary_raw = config.get("thinking_summary_visible", "off").lower()
         t_summary = "**`ON`**" if t_summary_raw == "on" else "`OFF`"
-        t_level = config.get("thinking_level", source_profile_data.get("thinking_level", "high")).title()
-        t_budget = config.get("thinking_budget", source_profile_data.get("thinking_budget", -1))
+        t_level = config.get("thinking_level", "high").title()
+        t_budget = config.get("thinking_budget", -1)
         budget_display = "Dynamic (-1)" if t_budget == -1 else f"{t_budget}"
 
         thinking_val = (
@@ -2354,26 +2354,26 @@ class CoreMixin:
         )
         embed.add_field(name="Thinking/Reasoning", value=thinking_val, inline=True)
 
-        img_gen = "**`ON`**" if config.get("image_generation_enabled", source_profile_data.get("image_generation_enabled", False)) else "`OFF`"
+        img_gen = "**`ON`**" if config.get("image_generation_enabled", False) else "`OFF`"
         
-        raw_ground_mode = config.get("grounding_mode", source_profile_data.get("grounding_mode", "off"))
+        raw_ground_mode = config.get("grounding_mode", "off")
         if isinstance(raw_ground_mode, bool): raw_ground_mode = "rag" if raw_ground_mode else "off"
         elif raw_ground_mode in ["on", "on+"]: raw_ground_mode = "rag"
         grounding_display = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(raw_ground_mode, "`OFF`")
         
-        raw_url_mode = config.get("url_mode", source_profile_data.get("url_mode", "off"))
+        raw_url_mode = config.get("url_mode", "off")
         if "url_mode" not in config:
-            raw_url_mode = "rag" if config.get("url_fetching_enabled", source_profile_data.get("url_fetching_enabled", False)) else "off"
+            raw_url_mode = "rag" if config.get("url_fetching_enabled", False) else "off"
         url_ctx = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(raw_url_mode, "`OFF`")
         
-        timezone = config.get("timezone", source_profile_data.get("timezone", "UTC"))
-        typing = "**`ON`**" if config.get("realistic_typing_enabled", source_profile_data.get("realistic_typing_enabled", False)) else "`OFF`"
-        critic = "**`ON`**" if config.get("critic_enabled", source_profile_data.get("critic_enabled", False)) else "`OFF`"
-        neuro = "**`ON`**" if config.get("neuro_engine_enabled", source_profile_data.get("neuro_engine_enabled", False)) else "`OFF`"
-        metadata_vis = "**`ON`**" if config.get("generation_metadata_enabled", source_profile_data.get("generation_metadata_enabled", False)) else "`OFF`"
-        resp_mode = config.get("response_mode", source_profile_data.get("response_mode", "regular")).replace('_', ' ').title()
+        timezone = config.get("timezone", "UTC")
+        typing = "**`ON`**" if config.get("realistic_typing_enabled", False) else "`OFF`"
+        critic = "**`ON`**" if config.get("critic_enabled", False) else "`OFF`"
+        neuro = "**`ON`**" if config.get("neuro_engine_enabled", False) else "`OFF`"
+        metadata_vis = "**`ON`**" if config.get("generation_metadata_enabled", False) else "`OFF`"
+        resp_mode = config.get("response_mode", "regular").replace('_', ' ').title()
 
-        ph_text = f"{config.get('placeholder_emoji', source_profile_data.get('placeholder_emoji')) or 'Default'}"
+        ph_text = f"{config.get('placeholder_emoji') or 'Default'}"
         
         tools_val = (
             f"Image Gen: {img_gen}\n"
@@ -2388,10 +2388,10 @@ class CoreMixin:
         )
         embed.add_field(name="Tools", value=tools_val, inline=False)
 
-        s_voice = config.get("speech_voice", source_profile_data.get("speech_voice", "Aoede"))
-        s_model = config.get("speech_model", source_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts"))
-        s_temp = config.get("speech_temperature", source_profile_data.get("speech_temperature", 1.0))
-        s_enabled = "**`ON`**" if config.get("speech_tts_enabled", source_profile_data.get("speech_tts_enabled", False)) else "`OFF`"
+        s_voice = config.get("speech_voice", "Aoede")
+        s_model = config.get("speech_model", "gemini-2.5-flash-preview-tts")
+        s_temp = config.get("speech_temperature", 1.0)
+        s_enabled = "**`ON`**" if config.get("speech_tts_enabled", False) else "`OFF`"
         s_model_disp = s_model.replace("gemini-", "").replace("-preview-tts", "").title()
         
         speech_val = (
@@ -2408,11 +2408,11 @@ class CoreMixin:
         )
         embed.add_field(name="Training Examples", value=train_val, inline=True)
 
-        ltm_ctx = config.get("ltm_context_size", source_profile_data.get("ltm_context_size", 3))
-        ltm_rel = config.get("ltm_relevance_threshold", source_profile_data.get("ltm_relevance_threshold", 0.75))
-        ltm_status = "**`ON`**" if config.get("ltm_creation_enabled", source_profile_data.get("ltm_creation_enabled", False)) else "`OFF`"
-        ltm_inv = config.get("ltm_creation_interval", source_profile_data.get("ltm_creation_interval", 10))
-        ltm_s_ctx = config.get("ltm_summarization_context", source_profile_data.get("ltm_summarization_context", 10))
+        ltm_ctx = config.get("ltm_context_size", 3)
+        ltm_rel = config.get("ltm_relevance_threshold", 0.75)
+        ltm_status = "**`ON`**" if config.get("ltm_creation_enabled", False) else "`OFF`"
+        ltm_inv = config.get("ltm_creation_interval", 10)
+        ltm_s_ctx = config.get("ltm_summarization_context", 10)
 
         ltm_val = (
             f"Auto-Creation: {ltm_status}\n"
@@ -2931,41 +2931,17 @@ class CoreMixin:
         else:
             pointer_value = source_pointer
 
-        snapshot_data = {
+        snapshot_data = owner_profile_data.copy()
+        snapshot_data.update({
             "original_owner_id": str(sharer_id),
             "original_pid": target_original_pid,
             "original_profile_name": current_name,
             "original_profile_id": target_original_pid,
             "pointer": pointer_value,
             "borrowed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "grounding_enabled": owner_profile_data.get("grounding_enabled", False),
-            "realistic_typing_enabled": owner_profile_data.get("realistic_typing_enabled", False),
-            "time_tracking_enabled": owner_profile_data.get("time_tracking_enabled", False),
-            "timezone": owner_profile_data.get("timezone", "UTC"),
             "ltm_creation_enabled": False, 
-            "ltm_scope": "server", 
-            "safety_level": "low",
-            "thinking_summary_visible": owner_profile_data.get("thinking_summary_visible", "off"),
-            "thinking_level": owner_profile_data.get("thinking_level", "high"),
-            "thinking_budget": owner_profile_data.get("thinking_budget", -1),
-            "thinking_signatures_enabled": owner_profile_data.get("thinking_signatures_enabled", "off"),
-            "stm_length": owner_profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH),
-            "image_generation_enabled": owner_profile_data.get("image_generation_enabled", False),
-            "image_generation_model": owner_profile_data.get("image_generation_model", "gemini-2.5-flash-image"),
-            "url_fetching_enabled": owner_profile_data.get("url_fetching_enabled", False),
-            "critic_enabled": owner_profile_data.get("critic_enabled", False),
-            "speech_voice": owner_profile_data.get("speech_voice", "Aoede"),
-            "speech_model": owner_profile_data.get("speech_model", "gemini-2.5-flash-preview-tts"),
-            "speech_temperature": owner_profile_data.get("speech_temperature", 1.0),
-            "ltm_creation_interval": owner_profile_data.get("ltm_creation_interval", 10),
-            "ltm_summarization_context": owner_profile_data.get("ltm_summarization_context", 10),
-            "ltm_context_size": owner_profile_data.get("ltm_context_size", 3),
-            "ltm_relevance_threshold": owner_profile_data.get("ltm_relevance_threshold", 0.75),
-        }
-
-        for adv_k in ["frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a"]:
-            if adv_k in owner_profile_data:
-                snapshot_data[adv_k] = owner_profile_data[adv_k]
+            "ltm_scope": "server"
+        })
 
         import uuid
         pid = f"B{uuid.uuid4().hex[:15].upper()}"

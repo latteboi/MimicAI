@@ -439,7 +439,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         )
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
         
-        embed.add_field(name="Version", value="v0.2.1 Beta", inline=True)
+        embed.add_field(name="Version", value="v0.2.2 Beta", inline=True)
         embed.add_field(name="Global Scope", value=f"{len(self.bot.guilds)} Servers", inline=True)
 
         if is_owner:
@@ -470,13 +470,8 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
         is_view_borrowed = is_borrowed
 
-        effective_owner_id = interaction.user.id
-        if is_view_borrowed:
-            b_config = self._get_profile_config(interaction.user.id, profile_name, True) or {}
-            effective_owner_id = int(b_config.get("original_owner_id", 0))
-
         await interaction.response.defer(ephemeral=True)
-        view = DataManageView(self, interaction, profile_name, is_borrowed=is_view_borrowed, effective_owner_id=effective_owner_id)
+        view = DataManageView(self, interaction, profile_name, is_borrowed=is_view_borrowed)
         await view.start()
 
     @profile_group.command(name="hub", description="The unified dashboard for managing profiles, sharing, and the public library.")
