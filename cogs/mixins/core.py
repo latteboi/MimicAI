@@ -703,6 +703,8 @@ class CoreMixin:
         profile_id = self._get_profile_id(effective_owner_id, effective_profile_name)
         history_line = self._format_history_entry(speaker_display_name, interaction_to_respond.created_at, message, entity_id=profile_id)
         
+        display_message = f"{message}\n\n||-# Authored by {author.mention} ({author.id}).||"
+
         turn_object = None
         if session:
             participant_key = (user_id, profile_name)
@@ -746,14 +748,14 @@ class CoreMixin:
             await self.manager_queue.put({
                 "action": "send_to_child", "bot_id": child_bot_id,
                 "payload": {
-                    "action": "send_message", "channel_id": channel.id, "content": message,
+                    "action": "send_message", "channel_id": channel.id, "content": display_message,
                     "realistic_typing": profile_data_source.get("realistic_typing_enabled", False),
                     "correlation_id": correlation_id
                 }
             })
         else:
             sent_messages = await self._send_channel_message(
-                channel, message,
+                channel, display_message,
                 profile_owner_id_for_appearance=effective_owner_id,
                 profile_name_for_appearance=effective_profile_name
             )

@@ -1301,20 +1301,12 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="documentation", description="Interactive guide for prompt engineering, intelligence, and generation parameters.")
+    @app_commands.command(name="documentation", description="Interactive guide for prompt engineering, intelligence, pricing, and generation parameters.")
     @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)
     async def documentation_slash(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         from .mixins.content import DOC_CATEGORIES
         view = DropdownContentView(DOC_CATEGORIES, "MimicAI Advanced Documentation")
-        await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
-
-    @app_commands.command(name="transparency", description="Displays info about background AI models and their API costs.")
-    @app_commands.checks.cooldown(1, 30.0, key=lambda i: i.user.id)
-    async def transparency_slash(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        from .mixins.content import TRANSPARENCY_CATEGORIES
-        view = DropdownContentView(TRANSPARENCY_CATEGORIES, "Transparency & Pricing", link_button_label="Official Google Pricing Page", link_button_url="https://ai.google.dev/gemini-api/docs/pricing")
         await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="help", description="Displays detailed documentation about the bot's features and commands.")
@@ -1328,20 +1320,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     @app_commands.command(name="terms", description="View the MimicAI Terms of Service and Privacy Policy.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     async def terms_slash(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        from .mixins.content import TERMS_CATEGORIES_OFFICIAL, TERMS_CATEGORIES_SELF_HOSTED
-        
-        OFFICIAL_BOT_ID = 1376696185947164854
-        
-        if self.bot.user and self.bot.user.id == OFFICIAL_BOT_ID:
-            categories_to_use = TERMS_CATEGORIES_OFFICIAL
-        else:
-            categories_to_use = TERMS_CATEGORIES_SELF_HOSTED
-            
-        view = DropdownContentView(categories_to_use, "Terms & Privacy", link_button_label="Open Official Website", link_button_url="https://mimic-ai.org/")
-        await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
+        await interaction.response.send_message("View the Terms of Service and Privacy Policy here: https://mimic-ai.org/", ephemeral=True)
 
-    @app_commands.command(name="settings", description="Manage API keys and your personal child bots (DM-Only).")
+    @app_commands.command(name="settings", description="Manage API keys and Child Bots (DM-Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     @app_commands.dm_only()
     async def settings_slash(self, interaction: discord.Interaction):

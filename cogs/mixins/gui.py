@@ -5553,8 +5553,11 @@ class SettingsHomeView(SettingsBaseView):
         stat_gemini = f"✅ **`Set ({u_tier} Tier)`**" if p_key_gemini else "❌ `Not Set`"
         stat_or = f"✅ **`Set (Paid Tier)`**" if p_key_or else "❌ `Not Set`"
         
-        child_bots = [b for b in self.cog.child_bots.values() if b['owner_id'] == self.user_id]
-        bot_text = f"You own **{len(child_bots)}** Child Bots." if child_bots else "You do not own any Child Bots."
+        if self.user_id == int(defaultConfig.DISCORD_OWNER_ID):
+            child_bots = [b for b in self.cog.child_bots.values() if b['owner_id'] == self.user_id]
+            bot_text = f"You own **{len(child_bots)}** Child Bots." if child_bots else "You do not own any Child Bots."
+        else:
+            bot_text = "Child Bots are restricted to the bot owner."
         
         primary_count = 0
         pool_count = 0
@@ -5732,6 +5735,9 @@ class SettingsChildBotView(SettingsBaseView):
         for item in self.children[:]:
             if item.row != 4: self.remove_item(item)
 
+        if self.user_id != int(defaultConfig.DISCORD_OWNER_ID):
+            return
+
         user_bots = [b for b_id, b in self.cog.child_bots.items() if b['owner_id'] == self.user_id]
         
         # Row 0: Select Bot
@@ -5771,6 +5777,11 @@ class SettingsChildBotView(SettingsBaseView):
             self.add_item(btn_del)
 
     async def update_display(self):
+        if self.user_id != int(defaultConfig.DISCORD_OWNER_ID):
+            embed = discord.Embed(title="Child Bots", description="Only the bot owner can create Child Bots.", color=discord.Color.red())
+            await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
+            return
+
         embed = discord.Embed(title="My Child Bots", description="Manage your linked bot applications.", color=discord.Color.dark_magenta())
         if self.selected_bot_id:
             bot_user = self.cog.bot.get_user(int(self.selected_bot_id))
@@ -6527,6 +6538,10 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
+        if interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
+            await interaction.followup.send("❌ **Error:** Only the bot owner can create Child Bots.", ephemeral=True)
+            return
+            
         token = self.token_input.value.strip()
         pid = self.profile_id_input.value.strip().upper()
         owner_id = interaction.user.id

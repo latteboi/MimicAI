@@ -5342,7 +5342,7 @@ class ServicesMixin:
             if not api_key:
                 return False, "A Personal Google Gemini API Key is required to perform safety analysis for public profiles. Please configure one via the `/settings` command."
             
-            model_name = 'gemini-flash-lite-latest'
+            model_name = 'gemini-2.5-flash-lite'
             status = "api_error"
             try:
                 # [FIXED] Move rules to system_instruction to prevent jailbreaking
