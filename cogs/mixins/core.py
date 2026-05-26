@@ -2512,16 +2512,20 @@ class CoreMixin:
         
         public_pointers = set()
         for p_info in self.public_profiles.values():
-            oid = str(p_info.get("owner_id"))
-            oname = p_info.get("original_profile_name")
-            if oid and oname:
-                public_pointers.add((oid, oname))
+            if isinstance(p_info, str) and ":" in p_info:
+                public_pointers.add(p_info)
+            elif isinstance(p_info, dict):
+                oid = str(p_info.get("owner_id"))
+                opid = p_info.get("original_pid")
+                if oid and opid:
+                    public_pointers.add(f"{oid}:{opid}")
         
         choices = []
         current_lower = current.lower()
 
         for name in index.get("personal", []):
-            if (str(user_id), name) in public_pointers and current_lower in name.lower():
+            pid = self._get_pid_from_name_any(user_id, name)
+            if f"{user_id}:{pid}" in public_pointers and current_lower in name.lower():
                 choices.append(app_commands.Choice(name=name, value=name))
         
         for local_name in index.get("borrowed", []):
@@ -2529,9 +2533,9 @@ class CoreMixin:
             if not b_config: continue
             
             orig_oid = str(b_config.get("original_owner_id"))
-            orig_name = b_config.get("original_profile_name")
+            orig_pid = b_config.get("original_pid") or b_config.get("original_profile_id")
             
-            if (orig_oid, orig_name) in public_pointers and current_lower in local_name.lower():
+            if f"{orig_oid}:{orig_pid}" in public_pointers and current_lower in local_name.lower():
                 choices.append(app_commands.Choice(name=local_name, value=local_name))
         
         return choices[:25]
@@ -2543,16 +2547,6 @@ class CoreMixin:
         for p in index.get("personal", []):
             if current_lower in p.lower():
                 choices.append(app_commands.Choice(name=p, value=p))
-        return choices[:25]
-
-    async def personal_profile_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        index = self._get_user_index(interaction.user.id)
-        choices = []
-        current_lower = current.lower()
-        for p in index.get("personal", []):
-            label = self._build_autocomplete_label(interaction.user.id, p, False)
-            if current_lower in label.lower():
-                choices.append(app_commands.Choice(name=label, value=p))
         return choices[:25]
 
     async def appearance_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:

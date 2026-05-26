@@ -1066,16 +1066,25 @@ class StorageMixin:
             return encrypted_key
 
     def _is_profile_public(self, user_id: int, profile_name: str) -> bool:
-        user_id_str = str(user_id)
-        local_pid = self._get_pid_from_name_any(user_id, profile_name)
-        target_pointer = f"{user_id_str}:{local_pid}"
+        index = self._get_user_index(user_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
+        
+        effective_owner_id = user_id
+        effective_pid = self._get_pid_from_name_any(user_id, profile_name)
+        
+        if is_borrowed:
+            b_config = self._get_profile_config(user_id, profile_name, True) or {}
+            effective_owner_id = int(b_config.get("original_owner_id", user_id))
+            effective_pid = b_config.get("original_pid") or b_config.get("original_profile_id")
+            
+        target_pointer = f"{effective_owner_id}:{effective_pid}"
         
         for p_info in self.public_profiles.values():
             if isinstance(p_info, str):
                 if p_info == target_pointer:
                     return True
             elif isinstance(p_info, dict):
-                if str(p_info.get("owner_id")) == user_id_str and p_info.get("original_profile_name") == profile_name:
+                if str(p_info.get("owner_id")) == str(effective_owner_id) and p_info.get("original_pid") == effective_pid:
                     return True
         return False
 

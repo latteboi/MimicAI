@@ -1867,23 +1867,22 @@ class HubPublicLibraryView(HubBaseView):
                     owner_id_str, original_pid = p_info.split(":", 1)
                     owner_id = int(owner_id_str)
                     
-                    cfg_path = os.path.join(self.cog.USERS_DIR, owner_id_str, "profiles", original_pid, "config.json.gz")
-                    cfg_data = self.cog._load_json_gzip(cfg_path) or {}
-                    
                     original_profile_name = "Unknown"
+                    published_at = 0
+                    
                     name_path = os.path.join(self.cog.USERS_DIR, owner_id_str, "profiles", original_pid, "name.txt")
                     if os.path.exists(name_path):
                         with open(name_path, "r", encoding="utf-8") as nf:
                             original_profile_name = nf.read().strip()
+                        # Use file modification time as a lightweight fallback for sorting
+                        published_at = os.path.getmtime(name_path)
 
                     raw_list.append({
                         "id": p_id,
                         "owner_id": owner_id,
                         "original_pid": original_pid,
                         "profile_name": original_profile_name,
-                        "published_at": cfg_data.get("created_at", ""),
-                        "display_name": cfg_data.get("custom_display_name", original_profile_name),
-                        "avatar_url": cfg_data.get("custom_avatar_url")
+                        "published_at": published_at
                     })
                 except Exception as e:
                     print(f"Error loading public entry {p_id}: {e}")
@@ -1893,9 +1892,7 @@ class HubPublicLibraryView(HubBaseView):
                     "owner_id": p_info.get('owner_id'),
                     "original_pid": p_info.get("original_pid"),
                     "profile_name": p_info.get('original_profile_name', 'Unknown'),
-                    "published_at": p_info.get("published_at", ""),
-                    "display_name": p_info.get("display_name", p_info.get('original_profile_name', 'Unknown')),
-                    "avatar_url": p_info.get("avatar_url")
+                    "published_at": p_info.get("published_at", 0)
                 })
         
         raw_list.sort(key=lambda x: x['published_at'], reverse=True)
@@ -1993,12 +1990,19 @@ class HubPublicLibraryView(HubBaseView):
         
         p_info = self.filtered_list[self.current_page]
         owner_id = p_info['owner_id']
+        original_pid = p_info.get('original_pid')
+        
+        # Load the heavy config data dynamically ONLY for the profile actively being viewed
+        cfg_data = {}
+        if original_pid:
+            cfg_path = os.path.join(self.cog.USERS_DIR, str(owner_id), "profiles", original_pid, "config.json.gz")
+            cfg_data = self.cog._load_json_gzip(cfg_path) or {}
         
         owner = self.cog.bot.get_user(owner_id) or await self.cog.bot.fetch_user(owner_id)
         owner_name = owner.name if owner else "Unknown"
         
-        disp_name = p_info.get("display_name")
-        avatar_url = p_info.get("avatar_url")
+        disp_name = cfg_data.get("custom_display_name", p_info['profile_name'])
+        avatar_url = cfg_data.get("custom_avatar_url")
 
         embed = discord.Embed(title=disp_name, description=f"Created by **{owner_name}**", color=discord.Color.random())
         if avatar_url: embed.set_image(url=avatar_url)

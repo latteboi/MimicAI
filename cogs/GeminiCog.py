@@ -1226,6 +1226,11 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             await interaction.response.send_message(f"Profile '{profile_name_lower}' not found.", ephemeral=True)
             return
 
+        is_public = self._is_profile_public(user_id, profile_name_lower)
+        if not is_public:
+            await interaction.response.send_message(f"The profile '{profile_name_lower}' is not published to the Public Library. Only published profiles can be used in Global Chat.", ephemeral=True)
+            return
+
         await interaction.response.defer(ephemeral=False)
 
         model_cache_key = ('global', user_id, profile_name_lower)
