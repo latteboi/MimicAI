@@ -1329,15 +1329,18 @@ class ProfileManageView(ui.View):
             curr = profile.get("response_mode", "regular")
             profile["response_mode"] = modes[(modes.index(curr) + 1) % len(modes)]
             await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
-        elif choice in ["image_settings", "image_toggle"]:
+        elif choice == "image_settings":
             async def refresh_cb(modal_interaction: discord.Interaction):
                 new_embed = await self.cog._build_profile_manage_embed(modal_interaction, profile_name)
                 await self.original_interaction.edit_original_response(embed=new_embed, view=self)
             modal = ProfileImageGenSettingsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb)
             await interaction.response.send_modal(modal)
         elif choice == "typing":
-            profile["realistic_typing_enabled"] = not profile.get("realistic_typing_enabled", False)
-            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
+            async def refresh_cb(modal_interaction: discord.Interaction):
+                new_embed = await self.cog._build_profile_manage_embed(modal_interaction, profile_name)
+                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
+            modal = ProfileTypingSettingsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb)
+            await interaction.response.send_modal(modal)
         elif choice == "grounding":
             current_mode = profile.get("grounding_mode", "off")
             if isinstance(current_mode, bool): current_mode = "rag" if current_mode else "off"
@@ -3296,6 +3299,50 @@ class ProfileLTMTriggerModal(ui.Modal, title="Set LTM Frequency & Context"):
             await interaction.followup.send(f"✅ LTM frequency settings updated for '{self.profile_name}'.", ephemeral=True)
             if self.callback: await self.callback(interaction)
 
+class ProfileTypingSettingsModal(ui.Modal, title="Realistic Typing Settings"):
+    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+        super().__init__()
+        self.cog = cog
+        self.profile_name = profile_name
+        self.is_borrowed = is_borrowed
+        self.callback = callback
+        
+        status_val = "on" if current_params.get("realistic_typing_enabled", False) else "off"
+        self.add_item(ui.TextInput(label="Enable Realistic Typing (on/off)", custom_id="enabled", default=status_val, required=True))
+        self.add_item(ui.TextInput(label="Characters per Second", custom_id="cps", default=str(current_params.get("typing_cps", 30.0)), required=False, placeholder="Default: 30.0"))
+        self.add_item(ui.TextInput(label="Max Delay per Sentence (Seconds)", custom_id="max_delay", default=str(current_params.get("typing_max_delay", 2.5)), required=False, placeholder="Default: 2.5"))
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        new_params = {}
+        try:
+            def gv(cid): return next((c.value for c in self.children if c.custom_id == cid), None)
+            en_val = gv("enabled").strip().lower()
+            new_params["realistic_typing_enabled"] = (en_val == "on")
+            
+            cps_val = gv("cps")
+            if cps_val and cps_val.strip(): new_params["typing_cps"] = float(cps_val.strip())
+            
+            max_delay_val = gv("max_delay")
+            if max_delay_val and max_delay_val.strip(): new_params["typing_max_delay"] = float(max_delay_val.strip())
+        except ValueError:
+            await interaction.followup.send("❌ **Invalid Input**: Please enter valid numbers.", ephemeral=True); return
+        except Exception:
+            await interaction.followup.send("Error parsing input.", ephemeral=True); return
+        
+        if self.profile_name == "BULK_APPLY":
+            if self.callback: await self.callback(interaction, new_params)
+            return
+            
+        target = self.cog._get_profile_config(interaction.user.id, self.profile_name, self.is_borrowed)
+        if target:
+            target.update(new_params)
+            self.cog._save_profile_config(interaction.user.id, self.profile_name, target, self.is_borrowed)
+            await interaction.followup.send("✅ Realistic typing settings updated.", ephemeral=True)
+            if self.callback: await self.callback(interaction)
+        else:
+            await interaction.followup.send("❌ Profile not found.", ephemeral=True)
+
 class ProfileImageGenSettingsModal(ui.Modal, title="Image Generation Settings"):
     def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
         super().__init__()
@@ -4241,6 +4288,13 @@ class BaseBulkProfileView(ui.View):
         toggle_btn.callback = self.toggle_page_select_callback
         self.add_item(toggle_btn)
 
+        active_list_set = set(active_list)
+        all_selected_global = active_list_set.issubset(self.selected_profiles) if active_list else False
+        toggle_all_label = "Unselect All" if all_selected_global else "Select All"
+        toggle_all_btn = ui.Button(label=toggle_all_label, style=discord.ButtonStyle.secondary, custom_id="toggle_all_select", row=btn_row, disabled=(not active_list))
+        toggle_all_btn.callback = self.toggle_all_select_callback
+        self.add_item(toggle_all_btn)
+
     async def toggle_source_callback(self, interaction: discord.Interaction):
         self.view_source = 'borrowed' if self.view_source == 'personal' else 'personal'
         self.current_page = 0
@@ -4274,6 +4328,14 @@ class BaseBulkProfileView(ui.View):
         
         if page_items.issubset(self.selected_profiles): self.selected_profiles.difference_update(page_items)
         else: self.selected_profiles.update(page_items)
+        self._build_view()
+        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+
+    async def toggle_all_select_callback(self, interaction: discord.Interaction):
+        active_list = self._get_active_list()
+        all_set = set(active_list)
+        if all_set.issubset(self.selected_profiles): self.selected_profiles.difference_update(all_set)
+        else: self.selected_profiles.update(all_set)
         self._build_view()
         await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
 
@@ -4370,6 +4432,8 @@ class BulkActionView(BaseBulkProfileView):
             final_message = await self.cog.bulk_apply_image_settings(self.user_id, target_profiles_list, self.params)
         elif self.action == "apply_generation_visual":
             final_message = await self.cog.bulk_apply_generation_visual(self.user_id, target_profiles_list, self.params)
+        elif self.action == "apply_typing_settings":
+            final_message = await self.cog.bulk_apply_typing_settings(self.user_id, target_profiles_list, self.params)
         elif self.action == "apply_neuro_settings":
             # Direct logic for neuro settings to maintain atomic state updates
             updated_count = 0
@@ -6287,7 +6351,7 @@ class BulkManageView(ui.View):
         all_profiles = list(index.get("personal", [])) + list(index.get("borrowed", []))
         
         if not all_profiles:
-            await self.original_interaction.edit_original_response(content="You have no profiles to apply settings to.", view=None)
+            await interaction.response.send_message("You have no profiles to apply settings to.", ephemeral=True)
             return
 
         if choice == "gen_params":
@@ -6311,7 +6375,7 @@ class BulkManageView(ui.View):
                     await i.followup.send(f"❌ **Invalid Input**", ephemeral=True); return
 
                 view = BulkActionView(self.cog, self.user_id, "apply_params", "Select profiles to apply parameters to...", params=params, include_borrowed=True)
-                await self.original_interaction.edit_original_response(content="Parameters validated. Select the profiles to apply them to:", view=view)
+                await i.followup.send(content="Parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal.on_submit = modal_callback
             await interaction.response.send_modal(modal)
 
@@ -6334,7 +6398,7 @@ class BulkManageView(ui.View):
                 if not clean: await i.followup.send("No parameters set.", ephemeral=True); return
 
                 view = BulkActionView(self.cog, self.user_id, "apply_params", "Select profiles to apply parameters to...", params=clean, include_borrowed=True)
-                await self.original_interaction.edit_original_response(content="Advanced parameters validated. Select the profiles to apply them to:", view=view)
+                await i.followup.send(content="Advanced parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal.on_submit = modal_callback
             await interaction.response.send_modal(modal)
 
@@ -6346,7 +6410,6 @@ class BulkManageView(ui.View):
                 try:
                     def gv(cid): return next(c.value for c in modal.children if c.custom_id == cid).strip().lower()
                     params["thinking_summary_visible"] = gv("thinking_summary_visible") if gv("thinking_summary_visible") in ["on", "off"] else "off"
-                    # [UPDATED] Validating against the 6 standardized effort levels in bulk mode
                     lvl = gv("thinking_level")
                     if lvl not in ["xhigh", "high", "medium", "low", "minimal", "none"]:
                         lvl = "high"
@@ -6358,7 +6421,7 @@ class BulkManageView(ui.View):
                     await i.followup.send("❌ **Invalid Input**", ephemeral=True); return
 
                 view = BulkActionView(self.cog, self.user_id, "apply_thinking_params", "Select profiles to apply thinking settings to...", params=params, include_borrowed=True)
-                await self.original_interaction.edit_original_response(content="Thinking parameters validated. Select the profiles to apply them to:", view=view)
+                await i.followup.send(content="Thinking parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal.on_submit = modal_callback
             await interaction.response.send_modal(modal)
 
@@ -6375,7 +6438,7 @@ class BulkManageView(ui.View):
                 except ValueError: await i.followup.send("Invalid Input", ephemeral=True); return
 
                 view = BulkActionView(self.cog, self.user_id, "apply_training_params", "Select personal profiles to apply settings to...", params=params, include_borrowed=False)
-                await self.original_interaction.edit_original_response(content="Parameters validated. Select the profiles to apply them to:", view=view)
+                await i.followup.send(content="Parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal.on_submit = modal_callback
             await interaction.response.send_modal(modal)
 
@@ -6397,96 +6460,90 @@ class BulkManageView(ui.View):
                 except ValueError: await i.followup.send("Invalid Input", ephemeral=True); return
 
                 view = BulkActionView(self.cog, self.user_id, "apply_ltm_params", "Select profiles to apply LTM settings to...", params=params, include_borrowed=True)
-                await self.original_interaction.edit_original_response(content="Parameters validated. Select the profiles to apply them to:", view=view)
+                await i.followup.send(content="Parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal.on_submit = modal_callback
             await interaction.response.send_modal(modal)
 
         elif choice == "ltm_summarization":
             modal = ProfileLTMSummarizationModal(self.cog, "BULK_APPLY", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
             async def modal_callback(i: discord.Interaction):
-                await i.response.defer()
+                await i.response.defer(ephemeral=True)
                 instructions = modal.instructions_input.value.strip() or DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS
                 
                 params = {"ltm_summarization_instructions": instructions}
 
                 view = BulkActionView(self.cog, self.user_id, "apply_ltm_summarization", "Select personal profiles to apply LTM prompt to...", params=params, include_borrowed=False)
-                await self.original_interaction.edit_original_response(content="Prompt received. Now select the profiles to apply it to:", view=view)
+                await i.followup.send(content="Prompt received. Now select the profiles to apply it to:", view=view, ephemeral=True)
             modal.on_submit = modal_callback
             await interaction.response.send_modal(modal)
 
         elif choice == "models":
-            await interaction.response.defer()
             view = ModelApplyView(self.cog, self.user_id, self.original_interaction)
-            await self.original_interaction.edit_original_response(content="Select models and profiles:", view=view)
+            await interaction.response.send_message(content="Select models and profiles:", view=view, ephemeral=True)
 
         elif choice == "grounding":
-            await interaction.response.defer()
             view = BulkGroundingView(self.cog, self.user_id)
-            await self.original_interaction.edit_original_response(content="Select grounding mode and profiles:", view=view)
+            await interaction.response.send_message(content="Select grounding mode and profiles:", view=view, ephemeral=True)
 
         elif choice == "response_mode":
-            await interaction.response.defer()
             view = BulkResponseModeView(self.cog, self.user_id)
-            await self.original_interaction.edit_original_response(content="Select a response mode and profiles:", view=view)
+            await interaction.response.send_message(content="Select a response mode and profiles:", view=view, ephemeral=True)
 
         elif choice == "url_context":
-            await interaction.response.defer()
             view = BulkURLContextView(self.cog, self.user_id)
-            await self.original_interaction.edit_original_response(content="Select URL context action and profiles:", view=view)
+            await interaction.response.send_message(content="Select URL context action and profiles:", view=view, ephemeral=True)
 
         elif choice == "image_gen":
             modal = ProfileImageGenSettingsModal(self.cog, "BULK_APPLY", {}, False)
             async def modal_callback(i: discord.Interaction, params: Dict):
                 view = BulkActionView(self.cog, self.user_id, "apply_image_settings", "Select profiles to apply image settings to...", params=params, include_borrowed=True)
-                await self.original_interaction.edit_original_response(content="Image settings validated. Select the profiles to apply them to:", view=view)
+                await i.followup.send(content="Image settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal.callback = modal_callback
             await interaction.response.send_modal(modal)
             
         elif choice == "timezone":
-            await interaction.response.defer()
             view = BulkTimezoneView(self.cog, self.user_id)
-            await self.original_interaction.edit_original_response(content="Select a timezone and the profiles to apply it to:", view=view)
+            await interaction.response.send_message(content="Select a timezone and the profiles to apply it to:", view=view, ephemeral=True)
             
         elif choice == "generation_visual":
             modal = ProfileGenerationVisualModal(self.cog, "BULK_APPLY", {}, False)
             async def modal_callback(i: discord.Interaction, params: Dict):
                 view = BulkActionView(self.cog, self.user_id, "apply_generation_visual", "Select profiles to apply visual settings to...", params=params, include_borrowed=True)
-                await self.original_interaction.edit_original_response(content="Visual settings validated. Select the profiles to apply them to:", view=view)
+                await i.followup.send(content="Visual settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal.callback = modal_callback
             await interaction.response.send_modal(modal)
         
         elif choice == "critic":
-            await interaction.response.defer()
             view = BulkCriticView(self.cog, self.user_id)
-            await self.original_interaction.edit_original_response(content="Select critic action and profiles:", view=view)
+            await interaction.response.send_message(content="Select critic action and profiles:", view=view, ephemeral=True)
 
         elif choice == "neuro":
             modal = ProfileNeuroModal(self.cog, "BULK_APPLY", {}, False)
             async def modal_callback(i: discord.Interaction, params: Dict):
                 view = BulkActionView(self.cog, self.user_id, "apply_neuro_settings", "Select profiles to apply neuro settings to...", params=params, include_borrowed=True)
-                await self.original_interaction.edit_original_response(content="Neuro settings validated. Select the profiles to apply them to:", view=view)
+                await i.followup.send(content="Neuro settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal.callback = modal_callback
             await interaction.response.send_modal(modal)
 
         elif choice == "typing":
-            await interaction.response.defer()
-            view = TypingManageView(self.cog, self.user_id)
-            await self.original_interaction.edit_original_response(content="Select typing action and profiles:", view=view)
+            modal = ProfileTypingSettingsModal(self.cog, "BULK_APPLY", {}, False)
+            async def modal_callback(i: discord.Interaction, params: Dict):
+                view = BulkActionView(self.cog, self.user_id, "apply_typing_settings", "Select profiles to apply typing settings to...", params=params, include_borrowed=True)
+                await i.followup.send(content="Typing settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
+            modal.callback = modal_callback
+            await interaction.response.send_modal(modal)
 
         elif choice == "data_reset":
-            await interaction.response.defer()
             view = BulkResetView(self.cog, self.user_id)
-            await self.original_interaction.edit_original_response(content="Select reset action:", view=view)
+            await interaction.response.send_message(content="Select reset action:", view=view, ephemeral=True)
 
         elif choice == "delete_items":
-            await interaction.response.defer()
             view = BulkDeleteView(self.cog, self.user_id)
-            await self.original_interaction.edit_original_response(content="Select profiles to delete:", view=view)
+            await interaction.response.send_message(content="Select profiles to delete:", view=view, ephemeral=True)
 
         elif choice == "safety_level":
-            await interaction.response.defer()
             view = BulkSafetyLevelView(self.cog, self.user_id)
-            await self.original_interaction.edit_original_response(content=view._get_selection_feedback_message(), view=view)
+            await interaction.response.send_message(content=view._get_selection_feedback_message(), view=view, ephemeral=True)
 
 class PrivacyDashboardView(ui.View):
     def __init__(self, cog: 'GeminiAgent', user_id: int):
@@ -7258,3 +7315,9 @@ class ParentPresenceView(ui.View):
         status_map = {"online": discord.Status.online, "idle": discord.Status.idle, "dnd": discord.Status.dnd, "invisible": discord.Status.invisible}
         await self.cog.bot.change_presence(status=status_map.get(status_val, discord.Status.online), activity=None)
         await interaction.response.send_message("Activity cleared.", ephemeral=True)
+
+class InviteView(ui.View):
+    def __init__(self, invite_url: str):
+        super().__init__(timeout=None)
+        btn = ui.Button(label="Add MimicAI to Server", url=invite_url, style=discord.ButtonStyle.link)
+        self.add_item(btn)

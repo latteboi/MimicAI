@@ -656,14 +656,6 @@ class CoreMixin:
         
         session = self.multi_profile_channels.get(channel.id)
         if session:
-            # Fix: Use the standard hydration method to ensure ChatSession objects are created,
-            # not raw lists from _load_session_from_disk.
-            if not session.get("is_hydrated"):
-                session = await self._ensure_session_hydrated(channel.id, session.get("type", "multi"))
-                if not session:
-                    await interaction_to_respond.followup.send("Failed to load session data.", ephemeral=True)
-                    return
-
             participant_data = next((p for p in session.get("profiles", []) if p.get("owner_id") == user_id and p.get("profile_name") == profile_name), None)
             if not participant_data:
                 await interaction_to_respond.followup.send(f"The profile '{profile_name}' is not an active participant in this channel's multi-profile session.", ephemeral=True)
@@ -750,6 +742,8 @@ class CoreMixin:
                 "payload": {
                     "action": "send_message", "channel_id": channel.id, "content": display_message,
                     "realistic_typing": profile_data_source.get("realistic_typing_enabled", False),
+                    "typing_cps": profile_data_source.get("typing_cps", 30.0),
+                    "typing_max_delay": profile_data_source.get("typing_max_delay", 2.5),
                     "correlation_id": correlation_id
                 }
             })
@@ -2697,20 +2691,21 @@ class CoreMixin:
                 self._save_profile_config(user_id, name, profile, is_borrowed)
                 updated_count += 1
         return f"Updated generation visual settings for {updated_count} profile(s)."
-    
-    async def bulk_apply_metadata_settings(self, user_id: int, profile_names: List[str], params: Dict) -> str:
+
+    async def bulk_apply_typing_settings(self, user_id: int, profile_names: List[str], params: Dict) -> str:
         index = self._get_user_index(user_id)
         updated_count = 0
         for name in profile_names:
             is_borrowed = name in index.get("borrowed", [])
             profile = self._get_profile_config(user_id, name, is_borrowed)
             if profile:
-                profile["generation_metadata_enabled"] = params.get("generation_metadata_enabled", False)
-                profile["id_metadata_enabled"] = params.get("id_metadata_enabled", False)
+                if "realistic_typing_enabled" in params: profile["realistic_typing_enabled"] = params["realistic_typing_enabled"]
+                if "typing_cps" in params: profile["typing_cps"] = params["typing_cps"]
+                if "typing_max_delay" in params: profile["typing_max_delay"] = params["typing_max_delay"]
                 self._save_profile_config(user_id, name, profile, is_borrowed)
                 updated_count += 1
         
-        return f"Updated metadata visibility settings for {updated_count} profile(s)."
+        return f"Updated realistic typing settings for {updated_count} profile(s)."
 
     async def bulk_toggle_grounding(self, user_id: int, profile_names: List[str], enable: bool) -> str:
         index = self._get_user_index(user_id)

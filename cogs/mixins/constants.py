@@ -3,8 +3,8 @@ from typing import Literal
 import configs.DefaultConfig as defaultConfig
 from google.genai.types import HarmCategory, HarmBlockThreshold
 
-PRIMARY_MODEL_NAME = 'gemini-flash-latest'
-FALLBACK_MODEL_NAME = 'gemini-flash-lite-latest'
+PRIMARY_MODEL_NAME = 'gemini-3.1-flash-lite'
+FALLBACK_MODEL_NAME = 'gemini-2.5-flash-lite'
 DEFAULT_SYSTEM_INSTRUCTION = "."
 
 # Define the allowed models for the new command

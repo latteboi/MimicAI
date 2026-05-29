@@ -2680,6 +2680,17 @@ class ServicesMixin:
 
                     is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
 
+                    if is_realistic_typing:
+                        if state_container and state_container.get('sending_task'):
+                            state_container['sending_task'].cancel()
+                        msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
+                        msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
+                        await self._safe_delete_placeholder(channel, msg_a_to_delete)
+                        await self._safe_delete_placeholder(channel, msg_b_to_delete)
+                        if state_container:
+                            state_container['msg_a_id'] = None
+                            state_container['msg_b_id'] = None
+
                     # [NEW] Unified Synthesis Logic
                     audio_file_for_send = None
                     
@@ -2746,6 +2757,16 @@ class ServicesMixin:
                     elif audio_file_for_send:
                         file_to_send = audio_file_for_send
 
+                    is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
+
+                    if is_realistic_typing:
+                        if state_container and state_container.get('sending_task'):
+                            state_container['sending_task'].cancel()
+                        msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
+                        await self._safe_delete_placeholder(channel, msg_b_to_delete)
+                        if state_container:
+                            state_container['msg_b_id'] = None
+
                     if participant.get('method') == 'child_bot':
                         if placeholder_message and hasattr(placeholder_message, 'id'):
                             try:
@@ -2772,7 +2793,10 @@ class ServicesMixin:
 
                         payload = {
                             "action": "send_message", "channel_id": channel.id, "content": display_text,
-                            "realistic_typing": is_realistic_typing, "correlation_id": correlation_id,
+                            "realistic_typing": is_realistic_typing, 
+                            "typing_cps": profile_settings.get("typing_cps", 30.0),
+                            "typing_max_delay": profile_settings.get("typing_max_delay", 2.5),
+                            "correlation_id": correlation_id,
                             "reply_to_id": reply_id, "ping": should_ping
                         }
                         
@@ -4107,6 +4131,8 @@ class ServicesMixin:
         custom_avatar_url_to_use = self.bot.user.display_avatar.url if self.bot.user else None
         use_webhook = False
         is_realistic_typing = False
+        typing_cps = 30.0
+        typing_max_delay = 2.5
         
         is_placeholder = (content == f"{PLACEHOLDER_EMOJI}")
 
@@ -4117,12 +4143,16 @@ class ServicesMixin:
             if is_borrowed:
                 borrowed_data = self._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, True) or {}
                 is_realistic_typing = borrowed_data.get("realistic_typing_enabled", False)
+                typing_cps = borrowed_data.get("typing_cps", 30.0)
+                typing_max_delay = borrowed_data.get("typing_max_delay", 2.5)
                 
                 effective_owner_id = int(borrowed_data.get("original_owner_id", profile_owner_id_for_appearance))
                 effective_profile_name = borrowed_data.get("original_profile_name", profile_name_for_appearance)
             else:
                 personal_profile_data = self._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, False) or {}
                 is_realistic_typing = personal_profile_data.get("realistic_typing_enabled", False)
+                typing_cps = personal_profile_data.get("typing_cps", 30.0)
+                typing_max_delay = personal_profile_data.get("typing_max_delay", 2.5)
 
                 effective_owner_id = profile_owner_id_for_appearance
                 effective_profile_name = profile_name_for_appearance
@@ -4191,7 +4221,16 @@ class ServicesMixin:
                     if not isinstance(sentence, str) or not sentence.strip():
                         continue
                     
-                    delay = max(0.5, min(len(sentence) / 30.0, 2.5))
+                    try:
+                        typing_cps_float = float(typing_cps)
+                        if typing_cps_float <= 0: typing_cps_float = 30.0
+                    except: typing_cps_float = 30.0
+                    
+                    try:
+                        typing_max_delay_float = float(typing_max_delay)
+                    except: typing_max_delay_float = 2.5
+
+                    delay = max(0.5, min(len(sentence) / typing_cps_float, typing_max_delay_float))
                     await asyncio.sleep(delay)
                     
                     embeds_to_send = embeds if i == 0 and embeds is not None else []

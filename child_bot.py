@@ -312,6 +312,8 @@ class HiveMind:
         attachment_data = payload.get("attachment")
         correlation_id = payload.get("correlation_id")
         realistic_typing = payload.get("realistic_typing", False)
+        typing_cps = payload.get("typing_cps", 30.0)
+        typing_max_delay = payload.get("typing_max_delay", 2.5)
         reply_to_id = payload.get("reply_to_id")
         ping = payload.get("ping", False)
 
@@ -338,7 +340,16 @@ class HiveMind:
                 async with channel.typing():
                     for i, sentence in enumerate(sentences):
                         if not sentence.strip(): continue
-                        delay = max(1.0, min(len(sentence) / 20, 4.0))
+                        try:
+                            typing_cps_float = float(typing_cps)
+                            if typing_cps_float <= 0: typing_cps_float = 30.0
+                        except: typing_cps_float = 30.0
+                        
+                        try:
+                            typing_max_delay_float = float(typing_max_delay)
+                        except: typing_max_delay_float = 2.5
+
+                        delay = max(0.5, min(len(sentence) / typing_cps_float, typing_max_delay_float))
                         await asyncio.sleep(delay)
                         
                         kwargs = {"content": sentence}

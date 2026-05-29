@@ -1322,6 +1322,45 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     async def terms_slash(self, interaction: discord.Interaction):
         await interaction.response.send_message("View the Terms of Service and Privacy Policy here: https://mimic-ai.org/", ephemeral=True)
 
+    @app_commands.command(name="invite", description="Get the invite link to add MimicAI to your server.")
+    @app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
+    async def invite_slash(self, interaction: discord.Interaction):
+        client_id = self.bot.user.id if self.bot.user else 1376696185947164854
+        invite_url = f"https://discord.com/api/oauth2/authorize?client_id={client_id}&permissions=8&scope=bot%20applications.commands"
+        
+        embed = discord.Embed(
+            title="Bring Your Personas to Life with MimicAI",
+            description="Experience a revolutionary, unified orchestration engine that gives you complete control over your chatbot. MimicAI brings unparalleled customisation and model diversity directly into your Discord servers.",
+            color=discord.Color.blue()
+        )
+        
+        embed.add_field(
+            name="Bring Your Own API (BYO API)",
+            value="Connect your own Google Gemini or OpenRouter API keys to unlock virtually any language model on the market, from lightweight performance engines to frontier reasoning models. Pay only for what you generate directly with your provider.",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Advanced Customisation",
+            value="Configure Short-Term Memory limits, fine-tune sampling parameters (Temperature, Top P, Top K), or manipulate advanced OpenRouter heuristics. Integrate external tools like real-time Web Grounding (RAG), URL context fetching, custom placeholder emojis, and simulated neuro-endocrine emotional engines.",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Multi-Profile Chat Sessions",
+            value="Organise several unique characters into a single, unified Chat Session. Watch them interact with each other and server members with chronological awareness and deep memory coherence.",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Disclaimer",
+            value="-# All software features and customisation options within MimicAI are completely free to use. However, connecting to background AI models for text, speech, or image generation requires an active billing account with your selected API provider (Google or OpenRouter). Token overhead usage applies.",
+            inline=False
+        )
+        
+        view = InviteView(invite_url)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
+
     @app_commands.command(name="settings", description="Manage API keys and Child Bots (DM-Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     @app_commands.dm_only()
