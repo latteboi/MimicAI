@@ -15,7 +15,12 @@ import base64
 import httpx
 import gc
 import pathlib
+import warnings
 import orjson as json
+
+# Suppress specific Google GenAI warnings
+warnings.filterwarnings("ignore", message=".*MALFORMED_RESPONSE is not a valid FinishReason.*")
+
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.fernet import InvalidToken, Fernet
@@ -2453,9 +2458,11 @@ class ServicesMixin:
                         # Check if the last turn was from this model itself
                         if contents_for_api_call and contents_for_api_call[-1].get('role', contents_for_api_call[-1].get('role', 'user')) == 'model':
                             last_model_text = "".join(p if isinstance(p, str) else p.get('text', '') for p in contents_for_api_call[-1].get('parts', []))
-                            if "<private_response>" not in last_model_text:
+                            if "<private_response>" in last_model_text:
+                                pseudo_user_turn = {'role': 'user', 'parts': ["<internal_note>Continue the public conversation.</internal_note>"]}
+                            else:
                                 pseudo_user_turn = {'role': 'user', 'parts': ["<internal_note>No response from anyone OR no user is present.</internal_note>"]}
-                                contents_for_api_call.append(pseudo_user_turn)
+                            contents_for_api_call.append(pseudo_user_turn)
 
                         # Collect all supplementary context to inject into the final user turn
                         supplementary_parts = []
@@ -4221,7 +4228,7 @@ class ServicesMixin:
                 return response_text
         except Exception as e:
             err_str = str(e)
-            if "429" not in err_str and "RESOURCE_EXHAUSTED" not in err_str:
+            if "429" not in err_str and "RESOURCE_EXHAUSTED" not in err_str and "503" not in err_str and "UNAVAILABLE" not in err_str:
                 print(f"LTM Gen err {user_dn}: {e}")
                 traceback.print_exc()
                 if warning_channel:
