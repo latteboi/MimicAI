@@ -1047,7 +1047,7 @@ class CoreMixin:
                             api_error_reason = self._format_api_error(retry_e)
                         status = "api_error"
             finally:
-                self._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
+                self._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat", model_used=model, status=status)
 
             if not response or not response.candidates:
                 reason = api_error_reason or "Unknown Error"
@@ -1280,7 +1280,7 @@ class CoreMixin:
         finally:
             if 'state_container' in locals() and state_container:
                 await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
-            self._log_api_call(user_id=interaction.user.id, guild_id=interaction.guild.id, context="whisper", model_used=model.model_name if (model and hasattr(model, 'model_name')) else "unknown", status=status)
+            self._log_api_call(user_id=interaction.user.id, guild_id=interaction.guild.id, context="whisper", model_used=model, status=status)
         
         response_text = "..."
         if not response or not response.candidates:
@@ -1522,7 +1522,7 @@ class CoreMixin:
         finally:
             if 'state_container' in locals() and state_container:
                 await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
-            self._log_api_call(user_id=interaction.user.id, guild_id=interaction.guild.id, context="whisper_regen", model_used=model.model_name if model else "unknown", status=status)
+            self._log_api_call(user_id=interaction.user.id, guild_id=interaction.guild.id, context="whisper_regen", model_used=model, status=status)
 
         if not response or not response.candidates:
             err_embed = placeholder_embed.copy()
@@ -1564,12 +1564,11 @@ class CoreMixin:
         view = WhisperActionView(self, interaction, whisper_turn_id, response_turn_id, target_participant, whisper_message)
         await interaction.edit_original_response(embed=final_embed, view=view)
 
-    async def _execute_export(self, interaction: discord.Interaction, profile_names: List[str], filters: Set[str]):
+    async def _execute_export(self, interaction: discord.Interaction, profile_names: List[str], filters: Set[str], passphrase: Optional[str] = None):
         user_id = interaction.user.id
         user_id_str = str(user_id)
         
-        export_data = {
-            "version": "2.0",
+        raw_export_data = {
             "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "profiles": {}
         }
@@ -1605,23 +1604,85 @@ class CoreMixin:
                 if training_data:
                     p_entry["training"] = training_data
 
-            export_data["profiles"][name] = p_entry
+            raw_export_data["profiles"][name] = p_entry
 
-        file_data = json.dumps(export_data, option=json.OPT_INDENT_2)
+        raw_json_bytes = json.dumps(raw_export_data)
+        export_container = {
+            "mimic_version": "3.0",
+        }
+
+        if passphrase:
+            salt = os.urandom(16)
+            kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=480000)
+            derived_key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode('utf-8')))
+            temp_fernet = Fernet(derived_key)
+            
+            encrypted_payload = temp_fernet.encrypt(raw_json_bytes)
+            export_container["auth_mode"] = "passphrase"
+            export_container["salt"] = base64.b64encode(salt).decode('utf-8')
+            export_container["payload"] = encrypted_payload.decode('utf-8')
+        else:
+            encrypted_payload = self.fernet.encrypt(raw_json_bytes)
+            export_container["auth_mode"] = "master"
+            export_container["payload"] = encrypted_payload.decode('utf-8')
+
+        file_data = json.dumps(export_container, option=json.OPT_INDENT_2)
         filename = f"mimic_export_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.mimic"
         
         buffer = io.BytesIO(file_data)
         discord_file = discord.File(buffer, filename=filename)
         
-        await interaction.followup.send("✅ Export complete. Keep this file safe; it contains your data in plaintext.", file=discord_file, ephemeral=True)
+        msg = "✅ Export complete."
+        if passphrase:
+            msg += " Your data has been securely encrypted with your passphrase for self-hosted migration."
+        else:
+            msg += " Your data is securely encrypted with the official instance master key."
+            
+        await interaction.followup.send(msg, file=discord_file, ephemeral=True)
 
-    async def _execute_import(self, interaction: discord.Interaction, attachment: discord.Attachment):
+    async def _execute_import(self, interaction: discord.Interaction, attachment: discord.Attachment, passphrase: Optional[str] = None):
         try:
             file_bytes = await attachment.read()
-            data = json.loads(file_bytes)
+            
+            try:
+                container = json.loads(file_bytes)
+            except json.JSONDecodeError:
+                raise ValueError("The provided file is not a valid MimicAI 3.0 export container (Invalid JSON).")
+
+            if container.get("mimic_version") != "3.0" or "payload" not in container:
+                raise ValueError("Plaintext or legacy v2.0 exports are rejected by the official instance for security and anti-injection compliance. Please use a valid v3.0 encrypted `.mimic` file.")
+
+            auth_mode = container.get("auth_mode")
+            encrypted_payload = container["payload"].encode('utf-8')
+            raw_json_bytes = None
+
+            if auth_mode == "passphrase":
+                if not passphrase:
+                    raise ValueError("This file is encrypted with a passphrase for self-hosted migration. You must provide the passphrase in the command options to import it.")
+                
+                salt_b64 = container.get("salt")
+                if not salt_b64:
+                    raise ValueError("Corrupted passphrase export: missing cryptographic salt.")
+                    
+                salt = base64.b64decode(salt_b64)
+                kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=480000)
+                derived_key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode('utf-8')))
+                temp_fernet = Fernet(derived_key)
+                
+                try:
+                    raw_json_bytes = temp_fernet.decrypt(encrypted_payload)
+                except InvalidToken:
+                    raise ValueError("Decryption failed. The passphrase provided is incorrect.")
+            else:
+                try:
+                    raw_json_bytes = self.fernet.decrypt(encrypted_payload)
+                except InvalidToken:
+                    raise ValueError("Master key decryption failed. This file belongs to a different MimicAI instance and cannot be imported here without a passphrase migration export.")
+
+            data = json.loads(raw_json_bytes)
             
             if "profiles" not in data:
-                raise ValueError("Invalid MimicAI data structure.")
+                raise ValueError("Decrypted payload is missing the profiles object.")
 
             user_id = interaction.user.id
             user_id_str = str(user_id)
@@ -1633,8 +1694,8 @@ class CoreMixin:
                 if local_name in index.get("personal", []):
                     local_name = f"{name}_imported_{uuid.uuid4().hex[:4]}"
                 
-                import uuid
-                new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
+                import uuid as uuid_lib
+                new_pid = f"A{uuid_lib.uuid4().hex[:15].upper()}"
                 recip_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles", new_pid)
                 os.makedirs(recip_dir, exist_ok=True)
 
@@ -1673,10 +1734,12 @@ class CoreMixin:
 
             self._save_user_index(user_id, index)
             
-            await interaction.followup.send(f"### 📥 Import Successful\nThe following profiles have been added to your vault:\n" + "\n".join(import_log), ephemeral=True)
+            await interaction.followup.send(f"### 📥 Import Successful\nThe following profiles have been securely decrypted and added to your vault:\n" + "\n".join(import_log), ephemeral=True)
 
+        except ValueError as ve:
+            await interaction.followup.send(f"❌ **Import Rejected:** {ve}", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ **Import Failed:** {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ **Import Failed:** An unexpected error occurred: {e}", ephemeral=True)
 
     async def _execute_privacy_export(self, user_id: int, interaction: discord.Interaction):
         user_id_str = str(user_id)

@@ -7,6 +7,9 @@ PRIMARY_MODEL_NAME = 'gemini-3.1-flash-lite'
 FALLBACK_MODEL_NAME = 'gemini-2.5-flash-lite'
 DEFAULT_SYSTEM_INSTRUCTION = "."
 
+DEFAULT_SYSTEM_INSTRUCTION = "."
+OLLAMA_LOCAL_URL = "http://127.0.0.1:11434"
+
 # Define the allowed models for the new command
 ALLOWED_MODELS = Literal[
     'gemini-pro-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest',

@@ -128,3 +128,16 @@ HELP_CATEGORIES = {
         "Interaction": "- `/session swap`: Changes the active profile context for the current session.\n- `/profile list`: Enumerates valid user indices.\n- `/session view`: Dumps session variables and participant statuses to chat.\n- `/refresh`: Performs a targeted wipe of the channel's Short-Term Memory buffer without destroying the session structure.\n- `/whisper`: Transmits hidden variables directly to a profile's context window, eliciting an ephemeral response."
     }
 }
+
+OLLAMA_GUIDE_TEXT = (
+    "**Ollama Localhost Setup Guide**\n\n"
+    "To allow MimicAI to connect to your local Ollama instance remotely, you need to expose your local port securely. "
+    "You can do this easily without port forwarding using a free service like [localhost.run](https://localhost.run/).\n\n"
+    "**Steps:**\n"
+    "1. Ensure Ollama is running locally on port `11434`.\n"
+    "2. Open your terminal or command prompt.\n"
+    "3. Run the following command: `ssh -R 80:localhost:11434 nokey@localhost.run`\n"
+    "4. The output will provide you with a secure `https://` URL (e.g., `https://your-tunnel.localhost.run`).\n"
+    "5. Click **Set Host URL** and paste that `https://` URL.\n\n"
+    "*Note: If the **Set Host URL** appears green, the URL is working. Otherwise, it will appear red. Every time you restart the SSH tunnel, the URL may change.*"
+)

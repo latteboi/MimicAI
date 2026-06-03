@@ -16,6 +16,9 @@ import httpx
 import gc
 import pathlib
 import orjson as json
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.fernet import InvalidToken, Fernet
 from PIL import Image
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple, Optional, Any, Union, get_args
@@ -237,6 +240,177 @@ class OpenRouterModel:
         except asyncio.CancelledError:
             raise
 
+_ollama_global_lock = asyncio.Lock()
+
+class OllamaChatSession:
+    def __init__(self, model, history=None):
+        self.model = model
+        self.history = history or []
+
+class OllamaResponse:
+    def __init__(self, message_dict, finish_reason):
+        self.text = message_dict.get('content', '') or ''
+        self.thought = message_dict.get('reasoning', '') or message_dict.get('reasoning_content', '') or ''
+        self.thought_signature = None
+        
+        if not self.thought and "<think>" in self.text.lower():
+            text_lower = self.text.lower()
+            think_start = text_lower.find("<think>")
+            think_end = text_lower.find("</think>")
+            
+            if think_start != -1:
+                if think_end != -1:
+                    self.thought = self.text[think_start+7:think_end].strip()
+                    self.text = (self.text[:think_start] + self.text[think_end+8:]).strip()
+                else:
+                    self.thought = self.text[think_start+7:].strip()
+                    self.text = self.text[:think_start].strip()
+
+        mock_part = type('obj', (object,), {'text': self.text})
+        mock_content = type('obj', (object,), {'parts': [mock_part]})
+        self.candidates = [type('obj', (object,), {
+            'content': mock_content,
+            'finish_reason': type('obj', (object,), {'name': finish_reason})
+        })]
+        
+    def __bool__(self): return True
+
+class OllamaModel:
+    def __init__(self, model_name, api_url=OLLAMA_LOCAL_URL, system_instruction=None, thinking_params=None, **kwargs):
+        self.model_name = model_name.replace("OLLAMA/", "").replace("GOOGLE/", "").replace("OPENROUTER/", "")
+        self.api_url = api_url.rstrip("/")
+        self.system_instruction = system_instruction
+        self.thinking_params = thinking_params or {}
+
+    def start_chat(self, history=None):
+        return OllamaChatSession(self, history=history)
+
+    async def generate_content_async(self, contents, generation_config=None, safety_settings=None, stream_state=None):
+        import base64
+        import re
+        messages = []
+        if self.system_instruction:
+            messages.append({"role": "system", "content": self.system_instruction})
+        
+        for content in contents:
+            role = "assistant" if content.get('role', 'user') == "model" else "user"
+            text_parts = []
+            images = []
+            
+            for p in content.get('parts', []):
+                if isinstance(p, str) and p.strip():
+                    text_parts.append(p)
+                elif isinstance(p, dict) and 'mime_type' in p and 'data' in p:
+                    mime_type = p['mime_type']
+                    if mime_type.startswith("image/"):
+                        try:
+                            b64_data = base64.b64encode(p['data']).decode('utf-8')
+                            images.append(b64_data)
+                        except Exception as e:
+                            print(f"Error encoding image for Ollama: {e}")
+                elif hasattr(p, 'inline_data') and p.inline_data:
+                    mime_type = p.inline_data.mime_type
+                    if mime_type.startswith("image/"):
+                        try:
+                            b64_data = base64.b64encode(p.inline_data.data).decode('utf-8')
+                            images.append(b64_data)
+                        except Exception as e:
+                            print(f"Error encoding legacy image for Ollama: {e}")
+                elif isinstance(p, dict) and 'url' in p:
+                    mime_type = p.get('mime_type', '')
+                    url = p['url']
+                    if mime_type.startswith("image/"):
+                        if url.startswith(('http://', 'https://')):
+                            try:
+                                async with httpx.AsyncClient() as client:
+                                    resp = await client.get(url, follow_redirects=True, timeout=15.0)
+                                    resp.raise_for_status()
+                                    b64_data = base64.b64encode(resp.content).decode('utf-8')
+                                    images.append(b64_data)
+                            except Exception as e:
+                                print(f"Ollama failed to fetch and encode remote image {url}: {e}")
+                        else:
+                            import re as regex
+                            match = regex.match(r'data:image/[^;]+;base64,(.+)', url)
+                            if match:
+                                images.append(match.group(1))
+
+            msg_obj = {"role": role, "content": "\n".join(text_parts)}
+            if images:
+                msg_obj["images"] = images
+            messages.append(msg_obj)
+
+        temp = 1.0
+        top_p = 1.0
+        advanced = {}
+
+        if isinstance(generation_config, dict):
+            temp = generation_config.get("temperature", 1.0)
+            top_p = generation_config.get("top_p", 1.0)
+            advanced = generation_config.get("_advanced_params", {})
+        elif generation_config:
+            temp = getattr(generation_config, 'temperature', 1.0)
+            top_p = getattr(generation_config, 'top_p', 1.0)
+            if hasattr(generation_config, '_advanced_params') and generation_config._advanced_params:
+                advanced = generation_config._advanced_params
+
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "options": {
+                "temperature": temp,
+                "top_p": top_p,
+            },
+            "stream": True
+        }
+
+        if advanced:
+            if "frequency_penalty" in advanced: payload["options"]["frequency_penalty"] = advanced["frequency_penalty"]
+            if "presence_penalty" in advanced: payload["options"]["presence_penalty"] = advanced["presence_penalty"]
+
+        headers = {
+            "Content-Type": "application/json",
+            "Connection": "keep-alive"
+        }
+
+        global _ollama_global_lock
+        async with _ollama_global_lock:
+            try:
+                async with httpx.AsyncClient() as client:
+                    full_content = ""
+                    reasoning_content = ""
+                    finish_reason = "STOP"
+                    
+                    async with client.stream("POST", f"{self.api_url}/api/chat", json=payload, headers=headers, timeout=120.0) as response:
+                        if response.status_code != 200:
+                            err_text = await response.aread()
+                            raise Exception(f"Ollama API Error {response.status_code}: {err_text.decode('utf-8', errors='ignore')}")
+                        
+                        async for line in response.aiter_lines():
+                            if not line.strip(): continue
+                            try:
+                                chunk = json.loads(line)
+                                msg = chunk.get("message", {})
+                                
+                                if "content" in msg and msg["content"]:
+                                    full_content += msg["content"]
+                                if "thinking" in msg and msg["thinking"]:
+                                    reasoning_content += msg["thinking"]
+                                    
+                                if chunk.get("done"):
+                                    done_reason = chunk.get("done_reason")
+                                    if done_reason:
+                                        finish_reason = done_reason
+                            except Exception:
+                                pass
+
+                    msg_obj = {"content": full_content, "reasoning": reasoning_content}
+                    return OllamaResponse(msg_obj, (finish_reason or 'STOP').upper())
+            except httpx.RequestError as e:
+                raise Exception(f"Ollama Network Error: {str(e)}")
+            except asyncio.CancelledError:
+                raise
+
 class GoogleGenAIChatSession:
     def __init__(self, history=None):
         self.history = history or []
@@ -418,8 +592,6 @@ class ServicesMixin:
     async def _get_or_create_model_for_channel(self, channel_id: int, actual_message_author_id: int, guild_id: int, profile_owner_override: Optional[int] = None, profile_name_override: Optional[str] = None, prompt_content: Optional[str] = None) -> Tuple[Optional[Any], bool, float, float, int, Optional[str], Optional[str]]:
         
         api_key = self._get_api_key_for_guild(guild_id)
-        if not api_key:
-            return None, True, 0.0, 0.0, 0, "Server API key is not configured.", None
         
         if profile_owner_override is not None and profile_name_override is not None:
             profile_owner_id_for_instructions = profile_owner_override
@@ -464,6 +636,9 @@ class ServicesMixin:
             channel_id,
             training_examples_list=training_examples_list
         )
+        
+        if not api_key and not primary_model.upper().startswith("OLLAMA/"):
+             return None, True, 0.0, 0.0, 0, "Server API key is not configured.", None
         
         warning_message = None
 
@@ -533,10 +708,14 @@ class ServicesMixin:
             name_upper = name.upper()
             actual_name = name
             is_openrouter = False
+            is_ollama = False
             
             if name_upper.startswith("OPENROUTER/"):
                 actual_name = name[11:]
                 is_openrouter = True
+            elif name_upper.startswith("OLLAMA/"):
+                actual_name = name[7:]
+                is_ollama = True
             elif name_upper.startswith("GOOGLE/"):
                 actual_name = name[7:]
             
@@ -544,6 +723,9 @@ class ServicesMixin:
                 or_key = self._get_api_key_for_guild(guild_id, provider="openrouter")
                 if not or_key: raise ValueError("OpenRouter API Key not found.")
                 return OpenRouterModel(actual_name, api_key=or_key, system_instruction=system_instr, thinking_params=t_params)
+            elif is_ollama:
+                ollama_host = p_sett_thinking.get("ollama_host_url", OLLAMA_LOCAL_URL)
+                return OllamaModel(actual_name, api_url=ollama_host, system_instruction=system_instr, thinking_params=t_params)
             else:
                 return GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instr, safety_settings=safety, thinking_params=t_params, tools=model_tools)
 
@@ -794,33 +976,43 @@ class ServicesMixin:
         warning_message = None
         system_instructions, _, _, _, _, _, _, _ = self._construct_system_instructions(user_id, profile_name, 0)
         
+        user_api_key = self._get_api_key_for_user(user_id)
+        if not user_api_key and not primary_model.upper().startswith("OLLAMA/"):
+            return None, 0.0, 0.0, 0, "This feature requires a personal API key. Use `/settings` to add one.", None
+        
         safety_level_str = profile_data.get("safety_level", "low")
         safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
         threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
         safety_settings = { cat: threshold for cat in get_args(HarmCategory) }
 
         is_or = False
+        is_ollama = False
         actual_model_name = primary_model
         
         if primary_model.upper().startswith("OPENROUTER/"):
             is_or = True
             actual_model_name = primary_model[11:]
+        elif primary_model.upper().startswith("OLLAMA/"):
+            is_ollama = True
+            actual_model_name = primary_model[7:]
         elif primary_model.upper().startswith("GOOGLE/"):
             is_or = False
-            # [FIXED] Correctly strip the prefix to provide a valid ID to the new SDK
             actual_model_name = primary_model[7:]
         elif "/" in primary_model or "grok" in primary_model.lower():
             is_or = True
 
         try:
             if is_or:
-                user_api_key = self._get_api_key_for_user(user_id, provider="openrouter")
-                if not user_api_key:
+                user_api_key_or = self._get_api_key_for_user(user_id, provider="openrouter")
+                if not user_api_key_or:
                     return None, 0.0, 0.0, 0, "You need to submit an OpenRouter API key using `/settings` to use this model.", None
-                model = OpenRouterModel(actual_model_name, api_key=user_api_key, system_instruction=system_instructions, thinking_params={})
+                model = OpenRouterModel(actual_model_name, api_key=user_api_key_or, system_instruction=system_instructions, thinking_params={})
+            elif is_ollama:
+                ollama_host = profile_data.get("ollama_host_url", OLLAMA_LOCAL_URL)
+                model = OllamaModel(actual_model_name, api_url=ollama_host, system_instruction=system_instructions, thinking_params={})
             else:
-                user_api_key = self._get_api_key_for_user(user_id)
-                if not user_api_key:
+                user_api_key_google = self._get_api_key_for_user(user_id)
+                if not user_api_key_google:
                     return None, 0.0, 0.0, 0, "This feature requires a personal Google Gemini API key. Use `/settings` to add one.", None
                 
                 t_params = {
@@ -2146,10 +2338,14 @@ class ServicesMixin:
                         name_upper = primary_model.upper()
                         actual_name = primary_model
                         is_openrouter = False
+                        is_ollama = False
                         
                         if name_upper.startswith("OPENROUTER/"):
                             actual_name = primary_model[11:]
                             is_openrouter = True
+                        elif name_upper.startswith("OLLAMA/"):
+                            actual_name = primary_model[7:]
+                            is_ollama = True
                         elif name_upper.startswith("GOOGLE/"):
                             actual_name = primary_model[7:]
                         elif "/" in primary_model or "grok" in primary_model.lower():
@@ -2191,6 +2387,9 @@ class ServicesMixin:
                                 model = OpenRouterModel(actual_name, api_key=or_key, system_instruction=full_system_instruction, thinking_params=t_params_worker)
                             else:
                                 warning_message = f"API Configuration Error: OpenRouter API Key missing for this server. Cannot load model '{primary_model}'."
+                        elif is_ollama:
+                            ollama_host = p_settings.get("ollama_host_url", OLLAMA_LOCAL_URL)
+                            model = OllamaModel(actual_name, api_url=ollama_host, system_instruction=full_system_instruction, thinking_params=t_params_worker)
                         else:
                             try:
                                 # [NEW] Pass thinking_params and tools here
@@ -2384,12 +2583,16 @@ class ServicesMixin:
                                     try:
                                         fb_name = fallback_model_name
                                         fb_is_or = False
+                                        fb_is_ollama = False
                                         
                                         if fb_name.upper().startswith("GOOGLE/"):
                                             fb_name = fb_name[7:]
                                         elif fb_name.upper().startswith("OPENROUTER/"):
                                             fb_name = fb_name[11:]
                                             fb_is_or = True
+                                        elif fb_name.upper().startswith("OLLAMA/"):
+                                            fb_name = fb_name[7:]
+                                            fb_is_ollama = True
                                         elif "/" in fb_name:
                                             fb_is_or = True
                                         
@@ -2399,15 +2602,11 @@ class ServicesMixin:
                                                 fallback_instance = OpenRouterModel(fb_name, api_key=or_key, system_instruction=full_system_instruction, thinking_params=t_params_worker)
                                             else:
                                                 raise ValueError("No OpenRouter key for fallback")
+                                        elif fb_is_ollama:
+                                            ollama_host = p_settings.get("ollama_host_url", OLLAMA_LOCAL_URL)
+                                            fallback_instance = OllamaModel(fb_name, api_url=ollama_host, system_instruction=full_system_instruction, thinking_params=t_params_worker)
                                         else:
-                                            fallback_instance = GoogleGenAIModel(
-                                                api_key=api_key, 
-                                                model_name=fb_name, 
-                                                system_instruction=full_system_instruction, 
-                                                safety_settings=dynamic_safety_settings, 
-                                                thinking_params=t_params_worker,
-                                                tools=model_tools
-                                            )
+                                            api_key = self._get_api_key_for_guild(channel.guild.id)
                                         
                                         response, state_container = await self._generate_with_heartbeat(
                                             fallback_instance, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
@@ -2443,7 +2642,7 @@ class ServicesMixin:
                                             api_error_reason = self._format_api_error(retry_e)
                                         status = "api_error"
                             finally:
-                                self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile", model_used=model.model_name if hasattr(model, 'model_name') else "unknown", status=status)
+                                self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile", model_used=model, status=status)
                         else:
                             api_error_reason = warning_message or "Internal API Initialization Error"
 
@@ -3382,7 +3581,7 @@ class ServicesMixin:
                                     failure_reason = self._format_api_error(e)
                                     status = "api_error"
                                 finally:
-                                    self._log_api_call(user_id=package['author_id'], guild_id=package['guild_id'], context="image_generation_jit", model_used=image_model.model_name, status=status)
+                                    self._log_api_call(user_id=package['author_id'], guild_id=package['guild_id'], context="image_generation_jit", model_used=image_model, status=status)
                                 
                                 del parts
 
@@ -3658,7 +3857,7 @@ class ServicesMixin:
                         response = await image_model.generate_content_async([{'role': 'user', 'parts': [request_data['prompt_text']]}])
                         status = "blocked_by_safety" if not response.candidates else "success"
                     finally:
-                        self._log_api_call(user_id=request_data['author_id'], guild_id=request_data['guild_id'], context="image_generation_prefetch", model_used=image_model.model_name, status=status)
+                        self._log_api_call(user_id=request_data['author_id'], guild_id=request_data['guild_id'], context="image_generation_prefetch", model_used=image_model, status=status)
 
                     if not response.candidates:
                         reason = "Safety Filter";
@@ -3979,10 +4178,14 @@ class ServicesMixin:
             ltm_model_raw = params_source.get("ltm_model", FALLBACK_MODEL_NAME) if 'params_source' in locals() else FALLBACK_MODEL_NAME
             
         is_or = False
+        is_ollama = False
         actual_model_name = ltm_model_raw
         if ltm_model_raw.upper().startswith("OPENROUTER/"):
             actual_model_name = ltm_model_raw[11:]
             is_or = True
+        elif ltm_model_raw.upper().startswith("OLLAMA/"):
+            actual_model_name = ltm_model_raw[7:]
+            is_ollama = True
         elif ltm_model_raw.upper().startswith("GOOGLE/"):
             actual_model_name = ltm_model_raw[7:]
             is_or = False
@@ -3997,6 +4200,9 @@ class ServicesMixin:
                 api_key = self._get_api_key_for_guild(effective_guild_id, "openrouter") if effective_guild_id else self._get_api_key_for_user(profile_owner_id, "openrouter")
                 if not api_key: return None
                 m = OpenRouterModel(actual_model_name, api_key=api_key, system_instruction=instructions, thinking_params={})
+            elif is_ollama:
+                ollama_host = params_source.get("ollama_host_url", OLLAMA_LOCAL_URL) if 'params_source' in locals() else OLLAMA_LOCAL_URL
+                m = OllamaModel(actual_model_name, api_url=ollama_host, system_instruction=instructions, thinking_params={})
             else:
                 api_key = self._get_api_key_for_guild(effective_guild_id) if effective_guild_id else self._get_api_key_for_user(profile_owner_id)
                 if not api_key: return None
@@ -5463,10 +5669,14 @@ class ServicesMixin:
                     break
         
         is_or = False
+        is_ollama = False
         actual_model_name = critic_model_raw
         if critic_model_raw.upper().startswith("OPENROUTER/"):
             actual_model_name = critic_model_raw[11:]
             is_or = True
+        elif critic_model_raw.upper().startswith("OLLAMA/"):
+            actual_model_name = critic_model_raw[7:]
+            is_ollama = True
         elif critic_model_raw.upper().startswith("GOOGLE/"):
             actual_model_name = critic_model_raw[7:]
             is_or = False
@@ -5481,6 +5691,9 @@ class ServicesMixin:
                 api_key = self._get_api_key_for_guild(guild_id, "openrouter")
                 if not api_key: return None
                 model = OpenRouterModel(actual_model_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params)
+            elif is_ollama:
+                ollama_host = p_config.get("ollama_host_url", OLLAMA_LOCAL_URL) if 'p_config' in locals() else OLLAMA_LOCAL_URL
+                model = OllamaModel(actual_model_name, api_url=ollama_host, system_instruction=system_instruction, thinking_params=t_params)
             else:
                 api_key = self._get_api_key_for_guild(guild_id)
                 if not api_key: return None
@@ -5519,13 +5732,27 @@ class ServicesMixin:
         try:
             # Route based on prefix
             is_or = model_name.upper().startswith("OPENROUTER/")
-            actual_model = model_name[11:] if is_or else model_name[7:]
+            is_ollama = model_name.upper().startswith("OLLAMA/")
+            
+            actual_model = model_name
+            if is_or: actual_model = model_name[11:]
+            elif is_ollama: actual_model = model_name[7:]
+            elif model_name.upper().startswith("GOOGLE/"): actual_model = model_name[7:]
             
             response_text = ""
             if is_or:
                 key = self._get_api_key_for_user(user_id, "openrouter") or self._get_api_key_for_guild(interaction.guild_id, "openrouter")
                 if not key: raise ValueError("No OpenRouter API key found.")
                 model = OpenRouterModel(actual_model, api_key=key)
+                resp = await model.generate_content_async([{"role": "user", "parts": [prompt]}])
+                response_text = resp.text
+            elif is_ollama:
+                index = self._get_user_index(user_id)
+                p_is_b = profile_name in index.get("borrowed", [])
+                p_cfg = self._get_profile_config(user_id, profile_name, p_is_b) or {}
+                ollama_host = p_cfg.get("ollama_host_url", OLLAMA_LOCAL_URL)
+                
+                model = OllamaModel(actual_model, api_url=ollama_host)
                 resp = await model.generate_content_async([{"role": "user", "parts": [prompt]}])
                 response_text = resp.text
             else:
@@ -6505,12 +6732,16 @@ class ServicesMixin:
                     try:
                         fb_name = fallback_model_name
                         fb_is_or = False
+                        fb_is_ollama = False
                         
                         if fb_name.upper().startswith("GOOGLE/"):
                             fb_name = fb_name[7:]
                         elif fb_name.upper().startswith("OPENROUTER/"):
                             fb_name = fb_name[11:]
                             fb_is_or = True
+                        elif fb_name.upper().startswith("OLLAMA/"):
+                            fb_name = fb_name[7:]
+                            fb_is_ollama = True
                         elif "/" in fb_name:
                             fb_is_or = True
                         
@@ -6520,6 +6751,9 @@ class ServicesMixin:
                                 fallback_instance = OpenRouterModel(fb_name, api_key=or_key, system_instruction=full_system_instruction, thinking_params=t_params_worker)
                             else:
                                 raise ValueError("No OpenRouter key for fallback")
+                        elif fb_is_ollama:
+                            ollama_host = p_profile.get("ollama_host_url", OLLAMA_LOCAL_URL)
+                            fallback_instance = OllamaModel(fb_name, api_url=ollama_host, system_instruction=full_system_instruction, thinking_params=t_params_worker)
                         else:
                             api_key = self._get_api_key_for_guild(channel.guild.id)
                             
@@ -6839,6 +7073,11 @@ class ServicesMixin:
             return "Unsupported File Format (Model lacks Audio support)"
         if "video input" in error_str.lower() or "support video" in error_str.lower():
             return "Unsupported File Format (Model lacks Video support)"
+            
+        if "Ollama Network Error" in error_str:
+            return "Localhost Unreachable (Ensure Ollama is running on 127.0.0.1:11434)"
+        if "Ollama API Error" in error_str:
+            return f"Ollama Error: {error_str.split(':', 1)[-1].strip()}"
             
         # [NEW] Parse OpenRouter JSON errors gracefully
         if "OpenRouter API Error" in error_str:

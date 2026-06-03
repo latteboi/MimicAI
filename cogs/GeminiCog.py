@@ -402,19 +402,19 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     @app_commands.dm_only()
     async def export_command(self, interaction: discord.Interaction):
         view = BulkExportView(self, interaction.user.id)
-        await interaction.response.send_message("### 📤 Profile Export\nSelect profiles and components to export. **Warning:** The file will contain decrypted data.", view=view, ephemeral=True)
+        await interaction.response.send_message("### 📤 Profile Export\nSelect profiles and components to export.\n\n*The file will contain encrypted data. Tampered files cannot be imported.*\n", view=view, ephemeral=True)
 
     @app_commands.command(name="import", description="Import profiles and memories from a MimicAI export file (DM Only).")
     @app_commands.checks.cooldown(1, 30.0, key=lambda i: i.user.id)
     @app_commands.dm_only()
-    @app_commands.describe(file="The .json or .mimic file exported from a MimicAI instance.")
-    async def import_command(self, interaction: discord.Interaction, file: discord.Attachment):
-        if not file.filename.endswith(('.json', '.mimic')):
-            await interaction.response.send_message("❌ Invalid file type. Please upload a `.json` or `.mimic` file.", ephemeral=True)
+    @app_commands.describe(file="The .mimic file exported from a MimicAI instance.", passphrase="Required if the file was exported using the Self-Hosted option.")
+    async def import_command(self, interaction: discord.Interaction, file: discord.Attachment, passphrase: Optional[str] = None):
+        if not file.filename.endswith('.mimic'):
+            await interaction.response.send_message("❌ Invalid file type. Please upload a `.mimic` file.", ephemeral=True)
             return
         
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self._execute_import(interaction, file)
+        await self._execute_import(interaction, file, passphrase)
 
     @app_commands.command(name="privacy", description="Manage your data privacy and account deletion.")
     @app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
@@ -439,7 +439,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         )
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
         
-        embed.add_field(name="Version", value="v0.2.2 Beta", inline=True)
+        embed.add_field(name="Version", value="v0.3.0 Beta", inline=True)
         embed.add_field(name="Global Scope", value=f"{len(self.bot.guilds)} Servers", inline=True)
 
         if is_owner:
@@ -1375,6 +1375,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
 
     def _record_model_usage(self, model_name: str, provider: str):
         if not model_name or provider == "google": return
+        if "OLLAMA/" in model_name.upper() or provider == "ollama": return
         
         filename = "openrouter_models.json"
         path = os.path.join(self.MODELS_DATA_DIR, filename)
@@ -1398,7 +1399,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         except Exception as e:
             print(f"Error recording model usage: {e}")
 
-    def _log_api_call(self, user_id: int, guild_id: Optional[int], context: str, model_used: str, status: str):
+    def _log_api_call(self, user_id: int, guild_id: Optional[int], context: str, model_used: Any, status: str):
         if status == "success":
             allowed_contexts = [
                 'multi_profile', 'global_chat', 'freewill',
@@ -1407,20 +1408,41 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             if context not in allowed_contexts:
                 return
 
-            # Robust provider detection for recording popularity
+            model_name_str = "unknown"
+            is_ollama = False
             is_google = False
-            if model_used in get_args(ALLOWED_MODELS):
-                is_google = True
-            elif model_used.startswith("models/"):
-                is_google = True
-            elif "gemini" in model_used.lower():
-                if "/" in model_used and not model_used.startswith("models/"):
-                    is_google = False
-                else:
+
+            if isinstance(model_used, str):
+                model_name_str = model_used
+                if "OLLAMA/" in model_name_str.upper():
+                    is_ollama = True
+            elif model_used is not None:
+                class_name = model_used.__class__.__name__
+                if class_name == "OllamaModel":
+                    is_ollama = True
+                    model_name_str = f"OLLAMA/{model_used.model_name}"
+                elif class_name == "OpenRouterModel":
+                    model_name_str = f"OPENROUTER/{model_used.model_name}"
+                elif class_name == "GoogleGenAIModel":
+                    model_name_str = f"GOOGLE/{model_used.model_name}"
                     is_google = True
+                elif hasattr(model_used, "model_name"):
+                    model_name_str = model_used.model_name
+
+            if not is_ollama and not is_google:
+                # Robust provider detection for recording popularity
+                if model_name_str in get_args(ALLOWED_MODELS):
+                    is_google = True
+                elif model_name_str.startswith("models/"):
+                    is_google = True
+                elif "gemini" in model_name_str.lower():
+                    if "/" in model_name_str and not model_name_str.startswith("models/"):
+                        is_google = False
+                    else:
+                        is_google = True
             
-            if not is_google:
-                self._record_model_usage(model_used, "openrouter")
+            if not is_google and not is_ollama:
+                self._record_model_usage(model_name_str, "openrouter")
 
     async def session_participant_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
         server_id_str = str(interaction.guild_id) if interaction.guild_id else "dm"

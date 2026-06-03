@@ -14,6 +14,7 @@ import asyncio
 import orjson as json
 from typing import TYPE_CHECKING, List, Dict, Tuple, Set, Literal, Any, Optional, get_args
 from .constants import IMAGE_MODELS, AUDIO_MODELS
+from .content import OLLAMA_GUIDE_TEXT
 from .storage import (
     _quantize_embedding, 
 )
@@ -342,16 +343,14 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
     async def on_submit(self, interaction: discord.Interaction):
         value = self.model_id_input.value.strip()
         
-        # Remove potential system display prefixes if user typed them manually (Case-Sensitive)
-        if value.startswith("GOOGLE/"):
-            value = value[7:]
-        elif value.startswith("OPENROUTER/"):
-            value = value[11:]
+        if value.startswith("GOOGLE/"): value = value[7:]
+        elif value.startswith("OPENROUTER/"): value = value[11:]
+        elif value.startswith("OLLAMA/"): value = value[7:]
         
-        # Determine prefix based on mode
-        prefix = "OPENROUTER/" if self.parent_view.view_mode == "openrouter" else "GOOGLE/"
+        prefix = "GOOGLE/"
+        if self.parent_view.view_mode == "openrouter": prefix = "OPENROUTER/"
+        elif self.parent_view.view_mode == "ollama": prefix = "OLLAMA/"
         
-        # Always prepend the prefix
         value = prefix + value
         
         self.parent_view._save_changes(self.target_config_key, value)
@@ -3653,6 +3652,35 @@ class SessionConfigView(ui.View):
         except Exception as e:
             print(f"Error updating SessionConfigView: {e}")
 
+class OllamaHostModal(ui.Modal, title="Set Ollama Host URL"):
+    host_input = ui.TextInput(label="Ollama API URL", placeholder="http://127.0.0.1:11434 (Blank for default)", required=False)
+    
+    def __init__(self, view):
+        super().__init__()
+        self.parent_view = view
+        
+        if hasattr(view, 'profile_name') and view.profile_name != "BULK_APPLY":
+            cfg = view.cog._get_profile_config(view.user_id, view.profile_name, getattr(view, 'is_borrowed', False)) or {}
+            self.host_input.default = cfg.get("ollama_host_url", OLLAMA_LOCAL_URL)
+        else:
+            self.host_input.default = getattr(view, 'models_state', {}).get("ollama_host_url", OLLAMA_LOCAL_URL)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        url = self.host_input.value.strip()
+        if not url:
+            url = OLLAMA_LOCAL_URL
+        elif not url.startswith("http"):
+            url = "http://" + url
+        
+        self.parent_view._save_changes("ollama_host_url", url)
+        
+        await interaction.response.defer()
+        self.parent_view.ollama_working = "processing"
+        
+        await self.parent_view._update_ollama_status()
+        self.parent_view._build_view()
+        await interaction.edit_original_response(content=self.parent_view._get_selection_feedback_message(), view=self.parent_view)
+
 class SingleProfileModelView(ui.View):
     def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, profile_name: str):
         super().__init__(timeout=300)
@@ -3699,11 +3727,13 @@ class SingleProfileModelView(ui.View):
         
         def clean(val):
             if not val: return "None"
-            return str(val).replace("GOOGLE/", "").replace("OPENROUTER/", "")
+            return str(val).replace("GOOGLE/", "").replace("OPENROUTER/", "").replace("OLLAMA/", "")
             
         msg = f"**Profile:** `{self.profile_name}`\n"
         if self.view_mode == 'openrouter':
             msg += "⚠️ **Note:** OpenRouter / Custom models require **RAG Mode** for Grounding and URL Context.\n\n"
+        elif self.view_mode == 'ollama':
+            msg += "⚠️ **Note:** Localhost models run on your machine's hardware. Processing speed depends on your GPU/CPU.\n\n"
         
         if self.category == 'response':
             p_clean = clean(data.get("primary_model", PRIMARY_MODEL_NAME))
@@ -3732,19 +3762,42 @@ class SingleProfileModelView(ui.View):
             
         if provider == 'google':
             return list(get_args(ALLOWED_MODELS))
+        elif provider == 'ollama':
+            return getattr(self, 'cached_ollama_models', [])
 
+        import os
+        import json as std_json
         filename = "openrouter_models.json"
         path = os.path.join(self.cog.MODELS_DATA_DIR, filename)
         
         data = {}
         if os.path.exists(path):
             try:
-                with open(path, 'rb') as f:
-                    data = json.loads(f.read())
-            except: data = {}
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = std_json.load(f)
+            except: 
+                data = {}
 
         sorted_models = sorted(data.items(), key=lambda x: x[1], reverse=True)
         return [m[0] for m in sorted_models]
+
+    async def _update_ollama_status(self):
+        host_url = OLLAMA_LOCAL_URL
+        if hasattr(self, 'profile_name') and self.profile_name != "BULK_APPLY":
+            cfg = self.cog._get_profile_config(self.user_id, self.profile_name, getattr(self, 'is_borrowed', False)) or {}
+            host_url = cfg.get("ollama_host_url", OLLAMA_LOCAL_URL)
+        
+        try:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{host_url.rstrip('/')}/api/tags", timeout=2.0)
+                self.ollama_working = (resp.status_code == 200)
+                if self.ollama_working:
+                    data = resp.json()
+                    self.cached_ollama_models = [m['name'] for m in data.get('models', [])]
+        except Exception:
+            self.ollama_working = False
+            self.cached_ollama_models = []
 
     class GenericModelSelect(ui.Select):
         def __init__(self, placeholder: str, options: list, row: int, target_config_key: str):
@@ -3753,6 +3806,9 @@ class SingleProfileModelView(ui.View):
 
         async def callback(self, interaction: discord.Interaction):
             view: SingleProfileModelView = self.view
+            if self.values[0] == "ollama_offline":
+                await interaction.response.send_message("Ollama is offline or has no models downloaded.", ephemeral=True)
+                return
             if self.values[0] == "custom_option":
                 await interaction.response.send_modal(CustomModelModal(view, self.target_config_key))
             else: 
@@ -3765,12 +3821,14 @@ class SingleProfileModelView(ui.View):
         opts = [discord.SelectOption(label="Custom Model...", value="custom_option", description="Enter manually via modal")]
         
         if current_val:
-            # We do NOT strip the prefix here so the user always sees the exact provider routing for the active model.
             opts.append(discord.SelectOption(label=f"Current: {current_val}", value=current_val, default=True))
         
-        prefix = "OPENROUTER/" if self.view_mode == 'openrouter' else "GOOGLE/"
+        prefix = "GOOGLE/"
+        if self.view_mode == 'openrouter': prefix = "OPENROUTER/"
+        elif self.view_mode == 'ollama': prefix = "OLLAMA/"
+        
         if target_config_key in ['image_generation_model', 'speech_model']:
-            prefix = "GOOGLE/" # Enforce Google prefix for media
+            prefix = "GOOGLE/"
             
         added = len(opts)
         for m in top_models:
@@ -3779,6 +3837,10 @@ class SingleProfileModelView(ui.View):
             if current_val != val:
                 opts.append(discord.SelectOption(label=m[:100], value=val))
                 added += 1
+                
+        if self.view_mode == 'ollama' and not top_models:
+            opts.append(discord.SelectOption(label="⚠️ Ollama Offline / No Models", value="ollama_offline", description=f"Check {OLLAMA_LOCAL_URL}"))
+            
         return opts
 
     def _build_view(self):
@@ -3813,14 +3875,45 @@ class SingleProfileModelView(ui.View):
             self.add_item(self.GenericModelSelect("Select LTM Summariser Model...", self._create_model_options(l_val, "ltm_model"), 0, "ltm_model"))
 
         # --- Row 2 Actions ---
-        api_label = "API: Google" if self.view_mode == 'google' else "API: OpenRouter"
-        btn_api = ui.Button(label=api_label, style=discord.ButtonStyle.primary, row=2, disabled=(self.category == 'media'))
+        api_modes = ['google', 'openrouter', 'ollama']
+        api_labels = {'google': 'API: Google', 'openrouter': 'API: OpenRouter', 'ollama': 'API: Ollama (Local)'}
+        
+        btn_api = ui.Button(label=api_labels[self.view_mode], style=discord.ButtonStyle.primary, row=2, disabled=(self.category == 'media'))
         async def api_cb(i: discord.Interaction):
-            self.view_mode = 'openrouter' if self.view_mode == 'google' else 'google'
-            self._build_view()
-            await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+            next_idx = (api_modes.index(self.view_mode) + 1) % len(api_modes)
+            self.view_mode = api_modes[next_idx]
+            if self.view_mode == 'ollama':
+                await i.response.defer()
+                self.ollama_working = "processing"
+                await self._update_ollama_status()
+                self._build_view()
+                await i.edit_original_response(content=self._get_selection_feedback_message(), view=self)
+            else:
+                self._build_view()
+                await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
         btn_api.callback = api_cb
         self.add_item(btn_api)
+        
+        if self.view_mode == 'ollama':
+            host_style = discord.ButtonStyle.secondary
+            if getattr(self, 'ollama_working', None) == "processing":
+                host_style = discord.ButtonStyle.blurple
+            elif getattr(self, 'ollama_working', None) is True:
+                host_style = discord.ButtonStyle.success
+            elif getattr(self, 'ollama_working', None) is False:
+                host_style = discord.ButtonStyle.danger
+                
+            btn_host = ui.Button(label="Set Host URL", style=host_style, row=2)
+            async def host_cb(i: discord.Interaction):
+                await i.response.send_modal(OllamaHostModal(self))
+            btn_host.callback = host_cb
+            self.add_item(btn_host)
+            
+            btn_guide = ui.Button(label="Guide", style=discord.ButtonStyle.secondary, row=2)
+            async def guide_cb(i: discord.Interaction):
+                await i.response.send_message(OLLAMA_GUIDE_TEXT, ephemeral=True)
+            btn_guide.callback = guide_cb
+            self.add_item(btn_guide)
 
         categories = ['response', 'media', 'tools', 'ltm']
         cat_labels = {'response': 'Response', 'media': 'Media', 'tools': 'Tools', 'ltm': 'LTM'}
@@ -3891,7 +3984,8 @@ class ModelApplyView(ui.View):
             'speech_model': None,
             'grounding_rag_model': None,
             'critic_model': None,
-            'ltm_model': None
+            'ltm_model': None,
+            'ollama_host_url': None
         }
 
         self._load_lists()
@@ -3916,11 +4010,13 @@ class ModelApplyView(ui.View):
         
         def clean(val):
             if not val: return "Unchanged"
-            return str(val).replace("GOOGLE/", "").replace("OPENROUTER/", "")
+            return str(val).replace("GOOGLE/", "").replace("OPENROUTER/", "").replace("OLLAMA/", "")
             
         msg = f"**Category:** `{self.category.title()}`\n"
         if self.view_mode == 'openrouter':
             msg += "⚠️ **Note:** OpenRouter / Custom models require **RAG Mode** for Grounding and URL Context.\n\n"
+        elif self.view_mode == 'ollama':
+            msg += "⚠️ **Note:** Localhost models run on your machine's hardware. Processing speed depends on your GPU/CPU.\n\n"
         
         if self.category == 'response':
             p_clean = clean(self.models_state['primary_model'])
@@ -3958,21 +4054,25 @@ class ModelApplyView(ui.View):
             
         if provider == 'google':
             return list(get_args(ALLOWED_MODELS))
+        elif provider == 'ollama':
+            return getattr(self, 'cached_ollama_models', [])
 
+        import os
+        import json as std_json
         filename = "openrouter_models.json"
         path = os.path.join(self.cog.MODELS_DATA_DIR, filename)
         
         data = {}
         if os.path.exists(path):
             try:
-                with open(path, 'rb') as f:
-                    data = json.loads(f.read())
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = std_json.load(f)
             except: 
                 data = {}
 
         sorted_models = sorted(data.items(), key=lambda x: x[1], reverse=True)
         return [m[0] for m in sorted_models]
-
+    
     class GenericBulkModelSelect(ui.Select):
         def __init__(self, placeholder: str, options: list, row: int, target_config_key: str):
             super().__init__(placeholder=placeholder, options=options, row=row)
@@ -3980,6 +4080,9 @@ class ModelApplyView(ui.View):
 
         async def callback(self, interaction: discord.Interaction):
             view = self.view
+            if self.values[0] == "ollama_offline":
+                await interaction.response.send_message("Ollama is offline or has no models downloaded.", ephemeral=True)
+                return
             if self.values[0] == "custom_option":
                 await interaction.response.send_modal(CustomModelModal(view, self.target_config_key))
             else: 
@@ -3994,7 +4097,10 @@ class ModelApplyView(ui.View):
         if current_val:
             opts.append(discord.SelectOption(label=f"Current: {current_val}", value=current_val, default=True))
         
-        prefix = "OPENROUTER/" if self.view_mode == 'openrouter' else "GOOGLE/"
+        prefix = "GOOGLE/"
+        if self.view_mode == 'openrouter': prefix = "OPENROUTER/"
+        elif self.view_mode == 'ollama': prefix = "OLLAMA/"
+        
         if target_config_key in ['image_generation_model', 'speech_model']:
             prefix = "GOOGLE/"
             
@@ -4005,6 +4111,10 @@ class ModelApplyView(ui.View):
             if current_val != val:
                 opts.append(discord.SelectOption(label=m[:100], value=val))
                 added += 1
+                
+        if self.view_mode == 'ollama' and not top_models:
+            opts.append(discord.SelectOption(label="⚠️ Ollama Offline / No Models", value="ollama_offline", description=f"Check {OLLAMA_LOCAL_URL}"))
+            
         return opts
 
     def _build_view(self):
@@ -4036,35 +4146,52 @@ class ModelApplyView(ui.View):
             self.add_item(self.GenericBulkModelSelect("Select LTM Summariser Model...", self._create_model_options(l_val, "ltm_model"), 0, "ltm_model"))
 
         active_list = self._get_active_list()
-        num_pages = (len(active_list) - 1) // DROPDOWN_MAX_OPTIONS + 1
+        per_page = 23
+        num_pages = max(1, (len(active_list) - 1) // per_page + 1)
         if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
         
-        start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_profiles = active_list[start : start + DROPDOWN_MAX_OPTIONS]
+        start = self.current_page * per_page
+        page_profiles = active_list[start : start + per_page]
 
-        # Row 2 Settings & Actions
-        page_set = set(page_profiles)
-        page_selected = page_set.issubset(self.target_profiles) if page_profiles else False
-        page_label = "Unselect Page" if page_selected else "Select Page"
-        toggle_page_btn = ui.Button(label=page_label, style=discord.ButtonStyle.secondary, row=2)
-        toggle_page_btn.callback = self.toggle_page_callback
-        self.add_item(toggle_page_btn)
+        api_modes = ['google', 'openrouter', 'ollama']
+        api_labels = {'google': 'API: Google', 'openrouter': 'API: OpenRouter', 'ollama': 'API: Ollama (Local)'}
         
-        all_set = set(active_list)
-        all_selected = all_set.issubset(self.target_profiles) if active_list else False
-        all_label = "Unselect All" if all_selected else "Select All"
-        toggle_all_btn = ui.Button(label=all_label, style=discord.ButtonStyle.secondary, row=2)
-        toggle_all_btn.callback = self.toggle_all_callback
-        self.add_item(toggle_all_btn)
-
-        api_label = "API: Google" if self.view_mode == 'google' else "API: OpenRouter"
-        btn_api = ui.Button(label=api_label, style=discord.ButtonStyle.primary, row=2, disabled=(self.category == 'media'))
+        btn_api = ui.Button(label=api_labels[self.view_mode], style=discord.ButtonStyle.primary, row=2, disabled=(self.category == 'media'))
         async def api_cb(i: discord.Interaction):
-            self.view_mode = 'openrouter' if self.view_mode == 'google' else 'google'
-            self._build_view()
-            await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+            next_idx = (api_modes.index(self.view_mode) + 1) % len(api_modes)
+            self.view_mode = api_modes[next_idx]
+            if self.view_mode == 'ollama':
+                await i.response.defer()
+                self.ollama_working = "processing"
+                await self._update_ollama_status()
+                self._build_view()
+                await i.edit_original_response(content=self._get_selection_feedback_message(), view=self)
+            else:
+                self._build_view()
+                await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
         btn_api.callback = api_cb
         self.add_item(btn_api)
+
+        if self.view_mode == 'ollama':
+            host_style = discord.ButtonStyle.secondary
+            if getattr(self, 'ollama_working', None) == "processing":
+                host_style = discord.ButtonStyle.blurple
+            elif getattr(self, 'ollama_working', None) is True:
+                host_style = discord.ButtonStyle.success
+            elif getattr(self, 'ollama_working', None) is False:
+                host_style = discord.ButtonStyle.danger
+                
+            btn_host = ui.Button(label="Set Host URL", style=host_style, row=2)
+            async def host_cb(i: discord.Interaction):
+                await i.response.send_modal(OllamaHostModal(self))
+            btn_host.callback = host_cb
+            self.add_item(btn_host)
+            
+            btn_guide = ui.Button(label="Guide", style=discord.ButtonStyle.secondary, row=2)
+            async def guide_cb(i: discord.Interaction):
+                await i.response.send_message(OLLAMA_GUIDE_TEXT, ephemeral=True)
+            btn_guide.callback = guide_cb
+            self.add_item(btn_guide)
 
         categories = ['response', 'media', 'tools', 'ltm']
         cat_labels = {'response': 'Response', 'media': 'Media', 'tools': 'Tools', 'ltm': 'LTM'}
@@ -4094,6 +4221,17 @@ class ModelApplyView(ui.View):
             self.add_item(btn_fallback)
         
         options = []
+        if page_profiles:
+            page_set = set(page_profiles)
+            page_selected = page_set.issubset(self.target_profiles)
+            page_label = "Unselect Page" if page_selected else "Select Page"
+            options.append(discord.SelectOption(label=page_label, value="toggle_page", description="Toggle selection for all profiles on this page.", emoji="📄"))
+            
+            all_set = set(active_list)
+            all_selected = all_set.issubset(self.target_profiles)
+            all_label = "Unselect All" if all_selected else "Select All"
+            options.append(discord.SelectOption(label=all_label, value="toggle_all", description="Toggle selection for all profiles in this source.", emoji="📚"))
+
         for name in page_profiles:
             options.append(discord.SelectOption(label=name, value=name, default=(name in self.target_profiles)))
         
@@ -4123,6 +4261,20 @@ class ModelApplyView(ui.View):
         apply_btn.callback = self.apply_settings
         self.add_item(apply_btn)
 
+    async def _update_ollama_status(self):
+        host_url = self.models_state.get("ollama_host_url") or OLLAMA_LOCAL_URL
+        try:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{host_url.rstrip('/')}/api/tags", timeout=2.0)
+                self.ollama_working = (resp.status_code == 200)
+                if self.ollama_working:
+                    data = resp.json()
+                    self.cached_ollama_models = [m['name'] for m in data.get('models', [])]
+        except Exception:
+            self.ollama_working = False
+            self.cached_ollama_models = []
+
     async def toggle_source_callback(self, interaction: discord.Interaction):
         self.view_source = 'borrowed' if self.view_source == 'personal' else 'personal'
         self.current_page = 0
@@ -4140,29 +4292,25 @@ class ModelApplyView(ui.View):
         await interaction.response.edit_message(view=self)
 
     async def profile_callback(self, interaction: discord.Interaction):
+        vals = interaction.data.get('values', [])
+        
+        per_page = 23
         active_list = self._get_active_list()
-        start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_profiles = active_list[start : start + DROPDOWN_MAX_OPTIONS]
-        self.target_profiles.difference_update(set(page_profiles))
-        self.target_profiles.update(interaction.data['values'])
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def toggle_page_callback(self, interaction: discord.Interaction):
-        active_list = self._get_active_list()
-        start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_profiles = active_list[start : start + DROPDOWN_MAX_OPTIONS]
-        page_set = set(page_profiles)
-        if page_set.issubset(self.target_profiles): self.target_profiles.difference_update(page_set)
-        else: self.target_profiles.update(page_set)
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def toggle_all_callback(self, interaction: discord.Interaction):
-        active_list = self._get_active_list()
-        all_set = set(active_list)
-        if all_set.issubset(self.target_profiles): self.target_profiles.difference_update(all_set)
-        else: self.target_profiles.update(all_set)
+        start = self.current_page * per_page
+        page_profiles = active_list[start : start + per_page]
+        
+        if "toggle_page" in vals:
+            page_set = set(page_profiles)
+            if page_set.issubset(self.target_profiles): self.target_profiles.difference_update(page_set)
+            else: self.target_profiles.update(page_set)
+        elif "toggle_all" in vals:
+            all_set = set(active_list)
+            if all_set.issubset(self.target_profiles): self.target_profiles.difference_update(all_set)
+            else: self.target_profiles.update(all_set)
+        else:
+            self.target_profiles.difference_update(set(page_profiles))
+            self.target_profiles.update(vals)
+            
         self._build_view()
         await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
 
@@ -4243,13 +4391,24 @@ class BaseBulkProfileView(ui.View):
     def _build_profile_select_ui(self, row=1):
         active_list = self._get_active_list()
         
-        num_pages = (len(active_list) - 1) // DROPDOWN_MAX_OPTIONS + 1
+        per_page = 23
+        num_pages = (len(active_list) - 1) // per_page + 1
         if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
-        start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_items = active_list[start : start + DROPDOWN_MAX_OPTIONS]
+        start = self.current_page * per_page
+        page_items = active_list[start : start + per_page]
         
         options = []
         if page_items:
+            page_set = set(page_items)
+            page_selected = page_set.issubset(self.selected_profiles)
+            page_label = "Unselect Page" if page_selected else "Select Page"
+            options.append(discord.SelectOption(label=page_label, value="toggle_page", description="Toggle selection for all profiles on this page.", emoji="📄"))
+            
+            all_set = set(active_list)
+            all_selected = all_set.issubset(self.selected_profiles)
+            all_label = "Unselect All" if all_selected else "Select All"
+            options.append(discord.SelectOption(label=all_label, value="toggle_all", description="Toggle selection for all profiles in this source.", emoji="📚"))
+
             for name in page_items:
                 options.append(discord.SelectOption(label=name, value=name, default=(name in self.selected_profiles)))
         else:
@@ -4311,13 +4470,22 @@ class BaseBulkProfileView(ui.View):
         vals = interaction.data.get('values', [])
         if "none" in vals: vals = []
         
+        per_page = 23
         active_list = self._get_active_list()
-        start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_items = set(active_list[start : start + DROPDOWN_MAX_OPTIONS])
+        start = self.current_page * per_page
+        page_items = set(active_list[start : start + per_page])
         
-        self.selected_profiles.difference_update(page_items)
-        self.selected_profiles.update(vals)
-        
+        if "toggle_page" in vals:
+            if page_items.issubset(self.selected_profiles): self.selected_profiles.difference_update(page_items)
+            else: self.selected_profiles.update(page_items)
+        elif "toggle_all" in vals:
+            all_set = set(active_list)
+            if all_set.issubset(self.selected_profiles): self.selected_profiles.difference_update(all_set)
+            else: self.selected_profiles.update(all_set)
+        else:
+            self.selected_profiles.difference_update(page_items)
+            self.selected_profiles.update(vals)
+            
         self._build_view()
         await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
 
@@ -6706,6 +6874,18 @@ class SessionView(ui.View):
         embed = await self.cog._build_profile_embed(participant['owner_id'], participant['profile_name'], self.channel_id)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+class ExportPassphraseModal(ui.Modal, title="Self-Hosted Export"):
+    passphrase_input = ui.TextInput(label="Enter a strong passphrase", placeholder="Used to decrypt on your self-hosted instance", required=True, min_length=8, max_length=100)
+
+    def __init__(self, parent_view):
+        super().__init__()
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        passphrase = self.passphrase_input.value
+        await self.parent_view.cog._execute_export(interaction, list(self.parent_view.selected_profiles), self.parent_view.export_filters, passphrase=passphrase)
+
 class BulkExportView(BaseBulkProfileView):
     def __init__(self, cog: 'GeminiAgent', user_id: int):
         super().__init__(cog, user_id, include_borrowed=False)
@@ -6731,21 +6911,30 @@ class BulkExportView(BaseBulkProfileView):
         filter_select.callback = self.filter_callback
         self.add_item(filter_select)
 
-        export_btn = ui.Button(label="Export Selected to Plaintext", style=discord.ButtonStyle.green, row=3)
-        export_btn.callback = self.export_callback
-        self.add_item(export_btn)
+        export_master_btn = ui.Button(label="Standard Export", style=discord.ButtonStyle.primary, row=3)
+        export_master_btn.callback = self.export_master_callback
+        self.add_item(export_master_btn)
+
+        export_selfhost_btn = ui.Button(label="Export for Self-Hosted", style=discord.ButtonStyle.secondary, row=3)
+        export_selfhost_btn.callback = self.export_selfhost_callback
+        self.add_item(export_selfhost_btn)
 
     async def filter_callback(self, interaction: discord.Interaction):
         self.export_filters = set(interaction.data['values'])
         await interaction.response.defer()
 
-    async def export_callback(self, interaction: discord.Interaction):
+    async def export_master_callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         if not self.selected_profiles:
             await interaction.followup.send("Select at least one profile to export.", ephemeral=True)
             return
-        
         await self.cog._execute_export(interaction, list(self.selected_profiles), self.export_filters)
+
+    async def export_selfhost_callback(self, interaction: discord.Interaction):
+        if not self.selected_profiles:
+            await interaction.response.send_message("Select at least one profile to export.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ExportPassphraseModal(self))
 
 class ModBaseView(ui.View):
     def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, current_tab: str):
