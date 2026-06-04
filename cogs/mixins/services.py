@@ -2614,6 +2614,15 @@ class ServicesMixin:
                                             fallback_instance = OllamaModel(fb_name, api_url=ollama_host, system_instruction=full_system_instruction, thinking_params=t_params_worker)
                                         else:
                                             api_key = self._get_api_key_for_guild(channel.guild.id)
+                                            if not api_key: raise ValueError("No Google API Key for fallback")
+                                            fallback_instance = GoogleGenAIModel(
+                                                api_key=api_key, 
+                                                model_name=fb_name, 
+                                                system_instruction=full_system_instruction, 
+                                                safety_settings=dynamic_safety_settings,
+                                                thinking_params=t_params_worker,
+                                                tools=model_tools
+                                            )
                                         
                                         response, state_container = await self._generate_with_heartbeat(
                                             fallback_instance, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container

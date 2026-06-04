@@ -971,13 +971,16 @@ class CoreMixin:
 
                         fb_name = fallback_model_name
                         fb_is_or = False
+                        fb_is_ollama = False
                         
                         if fb_name.upper().startswith("OPENROUTER/"):
                             fb_name = fb_name[11:]
                             fb_is_or = True
                         elif fb_name.upper().startswith("GOOGLE/"):
                             fb_name = fb_name[7:]
-                            fb_is_or = False
+                        elif fb_name.upper().startswith("OLLAMA/"):
+                            fb_name = fb_name[7:]
+                            fb_is_ollama = True
                         elif "/" in fb_name:
                             fb_is_or = True
                         
@@ -987,6 +990,9 @@ class CoreMixin:
                                 fallback_instance = OpenRouterModel(fb_name, api_key=or_key, system_instruction=sys_instr, thinking_params={})
                             else:
                                 raise ValueError("No OR key for fallback")
+                        elif fb_is_ollama:
+                            ollama_host = p_data_f.get("ollama_host_url", OLLAMA_LOCAL_URL)
+                            fallback_instance = OllamaModel(fb_name, api_url=ollama_host, system_instruction=sys_instr, thinking_params={})
                         else:
                             user_key = self._get_api_key_for_user(host_user_id)
                             if user_key:
