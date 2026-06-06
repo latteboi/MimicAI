@@ -1328,7 +1328,12 @@ class ProfileManageView(ui.View):
             curr = profile.get("response_mode", "regular")
             profile["response_mode"] = modes[(modes.index(curr) + 1) % len(modes)]
             await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
-        elif choice == "image_settings":
+        elif choice == "image_toggle":
+            # Inject prompt into current_params to avoid breaking the modal signature
+            if not self.is_borrowed:
+                prompts = self.cog._get_profile_prompts(self.user_id, profile_name) or {}
+                profile["image_generation_prompt"] = prompts.get("image_generation_prompt")
+                
             async def refresh_cb(modal_interaction: discord.Interaction):
                 new_embed = await self.cog._build_profile_manage_embed(modal_interaction, profile_name)
                 await self.original_interaction.edit_original_response(embed=new_embed, view=self)
@@ -4392,7 +4397,7 @@ class BaseBulkProfileView(ui.View):
         active_list = self._get_active_list()
         
         per_page = 23
-        num_pages = (len(active_list) - 1) // per_page + 1
+        num_pages = max(1, (len(active_list) - 1) // per_page + 1)
         if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
         start = self.current_page * per_page
         page_items = active_list[start : start + per_page]
@@ -4439,20 +4444,6 @@ class BaseBulkProfileView(ui.View):
         next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, custom_id="next_page", disabled=(self.current_page >= num_pages - 1), row=btn_row)
         next_btn.callback = self.pagination_callback
         self.add_item(next_btn)
-        
-        page_set = set(page_items)
-        all_selected = page_set.issubset(self.selected_profiles) if page_items else False
-        toggle_label = "Unselect Page" if all_selected else "Select Page"
-        toggle_btn = ui.Button(label=toggle_label, style=discord.ButtonStyle.secondary, custom_id="toggle_page_select", row=btn_row, disabled=(not page_items))
-        toggle_btn.callback = self.toggle_page_select_callback
-        self.add_item(toggle_btn)
-
-        active_list_set = set(active_list)
-        all_selected_global = active_list_set.issubset(self.selected_profiles) if active_list else False
-        toggle_all_label = "Unselect All" if all_selected_global else "Select All"
-        toggle_all_btn = ui.Button(label=toggle_all_label, style=discord.ButtonStyle.secondary, custom_id="toggle_all_select", row=btn_row, disabled=(not active_list))
-        toggle_all_btn.callback = self.toggle_all_select_callback
-        self.add_item(toggle_all_btn)
 
     async def toggle_source_callback(self, interaction: discord.Interaction):
         self.view_source = 'borrowed' if self.view_source == 'personal' else 'personal'
@@ -4486,24 +4477,6 @@ class BaseBulkProfileView(ui.View):
             self.selected_profiles.difference_update(page_items)
             self.selected_profiles.update(vals)
             
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def toggle_page_select_callback(self, interaction: discord.Interaction):
-        active_list = self._get_active_list()
-        start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_items = set(active_list[start : start + DROPDOWN_MAX_OPTIONS])
-        
-        if page_items.issubset(self.selected_profiles): self.selected_profiles.difference_update(page_items)
-        else: self.selected_profiles.update(page_items)
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def toggle_all_select_callback(self, interaction: discord.Interaction):
-        active_list = self._get_active_list()
-        all_set = set(active_list)
-        if all_set.issubset(self.selected_profiles): self.selected_profiles.difference_update(all_set)
-        else: self.selected_profiles.update(all_set)
         self._build_view()
         await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
 

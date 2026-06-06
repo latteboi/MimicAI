@@ -2361,7 +2361,7 @@ class CoreMixin:
 
         def clean_m(m_str):
             if not m_str: return "None"
-            return str(m_str).replace("GOOGLE/", "").replace("OPENROUTER/", "")
+            return str(m_str)
 
         img_model = config.get("image_generation_model", "gemini-2.5-flash-image")
         aud_model = config.get("speech_model", "gemini-2.5-flash-preview-tts")

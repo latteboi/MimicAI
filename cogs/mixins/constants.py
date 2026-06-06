@@ -122,7 +122,8 @@ DEFAULT_ANTI_REPETITION_PROMPT = (
     "  * 'Do not acknowledge or reference the user's frustration or feedback.'\n"
     "  * 'Do not mention Melbourne Central or Miyama in this response.'\n"
     "  * 'Do not start the message by addressing User X.'\n"
-    "  * 'Avoid using a clinical or corporate tone; stop explaining your purpose.'"
+    "  * 'Avoid using a clinical or corporate tone; stop explaining your purpose.'\n"
+    "- Restrict your constraints to 8 lines."
 )
 
 DEFAULT_TRAINING_ANALYST_PROMPT = (

@@ -5599,38 +5599,80 @@ class ServicesMixin:
                 return False, f"An error occurred while processing the avatar URL: {e}"
 
         try:
-            api_key = self._get_api_key_for_user(user_id)
-            if not api_key:
-                return False, "A Personal Google Gemini API Key is required to perform safety analysis for public profiles. Please configure one via the `/settings` command."
+            or_key = self._get_api_key_for_user(user_id, "openrouter")
+            g_key = self._get_api_key_for_user(user_id, "gemini")
             
-            model_name = 'gemini-2.5-flash-lite'
+            if not or_key and not g_key:
+                return False, "A Personal API Key (OpenRouter or Google) is required to perform safety analysis for public profiles. Please configure one via the `/settings` command."
+            
+            parts_list = [
+                f"<target_content>\nProfile Name: {profile_name}\nDisplay Name: {display_name}\n</target_content>"
+            ]
+            if image_data:
+                parts_list.append({"mime_type": content_type, "data": image_data})
+
+            eval_payload = [{"role": "user", "parts": parts_list}]
+            gen_cfg = {"temperature": 0.0, "top_k": 1, "top_p": 0.9}
+            
+            response = None
             status = "api_error"
-            try:
-                # [FIXED] Move rules to system_instruction to prevent jailbreaking
-                model = GoogleGenAIModel(
-                    api_key=api_key,
-                    model_name=model_name, 
-                    system_instruction=prompt_text,
-                    safety_settings=DEFAULT_SAFETY_SETTINGS
-                )
-                eval_payload = [
-                    f"<target_content>\nProfile Name: {profile_name}\nDisplay Name: {display_name}\n</target_content>"
-                ]
-                if image_data:
-                    eval_payload.append({"mime_type": content_type, "data": image_data})
+            or_error = None
+            g_error = None
+            
+            if or_key:
+                used_model = "amazon/nova-lite-v1"
+                try:
+                    model = OpenRouterModel(
+                        api_key=or_key,
+                        model_name=used_model, 
+                        system_instruction=prompt_text
+                    )
+                    response = await model.generate_content_async(eval_payload, generation_config=gen_cfg)
+                    status = "blocked_by_safety" if not response.candidates else "success"
+                except Exception as e:
+                    or_error = str(e)
+                    print(f"OpenRouter Auto-Mod failed: {e}")
+                    response = None
+                finally:
+                    self._log_api_call(user_id=0, guild_id=None, context="moderation_check", model_used=used_model, status=status)
 
-                gen_cfg = {"temperature": 0.0, "top_k": 1, "top_p": 0.9}
-                response = await model.generate_content_async(eval_payload, generation_config=gen_cfg)
-                status = "blocked_by_safety" if not response.candidates else "success"
-            finally:
-                self._log_api_call(user_id=0, guild_id=None, context="moderation_check", model_used=model_name, status=status)
+            if not response and g_key:
+                status = "api_error"
+                used_model = "gemini-2.5-flash-lite"
+                try:
+                    model = GoogleGenAIModel(
+                        api_key=g_key,
+                        model_name=used_model,
+                        system_instruction=prompt_text,
+                        safety_settings=DEFAULT_SAFETY_SETTINGS
+                    )
+                    response = await model.generate_content_async(eval_payload, generation_config=gen_cfg)
+                    status = "blocked_by_safety" if not response.candidates else "success"
+                except Exception as e:
+                    g_error = str(e)
+                    print(f"Google Auto-Mod failed: {e}")
+                    response = None
+                finally:
+                    self._log_api_call(user_id=0, guild_id=None, context="moderation_check_fallback" if or_key else "moderation_check", model_used=used_model, status=status)
 
-            if not response.candidates:
+            if not response or not response.candidates:
                 reason = "Unknown"
-                if response.prompt_feedback and response.prompt_feedback.block_reason:
+                if response and hasattr(response, 'prompt_feedback') and response.prompt_feedback and response.prompt_feedback.block_reason:
                     reason = response.prompt_feedback.block_reason.name
-                print(f"Auto-moderation check failed because the prompt was blocked. Reason: {reason}")
-                return False, f"Content was flagged as unsafe by the AI moderator ({reason})."
+                
+                print(f"Auto-moderation check failed. OpenRouter Error: {or_error} | Google Error: {g_error} | Block Reason: {reason}")
+                
+                err_msg = "Content was flagged as unsafe or validation failed."
+                if or_error and g_error:
+                    err_msg += f" Primary model failed ({self._format_api_error(Exception(or_error))}). Fallback model failed ({self._format_api_error(Exception(g_error))})."
+                elif or_error:
+                    err_msg += f" Model failed ({self._format_api_error(Exception(or_error))})."
+                elif g_error:
+                    err_msg += f" Model failed ({self._format_api_error(Exception(g_error))})."
+                elif reason != "Unknown":
+                    err_msg += f" Block reason: {reason}."
+                
+                return False, err_msg
 
             result = ""
             if response.candidates:
@@ -5638,7 +5680,9 @@ class ServicesMixin:
                 if candidate.content and candidate.content.parts:
                     result = "".join(p.text for p in candidate.content.parts if hasattr(p, 'text')).strip().upper()
 
-            if result == "SAFE":
+            if "SAFE" in result and "UNSAFE" not in result:
+                return True, "Content is safe."
+            elif result == "SAFE":
                 return True, "Content is safe."
             else:
                 return False, "Content was flagged as unsafe by the AI moderator."
