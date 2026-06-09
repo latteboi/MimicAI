@@ -3313,8 +3313,12 @@ class ProfileTypingSettingsModal(ui.Modal, title="Realistic Typing Settings"):
         
         status_val = "on" if current_params.get("realistic_typing_enabled", False) else "off"
         self.add_item(ui.TextInput(label="Enable Realistic Typing (on/off)", custom_id="enabled", default=status_val, required=True))
+        
+        mode_val = current_params.get("typing_mode", "sentence")
+        self.add_item(ui.TextInput(label="Mode (sentence/line)", custom_id="mode", default=mode_val, required=False, placeholder="Default: sentence"))
+        
         self.add_item(ui.TextInput(label="Characters per Second", custom_id="cps", default=str(current_params.get("typing_cps", 30.0)), required=False, placeholder="Default: 30.0"))
-        self.add_item(ui.TextInput(label="Max Delay per Sentence (Seconds)", custom_id="max_delay", default=str(current_params.get("typing_max_delay", 2.5)), required=False, placeholder="Default: 2.5"))
+        self.add_item(ui.TextInput(label="Max Delay per Chunk (Seconds)", custom_id="max_delay", default=str(current_params.get("typing_max_delay", 2.5)), required=False, placeholder="Default: 2.5"))
     
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -3323,6 +3327,11 @@ class ProfileTypingSettingsModal(ui.Modal, title="Realistic Typing Settings"):
             def gv(cid): return next((c.value for c in self.children if c.custom_id == cid), None)
             en_val = gv("enabled").strip().lower()
             new_params["realistic_typing_enabled"] = (en_val == "on")
+            
+            mode_val = gv("mode")
+            if mode_val:
+                mode_clean = mode_val.strip().lower()
+                new_params["typing_mode"] = "line" if mode_clean == "line" else "sentence"
             
             cps_val = gv("cps")
             if cps_val and cps_val.strip(): new_params["typing_cps"] = float(cps_val.strip())

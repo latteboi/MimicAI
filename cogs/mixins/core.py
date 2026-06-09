@@ -744,6 +744,7 @@ class CoreMixin:
                     "realistic_typing": profile_data_source.get("realistic_typing_enabled", False),
                     "typing_cps": profile_data_source.get("typing_cps", 30.0),
                     "typing_max_delay": profile_data_source.get("typing_max_delay", 2.5),
+                    "typing_mode": profile_data_source.get("typing_mode", "sentence"),
                     "correlation_id": correlation_id
                 }
             })

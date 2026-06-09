@@ -914,6 +914,37 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         
         await interaction.followup.send("The session memory for this channel has been cleared. The conversation will start from scratch.", ephemeral=True)
 
+    @app_commands.command(name="cancel", description="Stops the bot's current generation or typing in this channel.")
+    @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
+    @app_commands.guild_only()
+    async def cancel_slash(self, interaction: discord.Interaction):
+        if not self.has_lock: return
+        session = self.multi_profile_channels.get(interaction.channel_id)
+        
+        if not session or (not session.get('is_running') and not session.get('is_regenerating')):
+            await interaction.response.send_message("Nothing is currently being generated in this channel.", ephemeral=True)
+            return
+
+        if session.get("owner_id") != interaction.user.id and not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only the session owner or a server administrator can cancel generation.", ephemeral=True)
+            return
+
+        if session.get('worker_task') and not session['worker_task'].done():
+            self._safe_cancel_task(session['worker_task'])
+            session['worker_task'] = None
+            
+        session['is_running'] = False
+        session['is_regenerating'] = False
+        
+        for p in session.get('profiles', []):
+            if p.get('method') == 'child_bot' and p.get('bot_id'):
+                await self.manager_queue.put({
+                    "action": "send_to_child", "bot_id": p['bot_id'],
+                    "payload": {"action": "stop_typing", "channel_id": interaction.channel_id}
+                })
+
+        await interaction.response.send_message("Generation and typing cancelled for this channel.", ephemeral=True)
+
     @app_commands.command(name="shutdown", description="Gracefully shuts down this bot instance (Bot Owner Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     @app_commands.dm_only()

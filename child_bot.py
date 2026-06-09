@@ -314,6 +314,7 @@ class HiveMind:
         realistic_typing = payload.get("realistic_typing", False)
         typing_cps = payload.get("typing_cps", 30.0)
         typing_max_delay = payload.get("typing_max_delay", 2.5)
+        typing_mode = payload.get("typing_mode", "sentence")
         reply_to_id = payload.get("reply_to_id")
         ping = payload.get("ping", False)
 
@@ -336,33 +337,60 @@ class HiveMind:
         sent_messages = []
         try:
             if realistic_typing:
-                sentences = _split_into_sentences_with_abbreviations(content)
+                chunks = _split_into_sentences_with_abbreviations(content)
+                
                 async with channel.typing():
-                    for i, sentence in enumerate(sentences):
-                        if not sentence.strip(): continue
-                        try:
-                            typing_cps_float = float(typing_cps)
-                            if typing_cps_float <= 0: typing_cps_float = 30.0
-                        except: typing_cps_float = 30.0
-                        
-                        try:
-                            typing_max_delay_float = float(typing_max_delay)
-                        except: typing_max_delay_float = 2.5
+                    displayed_text = ""
+                    last_edit_time = 0
+                    sent_message = None
+                    
+                    try:
+                        typing_cps_float = float(typing_cps)
+                        if typing_cps_float <= 0: typing_cps_float = 30.0
+                    except: typing_cps_float = 30.0
+                    
+                    try:
+                        typing_max_delay_float = float(typing_max_delay)
+                    except: typing_max_delay_float = 2.5
 
-                        delay = max(0.5, min(len(sentence) / typing_cps_float, typing_max_delay_float))
+                    for i, chunk in enumerate(chunks):
+                        if not chunk.strip():
+                            continue
+
+                        delay = max(0.5, min(len(chunk) / typing_cps_float, typing_max_delay_float))
                         await asyncio.sleep(delay)
                         
-                        kwargs = {"content": sentence}
-                        if i == 0:
-                            if file_to_send: kwargs["file"] = file_to_send
-                            if reply_to_id:
-                                try:
-                                    ref_msg = await channel.fetch_message(reply_to_id)
-                                    m = await ref_msg.reply(mention_author=ping, **kwargs)
-                                except: m = await channel.send(**kwargs)
-                            else: m = await channel.send(**kwargs)
-                        else: m = await channel.send(**kwargs)
-                        sent_messages.append(m)
+                        separator = "\n" if typing_mode == "line" and displayed_text else (" " if displayed_text else "")
+                        
+                        if len(displayed_text) + len(separator) + len(chunk) > 2000:
+                            displayed_text = chunk
+                            sent_message = None
+                        else:
+                            displayed_text += separator + chunk
+                            
+                        kwargs = {"content": displayed_text}
+                        
+                        if not sent_message:
+                            if i == 0:
+                                if file_to_send: kwargs["file"] = file_to_send
+                                if reply_to_id:
+                                    try:
+                                        ref_msg = await channel.fetch_message(reply_to_id)
+                                        sent_message = await ref_msg.reply(mention_author=ping, **kwargs)
+                                    except: sent_message = await channel.send(**kwargs)
+                                else: sent_message = await channel.send(**kwargs)
+                            else: sent_message = await channel.send(**kwargs)
+                            sent_messages.append(sent_message)
+                            last_edit_time = asyncio.get_running_loop().time()
+                        else:
+                            now = asyncio.get_running_loop().time()
+                            if now - last_edit_time < 1.5:
+                                await asyncio.sleep(1.5 - (now - last_edit_time))
+                            try:
+                                await sent_message.edit(content=displayed_text)
+                            except Exception as e:
+                                print(f"[Hive] Typing edit failed: {e}")
+                            last_edit_time = asyncio.get_running_loop().time()
             else:
                 try: await channel.typing()
                 except: pass

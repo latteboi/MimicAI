@@ -868,7 +868,7 @@ class ServicesMixin:
                     gen_task.cancel()
                     try:
                         await gen_task
-                    except Exception:
+                    except (Exception, asyncio.CancelledError):
                         pass # Ignore exceptions from the forcibly killed task
                     err = TimeoutError(f"Generation timed out after {hard_timeout} seconds")
                     err.state_container = state_container
@@ -3011,6 +3011,7 @@ class ServicesMixin:
                             "realistic_typing": is_realistic_typing, 
                             "typing_cps": profile_settings.get("typing_cps", 30.0),
                             "typing_max_delay": profile_settings.get("typing_max_delay", 2.5),
+                            "typing_mode": profile_settings.get("typing_mode", "sentence"),
                             "correlation_id": correlation_id,
                             "reply_to_id": reply_id, "ping": should_ping
                         }
@@ -3769,6 +3770,9 @@ class ServicesMixin:
                         payload = {
                             "action": "send_message", "channel_id": channel.id, "content": delivery_text, 
                             "correlation_id": correlation_id, "realistic_typing": is_realistic_typing,
+                            "typing_cps": profile_settings.get("typing_cps", 30.0),
+                            "typing_max_delay": profile_settings.get("typing_max_delay", 2.5),
+                            "typing_mode": profile_settings.get("typing_mode", "sentence"),
                             "reply_to_id": reply_id, "ping": should_ping
                         }
                         if image_file_to_send:
@@ -4433,48 +4437,74 @@ class ServicesMixin:
                 if not webhook_to_use:
                     raise ValueError("Could not get webhook for realistic typing.")
 
-                if target_message_to_edit:
-                    try: await target_message_to_edit.delete()
-                    except (discord.NotFound, discord.Forbidden): pass
-                
-                sentences = _split_into_sentences_with_abbreviations(content)
-                
-                for i, sentence in enumerate(sentences):
-                    if not isinstance(sentence, str) or not sentence.strip():
-                        continue
-                    
-                    try:
-                        typing_cps_float = float(typing_cps)
-                        if typing_cps_float <= 0: typing_cps_float = 30.0
-                    except: typing_cps_float = 30.0
-                    
-                    try:
-                        typing_max_delay_float = float(typing_max_delay)
-                    except: typing_max_delay_float = 2.5
+                typing_mode = "sentence"
+                if profile_owner_id_for_appearance is not None and profile_name_for_appearance:
+                    index = self._get_user_index(profile_owner_id_for_appearance)
+                    is_borrowed = profile_name_for_appearance in index.get("borrowed", [])
+                    p_config = self._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, is_borrowed) or {}
+                    typing_mode = p_config.get("typing_mode", "sentence")
 
-                    delay = max(0.5, min(len(sentence) / typing_cps_float, typing_max_delay_float))
+                chunks = _split_into_sentences_with_abbreviations(content)
+
+                displayed_text = ""
+                last_edit_time = 0
+                sent_message = None
+
+                try:
+                    typing_cps_float = float(typing_cps)
+                    if typing_cps_float <= 0: typing_cps_float = 30.0
+                except: typing_cps_float = 30.0
+                
+                try:
+                    typing_max_delay_float = float(typing_max_delay)
+                except: typing_max_delay_float = 2.5
+
+                for i, chunk in enumerate(chunks):
+                    if not chunk.strip():
+                        continue
+                        
+                    delay = max(0.5, min(len(chunk) / typing_cps_float, typing_max_delay_float))
                     await asyncio.sleep(delay)
                     
-                    embeds_to_send = embeds if i == 0 and embeds is not None else []
+                    separator = "\n" if typing_mode == "line" and displayed_text else (" " if displayed_text else "")
                     
-                    send_kwargs = {
-                        "content": sentence,
-                        "username": custom_display_name_to_use,
-                        "avatar_url": custom_avatar_url_to_use,
-                        "embeds": embeds_to_send,
-                        "wait": True
-                    }
-                    if i == 0 and file:
-                        send_kwargs["file"] = file
-                    if isinstance(channel, discord.Thread):
-                        send_kwargs["thread"] = channel
+                    if len(displayed_text) + len(separator) + len(chunk) > 2000:
+                        displayed_text = chunk
+                        sent_message = None
+                    else:
+                        displayed_text += separator + chunk
                     
-                    sent_message_part = await webhook_to_use.send(**send_kwargs)
-                    if sent_message_part:
-                        sent_messages_list.append(sent_message_part)
+                    if not sent_message:
+                        send_kwargs = {
+                            "content": displayed_text,
+                            "username": custom_display_name_to_use,
+                            "avatar_url": custom_avatar_url_to_use,
+                            "embeds": embeds if (i == 0 and embeds) else [],
+                            "wait": True
+                        }
+                        if i == 0 and file: send_kwargs["file"] = file
+                        if isinstance(channel, discord.Thread): send_kwargs["thread"] = channel
+                        
+                        if i == 0 and target_message_to_edit:
+                            try: await target_message_to_edit.delete()
+                            except: pass
+                            
+                        sent_message = await webhook_to_use.send(**send_kwargs)
+                        sent_messages_list.append(sent_message)
                         if i == 0 and store_prompt_for_id:
-                            self.message_id_to_original_prompt[sent_message_part.id] = store_prompt_for_id
-                
+                            self.message_id_to_original_prompt[sent_message.id] = store_prompt_for_id
+                        last_edit_time = time.monotonic()
+                    else:
+                        now = time.monotonic()
+                        if now - last_edit_time < 1.5:
+                            await asyncio.sleep(1.5 - (now - last_edit_time))
+                            
+                        try:
+                            await webhook_to_use.edit_message(sent_message.id, content=displayed_text)
+                        except Exception as e:
+                            print(f"Typing edit failed: {e}")
+                        last_edit_time = time.monotonic()
+                        
                 return sent_messages_list
             except Exception as e:
                 print(f"Realistic typing failed, falling back to standard send. Error: {e}")
@@ -7135,7 +7165,7 @@ class ServicesMixin:
             return "Unsupported File Format (Model lacks Video support)"
             
         if "Ollama Network Error" in error_str:
-            return "Localhost Unreachable (Ensure Ollama is running on 127.0.0.1:11434)"
+            return "Ollama Unreachable (Ensure Ollama is running."
         if "Ollama API Error" in error_str:
             return f"Ollama Error: {error_str.split(':', 1)[-1].strip()}"
             
