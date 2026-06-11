@@ -896,10 +896,13 @@ class CoreMixin:
             
             stm_length = int(profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
             if stm_length > 0:
-                history_slice = chat.history[-(stm_length * 2):]
+                history_slice = chat.history[-stm_length:]
                 contents_for_api_call.extend(history_slice)
 
-            contents_for_api_call.append(user_content_obj_for_turn)
+            if contents_for_api_call and contents_for_api_call[-1].get('role') == 'user':
+                contents_for_api_call[-1]['parts'].extend(user_content_obj_for_turn['parts'])
+            else:
+                contents_for_api_call.append(user_content_obj_for_turn)
             
             gen_config = {
                 "temperature": temp, "top_p": top_p, "top_k": top_k,
@@ -1485,7 +1488,7 @@ class CoreMixin:
         
         stm_length = int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
         if stm_length > 0:
-            past_log = past_log[-(stm_length * 2):]
+            past_log = past_log[-stm_length:]
         else:
             past_log = []
             
@@ -1504,15 +1507,24 @@ class CoreMixin:
                         parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
                     if turn.get("grounding_context") and p_settings.get("grounding_mode", "off") != "off":
                         parts.append(f"\n{turn.get('grounding_context')}")
-                participant_history.append({'role': role, 'parts': parts})
+                if participant_history and participant_history[-1]['role'] == role:
+                    participant_history[-1]['parts'].extend(parts)
+                else:
+                    participant_history.append({'role': role, 'parts': parts})
             elif turn_type == "whisper" and turn.get("target_pid") == bot_pid:
                 header, body = turn.get("content").split('\n', 1)
                 wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
-                participant_history.append({'role': 'user', 'parts': [wrapped]})
+                if participant_history and participant_history[-1]['role'] == 'user':
+                    participant_history[-1]['parts'].append(wrapped)
+                else:
+                    participant_history.append({'role': 'user', 'parts': [wrapped]})
             elif turn_type == "private_response" and turn.get("speaker_pid") == bot_pid:
                 header, body = turn.get("content").split('\n', 1)
                 wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                participant_history.append({'role': 'model', 'parts': [wrapped]})
+                if participant_history and participant_history[-1]['role'] == 'model':
+                    participant_history[-1]['parts'].append(wrapped)
+                else:
+                    participant_history.append({'role': 'model', 'parts': [wrapped]})
 
         gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "thinking_config": {"include_thoughts": True}}
         
@@ -1951,10 +1963,18 @@ class CoreMixin:
             
             for key_to_add in new_keys - existing_keys:
                 participant_history = []
+                bot_pid = self._get_pid_from_name_any(key_to_add[0], key_to_add[1])
                 for turn in session.get("unified_log", []):
                     speaker_key = tuple(turn.get("speaker_key", []))
-                    role = 'model' if speaker_key == key_to_add else 'user'
-                    participant_history.append({'role': role, 'parts': [turn.get("content")]})
+                    if turn.get("speaker_pid"):
+                        role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
+                    else:
+                        role = 'model' if speaker_key == key_to_add else 'user'
+                    
+                    if participant_history and participant_history[-1]['role'] == role:
+                        participant_history[-1]['parts'].append(turn.get("content"))
+                    else:
+                        participant_history.append({'role': role, 'parts': [turn.get("content")]})
                 session["chat_sessions"][key_to_add] = GoogleGenAIChatSession(history=participant_history)
 
             for key_to_remove in existing_keys - new_keys:
@@ -2154,7 +2174,7 @@ class CoreMixin:
             if stm_length > 0:
                 # Ensure we have enough context relative to the cast size
                 effective_stm = max(stm_length, num_participants)
-                history_slice = unified_log[-(effective_stm * 2):]
+                history_slice = unified_log[-effective_stm:]
 
             participant_history = []
             for turn in history_slice:
@@ -2170,23 +2190,34 @@ class CoreMixin:
                     if role == 'user' and turn.get("grounding_context") and p_profile_settings.get("grounding_mode", "off") != "off":
                         parts.append(f"\n{turn.get('grounding_context')}")
 
-                    participant_history.append({'role': role, 'parts': parts})
+                    if participant_history and participant_history[-1]['role'] == role:
+                        participant_history[-1]['parts'].extend(parts)
+                    else:
+                        participant_history.append({'role': role, 'parts': parts})
                 elif turn_type == "whisper":
                     if turn.get("target_pid") == bot_pid:
                         # [NEW] Apply standardised XML wrapping during re-hydration
                         clean_content = turn.get("content")
                         wrapped = f"<whisper_context>\n{clean_content.strip()}\n</whisper_context>\n"
-                        participant_history.append({'role': 'user', 'parts': [wrapped]})
+                        if participant_history and participant_history[-1]['role'] == 'user':
+                            participant_history[-1]['parts'].append(wrapped)
+                        else:
+                            participant_history.append({'role': 'user', 'parts': [wrapped]})
                 elif turn_type == "private_response":
                     if turn.get("speaker_pid") == bot_pid:
                         # [NEW] Apply dynamic XML wrapping during re-hydration
                         clean_content = turn.get("content")
                         header, body = clean_content.split('\n', 1)
                         wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                        obj = {'role': 'model', 'parts': [wrapped]}
-                        if turn.get('thought_signature'):
-                            obj['thought_signature'] = turn.get('thought_signature')
-                        participant_history.append(obj)
+                        if participant_history and participant_history[-1]['role'] == 'model':
+                            participant_history[-1]['parts'].append(wrapped)
+                            if turn.get('thought_signature'):
+                                participant_history[-1]['thought_signature'] = turn.get('thought_signature')
+                        else:
+                            obj = {'role': 'model', 'parts': [wrapped]}
+                            if turn.get('thought_signature'):
+                                obj['thought_signature'] = turn.get('thought_signature')
+                            participant_history.append(obj)
             
             session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 

@@ -129,6 +129,9 @@ class OpenRouterModel:
             messages.append({"role": "system", "content": self.system_instruction})
         
         for content in contents:
+            if isinstance(content, str):
+                content = {'role': 'user', 'parts': [content]}
+                
             role = "assistant" if content.get('role', 'user') == "model" else "user"
             message_parts = []
             
@@ -298,6 +301,9 @@ class OllamaModel:
             messages.append({"role": "system", "content": self.system_instruction})
         
         for content in contents:
+            if isinstance(content, str):
+                content = {'role': 'user', 'parts': [content]}
+                
             role = "assistant" if content.get('role', 'user') == "model" else "user"
             text_parts = []
             images = []
@@ -1315,22 +1321,33 @@ class ServicesMixin:
                             
                             if not turn_type:
                                 role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
-                                participant_history.append({'role': role, 'parts': [turn.get("content")]})
+                                if participant_history and participant_history[-1]['role'] == role:
+                                    participant_history[-1]['parts'].append(turn.get("content"))
+                                else:
+                                    participant_history.append({'role': role, 'parts': [turn.get("content")]})
                             elif turn_type == "whisper":
                                 if turn.get("target_pid") == bot_pid:
                                     clean_content = turn.get("content")
                                     header, body = clean_content.split('\n', 1)
                                     wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
-                                    participant_history.append({'role': 'user', 'parts': [wrapped]})
+                                    if participant_history and participant_history[-1]['role'] == 'user':
+                                        participant_history[-1]['parts'].append(wrapped)
+                                    else:
+                                        participant_history.append({'role': 'user', 'parts': [wrapped]})
                             elif turn_type == "private_response":
                                 if turn.get("speaker_pid") == bot_pid:
                                     clean_content = turn.get("content")
                                     header, body = clean_content.split('\n', 1)
                                     wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                                    obj = {'role': 'model', 'parts': [wrapped]}
-                                    if turn.get('thought_signature'):
-                                        obj['thought_signature'] = turn.get('thought_signature')
-                                    participant_history.append(obj)
+                                    if participant_history and participant_history[-1]['role'] == 'model':
+                                        participant_history[-1]['parts'].append(wrapped)
+                                        if turn.get('thought_signature'):
+                                            participant_history[-1]['thought_signature'] = turn.get('thought_signature')
+                                    else:
+                                        obj = {'role': 'model', 'parts': [wrapped]}
+                                        if turn.get('thought_signature'):
+                                            obj['thought_signature'] = turn.get('thought_signature')
+                                        participant_history.append(obj)
                         
                         session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 
@@ -1992,11 +2009,20 @@ class ServicesMixin:
                     # [FIX] Dynamically inject missing ChatSession for ephemeral participants
                     if participant_key not in session['chat_sessions'] or session['chat_sessions'][participant_key] is None:
                         p_history = []
+                        bot_pid = self._get_pid_from_name_any(participant['owner_id'], participant['profile_name'])
                         for turn in session.get("unified_log", []):
                             if turn.get("is_hidden"): continue
                             speaker_key = tuple(turn.get("speaker_key", []))
-                            role = 'model' if speaker_key == participant_key else 'user'
-                            p_history.append({'role': role, 'parts': [turn.get("content")]})
+                            
+                            if turn.get("speaker_pid"):
+                                role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
+                            else:
+                                role = 'model' if speaker_key == participant_key else 'user'
+
+                            if p_history and p_history[-1]['role'] == role:
+                                p_history[-1]['parts'].append(turn.get("content"))
+                            else:
+                                p_history.append({'role': role, 'parts': [turn.get("content")]})
                         session['chat_sessions'][participant_key] = GoogleGenAIChatSession(history=p_history)
 
                     chat_session = session['chat_sessions'].get(participant_key)
@@ -2420,7 +2446,7 @@ class ServicesMixin:
                         
                         stm_length = int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
                         if stm_length > 0:
-                            past_log = past_log[-(stm_length * 2):]
+                            past_log = past_log[-stm_length:]
                         else:
                             past_log = []
                             
@@ -2438,22 +2464,34 @@ class ServicesMixin:
                                     parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
                                 if role == 'user' and turn.get("grounding_context") and p_settings.get("grounding_mode", "off") != "off":
                                     parts.append(f"\n{turn.get('grounding_context')}")
-                                contents_for_api_call.append({'role': role, 'parts': parts})
+                                
+                                if contents_for_api_call and contents_for_api_call[-1].get('role') == role:
+                                    contents_for_api_call[-1]['parts'].extend(parts)
+                                else:
+                                    contents_for_api_call.append({'role': role, 'parts': parts})
                             elif turn_type == "whisper":
                                 if turn.get("target_pid") == bot_pid:
                                     clean_content = turn.get("content")
                                     header, body = clean_content.split('\n', 1)
                                     wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
-                                    contents_for_api_call.append({'role': 'user', 'parts': [wrapped]})
+                                    if contents_for_api_call and contents_for_api_call[-1].get('role') == 'user':
+                                        contents_for_api_call[-1]['parts'].append(wrapped)
+                                    else:
+                                        contents_for_api_call.append({'role': 'user', 'parts': [wrapped]})
                             elif turn_type == "private_response":
                                 if turn.get("speaker_pid") == bot_pid:
                                     clean_content = turn.get("content")
                                     header, body = clean_content.split('\n', 1)
                                     wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                                    obj = {'role': 'model', 'parts': [wrapped]}
-                                    if turn.get('thought_signature'):
-                                        obj['thought_signature'] = turn.get('thought_signature')
-                                    contents_for_api_call.append(obj)
+                                    if contents_for_api_call and contents_for_api_call[-1].get('role') == 'model':
+                                        contents_for_api_call[-1]['parts'].append(wrapped)
+                                        if turn.get('thought_signature'):
+                                            contents_for_api_call[-1]['thought_signature'] = turn.get('thought_signature')
+                                    else:
+                                        obj = {'role': 'model', 'parts': [wrapped]}
+                                        if turn.get('thought_signature'):
+                                            obj['thought_signature'] = turn.get('thought_signature')
+                                        contents_for_api_call.append(obj)
 
                         # Check if the last turn was from this model itself
                         if contents_for_api_call and contents_for_api_call[-1].get('role', contents_for_api_call[-1].get('role', 'user')) == 'model':
@@ -3346,10 +3384,10 @@ class ServicesMixin:
               
                         if participant['ltm_counter'] >= interval:
                             history_source_obj = next(iter(session['chat_sessions'].values()), None)
-                            if history_source_obj and len(history_source_obj.history) >= 4:
-                                # Context size * 2 because turn history includes both user and bot
+                            if history_source_obj and len(history_source_obj.history) >= 2:
+                                # Turn history is consolidated
                                 events_for_summary = []
-                                for turn in history_source_obj.history[-(context_size * 2):]:
+                                for turn in history_source_obj.history[-context_size:]:
                                     parts = turn.get('parts', [])
                                     if parts:
                                         text_val = parts[0] if isinstance(parts[0], str) else parts[0].get('text', '')
@@ -3396,7 +3434,7 @@ class ServicesMixin:
                     p_profile_settings = self._get_profile_config(p_data['owner_id'], p_data['profile_name'], p_is_borrowed) or {}
                     stm_length = int(p_profile_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
 
-                    history_slice = trimmed_unified_log[-(stm_length * 2):] if stm_length > 0 else []
+                    history_slice = trimmed_unified_log[-stm_length:] if stm_length > 0 else []
                     
                     participant_history =[]
                     for turn in history_slice:
@@ -3412,10 +3450,15 @@ class ServicesMixin:
                             if role == 'user' and turn.get("grounding_context") and p_profile_settings.get("grounding_mode", "off") != "off":
                                 parts.append(f"\n<external_context>\n{turn.get('grounding_context')}\n</external_context>")
 
-                            content_obj = {'role': role, 'parts': parts}
-                            if role == 'model' and turn.get('thought_signature'):
-                                content_obj['thought_signature'] = turn.get('thought_signature')
-                            participant_history.append(content_obj)
+                            if participant_history and participant_history[-1]['role'] == role:
+                                participant_history[-1]['parts'].extend(parts)
+                                if role == 'model' and turn.get('thought_signature'):
+                                    participant_history[-1]['thought_signature'] = turn.get('thought_signature')
+                            else:
+                                content_obj = {'role': role, 'parts': parts}
+                                if role == 'model' and turn.get('thought_signature'):
+                                    content_obj['thought_signature'] = turn.get('thought_signature')
+                                participant_history.append(content_obj)
 
                         elif turn_type == "whisper":
                             if turn.get("target_pid") == bot_pid:
@@ -3423,17 +3466,25 @@ class ServicesMixin:
                                 clean_content = turn.get("content")
                                 header, body = clean_content.split('\n', 1)
                                 wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
-                                participant_history.append({'role': 'user', 'parts':[wrapped]})
+                                if participant_history and participant_history[-1]['role'] == 'user':
+                                    participant_history[-1]['parts'].append(wrapped)
+                                else:
+                                    participant_history.append({'role': 'user', 'parts':[wrapped]})
                         elif turn_type == "private_response":
                             if turn.get("speaker_pid") == bot_pid:
                                 # [NEW] Apply dynamic XML wrapping during re-hydration
                                 clean_content = turn.get("content")
                                 header, body = clean_content.split('\n', 1)
                                 wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                                obj = {'role': 'model', 'parts': [wrapped]}
-                                if turn.get('thought_signature'):
-                                    obj['thought_signature'] = turn.get('thought_signature')
-                                participant_history.append(obj)
+                                if participant_history and participant_history[-1]['role'] == 'model':
+                                    participant_history[-1]['parts'].append(wrapped)
+                                    if turn.get('thought_signature'):
+                                        participant_history[-1]['thought_signature'] = turn.get('thought_signature')
+                                else:
+                                    obj = {'role': 'model', 'parts': [wrapped]}
+                                    if turn.get('thought_signature'):
+                                        obj['thought_signature'] = turn.get('thought_signature')
+                                    participant_history.append(obj)
                     session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 
             except asyncio.CancelledError:
@@ -4268,9 +4319,9 @@ class ServicesMixin:
      
         if self.message_counters_for_ltm[ltm_counter_key] >= interval:
             self.message_counters_for_ltm[ltm_counter_key] = 0
-            # Context size * 2 because turn history includes both user and bot
-            h_sum = hist[-(context_size * 2):]
-            if len(h_sum) < 4: # Minimal safety check
+            # Turn history is now consolidated, so context size represents exact chunks
+            h_sum = hist[-context_size:]
+            if len(h_sum) < 2: # Minimal safety check
                 return
 
             print(f"[DEBUG: LTM] Triggering summary for {profile_name} using {len(h_sum)} context turns.")
@@ -6437,7 +6488,7 @@ class ServicesMixin:
                 
                 stm_len = int(profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
                 grounding_stm = min(10, stm_len)
-                history_for_grounding = chat.history[-(grounding_stm * 2):] if chat and grounding_stm > 0 else []
+                history_for_grounding = chat.history[-grounding_stm:] if chat and grounding_stm > 0 else []
                 
                 mapping_key = self._get_mapping_key_for_session(session_key, 'single')
                 grounding_result = await self._get_hybrid_grounding_context(prompt_text, guild_id, history_for_grounding, mapping_key, safety_settings=dynamic_safety_settings, is_for_image=True, warning_channel=message.channel)
@@ -6641,7 +6692,7 @@ class ServicesMixin:
             
             stm_length = int(p_profile.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
             if stm_length > 0:
-                past_log = past_log[-(stm_length * 2):]
+                past_log = past_log[-stm_length:]
             else:
                 past_log = []
                 
@@ -6663,7 +6714,10 @@ class ServicesMixin:
                         if turn.get("grounding_context") and p_profile.get("grounding_mode", "off") != "off":
                             parts.append(f"\n{turn.get('grounding_context')}")
                             
-                    participant_history.append({'role': role, 'parts': parts})
+                    if participant_history and participant_history[-1]['role'] == role:
+                        participant_history[-1]['parts'].extend(parts)
+                    else:
+                        participant_history.append({'role': role, 'parts': parts})
                     if role == 'model':
                         pending_whispers_for_regen.clear()
                 elif turn_type == "whisper":
@@ -6671,14 +6725,20 @@ class ServicesMixin:
                         clean_content = turn.get("content")
                         header, body = clean_content.split('\n', 1)
                         wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
-                        participant_history.append({'role': 'user', 'parts': [wrapped]})
+                        if participant_history and participant_history[-1]['role'] == 'user':
+                            participant_history[-1]['parts'].append(wrapped)
+                        else:
+                            participant_history.append({'role': 'user', 'parts': [wrapped]})
                         pending_whispers_for_regen.append(clean_content)
                 elif turn_type == "private_response":
                     if turn.get("speaker_pid") == bot_pid:
                         clean_content = turn.get("content")
                         header, body = clean_content.split('\n', 1)
                         wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                        participant_history.append({'role': 'model', 'parts': [wrapped]})
+                        if participant_history and participant_history[-1]['role'] == 'model':
+                            participant_history[-1]['parts'].append(wrapped)
+                        else:
+                            participant_history.append({'role': 'model', 'parts': [wrapped]})
 
             # Pseudo-turn injection to ensure history ends with a 'user' role
             if participant_history and participant_history[-1].get('role', 'user') == 'model':
