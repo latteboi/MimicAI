@@ -2591,6 +2591,24 @@ class ServicesMixin:
                                 'custom_emoji': custom_emoji
                             }
                         
+                        all_participant_names = []
+                        for p_data_temp in session.get("profiles", []):
+                            p_owner_id_temp = p_data_temp['owner_id']
+                            p_name_temp = p_data_temp['profile_name']
+                            p_index_temp = self._get_user_index(p_owner_id_temp)
+                            p_is_borrowed_temp = p_name_temp in p_index_temp.get("borrowed", [])
+                            p_effective_owner_id = p_owner_id_temp
+                            p_effective_profile_name = p_name_temp
+                            if p_is_borrowed_temp:
+                                borrowed_data = self._get_profile_config(p_owner_id_temp, p_name_temp, True) or {}
+                                p_effective_owner_id = int(borrowed_data.get("original_owner_id", p_owner_id_temp))
+                                p_effective_profile_name = borrowed_data.get("original_profile_name", p_name_temp)
+                            display_name_temp = p_effective_profile_name
+                            appearance_data_temp = self.user_appearances.get(str(p_effective_owner_id), {}).get(p_effective_profile_name, {})
+                            if appearance_data_temp.get("custom_display_name"):
+                                display_name_temp = appearance_data_temp["custom_display_name"]
+                            all_participant_names.append(display_name_temp)
+                        
                         if model:
                             try:
                                 response, state_container = await self._generate_with_heartbeat(
@@ -2601,9 +2619,14 @@ class ServicesMixin:
                                     raise ValueError("Response blocked or empty")
                                 
                                 raw_text_check = getattr(response, 'text', "").strip()
-                                if not raw_text_check:
+                                temp_clean = re.sub(r'<neuro_update>\s*(.*?)\s*</neuro_update>', '', raw_text_check, flags=re.IGNORECASE | re.DOTALL)
+                                temp_clean = re.sub(r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})', '', temp_clean, flags=re.IGNORECASE)
+                                temp_scrubbed = self._scrub_response_text(temp_clean, participant_names=all_participant_names)
+                                temp_dedup = self._deduplicate_response(temp_scrubbed)
+                                
+                                if not temp_dedup:
                                     raise ValueError("Empty Response (AI produced no text content)")
-                                if re.search(r'(.)\1{999,}', raw_text_check):
+                                if temp_dedup == "[REPETITIVE_CONTENT_ERROR]":
                                     raise ValueError("[REPETITIVE_CONTENT_ERROR]")
                                     
                                 status = "success"
@@ -2668,10 +2691,16 @@ class ServicesMixin:
                                             
                                         if not response or not response.candidates:
                                             raise ValueError("Response blocked or empty")
+                                        
                                         fb_raw_check = getattr(response, 'text', "").strip()
-                                        if not fb_raw_check:
+                                        temp_clean = re.sub(r'<neuro_update>\s*(.*?)\s*</neuro_update>', '', fb_raw_check, flags=re.IGNORECASE | re.DOTALL)
+                                        temp_clean = re.sub(r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})', '', temp_clean, flags=re.IGNORECASE)
+                                        temp_scrubbed = self._scrub_response_text(temp_clean, participant_names=all_participant_names)
+                                        temp_dedup = self._deduplicate_response(temp_scrubbed)
+                                        
+                                        if not temp_dedup:
                                             raise ValueError("Empty Response (AI produced no text content)")
-                                        if re.search(r'(.)\1{999,}', fb_raw_check):
+                                        if temp_dedup == "[REPETITIVE_CONTENT_ERROR]":
                                             raise ValueError("[REPETITIVE_CONTENT_ERROR]")
 
                                         fallback_used = True
@@ -2731,26 +2760,6 @@ class ServicesMixin:
                                 raw_text = raw_text.strip()
                                 
                                 raw_text, parsed_neuro_state = self._extract_and_apply_neuro_state(raw_text, p_owner_id, p_name)
-                                
-                                all_participant_names =[]
-                                for p_data in session.get("profiles", []):
-                                    p_owner_id_temp = p_data['owner_id']
-                                    p_name_temp = p_data['profile_name']
-                                    
-                                    p_index_temp = self._get_user_index(p_owner_id_temp)
-                                    p_is_borrowed_temp = p_name_temp in p_index_temp.get("borrowed", [])
-                                    p_effective_owner_id = p_owner_id_temp
-                                    p_effective_profile_name = p_name_temp
-                                    if p_is_borrowed_temp:
-                                        borrowed_data = self._get_profile_config(p_owner_id_temp, p_name_temp, True) or {}
-                                        p_effective_owner_id = int(borrowed_data.get("original_owner_id", p_owner_id_temp))
-                                        p_effective_profile_name = borrowed_data.get("original_profile_name", p_name_temp)
-                                    
-                                    display_name = p_effective_profile_name
-                                    appearance_data = self.user_appearances.get(str(p_effective_owner_id), {}).get(p_effective_profile_name, {})
-                                    if appearance_data.get("custom_display_name"):
-                                        display_name = appearance_data["custom_display_name"]
-                                    all_participant_names.append(display_name)
 
                                 scrubbed_text = self._scrub_response_text(raw_text, participant_names=all_participant_names)
                                 response_text = self._deduplicate_response(scrubbed_text)
@@ -6858,10 +6867,16 @@ class ServicesMixin:
                 
                 if not response or not response.candidates:
                     raise ValueError("Response blocked or empty")
+                
                 raw_text_check = getattr(response, 'text', "").strip()
-                if not raw_text_check:
+                temp_clean = re.sub(r'<neuro_update>\s*(.*?)\s*</neuro_update>', '', raw_text_check, flags=re.IGNORECASE | re.DOTALL)
+                temp_clean = re.sub(r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})', '', temp_clean, flags=re.IGNORECASE)
+                temp_scrubbed = self._scrub_response_text(temp_clean)
+                temp_dedup = self._deduplicate_response(temp_scrubbed)
+                
+                if not temp_dedup:
                     raise ValueError("Empty Response (AI produced no text content)")
-                if re.search(r'(.)\1{999,}', raw_text_check):
+                if temp_dedup == "[REPETITIVE_CONTENT_ERROR]":
                     raise ValueError("[REPETITIVE_CONTENT_ERROR]")
                     
             except asyncio.CancelledError:
@@ -6938,10 +6953,16 @@ class ServicesMixin:
                             
                         if not response or not response.candidates:
                             raise ValueError("Response blocked or empty")
+                        
                         fb_raw_check = getattr(response, 'text', "").strip()
-                        if not fb_raw_check:
+                        temp_clean = re.sub(r'<neuro_update>\s*(.*?)\s*</neuro_update>', '', fb_raw_check, flags=re.IGNORECASE | re.DOTALL)
+                        temp_clean = re.sub(r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})', '', temp_clean, flags=re.IGNORECASE)
+                        temp_scrubbed = self._scrub_response_text(temp_clean)
+                        temp_dedup = self._deduplicate_response(temp_scrubbed)
+                        
+                        if not temp_dedup:
                             raise ValueError("Empty Response (AI produced no text content)")
-                        if re.search(r'(.)\1{999,}', fb_raw_check):
+                        if temp_dedup == "[REPETITIVE_CONTENT_ERROR]":
                             raise ValueError("[REPETITIVE_CONTENT_ERROR]")
 
                         fallback_used = True

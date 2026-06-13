@@ -1286,8 +1286,28 @@ class StorageMixin:
                 else:
                     index["personal"][p_name] = pid_folder
 
+            keys_path = os.path.join(self.USERS_DIR, user_id_str, "keys.json.gz")
+            if os.path.exists(keys_path):
+                keys_data = self._load_json_gzip(keys_path)
+                if keys_data and (keys_data.get("key") or keys_data.get("openrouter_key")):
+                    index["has_personal_key"] = True
+                else:
+                    index["has_personal_key"] = False
+            else:
+                index["has_personal_key"] = False
+
             self._save_user_index(user_id, index)
         else:
+            keys_path = os.path.join(self.USERS_DIR, user_id_str, "keys.json.gz")
+            if os.path.exists(keys_path):
+                keys_data = self._load_json_gzip(keys_path)
+                if keys_data and (keys_data.get("key") or keys_data.get("openrouter_key")):
+                    index["has_personal_key"] = True
+                else:
+                    index["has_personal_key"] = False
+            else:
+                index["has_personal_key"] = False
+                
             self._save_user_index(user_id, index)
             
         return index

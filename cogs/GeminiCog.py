@@ -168,7 +168,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     async def create_profile_slash(self, interaction: discord.Interaction, profile_name: str):
         await interaction.response.defer(ephemeral=True)
 
-        has_access = await self._has_api_key_access(interaction.user.id)
+        has_access = await self._has_api_key_access(interaction.user.id, interaction.guild_id)
         if not has_access:
             error_msg = (
                 "**Cannot Create Profile**\n"
@@ -249,17 +249,28 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             await interaction.followup.send(f"You have reached the maximum of {limit} personal profiles ({tier_name} tier).", ephemeral=True)
             return
 
-        api_key = self._get_api_key_for_guild(interaction.guild_id)
+        api_key = self._get_api_key_for_guild(interaction.guild_id) or self._get_api_key_for_user(interaction.user.id)
+        is_or = False
+        
         if not api_key:
-            await interaction.followup.send("This server's API key is not configured, so I cannot generate a profile.", ephemeral=True)
+            api_key = self._get_api_key_for_guild(interaction.guild_id, "openrouter") or self._get_api_key_for_user(interaction.user.id, "openrouter")
+            is_or = True
+            
+        if not api_key:
+            await interaction.followup.send("An API key (Server or Personal) is not configured, so I cannot generate a profile. Please configure one via `/settings`.", ephemeral=True)
             return
 
         generation_prompt = self.global_prompts.get("PROFILE_GENERATOR", DEFAULT_PROFILE_GENERATOR_PROMPT).format(prompt=prompt)
 
-        model_name = 'gemini-2.5-flash-lite'
         status = "api_error"
         try:
-            model = GoogleGenAIModel(api_key=api_key, model_name=model_name, safety_settings=DEFAULT_SAFETY_SETTINGS)
+            if is_or:
+                model_name = 'google/gemini-2.5-flash-lite'
+                model = OpenRouterModel(api_key=api_key, model_name=model_name, system_instruction=None, thinking_params={})
+            else:
+                model_name = 'gemini-2.5-flash-lite'
+                model = GoogleGenAIModel(api_key=api_key, model_name=model_name, safety_settings=DEFAULT_SAFETY_SETTINGS)
+                
             gen_config = {"temperature": 0.3}
             response = await model.generate_content_async([generation_prompt], generation_config=gen_config)
             

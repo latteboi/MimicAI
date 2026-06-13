@@ -936,8 +936,15 @@ class CoreMixin:
                     raise ValueError("Response blocked or empty")
                 
                 raw_text_check = getattr(response, 'text', "").strip()
-                if not raw_text_check:
+                temp_clean = re.sub(r'<neuro_update>\s*(.*?)\s*</neuro_update>', '', raw_text_check, flags=re.IGNORECASE | re.DOTALL)
+                temp_clean = re.sub(r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})', '', temp_clean, flags=re.IGNORECASE)
+                temp_scrubbed = self._scrub_response_text(temp_clean, participant_names=[app_name])
+                temp_dedup = self._deduplicate_response(temp_scrubbed)
+                
+                if not temp_dedup:
                     raise ValueError("Empty Response (AI produced no text content)")
+                if temp_dedup == "[REPETITIVE_CONTENT_ERROR]":
+                    raise ValueError("[REPETITIVE_CONTENT_ERROR]")
 
                 status = "success"
             except asyncio.CancelledError:
@@ -1039,8 +1046,15 @@ class CoreMixin:
                             status = "blocked_by_safety" if not response or not response.candidates else "success"
                             if status == "success":
                                 fb_raw_check = getattr(response, 'text', "").strip()
-                                if not fb_raw_check:
+                                temp_clean = re.sub(r'<neuro_update>\s*(.*?)\s*</neuro_update>', '', fb_raw_check, flags=re.IGNORECASE | re.DOTALL)
+                                temp_clean = re.sub(r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})', '', temp_clean, flags=re.IGNORECASE)
+                                temp_scrubbed = self._scrub_response_text(temp_clean, participant_names=[app_name])
+                                temp_dedup = self._deduplicate_response(temp_scrubbed)
+                                
+                                if not temp_dedup:
                                     raise ValueError("Empty Response (AI produced no text content)")
+                                if temp_dedup == "[REPETITIVE_CONTENT_ERROR]":
+                                    raise ValueError("[REPETITIVE_CONTENT_ERROR]")
 
                                 fallback_used = True
                                 self._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat_fallback", model_used=fb_name, status="success")
@@ -2974,23 +2988,20 @@ class CoreMixin:
 
         return True
     
-    async def _has_api_key_access(self, user_id: int) -> bool:
-        # 1. Check for personal key
+    async def _has_api_key_access(self, user_id: int, guild_id: Optional[int] = None) -> bool:
+        # 1. Check for cached personal key flag
+        index = self._get_user_index(user_id)
+        if index.get("has_personal_key", False):
+            return True
+        
+        # Fallback direct check just in case index is out of sync
         if self._get_api_key_for_user(user_id, "gemini") or self._get_api_key_for_user(user_id, "openrouter"):
             return True
         
-        # 2. Check mutual guilds for a server key
-        user = self.bot.get_user(user_id)
-        if not user:
-            try:
-                user = await self.bot.fetch_user(user_id)
-            except Exception:
-                return False
-
-        if user:
-            for guild in user.mutual_guilds:
-                if self._get_api_key_for_guild(guild.id, "gemini") or self._get_api_key_for_guild(guild.id, "openrouter"):
-                    return True
+        # 2. Check localized guild context
+        if guild_id:
+            if self._get_api_key_for_guild(guild_id, "gemini") or self._get_api_key_for_guild(guild_id, "openrouter"):
+                return True
         
         return False
     

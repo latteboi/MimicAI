@@ -5612,6 +5612,11 @@ class SubmitAPIKeyModal(ui.Modal, title="Edit API Key"):
             if self.target_type == 'personal':
                 self.cog._save_personal_api_key_shard(str(interaction.user.id), None)
                 if str(interaction.user.id) in self.cog.personal_api_keys: del self.cog.personal_api_keys[str(interaction.user.id)]
+                
+                idx = self.cog._get_user_index(interaction.user.id)
+                idx["has_personal_key"] = False
+                self.cog._save_user_index(interaction.user.id, idx)
+                
                 msg = "Personal key removed."
                 
             elif self.target_type == 'server_primary':
@@ -5667,6 +5672,10 @@ class SubmitAPIKeyModal(ui.Modal, title="Edit API Key"):
                 existing_data["tier"] = "free"
             self.cog._atomic_json_save_gzip(existing_data, path)
             self.cog.personal_api_keys[user_id_str] = existing_data.get("key") 
+            
+            idx = self.cog._get_user_index(interaction.user.id)
+            idx["has_personal_key"] = True
+            self.cog._save_user_index(interaction.user.id, idx)
             
             msg = f"✅ Personal {provider.title()} key updated ({tier.title()} Tier)."
 
