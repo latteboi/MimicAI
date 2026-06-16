@@ -123,6 +123,30 @@ class IOManager:
 
 class StorageMixin:
 
+    def _get_shard_path(self, shard_type: str, entity_id: str, sub_key: Optional[str] = None) -> str:
+        if shard_type in ["ltm", "training"]:
+            pid = self._get_pid_from_name_any(int(entity_id), sub_key)
+            return os.path.join(self.USERS_DIR, str(entity_id), "profiles", pid, f"{shard_type}.json.gz")
+        elif shard_type == "personal_keys":
+            return os.path.join(self.USERS_DIR, str(entity_id), "keys.json.gz")
+        elif shard_type == "profile_shares":
+            return os.path.join(self.USERS_DIR, str(entity_id), "shares.json.gz")
+        elif shard_type == "server_keys":
+            return os.path.join(self.SERVERS_DIR, str(entity_id), "api_keys.json.gz")
+        raise ValueError(f"Unknown shard type: {shard_type}")
+
+    def _load_shard(self, shard_type: str, entity_id: str, sub_key: Optional[str] = None) -> Optional[Any]:
+        path = self._get_shard_path(shard_type, entity_id, sub_key)
+        return IOManager.read_json_gzip(path, self.fernet)
+
+    def _save_shard(self, shard_type: str, entity_id: str, data: Any, sub_key: Optional[str] = None):
+        path = self._get_shard_path(shard_type, entity_id, sub_key)
+        IOManager.write_json_gzip(data, path, self.fernet)
+
+    def _delete_shard(self, shard_type: str, entity_id: str, sub_key: Optional[str] = None):
+        path = self._get_shard_path(shard_type, entity_id, sub_key)
+        _delete_file_shard(path)
+
     def _load_global_prompts(self):
         self.global_prompts = {}
         if os.path.exists(GLOBAL_PROMPTS_FILE_PATH):
@@ -317,13 +341,9 @@ class StorageMixin:
             return self._get_pid_from_name_any(user_id, profile_name)
 
     def _encrypt_data(self, plaintext: str) -> str:
-        if not self.fernet or not plaintext:
-            return plaintext
-        try:
-            return self.fernet.encrypt(plaintext.encode()).decode()
-        except Exception as e:
-            print(f"Encryption failed: {e}")
-            return plaintext
+        # Value-level encryption is deprecated to prevent CPU overhead.
+        # Files are already Fernet-encrypted natively at the shard-level.
+        return plaintext
 
     def _decrypt_data(self, encrypted_text: str) -> str:
         if not self.fernet or not encrypted_text:
@@ -341,9 +361,7 @@ class StorageMixin:
         return IOManager.read_json_gzip(file_path, self.fernet, encrypted)
         
     def _load_ltm_shard(self, user_id: str, profile_name: str) -> Optional[Dict[str, List[Dict]]]:
-        pid = self._get_pid_from_name_any(int(user_id), profile_name)
-        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "ltm.json.gz")
-        data = self._load_json_gzip(file_path)
+        data = self._load_shard("ltm", user_id, profile_name)
         if data:
             # Purge legacy non-server memories upon load
             guild_ltms =[item for item in data.get("guild", []) if item.get("scope") == "server"]
@@ -353,27 +371,21 @@ class StorageMixin:
         return data
 
     def _save_ltm_shard(self, user_id: str, profile_name: str, data: Dict[str, List[Dict]]):
-        pid = self._get_pid_from_name_any(int(user_id), profile_name)
-        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "ltm.json.gz")
-        self._atomic_json_save_gzip(data, file_path)
+        self._save_shard("ltm", user_id, data, profile_name)
 
     def _delete_ltm_shard(self, user_id: str, profile_name: str):
-        pid = self._get_pid_from_name_any(int(user_id), profile_name)
-        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "ltm.json.gz")
-        _delete_file_shard(file_path)
+        self._delete_shard("ltm", user_id, profile_name)
 
     def _rename_ltm_shards(self, user_id: str, old_profile_name: str, new_profile_name: str):
         pass # Obsolete. Data moves seamlessly when string changes in index.json
 
     def _copy_ltm_shard(self, user_id: str, source_profile_name: str, new_profile_name: str):
-        src_pid = self._get_pid_from_name_any(int(user_id), source_profile_name)
-        new_pid = self._get_pid_from_name_any(int(user_id), new_profile_name)
-        source_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", src_pid, "ltm.json.gz")
-        if os.path.exists(source_path):
-            new_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", new_pid, "ltm.json.gz")
+        src_path = self._get_shard_path("ltm", user_id, source_profile_name)
+        new_path = self._get_shard_path("ltm", user_id, new_profile_name)
+        if os.path.exists(src_path):
             os.makedirs(os.path.dirname(new_path), exist_ok=True)
             import shutil
-            shutil.copy2(source_path, new_path)
+            shutil.copy2(src_path, new_path)
 
     def _add_ltm(self, profile_owner_id: int, profile_name: str, summary: str, summary_embedding: List[float], guild_id: Optional[int], triggering_user_id: int, user_dn: Optional[str] = None):
         if not guild_id: return
@@ -453,32 +465,24 @@ class StorageMixin:
         return False
     
     def _load_training_shard(self, user_id: str, profile_name: str) -> Optional[List[Dict]]:
-        pid = self._get_pid_from_name_any(int(user_id), profile_name)
-        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "training.json.gz")
-        return self._load_json_gzip(file_path)
+        return self._load_shard("training", user_id, profile_name)
 
     def _save_training_shard(self, user_id: str, profile_name: str, data: List[Dict]):
-        pid = self._get_pid_from_name_any(int(user_id), profile_name)
-        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "training.json.gz")
-        self._atomic_json_save_gzip(data, file_path)
+        self._save_shard("training", user_id, data, profile_name)
 
     def _delete_training_shard(self, user_id: str, profile_name: str):
-        pid = self._get_pid_from_name_any(int(user_id), profile_name)
-        file_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "training.json.gz")
-        _delete_file_shard(file_path)
+        self._delete_shard("training", user_id, profile_name)
 
     def _rename_training_shards(self, user_id: str, old_profile_name: str, new_profile_name: str):
         pass # Obsolete. Data moves seamlessly when string changes in index.json
 
     def _copy_training_shard(self, user_id: str, source_profile_name: str, new_profile_name: str):
-        src_pid = self._get_pid_from_name_any(int(user_id), source_profile_name)
-        new_pid = self._get_pid_from_name_any(int(user_id), new_profile_name)
-        source_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", src_pid, "training.json.gz")
-        if os.path.exists(source_path):
-            new_path = os.path.join(self.USERS_DIR, str(user_id), "profiles", new_pid, "training.json.gz")
+        src_path = self._get_shard_path("training", user_id, source_profile_name)
+        new_path = self._get_shard_path("training", user_id, new_profile_name)
+        if os.path.exists(src_path):
             os.makedirs(os.path.dirname(new_path), exist_ok=True)
             import shutil
-            shutil.copy2(source_path, new_path)
+            shutil.copy2(src_path, new_path)
 
     def _get_session_dir_path(self, session_key: Any, session_type: str) -> pathlib.Path:
         if session_type == 'global_chat':
@@ -540,7 +544,8 @@ class StorageMixin:
             data_copy = copy.deepcopy(data_to_save)
             
             def _thread_save():
-                serialized_bytes = json.dumps(data_copy)
+                # Utilise high-speed Rust-based serialization flags
+                serialized_bytes = json.dumps(data_copy, option=json.OPT_SERIALIZE_NUMPY | json.OPT_NON_STR_KEYS)
                 compressed_bytes = gzip.compress(serialized_bytes)
                 encrypted_compressed_bytes = self.fernet.encrypt(compressed_bytes)
 
@@ -662,34 +667,6 @@ class StorageMixin:
                 self._atomic_json_save_gzip(data, str(path))
         except Exception as e:
             print(f"Error saving mapping for key {mapping_key}: {e}")
-
-    def _load_user_appearances(self):
-        self.user_appearances = {}
-        if not os.path.isdir(self.USERS_DIR):
-            return
-        for user_id_str in os.listdir(self.USERS_DIR):
-            if not user_id_str.isdigit(): continue
-            index = self._get_user_index(int(user_id_str))
-            all_profiles = list(index.get("personal", {})) + list(index.get("borrowed", {}))
-            
-            for profile_name in all_profiles:
-                pid = self._get_pid_from_name_any(int(user_id_str), profile_name)
-                config_path = os.path.join(self.USERS_DIR, user_id_str, "profiles", pid, "config.json.gz")
-                borrowed_path = os.path.join(self.USERS_DIR, user_id_str, "profiles", pid, "borrowed_config.json.gz")
-                
-                target_path = None
-                if os.path.exists(config_path):
-                    target_path = config_path
-                elif os.path.exists(borrowed_path):
-                    target_path = borrowed_path
-                    
-                if target_path:
-                    data = self._load_json_gzip(target_path)
-                    if data and (data.get("custom_display_name") or data.get("custom_avatar_url")):
-                        self.user_appearances.setdefault(user_id_str, {})[profile_name] = {
-                            "custom_display_name": data.get("custom_display_name"),
-                            "custom_avatar_url": data.get("custom_avatar_url")
-                        }
 
     def _load_channel_webhooks(self):
         self.channel_webhooks = {}
@@ -825,16 +802,10 @@ class StorageMixin:
                         self.server_api_keys[server_id_str] = server_keys_data.get("primary")
 
     def _save_server_api_key_shard(self, server_id_str: str, primary_key_data: Optional[Dict], submissions_data: List):
-        server_path = os.path.join(self.SERVERS_DIR, server_id_str)
-        os.makedirs(server_path, exist_ok=True)
-        file_path = os.path.join(server_path, "api_keys.json.gz")
-        
-        full_data = {
+        self._save_shard("server_keys", server_id_str, {
             "primary": primary_key_data,
             "submissions": submissions_data
-        }
-        
-        IOManager.write_json_gzip(full_data, file_path, self.fernet)
+        })
 
     def _load_personal_api_keys(self):
         self.personal_api_keys = {}
@@ -849,12 +820,10 @@ class StorageMixin:
                     self.personal_api_keys[user_id_str] = data["key"]
 
     def _save_personal_api_key_shard(self, user_id_str: str, encrypted_key: Optional[str]):
-        file_path = os.path.join(self.USERS_DIR, user_id_str, "keys.json.gz")
         if not encrypted_key:
-            _delete_file_shard(file_path)
+            self._delete_shard("personal_keys", user_id_str)
         else:
-            data_to_save = {"key": encrypted_key}
-            IOManager.write_json_gzip(data_to_save, file_path, self.fernet)
+            self._save_shard("personal_keys", user_id_str, {"key": encrypted_key})
 
     def _load_key_submissions(self):
         self.key_submissions = {}
@@ -888,11 +857,10 @@ class StorageMixin:
                     self.profile_shares[user_id_str] = data
 
     def _save_profile_share_shard(self, recipient_id_str: str, data: List):
-        file_path = os.path.join(self.USERS_DIR, recipient_id_str, "shares.json.gz")
         if not data:
-            _delete_file_shard(file_path)
+            self._delete_shard("profile_shares", recipient_id_str)
         else:
-            IOManager.write_json_gzip(data, file_path, self.fernet)
+            self._save_shard("profile_shares", recipient_id_str, data)
 
     async def _load_multi_profile_sessions(self):
         await self.bot.wait_until_ready()
@@ -1125,24 +1093,9 @@ class StorageMixin:
         if not config:
             return {}, "", False, defaultConfig.GEMINI_TEMPERATURE, defaultConfig.GEMINI_TOP_P, defaultConfig.GEMINI_TOP_K, defaultConfig.TRAINING_CONTEXT_SIZE, defaultConfig.TRAINING_RELEVANCE_THRESHOLD, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME
 
-        if is_borrowed:
-            pointer = config.get("pointer")
-            resolved = self._resolve_borrowed_pointer(pointer)
-            if resolved:
-                source_owner_id, source_profile_id = resolved
-                cfg_path = os.path.join(self.USERS_DIR, str(source_owner_id), "profiles", source_profile_id, "config.json.gz")
-                source_config = self._load_json_gzip(cfg_path) or {}
-                
-                prompts_path = os.path.join(self.USERS_DIR, str(source_owner_id), "profiles", source_profile_id, "prompts.json.gz")
-                prompts = self._load_json_gzip(prompts_path) or {}
-            else:
-                source_owner_id = int(config.get("original_owner_id", user_id))
-                source_profile_name = config.get("original_profile_name", active_profile_name)
-                source_config = self._get_profile_config(source_owner_id, source_profile_name, False) or {}
-                prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
-        else:
-            source_config = config
-            prompts = self._get_profile_prompts(user_id, active_profile_name) or {}
+        source_owner_id, source_profile_name = self._resolve_effective_profile(user_id, active_profile_name)
+        
+        prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
         
         persona = prompts.get("persona", {})
         ai_instructions = prompts.get("ai_instructions", "")
@@ -1387,6 +1340,29 @@ class StorageMixin:
             except Exception:
                 pass
 
+    def _resolve_effective_profile(self, user_id: int, profile_name: str) -> Tuple[int, str]:
+        index = self._get_user_index(user_id)
+        if profile_name in index.get("borrowed", []):
+            b_config = self._get_profile_config(user_id, profile_name, True) or {}
+            eff_owner = int(b_config.get("original_owner_id", user_id))
+            eff_name = b_config.get("original_profile_name", profile_name)
+            return eff_owner, eff_name
+        return user_id, profile_name
+
+    def _get_user_appearance(self, owner_id: int, profile_name: str) -> Dict[str, Optional[str]]:
+        eff_owner_id, eff_name = self._resolve_effective_profile(owner_id, profile_name)
+        owner_id_str = str(eff_owner_id)
+        if owner_id_str in self.user_appearances and eff_name in self.user_appearances[owner_id_str]:
+            return self.user_appearances[owner_id_str][eff_name]
+            
+        config = self._get_profile_config(eff_owner_id, eff_name, False) or {}
+        disp = config.get("custom_display_name")
+        ava = config.get("custom_avatar_url")
+        
+        data = {"custom_display_name": disp, "custom_avatar_url": ava}
+        self.user_appearances.setdefault(owner_id_str, {})[eff_name] = data
+        return data
+
     def _get_profile_prompts(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
         if not profile_name: return None
         cache_key = f"{user_id}:{profile_name}"
@@ -1441,11 +1417,11 @@ class StorageMixin:
                 "primary_model": PRIMARY_MODEL_NAME, "fallback_model": FALLBACK_MODEL_NAME,
                 "time_tracking_enabled": True, "timezone": "UTC",
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
-                "image_generation_enabled": False, "image_generation_model": "gemini-2.5-flash-image",
+                "image_generation_enabled": False, "image_generation_model": "GOOGLE/gemini-2.5-flash-image",
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
                 "thinking_level": "high", "thinking_budget": -1, "thinking_signatures_enabled": "off",
                 "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": "Aoede",
-                "speech_model": "gemini-2.5-flash-preview-tts", "speech_temperature": 1.0,
+                "speech_model": "GOOGLE/gemini-2.5-flash-preview-tts", "speech_temperature": 1.0,
                 "neuro_engine_enabled": False, "neuro_state": {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20},
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }

@@ -24,6 +24,18 @@ if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
     from ..GeminiCog import GeminiAgent
 
+def build_pagination_controls(view: ui.View, current_page: int, num_pages: int, row: int, prev_cb, next_cb, page_cb=None):
+    if num_pages <= 1: return
+    prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(current_page == 0), row=row)
+    page_lbl = ui.Button(label=f"{current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, disabled=(page_cb is None), row=row)
+    next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(current_page >= num_pages - 1), row=row)
+    prev_btn.callback = prev_cb
+    next_btn.callback = next_cb
+    if page_cb: page_lbl.callback = page_cb
+    view.add_item(prev_btn)
+    view.add_item(page_lbl)
+    view.add_item(next_btn)
+
 class GlobalChatInputModal(ui.Modal, title="Draft Your Reply"):
     def __init__(self, cog, view, existing_text="", is_edit=False):
         super().__init__()
@@ -204,14 +216,9 @@ class GlobalChatPlayView(ui.View):
         index = self.cog._get_user_index(self.user_id)
         is_borrowed = self.profile_name in index.get("borrowed", [])
         
-        eff_owner = self.user_id
-        eff_name = self.profile_name
-        if is_borrowed:
-            b_data = self.cog._get_profile_config(self.user_id, self.profile_name, True) or {}
-            eff_owner = int(b_data.get("original_owner_id", self.user_id))
-            eff_name = b_data.get("original_profile_name", self.profile_name)
+        eff_owner, eff_name = self.cog._resolve_effective_profile(self.user_id, self.profile_name)
             
-        app = self.cog.user_appearances.get(str(eff_owner), {}).get(eff_name)
+        app = self.cog._get_user_appearance(eff_owner, eff_name)
         if app:
             display_name = app.get("custom_display_name") or display_name
             avatar_url = app.get("custom_avatar_url") or avatar_url
@@ -461,34 +468,19 @@ class GlobalChatHistoryView(ui.View):
             self.add_item(jump_select)
 
         # Row 2: Buttons
-        prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.blurple, disabled=(self.current_page == 0), row=2)
-        next_btn = ui.Button(label="▶", style=discord.ButtonStyle.blurple, disabled=(self.current_page == len(self.rounds) - 1), row=2)
+        build_pagination_controls(self, self.current_page, len(self.rounds), 2, self.prev_callback, self.next_callback)
         delete_btn = ui.Button(label="Delete", style=discord.ButtonStyle.danger, row=2)
-        
-        prev_btn.callback = self.prev_callback
-        next_btn.callback = self.next_callback
         delete_btn.callback = self.delete_callback
         
-        self.add_item(prev_btn)
-        self.add_item(next_btn)
         self.add_item(delete_btn)
 
     def get_embed(self) -> discord.Embed:
         display_name = self.selected_profile
         avatar_url = self.cog.bot.user.display_avatar.url
         
-        index = self.cog._get_user_index(self.user_id)
-        is_borrowed = self.selected_profile in index.get("borrowed", [])
+        effective_owner_id, effective_profile_name = self.cog._resolve_effective_profile(self.user_id, self.selected_profile)
         
-        effective_owner_id = self.user_id
-        effective_profile_name = self.selected_profile
-        
-        if is_borrowed:
-            borrowed_data = self.cog._get_profile_config(self.user_id, self.selected_profile, True) or {}
-            effective_owner_id = int(borrowed_data.get("original_owner_id", self.user_id))
-            effective_profile_name = borrowed_data.get("original_profile_name", self.selected_profile)
-        
-        appearance_data = self.cog.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name)
+        appearance_data = self.cog._get_user_appearance(effective_owner_id, effective_profile_name)
         if appearance_data:
             display_name = appearance_data.get("custom_display_name") or display_name
             avatar_url = appearance_data.get("custom_avatar_url") or avatar_url
@@ -635,64 +627,86 @@ class GlobalChatHistoryView(ui.View):
         else:
             await interaction.followup.send("Failed to delete round.", ephemeral=True)
 
-class ProfileAdvancedParamsModal(ui.Modal, title="Advanced Parameters (OpenRouter Only)"):
-    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
-        super().__init__()
-        self.cog: GeminiAgent = cog
+class ConfigModal(ui.Modal):
+    def __init__(self, cog, profile_name, is_borrowed, title, fields, parser, callback=None, target_user_id=None):
+        super().__init__(title=title[:45])
+        self.cog = cog
         self.profile_name = profile_name
         self.is_borrowed = is_borrowed
+        self.parser = parser
         self.callback = callback
-
-        def get_val(key):
-            v = current_params.get(key)
-            return str(v) if v is not None else ""
-
-        self.add_item(ui.TextInput(label="Frequency Penalty (-2.0 to 2.0)", custom_id="frequency_penalty", default=get_val("frequency_penalty"), required=False, placeholder="Default: 0.0 (Disabled)"))
-        self.add_item(ui.TextInput(label="Presence Penalty (-2.0 to 2.0)", custom_id="presence_penalty", default=get_val("presence_penalty"), required=False, placeholder="Default: 0.0 (Disabled)"))
-        self.add_item(ui.TextInput(label="Repetition Penalty (0.0 to 2.0)", custom_id="repetition_penalty", default=get_val("repetition_penalty"), required=False, placeholder="Default: 0.0 (Disabled)"))
-        self.add_item(ui.TextInput(label="Min P (0.0 to 1.0)", custom_id="min_p", default=get_val("min_p"), required=False, placeholder="Default: 0.0 (Disabled)"))
-        self.add_item(ui.TextInput(label="Top A (0.0 to 1.0)", custom_id="top_a", default=get_val("top_a"), required=False, placeholder="Default: 0.0 (Disabled)"))
+        self.target_user_id = target_user_id
+        for f in fields:
+            self.add_item(ui.TextInput(**f))
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        new_params = {}
         try:
-            def parse_float(val, min_v, max_v, name):
-                if not val or not val.strip(): return None 
-                f = float(val)
-                if not (min_v <= f <= max_v): raise ValueError(f"{name} out of range ({min_v} to {max_v})")
-                return f
-
-            new_params["frequency_penalty"] = parse_float(next((c.value for c in self.children if c.custom_id == "frequency_penalty"), None), -2.0, 2.0, "Frequency Penalty")
-            new_params["presence_penalty"] = parse_float(next((c.value for c in self.children if c.custom_id == "presence_penalty"), None), -2.0, 2.0, "Presence Penalty")
-            new_params["repetition_penalty"] = parse_float(next((c.value for c in self.children if c.custom_id == "repetition_penalty"), None), 0.0, 2.0, "Repetition Penalty")
-            new_params["min_p"] = parse_float(next((c.value for c in self.children if c.custom_id == "min_p"), None), 0.0, 1.0, "Min P")
-            new_params["top_a"] = parse_float(next((c.value for c in self.children if c.custom_id == "top_a"), None), 0.0, 1.0, "Top A")
-
+            raw_values = {c.custom_id: c.value for c in self.children}
+            updates = self.parser(raw_values)
+            config_updates = updates.get("config", {})
+            prompt_updates = updates.get("prompts", {})
         except ValueError as e:
-            await interaction.followup.send(f"❌ **Invalid Input:** {e}.", ephemeral=True)
+            await interaction.followup.send(f"❌ **Invalid Input:** {e}", ephemeral=True)
             return
-        except Exception as e:
-            print(f"Error parsing adv params: {e}")
+        except Exception:
             await interaction.followup.send("❌ Error parsing input.", ephemeral=True)
             return
 
+        uid = self.target_user_id or interaction.user.id
+
         if self.profile_name == "BULK_APPLY":
-            pass
-        else:
-            try:
-                success = await self.cog.update_profile_advanced_params(interaction.user.id, self.profile_name, new_params, interaction.channel_id, self.is_borrowed)
-                if success:
-                    await interaction.followup.send(f"✅ Advanced parameters updated for '{self.profile_name}'.", ephemeral=True)
-                    if self.callback: 
-                        try: await self.callback(interaction)
-                        except Exception as e: print(f"Callback error in AdvParams: {e}")
-                else:
-                    await interaction.followup.send(f"❌ Failed to update parameters.", ephemeral=True)
-            except Exception as e:
-                print(f"Error updating adv params: {e}")
-                traceback.print_exc()
-                await interaction.followup.send("❌ An unexpected error occurred while saving.", ephemeral=True)
+            combined = {**config_updates, **prompt_updates}
+            if self.callback: await self.callback(interaction, combined)
+            return
+
+        if config_updates:
+            target = self.cog._get_profile_config(uid, self.profile_name, self.is_borrowed)
+            if target:
+                target.update(config_updates)
+                self.cog._save_profile_config(uid, self.profile_name, target, self.is_borrowed)
+                keys_to_clear = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and len(k) == 3 and k[1] == uid and k[2] == self.profile_name]
+                for k in keys_to_clear:
+                    self.cog.channel_models.pop(k, None)
+                    self.cog.chat_sessions.pop(k, None)
+                    self.cog.channel_model_last_profile_key.pop(k, None)
+
+        if prompt_updates and not self.is_borrowed:
+            prompts = self.cog._get_profile_prompts(uid, self.profile_name)
+            if prompts:
+                prompts.update(prompt_updates)
+                self.cog._save_profile_prompts(uid, self.profile_name, prompts)
+
+        await interaction.followup.send(f"✅ Settings updated for '{self.profile_name}'.", ephemeral=True)
+        if self.callback: await self.callback(interaction)
+
+def _pf(val): return float(val) if val and val.strip() else None
+def _pi(val): return int(val) if val and val.strip() else None
+def _ps(val): return val.strip() if val and val.strip() else None
+def _pb(val): return val.strip().lower() == "on"
+
+def ProfileAdvancedParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+    def gv(k):
+        v = current_params.get(k)
+        return str(v) if v is not None else ""
+    fields = [
+        {"label": "Frequency Penalty (-2.0 to 2.0)", "custom_id": "frequency_penalty", "default": gv("frequency_penalty"), "required": False, "placeholder": "Default: 0.0 (Disabled)"},
+        {"label": "Presence Penalty (-2.0 to 2.0)", "custom_id": "presence_penalty", "default": gv("presence_penalty"), "required": False, "placeholder": "Default: 0.0 (Disabled)"},
+        {"label": "Repetition Penalty (0.0 to 2.0)", "custom_id": "repetition_penalty", "default": gv("repetition_penalty"), "required": False, "placeholder": "Default: 0.0 (Disabled)"},
+        {"label": "Min P (0.0 to 1.0)", "custom_id": "min_p", "default": gv("min_p"), "required": False, "placeholder": "Default: 0.0 (Disabled)"},
+        {"label": "Top A (0.0 to 1.0)", "custom_id": "top_a", "default": gv("top_a"), "required": False, "placeholder": "Default: 0.0 (Disabled)"}
+    ]
+    def parser(v):
+        c = {}
+        for k, (min_v, max_v) in [("frequency_penalty", (-2.0, 2.0)), ("presence_penalty", (-2.0, 2.0)), ("repetition_penalty", (0.0, 2.0)), ("min_p", (0.0, 1.0)), ("top_a", (0.0, 1.0))]:
+            val = _pf(v[k])
+            if val is not None:
+                if not (min_v <= val <= max_v): raise ValueError(f"{k} out of range")
+                c[k] = val
+            else:
+                c[k] = None
+        return {"config": c}
+    return ConfigModal(cog, profile_name, is_borrowed, "Advanced Parameters (OpenRouter)", fields, parser, callback)
 
 class WhisperHistoryView(ui.View):
     def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, all_whispers: List[Dict]):
@@ -766,16 +780,20 @@ class WhisperHistoryView(ui.View):
             self.add_item(whisper_select)
 
         # --- Build Buttons ---
-        prev_button = ui.Button(label="◀", style=discord.ButtonStyle.blurple, disabled=(self.current_page == 0), row=2)
-        next_button = ui.Button(label="▶", style=discord.ButtonStyle.blurple, disabled=(self.current_page >= len(self.filtered_whispers) - 1), row=2)
-        delete_button = ui.Button(label="Delete", style=discord.ButtonStyle.danger, disabled=(not self.filtered_whispers), row=2)
+        async def _prev(i):
+            self.current_page -= 1
+            self._build_view()
+            await i.response.edit_message(embed=self._get_current_embed(), view=self)
+            
+        async def _next(i):
+            self.current_page += 1
+            self._build_view()
+            await i.response.edit_message(embed=self._get_current_embed(), view=self)
 
-        prev_button.callback = self.pagination_callback
-        next_button.callback = self.pagination_callback
+        build_pagination_controls(self, self.current_page, len(self.filtered_whispers), 2, _prev, _next)
+
+        delete_button = ui.Button(label="Delete", style=discord.ButtonStyle.danger, disabled=(not self.filtered_whispers), row=2)
         delete_button.callback = self.delete_callback
-        
-        self.add_item(prev_button)
-        self.add_item(next_button)
         self.add_item(delete_button)
 
     def _get_current_embed(self) -> discord.Embed:
@@ -801,16 +819,11 @@ class WhisperHistoryView(ui.View):
             for name, mapped_pid in index["borrowed"].items():
                 if mapped_pid == target_pid: effective_profile_name = name; break
 
-        is_borrowed = effective_profile_name in index.get("borrowed", {})
-        effective_owner_id = self.user_id
-        if is_borrowed:
-            borrowed_data = self.cog._get_profile_config(self.user_id, effective_profile_name, True) or {}
-            effective_owner_id = int(borrowed_data.get("original_owner_id", self.user_id))
-            effective_profile_name = borrowed_data.get("original_profile_name", effective_profile_name)
+        effective_owner_id, effective_profile_name = self.cog._resolve_effective_profile(self.user_id, effective_profile_name)
         
         display_name = effective_profile_name
         avatar_url = self.cog.bot.user.display_avatar.url
-        appearance = self.cog.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name)
+        appearance = self.cog._get_user_appearance(effective_owner_id, effective_profile_name)
         if appearance:
             display_name = appearance.get("custom_display_name") or display_name
             avatar_url = appearance.get("custom_avatar_url") or avatar_url
@@ -830,14 +843,6 @@ class WhisperHistoryView(ui.View):
 
     async def whisper_jump_callback(self, interaction: discord.Interaction):
         self.current_page = int(interaction.data['values'][0])
-        self._build_view()
-        await interaction.response.edit_message(embed=self._get_current_embed(), view=self)
-
-    async def pagination_callback(self, interaction: discord.Interaction):
-        if interaction.data['custom_id'] == 'prev_button':
-            self.current_page -= 1
-        else:
-            self.current_page += 1
         self._build_view()
         await interaction.response.edit_message(embed=self._get_current_embed(), view=self)
 
@@ -910,146 +915,34 @@ class WhisperActionView(ui.View):
             return
         await self.cog._execute_whisper_regeneration(interaction, self.whisper_turn_id, self.response_turn_id, self.target_participant, self.whisper_message)
 
-class ProfileDirectorDeskModal(ui.Modal, title="Director's Desk: TTS Instructions"):
-    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], callback=None, target_user_id: Optional[int] = None):
-        super().__init__()
-        self.cog = cog
-        self.profile_name = profile_name
-        self.callback = callback
-        self.target_user_id = target_user_id
+def ProfileDirectorDeskModal(cog, profile_name: str, current_params: Dict[str, Any], callback=None, target_user_id: Optional[int] = None):
+    fields = [
+        {"label": "Archetype (Who)", "custom_id": "speech_archetype", "default": str(current_params.get("speech_archetype", "")), "required": False, "max_length": 200, "placeholder": "e.g. A cynical noir detective, a bubbly influencer."},
+        {"label": "Accent", "custom_id": "speech_accent", "default": str(current_params.get("speech_accent", "")), "required": False, "max_length": 200, "placeholder": "e.g. Australian (Melbourne), British (Brixton)."},
+        {"label": "Dynamics (Where / Acoustics)", "custom_id": "speech_dynamics", "default": str(current_params.get("speech_dynamics", "")), "required": False, "max_length": 200, "placeholder": "e.g. Speaking in a whisper, cavernous echoing hall."},
+        {"label": "Vocal Style (How)", "custom_id": "speech_style", "default": str(current_params.get("speech_style", "")), "required": False, "max_length": 200, "placeholder": "e.g. A vocal smile, breathy, gritty and gravelly."},
+        {"label": "Pacing (Tempo)", "custom_id": "speech_pacing", "default": str(current_params.get("speech_pacing", "")), "required": False, "max_length": 200, "placeholder": "e.g. Rapid-fire delivery, slow deliberate drawl."}
+    ]
+    def parser(v):
+        return {"config": {k: _ps(v[k]) or "" for k in ["speech_archetype", "speech_accent", "speech_dynamics", "speech_style", "speech_pacing"]}}
+    return ConfigModal(cog, profile_name, False, "Director's Desk: TTS Instructions", fields, parser, callback, target_user_id)
 
-        self.archetype_input = ui.TextInput(
-            label="Archetype (Who)", 
-            default=str(current_params.get("speech_archetype", "")), 
-            placeholder="e.g. A cynical noir detective, a bubbly influencer.",
-            required=False, max_length=200
-        )
-        self.accent_input = ui.TextInput(
-            label="Accent", 
-            default=str(current_params.get("speech_accent", "")), 
-            placeholder="e.g. Australian (Melbourne), British (Brixton).",
-            required=False, max_length=200
-        )
-        self.dynamics_input = ui.TextInput(
-            label="Dynamics (Where / Acoustics)", 
-            default=str(current_params.get("speech_dynamics", "")), 
-            placeholder="e.g. Speaking in a whisper, cavernous echoing hall.",
-            required=False, max_length=200
-        )
-        self.style_input = ui.TextInput(
-            label="Vocal Style (How)", 
-            default=str(current_params.get("speech_style", "")), 
-            placeholder="e.g. A vocal smile, breathy, gritty and gravelly.",
-            required=False, max_length=200
-        )
-        self.pacing_input = ui.TextInput(
-            label="Pacing (Tempo)", 
-            default=str(current_params.get("speech_pacing", "")), 
-            placeholder="e.g. Rapid-fire delivery, slow deliberate drawl.",
-            required=False, max_length=200
-        )
-        
-        self.add_item(self.archetype_input)
-        self.add_item(self.accent_input)
-        self.add_item(self.dynamics_input)
-        self.add_item(self.style_input)
-        self.add_item(self.pacing_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        
-        new_params = {
-            "speech_archetype": self.archetype_input.value.strip(),
-            "speech_accent": self.accent_input.value.strip(),
-            "speech_dynamics": self.dynamics_input.value.strip(),
-            "speech_style": self.style_input.value.strip(),
-            "speech_pacing": self.pacing_input.value.strip()
-        }
-
-        user_id = getattr(self, "target_user_id", None) or interaction.user.id
-        index = self.cog._get_user_index(user_id)
-        is_borrowed = self.profile_name in index.get("borrowed", [])
-        profile = self.cog._get_profile_config(user_id, self.profile_name, is_borrowed)
-        
-        if profile:
-            profile.update(new_params)
-            self.cog._save_profile_config(user_id, self.profile_name, profile, is_borrowed)
-            await interaction.followup.send(f"✅ TTS Instructions updated for '{self.profile_name}'.", ephemeral=True)
-            if self.callback: await self.callback(interaction)
-
-class ProfileSpeechSettingsModal(ui.Modal, title="Speech & Voice Settings"):
-    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
-        super().__init__()
-        self.cog = cog
-        self.profile_name = profile_name
-        self.is_borrowed = is_borrowed
-        self.callback = callback
-
-        toggle_val = "on" if current_params.get("speech_tts_enabled", False) else "off"
-        self.toggle_input = ui.TextInput(
-            label="Enable TTS (on/off)", 
-            default=toggle_val, 
-            placeholder="on or off",
-            required=True,
-            max_length=10
-        )
-        self.voice_input = ui.TextInput(
-            label="Voice Name (Aoede, Charon, Puck, Kore, etc)", 
-            default=str(current_params.get("speech_voice", "Aoede")), 
-            placeholder="Identity for synthesis (e.g. Aoede)",
-            required=False,
-            max_length=40
-        )
-        self.temp_input = ui.TextInput(
-            label="Temperature (0.0 - 2.0)", 
-            default=str(current_params.get("speech_temperature", 1.0)), 
-            placeholder="1.0 = Default, 2.0 = High Expression",
-            required=False,
-            max_length=5
-        )
-        
-        self.add_item(self.toggle_input)
-        self.add_item(self.voice_input)
-        self.add_item(self.temp_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        
-        tts_enabled = self.toggle_input.value.strip().lower() == "on"
-        voice = self.voice_input.value.strip() or "Aoede"
-        
-        try:
-            temp_raw = self.temp_input.value.strip()
-            temp = float(temp_raw) if temp_raw else 1.0
-            if not (0.0 <= temp <= 2.0): raise ValueError()
-        except ValueError:
-            await interaction.followup.send("❌ **Invalid Temperature.** Enter a number between 0.0 and 2.0.", ephemeral=True)
-            return
-
-        new_params = {
-            "speech_tts_enabled": tts_enabled,
-            "speech_voice": voice,
-            "speech_temperature": temp,
-        }
-
-        user_id = interaction.user.id
-        profile = self.cog._get_profile_config(user_id, self.profile_name, self.is_borrowed)
-        
-        if profile:
-            profile.update(new_params)
-            self.cog._save_profile_config(user_id, self.profile_name, profile, self.is_borrowed)
-            
-            keys_to_clear = [
-                k for k in self.cog.channel_models.keys() 
-                if isinstance(k, tuple) and len(k) == 3 and k[1] == user_id and k[2] == self.profile_name
-            ]
-            for k in keys_to_clear:
-                self.cog.channel_models.pop(k, None)
-                self.cog.chat_sessions.pop(k, None)
-                self.cog.channel_model_last_profile_key.pop(k, None)
-
-            await interaction.followup.send(f"✅ Speech settings updated for '{self.profile_name}'.", ephemeral=True)
-            if self.callback: await self.callback(interaction)
+def ProfileSpeechSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+    fields = [
+        {"label": "Enable TTS (on/off)", "custom_id": "speech_tts_enabled", "default": "on" if current_params.get("speech_tts_enabled", False) else "off", "required": True, "max_length": 10},
+        {"label": "Voice Name", "custom_id": "speech_voice", "default": str(current_params.get("speech_voice", "Aoede")), "required": False, "max_length": 40},
+        {"label": "Temperature (0.0 - 2.0)", "custom_id": "speech_temperature", "default": str(current_params.get("speech_temperature", 1.0)), "required": False, "max_length": 5}
+    ]
+    def parser(v):
+        c = {}
+        c["speech_tts_enabled"] = _pb(v["speech_tts_enabled"])
+        c["speech_voice"] = _ps(v["speech_voice"]) or "Aoede"
+        t = _pf(v["speech_temperature"])
+        if t is not None:
+            if not (0.0 <= t <= 2.0): raise ValueError("Temperature out of range")
+            c["speech_temperature"] = t
+        return {"config": c}
+    return ConfigModal(cog, profile_name, is_borrowed, "Speech & Voice Settings", fields, parser, callback)
 
 class DropdownContentView(ui.View):
     def __init__(self, content_dict: dict, title: str, link_button_label: Optional[str] = None, link_button_url: Optional[str] = None):
@@ -1425,13 +1318,8 @@ class ProfileManageView(ui.View):
         await self._save_and_refresh(interaction, profile, self.profile_name, self.is_borrowed)
 
     async def _handle_appearance(self, interaction):
-        user_apps = self.cog.user_appearances.get(str(self.user_id), {})
-        if self.profile_name in user_apps:
-            view = AppearanceEditView(self.cog, self.original_interaction, self.profile_name)
-            await view.show(interaction)
-        else:
-            modal = AppearanceCreateModal(self.cog, self.original_interaction, self.profile_name)
-            await interaction.response.send_modal(modal)
+        modal = AppearanceModal(self.cog, self.original_interaction, self.profile_name)
+        await interaction.response.send_modal(modal)
 
     async def _handle_rename(self, interaction):
         modal = ui.Modal(title=f"Rename '{self.profile_name}'")
@@ -1632,14 +1520,8 @@ class ProfileManageView(ui.View):
         try: await self.original_interaction.edit_original_response(content="Manager timed out.", view=None)
         except: pass
 
-def is_owner_in_dm_check(): 
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.guild is not None:
-            return False
-        return interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)
-    return app_commands.check(predicate)
-
 class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
+    share_code_input = ui.TextInput(label="Enter the share code", required=True, min_length=12, max_length=16)
     share_code_input = ui.TextInput(label="Enter the share code", required=True, min_length=12, max_length=16)
     name_input = ui.TextInput(label="Desired Profile/Internal Name (Optional)", required=False, placeholder="Leave blank to auto-generate.", max_length=30)
 
@@ -1944,14 +1826,7 @@ class HubPublicLibraryView(HubBaseView):
             select.callback = self.select_callback
             self.add_item(select)
 
-        prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page == 0))
-        prev_btn.callback = self.prev_page_cb
-        
-        page_lbl = ui.Button(label=f"{self.current_page + 1}/{num_profiles}", style=discord.ButtonStyle.grey, row=1, disabled=False)
-        page_lbl.callback = self.page_jump_cb
-        
-        next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page >= num_profiles - 1))
-        next_btn.callback = self.next_page_cb
+        build_pagination_controls(self, self.current_page, num_profiles, 1, self.prev_page_cb, self.next_page_cb, self.page_jump_cb)
         
         p_info = self.filtered_list[self.current_page]
         
@@ -1980,9 +1855,6 @@ class HubPublicLibraryView(HubBaseView):
         search_btn = ui.Button(label="Search / Sort", style=discord.ButtonStyle.secondary, row=1)
         search_btn.callback = self.search_cb
 
-        self.add_item(prev_btn)
-        self.add_item(page_lbl)
-        self.add_item(next_btn)
         self.add_item(borrow_btn)
         self.add_item(search_btn)
 
@@ -2113,17 +1985,7 @@ class HubIncomingView(HubBaseView):
             self.add_item(select)
 
         # Row 1: Pagination (if needed)
-        if num_pages > 1:
-            prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page == 0))
-            page_lbl = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, row=1, disabled=True)
-            next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page >= num_pages - 1))
-            
-            prev_btn.callback = self.prev_page
-            next_btn.callback = self.next_page
-            
-            self.add_item(prev_btn)
-            self.add_item(page_lbl)
-            self.add_item(next_btn)
+        build_pagination_controls(self, self.current_page, num_pages, 1, self.prev_page, self.next_page)
 
         # Row 2: Actions
         action_row = 2 if num_pages > 1 else 1 # Move up if no pagination
@@ -2282,35 +2144,19 @@ class HubShareManagerView(HubBaseView):
             self.add_item(prof_sel)
 
         # Row 2: Pagination Buttons (if needed) AND Action Buttons
-        # We share Row 2 for buttons.
-        
-        btn_items = []
-        if num_pages > 1:
-            prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, row=2, disabled=(self.current_page == 0))
-            page_lbl = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, row=2, disabled=True)
-            next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, row=2, disabled=(self.current_page >= num_pages - 1))
-            prev_btn.callback = self.prev_page
-            next_btn.callback = self.next_page
-            btn_items.extend([prev_btn, page_lbl, next_btn])
+        build_pagination_controls(self, self.current_page, num_pages, 2, self.prev_page, self.next_page)
 
         if self.mode == "private":
-            if len(btn_items) <= 3: # Fits on Row 2
-                send_btn = ui.Button(label="Send", style=discord.ButtonStyle.green, row=2)
-                code_btn = ui.Button(label="Get Code", style=discord.ButtonStyle.secondary, row=2)
-                send_btn.callback = self.send_private
-                code_btn.callback = self.generate_code
-                btn_items.append(send_btn)
-                btn_items.append(code_btn)
-            else: # Full row, move to Row 3? But user select needs Row 3.
-                # Prioritize functionality: Pagination + Send. Code button moves?
-                pass 
+            send_btn = ui.Button(label="Send", style=discord.ButtonStyle.green, row=2)
+            code_btn = ui.Button(label="Get Code", style=discord.ButtonStyle.secondary, row=2)
+            send_btn.callback = self.send_private
+            code_btn.callback = self.generate_code
+            self.add_item(send_btn)
+            self.add_item(code_btn)
         else:
             apply_btn = ui.Button(label="Apply Changes", style=discord.ButtonStyle.green, row=2)
             apply_btn.callback = self.apply_public
-            btn_items.append(apply_btn)
-
-        for btn in btn_items:
-            self.add_item(btn)
+            self.add_item(apply_btn)
 
         # Row 3: User Select (Private)
         if self.mode == "private":
@@ -2509,7 +2355,9 @@ class HubShareManagerView(HubBaseView):
             analysis_message = await i.followup.send("🔍 Analysing profiles for safety...", ephemeral=True)
             
             async def evaluate_profile(name: str):
-                appearance_data = self.cog.user_appearances.get(user_id_str, {}).get(name, {})
+                eff_owner, eff_name = self.cog._resolve_effective_profile(self.user_id, name)
+                
+                appearance_data = self.cog.user_appearances.get(str(eff_owner), {}).get(eff_name, {})
                 disp = appearance_data.get("custom_display_name") or name
                 ava = appearance_data.get("custom_avatar_url")
                 
@@ -2604,18 +2452,7 @@ class HubCloningView(HubBaseView):
             select.callback = self.select_profile_cb
             self.add_item(select)
 
-        if num_pages > 1:
-            prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page == 0))
-            prev_btn.callback = self.prev_page
-            
-            page_lbl = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, row=1, disabled=True)
-            
-            next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page >= num_pages - 1))
-            next_btn.callback = self.next_page
-            
-            self.add_item(prev_btn)
-            self.add_item(page_lbl)
-            self.add_item(next_btn)
+        build_pagination_controls(self, self.current_page, num_pages, 1, self.prev_page, self.next_page)
 
         action_row = 2 if num_pages > 1 else 1
         
@@ -2763,13 +2600,6 @@ class ShutdownConfirmView(ui.View):
     async def on_timeout(self):
         pass
 
-def is_admin_or_owner_check(): 
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.guild:
-            return interaction.user.guild_permissions.administrator
-        return interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)
-    return app_commands.check(predicate)
-
 class EditUserProfilePersonaModal(ui.Modal): 
     def __init__(self, cog_instance, profile_name: str, current_persona_data: Dict[str, List[str]], user_id: int):
         self.cog_instance: GeminiAgent = cog_instance
@@ -2799,14 +2629,6 @@ class EditUserProfilePersonaModal(ui.Modal):
         )
         scope = f"your profile '{self.profile_name}'"
         message = f"Persona sections for {scope} {'updated' if success else 'update failed (max profiles reached or other issue)'}."
-        
-        if success:
-            active_profile_for_channel = self.cog_instance._get_active_user_profile_name_for_channel(i.user.id, i.channel_id)
-            if active_profile_for_channel == self.profile_name:
-                message += " This profile is active in this channel; changes will apply on next interaction."
-            else:
-                message += f" Use `/profile swap profile_name:{self.profile_name}` to make it active in this channel."
-
 
         await i.followup.send(message, ephemeral=True)
     async def on_error(self, i:discord.Interaction, e:Exception): print(f"EditUserProfilePersonaModal err: {e}"); traceback.print_exc(); await i.followup.send('Form error.',ephemeral=True)
@@ -2842,12 +2664,6 @@ class EditUserProfileAIInstructionsModal(ui.Modal):
         scope=f"your profile '{self.profile_name}'"
         message = f"AI Instructions for {scope} {'updated' if success else 'update failed (max profiles reached or other issue)'}."
 
-        if success:
-            active_profile_for_channel = self.cog._get_active_user_profile_name_for_channel(i.user.id, i.channel_id)
-            if active_profile_for_channel == self.profile_name:
-                message += " This profile is active in this channel; changes will apply on next interaction."
-            else:
-                message += f" Use `/profile swap profile_name:{self.profile_name}` to make it active in this channel."
         await i.followup.send(message,ephemeral=True)
     async def on_error(self, i:discord.Interaction,e:Exception): print(f"EditUserProfileAIInstrModal err: {e}"); traceback.print_exc(); await i.followup.send('Form error.',ephemeral=True)
 
@@ -3010,395 +2826,148 @@ class EditTrainingExampleModal(ui.Modal, title="Edit Profile Training Example"):
         traceback.print_exc()
         await i.followup.send("An error occurred with the edit form.", ephemeral=True)
 
-class ProfileParamsModal(ui.Modal, title="Set Profile Generation Parameters"):
-    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
-        super().__init__()
-        self.cog: GeminiAgent = cog
-        self.profile_name = profile_name
-        self.is_borrowed = is_borrowed
-        self.callback = callback
+def ProfileParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+    fields = [
+        {"label": "Temperature (0.0-2.0)", "custom_id": "temperature", "default": str(current_params.get("temperature", defaultConfig.GEMINI_TEMPERATURE)), "required": False},
+        {"label": "Top P (0.0-1.0)", "custom_id": "top_p", "default": str(current_params.get("top_p", defaultConfig.GEMINI_TOP_P)), "required": False},
+        {"label": "Top K (integer 0-100)", "custom_id": "top_k", "default": str(current_params.get("top_k", defaultConfig.GEMINI_TOP_K)), "required": False},
+        {"label": f"STM Length (0-{STM_LIMIT_MAX})", "custom_id": "stm_length", "default": str(current_params.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)), "required": False}
+    ]
+    def parser(v):
+        c = {}
+        t = _pf(v["temperature"]); p = _pf(v["top_p"]); k = _pi(v["top_k"]); s = _pi(v["stm_length"])
+        if t is not None:
+            if not (0.0 <= t <= 2.0): raise ValueError("Temperature out of range")
+            c["temperature"] = t
+        if p is not None:
+            if not (0.0 <= p <= 1.0): raise ValueError("Top P out of range")
+            c["top_p"] = p
+        if k is not None:
+            if not (0 <= k <= 100): raise ValueError("Top K out of range")
+            c["top_k"] = k
+        if s is not None:
+            if not (0 <= s <= STM_LIMIT_MAX): raise ValueError(f"STM Length out of range (0-{STM_LIMIT_MAX})")
+            c["stm_length"] = s
+        return {"config": c}
+    return ConfigModal(cog, profile_name, is_borrowed, "Set Profile Generation Parameters", fields, parser, callback)
 
-        self.add_item(ui.TextInput(label="Temperature (0.0-2.0)", custom_id="temperature", default=str(current_params.get("temperature", defaultConfig.GEMINI_TEMPERATURE)), required=False))
-        self.add_item(ui.TextInput(label="Top P (0.0-1.0)", custom_id="top_p", default=str(current_params.get("top_p", defaultConfig.GEMINI_TOP_P)), required=False))
-        self.add_item(ui.TextInput(label="Top K (integer 0-100)", custom_id="top_k", default=str(current_params.get("top_k", defaultConfig.GEMINI_TOP_K)), required=False))
-        self.add_item(ui.TextInput(label=f"STM Length (0-{STM_LIMIT_MAX})", custom_id="stm_length", default=str(current_params.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)), required=False))
+def ProfileTrainingParamsModal(cog, profile_name: str, current_params: Dict[str, Any], callback=None):
+    fields = [
+        {"label": "Context Size (0-10)", "custom_id": "training_context_size", "default": str(current_params.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE)), "required": False},
+        {"label": "Relevance Threshold (0.0-1.0)", "custom_id": "training_relevance_threshold", "default": str(current_params.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD)), "required": False}
+    ]
+    def parser(v):
+        c = {}
+        cs = _pi(v["training_context_size"]); rt = _pf(v["training_relevance_threshold"])
+        if cs is not None:
+            if not (0 <= cs <= 10): raise ValueError("Context Size out of range")
+            c["training_context_size"] = cs
+        if rt is not None:
+            if not (0.0 <= rt <= 1.0): raise ValueError("Relevance Threshold out of range")
+            c["training_relevance_threshold"] = rt
+        return {"config": c}
+    return ConfigModal(cog, profile_name, False, "Set Profile Training Parameters", fields, parser, callback)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
+def ProfileThinkingParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+    fields = [
+        {"label": "Thinking Summary (on/off)", "custom_id": "thinking_summary_visible", "default": current_params.get("thinking_summary_visible", "off"), "required": False, "placeholder": "Display reasoning tokens below your message."},
+        {"label": "Reasoning Effort / Level", "custom_id": "thinking_level", "default": current_params.get("thinking_level", "high"), "required": False, "placeholder": "xhigh, high, medium, low, minimal, none"},
+        {"label": "Reasoning Token Budget (-1=dyn)", "custom_id": "thinking_budget", "default": str(current_params.get("thinking_budget", -1)), "required": False, "placeholder": "-1 = dynamic, 128+ = token limit"},
+        {"label": "Thought Signatures (on/off)", "custom_id": "thinking_signatures_enabled", "default": current_params.get("thinking_signatures_enabled", "off"), "required": False, "placeholder": "Preserve reasoning context across turns."}
+    ]
+    def parser(v):
+        c = {}
+        sv = _ps(v["thinking_summary_visible"])
+        c["thinking_summary_visible"] = "on" if sv and sv.lower() == "on" else "off"
         
-        new_params = {}
-        try:
-            temp_str = next((c.value for c in self.children if c.custom_id == "temperature"), None)
-            if temp_str: 
-                val = float(temp_str)
-                if not (0.0 <= val <= 2.0): raise ValueError("Temperature out of range")
-                new_params["temperature"] = val
-            
-            topp_str = next((c.value for c in self.children if c.custom_id == "top_p"), None)
-            if topp_str: 
-                val = float(topp_str)
-                if not (0.0 <= val <= 1.0): raise ValueError("Top P out of range")
-                new_params["top_p"] = val
-
-            topk_str = next((c.value for c in self.children if c.custom_id == "top_k"), None)
-            if topk_str: 
-                val = int(topk_str)
-                if not (0 <= val <= 100): raise ValueError("Top K out of range")
-                new_params["top_k"] = val
-
-            stm_str = next((c.value for c in self.children if c.custom_id == "stm_length"), None)
-            if stm_str:
-                val = int(stm_str)
-                if not (0 <= val <= STM_LIMIT_MAX): raise ValueError(f"STM Length out of range (0-{STM_LIMIT_MAX})")
-                new_params["stm_length"] = val
-
-        except ValueError as e:
-            await interaction.followup.send(f"❌ **Invalid Input:** {e}. Please check your values.", ephemeral=True)
-            return
-        except Exception as e:
-            print(f"Error parsing params: {e}")
-            await interaction.followup.send("❌ Error parsing input.", ephemeral=True)
-            return
-
-        if self.profile_name == "BULK_APPLY":
-            # Bulk logic handled by caller if needed, but usually this modal isn't used for bulk directly like this
-            pass
-        else:
-            try:
-                success = await self.cog.update_profile_generation_params(interaction.user.id, self.profile_name, new_params, interaction.channel_id, self.is_borrowed)
-                if success:
-                    await interaction.followup.send(f"✅ Generation parameters updated for '{self.profile_name}'.", ephemeral=True)
-                    if self.callback: 
-                        try: await self.callback(interaction)
-                        except Exception as e: print(f"Callback error in ProfileParamsModal: {e}")
-                else:
-                    await interaction.followup.send(f"❌ Failed to update parameters for '{self.profile_name}'.", ephemeral=True)
-            except Exception as e:
-                print(f"Error updating params: {e}")
-                traceback.print_exc()
-                await interaction.followup.send("❌ An unexpected error occurred while saving.", ephemeral=True)
-
-class ProfileTrainingParamsModal(ui.Modal, title="Set Profile Training Parameters"):
-    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], callback=None):
-        super().__init__()
-        self.cog: GeminiAgent = cog
-        self.profile_name = profile_name
-        self.callback = callback
-        self.add_item(ui.TextInput(label="Context Size (0-10)", custom_id="training_context_size", default=str(current_params.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE)), required=False))
-        self.add_item(ui.TextInput(label="Relevance Threshold (0.0-1.0)", custom_id="training_relevance_threshold", default=str(current_params.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD)), required=False))
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        new_params = {}
-        try:
-            ctx_str = next((c.value for c in self.children if c.custom_id == "training_context_size"), None)
-            if ctx_str: 
-                val = int(ctx_str)
-                if not (0 <= val <= 10): raise ValueError("Context Size out of range (0-10)")
-                new_params["training_context_size"] = val
-            
-            rel_str = next((c.value for c in self.children if c.custom_id == "training_relevance_threshold"), None)
-            if rel_str: 
-                val = float(rel_str)
-                if not (0.0 <= val <= 1.0): raise ValueError("Relevance Threshold out of range (0.0-1.0)")
-                new_params["training_relevance_threshold"] = val
-        except ValueError as e:
-            await interaction.followup.send(f"❌ **Invalid Input:** {e}.", ephemeral=True)
-            return
-
-        if self.profile_name == "BULK_APPLY":
-            pass
-        else:
-            success = await self.cog.update_profile_training_params(interaction.user.id, self.profile_name, new_params)
-            if success:
-                await interaction.followup.send(f"✅ Training parameters updated for '{self.profile_name}'.", ephemeral=True)
-                if self.callback: await self.callback(interaction)
-            else:
-                await interaction.followup.send(f"❌ Failed to update training parameters for '{self.profile_name}'.", ephemeral=True)
-
-class ProfileThinkingParamsModal(ui.Modal, title="Thinking & Reasoning Parameters"):
-    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
-        super().__init__()
-        self.cog = cog
-        self.profile_name = profile_name
-        self.is_borrowed = is_borrowed
-        self.callback = callback
-
-        self.add_item(ui.TextInput(
-            label="Thinking Summary (on/off)", 
-            custom_id="thinking_summary_visible", 
-            default=current_params.get("thinking_summary_visible", "off"), 
-            placeholder="Display reasoning tokens below your message.",
-            required=False
-        ))
-        self.add_item(ui.TextInput(
-            label="Reasoning Effort / Level", 
-            custom_id="thinking_level", 
-            default=current_params.get("thinking_level", "high"), 
-            placeholder="xhigh, high, medium, low, minimal, none",
-            required=False
-        ))
-        self.add_item(ui.TextInput(
-            label="Reasoning Token Budget (Gemini 2.5 Only)", 
-            custom_id="thinking_budget", 
-            default=str(current_params.get("thinking_budget", -1)), 
-            placeholder="-1 = dynamic, 128+ = token limit",
-            required=False
-        ))
-        self.add_item(ui.TextInput(
-            label="Thought Signatures (on/off)", 
-            custom_id="thinking_signatures_enabled", 
-            default=current_params.get("thinking_signatures_enabled", "off"), 
-            placeholder="Preserve reasoning context across turns.",
-            required=False
-        ))
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        new_params = {}
-        try:
-            def get_v(cid): return next(c.value for c in self.children if c.custom_id == cid).strip().lower()
-            
-            s_val = get_v("thinking_summary_visible")
-            if s_val not in ["on", "off"]: s_val = "off"
-            new_params["thinking_summary_visible"] = s_val
-            
-            l_val = get_v("thinking_level")
-            # [UPDATED] Validation for all 6 standardized effort levels
-            if l_val not in ["xhigh", "high", "medium", "low", "minimal", "none"]:
-                l_val = "high"
-            new_params["thinking_level"] = l_val
-            
-            b_val = int(get_v("thinking_budget"))
-            if b_val < -1: b_val = -1
-            new_params["thinking_budget"] = min(b_val, 32768)
-
-            sig_val = get_v("thinking_signatures_enabled")
-            if sig_val not in ["on", "off"]: sig_val = "off"
-            new_params["thinking_signatures_enabled"] = sig_val
-
-        except ValueError as e:
-            await interaction.followup.send(f"❌ **Invalid Input:** {e}", ephemeral=True); return
-
-        if self.profile_name == "BULK_APPLY":
-            return
-
-        index = self.cog._get_user_index(interaction.user.id)
+        lv = _ps(v["thinking_level"])
+        c["thinking_level"] = lv.lower() if lv and lv.lower() in ["xhigh", "high", "medium", "low", "minimal", "none"] else "high"
         
-        target_dict = self.cog._get_profile_config(interaction.user.id, self.profile_name, self.is_borrowed)
+        bv = _pi(v["thinking_budget"])
+        c["thinking_budget"] = min(bv if bv is not None and bv >= -1 else -1, 32768)
         
-        if target_dict:
-            target_dict.update(new_params)
-            self.cog._save_profile_config(interaction.user.id, self.profile_name, target_dict, self.is_borrowed)
-            
-            cache_key = (interaction.channel_id, interaction.user.id, self.profile_name)
-            self.cog.channel_models.pop(cache_key, None)
-            self.cog.chat_sessions.pop(cache_key, None)
-            self.cog.channel_model_last_profile_key.pop(cache_key, None)
+        ts = _ps(v["thinking_signatures_enabled"])
+        c["thinking_signatures_enabled"] = "on" if ts and ts.lower() == "on" else "off"
+        return {"config": c}
+    return ConfigModal(cog, profile_name, is_borrowed, "Thinking & Reasoning Parameters", fields, parser, callback)
 
-            await interaction.followup.send(f"✅ Thinking parameters updated for '{self.profile_name}'.", ephemeral=True)
-            if self.callback: await self.callback(interaction)
+def ProfileLTMParamsModal(cog, profile_name: str, current_params: Dict[str, Any], callback=None):
+    fields = [
+        {"label": "Creation Interval (5-100 msgs)", "custom_id": "ltm_creation_interval", "default": str(current_params.get("ltm_creation_interval", 10)), "required": False, "placeholder": "Default: 10"},
+        {"label": "Summarization Context (5-50 msgs)", "custom_id": "ltm_summarization_context", "default": str(current_params.get("ltm_summarization_context", 10)), "required": False, "placeholder": "Default: 10"},
+        {"label": "Recall Context Size (0-10)", "custom_id": "ltm_context_size", "default": str(current_params.get("ltm_context_size", 3)), "required": False, "placeholder": "Default: 3"},
+        {"label": "Relevance Threshold (0.0-1.0)", "custom_id": "ltm_relevance_threshold", "default": str(current_params.get("ltm_relevance_threshold", 0.75)), "required": False, "placeholder": "Default: 0.75"}
+    ]
+    def parser(v):
+        c = {}
+        inv = _pi(v["ltm_creation_interval"]); ctx = _pi(v["ltm_summarization_context"])
+        rs = _pi(v["ltm_context_size"]); rt = _pf(v["ltm_relevance_threshold"])
+        if inv is not None:
+            if not (5 <= inv <= 100): raise ValueError("Interval out of range")
+            c["ltm_creation_interval"] = inv
+        if ctx is not None:
+            if not (5 <= ctx <= 50): raise ValueError("Context out of range")
+            c["ltm_summarization_context"] = ctx
+        if rs is not None:
+            if not (0 <= rs <= 10): raise ValueError("Context Size out of range")
+            c["ltm_context_size"] = rs
+        if rt is not None:
+            if not (0.0 <= rt <= 1.0): raise ValueError("Relevance Threshold out of range")
+            c["ltm_relevance_threshold"] = rt
+        return {"config": c}
+    return ConfigModal(cog, profile_name, False, "LTM Parameters", fields, parser, callback)
 
-class ProfileLTMParamsModal(ui.Modal, title="LTM Parameters"):
-    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], callback=None):
-        super().__init__()
-        self.cog: GeminiAgent = cog
-        self.profile_name = profile_name
-        self.callback = callback
+def ProfileLTMSummarizationModal(cog, profile_name: str, current_instructions: str, callback=None):
+    decrypted = cog._decrypt_data(current_instructions)
+    fields = [{
+        "label": "AI Instructions for Summarization",
+        "custom_id": "ltm_summarization_instructions",
+        "style": discord.TextStyle.paragraph,
+        "default": decrypted,
+        "required": True,
+        "max_length": 2000,
+        "placeholder": "The system will automatically append the conversation excerpt to these instructions."
+    }]
+    def parser(v):
+        ins = _ps(v["ltm_summarization_instructions"]) or DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS
+        return {"prompts": {"ltm_summarization_instructions": cog._encrypt_data(ins)}}
+    return ConfigModal(cog, profile_name, False, "Set LTM Summarization Instructions", fields, parser, callback)
+
+def ProfileTypingSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+    fields = [
+        {"label": "Enable Realistic Typing (on/off)", "custom_id": "realistic_typing_enabled", "default": "on" if current_params.get("realistic_typing_enabled") else "off", "required": True},
+        {"label": "Mode (sentence/line)", "custom_id": "typing_mode", "default": current_params.get("typing_mode", "sentence"), "required": False, "placeholder": "Default: sentence"},
+        {"label": "Characters per Second", "custom_id": "typing_cps", "default": str(current_params.get("typing_cps", 30.0)), "required": False, "placeholder": "Default: 30.0"},
+        {"label": "Max Delay per Chunk (Seconds)", "custom_id": "typing_max_delay", "default": str(current_params.get("typing_max_delay", 2.5)), "required": False, "placeholder": "Default: 2.5"}
+    ]
+    def parser(v):
+        c = {"realistic_typing_enabled": _pb(v["realistic_typing_enabled"])}
+        m = _ps(v["typing_mode"])
+        if m: c["typing_mode"] = "line" if m.lower() == "line" else "sentence"
+        cps = _pf(v["typing_cps"])
+        if cps is not None: c["typing_cps"] = cps
+        md = _pf(v["typing_max_delay"])
+        if md is not None: c["typing_max_delay"] = md
+        return {"config": c}
+    return ConfigModal(cog, profile_name, is_borrowed, "Realistic Typing Settings", fields, parser, callback)
+
+def ProfileImageGenSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+    fields = [
+        {"label": "Enable Image Gen (on/off)", "custom_id": "image_generation_enabled", "default": "on" if current_params.get("image_generation_enabled") else "off", "required": True}
+    ]
+    if not is_borrowed:
+        enc = current_params.get("image_generation_prompt")
+        dec = cog._decrypt_data(enc) if enc else ""
+        fields.append({"label": "Image Generation Prompt", "custom_id": "image_generation_prompt", "style": discord.TextStyle.paragraph, "default": dec, "required": False, "max_length": 2000})
         
-        self.add_item(ui.TextInput(label="Creation Interval (5-100 msgs)", custom_id="ltm_creation_interval", default=str(current_params.get("ltm_creation_interval", 10)), required=False, placeholder="Default: 10"))
-        self.add_item(ui.TextInput(label="Summarization Context (5-50 msgs)", custom_id="ltm_summarization_context", default=str(current_params.get("ltm_summarization_context", 10)), required=False, placeholder="Default: 10"))
-        self.add_item(ui.TextInput(label="Recall Context Size (0-10)", custom_id="ltm_context_size", default=str(current_params.get("ltm_context_size", 3)), required=False, placeholder="Default: 3"))
-        self.add_item(ui.TextInput(label="Relevance Threshold (0.0-1.0)", custom_id="ltm_relevance_threshold", default=str(current_params.get("ltm_relevance_threshold", 0.75)), required=False, placeholder="Default: 0.75"))
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        new_params = {}
-        try:
-            def parse(cid, default, min_v, max_v, is_float=False):
-                val = next(c.value for c in self.children if c.custom_id == cid).strip()
-                if not val: return default
-                res = float(val) if is_float else int(val)
-                if not (min_v <= res <= max_v): raise ValueError(f"{cid} out of range")
-                return res
-
-            new_params["ltm_creation_interval"] = parse("ltm_creation_interval", 10, 5, 100)
-            new_params["ltm_summarization_context"] = parse("ltm_summarization_context", 10, 5, 50)
-            new_params["ltm_context_size"] = parse("ltm_context_size", 3, 0, 10)
-            new_params["ltm_relevance_threshold"] = parse("ltm_relevance_threshold", 0.75, 0.0, 1.0, True)
-        except ValueError as e:
-            await interaction.followup.send(f"❌ **Invalid Input:** {e}.", ephemeral=True); return
-
-        if self.profile_name == "BULK_APPLY":
-            pass
-        else:
-            success = await self.cog.update_profile_ltm_params(interaction.user.id, self.profile_name, new_params)
-            if success:
-                await interaction.followup.send(f"✅ LTM parameters updated for '{self.profile_name}'.", ephemeral=True)
-                if self.callback: await self.callback(interaction)
-            else:
-                await interaction.followup.send(f"❌ Failed to update LTM parameters for '{self.profile_name}'.", ephemeral=True)
-
-class ProfileLTMSummarizationModal(ui.Modal, title="Set LTM Summarization Instructions"):
-    def __init__(self, cog, profile_name: str, current_instructions: str):
-        super().__init__()
-        self.cog: GeminiAgent = cog
-        self.profile_name = profile_name
-        decrypted_instructions = self.cog._decrypt_data(current_instructions)
-        self.instructions_input = ui.TextInput(
-            label="AI Instructions for Summarization",
-            style=discord.TextStyle.paragraph,
-            default=decrypted_instructions,
-            required=True,
-            max_length=2000,
-            placeholder="The system will automatically append the conversation excerpt to these instructions."
-        )
-        self.add_item(self.instructions_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        new_instructions = self.instructions_input.value.strip()
-        if not new_instructions:
-            new_instructions = DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS
-        
-        user_id = interaction.user.id
-        prompts = self.cog._get_profile_prompts(user_id, self.profile_name)
-        if not prompts:
-            await interaction.followup.send("Profile prompts not found.", ephemeral=True)
-            return
-
-        prompts["ltm_summarization_instructions"] = self.cog._encrypt_data(new_instructions)
-        self.cog._save_profile_prompts(user_id, self.profile_name, prompts)
-        
-        await interaction.followup.send(f"LTM summarization instructions updated for profile '{self.profile_name}'.", ephemeral=True)
-
-class ProfileLTMTriggerModal(ui.Modal, title="Set LTM Frequency & Context"):
-    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], callback=None):
-        super().__init__()
-        self.cog: GeminiAgent = cog
-        self.profile_name = profile_name
-        self.callback = callback
-        self.add_item(ui.TextInput(label="Creation Interval (5-100 msgs)", custom_id="ltm_creation_interval", default=str(current_params.get("ltm_creation_interval", 10)), placeholder="How many messages before creating a memory?"))
-        self.add_item(ui.TextInput(label="Summarization Context (5-50 msgs)", custom_id="ltm_summarization_context", default=str(current_params.get("ltm_summarization_context", 10)), placeholder="How many recent messages to summarize?"))
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        new_params = {}
-        try:
-            inv = int(next(c.value for c in self.children if c.custom_id == "ltm_creation_interval"))
-            ctx = int(next(c.value for c in self.children if c.custom_id == "ltm_summarization_context"))
-            if not (5 <= inv <= 100): raise ValueError("Interval out of range (5-100)")
-            if not (5 <= ctx <= 50): raise ValueError("Context out of range (5-50)")
-            new_params["ltm_creation_interval"] = inv
-            new_params["ltm_summarization_context"] = ctx
-        except ValueError as e:
-            await interaction.followup.send(f"❌ **Invalid Input:** {e}.", ephemeral=True); return
-
-        index = self.cog._get_user_index(interaction.user.id)
-        is_borrowed = self.profile_name in index.get("borrowed", [])
-        profile = self.cog._get_profile_config(interaction.user.id, self.profile_name, is_borrowed)
-        if profile:
-            profile.update(new_params)
-            self.cog._save_profile_config(interaction.user.id, self.profile_name, profile, is_borrowed)
-            await interaction.followup.send(f"✅ LTM frequency settings updated for '{self.profile_name}'.", ephemeral=True)
-            if self.callback: await self.callback(interaction)
-
-class ProfileTypingSettingsModal(ui.Modal, title="Realistic Typing Settings"):
-    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
-        super().__init__()
-        self.cog = cog
-        self.profile_name = profile_name
-        self.is_borrowed = is_borrowed
-        self.callback = callback
-        
-        status_val = "on" if current_params.get("realistic_typing_enabled", False) else "off"
-        self.add_item(ui.TextInput(label="Enable Realistic Typing (on/off)", custom_id="enabled", default=status_val, required=True))
-        
-        mode_val = current_params.get("typing_mode", "sentence")
-        self.add_item(ui.TextInput(label="Mode (sentence/line)", custom_id="mode", default=mode_val, required=False, placeholder="Default: sentence"))
-        
-        self.add_item(ui.TextInput(label="Characters per Second", custom_id="cps", default=str(current_params.get("typing_cps", 30.0)), required=False, placeholder="Default: 30.0"))
-        self.add_item(ui.TextInput(label="Max Delay per Chunk (Seconds)", custom_id="max_delay", default=str(current_params.get("typing_max_delay", 2.5)), required=False, placeholder="Default: 2.5"))
-    
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        new_params = {}
-        try:
-            def gv(cid): return next((c.value for c in self.children if c.custom_id == cid), None)
-            en_val = gv("enabled").strip().lower()
-            new_params["realistic_typing_enabled"] = (en_val == "on")
-            
-            mode_val = gv("mode")
-            if mode_val:
-                mode_clean = mode_val.strip().lower()
-                new_params["typing_mode"] = "line" if mode_clean == "line" else "sentence"
-            
-            cps_val = gv("cps")
-            if cps_val and cps_val.strip(): new_params["typing_cps"] = float(cps_val.strip())
-            
-            max_delay_val = gv("max_delay")
-            if max_delay_val and max_delay_val.strip(): new_params["typing_max_delay"] = float(max_delay_val.strip())
-        except ValueError:
-            await interaction.followup.send("❌ **Invalid Input**: Please enter valid numbers.", ephemeral=True); return
-        except Exception:
-            await interaction.followup.send("Error parsing input.", ephemeral=True); return
-        
-        if self.profile_name == "BULK_APPLY":
-            if self.callback: await self.callback(interaction, new_params)
-            return
-            
-        target = self.cog._get_profile_config(interaction.user.id, self.profile_name, self.is_borrowed)
-        if target:
-            target.update(new_params)
-            self.cog._save_profile_config(interaction.user.id, self.profile_name, target, self.is_borrowed)
-            await interaction.followup.send("✅ Realistic typing settings updated.", ephemeral=True)
-            if self.callback: await self.callback(interaction)
-        else:
-            await interaction.followup.send("❌ Profile not found.", ephemeral=True)
-
-class ProfileImageGenSettingsModal(ui.Modal, title="Image Generation Settings"):
-    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
-        super().__init__()
-        self.cog = cog
-        self.profile_name = profile_name
-        self.is_borrowed = is_borrowed
-        self.callback = callback
-        
-        status_val = "on" if current_params.get("image_generation_enabled", False) else "off"
-        self.add_item(ui.TextInput(label="Enable Image Gen (on/off)", custom_id="enabled", default=status_val, required=True))
-        
-        if not self.is_borrowed:
-            enc_prompt = current_params.get("image_generation_prompt")
-            prompt_val = self.cog._decrypt_data(enc_prompt) if enc_prompt else ""
-            self.add_item(ui.TextInput(label="Image Generation Prompt", custom_id="prompt", style=discord.TextStyle.paragraph, default=prompt_val, required=False, max_length=2000))
-    
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        new_params = {}
-        try:
-            def gv(cid): return next((c.value for c in self.children if c.custom_id == cid), None)
-            en_val = gv("enabled").strip().lower()
-            new_params["image_generation_enabled"] = (en_val == "on")
-            
-            if not self.is_borrowed:
-                pr_val = gv("prompt")
-                if pr_val is not None:
-                    new_params["image_generation_prompt"] = self.cog._encrypt_data(pr_val.strip()) if pr_val.strip() else None
-        except Exception:
-            await interaction.followup.send("Error parsing input.", ephemeral=True); return
-        
-        if self.profile_name == "BULK_APPLY":
-            if self.callback: await self.callback(interaction, new_params)
-            return
-            
-        target = self.cog._get_profile_config(interaction.user.id, self.profile_name, self.is_borrowed)
-        if target:
-            target.update(new_params)
-            self.cog._save_profile_config(interaction.user.id, self.profile_name, target, self.is_borrowed)
-            await interaction.followup.send("✅ Image generation settings updated.", ephemeral=True)
-            if self.callback: await self.callback(interaction)
-        else:
-            await interaction.followup.send("❌ Profile not found.", ephemeral=True)
+    def parser(v):
+        c = {"image_generation_enabled": _pb(v["image_generation_enabled"])}
+        p = {}
+        if not is_borrowed and "image_generation_prompt" in v:
+            pr = _ps(v["image_generation_prompt"])
+            p["image_generation_prompt"] = cog._encrypt_data(pr) if pr else None
+        return {"config": c, "prompts": p}
+    return ConfigModal(cog, profile_name, is_borrowed, "Image Generation Settings", fields, parser, callback)
 
 class SessionPromptModal(ui.Modal, title="Set Master Prompt"):
     prompt_input = ui.TextInput(label="Master Prompt / Director's Note", style=discord.TextStyle.paragraph, placeholder="The persistent background instruction to set the scene...", required=False, max_length=1500)
@@ -3578,16 +3147,9 @@ class SessionConfigView(ui.View):
             self.add_item(source_btn)
 
             if num_pages > 1:
-                prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page==0), row=1)
                 async def p_cb(i): self.current_page -= 1; await i.response.defer(); await self.update_display()
-                prev_btn.callback = p_cb; self.add_item(prev_btn)
-                
-                page_btn = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, disabled=True, row=1)
-                self.add_item(page_btn)
-                
-                next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page>=num_pages-1), row=1)
                 async def n_cb(i): self.current_page += 1; await i.response.defer(); await self.update_display()
-                next_btn.callback = n_cb; self.add_item(next_btn)
+                build_pagination_controls(self, self.current_page, num_pages, 1, p_cb, n_cb)
 
             cast_list = "\n".join(f"{idx+1}. `{p['profile_name']}` ({'Child Bot' if p.get('method') == 'child_bot' else 'Webhook'})" for idx, p in enumerate(self.session['profiles'])) or "*No participants*"
             embed.add_field(name="Current Cast", value=cast_list, inline=False)
@@ -3769,31 +3331,7 @@ class SingleProfileModelView(ui.View):
         return msg
 
     def _get_top_models(self, provider: str, target_config_key: str) -> List[str]:
-        if target_config_key == 'image_generation_model':
-            return list(get_args(IMAGE_MODELS))
-        if target_config_key == 'speech_model':
-            return list(get_args(AUDIO_MODELS))
-            
-        if provider == 'google':
-            return list(get_args(ALLOWED_MODELS))
-        elif provider == 'ollama':
-            return getattr(self, 'cached_ollama_models', [])
-
-        import os
-        import json as std_json
-        filename = "openrouter_models.json"
-        path = os.path.join(self.cog.MODELS_DATA_DIR, filename)
-        
-        data = {}
-        if os.path.exists(path):
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = std_json.load(f)
-            except: 
-                data = {}
-
-        sorted_models = sorted(data.items(), key=lambda x: x[1], reverse=True)
-        return [m[0] for m in sorted_models]
+        return self.cog.get_top_models(provider, target_config_key)
 
     async def _update_ollama_status(self):
         host_url = OLLAMA_LOCAL_URL
@@ -4061,31 +3599,7 @@ class ModelApplyView(ui.View):
         return msg
 
     def _get_top_models(self, provider: str, target_config_key: str) -> List[str]:
-        if target_config_key == 'image_generation_model':
-            return list(get_args(IMAGE_MODELS))
-        if target_config_key == 'speech_model':
-            return list(get_args(AUDIO_MODELS))
-            
-        if provider == 'google':
-            return list(get_args(ALLOWED_MODELS))
-        elif provider == 'ollama':
-            return getattr(self, 'cached_ollama_models', [])
-
-        import os
-        import json as std_json
-        filename = "openrouter_models.json"
-        path = os.path.join(self.cog.MODELS_DATA_DIR, filename)
-        
-        data = {}
-        if os.path.exists(path):
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = std_json.load(f)
-            except: 
-                data = {}
-
-        sorted_models = sorted(data.items(), key=lambda x: x[1], reverse=True)
-        return [m[0] for m in sorted_models]
+        return self.cog.get_top_models(provider, target_config_key)
     
     class GenericBulkModelSelect(ui.Select):
         def __init__(self, placeholder: str, options: list, row: int, target_config_key: str):
@@ -4260,16 +3774,7 @@ class ModelApplyView(ui.View):
         source_btn.callback = self.toggle_source_callback
         self.add_item(source_btn)
 
-        prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page==0), row=4)
-        prev_btn.callback = self.prev_page_callback
-        self.add_item(prev_btn)
-
-        page_btn = ui.Button(label=f"{self.current_page+1}/{num_pages}", style=discord.ButtonStyle.grey, disabled=True, row=4)
-        self.add_item(page_btn)
-
-        next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page>=num_pages-1), row=4)
-        next_btn.callback = self.next_page_callback
-        self.add_item(next_btn)
+        build_pagination_controls(self, self.current_page, num_pages, 4, self.prev_page_callback, self.next_page_callback)
 
         apply_btn = ui.Button(label="Apply", style=discord.ButtonStyle.success, row=4)
         apply_btn.callback = self.apply_settings
@@ -4396,6 +3901,10 @@ class BaseBulkProfileView(ui.View):
         self.personal_profiles = sorted(list(index.get("personal", [])))
         self.borrowed_profiles = sorted(list(index.get("borrowed", []))) if include_borrowed else []
         
+        # Pre-compute options once to save massive UI overhead
+        self._cached_personal_opts = [discord.SelectOption(label=p, value=p) for p in self.personal_profiles]
+        self._cached_borrowed_opts = [discord.SelectOption(label=p, value=p) for p in self.borrowed_profiles]
+        
         self.current_page = 0
         self.view_source = 'personal'
 
@@ -4404,12 +3913,15 @@ class BaseBulkProfileView(ui.View):
 
     def _build_profile_select_ui(self, row=1):
         active_list = self._get_active_list()
+        cached_opts = self._cached_personal_opts if self.view_source == 'personal' else self._cached_borrowed_opts
         
         per_page = 23
         num_pages = max(1, (len(active_list) - 1) // per_page + 1)
         if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
         start = self.current_page * per_page
+        
         page_items = active_list[start : start + per_page]
+        page_opts = cached_opts[start : start + per_page]
         
         options = []
         if page_items:
@@ -4423,8 +3935,10 @@ class BaseBulkProfileView(ui.View):
             all_label = "Unselect All" if all_selected else "Select All"
             options.append(discord.SelectOption(label=all_label, value="toggle_all", description="Toggle selection for all profiles in this source.", emoji="📚"))
 
-            for name in page_items:
-                options.append(discord.SelectOption(label=name, value=name, default=(name in self.selected_profiles)))
+            # Update default state directly on the cached objects
+            for opt in page_opts:
+                opt.default = (opt.value in self.selected_profiles)
+                options.append(opt)
         else:
             options = [discord.SelectOption(label="No profiles found", value="none", default=False)]
 
@@ -4446,23 +3960,21 @@ class BaseBulkProfileView(ui.View):
             info_btn = ui.Button(label=label, style=discord.ButtonStyle.grey, disabled=True, row=btn_row)
             self.add_item(info_btn)
 
-        prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, custom_id="prev_page", disabled=(self.current_page == 0), row=btn_row)
-        prev_btn.callback = self.pagination_callback
-        self.add_item(prev_btn)
+        async def p_cb(i: discord.Interaction):
+            self.current_page -= 1
+            self._build_view()
+            await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
 
-        next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, custom_id="next_page", disabled=(self.current_page >= num_pages - 1), row=btn_row)
-        next_btn.callback = self.pagination_callback
-        self.add_item(next_btn)
+        async def n_cb(i: discord.Interaction):
+            self.current_page += 1
+            self._build_view()
+            await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+
+        build_pagination_controls(self, self.current_page, num_pages, btn_row, p_cb, n_cb)
 
     async def toggle_source_callback(self, interaction: discord.Interaction):
         self.view_source = 'borrowed' if self.view_source == 'personal' else 'personal'
         self.current_page = 0
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def pagination_callback(self, interaction: discord.Interaction):
-        if interaction.data['custom_id'] == 'prev_page': self.current_page -= 1
-        else: self.current_page += 1
         self._build_view()
         await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
 
@@ -4499,52 +4011,6 @@ class BaseBulkProfileView(ui.View):
     
     def _build_view(self):
         raise NotImplementedError
-
-class BulkCriticView(BaseBulkProfileView):
-    def __init__(self, cog, user_id):
-        super().__init__(cog, user_id, include_borrowed=True)
-        self.toggle_choice = None
-        self._build_view()
-
-    def _build_view(self):
-        self.clear_items()
-        
-        toggle_options = [
-            discord.SelectOption(label="Enable Critic", value="enable", default=(self.toggle_choice is True)),
-            discord.SelectOption(label="Disable Critic", value="disable", default=(self.toggle_choice is False))
-        ]
-        toggle_select = ui.Select(placeholder="Choose an action...", options=toggle_options, row=0)
-        toggle_select.callback = self.toggle_callback
-        self.add_item(toggle_select)
-
-        self._build_profile_select_ui(row=1)
-        
-        apply_btn = ui.Button(label="Apply", style=discord.ButtonStyle.green, row=3)
-        apply_btn.callback = self.apply_action
-        self.add_item(apply_btn)
-
-    async def toggle_callback(self, interaction: discord.Interaction):
-        self.toggle_choice = interaction.data['values'][0] == "enable"
-        self._build_view()
-        await interaction.response.edit_message(view=self)
-
-    async def apply_action(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        if self.toggle_choice is None or not self.selected_profiles:
-            await interaction.edit_original_response(content="Please select an action and at least one profile.", view=None); return
-
-        updated_count = 0
-        index = self.cog._get_user_index(self.user_id)
-        for profile_name in self.selected_profiles:
-            is_borrowed = profile_name in index.get("borrowed", [])
-            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
-            if profile:
-                profile["critic_enabled"] = self.toggle_choice
-                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
-                updated_count += 1
-        
-        status = "ENABLED" if self.toggle_choice else "DISABLED"
-        await interaction.edit_original_response(content=f"Critic has been set to **{status}** for {updated_count} profile(s).", view=None)
 
 class BulkActionView(BaseBulkProfileView):
     def __init__(self, cog: 'GeminiAgent', user_id: int, action: str, placeholder: str, params: Optional[Dict] = None, include_borrowed: bool = False):
@@ -4837,78 +4303,38 @@ class BulkTimezoneView(BaseBulkProfileView):
 
         await interaction.edit_original_response(content=f"Timezone set to **{self.selected_tz}** for {updated_count} profiles.", view=None)
 
-class ProfileGenerationVisualModal(ui.Modal, title="Generation Visual"):
-    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
-        super().__init__()
-        self.cog = cog
-        self.profile_name = profile_name
-        self.is_borrowed = is_borrowed
-        self.callback = callback
+def ProfileGenerationVisualModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+    raw = current_params.get("placeholder_emoji") or ""
+    name_val, id_val = "", ""
+    if raw.startswith("<") and raw.endswith(">"):
+        parts = raw.strip("<>").split(":")
+        if len(parts) >= 3:
+            name_val = f"a:{parts[1]}" if parts[0] == "a" else parts[1]
+            id_val = parts[2]
+    else:
+        name_val = raw
 
-        raw_emoji = current_params.get("placeholder_emoji") or ""
-        name_val = ""
-        id_val = ""
-        if raw_emoji.startswith("<") and raw_emoji.endswith(">"):
-            parts = raw_emoji.strip("<>").split(":")
-            if len(parts) >= 3:
-                name_val = f"a:{parts[1]}" if parts[0] == "a" else parts[1]
-                id_val = parts[2]
-        else:
-            name_val = raw_emoji
-
-        self.name_input = ui.TextInput(label="Emote Name (or Native Emote)", default=name_val, required=False, placeholder="e.g. mimic_thinking or 🤔", max_length=100)
-        self.id_input = ui.TextInput(label="Emote ID (Leave blank if native)", default=id_val, required=False, placeholder="e.g. 1441782350752120874", max_length=30)
-        
-        toggle_val = "on" if current_params.get("child_bot_placeholder", False) else "off"
-        self.toggle_input = ui.TextInput(label="Placeholder for Child Bot (on/off)", default=toggle_val, required=True, placeholder="on or off", max_length=10)
-
-        self.add_item(self.name_input)
-        self.add_item(self.id_input)
-        self.add_item(self.toggle_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        name = self.name_input.value.strip()
-        emote_id = self.id_input.value.strip()
-        toggle = self.toggle_input.value.strip().lower() == "on"
-
-        placeholder_emoji = ""
-        if name:
-            if name.startswith("<") and name.endswith(">"):
-                placeholder_emoji = name
+    fields = [
+        {"label": "Emote Name (or Native Emote)", "custom_id": "name", "default": name_val, "required": False, "max_length": 100, "placeholder": "e.g. mimic_thinking or 🤔"},
+        {"label": "Emote ID (Blank if native)", "custom_id": "id", "default": id_val, "required": False, "max_length": 30, "placeholder": "e.g. 1441782350752120874"},
+        {"label": "Placeholder for Child Bot (on/off)", "custom_id": "child_bot_placeholder", "default": "on" if current_params.get("child_bot_placeholder") else "off", "required": True, "max_length": 10}
+    ]
+    def parser(v):
+        c = {}
+        n = _ps(v["name"]); i = _ps(v["id"])
+        p_emoji = ""
+        if n:
+            if n.startswith("<") and n.endswith(">"): p_emoji = n
             else:
-                is_animated = False
-                if name.startswith("a:"):
-                    is_animated = True
-                    name = name[2:]
-                
-                name = name.strip(":")
-                
-                if emote_id:
-                    if is_animated:
-                        placeholder_emoji = f"<a:{name}:{emote_id}>"
-                    else:
-                        placeholder_emoji = f"<:{name}:{emote_id}>"
-                else:
-                    placeholder_emoji = name
-
-        new_params = {
-            "placeholder_emoji": placeholder_emoji if placeholder_emoji else None,
-            "child_bot_placeholder": toggle
-        }
-
-        if self.profile_name == "BULK_APPLY":
-            if self.callback: await self.callback(interaction, new_params)
-            return
-
-        target = self.cog._get_profile_config(interaction.user.id, self.profile_name, self.is_borrowed)
-        if target:
-            target.update(new_params)
-            self.cog._save_profile_config(interaction.user.id, self.profile_name, target, self.is_borrowed)
-            await interaction.followup.send("✅ Generation Visual settings updated.", ephemeral=True)
-            if self.callback: await self.callback(interaction)
-        else:
-            await interaction.followup.send("❌ Profile not found.", ephemeral=True)
+                is_a = False
+                if n.startswith("a:"): is_a = True; n = n[2:]
+                n = n.strip(":")
+                if i: p_emoji = f"<a:{n}:{i}>" if is_a else f"<:{n}:{i}>"
+                else: p_emoji = n
+        c["placeholder_emoji"] = p_emoji if p_emoji else None
+        c["child_bot_placeholder"] = _pb(v["child_bot_placeholder"])
+        return {"config": c}
+    return ConfigModal(cog, profile_name, is_borrowed, "Generation Visual", fields, parser, callback)
 
 class BulkResetView(BaseBulkProfileView):
     def __init__(self, cog: 'GeminiAgent', user_id: int):
@@ -5118,21 +4544,6 @@ class BulkDeleteView(BaseBulkProfileView):
         
         if deleted_count > 0: self.cog._save_user_index(self.user_id, index)
         await interaction.edit_original_response(content=f"Successfully deleted {deleted_count} profiles.", view=None)
-
-class SearchDataModal(ui.Modal, title="Search Data"):
-    search_input = ui.TextInput(label="Enter search term (leave blank to clear)", required=False, max_length=100)
-
-    def __init__(self, parent_view: 'DataManageView'):
-        super().__init__()
-        self.parent_view = parent_view
-        if self.parent_view.search_term:
-            self.search_input.default = self.parent_view.search_term
-
-    async def on_submit(self, interaction: discord.Interaction):
-        search_term = self.search_input.value.strip()
-        self.parent_view.search_term = search_term if search_term else None
-        self.parent_view.current_page = 1
-        await self.parent_view._update_view(interaction)
 
 class SearchDataModal(ui.Modal, title="Search Data"):
     search_input = ui.TextInput(label="Enter search term (leave blank to clear)", required=False, max_length=100)
@@ -5839,16 +5250,7 @@ class SettingsAPIView(SettingsBaseView):
         # Pagination Buttons (Row 1 - If Needed)
         btn_start_row = 1
         if num_pages > 1:
-            prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page == 0))
-            page_lbl = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, row=1, disabled=True)
-            next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, row=1, disabled=(self.current_page >= num_pages - 1))
-            
-            prev_btn.callback = self.prev_page
-            next_btn.callback = self.next_page
-            
-            self.add_item(prev_btn)
-            self.add_item(page_lbl)
-            self.add_item(next_btn)
+            build_pagination_controls(self, self.current_page, num_pages, 1, self.prev_page, self.next_page)
             btn_start_row = 2
 
         # Dynamic Action Buttons (Row 1 or 2)
@@ -6199,75 +5601,9 @@ class BulkCriticView(BaseBulkProfileView):
         status = "ENABLED" if self.toggle_choice else "DISABLED"
         await interaction.edit_original_response(content=f"Critic has been set to **{status}** for {updated_count} profile(s).", view=None)
 
-class AppearanceCreateModal(ui.Modal):
+class AppearanceModal(ui.Modal):
     def __init__(self, cog: 'GeminiAgent', original_interaction: discord.Interaction, profile_name: str):
-        super().__init__(title=f"Create Appearance for '{profile_name}'")
-        self.cog = cog
-        self.original_interaction = original_interaction
-        self.profile_name = profile_name
-        self.display_name_input = ui.TextInput(label="Custom Display Name (Optional)", required=False, max_length=80)
-        self.avatar_url_input = ui.TextInput(label="Avatar URL (Optional, direct link)", required=False)
-        self.add_item(self.display_name_input)
-        self.add_item(self.avatar_url_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        display_name = self.display_name_input.value or None
-        avatar_url = self.avatar_url_input.value or None
-        user_id_str = str(interaction.user.id)
-
-        if display_name and display_name.lower() == 'clyde':
-            await interaction.followup.send("The name 'clyde' is reserved and cannot be used as a display name.", ephemeral=True)
-            return
-
-        config = self.cog._get_profile_config(interaction.user.id, self.profile_name, False)
-        if config:
-            config["custom_display_name"] = display_name
-            config["custom_avatar_url"] = avatar_url
-            self.cog._save_profile_config(interaction.user.id, self.profile_name, config, False)
-            
-            self.cog.user_appearances.setdefault(user_id_str, {})[self.profile_name] = {
-                "custom_display_name": display_name,
-                "custom_avatar_url": avatar_url
-            }
-
-        # Check if this profile is linked to a child bot and send an update
-        linked_bot_id = next((bot_id for bot_id, data in self.cog.child_bots.items() if str(data.get("owner_id")) == user_id_str and data.get("profile_name") == self.profile_name), None)
-        if linked_bot_id:
-            now = time.time()
-            cooldown_window = 600  # 10 minutes
-            max_changes = 2
-            
-            timestamps = self.cog.child_bot_edit_cooldowns.get(linked_bot_id, [])
-            valid_timestamps = [ts for ts in timestamps if now - ts < cooldown_window]
-
-            if len(valid_timestamps) >= max_changes:
-                remaining = int(cooldown_window - (now - valid_timestamps[0]))
-                await interaction.followup.send(f"This child bot's appearance has been changed too frequently. Please wait {remaining // 60} more minute(s) before trying again.", ephemeral=True)
-            else:
-                # Send avatar update
-                await self.cog.manager_queue.put({
-                    "action": "send_to_child",
-                    "bot_id": linked_bot_id,
-                    "payload": {"action": "update_avatar", "avatar_url": avatar_url}
-                })
-                # Send username update
-                await self.cog.manager_queue.put({
-                    "action": "send_to_child",
-                    "bot_id": linked_bot_id,
-                    "payload": {"action": "update_username", "username": display_name}
-                })
-                
-                valid_timestamps.append(now)
-                self.cog.child_bot_edit_cooldowns[linked_bot_id] = valid_timestamps
-        
-        # Refresh the main profile manage embed
-        new_embed = await self.cog._build_profile_manage_embed(self.original_interaction, self.profile_name)
-        await self.original_interaction.edit_original_response(embed=new_embed)
-
-class AppearanceEditModal(ui.Modal):
-    def __init__(self, cog: 'GeminiAgent', original_interaction: discord.Interaction, profile_name: str):
-        super().__init__(title=f"Edit Appearance: '{profile_name}'")
+        super().__init__(title=f"Appearance: '{profile_name[:30]}'")
         self.cog = cog
         self.original_interaction = original_interaction
         self.profile_name = profile_name
@@ -6275,201 +5611,91 @@ class AppearanceEditModal(ui.Modal):
         user_id_str = str(original_interaction.user.id)
         current_data = self.cog.user_appearances.get(user_id_str, {}).get(self.profile_name, {})
         
-        self.display_name_input = ui.TextInput(label="Custom Display Name (Optional)", required=False, max_length=80, default=current_data.get("custom_display_name"))
-        self.avatar_url_input = ui.TextInput(label="Avatar URL (Optional)", required=False, default=current_data.get("custom_avatar_url"))
+        self.display_name_input = ui.TextInput(label="Custom Display Name (Blank to reset)", required=False, max_length=80, default=current_data.get("custom_display_name"))
+        self.avatar_url_input = ui.TextInput(label="Avatar URL (Blank to reset)", required=False, default=current_data.get("custom_avatar_url"))
         self.add_item(self.display_name_input)
         self.add_item(self.avatar_url_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        new_display_name = self.display_name_input.value or None
-        new_avatar_url = self.avatar_url_input.value or None
+        new_display_name = self.display_name_input.value.strip() or None
+        new_avatar_url = self.avatar_url_input.value.strip() or None
         user_id_str = str(interaction.user.id)
 
         if new_display_name and new_display_name.lower() == 'clyde':
-            await interaction.followup.send("The name 'clyde' is reserved and cannot be used as a display name.", ephemeral=True)
+            await interaction.followup.send("The name 'clyde' is reserved.", ephemeral=True)
             return
 
         is_public = self.cog._is_profile_public(interaction.user.id, self.profile_name)
-        if is_public:
+        if is_public and (new_display_name or new_avatar_url):
             is_safe, reason = await self.cog._is_profile_content_safe(interaction.user.id, self.profile_name, new_display_name or self.profile_name, new_avatar_url)
             if not is_safe:
-                await interaction.followup.send(f"**Could not save appearance.** The new display name or avatar was flagged for a content policy violation: {reason}\n\nIf you wish to proceed with this restricted edit, you must first unpublish the profile using `/profile public manage`.", ephemeral=True)
+                await interaction.followup.send(f"**Safety Block:** {reason}", ephemeral=True)
                 return
 
         config = self.cog._get_profile_config(interaction.user.id, self.profile_name, False)
         if config:
-            config["custom_display_name"] = new_display_name
-            config["custom_avatar_url"] = new_avatar_url
+            if new_display_name: config["custom_display_name"] = new_display_name
+            else: config.pop("custom_display_name", None)
+            
+            if new_avatar_url: config["custom_avatar_url"] = new_avatar_url
+            else: config.pop("custom_avatar_url", None)
+            
             self.cog._save_profile_config(interaction.user.id, self.profile_name, config, False)
             
-            self.cog.user_appearances.setdefault(user_id_str, {})[self.profile_name] = {
-                "custom_display_name": new_display_name,
-                "custom_avatar_url": new_avatar_url
-            }
+            if new_display_name or new_avatar_url:
+                self.cog.user_appearances.setdefault(user_id_str, {})[self.profile_name] = {
+                    "custom_display_name": new_display_name,
+                    "custom_avatar_url": new_avatar_url
+                }
+            else:
+                if user_id_str in self.cog.user_appearances:
+                    self.cog.user_appearances[user_id_str].pop(self.profile_name, None)
 
-        # Check if this profile is linked to a child bot and send an update
         linked_bot_id = next((bot_id for bot_id, data in self.cog.child_bots.items() if str(data.get("owner_id")) == user_id_str and data.get("profile_name") == self.profile_name), None)
         if linked_bot_id:
             now = time.time()
-            cooldown_window = 600  # 10 minutes
+            cooldown_window = 600
             max_changes = 2
-            
             timestamps = self.cog.child_bot_edit_cooldowns.get(linked_bot_id, [])
             valid_timestamps = [ts for ts in timestamps if now - ts < cooldown_window]
 
             if len(valid_timestamps) >= max_changes:
                 remaining = int(cooldown_window - (now - valid_timestamps[0]))
-                await interaction.followup.send(f"This child bot's appearance has been changed too frequently. Please wait {remaining // 60} more minute(s) before trying again.", ephemeral=True)
+                await interaction.followup.send(f"Child bot appearance changed too frequently. Wait {remaining // 60}m.", ephemeral=True)
             else:
-                # Send avatar update
-                await self.cog.manager_queue.put({
-                    "action": "send_to_child",
-                    "bot_id": linked_bot_id,
-                    "payload": {"action": "update_avatar", "avatar_url": new_avatar_url}
-                })
-                # Send username update
-                await self.cog.manager_queue.put({
-                    "action": "send_to_child",
-                    "bot_id": linked_bot_id,
-                    "payload": {"action": "update_username", "username": new_display_name}
-                })
-                
+                await self.cog.manager_queue.put({"action": "send_to_child", "bot_id": linked_bot_id, "payload": {"action": "update_avatar", "avatar_url": new_avatar_url}})
+                await self.cog.manager_queue.put({"action": "send_to_child", "bot_id": linked_bot_id, "payload": {"action": "update_username", "username": new_display_name}})
                 valid_timestamps.append(now)
                 self.cog.child_bot_edit_cooldowns[linked_bot_id] = valid_timestamps
 
-        # Refresh the main profile manage embed
         new_embed = await self.cog._build_profile_manage_embed(self.original_interaction, self.profile_name)
         await self.original_interaction.edit_original_response(embed=new_embed)
+        await interaction.followup.send("Appearance updated.", ephemeral=True)
 
-class AppearanceEditView(ui.View):
-    def __init__(self, cog: 'GeminiAgent', original_interaction: discord.Interaction, profile_name: str):
-        super().__init__(timeout=300)
-        self.cog = cog
-        self.original_interaction = original_interaction
-        self.profile_name = profile_name
-        self.user_id = original_interaction.user.id
-
-        edit_button = ui.Button(label="Edit Details", style=discord.ButtonStyle.primary)
-        edit_button.callback = self.edit_callback
-        self.add_item(edit_button)
-
-        delete_button = ui.Button(label="Delete Appearance", style=discord.ButtonStyle.danger)
-        delete_button.callback = self.delete_callback
-        self.add_item(delete_button)
-
-    async def show(self, interaction: discord.Interaction):
-        user_id_str = str(self.user_id)
-        appearance_data = self.cog.user_appearances.get(user_id_str, {}).get(self.profile_name, {})
+def ProfileNeuroModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+    state = current_params.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
+    fields = [
+        {"label": "Engine Status (on/off)", "custom_id": "neuro_engine_enabled", "default": "on" if current_params.get("neuro_engine_enabled") else "off", "required": False, "placeholder": "Enable or disable the engine."},
+        {"label": "Dopamine (0-100)", "custom_id": "dopamine", "default": str(state.get("dopamine", 50)), "required": False, "placeholder": "Motivation and joy."},
+        {"label": "Cortisol (0-100)", "custom_id": "cortisol", "default": str(state.get("cortisol", 20)), "required": False, "placeholder": "Stress and anxiety."},
+        {"label": "Oxytocin (0-100)", "custom_id": "oxytocin", "default": str(state.get("oxytocin", 50)), "required": False, "placeholder": "Bonding and trust."},
+        {"label": "Adrenaline (0-100)", "custom_id": "adrenaline", "default": str(state.get("adrenaline", 20)), "required": False, "placeholder": "Energy and urgency."}
+    ]
+    def parser(v):
+        c = {}
+        ns = _ps(v["neuro_engine_enabled"])
+        if ns: c["neuro_engine_enabled"] = (ns.lower() == "on")
         
-        embed = discord.Embed(title=f"Managing Appearance for '{self.profile_name}'", color=discord.Color.teal())
-        disp_name = appearance_data.get("custom_display_name") or "(Uses Profile Name)"
-        avatar_url = appearance_data.get("custom_avatar_url") or "(Uses Default Avatar)"
-        embed.add_field(name="Display Name", value=disp_name, inline=False)
-        embed.add_field(name="Avatar URL", value=avatar_url, inline=False)
-        if appearance_data.get("custom_avatar_url"):
-            embed.set_thumbnail(url=appearance_data.get("custom_avatar_url"))
-        
-        await interaction.response.send_message(embed=embed, view=self, ephemeral=True)
-
-    async def edit_callback(self, interaction: discord.Interaction):
-        modal = AppearanceEditModal(self.cog, self.original_interaction, self.profile_name)
-        await interaction.response.send_modal(modal)
-        await interaction.delete_original_response() # Close the edit view after opening modal
-
-    async def delete_callback(self, interaction: discord.Interaction):
-        confirm_view = ui.View(timeout=60)
-        
-        async def confirm_delete(i: discord.Interaction):
-            await i.response.defer()
-            config = self.cog._get_profile_config(self.user_id, self.profile_name, False)
-            if config:
-                config.pop("custom_display_name", None)
-                config.pop("custom_avatar_url", None)
-                self.cog._save_profile_config(self.user_id, self.profile_name, config, False)
-            
-            user_id_str = str(self.user_id)
-            if user_id_str in self.cog.user_appearances and self.profile_name in self.cog.user_appearances[user_id_str]:
-                del self.cog.user_appearances[user_id_str][self.profile_name]
-                
-            # Refresh the main profile manage embed
-            new_embed = await self.cog._build_profile_manage_embed(self.original_interaction, self.profile_name)
-            await self.original_interaction.edit_original_response(embed=new_embed)
-            await interaction.delete_original_response()
-
-        confirm_button = ui.Button(label="Confirm Deletion", style=discord.ButtonStyle.danger)
-        confirm_button.callback = confirm_delete
-        confirm_view.add_item(confirm_button)
-        await interaction.response.send_message(f"**Are you sure you want to delete the appearance for '{self.profile_name}'?**", view=confirm_view, ephemeral=True)
-
-class ProfileNeuroModal(ui.Modal, title="Neuro-Endocrine Engine Configuration"):
-    def __init__(self, cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
-        super().__init__()
-        self.cog = cog
-        self.profile_name = profile_name
-        self.is_borrowed = is_borrowed
-        self.callback = callback
-
-        status_val = "on" if current_params.get("neuro_engine_enabled", False) else "off"
-        state = current_params.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
-
-        self.status_input = ui.TextInput(label="Engine Status (on/off)", default=status_val, required=False, placeholder="Enable or disable the engine.")
-        self.d_input = ui.TextInput(label="Dopamine (0-100)", default=str(state.get("dopamine", "")), required=False, placeholder="Motivation and joy.")
-        self.c_input = ui.TextInput(label="Cortisol (0-100)", default=str(state.get("cortisol", "")), required=False, placeholder="Stress and anxiety.")
-        self.o_input = ui.TextInput(label="Oxytocin (0-100)", default=str(state.get("oxytocin", "")), required=False, placeholder="Bonding and trust.")
-        self.a_input = ui.TextInput(label="Adrenaline (0-100)", default=str(state.get("adrenaline", "")), required=False, placeholder="Energy and urgency.")
-        
-        self.add_item(self.status_input)
-        self.add_item(self.d_input)
-        self.add_item(self.c_input)
-        self.add_item(self.o_input)
-        self.add_item(self.a_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        new_params = {}
-        
-        try:
-            status_raw = self.status_input.value.strip().lower()
-            if status_raw:
-                new_params["neuro_engine_enabled"] = (status_raw == "on")
-
-            def parse_val(val, name):
-                if not val.strip(): return None
-                res = int(val.strip())
-                if not (0 <= res <= 100): raise ValueError(f"{name} out of range.")
-                return res
-
-            parsed_state = {
-                "dopamine": parse_val(self.d_input.value, "Dopamine"),
-                "cortisol": parse_val(self.c_input.value, "Cortisol"),
-                "oxytocin": parse_val(self.o_input.value, "Oxytocin"),
-                "adrenaline": parse_val(self.a_input.value, "Adrenaline")
-            }
-            # Only include non-None values
-            new_params["neuro_state"] = {k: v for k, v in parsed_state.items() if v is not None}
-            
-        except ValueError as e:
-            await interaction.followup.send(f"❌ **Invalid Input:** {e}", ephemeral=True)
-            return
-
-        if self.profile_name == "BULK_APPLY":
-            if self.callback: await self.callback(interaction, new_params)
-            return
-
-        target = self.cog._get_profile_config(interaction.user.id, self.profile_name, self.is_borrowed)
-        if target:
-            if "neuro_engine_enabled" in new_params:
-                target["neuro_engine_enabled"] = new_params["neuro_engine_enabled"]
-            
-            if "neuro_state" in new_params:
-                current_state = target.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
-                current_state.update(new_params["neuro_state"])
-                target["neuro_state"] = current_state
-            
-            self.cog._save_profile_config(interaction.user.id, self.profile_name, target, self.is_borrowed)
-            await interaction.followup.send(f"✅ Neuro-Endocrine settings updated for '{self.profile_name}'.", ephemeral=True)
-            if self.callback: await self.callback(interaction)
+        nstate = {}
+        for k in ["dopamine", "cortisol", "oxytocin", "adrenaline"]:
+            val = _pi(v[k])
+            if val is not None:
+                if not (0 <= val <= 100): raise ValueError(f"{k} out of range")
+                nstate[k] = val
+        if nstate: c["neuro_state"] = nstate
+        return {"config": c}
+    return ConfigModal(cog, profile_name, is_borrowed, "Neuro-Endocrine Engine Configuration", fields, parser, callback)
 
 class BulkManageView(ui.View):
     def __init__(self, cog: 'GeminiAgent', original_interaction: discord.Interaction):
@@ -6514,126 +5740,46 @@ class BulkManageView(ui.View):
             return
 
         if choice == "gen_params":
-            modal = ProfileParamsModal(self.cog, "BULK_APPLY", {}, is_borrowed=False)
-            async def modal_callback(i: discord.Interaction):
-                await i.response.defer(ephemeral=True)
-                params = {}
-                try:
-                    stm_str = next((c.value for c in modal.children if c.custom_id == "stm_length"), None)
-                    if stm_str: params["stm_length"] = int(stm_str)
-                    
-                    temp_str = next((c.value for c in modal.children if c.custom_id == "temperature"), None)
-                    if temp_str: params["temperature"] = float(temp_str)
-                    
-                    topp_str = next((c.value for c in modal.children if c.custom_id == "top_p"), None)
-                    if topp_str: params["top_p"] = float(topp_str)
-
-                    topk_str = next((c.value for c in modal.children if c.custom_id == "top_k"), None)
-                    if topk_str: params["top_k"] = int(topk_str)
-                except ValueError:
-                    await i.followup.send(f"❌ **Invalid Input**", ephemeral=True); return
-
+            async def modal_callback(i: discord.Interaction, params: Dict):
                 view = BulkActionView(self.cog, self.user_id, "apply_params", "Select profiles to apply parameters to...", params=params, include_borrowed=True)
                 await i.followup.send(content="Parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal.on_submit = modal_callback
+            modal = ProfileParamsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
 
         elif choice == "adv_params":
-            modal = ProfileAdvancedParamsModal(self.cog, "BULK_APPLY", {}, is_borrowed=False)
-            async def modal_callback(i: discord.Interaction):
-                await i.response.defer(ephemeral=True)
-                params = {}
-                try:
-                    def pf(val): return float(val) if val and val.strip() else None
-                    params["frequency_penalty"] = pf(next((c.value for c in modal.children if c.custom_id == "frequency_penalty"), None))
-                    params["presence_penalty"] = pf(next((c.value for c in modal.children if c.custom_id == "presence_penalty"), None))
-                    params["repetition_penalty"] = pf(next((c.value for c in modal.children if c.custom_id == "repetition_penalty"), None))
-                    params["min_p"] = pf(next((c.value for c in modal.children if c.custom_id == "min_p"), None))
-                    params["top_a"] = pf(next((c.value for c in modal.children if c.custom_id == "top_a"), None))
-                except ValueError:
-                    await i.followup.send(f"❌ **Invalid Input**", ephemeral=True); return
-
-                clean = {k:v for k,v in params.items() if v is not None}
-                if not clean: await i.followup.send("No parameters set.", ephemeral=True); return
-
-                view = BulkActionView(self.cog, self.user_id, "apply_params", "Select profiles to apply parameters to...", params=clean, include_borrowed=True)
+            async def modal_callback(i: discord.Interaction, params: Dict):
+                if not params: await i.followup.send("No parameters set.", ephemeral=True); return
+                view = BulkActionView(self.cog, self.user_id, "apply_params", "Select profiles to apply parameters to...", params=params, include_borrowed=True)
                 await i.followup.send(content="Advanced parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal.on_submit = modal_callback
+            modal = ProfileAdvancedParamsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
 
         elif choice == "thinking_params":
-            modal = ProfileThinkingParamsModal(self.cog, "BULK_APPLY", {}, False)
-            async def modal_callback(i: discord.Interaction):
-                await i.response.defer(ephemeral=True)
-                params = {}
-                try:
-                    def gv(cid): return next(c.value for c in modal.children if c.custom_id == cid).strip().lower()
-                    params["thinking_summary_visible"] = gv("thinking_summary_visible") if gv("thinking_summary_visible") in ["on", "off"] else "off"
-                    lvl = gv("thinking_level")
-                    if lvl not in ["xhigh", "high", "medium", "low", "minimal", "none"]:
-                        lvl = "high"
-                    params["thinking_level"] = lvl
-                    params["thinking_budget"] = int(gv("thinking_budget"))
-                    sig_val = gv("thinking_signatures_enabled")
-                    params["thinking_signatures_enabled"] = sig_val if sig_val in ["on", "off"] else "off"
-                except ValueError:
-                    await i.followup.send("❌ **Invalid Input**", ephemeral=True); return
-
+            async def modal_callback(i: discord.Interaction, params: Dict):
                 view = BulkActionView(self.cog, self.user_id, "apply_thinking_params", "Select profiles to apply thinking settings to...", params=params, include_borrowed=True)
                 await i.followup.send(content="Thinking parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal.on_submit = modal_callback
+            modal = ProfileThinkingParamsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
 
         elif choice == "train_params":
-            modal = ProfileTrainingParamsModal(self.cog, "BULK_APPLY", {})
-            async def modal_callback(i: discord.Interaction):
-                await i.response.defer(ephemeral=True)
-                params = {}
-                try:
-                    ctx = next((c.value for c in modal.children if c.custom_id == "training_context_size"), None)
-                    if ctx: params["training_context_size"] = int(ctx)
-                    rel = next((c.value for c in modal.children if c.custom_id == "training_relevance_threshold"), None)
-                    if rel: params["training_relevance_threshold"] = float(rel)
-                except ValueError: await i.followup.send("Invalid Input", ephemeral=True); return
-
+            async def modal_callback(i: discord.Interaction, params: Dict):
                 view = BulkActionView(self.cog, self.user_id, "apply_training_params", "Select personal profiles to apply settings to...", params=params, include_borrowed=False)
                 await i.followup.send(content="Parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal.on_submit = modal_callback
+            modal = ProfileTrainingParamsModal(self.cog, "BULK_APPLY", {}, callback=modal_callback)
             await interaction.response.send_modal(modal)
 
         elif choice == "ltm_params":
-            modal = ProfileLTMParamsModal(self.cog, "BULK_APPLY", {})
-            async def modal_callback(i: discord.Interaction):
-                await i.response.defer(ephemeral=True)
-                params = {}
-                try:
-                    ctx = next((c.value for c in modal.children if c.custom_id == "ltm_context_size"), None)
-                    if ctx: params["ltm_context_size"] = int(ctx)
-                    rel = next((c.value for c in modal.children if c.custom_id == "ltm_relevance_threshold"), None)
-                    if rel: params["ltm_relevance_threshold"] = float(rel)
-                    
-                    inv = next((c.value for c in modal.children if c.custom_id == "ltm_creation_interval"), None)
-                    if inv: params["ltm_creation_interval"] = int(inv)
-                    sctx = next((c.value for c in modal.children if c.custom_id == "ltm_summarization_context"), None)
-                    if sctx: params["ltm_summarization_context"] = int(sctx)
-                except ValueError: await i.followup.send("Invalid Input", ephemeral=True); return
-
+            async def modal_callback(i: discord.Interaction, params: Dict):
                 view = BulkActionView(self.cog, self.user_id, "apply_ltm_params", "Select profiles to apply LTM settings to...", params=params, include_borrowed=True)
                 await i.followup.send(content="Parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal.on_submit = modal_callback
+            modal = ProfileLTMParamsModal(self.cog, "BULK_APPLY", {}, callback=modal_callback)
             await interaction.response.send_modal(modal)
 
         elif choice == "ltm_summarization":
-            modal = ProfileLTMSummarizationModal(self.cog, "BULK_APPLY", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
-            async def modal_callback(i: discord.Interaction):
-                await i.response.defer(ephemeral=True)
-                instructions = modal.instructions_input.value.strip() or DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS
-                
-                params = {"ltm_summarization_instructions": instructions}
-
+            async def modal_callback(i: discord.Interaction, params: Dict):
                 view = BulkActionView(self.cog, self.user_id, "apply_ltm_summarization", "Select personal profiles to apply LTM prompt to...", params=params, include_borrowed=False)
                 await i.followup.send(content="Prompt received. Now select the profiles to apply it to:", view=view, ephemeral=True)
-            modal.on_submit = modal_callback
+            modal = ProfileLTMSummarizationModal(self.cog, "BULK_APPLY", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS, callback=modal_callback)
             await interaction.response.send_modal(modal)
 
         elif choice == "models":
@@ -6653,11 +5799,10 @@ class BulkManageView(ui.View):
             await interaction.response.send_message(content="Select URL context action and profiles:", view=view, ephemeral=True)
 
         elif choice == "image_gen":
-            modal = ProfileImageGenSettingsModal(self.cog, "BULK_APPLY", {}, False)
             async def modal_callback(i: discord.Interaction, params: Dict):
                 view = BulkActionView(self.cog, self.user_id, "apply_image_settings", "Select profiles to apply image settings to...", params=params, include_borrowed=True)
                 await i.followup.send(content="Image settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal.callback = modal_callback
+            modal = ProfileImageGenSettingsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
             
         elif choice == "timezone":
@@ -6665,11 +5810,10 @@ class BulkManageView(ui.View):
             await interaction.response.send_message(content="Select a timezone and the profiles to apply it to:", view=view, ephemeral=True)
             
         elif choice == "generation_visual":
-            modal = ProfileGenerationVisualModal(self.cog, "BULK_APPLY", {}, False)
             async def modal_callback(i: discord.Interaction, params: Dict):
                 view = BulkActionView(self.cog, self.user_id, "apply_generation_visual", "Select profiles to apply visual settings to...", params=params, include_borrowed=True)
                 await i.followup.send(content="Visual settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal.callback = modal_callback
+            modal = ProfileGenerationVisualModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
         
         elif choice == "critic":
@@ -6677,19 +5821,17 @@ class BulkManageView(ui.View):
             await interaction.response.send_message(content="Select critic action and profiles:", view=view, ephemeral=True)
 
         elif choice == "neuro":
-            modal = ProfileNeuroModal(self.cog, "BULK_APPLY", {}, False)
             async def modal_callback(i: discord.Interaction, params: Dict):
                 view = BulkActionView(self.cog, self.user_id, "apply_neuro_settings", "Select profiles to apply neuro settings to...", params=params, include_borrowed=True)
                 await i.followup.send(content="Neuro settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal.callback = modal_callback
+            modal = ProfileNeuroModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
 
         elif choice == "typing":
-            modal = ProfileTypingSettingsModal(self.cog, "BULK_APPLY", {}, False)
             async def modal_callback(i: discord.Interaction, params: Dict):
                 view = BulkActionView(self.cog, self.user_id, "apply_typing_settings", "Select profiles to apply typing settings to...", params=params, include_borrowed=True)
                 await i.followup.send(content="Typing settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal.callback = modal_callback
+            modal = ProfileTypingSettingsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
 
         elif choice == "data_reset":
@@ -7063,10 +6205,6 @@ class ModBlacklistView(ModBaseView):
             self.add_item(sel)
 
             if num_pages > 1:
-                prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page == 0), row=2)
-                page_lbl = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, disabled=True, row=2)
-                next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page >= num_pages - 1), row=2)
-                
                 async def p_cb(i: discord.Interaction):
                     self.current_page -= 1
                     self._build_view()
@@ -7076,11 +6214,7 @@ class ModBlacklistView(ModBaseView):
                     self._build_view()
                     await i.response.edit_message(embed=self._get_embed(), view=self)
                     
-                prev_btn.callback = p_cb
-                next_btn.callback = n_cb
-                self.add_item(prev_btn)
-                self.add_item(page_lbl)
-                self.add_item(next_btn)
+                build_pagination_controls(self, self.current_page, num_pages, 2, p_cb, n_cb)
 
         self._add_nav_buttons()
 
@@ -7165,10 +6299,6 @@ class ModStatsView(ModBaseView):
         num_pages = len(pages)
         if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
 
-        prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page == 0), row=1)
-        page_lbl = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, disabled=True, row=1)
-        next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page >= num_pages - 1), row=1)
-        
         async def p_cb(i: discord.Interaction):
             self.current_page -= 1
             self._build_view()
@@ -7178,13 +6308,7 @@ class ModStatsView(ModBaseView):
             self._build_view()
             await i.response.edit_message(embed=self._get_embed(), view=self)
 
-        prev_btn.callback = p_cb
-        next_btn.callback = n_cb
-        
-        self.add_item(prev_btn)
-        self.add_item(page_lbl)
-        self.add_item(next_btn)
-
+        build_pagination_controls(self, self.current_page, num_pages, 1, p_cb, n_cb)
         self._add_nav_buttons()
 
     def _get_embed(self):
@@ -7253,10 +6377,6 @@ class ModProfilesView(ModBaseView):
                 self.add_item(sel)
 
                 if num_pages > 1:
-                    prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page == 0), row=2)
-                    page_lbl = ui.Button(label=f"{self.current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, disabled=True, row=2)
-                    next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page >= num_pages - 1), row=2)
-                    
                     async def p_cb(i: discord.Interaction):
                         self.current_page -= 1
                         self._build_view()
@@ -7266,11 +6386,7 @@ class ModProfilesView(ModBaseView):
                         self._build_view()
                         await i.response.edit_message(embed=self._get_embed(), view=self)
                         
-                    prev_btn.callback = p_cb
-                    next_btn.callback = n_cb
-                    self.add_item(prev_btn)
-                    self.add_item(page_lbl)
-                    self.add_item(next_btn)
+                    build_pagination_controls(self, self.current_page, num_pages, 2, p_cb, n_cb)
 
         self._add_nav_buttons()
 

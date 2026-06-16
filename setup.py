@@ -89,7 +89,8 @@ def setup_mimic():
         "cogs/data/users",
         "cogs/data/servers",
         "cogs/data/public_profiles",
-        "cogs/data/models"
+        "cogs/data/models",
+        "cogs/data/mod"
     ]
     for directory in directories:
         os.makedirs(directory, exist_ok=True)

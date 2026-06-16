@@ -593,7 +593,79 @@ class GoogleGenAIModel:
 
         return ThoughtResponse(response)
     
+def _yield_message_chunks(content: str, max_length: int = DISCORD_MAX_MESSAGE_LENGTH):
+    """Generator that splits strings precisely to fit Discord limits without breaking paragraphs/sentences."""
+    remaining = content
+    while remaining:
+        if len(remaining) <= max_length:
+            yield remaining
+            break
+        
+        split_pos = -1
+        para_break = remaining.rfind('\n\n', 0, max_length)
+        if para_break != -1: 
+            split_pos = para_break + 2
+        else:
+            sent_break = remaining.rfind('. ', 0, max_length)
+            if sent_break != -1: 
+                split_pos = sent_break + 2
+            else: 
+                split_pos = max_length
+        
+        yield remaining[:split_pos]
+        remaining = remaining[split_pos:]
+
 class ServicesMixin:
+
+    def _instantiate_model(self, raw_model_name: str, guild_id: Optional[int], user_id: Optional[int], system_instruction: Optional[str] = None, safety_settings: Optional[Dict] = None, thinking_params: Optional[Dict] = None, tools: Optional[List] = None, profile_settings: Optional[Dict] = None):
+        name_upper = raw_model_name.upper()
+        actual_name = raw_model_name
+        is_openrouter = False
+        is_ollama = False
+        
+        if name_upper.startswith("OPENROUTER/"):
+            actual_name = raw_model_name[11:]
+            is_openrouter = True
+        elif name_upper.startswith("OLLAMA/"):
+            actual_name = raw_model_name[7:]
+            is_ollama = True
+        elif name_upper.startswith("GOOGLE/"):
+            actual_name = raw_model_name[7:]
+        elif "/" in raw_model_name or "grok" in raw_model_name.lower() or "anthropic" in raw_model_name.lower():
+            is_openrouter = True
+            
+        t_params = thinking_params or {}
+        p_settings = profile_settings or {}
+        
+        if is_openrouter:
+            api_key = self._get_api_key_for_guild(guild_id, "openrouter") if guild_id else self._get_api_key_for_user(user_id, "openrouter")
+            if not api_key: raise ValueError("OpenRouter API Key not found. Use `/settings` to add one.")
+            return OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params)
+        elif is_ollama:
+            ollama_host = p_settings.get("ollama_host_url", OLLAMA_LOCAL_URL)
+            return OllamaModel(actual_name, api_url=ollama_host, system_instruction=system_instruction, thinking_params=t_params)
+        else:
+            api_key = self._get_api_key_for_guild(guild_id) if guild_id else self._get_api_key_for_user(user_id)
+            if not api_key: raise ValueError("Google API Key not found. Use `/settings` to add one.")
+            return GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instruction, safety_settings=safety_settings, thinking_params=t_params, tools=tools)
+
+    def get_top_models(self, provider: str, target_config_key: str) -> List[str]:
+        if target_config_key == 'image_generation_model': return list(get_args(IMAGE_MODELS))
+        if target_config_key == 'speech_model': return list(get_args(AUDIO_MODELS))
+        if provider == 'google': return list(get_args(ALLOWED_MODELS))
+        elif provider == 'ollama': return getattr(self, 'cached_ollama_models', [])
+
+        import os
+        import json as std_json
+        path = os.path.join(self.MODELS_DATA_DIR, "openrouter_models.json")
+        data = {}
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f: data = std_json.load(f)
+            except: pass
+
+        sorted_models = sorted(data.items(), key=lambda x: x[1], reverse=True)
+        return [m[0] for m in sorted_models]
 
     @tasks.loop(hours=1.0)
     async def hourly_self_repair_task(self):
@@ -622,13 +694,8 @@ class ServicesMixin:
 
         user_index = self._get_user_index(profile_owner_id_for_instructions)
         is_borrowed = profile_name_for_instructions in user_index.get("borrowed", [])
-        
-        original_owner_id = profile_owner_id_for_instructions
-        original_profile_name = profile_name_for_instructions
-        if is_borrowed:
-            borrowed_data = self._get_profile_config(profile_owner_id_for_instructions, profile_name_for_instructions, True) or {}
-            original_owner_id = int(borrowed_data.get("original_owner_id", profile_owner_id_for_instructions))
-            original_profile_name = borrowed_data.get("original_profile_name", profile_name_for_instructions)
+
+        original_owner_id, original_profile_name = self._resolve_effective_profile(profile_owner_id_for_instructions, profile_name_for_instructions)
 
         current_profile_key_for_model = (original_owner_id, original_profile_name)
 
@@ -715,39 +782,14 @@ class ServicesMixin:
             
         model_tools = model_tools_list if model_tools_list else None
 
-        def create_model_instance(name, system_instr, safety):
-            name_upper = name.upper()
-            actual_name = name
-            is_openrouter = False
-            is_ollama = False
-            
-            if name_upper.startswith("OPENROUTER/"):
-                actual_name = name[11:]
-                is_openrouter = True
-            elif name_upper.startswith("OLLAMA/"):
-                actual_name = name[7:]
-                is_ollama = True
-            elif name_upper.startswith("GOOGLE/"):
-                actual_name = name[7:]
-            
-            if is_openrouter:
-                or_key = self._get_api_key_for_guild(guild_id, provider="openrouter")
-                if not or_key: raise ValueError("OpenRouter API Key not found.")
-                return OpenRouterModel(actual_name, api_key=or_key, system_instruction=system_instr, thinking_params=t_params)
-            elif is_ollama:
-                ollama_host = p_sett_thinking.get("ollama_host_url", OLLAMA_LOCAL_URL)
-                return OllamaModel(actual_name, api_url=ollama_host, system_instruction=system_instr, thinking_params=t_params)
-            else:
-                return GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instr, safety_settings=safety, thinking_params=t_params, tools=model_tools)
-
         try:
-            model_instance = create_model_instance(model_to_create, current_instructions, dynamic_safety_settings)
+            model_instance = self._instantiate_model(model_to_create, guild_id, profile_owner_id_for_instructions, current_instructions, dynamic_safety_settings, t_params, model_tools, p_sett_thinking)
             model_init_error = False
         except Exception as e1:
             print(f"Err '{model_to_create}' key {model_cache_key}: {e1}. Fallback.")
             model_to_create = fallback_model
             try:
-                model_instance = create_model_instance(model_to_create, current_instructions, dynamic_safety_settings)
+                model_instance = self._instantiate_model(model_to_create, guild_id, profile_owner_id_for_instructions, current_instructions, dynamic_safety_settings, t_params, model_tools, p_sett_thinking)
                 model_init_error = False
             except Exception as e2:
                 return None, True, temperature, top_p, top_k, f"Model Initialization Error: Failed to load Primary ('{primary_model}') and Fallback ('{fallback_model}') models. Check your API key.", fallback_model
@@ -758,36 +800,9 @@ class ServicesMixin:
         return model_instance, final_error_state, temperature, top_p, top_k, warning_message, fallback_model
 
     def _resolve_appearance_data(self, owner_id: int, profile_name: str) -> Tuple[str, str]:
-        index = self._get_user_index(owner_id)
-        is_borrowed = profile_name in index.get("borrowed", [])
-        
-        display_name = profile_name
-        avatar_url = self.bot.user.display_avatar.url if self.bot.user else ""
-        
-        if is_borrowed:
-            borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
-            pointer = borrowed_data.get("pointer")
-            resolved = self._resolve_borrowed_pointer(pointer)
-            
-            if resolved:
-                orig_owner_id, orig_profile_id = resolved
-                path = os.path.join(self.USERS_DIR, str(orig_owner_id), "profiles", orig_profile_id, "config.json.gz")
-                orig_config = self._load_json_gzip(path) or {}
-                display_name = orig_config.get("custom_display_name") or borrowed_data.get("original_profile_name", profile_name)
-                avatar_url = orig_config.get("custom_avatar_url") or avatar_url
-            else:
-                orig_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
-                orig_name = borrowed_data.get("original_profile_name", profile_name)
-                appearance = self.user_appearances.get(str(orig_owner_id), {}).get(orig_name)
-                if appearance:
-                    display_name = appearance.get("custom_display_name") or display_name
-                    avatar_url = appearance.get("custom_avatar_url") or avatar_url
-        else:
-            appearance = self.user_appearances.get(str(owner_id), {}).get(profile_name)
-            if appearance:
-                display_name = appearance.get("custom_display_name") or display_name
-                avatar_url = appearance.get("custom_avatar_url") or avatar_url
-        
+        app = self._get_user_appearance(owner_id, profile_name)
+        display_name = app.get("custom_display_name") or profile_name
+        avatar_url = app.get("custom_avatar_url") or (self.bot.user.display_avatar.url if self.bot.user else "")
         return display_name, avatar_url
 
     async def _send_session_warning(self, channel: discord.abc.Messageable, message: str):
@@ -964,15 +979,7 @@ class ServicesMixin:
             raise
 
     async def _get_or_create_model_for_global_chat(self, user_id: int, profile_name: str) -> Tuple[Optional[Any], float, float, int, Optional[str], Optional[str]]:
-        index = self._get_user_index(user_id)
-        is_borrowed = profile_name in index.get("borrowed", [])
-        
-        source_owner_id = user_id
-        source_profile_name = profile_name
-        if is_borrowed:
-            borrowed_data = self._get_profile_config(user_id, profile_name, True) or {}
-            source_owner_id = int(borrowed_data.get("original_owner_id", user_id))
-            source_profile_name = borrowed_data.get("original_profile_name", profile_name)
+        source_owner_id, source_profile_name = self._resolve_effective_profile(user_id, profile_name)
         
         profile_data = self._get_profile_config(source_owner_id, source_profile_name, False)
         if not profile_data:
@@ -996,43 +1003,15 @@ class ServicesMixin:
         threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
         safety_settings = { cat: threshold for cat in get_args(HarmCategory) }
 
-        is_or = False
-        is_ollama = False
-        actual_model_name = primary_model
-        
-        if primary_model.upper().startswith("OPENROUTER/"):
-            is_or = True
-            actual_model_name = primary_model[11:]
-        elif primary_model.upper().startswith("OLLAMA/"):
-            is_ollama = True
-            actual_model_name = primary_model[7:]
-        elif primary_model.upper().startswith("GOOGLE/"):
-            is_or = False
-            actual_model_name = primary_model[7:]
-        elif "/" in primary_model or "grok" in primary_model.lower():
-            is_or = True
-
         try:
-            if is_or:
-                user_api_key_or = self._get_api_key_for_user(user_id, provider="openrouter")
-                if not user_api_key_or:
-                    return None, 0.0, 0.0, 0, "You need to submit an OpenRouter API key using `/settings` to use this model.", None
-                model = OpenRouterModel(actual_model_name, api_key=user_api_key_or, system_instruction=system_instructions, thinking_params={})
-            elif is_ollama:
-                ollama_host = profile_data.get("ollama_host_url", OLLAMA_LOCAL_URL)
-                model = OllamaModel(actual_model_name, api_url=ollama_host, system_instruction=system_instructions, thinking_params={})
-            else:
-                user_api_key_google = self._get_api_key_for_user(user_id)
-                if not user_api_key_google:
-                    return None, 0.0, 0.0, 0, "This feature requires a personal Google Gemini API key. Use `/settings` to add one.", None
-                
-                t_params = {
-                    "thinking_summary_visible": profile_data.get("thinking_summary_visible", "off"),
-                    "thinking_level": profile_data.get("thinking_level", "high"),
-                    "thinking_budget": profile_data.get("thinking_budget", -1)
-                }
-                
-                # [NEW] Native Tool Construction
+            t_params = {
+                "thinking_summary_visible": profile_data.get("thinking_summary_visible", "off"),
+                "thinking_level": profile_data.get("thinking_level", "high"),
+                "thinking_budget": profile_data.get("thinking_budget", -1)
+            }
+            
+            model_tools = None
+            if not primary_model.upper().startswith(("OPENROUTER/", "OLLAMA/")) and "/" not in primary_model:
                 grounding_mode = profile_data.get("grounding_mode", "off")
                 if isinstance(grounding_mode, bool): grounding_mode = "rag" if grounding_mode else "off"
                 elif grounding_mode in ["on", "on+"]: grounding_mode = "rag"
@@ -1049,7 +1028,7 @@ class ServicesMixin:
                     
                 model_tools = model_tools_list if model_tools_list else None
                     
-                model = GoogleGenAIModel(api_key=user_api_key, model_name=actual_model_name, system_instruction=system_instructions, safety_settings=safety_settings, thinking_params=t_params, tools=model_tools)
+            model = self._instantiate_model(primary_model, None, user_id, system_instructions, safety_settings, t_params, model_tools, profile_data)
             
             return model, temp, top_p, top_k, warning_message, fallback_model
         except Exception as e:
@@ -1181,7 +1160,7 @@ class ServicesMixin:
                 # Step 2: Tier Detection (Does it have access to premium-only models?)
                 try:
                     await test_client.aio.models.generate_content(
-                        model='gemini-3.1-flash-image-preview', 
+                        model='gemini-3.1-flash-image', 
                         contents="ping",
                         config=types.GenerateContentConfig(max_output_tokens=1)
                     )
@@ -1299,57 +1278,9 @@ class ServicesMixin:
                     session['is_running'] = False
                     continue
                 
-                # [NEW] Pre-Round Hydration: Ensure all participant sessions are ready BEFORE processing triggers
-                
                 # We re-verify hydration here to catch sessions that were dehydrated during the await queue.get()
                 if not session.get("is_hydrated"):
                     session = await self._ensure_session_hydrated(channel_id, session_type)
-
-                for p_data in session.get('profiles', []):
-                    p_key = (p_data['owner_id'], p_data['profile_name'])
-                    if p_key not in session['chat_sessions'] or session['chat_sessions'][p_key] is None:
-                        # Rebuild history from the currently loaded log
-                        p_index = self._get_user_index(p_data['owner_id'])
-                        p_is_b = p_data['profile_name'] in p_index.get("borrowed", [])
-                        p_settings = self._get_profile_config(p_data['owner_id'], p_data['profile_name'], p_is_b) or {}
-                        
-                        bot_pid = self._get_pid_from_name_any(p_data['owner_id'], p_data['profile_name'])
-                        participant_history = []
-                        for turn in session.get("unified_log", []):
-                            if turn.get("is_hidden"): continue
-                            turn_type = turn.get("type")
-                            
-                            if not turn_type:
-                                role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
-                                if participant_history and participant_history[-1]['role'] == role:
-                                    participant_history[-1]['parts'].append(turn.get("content"))
-                                else:
-                                    participant_history.append({'role': role, 'parts': [turn.get("content")]})
-                            elif turn_type == "whisper":
-                                if turn.get("target_pid") == bot_pid:
-                                    clean_content = turn.get("content")
-                                    header, body = clean_content.split('\n', 1)
-                                    wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
-                                    if participant_history and participant_history[-1]['role'] == 'user':
-                                        participant_history[-1]['parts'].append(wrapped)
-                                    else:
-                                        participant_history.append({'role': 'user', 'parts': [wrapped]})
-                            elif turn_type == "private_response":
-                                if turn.get("speaker_pid") == bot_pid:
-                                    clean_content = turn.get("content")
-                                    header, body = clean_content.split('\n', 1)
-                                    wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                                    if participant_history and participant_history[-1]['role'] == 'model':
-                                        participant_history[-1]['parts'].append(wrapped)
-                                        if turn.get('thought_signature'):
-                                            participant_history[-1]['thought_signature'] = turn.get('thought_signature')
-                                    else:
-                                        obj = {'role': 'model', 'parts': [wrapped]}
-                                        if turn.get('thought_signature'):
-                                            obj['thought_signature'] = turn.get('thought_signature')
-                                        participant_history.append(obj)
-                        
-                        session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 
                 # Now process triggers into new_round_turn_data and unified_log...
                 primary_eager_placeholder = None
@@ -1639,25 +1570,11 @@ class ServicesMixin:
 
                     elif reaction_trigger and i == 0:
                         triggering_user_id = reaction_trigger.user_id
-
-                # [FIXED] Standardised XML formatting for link context in history
-                for base_text, url_ctx, media in new_round_turn_data:
-                    for p_key, chat_session in session['chat_sessions'].items():
-                        if chat_session is None: continue
-                        p_owner_id, p_name = p_key
-                        p_index = self._get_user_index(p_owner_id)
-                        p_is_b = p_name in p_index.get("borrowed", [])
-                        p_settings = self._get_profile_config(p_owner_id, p_name, p_is_b) or {}
-                        
-                        final_parts = [base_text]
-                        if url_ctx and p_settings.get("url_fetching_enabled", True):
-                            final_parts.append(f"\n<document_context>\n{url_ctx}\n</document_context>")
-                        
-                        content_obj = {'role': 'user', 'parts': final_parts}
-                        chat_session.history.append(content_obj)
+                        user_obj = self.bot.get_user(triggering_user_id)
+                        if user_obj:
+                            round_author_name = user_obj.display_name
 
                 for content_obj in new_round_turn_data:
-                    # Logic to populate chat_sessions handled below by new_round_turn_data loop
                     pass
 
                 profile_order = []
@@ -1768,6 +1685,7 @@ class ServicesMixin:
                 generated_image_bytes_for_round = None
                 generator_profile_key = None
                 generator_display_name = "A participant"
+                image_gen_error_msg = None
 
                 if is_image_gen_round:
                     if starting_profile_override:
@@ -1778,14 +1696,7 @@ class ServicesMixin:
                     
                     if generator_profile_key:
                         gen_owner_id, gen_profile_name = generator_profile_key
-                        gen_index = self._get_user_index(gen_owner_id)
-                        gen_is_borrowed = gen_profile_name in gen_index.get("borrowed", [])
-                        gen_effective_owner_id = gen_owner_id
-                        gen_effective_profile_name = gen_profile_name
-                        if gen_is_borrowed:
-                            borrowed_data = self._get_profile_config(gen_owner_id, gen_profile_name, True) or {}
-                            gen_effective_owner_id = int(borrowed_data.get("original_owner_id", gen_owner_id))
-                            gen_effective_profile_name = borrowed_data.get("original_profile_name", gen_profile_name)
+                        gen_effective_owner_id, gen_effective_profile_name = self._resolve_effective_profile(gen_owner_id, gen_profile_name)
                         
                         gen_appearance_data = self.user_appearances.get(str(gen_effective_owner_id), {}).get(gen_effective_profile_name, {})
                         if gen_appearance_data.get("custom_display_name"):
@@ -1948,6 +1859,88 @@ class ServicesMixin:
                     pre_generation_warnings.extend(u_w)
                     round_url_text_contexts.extend(u_t)
 
+                # --- NEW IMAGE GENERATION LOGIC ---
+                if is_image_gen_round and generator_profile_key:
+                    gen_owner_id, gen_profile_name = generator_profile_key
+                    gen_idx = self._get_user_index(gen_owner_id)
+                    gen_is_b = gen_profile_name in gen_idx.get("borrowed", [])
+                    gen_cfg = self._get_profile_config(gen_owner_id, gen_profile_name, gen_is_b) or {}
+                    
+                    if gen_cfg.get("image_generation_enabled", False):
+                        try:
+                            api_key = self._get_api_key_for_guild(channel.guild.id)
+                            if not api_key: raise ValueError("Server API key not configured.")
+                            
+                            img_model_name = gen_cfg.get("image_generation_model", "GOOGLE/gemini-2.5-flash-image")
+                            if img_model_name.upper().startswith("GOOGLE/"): img_model_name = img_model_name[7:]
+                            
+                            system_instruction = self._get_image_gen_system_instruction(gen_owner_id, gen_profile_name)
+                            
+                            # Combine prompt with appearance if needed
+                            appearance_text = ""
+                            source_prompts = self._get_profile_prompts(gen_owner_id, gen_profile_name) or {}
+                            if source_prompts:
+                                appearance_lines = source_prompts.get("persona", {}).get("appearance", [])
+                                appearance_text = "\n".join([self._decrypt_data(line) for line in appearance_lines])
+                            
+                            final_prompt_text = image_gen_prompt
+                            if appearance_text.strip():
+                                prompt_lower = image_gen_prompt.lower()
+                                second_person_pronouns = ["you", "your", "yourself", "u", "ur"]
+                                if any(pronoun in prompt_lower.split() for pronoun in second_person_pronouns) or \
+                                   generator_display_name.lower() in prompt_lower or \
+                                   gen_profile_name.lower() in prompt_lower:
+                                    final_prompt_text = f"Your appearance:\n{appearance_text.strip()}\n\nUser's prompt:\n{image_gen_prompt}"
+                            
+                            ref_images = []
+                            for _, _, turn_media in new_round_turn_data:
+                                for media in turn_media:
+                                    if media.get("mime_type", "").startswith("image/"):
+                                        ref_images.append(media)
+                            
+                            parts = [final_prompt_text]
+                            for ref in ref_images[:10]:
+                                parts.append({"url": ref["url"], "mime_type": ref.get("mime_type", "image/png")})
+
+                            # Determine safety
+                            safety_level_str = gen_cfg.get("safety_level", "low")
+                            safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
+                            threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
+                            dynamic_safety_settings = { cat: threshold for cat in get_args(HarmCategory) }
+
+                            image_model = GoogleGenAIModel(
+                                api_key=api_key,
+                                model_name=img_model_name,
+                                system_instruction=system_instruction,
+                                safety_settings=dynamic_safety_settings
+                            )
+                            
+                            status = "api_error"
+                            response = await image_model.generate_content_async([{'role': 'user', 'parts': parts}])
+                            status = "blocked_by_safety" if not response.candidates else "success"
+                            
+                            if not response.candidates:
+                                reason = "Safety Filter"
+                                if response.prompt_feedback and response.prompt_feedback.block_reason: 
+                                    reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
+                                image_gen_error_msg = f"the safety filter ({reason})"
+                            else:
+                                candidate = response.candidates[0]
+                                if candidate.finish_reason.name != 'STOP':
+                                    image_gen_error_msg = f"process stopped: {candidate.finish_reason.name.replace('_', ' ').title()}"
+                                else:
+                                    img_bytes = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
+                                    if img_bytes:
+                                        generated_image_bytes_for_round = img_bytes
+                                    else:
+                                        image_gen_error_msg = "no image data returned"
+                                        
+                            self._log_api_call(user_id=session.get('owner_id', 0), guild_id=channel.guild.id, context="image_generation_multi", model_used=image_model, status=status)
+                                
+                        except Exception as e:
+                            image_gen_error_msg = self._format_api_error(e)
+                            print(f"Error generating image in multi-profile round: {e}")
+
                 for i, participant in enumerate(profile_order):
                     turn_warnings = []
                     if i == 0:
@@ -2008,21 +2001,12 @@ class ServicesMixin:
                     
                     # [FIX] Dynamically inject missing ChatSession for ephemeral participants
                     if participant_key not in session['chat_sessions'] or session['chat_sessions'][participant_key] is None:
-                        p_history = []
                         bot_pid = self._get_pid_from_name_any(participant['owner_id'], participant['profile_name'])
-                        for turn in session.get("unified_log", []):
-                            if turn.get("is_hidden"): continue
-                            speaker_key = tuple(turn.get("speaker_key", []))
-                            
-                            if turn.get("speaker_pid"):
-                                role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
-                            else:
-                                role = 'model' if speaker_key == participant_key else 'user'
-
-                            if p_history and p_history[-1]['role'] == role:
-                                p_history[-1]['parts'].append(turn.get("content"))
-                            else:
-                                p_history.append({'role': role, 'parts': [turn.get("content")]})
+                        p_index = self._get_user_index(participant['owner_id'])
+                        p_is_b = participant['profile_name'] in p_index.get("borrowed", [])
+                        p_settings_ephemeral = self._get_profile_config(participant['owner_id'], participant['profile_name'], p_is_b) or {}
+                        
+                        p_history = self._build_history_for_participant(session.get("unified_log", []), bot_pid, p_settings_ephemeral)
                         session['chat_sessions'][participant_key] = GoogleGenAIChatSession(history=p_history)
 
                     chat_session = session['chat_sessions'].get(participant_key)
@@ -2100,12 +2084,7 @@ class ServicesMixin:
 
                     user_index = self._get_user_index(owner_id)
                     is_borrowed = profile_name in user_index.get("borrowed", [])
-                    effective_owner_id = owner_id
-                    effective_profile_name = profile_name
-                    if is_borrowed:
-                        borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
-                        effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
-                        effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
+                    effective_owner_id, effective_profile_name = self._resolve_effective_profile(owner_id, profile_name)
 
                     speaker_display_name = profile_name
                     appearance_data = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
@@ -2124,16 +2103,9 @@ class ServicesMixin:
 
                         # This block is crucial to define the generator's variables when triggered mid-round
                         gen_owner_id, gen_profile_name = generator_profile_key
-                        gen_index = self._get_user_index(gen_owner_id)
-                        gen_is_borrowed = gen_profile_name in gen_index.get("borrowed", [])
-                        gen_effective_owner_id = gen_owner_id
-                        gen_effective_profile_name = gen_profile_name
-                        if gen_is_borrowed:
-                            borrowed_data = self._get_profile_config(gen_owner_id, gen_profile_name, True) or {}
-                            gen_effective_owner_id = int(borrowed_data.get("original_owner_id", gen_owner_id))
-                            gen_effective_profile_name = borrowed_data.get("original_profile_name", gen_profile_name)
+                        gen_effective_owner_id, gen_effective_profile_name = self._resolve_effective_profile(gen_owner_id, gen_profile_name)
                         
-                        gen_appearance_data = self.user_appearances.get(str(gen_effective_owner_id), {}).get(gen_effective_profile_name, {})
+                        gen_appearance_data = self._get_user_appearance(gen_effective_owner_id, gen_effective_profile_name)
                         if gen_appearance_data.get("custom_display_name"):
                             generator_display_name = gen_appearance_data["custom_display_name"]
                         else:
@@ -2207,131 +2179,38 @@ class ServicesMixin:
                         }
 
                         image_gen_error_msg = None
-                        if is_generator and generated_image_bytes_for_round is None:
-                            if self.image_gen_semaphore.locked() and image_gen_anchor_message:
-                                try:
-                                    if isinstance(image_gen_anchor_message, discord.Message):
-                                        await image_gen_anchor_message.reply("Your image generation request has been queued. It will be processed when the single spot opens.", delete_after=10)
-                                except Exception: pass
+                        if p_settings.get("url_fetching_enabled", False) and round_url_text_contexts:
+                            url_instr = "<url_research>\n[Context from links in current messages]:\n" + "\n".join(round_url_text_contexts) + "\n</url_research>"
+                            contents_for_api_call.append({'role': 'user', 'parts': [url_instr]})
 
-                            async with self.image_gen_semaphore:
-                                system_instruction = self._get_image_gen_system_instruction(owner_id, profile_name)
-                                
-                                # Get appearance text
-                                source_owner_id = owner_id
-                                source_profile_name = profile_name
-                                if is_borrowed:
-                                    borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
-                                    source_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
-                                    source_profile_name = borrowed_data.get("original_profile_name", profile_name)
-                                
-                                source_prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
-                                persona = source_prompts.get("persona", {})
-                                appearance_lines_encrypted = persona.get("appearance", [])
-                                appearance_text = "\n".join([self._decrypt_data(line) for line in appearance_lines_encrypted])
+                        if not contents_for_api_call:
+                            contents_for_api_call.append({'role': 'user', 'parts':["<internal_note>Start the conversation.</internal_note>"]})
 
-                                final_prompt_text = image_gen_prompt
-                                if appearance_text.strip():
-                                    prompt_lower = image_gen_prompt.lower()
-                                    second_person_pronouns = ["you", "your", "yourself", "u", "ur"]
-                                    if any(pronoun in prompt_lower.split() for pronoun in second_person_pronouns) or \
-                                    generator_display_name.lower() in prompt_lower or \
-                                    gen_profile_name.lower() in prompt_lower:
-                                        final_prompt_text = f"Your appearance:\n{appearance_text.strip()}\n\nUser's prompt:\n{image_gen_prompt}"
-
-                                profile_settings = self._get_profile_config(owner_id, profile_name, is_borrowed) or {}
-                                safety_level_str = profile_settings.get('safety_level', 'low')
-
-                                safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
-                                threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
-                                dynamic_safety_settings = { cat: threshold for cat in get_args(HarmCategory) }
-
-                                image_model = GoogleGenAIModel(
-                                    api_key=api_key, 
-                                    model_name=p_settings.get("image_generation_model", "gemini-2.5-flash-image"), 
-                                    system_instruction=system_instruction, 
-                                    safety_settings=dynamic_safety_settings
-                                )
-                                
-                                parts = [final_prompt_text]
-                                if image_gen_anchor_message:
-                                    # FIXED: Cumulative Image Gathering (Max 2 images)
-                                    # Logic handles Dict payloads (Child Bot) and Discord Objects (Webhook/User)
-                                    
-                                    # 1. Try to fetch from Reply Reference
-                                    ref_msg_id = None
-                                    ref_channel_id = None
-                                    
-                                    if isinstance(image_gen_anchor_message, dict):
-                                        replied_to = image_gen_anchor_message.get('replied_to')
-                                        if replied_to:
-                                            ref_msg_id = replied_to.get('id')
-                                            ref_channel_id = replied_to.get('channel_id')
-                                    else:
-                                        if image_gen_anchor_message.reference:
-                                            ref_msg_id = image_gen_anchor_message.reference.message_id
-                                            ref_channel_id = image_gen_anchor_message.reference.channel_id
-
-                                    if ref_msg_id:
-                                        try:
-                                            fetch_channel = channel
-                                            if ref_channel_id and ref_channel_id != channel.id:
-                                                fetch_channel = self.bot.get_channel(ref_channel_id)
-                                            
-                                            if fetch_channel:
-                                                ref_msg = await fetch_channel.fetch_message(ref_msg_id)
-                                                if ref_msg.attachments and ref_msg.attachments[0].content_type.startswith("image/"):
-                                                    parts.append({"url": ref_msg.attachments[0].url, "mime_type": ref_msg.attachments[0].content_type})
-                                        except Exception as e:
-                                            print(f"Error fetching referenced image for generation: {e}")
-                                    
-                                    # 2. Try to fetch from Current Attachments (fill remaining slots up to 10 images total)
-                                    # Note: parts[0] is text, so we check if len(parts) < 11 (1 text + 10 images)
-                                    if len(parts) < 11:
-                                        attachments_list = []
-                                        if isinstance(image_gen_anchor_message, dict):
-                                            attachments_list = image_gen_anchor_message.get('attachments', [])
-                                        else:
-                                            attachments_list = image_gen_anchor_message.attachments
-
-                                        for attachment in attachments_list:
-                                            if len(parts) >= 11: break # Limit reached
-
-                                            is_dict = isinstance(attachment, dict)
-                                            url = attachment['url'] if is_dict else attachment.url
-                                            ctype = attachment.get('content_type', 'image/png') if is_dict else attachment.content_type
-                                            
-                                            # Filter objects
-                                            if not is_dict and not (ctype and ctype.startswith("image/")):
-                                                continue
-
-                                            parts.append({"url": url, "mime_type": ctype})
-                                
-                                status = "api_error"
-                                response = None
-                                try:
-                                    response, state_container = await self._generate_with_heartbeat(
-                                        image_model, [{'role': 'user', 'parts': parts}], None, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type="text"
-                                    )
-                                    status = "blocked_by_safety" if not response.candidates else "success"
-                                except Exception as e:
-                                    image_gen_error_msg = self._format_api_error(e)
-                                    status = "api_error"
-                                finally:
-                                    self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="image_generation_multi", model_used=image_model.model_name, status=status)
-
-                                if response and response.candidates and response.candidates[0].finish_reason.name == 'STOP':
-                                    for part in response.candidates[0].content.parts:
-                                        if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/'):
-                                            generated_image_bytes_for_round = part.inline_data.data
-                                            break
+                        # [NEW] Hybrid STM: Rebuild history dynamically from unified_log
+                        bot_pid = self._get_pid_from_name_any(owner_id, profile_name)
                         
-                        # [RESTORED] Context Gathering for Retrieval
+                        unified_log = session.get("unified_log", [])
+                        past_log = unified_log[:batch_start_index]
+                        current_batch_log = unified_log[batch_start_index:]
+                        
+                        stm_length = int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
+                        if stm_length > 0:
+                            past_log = past_log[-stm_length:]
+                        else:
+                            past_log = []
+                            
+                        combined_log = past_log + current_batch_log
+                        contents_for_api_call = self._build_history_for_participant(combined_log, bot_pid, p_settings)
+
                         round_context_text = "\n".join([t[0] for t in new_round_turn_data])
-                        dynamic_context_for_turn = round_context_text + "\n" + "\n".join(responses_this_round)
+                        dynamic_context_for_turn = (round_context_text + "\n" + "\n".join(responses_this_round)).strip()
+                        
+                        if not dynamic_context_for_turn and session.get("unified_log"):
+                            # Fallback to the last available turn for vector search context
+                            dynamic_context_for_turn = session["unified_log"][-1].get("content", "")
 
                         # Parallelise Training Examples and LTM retrieval to reduce physical latency
-                        ltm_task = self._get_relevant_ltm_for_prompt(session_key, chat_session.history, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id)
+                        ltm_task = self._get_relevant_ltm_for_prompt(session_key, contents_for_api_call, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id)
                         training_task = self._get_relevant_training_examples(owner_id, profile_name, dynamic_context_for_turn, channel.guild.id)
                         
                         ltm_recall_text, training_examples_list = await asyncio.gather(ltm_task, training_task)
@@ -2435,63 +2314,7 @@ class ServicesMixin:
                             except Exception as e:
                                 warning_message = f"Model Initialization Error: Failed to instantiate Google model '{actual_name}'. {e}"
                         
-                        contents_for_api_call = []
                         session_key = (channel.id, owner_id, profile_name)
-
-                        # [NEW] Hybrid STM: Rebuild history dynamically from unified_log
-                        # Past history is governed by STM. Current round context bypasses STM.
-                        unified_log = session.get("unified_log", [])
-                        past_log = unified_log[:batch_start_index]
-                        current_batch_log = unified_log[batch_start_index:]
-                        
-                        stm_length = int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
-                        if stm_length > 0:
-                            past_log = past_log[-stm_length:]
-                        else:
-                            past_log = []
-                            
-                        combined_log = past_log + current_batch_log
-                        bot_pid = self._get_pid_from_name_any(owner_id, profile_name)
-                        
-                        for turn in combined_log:
-                            if turn.get("is_hidden"): continue
-                            
-                            turn_type = turn.get("type")
-                            if not turn_type:
-                                role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
-                                parts = [turn.get("content")]
-                                if role == 'user' and turn.get("url_context") and p_settings.get("url_fetching_enabled", False):
-                                    parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
-                                if role == 'user' and turn.get("grounding_context") and p_settings.get("grounding_mode", "off") != "off":
-                                    parts.append(f"\n{turn.get('grounding_context')}")
-                                
-                                if contents_for_api_call and contents_for_api_call[-1].get('role') == role:
-                                    contents_for_api_call[-1]['parts'].extend(parts)
-                                else:
-                                    contents_for_api_call.append({'role': role, 'parts': parts})
-                            elif turn_type == "whisper":
-                                if turn.get("target_pid") == bot_pid:
-                                    clean_content = turn.get("content")
-                                    header, body = clean_content.split('\n', 1)
-                                    wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
-                                    if contents_for_api_call and contents_for_api_call[-1].get('role') == 'user':
-                                        contents_for_api_call[-1]['parts'].append(wrapped)
-                                    else:
-                                        contents_for_api_call.append({'role': 'user', 'parts': [wrapped]})
-                            elif turn_type == "private_response":
-                                if turn.get("speaker_pid") == bot_pid:
-                                    clean_content = turn.get("content")
-                                    header, body = clean_content.split('\n', 1)
-                                    wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                                    if contents_for_api_call and contents_for_api_call[-1].get('role') == 'model':
-                                        contents_for_api_call[-1]['parts'].append(wrapped)
-                                        if turn.get('thought_signature'):
-                                            contents_for_api_call[-1]['thought_signature'] = turn.get('thought_signature')
-                                    else:
-                                        obj = {'role': 'model', 'parts': [wrapped]}
-                                        if turn.get('thought_signature'):
-                                            obj['thought_signature'] = turn.get('thought_signature')
-                                        contents_for_api_call.append(obj)
 
                         # Check if the last turn was from this model itself
                         if contents_for_api_call and contents_for_api_call[-1].get('role', contents_for_api_call[-1].get('role', 'user')) == 'model':
@@ -2604,7 +2427,7 @@ class ServicesMixin:
                                 p_effective_owner_id = int(borrowed_data.get("original_owner_id", p_owner_id_temp))
                                 p_effective_profile_name = borrowed_data.get("original_profile_name", p_name_temp)
                             display_name_temp = p_effective_profile_name
-                            appearance_data_temp = self.user_appearances.get(str(p_effective_owner_id), {}).get(p_effective_profile_name, {})
+                            appearance_data_temp = self._get_user_appearance(p_effective_owner_id, p_effective_profile_name)
                             if appearance_data_temp.get("custom_display_name"):
                                 display_name_temp = appearance_data_temp["custom_display_name"]
                             all_participant_names.append(display_name_temp)
@@ -2650,40 +2473,7 @@ class ServicesMixin:
                                 else:
                                     try:
                                         fb_name = fallback_model_name
-                                        fb_is_or = False
-                                        fb_is_ollama = False
-                                        
-                                        if fb_name.upper().startswith("GOOGLE/"):
-                                            fb_name = fb_name[7:]
-                                        elif fb_name.upper().startswith("OPENROUTER/"):
-                                            fb_name = fb_name[11:]
-                                            fb_is_or = True
-                                        elif fb_name.upper().startswith("OLLAMA/"):
-                                            fb_name = fb_name[7:]
-                                            fb_is_ollama = True
-                                        elif "/" in fb_name:
-                                            fb_is_or = True
-                                        
-                                        if fb_is_or:
-                                            or_key = self._get_api_key_for_guild(channel.guild.id, provider="openrouter")
-                                            if or_key:
-                                                fallback_instance = OpenRouterModel(fb_name, api_key=or_key, system_instruction=full_system_instruction, thinking_params=t_params_worker)
-                                            else:
-                                                raise ValueError("No OpenRouter key for fallback")
-                                        elif fb_is_ollama:
-                                            ollama_host = p_settings.get("ollama_host_url", OLLAMA_LOCAL_URL)
-                                            fallback_instance = OllamaModel(fb_name, api_url=ollama_host, system_instruction=full_system_instruction, thinking_params=t_params_worker)
-                                        else:
-                                            api_key = self._get_api_key_for_guild(channel.guild.id)
-                                            if not api_key: raise ValueError("No Google API Key for fallback")
-                                            fallback_instance = GoogleGenAIModel(
-                                                api_key=api_key, 
-                                                model_name=fb_name, 
-                                                system_instruction=full_system_instruction, 
-                                                safety_settings=dynamic_safety_settings,
-                                                thinking_params=t_params_worker,
-                                                tools=model_tools
-                                            )
+                                        fallback_instance = self._instantiate_model(fb_name, channel.guild.id, triggering_user_id, full_system_instruction, dynamic_safety_settings, t_params_worker, model_tools, p_settings)
                                         
                                         response, state_container = await self._generate_with_heartbeat(
                                             fallback_instance, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
@@ -3225,6 +3015,10 @@ class ServicesMixin:
                     # Collect short-lived turn objects
                     gc.collect(0)
 
+                    # Check if session was cancelled mid-turn and stop the round
+                    if not session.get('is_running') and not session.get('is_regenerating'):
+                        break
+
                     is_last_participant = (participant == profile_order[-1])
                     if not is_last_participant:
                         await asyncio.sleep(1.0)
@@ -3399,7 +3193,7 @@ class ServicesMixin:
                                 for turn in history_source_obj.history[-context_size:]:
                                     parts = turn.get('parts', [])
                                     if parts:
-                                        text_val = parts[0] if isinstance(parts[0], str) else parts[0].get('text', '')
+                                        text_val = "\n".join(p if isinstance(p, str) else p.get('text', '') for p in parts)
                                         events_for_summary.append(text_val)
                                 
                                 _, _, _, temp, top_p, top_k, primary_model, _ = self._construct_system_instructions(owner_id, profile_name, channel_id, is_multi_profile=True)
@@ -3445,55 +3239,7 @@ class ServicesMixin:
 
                     history_slice = trimmed_unified_log[-stm_length:] if stm_length > 0 else []
                     
-                    participant_history =[]
-                    for turn in history_slice:
-                        turn_type = turn.get("type")
-                        if not turn_type:
-                            role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
-                            
-                            # [UPDATED] Standardised Headers
-                            parts = [turn.get("content")]
-                            if role == 'user' and turn.get("url_context") and p_profile_settings.get("url_fetching_enabled", False):
-                                parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
-                            
-                            if role == 'user' and turn.get("grounding_context") and p_profile_settings.get("grounding_mode", "off") != "off":
-                                parts.append(f"\n<external_context>\n{turn.get('grounding_context')}\n</external_context>")
-
-                            if participant_history and participant_history[-1]['role'] == role:
-                                participant_history[-1]['parts'].extend(parts)
-                                if role == 'model' and turn.get('thought_signature'):
-                                    participant_history[-1]['thought_signature'] = turn.get('thought_signature')
-                            else:
-                                content_obj = {'role': role, 'parts': parts}
-                                if role == 'model' and turn.get('thought_signature'):
-                                    content_obj['thought_signature'] = turn.get('thought_signature')
-                                participant_history.append(content_obj)
-
-                        elif turn_type == "whisper":
-                            if turn.get("target_pid") == bot_pid:
-                                # [NEW] Apply dynamic XML wrapping during re-hydration
-                                clean_content = turn.get("content")
-                                header, body = clean_content.split('\n', 1)
-                                wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
-                                if participant_history and participant_history[-1]['role'] == 'user':
-                                    participant_history[-1]['parts'].append(wrapped)
-                                else:
-                                    participant_history.append({'role': 'user', 'parts':[wrapped]})
-                        elif turn_type == "private_response":
-                            if turn.get("speaker_pid") == bot_pid:
-                                # [NEW] Apply dynamic XML wrapping during re-hydration
-                                clean_content = turn.get("content")
-                                header, body = clean_content.split('\n', 1)
-                                wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                                if participant_history and participant_history[-1]['role'] == 'model':
-                                    participant_history[-1]['parts'].append(wrapped)
-                                    if turn.get('thought_signature'):
-                                        participant_history[-1]['thought_signature'] = turn.get('thought_signature')
-                                else:
-                                    obj = {'role': 'model', 'parts': [wrapped]}
-                                    if turn.get('thought_signature'):
-                                        obj['thought_signature'] = turn.get('thought_signature')
-                                    participant_history.append(obj)
+                    participant_history = self._build_history_for_participant(history_slice, bot_pid, p_profile_settings)
                     session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 
             except asyncio.CancelledError:
@@ -3512,24 +3258,24 @@ class ServicesMixin:
             session['worker_task'] = None
 
     def _extract_and_apply_neuro_state(self, raw_text: str, owner_id: int, profile_name: str) -> Tuple[str, Optional[Dict[str, int]]]:
-        # 1. Attempt strict XML tag extraction
         xml_pattern = r'<neuro_update>\s*(.*?)\s*</neuro_update>'
-        match = re.search(xml_pattern, raw_text, flags=re.IGNORECASE | re.DOTALL)
-        
         data_str = None
         clean_text = raw_text
         
-        if match:
-            data_str = match.group(1)
-            clean_text = re.sub(xml_pattern, '', raw_text, flags=re.IGNORECASE | re.DOTALL)
-        else:
-            # 2. Relaxed Pattern Matcher (Fallback for XML-less output)
-            # Looks for the raw D:XX|C:XX|O:XX|A:XX pattern typically at the end of the response
-            relaxed_pattern = r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})'
-            match = re.search(relaxed_pattern, raw_text, flags=re.IGNORECASE)
-            if match:
-                data_str = match.group(0)
-                clean_text = re.sub(relaxed_pattern, '', raw_text, flags=re.IGNORECASE)
+        try:
+            with Timeout(seconds=1, error_message="Neuro extraction timed out"):
+                match = re.search(xml_pattern, raw_text, flags=re.IGNORECASE | re.DOTALL)
+                if match:
+                    data_str = match.group(1)
+                    clean_text = re.sub(xml_pattern, '', raw_text, flags=re.IGNORECASE | re.DOTALL)
+                else:
+                    relaxed_pattern = r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})'
+                    match = re.search(relaxed_pattern, raw_text, flags=re.IGNORECASE)
+                    if match:
+                        data_str = match.group(0)
+                        clean_text = re.sub(relaxed_pattern, '', raw_text, flags=re.IGNORECASE)
+        except TimeoutError:
+            return raw_text.strip(), None
 
         if not data_str:
             return raw_text.strip(), None
@@ -3576,7 +3322,7 @@ class ServicesMixin:
                 item = await self.text_request_queue.get()
                 if item is None: break
                 
-                priority, package = item
+                priority, _, package = item
 
                 async with self.image_gen_semaphore:
                     placeholder_message = package.get("placeholder_message")
@@ -3908,11 +3654,11 @@ class ServicesMixin:
                 item = await self.image_request_queue.get()
                 if item is None: break 
                 
-                priority, request_data = item
+                priority, _, request_data = item
 
                 # If a reference image is present, this request bypasses pre-fetching.
                 if request_data.get("reference_image_urls"):
-                    await self.text_request_queue.put((priority, request_data))
+                    await self.text_request_queue.put((priority, time.time(), request_data))
                     self.image_request_queue.task_done()
                     continue
 
@@ -3957,7 +3703,7 @@ class ServicesMixin:
                 request_data['failure_reason'] = failure_reason
                 
                 # Pass priority to next stage
-                await self.text_request_queue.put((priority, request_data))
+                await self.text_request_queue.put((priority, time.time(), request_data))
                 self.image_request_queue.task_done()
             except asyncio.CancelledError:
                 break
@@ -4118,16 +3864,7 @@ class ServicesMixin:
             return []
 
         owner_id_str = str(profile_owner_id)
-        index = self._get_user_index(profile_owner_id)
-        is_borrowed = profile_name in index.get("borrowed", [])
-        
-        effective_owner_id_for_training = profile_owner_id
-        effective_profile_name_for_training = profile_name
-        
-        if is_borrowed:
-            borrowed_data = self._get_profile_config(profile_owner_id, profile_name, True) or {}
-            effective_owner_id_for_training = int(borrowed_data.get("original_owner_id", profile_owner_id))
-            effective_profile_name_for_training = borrowed_data.get("original_profile_name", profile_name)
+        effective_owner_id_for_training, effective_profile_name_for_training = self._resolve_effective_profile(profile_owner_id, profile_name)
 
         profile_examples = self._load_training_shard(str(effective_owner_id_for_training), effective_profile_name_for_training)
 
@@ -4159,20 +3896,20 @@ class ServicesMixin:
         if not api_key: 
             return None
 
-        # [NEW] Use the Google Gen AI SDK (v2) Client
         client = genai.Client(api_key=api_key)
 
         try:
-            # Request truncated 256-dimensional embedding to save space (Matryoshka)
-            result = await client.aio.models.embed_content(
-                model='gemini-embedding-001',
-                contents=text,
-                config=types.EmbedContentConfig(
-                    task_type=task_type,
-                    output_dimensionality=256
-                )
+            result = await asyncio.wait_for(
+                client.aio.models.embed_content(
+                    model='gemini-embedding-001',
+                    contents=text,
+                    config=types.EmbedContentConfig(
+                        task_type=task_type,
+                        output_dimensionality=256
+                    )
+                ),
+                timeout=5.0
             )
-            # The new SDK returns a list of embedding objects; we access values of the first one
             return result.embeddings[0].values
         except Exception as e:
             print(f"Embedding err for '{text[:30]}...': {e}")
@@ -4196,38 +3933,41 @@ class ServicesMixin:
 
             if not raw_text: continue
 
-            # 1. Strip technical metadata
-            text = re.sub(r'\(\s*Thought Initiated:.*?\)\s*\n?', '', raw_text).strip()
-            
-            # 2. Strip previous contexts to avoid "recursive" memory creation
-            lines = text.split('\n')
-            filtered_lines = []
-            skip_block = False
-            for line in lines:
-                l_strip = line.strip()
-                if any(l_strip.startswith(prefix) for prefix in [
-                    "<external_context>",
-                    "<document_context>",
-                    "<archive_context>",
-                    "<internal_note>",
-                    "<image_context>"
-                ]):
-                    skip_block = True
-                    continue
-                if skip_block:
-                    if l_strip.startswith(("</external_context>", "</document_context>", "</archive_context>", "</internal_note>", "</image_context>")):
-                        skip_block = False
-                    continue
-                filtered_lines.append(line)
-            
-            final_content = "\n".join(filtered_lines).strip()
-            if final_content:
-                # If it doesn't already have a Name [Timestamp] header (e.g. from single-profile hist), add it
-                if not re.match(r'^.+ \[[^\]]+\]:', final_content):
-                    ts_str = datetime.datetime.now(datetime.timezone.utc).strftime("[%a, %d %b %Y, %I:%M %p UTC]")
-                    convo_parts.append(f"{display_name} {ts_str}:\n{final_content}")
-                else:
-                    convo_parts.append(final_content)
+            try:
+                with Timeout(seconds=2, error_message="LTM regex parsing timed out"):
+                    # 1. Strip technical metadata
+                    text = re.sub(r'\(\s*Thought Initiated:.*?\)\s*\n?', '', raw_text).strip()
+                    
+                    # 2. Strip previous contexts to avoid "recursive" memory creation
+                    lines = text.split('\n')
+                    filtered_lines = []
+                    skip_block = False
+                    for line in lines:
+                        l_strip = line.strip()
+                        if any(l_strip.startswith(prefix) for prefix in [
+                            "<external_context>",
+                            "<document_context>",
+                            "<archive_context>",
+                            "<internal_note>",
+                            "<image_context>"
+                        ]):
+                            skip_block = True
+                            continue
+                        if skip_block:
+                            if l_strip.startswith(("</external_context>", "</document_context>", "</archive_context>", "</internal_note>", "</image_context>")):
+                                skip_block = False
+                            continue
+                        filtered_lines.append(line)
+                    
+                    final_content = "\n".join(filtered_lines).strip()
+                    if final_content:
+                        if not re.match(r'^.+ \[[^\]]+\]:', final_content):
+                            ts_str = datetime.datetime.now(datetime.timezone.utc).strftime("[%a, %d %b %Y, %I:%M %p UTC]")
+                            convo_parts.append(f"{display_name} {ts_str}:\n{final_content}")
+                        else:
+                            convo_parts.append(final_content)
+            except TimeoutError:
+                continue
 
         convo = "\n\n".join(convo_parts)
 
@@ -4236,16 +3976,12 @@ class ServicesMixin:
         
         instructions = DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS
         if profile_owner_id and profile_name:
-            index = self._get_user_index(profile_owner_id)
-            is_borrowed = profile_name in index.get("borrowed",[])
+            user_index = self._get_user_index(profile_owner_id)
+            is_borrowed = profile_name in user_index.get("borrowed", [])
             params_source = self._get_profile_config(profile_owner_id, profile_name, is_borrowed) or {}
-
-            if is_borrowed:
-                source_owner_id = int(params_source.get("original_owner_id", profile_owner_id))
-                source_profile_name = params_source.get("original_profile_name", profile_name)
-                prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
-            else:
-                prompts = self._get_profile_prompts(profile_owner_id, profile_name) or {}
+            
+            source_owner_id, source_profile_name = self._resolve_effective_profile(profile_owner_id, profile_name)
+            prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
             
             encrypted_instructions = prompts.get("ltm_summarization_instructions", self._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS))
             instructions = self._decrypt_data(encrypted_instructions)
@@ -4257,36 +3993,11 @@ class ServicesMixin:
         if profile_owner_id and profile_name:
             ltm_model_raw = params_source.get("ltm_model", FALLBACK_MODEL_NAME) if 'params_source' in locals() else FALLBACK_MODEL_NAME
             
-        is_or = False
-        is_ollama = False
-        actual_model_name = ltm_model_raw
-        if ltm_model_raw.upper().startswith("OPENROUTER/"):
-            actual_model_name = ltm_model_raw[11:]
-            is_or = True
-        elif ltm_model_raw.upper().startswith("OLLAMA/"):
-            actual_model_name = ltm_model_raw[7:]
-            is_ollama = True
-        elif ltm_model_raw.upper().startswith("GOOGLE/"):
-            actual_model_name = ltm_model_raw[7:]
-            is_or = False
-        elif "/" in ltm_model_raw:
-            is_or = True
-            
         effective_guild_id = guild_id or 0
         
         status = "api_error"
         try:
-            if is_or:
-                api_key = self._get_api_key_for_guild(effective_guild_id, "openrouter") if effective_guild_id else self._get_api_key_for_user(profile_owner_id, "openrouter")
-                if not api_key: return None
-                m = OpenRouterModel(actual_model_name, api_key=api_key, system_instruction=instructions, thinking_params={})
-            elif is_ollama:
-                ollama_host = params_source.get("ollama_host_url", OLLAMA_LOCAL_URL) if 'params_source' in locals() else OLLAMA_LOCAL_URL
-                m = OllamaModel(actual_model_name, api_url=ollama_host, system_instruction=instructions, thinking_params={})
-            else:
-                api_key = self._get_api_key_for_guild(effective_guild_id) if effective_guild_id else self._get_api_key_for_user(profile_owner_id)
-                if not api_key: return None
-                m = GoogleGenAIModel(api_key=api_key, model_name=actual_model_name, system_instruction=instructions, safety_settings=DEFAULT_SAFETY_SETTINGS)
+            m = self._instantiate_model(ltm_model_raw, effective_guild_id if effective_guild_id else None, profile_owner_id, instructions, DEFAULT_SAFETY_SETTINGS, {}, None, params_source if 'params_source' in locals() else {})
 
             r = await m.generate_content_async([f"<target_transcript>\n{convo}\n</target_transcript>"], generation_config=cfg)
             status = "blocked_by_safety" if not r.candidates else "success"
@@ -4356,14 +4067,7 @@ class ServicesMixin:
             user_id_map = {triggering_user_id: author_dn}
             sanitized_history, sanitized_author = self._get_sanitized_history_and_author(h_sum, user_id_map, triggering_user_id)
 
-            index = self._get_user_index(profile_owner_id)
-            is_borrowed = profile_name in index.get("borrowed", [])
-            effective_owner_id = profile_owner_id
-            effective_profile_name = profile_name
-            if is_borrowed:
-                borrowed_data = self._get_profile_config(profile_owner_id, profile_name, True) or {}
-                effective_owner_id = int(borrowed_data.get("original_owner_id", profile_owner_id))
-                effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
+            effective_owner_id, effective_profile_name = self._resolve_effective_profile(profile_owner_id, profile_name)
             
             bot_display_name = effective_profile_name
             appearance = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
@@ -4431,24 +4135,20 @@ class ServicesMixin:
                 is_realistic_typing = borrowed_data.get("realistic_typing_enabled", False)
                 typing_cps = borrowed_data.get("typing_cps", 30.0)
                 typing_max_delay = borrowed_data.get("typing_max_delay", 2.5)
-                
-                effective_owner_id = int(borrowed_data.get("original_owner_id", profile_owner_id_for_appearance))
-                effective_profile_name = borrowed_data.get("original_profile_name", profile_name_for_appearance)
             else:
                 personal_profile_data = self._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, False) or {}
                 is_realistic_typing = personal_profile_data.get("realistic_typing_enabled", False)
                 typing_cps = personal_profile_data.get("typing_cps", 30.0)
                 typing_max_delay = personal_profile_data.get("typing_max_delay", 2.5)
 
-                effective_owner_id = profile_owner_id_for_appearance
-                effective_profile_name = profile_name_for_appearance
+            effective_owner_id, effective_profile_name = self._resolve_effective_profile(profile_owner_id_for_appearance, profile_name_for_appearance)
             
             # [NEW] Enforce bypass if flag is set
             if bypass_typing:
                 is_realistic_typing = False
 
             owner_id_str = str(effective_owner_id)
-            appearance_data = self.user_appearances.get(owner_id_str, {}).get(effective_profile_name)
+            appearance_data = self._get_user_appearance(effective_owner_id, effective_profile_name)
 
             if appearance_data and (appearance_data.get("custom_display_name") or appearance_data.get("custom_avatar_url")):
                 use_webhook = True
@@ -4566,33 +4266,39 @@ class ServicesMixin:
                         last_edit_time = time.monotonic()
                         
                 return sent_messages_list
+            except asyncio.CancelledError:
+                # Flush the remaining un-sent content immediately on cancel
+                try:
+                    send_kwargs = {
+                        "content": content,
+                        "username": custom_display_name_to_use,
+                        "avatar_url": custom_avatar_url_to_use,
+                        "embeds": embeds,
+                        "wait": True
+                    }
+                    if file: send_kwargs["file"] = file
+                    if isinstance(channel, discord.Thread): send_kwargs["thread"] = channel
+                    
+                    if target_message_to_edit:
+                        try: await target_message_to_edit.delete()
+                        except: pass
+                        
+                    # If we already sent a partial message, edit it to show the full text instead of double sending
+                    if sent_messages_list:
+                        await webhook_to_use.edit_message(sent_messages_list[0].id, content=content)
+                    else:
+                        sent_msg = await webhook_to_use.send(**send_kwargs)
+                        sent_messages_list.append(sent_msg)
+                except Exception as flush_err:
+                    print(f"Failed to flush realistic typing on cancel: {flush_err}")
+                return sent_messages_list
             except Exception as e:
                 print(f"Realistic typing failed, falling back to standard send. Error: {e}")
                 traceback.print_exc()
 
-        remaining_content = content
         is_first_chunk = True
         
-        while remaining_content:
-            chunk = ""
-            if len(remaining_content) <= DISCORD_MAX_MESSAGE_LENGTH:
-                chunk = remaining_content
-                remaining_content = ""
-            else:
-                split_pos = -1
-                para_break = remaining_content.rfind('\n\n', 0, DISCORD_MAX_MESSAGE_LENGTH)
-                if para_break != -1:
-                    split_pos = para_break + 2
-                else:
-                    sent_break = remaining_content.rfind('. ', 0, DISCORD_MAX_MESSAGE_LENGTH)
-                    if sent_break != -1:
-                        split_pos = sent_break + 2
-                    else:
-                        split_pos = DISCORD_MAX_MESSAGE_LENGTH
-
-                chunk = remaining_content[:split_pos]
-                remaining_content = remaining_content[split_pos:]
-
+        for chunk in _yield_message_chunks(content):
             current_target_to_edit = target_message_to_edit if is_first_chunk else None
             current_reply_to = reply_to if is_first_chunk else None
             current_store_prompt = store_prompt_for_id if is_first_chunk else None
@@ -4608,13 +4314,11 @@ class ServicesMixin:
 
             final_content_for_send = chunk
             if is_first_chunk and reply_to and not is_placeholder:
-                # Handle Response Mode for Webhooks
                 index = self._get_user_index(profile_owner_id_for_appearance)
                 is_borrowed = profile_name_for_appearance in index.get("borrowed", [])
                 target_profile_settings = self._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, is_borrowed) or {}
                 
                 rmode = target_profile_settings.get("response_mode", "regular")
-                # Webhooks fallback to text mention for 'mention' and 'mention_reply'
                 if rmode in ["mention", "mention_reply"]:
                     final_content_for_send = f"{reply_to.author.mention} {final_content_for_send}"
 
@@ -4633,10 +4337,8 @@ class ServicesMixin:
                         "embeds": current_embeds_for_api,
                         "wait": True
                     }
-                    if current_file_for_api:
-                        send_kwargs["file"] = current_file_for_api
-                    if isinstance(channel, discord.Thread):
-                        send_kwargs["thread"] = channel
+                    if current_file_for_api: send_kwargs["file"] = current_file_for_api
+                    if isinstance(channel, discord.Thread): send_kwargs["thread"] = channel
                     
                     sent_message_part = await webhook_to_use.send(**send_kwargs)
                 except Exception as e:
@@ -4658,8 +4360,7 @@ class ServicesMixin:
                     self.message_id_to_original_prompt[sent_message_part.id] = store_prompt_for_id
 
             is_first_chunk = False
-            if remaining_content:
-                await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5)
 
         return sent_messages_list
 
@@ -4743,10 +4444,24 @@ class ServicesMixin:
                 final_text = clean_text
                 block_found = False
 
-                # 1. New: Check for a large repeating block that constitutes the entire message.
-                # This is separator-agnostic and handles cases like A-A-A or A...A...A
+                # 1. New: Check for sequence repetition (Model Collapse / Spam Loop)
+                lines = [line.strip() for line in clean_text.split('\n') if line.strip()]
+                if len(lines) >= 6:
+                    for window_size in range(1, len(lines) // 3 + 1):
+                        window = lines[:window_size]
+                        repeats = 0
+                        idx = 0
+                        while idx + window_size <= len(lines):
+                            if lines[idx:idx+window_size] == window:
+                                repeats += 1
+                                idx += window_size
+                            else:
+                                break
+                        if repeats >= 3 and idx >= len(lines) - window_size:
+                            return "[REPETITIVE_CONTENT_ERROR]"
+
+                # 2. Check for a large repeating block that constitutes the entire message.
                 min_block_len = 30 # Avoid matching small phrases
-                # Iterate from largest possible block size down to smallest
                 for block_len in range(len(clean_text) // 2, min_block_len, -1):
                     block = clean_text[:block_len]
                     if not block.strip():
@@ -4862,20 +4577,31 @@ class ServicesMixin:
                 session['worker_task'] = task
                 self.background_tasks.add(task)
 
+    def _mark_session_accessed(self, key):
+        ts = time.time()
+        self.session_last_accessed[key] = ts
+        import heapq
+        heapq.heappush(self.eviction_heap, (ts, key))
+
     @tasks.loop(seconds=60.0)
     async def evict_inactive_sessions_task(self):
+        import heapq
         now = time.time()
         inactive_threshold = 600  # 10 minute strict dehydration policy
         
-        keys_to_evict = []
-        for key, last_time in self.session_last_accessed.items():
-            if now - last_time > inactive_threshold:
-                # Protect actively working multi-profile sessions
+        keys_to_evict = set()
+        
+        # O(1) Heap Peek: Only evaluate sessions that have officially expired
+        while self.eviction_heap and now - self.eviction_heap[0][0] > inactive_threshold:
+            ts, key = heapq.heappop(self.eviction_heap)
+            
+            # Lazy Deletion: Ensure this wasn't updated recently
+            if self.session_last_accessed.get(key) == ts:
                 if isinstance(key, int):
                     session = self.multi_profile_channels.get(key)
                     if session and (session.get('is_running') or session.get('is_regenerating') or session.get('is_purging')):
                         continue
-                keys_to_evict.append(key)
+                keys_to_evict.add(key)
         
         for key in keys_to_evict:
             # Handle multi-profile sessions (key is channel_id int)
@@ -4889,12 +4615,12 @@ class ServicesMixin:
                         dummy_session_key = (key, None, None)
                         await self._save_session_to_disk(dummy_session_key, session_type, unified_log)
 
-                    # [FIXED] Use safe cancel to prevent "Task destroyed but pending"
+                    # Use safe cancel to prevent "Task destroyed but pending"
                     if session_to_evict.get('worker_task'):
                         self._safe_cancel_task(session_to_evict['worker_task'])
                         session_to_evict['worker_task'] = None
                     
-                    # FIXED: Aggressively dehydrate the session to release memory.
+                    # Aggressively dehydrate the session to release memory.
                     session_to_evict['is_hydrated'] = False
                     
                     # Clear the large data structures from the in-memory dictionary.
@@ -4910,14 +4636,12 @@ class ServicesMixin:
                     # Give the garbage collector a hint to clean up now.
                     gc.collect()
 
-            # Handle single-profile and global chat sessions (key is a tuple)
-            else:
-                session_to_save = self.chat_sessions.get(key) or self.global_chat_sessions.get(key)
+            # Handle global chat sessions (key is a tuple)
+            elif isinstance(key, tuple):
+                session_to_save = self.global_chat_sessions.get(key)
                 if session_to_save:
-                    session_type = 'global_chat' if key in self.global_chat_sessions else 'single'
-                    await self._save_session_to_disk(key, session_type, session_to_save)
+                    await self._save_session_to_disk(key, 'global_chat', session_to_save)
                     
-                self.chat_sessions.pop(key, None)
                 self.global_chat_sessions.pop(key, None)
 
             # Remove from tracking dict after processing
@@ -5502,7 +5226,7 @@ class ServicesMixin:
             is_premium = self.is_user_premium(owner_id)
             priority = 10 if is_premium else 20
             
-            await self.image_request_queue.put((priority, request_data))
+            await self.image_request_queue.put((priority, time.time(), request_data))
         except Exception as e:
             print(f"Error dispatching child bot image request for bot {bot_id}: {e}"); traceback.print_exc()
 
@@ -5818,36 +5542,11 @@ class ServicesMixin:
                     critic_model_raw = p_config.get("critic_model", FALLBACK_MODEL_NAME)
                     break
         
-        is_or = False
-        is_ollama = False
-        actual_model_name = critic_model_raw
-        if critic_model_raw.upper().startswith("OPENROUTER/"):
-            actual_model_name = critic_model_raw[11:]
-            is_or = True
-        elif critic_model_raw.upper().startswith("OLLAMA/"):
-            actual_model_name = critic_model_raw[7:]
-            is_ollama = True
-        elif critic_model_raw.upper().startswith("GOOGLE/"):
-            actual_model_name = critic_model_raw[7:]
-            is_or = False
-        elif "/" in critic_model_raw:
-            is_or = True
-        
         try:
             t_params = {"thinking_budget": 512, "thinking_summary_visible": "off", "thinking_level": "low"}
             critic_cfg = {"temperature": 0.1, "top_p": 0.95}
             
-            if is_or:
-                api_key = self._get_api_key_for_guild(guild_id, "openrouter")
-                if not api_key: return None
-                model = OpenRouterModel(actual_model_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params)
-            elif is_ollama:
-                ollama_host = p_config.get("ollama_host_url", OLLAMA_LOCAL_URL) if 'p_config' in locals() else OLLAMA_LOCAL_URL
-                model = OllamaModel(actual_model_name, api_url=ollama_host, system_instruction=system_instruction, thinking_params=t_params)
-            else:
-                api_key = self._get_api_key_for_guild(guild_id)
-                if not api_key: return None
-                model = GoogleGenAIModel(api_key=api_key, model_name=actual_model_name, system_instruction=system_instruction, thinking_params=t_params)
+            model = self._instantiate_model(critic_model_raw, guild_id, None, system_instruction, None, t_params, None, p_config if 'p_config' in locals() else {})
             
             resp = await model.generate_content_async([f"Transcript:\n{transcript}"], generation_config=critic_cfg)
 
@@ -5880,37 +5579,13 @@ class ServicesMixin:
         prompt = self.global_prompts.get("TRAINING_ANALYST", DEFAULT_TRAINING_ANALYST_PROMPT).format(verbosity=verbosity, examples_block=examples_block)
 
         try:
-            # Route based on prefix
-            is_or = model_name.upper().startswith("OPENROUTER/")
-            is_ollama = model_name.upper().startswith("OLLAMA/")
+            index = self._get_user_index(user_id)
+            p_is_b = profile_name in index.get("borrowed", [])
+            p_cfg = self._get_profile_config(user_id, profile_name, p_is_b) or {}
             
-            actual_model = model_name
-            if is_or: actual_model = model_name[11:]
-            elif is_ollama: actual_model = model_name[7:]
-            elif model_name.upper().startswith("GOOGLE/"): actual_model = model_name[7:]
-            
-            response_text = ""
-            if is_or:
-                key = self._get_api_key_for_user(user_id, "openrouter") or self._get_api_key_for_guild(interaction.guild_id, "openrouter")
-                if not key: raise ValueError("No OpenRouter API key found.")
-                model = OpenRouterModel(actual_model, api_key=key)
-                resp = await model.generate_content_async([{"role": "user", "parts": [prompt]}])
-                response_text = resp.text
-            elif is_ollama:
-                index = self._get_user_index(user_id)
-                p_is_b = profile_name in index.get("borrowed", [])
-                p_cfg = self._get_profile_config(user_id, profile_name, p_is_b) or {}
-                ollama_host = p_cfg.get("ollama_host_url", OLLAMA_LOCAL_URL)
-                
-                model = OllamaModel(actual_model, api_url=ollama_host)
-                resp = await model.generate_content_async([{"role": "user", "parts": [prompt]}])
-                response_text = resp.text
-            else:
-                key = self._get_api_key_for_user(user_id, "gemini") or self._get_api_key_for_guild(interaction.guild_id, "gemini")
-                if not key: raise ValueError("No Google API key found.")
-                model = GoogleGenAIModel(api_key=key, model_name=actual_model)
-                resp = await model.generate_content_async([prompt])
-                response_text = resp.text
+            model = self._instantiate_model(model_name, interaction.guild_id, user_id, None, None, {}, None, p_cfg)
+            resp = await model.generate_content_async([prompt])
+            response_text = resp.text
 
             if not response_text: raise ValueError("Model returned an empty response.")
             
@@ -6029,27 +5704,24 @@ class ServicesMixin:
                         get_response.raise_for_status()
                         page_content = get_response.text
                         
-                        # [FIXED] Proper chaining of cleaning steps and added noise removal
-                        # Remove styles and scripts first
-                        clean_content = re.sub(r'<style.*?</style>', '', page_content, flags=re.DOTALL | re.IGNORECASE)
-                        clean_content = re.sub(r'<script.*?</script>', '', clean_content, flags=re.DOTALL | re.IGNORECASE)
-                        
-                        # Remove non-content structural noise (nav, header, footer, etc.)
-                        clean_content = re.sub(r'<(head|nav|header|footer|svg|form|noscript).*?</\1>', '', clean_content, flags=re.DOTALL | re.IGNORECASE)
-                        
-                        # Strip remaining HTML tags
-                        clean_content = re.sub(r'<.*?>', '', clean_content)
-                        
-                        # Decode HTML entities (e.g. &amp; to &) and clean up whitespace
-                        import html
-                        clean_content = html.unescape(clean_content)
-                        clean_content = "\n".join([line.strip() for line in clean_content.splitlines() if line.strip()])
-                        clean_content = re.sub(r'\n{3,}', '\n\n', clean_content) # Limit vertical space
-                        
-                        truncated_content = self._truncate_text_by_char(clean_content, MAX_URL_CONTEXT_CHARACTERS)
-                        
-                        url_context = f"Source URL: {url}\nExtracted Content:\n{truncated_content}"
-                        text_contexts.append(url_context)
+                        try:
+                            with Timeout(seconds=3, error_message="HTML parsing timed out"):
+                                clean_content = re.sub(r'<style.*?</style>', '', page_content, flags=re.DOTALL | re.IGNORECASE)
+                                clean_content = re.sub(r'<script.*?</script>', '', clean_content, flags=re.DOTALL | re.IGNORECASE)
+                                clean_content = re.sub(r'<(head|nav|header|footer|svg|form|noscript).*?</\1>', '', clean_content, flags=re.DOTALL | re.IGNORECASE)
+                                clean_content = re.sub(r'<.*?>', '', clean_content)
+                                
+                                import html
+                                clean_content = html.unescape(clean_content)
+                                clean_content = "\n".join([line.strip() for line in clean_content.splitlines() if line.strip()])
+                                clean_content = re.sub(r'\n{3,}', '\n\n', clean_content)
+                                
+                                truncated_content = self._truncate_text_by_char(clean_content, MAX_URL_CONTEXT_CHARACTERS)
+                                url_context = f"Source URL: {url}\nExtracted Content:\n{truncated_content}"
+                                text_contexts.append(url_context)
+                        except TimeoutError as te:
+                            warnings.append(WARN_URL_FETCHING_FAILED.format(reason=str(te)))
+                            continue
 
                 except Exception as e:
                     warnings.append(WARN_URL_FETCHING_FAILED.format(reason=self._format_api_error(e)))
@@ -6522,7 +6194,7 @@ class ServicesMixin:
             is_premium = self.is_user_premium(effective_profile_owner_id)
             priority = 10 if is_premium else 20
             
-            await self.image_request_queue.put((priority, request_data))
+            await self.image_request_queue.put((priority, time.time(), request_data))
 
         except Exception as e:
             await message.reply(f"An error occurred while queueing your request: {e}", delete_after=10)
@@ -6707,47 +6379,8 @@ class ServicesMixin:
                 
             combined_log = past_log + current_batch_log
             
-            participant_history = []
-            pending_whispers_for_regen = []
-            for turn in combined_log:
-                if turn.get("is_hidden", False):
-                    continue
-                
-                turn_type = turn.get("type")
-                if not turn_type:
-                    role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
-                    parts = [turn.get("content")]
-                    if role == 'user':
-                        if turn.get("url_context") and p_profile.get("url_fetching_enabled", False):
-                            parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
-                        if turn.get("grounding_context") and p_profile.get("grounding_mode", "off") != "off":
-                            parts.append(f"\n{turn.get('grounding_context')}")
-                            
-                    if participant_history and participant_history[-1]['role'] == role:
-                        participant_history[-1]['parts'].extend(parts)
-                    else:
-                        participant_history.append({'role': role, 'parts': parts})
-                    if role == 'model':
-                        pending_whispers_for_regen.clear()
-                elif turn_type == "whisper":
-                    if turn.get("target_pid") == bot_pid:
-                        clean_content = turn.get("content")
-                        header, body = clean_content.split('\n', 1)
-                        wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
-                        if participant_history and participant_history[-1]['role'] == 'user':
-                            participant_history[-1]['parts'].append(wrapped)
-                        else:
-                            participant_history.append({'role': 'user', 'parts': [wrapped]})
-                        pending_whispers_for_regen.append(clean_content)
-                elif turn_type == "private_response":
-                    if turn.get("speaker_pid") == bot_pid:
-                        clean_content = turn.get("content")
-                        header, body = clean_content.split('\n', 1)
-                        wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                        if participant_history and participant_history[-1]['role'] == 'model':
-                            participant_history[-1]['parts'].append(wrapped)
-                        else:
-                            participant_history.append({'role': 'model', 'parts': [wrapped]})
+            participant_history = self._build_history_for_participant(combined_log, bot_pid, p_profile)
+            pending_whispers_for_regen = self._get_pending_whispers_for_participant(combined_log, bot_pid)
 
             # Pseudo-turn injection to ensure history ends with a 'user' role
             if participant_history and participant_history[-1].get('role', 'user') == 'model':
@@ -6938,14 +6571,7 @@ class ServicesMixin:
                                 
                             model_tools = model_tools_list if model_tools_list else None
                             
-                            fallback_instance = GoogleGenAIModel(
-                                api_key=api_key, 
-                                model_name=fb_name, 
-                                system_instruction=full_system_instruction, 
-                                safety_settings=dynamic_safety_settings, 
-                                thinking_params=t_params_worker,
-                                tools=model_tools
-                            )
+                            fallback_instance = self._instantiate_model(fb_name, channel.guild.id, payload.user_id, full_system_instruction, dynamic_safety_settings, t_params_worker, model_tools, p_profile)
                         
                         response, state_container = await self._generate_with_heartbeat(
                             fallback_instance, participant_history, gen_config, channel, participant, payload.message_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
@@ -7226,63 +6852,30 @@ class ServicesMixin:
 
     def _format_api_error(self, error: Exception) -> str:
         """Analyses API exceptions to provide specific, user-friendly diagnostic strings."""
-        if isinstance(error, asyncio.TimeoutError) or isinstance(error, TimeoutError):
-            if "Generation stalled or timed out" in str(error):
-                return "Generation Stalled (No data received for 20s)"
-            return "Response Timed-out (Took longer than 2 minutes)"
+        if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+            return "Generation Stalled (No data received for 20s)" if "Generation stalled or timed out" in str(error) else "Response Timed-out (Took longer than 2 minutes)"
         
         error_str = str(error)
         
-        # 0. Custom Internal Triggers
-        if "empty response" in error_str.lower():
-            return "Empty Response (AI failed to output text content)"
-        
-        # 1. Modality/Capability Errors (Specific to OpenRouter & Google)
-        if "image input" in error_str.lower() or "support image" in error_str.lower():
-            return "Unsupported File Format (Model lacks Vision support)"
-        if "audio input" in error_str.lower() or "support audio" in error_str.lower():
-            return "Unsupported File Format (Model lacks Audio support)"
-        if "video input" in error_str.lower() or "support video" in error_str.lower():
-            return "Unsupported File Format (Model lacks Video support)"
-            
-        if "Ollama Network Error" in error_str:
-            return "Ollama Unreachable (Ensure Ollama is running."
         if "Ollama API Error" in error_str:
             return f"Ollama Error: {error_str.split(':', 1)[-1].strip()}"
             
-        # [NEW] Parse OpenRouter JSON errors gracefully
         if "OpenRouter API Error" in error_str:
             try:
                 import orjson as json
-                json_part = error_str[error_str.find("{"):]
-                err_data = json.loads(json_part)
-                if "error" in err_data and "message" in err_data["error"]:
-                    msg = err_data["error"]["message"]
-                    if msg == "Provider returned error":
-                        return "Provider Error"
-                    return f"OpenRouter: {msg}"
-            except Exception:
-                pass
+                err_data = json.loads(error_str[error_str.find("{"):])
+                msg = err_data.get("error", {}).get("message", "")
+                return "Provider Error" if msg == "Provider returned error" else f"OpenRouter: {msg}"
+            except Exception: pass
         
-        # Strip URLs to prevent Discord ID numbers (e.g. 429) from triggering false positives
-        error_str_clean = re.sub(r'https?://[^\s]+', '', error_str)
+        error_str_clean = re.sub(r'https?://[^\s]+', '', error_str).lower()
         
-        # 2. Standard HTTP Status Codes
-        if "429" in error_str_clean or "resource_exhausted" in error_str_clean.lower():
-            if "openrouter" in error_str.lower() or "sk-or" in error_str.lower():
-                return "**OpenRouter Rate Limit:** Add credits to your OpenRouter account for increased RPM & RPD."
-            else:
-                return "**Gemini Rate Limit:** Set up billing in Google AI Studio for increased RPM & RPD (Paid Tier 1+)."
+        if "429" in error_str_clean or "resource_exhausted" in error_str_clean:
+            return "**OpenRouter Rate Limit:** Add credits to your OpenRouter account for increased RPM & RPD." if "openrouter" in error_str.lower() or "sk-or" in error_str.lower() else "**Gemini Rate Limit:** Set up billing in Google AI Studio for increased RPM & RPD (Paid Tier 1+)."
 
-        if "402" in error_str_clean: return "Insufficient Credits"
-        if "401" in error_str_clean: return "Invalid API Key"
-        if "404" in error_str_clean: 
-            if "no endpoints found" in error_str_clean.lower():
-                return "Capability Mismatch"
-            return "Model Not Found"
-        if "403" in error_str_clean: return "Access Forbidden/Moderated"
-        if "413" in error_str_clean: return "File Too Large"
+        for keys, error_msg in API_ERROR_MAPPINGS.items():
+            if any(k in error_str_clean for k in keys):
+                return error_msg
         
-        # 3. Fallback to truncated raw error with brackets stripped for aesthetic safety
         clean_err = error_str.replace('"', "'").replace('{', '').replace('}', '').replace('\n', ' ')
         return clean_err[:80] + "..." if len(clean_err) > 80 else clean_err

@@ -1,10 +1,71 @@
 import os
 from typing import Literal
-import configs.DefaultConfig as defaultConfig
 from google.genai.types import HarmCategory, HarmBlockThreshold
+from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+import discord
+from discord import app_commands
 
-PRIMARY_MODEL_NAME = 'gemini-3.1-flash-lite'
-FALLBACK_MODEL_NAME = 'gemini-2.5-flash-lite'
+load_dotenv()
+
+# Global GCP Client caching
+_gcp_client = None
+_gcp_project_id = os.getenv('GCP_PROJECT_ID')
+if _gcp_project_id:
+    try:
+        from google.cloud import secretmanager
+        _gcp_client = secretmanager.SecretManagerServiceClient()
+    except ImportError:
+        pass
+
+def get_config_value(key_name: str, default: str = None) -> str | None:
+    val = os.getenv(key_name)
+    if val: return val
+    if _gcp_client and _gcp_project_id:
+        from google.api_core.exceptions import NotFound, GoogleAPICallError
+        for name in [key_name.lower(), key_name.upper()]:
+            resource_name = f"projects/{_gcp_project_id}/secrets/{name}/versions/latest"
+            try:
+                response = _gcp_client.access_secret_version(request={"name": resource_name}, timeout=3.0)
+                return response.payload.data.decode("UTF-8")
+            except (NotFound, GoogleAPICallError): continue
+    return default
+
+class DefaultConfigNamespace:
+    def __init__(self):
+        self.DISCORD_SDK = get_config_value("DISCORD_SDK")
+        self.DISCORD_OWNER_ID = get_config_value("DISCORD_OWNER_ID")
+        self.ALL_USERS_PREMIUM = True
+        self.PLACEHOLDER_EMOJI = get_config_value("PLACEHOLDER_EMOJI", "⏳")
+        
+        raw_key = get_config_value("ENCRYPTION_KEY")
+        if not raw_key:
+            print("WARNING: No ENCRYPTION_KEY found. Generating a temporary session key.")
+            self.ENCRYPTION_KEY = Fernet.generate_key()
+        else:
+            key_val = raw_key.strip()
+            self.ENCRYPTION_KEY = key_val.encode() if isinstance(key_val, str) else key_val
+
+        self.LIMIT_PROFILES_FREE = 5
+        self.LIMIT_PROFILES_PREMIUM = 100
+        self.LIMIT_BORROWED_FREE = 5
+        self.LIMIT_BORROWED_PREMIUM = 100
+        self.LIMIT_LTM_FREE = 50
+        self.LIMIT_LTM_PREMIUM = 5000
+        self.LIMIT_TRAINING_FREE = 10
+        self.LIMIT_TRAINING_PREMIUM = 100
+        self.CHATBOT_MEMORY_LENGTH = 20
+        self.GEMINI_TEMPERATURE = 1.0
+        self.GEMINI_TOP_P = 0.95
+        self.GEMINI_TOP_K = 0
+        self.TRAINING_CONTEXT_SIZE = 5
+        self.TRAINING_RELEVANCE_THRESHOLD = 0.1
+        self.MIMIC_NEWS = ""
+
+defaultConfig = DefaultConfigNamespace()
+
+PRIMARY_MODEL_NAME = 'GOOGLE/gemini-3.1-flash-lite'
+FALLBACK_MODEL_NAME = 'GOOGLE/gemini-2.5-flash-lite'
 DEFAULT_SYSTEM_INSTRUCTION = "."
 
 DEFAULT_SYSTEM_INSTRUCTION = "."
@@ -18,7 +79,7 @@ ALLOWED_MODELS = Literal[
 ]
 
 IMAGE_MODELS = Literal[
-    'gemini-3.1-flash-image-preview', 'gemini-3-pro-image-preview', 'gemini-2.5-flash-image'
+    'gemini-3.1-flash-image', 'gemini-3-pro-image', 'gemini-2.5-flash-image'
 ]
 
 AUDIO_MODELS = Literal[
@@ -51,7 +112,7 @@ MAX_LTM_COUNT_PER_PROFILE_CONTEXT = 1000
 STM_LIMIT_MAX = 50
 LTM_INJECTION_PROBABILITY = 1
 LTM_CREATION_INTERVAL = 10
-MIN_HISTORY_FOR_LTM_CREATION = 6
+MIN_HISTORY_FOR_LTM_CREATION = 2
 MAX_TRAINING_EXAMPLES_PER_PROFILE = 50
 PERSONA_TEXT_INPUT_MAX_LENGTH = 4000
 AI_INSTRUCTIONS_PART_MAX_LENGTH = 4000
@@ -248,3 +309,29 @@ ERR_REASON_PROVIDER_ERROR = "Provider Error"
 ERR_REASON_TIMEOUT_MAIN = "Timed-out"
 ERR_REASON_TIMEOUT_FALLBACK = "Fallback Timed-out"
 ERR_REASON_TIMEOUT_BOTH = "Timed-out"
+
+API_ERROR_MAPPINGS = {
+    ("empty response",): "Empty Response (AI failed to output text content)",
+    ("image input", "support image"): "Unsupported File Format (Model lacks Vision support)",
+    ("audio input", "support audio"): "Unsupported File Format (Model lacks Audio support)",
+    ("video input", "support video"): "Unsupported File Format (Model lacks Video support)",
+    ("ollama network error",): "Ollama Unreachable (Ensure Ollama is running)",
+    ("402",): "Insufficient Credits",
+    ("401",): "Invalid API Key",
+    ("no endpoints found",): "Capability Mismatch",
+    ("404",): "Model Not Found",
+    ("403",): "Access Forbidden/Moderated",
+    ("413",): "File Too Large",
+}
+
+def is_owner_in_dm_check(): 
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild is not None: return False
+        return interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)
+    return app_commands.check(predicate)
+
+def is_admin_or_owner_check(): 
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild: return interaction.user.guild_permissions.administrator
+        return interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)
+    return app_commands.check(predicate)

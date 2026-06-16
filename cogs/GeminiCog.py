@@ -5,7 +5,6 @@ from .mixins.constants import *
 from .mixins.core import *
 from .mixins.gui import *
 
-import configs.DefaultConfig as defaultConfig
 from discord.ext import commands
 import discord
 from discord import app_commands, ui
@@ -92,8 +91,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         self.profile_prompts: LRUCache = LRUCache(max_size=20)
         
         self.user_appearances: Dict[str, Dict[str, Dict[str, Optional[str]]]] = {}
-        self._load_user_appearances()
-        self.channel_webhooks: Dict[int, Dict[str, Any]] = {}
         self._load_channel_webhooks()
 
         self.share_codes: Dict[str, Dict[str, Any]] = {}
@@ -129,6 +126,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         self.global_blacklist: Set[int] = set()
         self._load_blacklist()
         self.session_last_accessed = {}
+        self.eviction_heap = []
         self.evict_inactive_sessions_task.start()
         self.message_cooldown = commands.CooldownMapping.from_cooldown(5, 60.0, commands.BucketType.user)
         self.processed_child_messages: LRUCache = LRUCache(max_size=25)
@@ -652,12 +650,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 return
 
             # Resolve Method (Child Bot vs Webhook)
-            effective_owner_id = interaction.user.id
-            effective_profile_name = profile_name
-            if is_borrowed:
-                borrowed_data = self._get_profile_config(interaction.user.id, profile_name, True) or {}
-                effective_owner_id = int(borrowed_data.get("original_owner_id", interaction.user.id))
-                effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
+            effective_owner_id, effective_profile_name = self._resolve_effective_profile(interaction.user.id, profile_name)
 
             linked_bot_id = next((bot_id for bot_id, data in self.child_bots.items() if data.get("owner_id") == effective_owner_id and data.get("profile_name") == effective_profile_name), None)
             is_bot_in_guild = linked_bot_id and interaction.guild.get_member(int(linked_bot_id))

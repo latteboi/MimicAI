@@ -9,7 +9,6 @@
 # This workflow guarantees stable iterations without breaking the complex asynchronous state management of the bot.
 # --------------------------------------------------
 
-import configs.DefaultConfig as defaultConfig
 import asyncio
 import discord
 from discord.ext import commands
@@ -26,15 +25,13 @@ from dotenv import load_dotenv
 # Load variables from .env file if it exists
 load_dotenv()
 
-# Pre-emptively suppress DefaultConfig warnings if Manual Auth is flagged
+# Pre-emptively suppress warnings if Manual Auth is flagged
 if os.getenv("MANUAL_AUTH_MODE", "False").lower() == "true":
     if not os.getenv("DISCORD_SDK"): os.environ["DISCORD_SDK"] = "MANUAL_MODE_PENDING"
     if not os.getenv("DISCORD_OWNER_ID"): os.environ["DISCORD_OWNER_ID"] = "MANUAL_MODE_PENDING"
     if not os.getenv("ENCRYPTION_KEY"): os.environ["ENCRYPTION_KEY"] = "MANUAL_MODE_PENDING"
 
-
-# --- Global State for Orchestration ---
-load_dotenv()
+from cogs.mixins.constants import defaultConfig
 
 # --- Global State for Orchestration ---
 active_child_processes = {}  # Maps bot_id_str -> subprocess.Popen object
@@ -175,14 +172,14 @@ async def on_ready():
 # --- Main asynchronous function to setup and run the bot ---
 async def main():
     import hashlib
-    from dotenv import load_dotenv
-    load_dotenv(override=True)
     
     manual_auth = os.getenv("MANUAL_AUTH_MODE", "False").lower() == "true"
     
     def _clean_key(val):
         if not val: return ""
         import re
+        if isinstance(val, bytes):
+            val = val.decode('utf-8')
         return re.sub(r'\s+', '', str(val).replace('"', '').replace("'", ""))
     
     if manual_auth:
@@ -192,56 +189,9 @@ async def main():
         defaultConfig.ENCRYPTION_KEY = _clean_key(input("Enter ENCRYPTION_KEY: "))
         print("----------------------------------\n")
     else:
-        gcp_project_id = os.getenv("GCP_PROJECT_ID")
-        if gcp_project_id:
-            gcp_project_id = gcp_project_id.strip()
-            print(f"GCP_PROJECT_ID detected ({gcp_project_id}). Fetching keys from Google Cloud Secret Manager...")
-            try:
-                from google.cloud import secretmanager
-                client = secretmanager.SecretManagerServiceClient()
-                
-                def fetch_secret(secret_name):
-                    # Try exact name first, then lowercase as fallback
-                    for name_variant in [secret_name, secret_name.lower()]:
-                        try:
-                            resource_name = f"projects/{gcp_project_id}/secrets/{name_variant}/versions/latest"
-                            response = client.access_secret_version(request={"name": resource_name})
-                            return response.payload.data.decode("UTF-8").strip()
-                        except Exception:
-                            continue
-                    return None
-
-                # Diagnostics: List available secrets if a primary fetch fails
-                def debug_secrets():
-                    try:
-                        parent = f"projects/{gcp_project_id}"
-                        print(f"DEBUG: Listing all secrets in project {gcp_project_id}...")
-                        for secret in client.list_secrets(request={"parent": parent}):
-                            print(f" - Found secret: {secret.name.split('/')[-1]}")
-                    except Exception as e:
-                        print(f"DEBUG: Could not list secrets: {e}")
-
-                s_val = fetch_secret("DISCORD_SDK")
-                o_val = fetch_secret("DISCORD_OWNER_ID")
-                k_val = fetch_secret("ENCRYPTION_KEY")
-
-                if not s_val or not o_val or not k_val:
-                    print("ERROR: One or more secrets could not be found.")
-                    debug_secrets()
-
-                if not os.getenv("DISCORD_SDK"): os.environ["DISCORD_SDK"] = s_val or ""
-                if not os.getenv("DISCORD_OWNER_ID"): os.environ["DISCORD_OWNER_ID"] = o_val or ""
-                if not os.getenv("ENCRYPTION_KEY"): os.environ["ENCRYPTION_KEY"] = k_val or ""
-                
-            except ImportError:
-                print("CRITICAL ERROR: 'google-cloud-secret-manager' library not found. Install via 'pip install google-cloud-secret-manager'.")
-            except Exception as e:
-                print(f"WARNING: GCP Secret Manager initialization failed: {e}")
-
-        # Force re-read from environment and clean
-        defaultConfig.DISCORD_SDK = _clean_key(os.getenv("DISCORD_SDK"))
-        defaultConfig.DISCORD_OWNER_ID = _clean_key(os.getenv("DISCORD_OWNER_ID"))
-        defaultConfig.ENCRYPTION_KEY = _clean_key(os.getenv("ENCRYPTION_KEY"))
+        defaultConfig.DISCORD_SDK = _clean_key(defaultConfig.DISCORD_SDK)
+        defaultConfig.DISCORD_OWNER_ID = _clean_key(defaultConfig.DISCORD_OWNER_ID)
+        defaultConfig.ENCRYPTION_KEY = _clean_key(defaultConfig.ENCRYPTION_KEY)
         
         if not defaultConfig.DISCORD_SDK or not defaultConfig.ENCRYPTION_KEY:
             print("CRITICAL ERROR: MANUAL_AUTH_MODE is False, but your keys are missing from the .env file and GCP Secret Manager.")

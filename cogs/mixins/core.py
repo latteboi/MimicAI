@@ -25,9 +25,6 @@ class CoreMixin:
 
     @commands.Cog.listener()
     async def on_ready(self):
-        # [FIXED] Reload appearances into memory
-        self._load_user_appearances()
-        
         if not self.sessions_loaded:
             await self._load_multi_profile_sessions()
             self.sessions_loaded = True
@@ -688,7 +685,7 @@ class CoreMixin:
                     return
 
         speaker_display_name = effective_profile_name
-        appearance_data = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
+        appearance_data = self._get_user_appearance(effective_owner_id, effective_profile_name)
         if appearance_data.get("custom_display_name"):
             speaker_display_name = appearance_data["custom_display_name"]
 
@@ -857,14 +854,7 @@ class CoreMixin:
             combined_prompt_text = "\n\n".join([f"{t['display_name']}: {t['content']}" for t in queued_turns])
             combined_footer_text = " ".join([f"{t['display_name']}: {t['content']}" for t in queued_turns])
 
-            user_index = self._get_user_index(host_user_id)
-            is_borrowed = profile_name in user_index.get("borrowed",[])
-            source_owner_id = host_user_id
-            source_profile_name = profile_name
-            if is_borrowed:
-                b_data = self._get_profile_config(host_user_id, profile_name, True) or {}
-                source_owner_id = int(b_data.get("original_owner_id", host_user_id))
-                source_profile_name = b_data.get("original_profile_name", profile_name)
+            source_owner_id, source_profile_name = self._resolve_effective_profile(host_user_id, profile_name)
             
             bot_display_name = source_profile_name
             appearance = self.user_appearances.get(str(source_owner_id), {}).get(source_profile_name)
@@ -1262,15 +1252,10 @@ class CoreMixin:
         response = None
 
         # Resolve appearance and identity for placeholder
+        effective_owner_id, effective_profile_name = self._resolve_effective_profile(owner_id, profile_name)
+        
         user_index = self._get_user_index(owner_id)
         is_borrowed = profile_name in user_index.get("borrowed", [])
-        effective_owner_id = owner_id
-        effective_profile_name = profile_name
-        if is_borrowed:
-            borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
-            effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
-            effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
-        
         p_settings = self._get_profile_config(owner_id, profile_name, is_borrowed) or {}
         custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
 
@@ -1454,15 +1439,10 @@ class CoreMixin:
         )
 
         # Resolve appearance
+        effective_owner_id, effective_profile_name = self._resolve_effective_profile(owner_id, profile_name)
+        
         user_index = self._get_user_index(owner_id)
         is_borrowed = profile_name in user_index.get("borrowed", [])
-        effective_owner_id = owner_id
-        effective_profile_name = profile_name
-        if is_borrowed:
-            borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
-            effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
-            effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
-        
         p_settings = self._get_profile_config(owner_id, profile_name, is_borrowed) or {}
         custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
 
@@ -1508,37 +1488,8 @@ class CoreMixin:
             
         combined_log = past_log + current_batch_log
 
-        participant_history = []
         bot_pid = self._get_pid_from_name_any(owner_id, profile_name)
-        for turn in combined_log:
-            if turn.get("is_hidden"): continue
-            turn_type = turn.get("type")
-            if not turn_type:
-                role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
-                parts = [turn.get("content")]
-                if role == 'user':
-                    if turn.get("url_context") and p_settings.get("url_fetching_enabled", False):
-                        parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
-                    if turn.get("grounding_context") and p_settings.get("grounding_mode", "off") != "off":
-                        parts.append(f"\n{turn.get('grounding_context')}")
-                if participant_history and participant_history[-1]['role'] == role:
-                    participant_history[-1]['parts'].extend(parts)
-                else:
-                    participant_history.append({'role': role, 'parts': parts})
-            elif turn_type == "whisper" and turn.get("target_pid") == bot_pid:
-                header, body = turn.get("content").split('\n', 1)
-                wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
-                if participant_history and participant_history[-1]['role'] == 'user':
-                    participant_history[-1]['parts'].append(wrapped)
-                else:
-                    participant_history.append({'role': 'user', 'parts': [wrapped]})
-            elif turn_type == "private_response" and turn.get("speaker_pid") == bot_pid:
-                header, body = turn.get("content").split('\n', 1)
-                wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                if participant_history and participant_history[-1]['role'] == 'model':
-                    participant_history[-1]['parts'].append(wrapped)
-                else:
-                    participant_history.append({'role': 'model', 'parts': [wrapped]})
+        participant_history = self._build_history_for_participant(combined_log, bot_pid, p_settings)
 
         gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "thinking_config": {"include_thoughts": True}}
         
@@ -1963,6 +1914,76 @@ class CoreMixin:
                 return new_name
             counter += 1
 
+    def _get_pending_whispers_for_participant(self, log_list: List[Dict], bot_pid: str) -> List[str]:
+        pending = []
+        for turn in log_list:
+            if turn.get("is_hidden", False): continue
+            turn_type = turn.get("type")
+            if not turn_type:
+                if turn.get("speaker_pid") == bot_pid:
+                    pending.clear()
+            elif turn_type == "whisper":
+                if turn.get("target_pid") == bot_pid:
+                    pending.append(turn.get("content"))
+        return pending
+
+    def _build_history_for_participant(self, full_log: List[Dict], bot_pid: str, p_settings: Dict[str, Any], num_participants: int = 1) -> List[Dict]:
+        stm_length = int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
+        effective_stm = max(stm_length, num_participants) if stm_length > 0 else 0
+        log_slice = full_log[-effective_stm:] if effective_stm > 0 else []
+        
+        participant_history = []
+        for turn in log_slice:
+            if turn.get("is_hidden"): continue
+            
+            turn_type = turn.get("type")
+            if not turn_type:
+                role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
+                parts = [turn.get("content")]
+                
+                if role == 'user':
+                    if turn.get("url_context") and p_settings.get("url_fetching_enabled", False):
+                        parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
+                    if turn.get("grounding_context") and p_settings.get("grounding_mode", "off") != "off":
+                        parts.append(f"\n{turn.get('grounding_context')}")
+                
+                if participant_history and participant_history[-1]['role'] == role:
+                    participant_history[-1]['parts'].extend(parts)
+                    if role == 'model' and turn.get('thought_signature'):
+                        participant_history[-1]['thought_signature'] = turn.get('thought_signature')
+                else:
+                    content_obj = {'role': role, 'parts': parts}
+                    if role == 'model' and turn.get('thought_signature'):
+                        content_obj['thought_signature'] = turn.get('thought_signature')
+                    participant_history.append(content_obj)
+                    
+            elif turn_type == "whisper":
+                if turn.get("target_pid") == bot_pid:
+                    clean_content = turn.get("content")
+                    header, body = clean_content.split('\n', 1) if '\n' in clean_content else ("", clean_content)
+                    wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
+                    if participant_history and participant_history[-1]['role'] == 'user':
+                        participant_history[-1]['parts'].append(wrapped)
+                    else:
+                        participant_history.append({'role': 'user', 'parts': [wrapped]})
+                        
+            elif turn_type == "private_response":
+                if turn.get("speaker_pid") == bot_pid:
+                    clean_content = turn.get("content")
+                    header, body = clean_content.split('\n', 1) if '\n' in clean_content else ("", clean_content)
+                    wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
+                    if participant_history and participant_history[-1]['role'] == 'model':
+                        participant_history[-1]['parts'].append(wrapped)
+                        if turn.get('thought_signature'):
+                            participant_history[-1]['thought_signature'] = turn.get('thought_signature')
+                    else:
+                        obj = {'role': 'model', 'parts': [wrapped]}
+                        if turn.get('thought_signature'):
+                            obj['thought_signature'] = turn.get('thought_signature')
+                        participant_history.append(obj)
+                        
+        return participant_history
+
     async def setup_multi_profile_session(self, interaction: discord.Interaction, participants: List[Dict], session_prompt: Optional[str], session_mode: str, as_admin_scope: bool = False, audio_mode: str = "off"):
         user_id = interaction.user.id
         is_update = interaction.channel_id in self.multi_profile_channels
@@ -1976,19 +1997,12 @@ class CoreMixin:
             new_keys = { (p['owner_id'], p['profile_name']) for p in participants }
             
             for key_to_add in new_keys - existing_keys:
-                participant_history = []
                 bot_pid = self._get_pid_from_name_any(key_to_add[0], key_to_add[1])
-                for turn in session.get("unified_log", []):
-                    speaker_key = tuple(turn.get("speaker_key", []))
-                    if turn.get("speaker_pid"):
-                        role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
-                    else:
-                        role = 'model' if speaker_key == key_to_add else 'user'
-                    
-                    if participant_history and participant_history[-1]['role'] == role:
-                        participant_history[-1]['parts'].append(turn.get("content"))
-                    else:
-                        participant_history.append({'role': role, 'parts': [turn.get("content")]})
+                p_index = self._get_user_index(key_to_add[0])
+                p_is_b = key_to_add[1] in p_index.get("borrowed", [])
+                p_settings = self._get_profile_config(key_to_add[0], key_to_add[1], p_is_b) or {}
+                
+                participant_history = self._build_history_for_participant(session.get("unified_log", []), bot_pid, p_settings)
                 session["chat_sessions"][key_to_add] = GoogleGenAIChatSession(history=participant_history)
 
             for key_to_remove in existing_keys - new_keys:
@@ -2151,7 +2165,6 @@ class CoreMixin:
             unified_log = disk_log
         
         session["unified_log"] = unified_log
-        session["chat_sessions"] = {}
 
         # 3. Synchronise Memory for all current participants
         num_participants = len(session.get("profiles", []))
@@ -2161,79 +2174,9 @@ class CoreMixin:
             p_key = (p_data['owner_id'], p_data['profile_name'])
             bot_pid = self._get_pid_from_name_any(p_data['owner_id'], p_data['profile_name'])
             
-            p_index = self._get_user_index(p_data['owner_id'])
-            p_is_borrowed = p_data['profile_name'] in p_index.get("borrowed", [])
-            p_profile_settings = self._get_profile_config(p_data['owner_id'], p_data['profile_name'], p_is_borrowed) or {}
-            stm_length = int(p_profile_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
-
-            # [NEW] Reconstruct pending whispers from the full log to prevent reboot amnesia
-            pending_for_this_profile = []
-            for turn in unified_log:
-                if turn.get("is_hidden", False): continue
-                turn_type = turn.get("type")
-                
-                if not turn_type:
-                    # A public turn from this profile clears its pending whispers
-                    if turn.get("speaker_pid") == bot_pid:
-                        pending_for_this_profile.clear()
-                elif turn_type == "whisper":
-                    # A whisper targeted at this profile is added to the pending queue
-                    if turn.get("target_pid") == bot_pid:
-                        pending_for_this_profile.append(turn.get("content"))
-            
-            if pending_for_this_profile:
-                session["pending_whispers"][p_key] = pending_for_this_profile
-
-            history_slice = []
-            if stm_length > 0:
-                # Ensure we have enough context relative to the cast size
-                effective_stm = max(stm_length, num_participants)
-                history_slice = unified_log[-effective_stm:]
-
-            participant_history = []
-            for turn in history_slice:
-                if turn.get("is_hidden"): continue
-                
-                turn_type = turn.get("type")
-                if not turn_type: 
-                    role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
-                    
-                    parts = [turn.get("content")]
-                    if role == 'user' and turn.get("url_context") and p_profile_settings.get("url_fetching_enabled", False):
-                        parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
-                    if role == 'user' and turn.get("grounding_context") and p_profile_settings.get("grounding_mode", "off") != "off":
-                        parts.append(f"\n{turn.get('grounding_context')}")
-
-                    if participant_history and participant_history[-1]['role'] == role:
-                        participant_history[-1]['parts'].extend(parts)
-                    else:
-                        participant_history.append({'role': role, 'parts': parts})
-                elif turn_type == "whisper":
-                    if turn.get("target_pid") == bot_pid:
-                        # [NEW] Apply standardised XML wrapping during re-hydration
-                        clean_content = turn.get("content")
-                        wrapped = f"<whisper_context>\n{clean_content.strip()}\n</whisper_context>\n"
-                        if participant_history and participant_history[-1]['role'] == 'user':
-                            participant_history[-1]['parts'].append(wrapped)
-                        else:
-                            participant_history.append({'role': 'user', 'parts': [wrapped]})
-                elif turn_type == "private_response":
-                    if turn.get("speaker_pid") == bot_pid:
-                        # [NEW] Apply dynamic XML wrapping during re-hydration
-                        clean_content = turn.get("content")
-                        header, body = clean_content.split('\n', 1)
-                        wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
-                        if participant_history and participant_history[-1]['role'] == 'model':
-                            participant_history[-1]['parts'].append(wrapped)
-                            if turn.get('thought_signature'):
-                                participant_history[-1]['thought_signature'] = turn.get('thought_signature')
-                        else:
-                            obj = {'role': 'model', 'parts': [wrapped]}
-                            if turn.get('thought_signature'):
-                                obj['thought_signature'] = turn.get('thought_signature')
-                            participant_history.append(obj)
-            
-            session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
+            pending = self._get_pending_whispers_for_participant(unified_log, bot_pid)
+            if pending:
+                session["pending_whispers"][p_key] = pending
 
         session["is_hydrated"] = True
         return session
@@ -2246,22 +2189,14 @@ class CoreMixin:
             owner_id, channel_id, profile_name_override=profile_name
         )
 
+        effective_owner_id, effective_profile_name = self._resolve_effective_profile(owner_id, profile_name)
+        
         index = self._get_user_index(owner_id)
         is_borrowed = profile_name in index.get("borrowed", [])
         
-        if is_borrowed:
-            borrowed_data = self._get_profile_config(owner_id, profile_name, True) or {}
-            effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
-            effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
-            profile_data = borrowed_data
-            source_profile_data = self._get_profile_config(effective_owner_id, effective_profile_name, False) or {}
-        else:
-            effective_owner_id = owner_id
-            effective_profile_name = profile_name
-            profile_data = self._get_profile_config(owner_id, profile_name, False) or {}
-            source_profile_data = profile_data
+        profile_data = self._get_profile_config(owner_id, profile_name, is_borrowed) or {}
 
-        appearance = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
+        appearance = self._get_user_appearance(effective_owner_id, effective_profile_name)
         display_name = appearance.get("custom_display_name") or effective_profile_name
         appearance_text = f"`{effective_profile_name}`" if appearance else "None"
         
@@ -2352,20 +2287,15 @@ class CoreMixin:
         
         embed = discord.Embed(title=f"Profile Dashboard: '{profile_name}'", color=discord.Color.blue())
         
-        effective_owner_id = user_id
-        effective_profile_name = profile_name
+        effective_owner_id, effective_profile_name = self._resolve_effective_profile(user_id, profile_name)
         profile_type = "Personal"
 
         if is_borrowed:
-            borrowed_data = self._get_profile_config(user_id, profile_name, True) or {}
-            effective_owner_id = int(borrowed_data.get("original_owner_id", user_id))
-            effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
             owner_user = self.bot.get_user(effective_owner_id)
             profile_type = f"Borrowed (from {owner_user.name if owner_user else 'Unknown User'})"
 
         _, _, _, temp, top_p, top_k, train_ctx, train_rel, prim_model, fall_model = self._get_user_profile_for_model(user_id, channel_id, profile_name)
 
-        source_profile_data = self._get_profile_config(effective_owner_id, effective_profile_name, False) or {}
         config = self._get_profile_config(user_id, profile_name, is_borrowed) or {}
         
         ltm_shard = self._load_ltm_shard(str(user_id), profile_name)
@@ -2382,7 +2312,7 @@ class CoreMixin:
                 created_display = f"<t:{ts}:D>"
             except: pass
         
-        appearance_data = self.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
+        appearance_data = self._get_user_appearance(effective_owner_id, effective_profile_name)
         display_name = appearance_data.get("custom_display_name") or effective_profile_name
         safety_level = config.get("safety_level", "low").title()
 
@@ -2682,13 +2612,7 @@ class CoreMixin:
             is_borrowed = profile_name in index.get("borrowed", [])
             is_personal = profile_name in index.get("personal", [])
 
-            effective_owner_id = interaction.user.id
-            effective_profile_name = profile_name
-
-            if is_borrowed:
-                borrowed_data = self._get_profile_config(interaction.user.id, profile_name, True) or {}
-                effective_owner_id = int(borrowed_data.get("original_owner_id", interaction.user.id))
-                effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
+            effective_owner_id, effective_profile_name = self._resolve_effective_profile(interaction.user.id, profile_name)
             
             if is_personal or is_borrowed:
                 linked_bot_id = next((bot_id for bot_id, data in self.child_bots.items() if data.get("owner_id") == effective_owner_id and data.get("profile_name") == effective_profile_name), None)
