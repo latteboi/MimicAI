@@ -1707,7 +1707,8 @@ class ServicesMixin:
                 responses_this_round = []
                 # [NEW] Track round-specific audio segments for stitching
                 round_audio_segments = []
-                initial_round_context = ""
+                # [FIXED] Populate initial context immediately from batched triggers
+                initial_round_context = "\n".join([t[0] for t in new_round_turn_data])
                 
                 # [NEW] Batch Intent Tracking
                 batched_url_research_content = []
@@ -5795,9 +5796,8 @@ class ServicesMixin:
                 f"<user_query>\n{user_query}\n</user_query>"
             )
 
-            grounding_tool = types.Tool(
-                google_search=types.GoogleSearch()
-            )
+            # [FIXED] Use universal dict configuration for Google GenAI v2 Tools
+            grounding_tool = {"google_search": {}}
             
             # [NEW] Utility Routing Logic for Grounding RAG
             rag_model_raw = FALLBACK_MODEL_NAME

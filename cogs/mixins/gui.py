@@ -4012,209 +4012,57 @@ class BaseBulkProfileView(ui.View):
     def _build_view(self):
         raise NotImplementedError
 
-class BulkActionView(BaseBulkProfileView):
-    def __init__(self, cog: 'GeminiAgent', user_id: int, action: str, placeholder: str, params: Optional[Dict] = None, include_borrowed: bool = False):
+class UnifiedBulkTargetView(BaseBulkProfileView):
+    def __init__(self, cog: 'GeminiAgent', user_id: int, action_key: str, payload: Any, include_borrowed: bool = True):
         super().__init__(cog, user_id, include_borrowed=include_borrowed)
-        self.action = action
-        self.params = params
-        self.placeholder_text = placeholder
+        self.action_key = action_key
+        self.payload = payload
         self._build_view()
 
     def _build_view(self):
         self.clear_items()
-        self._build_profile_select_ui(row=0)
-        apply_btn = ui.Button(label="Apply Action", style=discord.ButtonStyle.green, row=2)
+        self._build_profile_select_ui(row=1)
+        apply_btn = ui.Button(label="Apply Settings", style=discord.ButtonStyle.green, row=3)
         apply_btn.callback = self.apply_action_callback
         self.add_item(apply_btn)
 
     async def apply_action_callback(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        target_profiles_list = list(self.selected_profiles)
-        if not target_profiles_list:
-            await interaction.edit_original_response(content="You must select at least one profile.", view=None); return
+        targets = list(self.selected_profiles)
+        if not targets:
+            await interaction.edit_original_response(content="You must select at least one profile.", view=None)
+            return
 
-        final_message = "An unknown action was attempted."
-        if self.action == "apply_params":
-            final_message = await self.cog.bulk_apply_generation_params(self.user_id, target_profiles_list, self.params)
-        elif self.action == "apply_thinking_params":
-            final_message = await self.cog.bulk_apply_thinking_params(self.user_id, target_profiles_list, self.params)
-        elif self.action == "apply_training_params":
-            final_message = await self.cog.bulk_apply_training_params(self.user_id, target_profiles_list, self.params)
-        elif self.action == "apply_ltm_params":
-            final_message = await self.cog.bulk_apply_ltm_params(self.user_id, target_profiles_list, self.params)
-        elif self.action == "apply_ltm_summarization":
-            final_message = await self.cog.bulk_apply_ltm_summarization_instructions(self.user_id, target_profiles_list, self.params)
-        elif self.action == "apply_image_settings":
-            final_message = await self.cog.bulk_apply_image_settings(self.user_id, target_profiles_list, self.params)
-        elif self.action == "apply_generation_visual":
-            final_message = await self.cog.bulk_apply_generation_visual(self.user_id, target_profiles_list, self.params)
-        elif self.action == "apply_typing_settings":
-            final_message = await self.cog.bulk_apply_typing_settings(self.user_id, target_profiles_list, self.params)
-        elif self.action == "apply_neuro_settings":
-            # Direct logic for neuro settings to maintain atomic state updates
-            updated_count = 0
-            index = self.cog._get_user_index(self.user_id)
-            for profile_name in target_profiles_list:
-                is_borrowed = profile_name in index.get("borrowed", [])
-                profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
-                if profile:
-                    if "neuro_engine_enabled" in self.params:
-                        profile["neuro_engine_enabled"] = self.params["neuro_engine_enabled"]
-                    if "neuro_state" in self.params:
-                        curr = profile.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
-                        curr.update(self.params["neuro_state"])
-                        profile["neuro_state"] = curr
-                    self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
-                    updated_count += 1
-            final_message = f"Applied neuro-endocrine settings to {updated_count} profile(s)."
-        
-        await interaction.edit_original_response(content=final_message, view=None)
-
-class BulkGroundingView(BaseBulkProfileView):
-    def __init__(self, cog: 'GeminiAgent', user_id: int):
-        super().__init__(cog, user_id, include_borrowed=True)
-        self.grounding_mode = None
-        self._build_view()
-
-    def _build_view(self):
-        self.clear_items()
-        mode_options = [
-            discord.SelectOption(label="Off", value="off", description="Disable Grounding entirely.", default=(self.grounding_mode == "off")),
-            discord.SelectOption(label="Native", value="native", description="Uses Google's internal web search tool (Google Gemini Only).", default=(self.grounding_mode == "native")),
-            discord.SelectOption(label="RAG", value="rag", description="Model-agnostic. Works with all models.", default=(self.grounding_mode == "rag"))
-        ]
-        mode_select = ui.Select(placeholder="Choose a grounding mode...", options=mode_options, row=0)
-        mode_select.callback = self.mode_callback
-        self.add_item(mode_select)
-
-        self._build_profile_select_ui(row=1)
-        
-        apply_btn = ui.Button(label="Apply Action", style=discord.ButtonStyle.green, row=3)
-        apply_btn.callback = self.apply_action
-        self.add_item(apply_btn)
-
-    async def mode_callback(self, interaction: discord.Interaction):
-        self.grounding_mode = interaction.data['values'][0]
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def apply_action(self, interaction: discord.Interaction, button: ui.Button = None):
-        await interaction.response.defer()
-        target_profiles = list(self.selected_profiles)
-        if self.grounding_mode is None or not target_profiles:
-            await interaction.edit_original_response(content="Please select a grounding mode and at least one profile.", view=None); return
-
-        updated_count = 0
+        success_count = 0
         index = self.cog._get_user_index(self.user_id)
-        for profile_name in target_profiles:
-            is_borrowed = profile_name in index.get("borrowed", [])
-            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
+        
+        for name in targets:
+            is_borrowed = name in index.get("borrowed", [])
+            profile = self.cog._get_profile_config(self.user_id, name, is_borrowed)
+            
             if profile:
-                profile["grounding_mode"] = self.grounding_mode
-                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
-                updated_count += 1
-        
-        display_mode = {"off": "Off", "native": "Native", "rag": "RAG"}.get(self.grounding_mode)
-        await interaction.edit_original_response(content=f"Grounding has been set to **{display_mode}** for {updated_count} profile(s).", view=None)
+                if self.action_key == "update_config":
+                    profile.update(self.payload)
+                elif self.action_key == "set_key":
+                    k, v = self.payload
+                    if v is not None: profile[k] = v
+                elif self.action_key == "update_prompts" and not is_borrowed:
+                    prompts = self.cog._get_profile_prompts(self.user_id, name)
+                    if prompts:
+                        prompts.update(self.payload)
+                        self.cog._save_profile_prompts(self.user_id, name, prompts)
+                
+                self.cog._save_profile_config(self.user_id, name, profile, is_borrowed)
+                success_count += 1
+                
+        if success_count > 0:
+            keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and len(k) >= 2 and k[1] == self.user_id]
+            for k in keys:
+                self.cog.channel_models.pop(k, None)
+                self.cog.chat_sessions.pop(k, None)
+                self.cog.channel_model_last_profile_key.pop(k, None)
 
-class BulkResponseModeView(BaseBulkProfileView):
-    def __init__(self, cog: 'GeminiAgent', user_id: int):
-        super().__init__(cog, user_id, include_borrowed=True)
-        self.mode_choice = None
-        self._build_view()
-
-    def _build_view(self):
-        self.clear_items()
-        opts = [
-            discord.SelectOption(label="Regular", value="regular", default=(self.mode_choice == "regular")),
-            discord.SelectOption(label="Mention User", value="mention", default=(self.mode_choice == "mention")),
-            discord.SelectOption(label="Reply to Message", value="reply", default=(self.mode_choice == "reply")),
-            discord.SelectOption(label="Mention + Reply", value="mention_reply", default=(self.mode_choice == "mention_reply"))
-        ]
-        select = ui.Select(placeholder="Choose a response mode...", options=opts, row=0)
-        select.callback = self.choice_callback
-        self.add_item(select)
-        self._build_profile_select_ui(row=1)
-        apply_btn = ui.Button(label="Apply Action", style=discord.ButtonStyle.green, row=3)
-        apply_btn.callback = self.apply_action
-        self.add_item(apply_btn)
-
-    async def choice_callback(self, interaction: discord.Interaction):
-        self.mode_choice = interaction.data['values'][0]
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def apply_action(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        if not self.mode_choice or not self.selected_profiles:
-            await interaction.edit_original_response(content="Select a mode and at least one profile.", view=None); return
-
-        updated_count = 0
-        index = self.cog._get_user_index(self.user_id)
-        for name in self.selected_profiles:
-            is_borrowed = name in index.get("borrowed", [])
-            p = self.cog._get_profile_config(self.user_id, name, is_borrowed)
-            if p: 
-                p["response_mode"] = self.mode_choice
-                self.cog._save_profile_config(self.user_id, name, p, is_borrowed)
-                updated_count += 1
-        
-        if updated_count > 0:
-            # Hot-Swap Cache Invalidation
-            keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.user_id]
-            for k in keys: self.cog.channel_models.pop(k, None); self.cog.chat_sessions.pop(k, None)
-
-        await interaction.edit_original_response(content=f"Response mode set to **{self.mode_choice.replace('_', ' ').title()}** for {updated_count} profiles.", view=None)
-
-class BulkURLContextView(BaseBulkProfileView):
-    def __init__(self, cog: 'GeminiAgent', user_id: int):
-        super().__init__(cog, user_id, include_borrowed=True)
-        self.url_mode = None
-        self._build_view()
-
-    def _build_view(self):
-        self.clear_items()
-        opts = [
-            discord.SelectOption(label="Off", value="off", description="Disable link reading entirely.", default=(self.url_mode == "off")),
-            discord.SelectOption(label="Native", value="native", description="Uses Google's internal URL tool (Google Gemini Only).", default=(self.url_mode == "native")),
-            discord.SelectOption(label="RAG", value="rag", description="Model-agnostic scraper. Works with all models.", default=(self.url_mode == "rag"))
-        ]
-        select = ui.Select(placeholder="Choose a URL context mode...", options=opts, row=0)
-        select.callback = self.choice_callback
-        self.add_item(select)
-        self._build_profile_select_ui(row=1)
-        apply_btn = ui.Button(label="Apply Action", style=discord.ButtonStyle.green, row=3)
-        apply_btn.callback = self.apply_action
-        self.add_item(apply_btn)
-
-    async def choice_callback(self, interaction: discord.Interaction):
-        self.url_mode = interaction.data['values'][0]
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def apply_action(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        if not self.url_mode or not self.selected_profiles:
-            await interaction.edit_original_response(content="Select a mode and at least one profile.", view=None); return
-
-        updated_count = 0
-        index = self.cog._get_user_index(self.user_id)
-        for name in self.selected_profiles:
-            is_borrowed = name in index.get("borrowed", [])
-            p = self.cog._get_profile_config(self.user_id, name, is_borrowed)
-            if p: 
-                p["url_mode"] = self.url_mode
-                # Fallback for old toggle to prevent logic breaking
-                p["url_fetching_enabled"] = (self.url_mode == "rag")
-                self.cog._save_profile_config(self.user_id, name, p, is_borrowed)
-                updated_count += 1
-        
-        if updated_count > 0:
-            keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.user_id]
-            for k in keys: self.cog.channel_models.pop(k, None); self.cog.chat_sessions.pop(k, None)
-
-        display_mode = {"off": "Off", "native": "Native", "rag": "RAG"}.get(self.url_mode)
-        await interaction.edit_original_response(content=f"URL Context Fetching has been set to **{display_mode}** for {updated_count} profiles.", view=None)
+        await interaction.edit_original_response(content=f"Successfully applied settings to {success_count} profile(s).", view=None)
 
 class BulkTimezoneModal(ui.Modal, title="Enter Custom Timezone"):
     tz_input = ui.TextInput(label="IANA Timezone ID", placeholder="e.g. Asia/Tokyo or America/New_York", required=True)
@@ -4386,114 +4234,6 @@ class BulkResetView(BaseBulkProfileView):
             final_message = await self.cog.bulk_reset_ltm(self.user_id, target_profiles)
         
         await interaction.edit_original_response(content=final_message, view=None)
-
-class BulkSafetyLevelView(BaseBulkProfileView):
-    def __init__(self, cog: 'GeminiAgent', user_id: int):
-        super().__init__(cog, user_id, include_borrowed=True)
-        self.selected_level = None
-        self._build_view()
-
-    def _build_view(self):
-        self.clear_items()
-        level_options = [
-            discord.SelectOption(label="Unrestricted", value="unrestricted", description="No content filtering. Cannot be applied to public/borrowed profiles.", default=(self.selected_level == "unrestricted")),
-            discord.SelectOption(label="Low", value="low", description="Blocks only highly probable harmful content. (Default)", default=(self.selected_level == "low")),
-            discord.SelectOption(label="Medium", value="medium", description="Blocks medium and high probability harmful content.", default=(self.selected_level == "medium")),
-            discord.SelectOption(label="High", value="high", description="Blocks low, medium, and high probability content.", default=(self.selected_level == "high"))
-        ]
-        level_select = ui.Select(placeholder="Choose a safety level to apply...", options=level_options, row=0)
-        level_select.callback = self.level_select_callback
-        self.add_item(level_select)
-
-        self._build_profile_select_ui(row=1)
-        
-        apply_button = ui.Button(label="Apply Safety Level", style=discord.ButtonStyle.green, row=3)
-        apply_button.callback = self.apply_callback
-        self.add_item(apply_button)
-
-    async def level_select_callback(self, interaction: discord.Interaction):
-        self.selected_level = interaction.data['values'][0]
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def apply_callback(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        target_profiles = list(self.selected_profiles)
-        if not self.selected_level or not target_profiles:
-            await interaction.edit_original_response(content="You must select a safety level and at least one profile.", view=None); return
-
-        updated_count, adjusted_count = 0, 0
-        index = self.cog._get_user_index(self.user_id)
-        
-        safety_map = {"unrestricted": 0, "low": 1, "medium": 2, "high": 3}
-        reverse_safety_map = {v: k for k, v in safety_map.items()}
-        desired_level_num = safety_map[self.selected_level]
-
-        for profile_name in target_profiles:
-            is_borrowed = profile_name in self.borrowed_profiles
-            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
-            
-            if profile:
-                is_public = self.cog._is_profile_public(self.user_id, profile_name)
-                min_level_num = safety_map["low"] if is_public or is_borrowed else safety_map["unrestricted"]
-                
-                final_level_num = max(desired_level_num, min_level_num)
-                final_level_str = reverse_safety_map[final_level_num]
-                
-                if final_level_num > desired_level_num: adjusted_count += 1
-                profile['safety_level'] = final_level_str
-                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
-                updated_count += 1
-        
-        message = f"Successfully updated safety level for {updated_count} profile(s)."
-        if adjusted_count > 0: message += f"\nThe '{self.selected_level}' level was automatically adjusted to 'low' for {adjusted_count} public/borrowed profile(s)."
-        await interaction.edit_original_response(content=message, view=None)
-
-class BulkLtmScopeView(BaseBulkProfileView):
-    def __init__(self, cog: 'GeminiAgent', user_id: int):
-        super().__init__(cog, user_id, include_borrowed=True)
-        self.selected_scope = None
-        self._build_view()
-
-    def _build_view(self):
-        self.clear_items()
-        scope_options = [
-            discord.SelectOption(label="Global", value="global", description="Memories can be recalled in any server by anyone.", default=(self.selected_scope == "global")),
-            discord.SelectOption(label="Server-Exclusive", value="server", description="Memories only recalled in the server they were made in.", default=(self.selected_scope == "server")),
-            discord.SelectOption(label="User-Exclusive", value="user", description="Memories only recalled by the profile owner.", default=(self.selected_scope == "user"))
-        ]
-        scope_select = ui.Select(placeholder="Choose an LTM scope to apply...", options=scope_options, row=0)
-        scope_select.callback = self.scope_select_callback
-        self.add_item(scope_select)
-
-        self._build_profile_select_ui(row=1)
-        
-        apply_button = ui.Button(label="Apply Scope", style=discord.ButtonStyle.green, row=3)
-        apply_button.callback = self.apply_callback
-        self.add_item(apply_button)
-
-    async def scope_select_callback(self, interaction: discord.Interaction):
-        self.selected_scope = interaction.data['values'][0]
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def apply_callback(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        target_profiles = self.selected_profiles
-        if not self.selected_scope or not target_profiles:
-            await interaction.edit_original_response(content="You must select a scope and at least one profile.", view=None); return
-
-        updated_count = 0
-        index = self.cog._get_user_index(self.user_id)
-        for profile_name in target_profiles:
-            is_borrowed = profile_name in self.borrowed_profiles
-            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
-            if profile:
-                profile['ltm_scope'] = self.selected_scope
-                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
-                updated_count += 1
-        
-        await interaction.edit_original_response(content=f"Successfully set LTM scope to '{self.selected_scope}' for {updated_count} profile(s).", view=None)
 
 class BulkDeleteView(BaseBulkProfileView):
     def __init__(self, cog: 'GeminiAgent', user_id: int):
@@ -5508,99 +5248,6 @@ class WakewordsModal(ui.Modal, title="Manage Wakewords"):
         super().__init__()
         self.wakewords_input.default = ", ".join(current_wakewords)
 
-class TypingManageView(BaseBulkProfileView):
-    def __init__(self, cog: 'GeminiAgent', user_id: int):
-        super().__init__(cog, user_id, include_borrowed=True)
-        self.toggle_choice = None
-        self._build_view()
-
-    def _build_view(self):
-        self.clear_items()
-        toggle_options = [
-            discord.SelectOption(label="Enable Realistic Typing", value="enable", default=(self.toggle_choice is True)),
-            discord.SelectOption(label="Disable Realistic Typing", value="disable", default=(self.toggle_choice is False))
-        ]
-        toggle_select = ui.Select(placeholder="Choose an action...", options=toggle_options, row=0)
-        toggle_select.callback = self.toggle_callback
-        self.add_item(toggle_select)
-
-        self._build_profile_select_ui(row=1)
-        
-        apply_action = ui.Button(label="Apply Action", style=discord.ButtonStyle.green, row=3)
-        apply_action.callback = self.apply_action_callback
-        self.add_item(apply_action)
-
-    async def toggle_callback(self, interaction: discord.Interaction):
-        self.toggle_choice = interaction.data['values'][0] == "enable"
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def apply_action_callback(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        target_profiles = list(self.selected_profiles)
-        if self.toggle_choice is None or not target_profiles:
-            await interaction.edit_original_response(content="Please select an action and at least one profile.", view=None); return
-
-        updated_count = 0
-        index = self.cog._get_user_index(self.user_id)
-        for profile_name in target_profiles:
-            is_borrowed = profile_name in index.get("borrowed", [])
-            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
-            if profile:
-                profile["realistic_typing_enabled"] = self.toggle_choice
-                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
-                updated_count += 1
-        
-        status = "ENABLED" if self.toggle_choice else "DISABLED"
-        await interaction.edit_original_response(content=f"Realistic typing has been set to **{status}** for {updated_count} profile(s).", view=None)
-
-class BulkCriticView(BaseBulkProfileView):
-    def __init__(self, cog: 'GeminiAgent', user_id: int):
-        super().__init__(cog, user_id, include_borrowed=True)
-        self.toggle_choice = None
-        self._build_view()
-
-    def _build_view(self):
-        self.clear_items()
-        
-        toggle_options = [
-            discord.SelectOption(label="Enable Critic", value="enable", default=(self.toggle_choice is True)),
-            discord.SelectOption(label="Disable Critic", value="disable", default=(self.toggle_choice is False))
-        ]
-        toggle_select = ui.Select(placeholder="Choose an action...", options=toggle_options, row=0)
-        toggle_select.callback = self.toggle_callback
-        self.add_item(toggle_select)
-
-        self._build_profile_select_ui(row=1)
-        
-        apply_btn = ui.Button(label="Apply Action", style=discord.ButtonStyle.green, row=3)
-        apply_btn.callback = self.apply_action
-        self.add_item(apply_btn)
-
-    async def toggle_callback(self, interaction: discord.Interaction):
-        self.toggle_choice = interaction.data['values'][0] == "enable"
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def apply_action(self, interaction: discord.Interaction, button: ui.Button = None):
-        await interaction.response.defer()
-        target_profiles = list(self.selected_profiles)
-        if self.toggle_choice is None or not target_profiles:
-            await interaction.edit_original_response(content="Please select an action and at least one profile.", view=None); return
-
-        updated_count = 0
-        index = self.cog._get_user_index(self.user_id)
-        for profile_name in target_profiles:
-            is_borrowed = profile_name in index.get("borrowed", [])
-            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
-            if profile:
-                profile["critic_enabled"] = self.toggle_choice
-                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
-                updated_count += 1
-        
-        status = "ENABLED" if self.toggle_choice else "DISABLED"
-        await interaction.edit_original_response(content=f"Critic has been set to **{status}** for {updated_count} profile(s).", view=None)
-
 class AppearanceModal(ui.Modal):
     def __init__(self, cog: 'GeminiAgent', original_interaction: discord.Interaction, profile_name: str):
         super().__init__(title=f"Appearance: '{profile_name[:30]}'")
@@ -5741,7 +5388,7 @@ class BulkManageView(ui.View):
 
         if choice == "gen_params":
             async def modal_callback(i: discord.Interaction, params: Dict):
-                view = BulkActionView(self.cog, self.user_id, "apply_params", "Select profiles to apply parameters to...", params=params, include_borrowed=True)
+                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=True)
                 await i.followup.send(content="Parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal = ProfileParamsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
@@ -5749,35 +5396,35 @@ class BulkManageView(ui.View):
         elif choice == "adv_params":
             async def modal_callback(i: discord.Interaction, params: Dict):
                 if not params: await i.followup.send("No parameters set.", ephemeral=True); return
-                view = BulkActionView(self.cog, self.user_id, "apply_params", "Select profiles to apply parameters to...", params=params, include_borrowed=True)
+                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=True)
                 await i.followup.send(content="Advanced parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal = ProfileAdvancedParamsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
 
         elif choice == "thinking_params":
             async def modal_callback(i: discord.Interaction, params: Dict):
-                view = BulkActionView(self.cog, self.user_id, "apply_thinking_params", "Select profiles to apply thinking settings to...", params=params, include_borrowed=True)
+                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=True)
                 await i.followup.send(content="Thinking parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal = ProfileThinkingParamsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
 
         elif choice == "train_params":
             async def modal_callback(i: discord.Interaction, params: Dict):
-                view = BulkActionView(self.cog, self.user_id, "apply_training_params", "Select personal profiles to apply settings to...", params=params, include_borrowed=False)
+                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=False)
                 await i.followup.send(content="Parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal = ProfileTrainingParamsModal(self.cog, "BULK_APPLY", {}, callback=modal_callback)
             await interaction.response.send_modal(modal)
 
         elif choice == "ltm_params":
             async def modal_callback(i: discord.Interaction, params: Dict):
-                view = BulkActionView(self.cog, self.user_id, "apply_ltm_params", "Select profiles to apply LTM settings to...", params=params, include_borrowed=True)
+                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=True)
                 await i.followup.send(content="Parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal = ProfileLTMParamsModal(self.cog, "BULK_APPLY", {}, callback=modal_callback)
             await interaction.response.send_modal(modal)
 
         elif choice == "ltm_summarization":
             async def modal_callback(i: discord.Interaction, params: Dict):
-                view = BulkActionView(self.cog, self.user_id, "apply_ltm_summarization", "Select personal profiles to apply LTM prompt to...", params=params, include_borrowed=False)
+                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_prompts", params.get("prompts", {}), include_borrowed=False)
                 await i.followup.send(content="Prompt received. Now select the profiles to apply it to:", view=view, ephemeral=True)
             modal = ProfileLTMSummarizationModal(self.cog, "BULK_APPLY", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS, callback=modal_callback)
             await interaction.response.send_modal(modal)
@@ -5786,53 +5433,86 @@ class BulkManageView(ui.View):
             view = ModelApplyView(self.cog, self.user_id, self.original_interaction)
             await interaction.response.send_message(content="Select models and profiles:", view=view, ephemeral=True)
 
-        elif choice == "grounding":
-            view = BulkGroundingView(self.cog, self.user_id)
-            await interaction.response.send_message(content="Select grounding mode and profiles:", view=view, ephemeral=True)
-
-        elif choice == "response_mode":
-            view = BulkResponseModeView(self.cog, self.user_id)
-            await interaction.response.send_message(content="Select a response mode and profiles:", view=view, ephemeral=True)
-
-        elif choice == "url_context":
-            view = BulkURLContextView(self.cog, self.user_id)
-            await interaction.response.send_message(content="Select URL context action and profiles:", view=view, ephemeral=True)
-
         elif choice == "image_gen":
             async def modal_callback(i: discord.Interaction, params: Dict):
-                view = BulkActionView(self.cog, self.user_id, "apply_image_settings", "Select profiles to apply image settings to...", params=params, include_borrowed=True)
+                payload = {**params.get("config", {}), **params.get("prompts", {})}
+                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", payload, include_borrowed=True)
                 await i.followup.send(content="Image settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal = ProfileImageGenSettingsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
             
-        elif choice == "timezone":
-            view = BulkTimezoneView(self.cog, self.user_id)
-            await interaction.response.send_message(content="Select a timezone and the profiles to apply it to:", view=view, ephemeral=True)
-            
         elif choice == "generation_visual":
             async def modal_callback(i: discord.Interaction, params: Dict):
-                view = BulkActionView(self.cog, self.user_id, "apply_generation_visual", "Select profiles to apply visual settings to...", params=params, include_borrowed=True)
+                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=True)
                 await i.followup.send(content="Visual settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal = ProfileGenerationVisualModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
-        
-        elif choice == "critic":
-            view = BulkCriticView(self.cog, self.user_id)
-            await interaction.response.send_message(content="Select critic action and profiles:", view=view, ephemeral=True)
 
         elif choice == "neuro":
             async def modal_callback(i: discord.Interaction, params: Dict):
-                view = BulkActionView(self.cog, self.user_id, "apply_neuro_settings", "Select profiles to apply neuro settings to...", params=params, include_borrowed=True)
+                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=True)
                 await i.followup.send(content="Neuro settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal = ProfileNeuroModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
 
         elif choice == "typing":
             async def modal_callback(i: discord.Interaction, params: Dict):
-                view = BulkActionView(self.cog, self.user_id, "apply_typing_settings", "Select profiles to apply typing settings to...", params=params, include_borrowed=True)
+                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=True)
                 await i.followup.send(content="Typing settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal = ProfileTypingSettingsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
+
+        elif choice == "grounding":
+            opts = [discord.SelectOption(label=l, value=v) for l,v in [("Off", "off"), ("Native", "native"), ("RAG", "rag")]]
+            view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("grounding_mode", None), include_borrowed=True)
+            sel = ui.Select(placeholder="Select Grounding Mode...", options=opts, row=0)
+            async def sel_cb(inter): view.payload = ("grounding_mode", sel.values[0]); await inter.response.defer()
+            sel.callback = sel_cb
+            view.add_item(sel)
+            await interaction.response.send_message(content="Select mode and profiles:", view=view, ephemeral=True)
+
+        elif choice == "response_mode":
+            opts = [discord.SelectOption(label=l, value=v) for l,v in [("Regular", "regular"), ("Mention", "mention"), ("Reply", "reply"), ("Mention+Reply", "mention_reply")]]
+            view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("response_mode", None), include_borrowed=True)
+            sel = ui.Select(placeholder="Select Response Mode...", options=opts, row=0)
+            async def sel_cb(inter): view.payload = ("response_mode", sel.values[0]); await inter.response.defer()
+            sel.callback = sel_cb
+            view.add_item(sel)
+            await interaction.response.send_message(content="Select mode and profiles:", view=view, ephemeral=True)
+
+        elif choice == "url_context":
+            opts = [discord.SelectOption(label=l, value=v) for l,v in [("Off", "off"), ("Native", "native"), ("RAG", "rag")]]
+            view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("url_mode", None), include_borrowed=True)
+            sel = ui.Select(placeholder="Select URL Mode...", options=opts, row=0)
+            async def sel_cb(inter): 
+                view.action_key = "update_config"
+                view.payload = {"url_mode": sel.values[0], "url_fetching_enabled": sel.values[0] == "rag"}
+                await inter.response.defer()
+            sel.callback = sel_cb
+            view.add_item(sel)
+            await interaction.response.send_message(content="Select mode and profiles:", view=view, ephemeral=True)
+
+        elif choice == "critic":
+            opts = [discord.SelectOption(label="Enable Critic", value="true"), discord.SelectOption(label="Disable Critic", value="false")]
+            view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("critic_enabled", False), include_borrowed=True)
+            sel = ui.Select(placeholder="Select action...", options=opts, row=0)
+            async def sel_cb(inter): view.payload = ("critic_enabled", sel.values[0] == "true"); await inter.response.defer()
+            sel.callback = sel_cb
+            view.add_item(sel)
+            await interaction.response.send_message(content="Select action and profiles:", view=view, ephemeral=True)
+            
+        elif choice == "safety_level":
+            opts = [discord.SelectOption(label=l, value=v) for l,v in [("Unrestricted", "unrestricted"), ("Low", "low"), ("Medium", "medium"), ("High", "high")]]
+            view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("safety_level", None), include_borrowed=True)
+            sel = ui.Select(placeholder="Select safety level...", options=opts, row=0)
+            async def sel_cb(inter): view.payload = ("safety_level", sel.values[0]); await inter.response.defer()
+            sel.callback = sel_cb
+            view.add_item(sel)
+            await interaction.response.send_message(content="Select safety level and profiles:", view=view, ephemeral=True)
+
+        elif choice == "timezone":
+            view = BulkTimezoneView(self.cog, self.user_id)
+            await interaction.response.send_message(content="Select a timezone and the profiles to apply it to:", view=view, ephemeral=True)
 
         elif choice == "data_reset":
             view = BulkResetView(self.cog, self.user_id)
@@ -5841,10 +5521,6 @@ class BulkManageView(ui.View):
         elif choice == "delete_items":
             view = BulkDeleteView(self.cog, self.user_id)
             await interaction.response.send_message(content="Select profiles to delete:", view=view, ephemeral=True)
-
-        elif choice == "safety_level":
-            view = BulkSafetyLevelView(self.cog, self.user_id)
-            await interaction.response.send_message(content=view._get_selection_feedback_message(), view=view, ephemeral=True)
 
 class PrivacyDashboardView(ui.View):
     def __init__(self, cog: 'GeminiAgent', user_id: int):
@@ -6469,55 +6145,6 @@ class ModPromptsView(ModBaseView):
 
     async def update_display(self):
         await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
-
-class BulkNeuroView(BaseBulkProfileView):
-    def __init__(self, cog: 'GeminiAgent', user_id: int):
-        super().__init__(cog, user_id, include_borrowed=True)
-        self.toggle_choice = None
-        self._build_view()
-
-    def _build_view(self):
-        self.clear_items()
-        
-        toggle_options =[
-            discord.SelectOption(label="Enable Neuro Engine", value="enable", default=(self.toggle_choice is True)),
-            discord.SelectOption(label="Disable Neuro Engine", value="disable", default=(self.toggle_choice is False))
-        ]
-        toggle_select = ui.Select(placeholder="Choose an action...", options=toggle_options, row=0)
-        toggle_select.callback = self.toggle_callback
-        self.add_item(toggle_select)
-
-        self._build_profile_select_ui(row=1)
-        
-        apply_btn = ui.Button(label="Apply Action", style=discord.ButtonStyle.green, row=3)
-        apply_btn.callback = self.apply_action
-        self.add_item(apply_btn)
-
-    async def toggle_callback(self, interaction: discord.Interaction):
-        self.toggle_choice = interaction.data['values'][0] == "enable"
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def apply_action(self, interaction: discord.Interaction, button: ui.Button = None):
-        await interaction.response.defer()
-        target_profiles = list(self.selected_profiles)
-        if self.toggle_choice is None or not target_profiles:
-            await interaction.edit_original_response(content="Please select an action and at least one profile.", view=None); return
-
-        updated_count = 0
-        index = self.cog._get_user_index(self.user_id)
-        for profile_name in target_profiles:
-            is_borrowed = profile_name in index.get("borrowed",[])
-            profile = self.cog._get_profile_config(self.user_id, profile_name, is_borrowed)
-            if profile:
-                profile["neuro_engine_enabled"] = self.toggle_choice
-                if self.toggle_choice and "neuro_state" not in profile:
-                    profile["neuro_state"] = {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20}
-                self.cog._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
-                updated_count += 1
-        
-        status = "ENABLED" if self.toggle_choice else "DISABLED"
-        await interaction.edit_original_response(content=f"Neuro-Endocrine Engine has been set to **{status}** for {updated_count} profile(s).", view=None)
 
 class ParentActivityModal(ui.Modal):
     def __init__(self, cog, act_type):

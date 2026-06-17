@@ -877,6 +877,31 @@ class CoreMixin:
                 if u_text:
                     final_user_parts.append(f"<document_context>\n" + "\n".join(u_text) + "\n</document_context>")
 
+            # [NEW] RAG Grounding for Global Chat
+            grounding_mode = profile_data.get('grounding_mode', 'off')
+            if isinstance(grounding_mode, bool): grounding_mode = "rag" if grounding_mode else "off"
+            elif grounding_mode in ["on", "on+"]: grounding_mode = "rag"
+            
+            global_rag_sources = []
+            if grounding_mode == "rag":
+                g_hist = []
+                stm_length = int(profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
+                g_stm_capped = min(10, stm_length)
+                if g_stm_capped > 0:
+                    g_hist = chat.history[-(g_stm_capped * 2):]
+                
+                s_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
+                thresh = s_map.get(safety_level, HarmBlockThreshold.BLOCK_ONLY_HIGH)
+                d_safe = { cat: thresh for cat in get_args(HarmCategory) }
+                
+                g_res = await self._get_hybrid_grounding_context(combined_prompt_text, 0, g_hist, ('global_chat', host_user_id), safety_settings=d_safe)
+                if g_res:
+                    g_ctx, g_srcs, _, g_warn = g_res
+                    if g_warn: turn_warnings.append(g_warn)
+                    if g_ctx:
+                        final_user_parts.append(g_ctx)
+                        global_rag_sources.extend(g_srcs)
+
             for turn in queued_turns:
                 user_hash = self._get_user_hash(turn["user_id"])
                 user_line = self._format_history_entry(turn["display_name"], turn["timestamp"], turn["content"], user_tz, entity_id=user_hash)
@@ -1109,6 +1134,7 @@ class CoreMixin:
 
             if response_text and response_text != "[REPETITIVE_CONTENT_ERROR]":
                 grounding_sources = []
+                grounding_sources.extend(global_rag_sources)
                 if hasattr(response, 'raw') and response.raw.candidates:
                     if hasattr(response.raw.candidates[0], 'grounding_metadata'):
                         metadata = response.raw.candidates[0].grounding_metadata
@@ -2621,145 +2647,6 @@ class CoreMixin:
 
         return [choice for choice in choices if current.lower() in choice.name.lower()]
     
-    async def bulk_apply_generation_params(self, user_id: int, profile_names: List[str], params: Dict) -> str:
-        index = self._get_user_index(user_id)
-        updated_count = 0
-        for name in profile_names:
-            if name in index.get("personal", []):
-                profile = self._get_profile_config(user_id, name, False)
-                if profile:
-                    profile.update(params)
-                    self._save_profile_config(user_id, name, profile, False)
-                    updated_count += 1
-        
-        return f"Updated generation parameters for {updated_count} personal profile(s)."
-
-    async def bulk_apply_thinking_params(self, user_id: int, profile_names: List[str], params: Dict) -> str:
-        index = self._get_user_index(user_id)
-        updated_count = 0
-        for name in profile_names:
-            is_borrowed = name in index.get("borrowed", [])
-            profile = self._get_profile_config(user_id, name, is_borrowed)
-            if profile:
-                profile.update(params)
-                self._save_profile_config(user_id, name, profile, is_borrowed)
-                updated_count += 1
-        
-        if updated_count > 0:
-            keys_to_clear = [k for k in self.channel_models.keys() if isinstance(k, tuple) and len(k) == 3 and k[1] == user_id]
-            for k in keys_to_clear:
-                self.channel_models.pop(k, None)
-                self.chat_sessions.pop(k, None)
-                self.channel_model_last_profile_key.pop(k, None)
-        
-        return f"Updated thinking parameters for {updated_count} profile(s)."
-
-    async def bulk_apply_training_params(self, user_id: int, profile_names: List[str], params: Dict) -> str:
-        index = self._get_user_index(user_id)
-        updated_count = 0
-        for name in profile_names:
-            if name in index.get("personal", []):
-                profile = self._get_profile_config(user_id, name, False)
-                if profile:
-                    profile.update(params)
-                    self._save_profile_config(user_id, name, profile, False)
-                    updated_count += 1
-        
-        return f"Updated training parameters for {updated_count} personal profile(s)."
-
-    async def bulk_apply_ltm_params(self, user_id: int, profile_names: List[str], params: Dict) -> str:
-        index = self._get_user_index(user_id)
-        updated_count = 0
-        for name in profile_names:
-            is_borrowed = name in index.get("borrowed", [])
-            profile = self._get_profile_config(user_id, name, is_borrowed)
-            if profile:
-                profile.update(params)
-                self._save_profile_config(user_id, name, profile, is_borrowed)
-                updated_count += 1
-        
-        return f"Updated LTM parameters for {updated_count} profile(s)."
-
-    async def bulk_apply_ltm_summarization_instructions(self, user_id: int, profile_names: List[str], params: Dict) -> str:
-        index = self._get_user_index(user_id)
-        updated_count = 0
-        instructions = params.get("ltm_summarization_instructions")
-        if not instructions:
-            return "Error: No instructions provided."
-
-        encrypted_instructions = self._encrypt_data(instructions)
-        for name in profile_names:
-            if name in index.get("personal", []):
-                prompts = self._get_profile_prompts(user_id, name)
-                if prompts:
-                    prompts["ltm_summarization_instructions"] = encrypted_instructions
-                    self._save_profile_prompts(user_id, name, prompts)
-                    updated_count += 1
-        
-        return f"Updated LTM summarization instructions for {updated_count} personal profile(s)."
-
-    async def bulk_apply_image_settings(self, user_id: int, profile_names: List[str], params: Dict) -> str:
-        index = self._get_user_index(user_id)
-        updated_count = 0
-        for name in profile_names:
-            is_borrowed = name in index.get("borrowed", [])
-            profile = self._get_profile_config(user_id, name, is_borrowed)
-            if profile:
-                profile["image_generation_enabled"] = params.get("image_generation_enabled", False)
-                profile["image_generation_model"] = params.get("image_generation_model", "gemini-2.5-flash-image")
-                self._save_profile_config(user_id, name, profile, is_borrowed)
-                
-                if not is_borrowed and "image_generation_prompt" in params:
-                    prompts = self._get_profile_prompts(user_id, name)
-                    if prompts:
-                        prompts["image_generation_prompt"] = params["image_generation_prompt"]
-                        self._save_profile_prompts(user_id, name, prompts)
-                updated_count += 1
-        
-        return f"Updated image generation settings for {updated_count} profile(s)."
-    
-    async def bulk_apply_generation_visual(self, user_id: int, profile_names: List[str], params: Dict) -> str:
-        index = self._get_user_index(user_id)
-        updated_count = 0
-        for name in profile_names:
-            is_borrowed = name in index.get("borrowed", [])
-            profile = self._get_profile_config(user_id, name, is_borrowed)
-            if profile:
-                profile["placeholder_emoji"] = params.get("placeholder_emoji")
-                profile["child_bot_placeholder"] = params.get("child_bot_placeholder", False)
-                self._save_profile_config(user_id, name, profile, is_borrowed)
-                updated_count += 1
-        return f"Updated generation visual settings for {updated_count} profile(s)."
-
-    async def bulk_apply_typing_settings(self, user_id: int, profile_names: List[str], params: Dict) -> str:
-        index = self._get_user_index(user_id)
-        updated_count = 0
-        for name in profile_names:
-            is_borrowed = name in index.get("borrowed", [])
-            profile = self._get_profile_config(user_id, name, is_borrowed)
-            if profile:
-                if "realistic_typing_enabled" in params: profile["realistic_typing_enabled"] = params["realistic_typing_enabled"]
-                if "typing_cps" in params: profile["typing_cps"] = params["typing_cps"]
-                if "typing_max_delay" in params: profile["typing_max_delay"] = params["typing_max_delay"]
-                self._save_profile_config(user_id, name, profile, is_borrowed)
-                updated_count += 1
-        
-        return f"Updated realistic typing settings for {updated_count} profile(s)."
-
-    async def bulk_toggle_grounding(self, user_id: int, profile_names: List[str], enable: bool) -> str:
-        index = self._get_user_index(user_id)
-        updated_count = 0
-        for name in profile_names:
-            if name in index.get("personal", []):
-                profile = self._get_profile_config(user_id, name, False)
-                if profile:
-                    profile["grounding_enabled"] = enable
-                    self._save_profile_config(user_id, name, profile, False)
-                    updated_count += 1
-        
-        status = "ENABLED" if enable else "DISABLED"
-        return f"Grounding has been set to **{status}** for {updated_count} personal profile(s)."
-
     async def bulk_reset_examples(self, user_id: int, profile_names: List[str]) -> str:
         user_id_str = str(user_id)
         reset_count = 0
