@@ -656,8 +656,7 @@ class ConfigModal(ui.Modal):
         uid = self.target_user_id or interaction.user.id
 
         if self.profile_name == "BULK_APPLY":
-            combined = {**config_updates, **prompt_updates}
-            if self.callback: await self.callback(interaction, combined)
+            if self.callback: await self.callback(interaction, updates)
             return
 
         if config_updates:
@@ -4051,6 +4050,14 @@ class UnifiedBulkTargetView(BaseBulkProfileView):
                     if prompts:
                         prompts.update(self.payload)
                         self.cog._save_profile_prompts(self.user_id, name, prompts)
+                elif self.action_key == "update_both":
+                    if "config" in self.payload:
+                        profile.update(self.payload["config"])
+                    if "prompts" in self.payload and not is_borrowed:
+                        prompts = self.cog._get_profile_prompts(self.user_id, name)
+                        if prompts:
+                            prompts.update(self.payload["prompts"])
+                            self.cog._save_profile_prompts(self.user_id, name, prompts)
                 
                 self.cog._save_profile_config(self.user_id, name, profile, is_borrowed)
                 success_count += 1
@@ -5435,8 +5442,7 @@ class BulkManageView(ui.View):
 
         elif choice == "image_gen":
             async def modal_callback(i: discord.Interaction, params: Dict):
-                payload = {**params.get("config", {}), **params.get("prompts", {})}
-                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", payload, include_borrowed=True)
+                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_both", params, include_borrowed=True)
                 await i.followup.send(content="Image settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
             modal = ProfileImageGenSettingsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
             await interaction.response.send_modal(modal)
