@@ -784,8 +784,11 @@ class CoreMixin:
             await interaction.followup.send("For safety reasons, profiles with an 'Unrestricted 18+' safety level cannot be used with `/profile global_chat`. Please set the safety level to 'Low', 'Medium', or 'High'.", ephemeral=True)
             return
 
-        user_api_key = self._get_api_key_for_user(host_user_id)
-        if not user_api_key:
+        user_api_key = self._get_api_key_for_user(host_user_id, "gemini")
+        or_key = self._get_api_key_for_user(host_user_id, "openrouter")
+        has_ollama = profile_data.get("primary_model", "").upper().startswith("OLLAMA/")
+        
+        if not user_api_key and not or_key and not has_ollama:
             await interaction.followup.send("The host of this session needs to submit a personal API key using `/settings` to use this feature.", ephemeral=True)
             return
 

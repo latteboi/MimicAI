@@ -3042,6 +3042,30 @@ class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
         except ValueError:
             await interaction.response.send_message("Invalid chance or cooldown.", ephemeral=True)
 
+class ResponseLimitModal(ui.Modal, title="Set Response Limit"):
+    limit_input = ui.TextInput(label="Max Responses per Round (1-10)", placeholder="Enter a number between 1 and 10 (Default: 10)", required=False, max_length=2)
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+        if view.session.get("max_responses"):
+            self.limit_input.default = str(view.session.get("max_responses"))
+    async def on_submit(self, interaction: discord.Interaction):
+        val_str = self.limit_input.value.strip()
+        if not val_str:
+            self.view.session["max_responses"] = 10
+        else:
+            try:
+                val = int(val_str)
+                if not (1 <= val <= 10):
+                    raise ValueError()
+                self.view.session["max_responses"] = val
+            except ValueError:
+                await interaction.response.send_message("❌ Invalid input. Please enter a number between 1 and 10.", ephemeral=True)
+                return
+        self.view.cog._save_multi_profile_sessions()
+        await interaction.response.defer()
+        await self.view.update_display()
+
 class SessionConfigView(ui.View):
     def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, session: dict):
         super().__init__(timeout=600)
@@ -3083,9 +3107,36 @@ class SessionConfigView(ui.View):
             embed.description = "Add or remove participants (10 max). This controls who is actively in the channel."
             active_list = self.lists[self.view_source]
             
-            num_pages = max(1, (len(active_list) - 1) // DROPDOWN_MAX_OPTIONS + 1)
+            selected_items = []
+            
+            active_map = {}
+            if self.view_source == 'child_bot':
+                for item in active_list:
+                    bid = next((k for k, v in self.cog.child_bots.items() if v is item), None)
+                    if bid:
+                        active_map[str(bid)] = item
+            else:
+                for item in active_list:
+                    active_map[item] = item
+                    
+            for p in self.session.get('profiles', []):
+                p_method = p.get('method')
+                if self.view_source == 'child_bot' and p_method == 'child_bot':
+                    bid_str = str(p.get('bot_id'))
+                    if bid_str in active_map:
+                        selected_items.append(active_map.pop(bid_str))
+                elif self.view_source != 'child_bot' and p_method != 'child_bot':
+                    p_name = p.get('profile_name')
+                    if p_name in active_map:
+                        selected_items.append(active_map.pop(p_name))
+                        
+            unselected_items = [item for item in active_list if item in active_map.values()]
+            
+            ordered_list = selected_items + unselected_items
+            
+            num_pages = max(1, (len(ordered_list) - 1) // DROPDOWN_MAX_OPTIONS + 1)
             start = self.current_page * DROPDOWN_MAX_OPTIONS
-            page_items = active_list[start : start + DROPDOWN_MAX_OPTIONS]
+            page_items = ordered_list[start : start + DROPDOWN_MAX_OPTIONS]
 
             options = []
             if page_items:
@@ -3155,11 +3206,22 @@ class SessionConfigView(ui.View):
 
         elif self.current_tab == "config":
             embed.description = "Configure session-wide behavior."
-            embed.add_field(name="Execution Mode", value=f"`{self.session.get('session_mode', 'sequential').title()}`", inline=True)
             mp = self.session.get("session_prompt")
-            embed.add_field(name="Master Prompt", value=f"```{mp[:500]}```" if mp else "`None`", inline=False)
+            audio_val = self.session.get("audio_mode", "off")
+            tts_status = "**`ON`**" if audio_val == "on" else "`OFF`"
+            response_limit = self.session.get("max_responses", 10)
+            
+            embed.add_field(name="Execution Mode", value=f"`{self.session.get('session_mode', 'sequential').title()}`", inline=True)
+            embed.add_field(name="Master Prompt", value=f"`{'Set' if mp else 'Not Set'}`", inline=True)
+            embed.add_field(name="\u200b", value="\u200b", inline=True)
+            
+            embed.add_field(name="TTS Status", value=f"{tts_status}", inline=True)
+            embed.add_field(name="Response Limit", value=f"`{response_limit}`", inline=True)
+            embed.add_field(name="\u200b", value="\u200b", inline=True)
+            
+            embed.add_field(name="Master Prompt Content", value=f"```{mp[:500]}```" if mp else "`None`", inline=False)
 
-            mode_btn = ui.Button(label="Toggle Mode (Seq/Random)", style=discord.ButtonStyle.secondary, row=0)
+            mode_btn = ui.Button(label="Toggle Execution", style=discord.ButtonStyle.secondary, row=0)
             async def mode_cb(i):
                 self.session["session_mode"] = "random" if self.session.get("session_mode", "sequential") == "sequential" else "sequential"
                 self.cog._save_multi_profile_sessions()
@@ -3172,14 +3234,18 @@ class SessionConfigView(ui.View):
             prompt_btn.callback = pr_cb
             self.add_item(prompt_btn)
 
-            audio_val = self.session.get("audio_mode", "off")
-            audio_btn = ui.Button(label=f"Toggle Audio: {'ON' if audio_val == 'on' else 'OFF'}", style=discord.ButtonStyle.success if audio_val == 'on' else discord.ButtonStyle.secondary, row=0)
+            audio_btn = ui.Button(label="Toggle TTS", style=discord.ButtonStyle.secondary, row=1)
             async def audio_cb(i):
                 self.session["audio_mode"] = "off" if self.session.get("audio_mode", "off") == "on" else "on"
                 self.cog._save_multi_profile_sessions()
                 await i.response.defer(); await self.update_display()
             audio_btn.callback = audio_cb
             self.add_item(audio_btn)
+
+            limit_btn = ui.Button(label="Set Response Limit", style=discord.ButtonStyle.primary, row=1)
+            async def limit_cb(i): await i.response.send_modal(ResponseLimitModal(self))
+            limit_btn.callback = limit_cb
+            self.add_item(limit_btn)
 
         elif self.current_tab == "reactivity":
             embed.description = "Manage how likely participants are to respond to messages."

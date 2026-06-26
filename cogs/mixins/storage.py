@@ -982,12 +982,17 @@ class StorageMixin:
             field = 'openrouter_key' if provider == "openrouter" else 'key'
             encrypted_key = primary_key_data.get(field)
             if encrypted_key:
+                raw_key = encrypted_key
                 try:
-                    raw_key = self.fernet.decrypt(encrypted_key.encode()).decode()
-                    # Check if this specific key is currently on rate-limit cooldown
-                    if raw_key not in self.api_key_cooldowns or now > self.api_key_cooldowns[raw_key]:
-                        return raw_key
-                except Exception: pass 
+                    # Attempt decryption in case it is legacy encrypted
+                    decrypted = self.fernet.decrypt(encrypted_key.encode()).decode()
+                    raw_key = decrypted
+                except Exception:
+                    pass 
+                
+                # Check if this specific key is currently on rate-limit cooldown
+                if raw_key not in self.api_key_cooldowns or now > self.api_key_cooldowns[raw_key]:
+                    return raw_key
 
         # 2. Failover to PAID Tier Keys in Pool
         if guild_id_str in self.key_submissions:
@@ -996,12 +1001,16 @@ class StorageMixin:
                 if submission.get("status") == "active" and submission.get("tier") == "paid":
                     sub_provider = submission.get("provider", "gemini")
                     if sub_provider == provider:
+                        raw_pool_key = submission["encrypted_key"]
                         try:
-                            raw_pool_key = self.fernet.decrypt(submission["encrypted_key"].encode()).decode()
-                            # Only add if not on cooldown
-                            if raw_pool_key not in self.api_key_cooldowns or now > self.api_key_cooldowns[raw_pool_key]:
-                                pool_candidates.append(raw_pool_key)
-                        except Exception: pass
+                            decrypted = self.fernet.decrypt(raw_pool_key.encode()).decode()
+                            raw_pool_key = decrypted
+                        except Exception:
+                            pass
+                        
+                        # Only add if not on cooldown
+                        if raw_pool_key not in self.api_key_cooldowns or now > self.api_key_cooldowns[raw_pool_key]:
+                            pool_candidates.append(raw_pool_key)
             
             if pool_candidates:
                 return random.choice(pool_candidates)

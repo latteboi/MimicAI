@@ -994,8 +994,10 @@ class ServicesMixin:
         warning_message = None
         system_instructions, _, _, _, _, _, _, _ = self._construct_system_instructions(user_id, profile_name, 0)
         
-        user_api_key = self._get_api_key_for_user(user_id)
-        if not user_api_key and not primary_model.upper().startswith("OLLAMA/"):
+        user_api_key = self._get_api_key_for_user(user_id, "gemini")
+        or_key = self._get_api_key_for_user(user_id, "openrouter")
+        
+        if not user_api_key and not or_key and not primary_model.upper().startswith("OLLAMA/"):
             return None, 0.0, 0.0, 0, "This feature requires a personal API key. Use `/settings` to add one.", None
         
         safety_level_str = profile_data.get("safety_level", "low")
@@ -1281,6 +1283,29 @@ class ServicesMixin:
                 # We re-verify hydration here to catch sessions that were dehydrated during the await queue.get()
                 if not session.get("is_hydrated"):
                     session = await self._ensure_session_hydrated(channel_id, session_type)
+
+                channel = self.bot.get_channel(channel_id)
+                has_gemini = self._get_api_key_for_guild(channel.guild.id, "gemini")
+                has_openrouter = self._get_api_key_for_guild(channel.guild.id, "openrouter")
+                
+                has_ollama = False
+                for p in session['profiles']:
+                    p_index = self._get_user_index(p['owner_id'])
+                    p_is_b = p['profile_name'] in p_index.get("borrowed", [])
+                    p_cfg = self._get_profile_config(p['owner_id'], p['profile_name'], p_is_b) or {}
+                    if p_cfg.get("primary_model", "").upper().startswith("OLLAMA/"):
+                        has_ollama = True
+                        break
+                
+                if not has_gemini and not has_openrouter and not has_ollama:
+                    try:
+                        await channel.send("An API key has not been configured for this server. You can use the `/settings` command in my DM to set one.")
+                    except discord.Forbidden: pass
+                    
+                    # Mark triggers as done to prevent queue stalling
+                    for trigger in all_triggers_for_round:
+                        if trigger is not None: session['task_queue'].task_done()
+                    continue
 
                 # Now process triggers into new_round_turn_data and unified_log...
                 primary_eager_placeholder = None
@@ -1645,6 +1670,11 @@ class ServicesMixin:
                             profile_order = [p for p in rotated if p in active_participants]
                         except (ValueError, StopIteration): pass
 
+                # Apply response limit if set
+                max_responses = session.get("max_responses", 10)
+                if len(profile_order) > max_responses:
+                    profile_order = profile_order[:max_responses]
+
                 # --- Ephemeral Participant Injection ---
                 ephemeral_participant = None
                 if isinstance(initial_trigger, tuple):
@@ -1948,7 +1978,8 @@ class ServicesMixin:
                         turn_warnings.extend(pre_generation_warnings)
                     
                     channel = self.bot.get_channel(channel_id)
-                    api_key = self._get_api_key_for_guild(channel.guild.id)
+                    api_key = self._get_api_key_for_guild(channel.guild.id, "gemini")
+                    or_key = self._get_api_key_for_guild(channel.guild.id, "openrouter")
                     
                     # Initialize turn-specific variables at the very start of the loop
                     is_generator = False
@@ -1964,20 +1995,22 @@ class ServicesMixin:
                     was_blocked = False
                     placeholder_message = None
                     
-                    if not api_key:
-                        if i == 0:
-                            try:
-                                await channel.send("An API key must be configured on this server for sessions.")
-                            except discord.Forbidden:
-                                pass
-                        break
-
                     # Resolve Real-time settings
                     p_owner_id = participant['owner_id']
                     p_name = participant['profile_name']
                     p_index = self._get_user_index(p_owner_id)
                     p_is_b = p_name in p_index.get("borrowed", [])
                     p_settings = self._get_profile_config(p_owner_id, p_name, p_is_b) or {}
+
+                    is_ollama = p_settings.get("primary_model", "").upper().startswith("OLLAMA/")
+                    
+                    if not api_key and not or_key and not is_ollama:
+                        if i == 0:
+                            try:
+                                await channel.send("An API key must be configured on this server for sessions.")
+                            except discord.Forbidden:
+                                pass
+                        break
 
                     # Ensure custom_main is safely bound early for error fallback
                     custom_main = p_settings.get("error_response", "An error has occurred.")
