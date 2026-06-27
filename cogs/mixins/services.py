@@ -5313,11 +5313,11 @@ class ServicesMixin:
                 if not session['profiles']:
                     self.multi_profile_channels.pop(channel_id, None)
             else:
-                if len(session['profiles']) >= 10:
+                if len(session['profiles']) >= 200:
                     if correlation_id:
                         await self.manager_queue.put({
                             "action": "send_to_child", "bot_id": bot_id,
-                            "payload": {"action": "toggle_result", "correlation_id": correlation_id, "result": "The current Chat Session contains the maximum of 10 participating profiles. Please remove a profile and try again."}
+                            "payload": {"action": "toggle_result", "correlation_id": correlation_id, "result": "The current Chat Session contains the maximum of 200 participating profiles. Please remove a profile and try again."}
                         })
                     return
 

@@ -2981,25 +2981,51 @@ class SessionPromptModal(ui.Modal, title="Set Master Prompt"):
         await interaction.response.defer()
         await self.view.update_display()
 
-class ReactivitySettingsModal(ui.Modal, title="Set Reactivity"):
-    chance_input = ui.TextInput(label="Chance to Respond (0-100)", placeholder="Default: 100", required=True, max_length=3)
-    keywords_input = ui.TextInput(label="Wakewords (comma-separated)", style=discord.TextStyle.paragraph, placeholder="e.g. hey bot, look at this", required=False, max_length=500)
-    def __init__(self, view: 'SessionConfigView', participant: dict):
+class ReactivitySettingsModal(ui.Modal, title="Edit Reactivity"):
+    chance_input = ui.TextInput(label="Chance to Respond (0-100)", placeholder="Leave blank to make no change", required=False, max_length=3)
+    keywords_input = ui.TextInput(label="Wakewords (comma-separated)", style=discord.TextStyle.paragraph, placeholder="Leave blank to make no change", required=False, max_length=500)
+    
+    def __init__(self, view, participants: List[Dict]):
         super().__init__()
         self.view = view
-        self.participant = participant
-        self.chance_input.default = str(participant.get("chance", 100))
-        self.keywords_input.default = ", ".join(participant.get("wakewords", []))
+        self.participants = participants
+        
+        if len(participants) == 1:
+            p = participants[0]
+            self.chance_input.default = str(p.get("chance", 100))
+            self.keywords_input.default = ", ".join(p.get("wakewords", []))
+            self.chance_input.placeholder = "Default: 100"
+            self.keywords_input.placeholder = "e.g. hey bot, look at this"
+
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            val = int(self.chance_input.value)
-            self.participant["chance"] = max(0, min(100, val))
-            self.participant["wakewords"] = [w.strip().lower() for w in self.keywords_input.value.split(',') if w.strip()]
-            self.view.cog._save_multi_profile_sessions()
-            await interaction.response.defer()
-            await self.view.update_display()
-        except ValueError:
-            await interaction.response.send_message("Invalid chance percentage.", ephemeral=True)
+        chance_val_str = self.chance_input.value.strip()
+        keywords_val_str = self.keywords_input.value.strip()
+        
+        parsed_chance = None
+        if chance_val_str:
+            try:
+                val = int(chance_val_str)
+                if not (0 <= val <= 100):
+                    raise ValueError()
+                parsed_chance = val
+            except ValueError:
+                await interaction.response.send_message("❌ Invalid chance percentage. Must be a number between 0 and 100.", ephemeral=True)
+                return
+        
+        parsed_keywords = None
+        if keywords_val_str:
+            parsed_keywords = [w.strip().lower() for w in keywords_val_str.split(',') if w.strip()]
+
+        for p in self.participants:
+            if parsed_chance is not None:
+                p["chance"] = parsed_chance
+            if parsed_keywords is not None:
+                p["wakewords"] = parsed_keywords
+        
+        self.view.selected_reactivity_profiles.clear()
+        self.view.cog._save_multi_profile_sessions()
+        await interaction.response.defer()
+        await self.view.update_display()
 
 DEFAULT_DIRECTOR_PROMPT = "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."
 
@@ -3066,6 +3092,158 @@ class ResponseLimitModal(ui.Modal, title="Set Response Limit"):
         await interaction.response.defer()
         await self.view.update_display()
 
+class SessionSwapListView(ui.View):
+    def __init__(self, cog, interaction, session_data_idx):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.interaction = interaction
+        self.session_data_idx = session_data_idx
+        self.current_page = 0
+        self.items_per_page = 20
+        self.update_view()
+
+    def update_view(self):
+        self.clear_items()
+        profiles = self.session_data_idx.get("profiles", [])
+        total_items = len(profiles)
+        num_pages = max(1, (total_items - 1) // self.items_per_page + 1)
+        
+        if self.current_page >= num_pages:
+            self.current_page = num_pages - 1
+            
+        start = self.current_page * self.items_per_page
+        end = start + self.items_per_page
+        page_profiles = profiles[start:end]
+        
+        profile_list = []
+        for i, p_data in enumerate(page_profiles, start=start + 1):
+            p_name = p_data.get('profile_name')
+            pid = p_data.get('pid', 'Unknown PID')
+            method_str = "Child Bot" if p_data.get('method') == 'child_bot' else "Webhook"
+            profile_list.append(f"**{i}.** `{p_name}` ({method_str}) [PID: {pid}]")
+            
+        owner_user = self.cog.bot.get_user(self.session_data_idx.get('owner_id'))
+        admin_name = owner_user.name if owner_user else "Unknown Admin"
+        
+        self.embed = discord.Embed(
+            title=f"Current Participants ({total_items})",
+            description=f"**Session Admin:** {admin_name}\n\n" + ("\n".join(profile_list) if profile_list else "*No participants*"),
+            color=discord.Color.purple()
+        )
+        self.embed.set_footer(text=f"Page {self.current_page + 1} of {num_pages}")
+        
+        if num_pages > 1:
+            async def prev_cb(i):
+                self.current_page -= 1
+                self.update_view()
+                await i.response.edit_message(embed=self.embed, view=self)
+            async def next_cb(i):
+                self.current_page += 1
+                self.update_view()
+                await i.response.edit_message(embed=self.embed, view=self)
+            
+            build_pagination_controls(self, self.current_page, num_pages, 0, prev_cb, next_cb)
+
+class SessionView(ui.View):
+    def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, session: Dict):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.original_interaction = interaction
+        self.session = session
+        self.channel_id = interaction.channel_id
+        self.current_page = 0
+        self.items_per_page = 20
+        self.update_view()
+
+    def update_view(self):
+        self.clear_items()
+        profiles = self.session.get("profiles", [])
+        total_items = len(profiles)
+        num_pages = max(1, (total_items - 1) // self.items_per_page + 1)
+        
+        if self.current_page >= num_pages:
+            self.current_page = num_pages - 1
+            
+        start = self.current_page * self.items_per_page
+        end = start + self.items_per_page
+        page_profiles = profiles[start:end]
+
+        options = []
+        for i, p in enumerate(page_profiles, start=start):
+            p_name = p.get("profile_name")
+            method = p.get("method", "webhook")
+            label = p_name
+            description = f"Owner ID: {p.get('owner_id')}"
+            
+            if method == 'child_bot':
+                bot_id = p.get("bot_id")
+                bot_user = self.cog.bot.get_user(int(bot_id)) if bot_id else None
+                if bot_user: 
+                    label = f"{bot_user.name} ({p_name})"
+                    description = "Child Bot"
+                else:
+                    label = f"Bot {bot_id} ({p_name})"
+            
+            options.append(discord.SelectOption(label=label[:100], value=str(i), description=description))
+
+        if options:
+            self.select = ui.Select(placeholder="Select a participant to view details...", options=options, row=0)
+            self.select.callback = self.callback
+            self.add_item(self.select)
+
+        if num_pages > 1:
+            async def prev_cb(i):
+                self.current_page -= 1
+                self.update_view()
+                await i.response.edit_message(embed=self.get_embed(), view=self)
+            async def next_cb(i):
+                self.current_page += 1
+                self.update_view()
+                await i.response.edit_message(embed=self.get_embed(), view=self)
+            
+            build_pagination_controls(self, self.current_page, num_pages, 1, prev_cb, next_cb)
+
+    def get_embed(self) -> discord.Embed:
+        profiles = self.session.get("profiles", [])
+        participant_count = len(profiles)
+        owner_id = self.session.get("owner_id")
+        owner = self.cog.bot.get_user(owner_id)
+        owner_name = owner.name if owner else f"ID: {owner_id}"
+        
+        embed = discord.Embed(title=f"Session Info: #{self.original_interaction.channel.name}", color=discord.Color.gold())
+        embed.add_field(name="Session Type", value="Chat Session", inline=True)
+        embed.add_field(name="Session Admin", value=owner_name, inline=True)
+        embed.add_field(name="Participants", value=str(participant_count), inline=True)
+        
+        if self.session.get("session_prompt"):
+            prompt_val = self.session["session_prompt"]
+            embed.add_field(name="Master Prompt", value=prompt_val[:200] + "..." if len(prompt_val) > 200 else prompt_val, inline=False)
+        
+        pro = self.session.get("proactivity", {})
+        if pro.get("enabled"):
+            embed.add_field(name="Proactivity", value=f"**ON** | Chance: {pro.get('chance')}% | Cooldown: {pro.get('cooldown')}s", inline=False)
+            
+        start = self.current_page * self.items_per_page
+        end = start + self.items_per_page
+        page_profiles = profiles[start:end]
+        
+        profile_list = []
+        for idx, p in enumerate(page_profiles, start=start + 1):
+            p_name = p.get('profile_name')
+            method_str = "Child Bot" if p.get('method') == 'child_bot' else "Webhook"
+            profile_list.append(f"**{idx}.** `{p_name}` ({method_str})")
+            
+        embed.add_field(name="Cast List", value="\n".join(profile_list) if profile_list else "*No participants*", inline=False)
+        return embed
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        idx = int(self.select.values[0])
+        participant = self.session["profiles"][idx]
+        
+        embed = await self.cog._build_profile_embed(participant['owner_id'], participant['profile_name'], self.channel_id)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
 class SessionConfigView(ui.View):
     def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, session: dict):
         super().__init__(timeout=600)
@@ -3075,6 +3253,7 @@ class SessionConfigView(ui.View):
         self.current_tab = "cast"
         self.view_source = 'personal'
         self.current_page = 0
+        self.selected_reactivity_profiles = set()
         self._load_lists()
 
     def _load_lists(self):
@@ -3093,6 +3272,7 @@ class SessionConfigView(ui.View):
             def make_cb(t):
                 async def cb(i: discord.Interaction):
                     self.current_tab = t; self.current_page = 0
+                    self.selected_reactivity_profiles.clear()
                     await i.response.defer(); await self.update_display()
                 return cb
             btn.callback = make_cb(tab)
@@ -3104,7 +3284,7 @@ class SessionConfigView(ui.View):
         embed = discord.Embed(title=f"Chat Session: #{self.original_interaction.channel.name}", color=discord.Color.gold())
 
         if self.current_tab == "cast":
-            embed.description = "Add or remove participants (10 max). This controls who is actively in the channel."
+            embed.description = "Add or remove participants (200 max). This controls who is actively in the channel."
             active_list = self.lists[self.view_source]
             
             selected_items = []
@@ -3134,12 +3314,35 @@ class SessionConfigView(ui.View):
             
             ordered_list = selected_items + unselected_items
             
-            num_pages = max(1, (len(ordered_list) - 1) // DROPDOWN_MAX_OPTIONS + 1)
-            start = self.current_page * DROPDOWN_MAX_OPTIONS
-            page_items = ordered_list[start : start + DROPDOWN_MAX_OPTIONS]
+            num_pages = max(1, (len(ordered_list) - 1) // 20 + 1)
+            if self.current_page >= num_pages:
+                self.current_page = num_pages - 1
+                
+            start = self.current_page * 20
+            page_items = ordered_list[start : start + 20]
 
             options = []
             if page_items:
+                page_selected_count = 0
+                for item in page_items:
+                    is_sel = False
+                    if self.view_source == 'child_bot':
+                        bid = next((k for k, v in self.cog.child_bots.items() if v is item), None)
+                        if bid:
+                            is_sel = any(p.get('method') == 'child_bot' and str(p.get('bot_id')) == str(bid) for p in self.session.get('profiles', []))
+                    else:
+                        is_sel = any(p.get('method') != 'child_bot' and p.get('profile_name') == item for p in self.session.get('profiles', []))
+                    
+                    if is_sel:
+                        page_selected_count += 1
+
+                page_toggle_label = "Unselect Page" if (page_selected_count == len(page_items)) else "Select Page"
+                options.append(discord.SelectOption(label=page_toggle_label, value="toggle_page", description="Toggle selection for all profiles on this page.", emoji="📄"))
+                
+                total_selected_count = len(selected_items)
+                all_toggle_label = "Unselect All" if (total_selected_count == len(ordered_list)) else "Select All"
+                options.append(discord.SelectOption(label=all_toggle_label, value="toggle_all", description="Toggle selection for all profiles in this source.", emoji="📚"))
+
                 for item in page_items:
                     if self.view_source == 'child_bot':
                         p_name = item.get('profile_name')
@@ -3163,24 +3366,75 @@ class SessionConfigView(ui.View):
                 if "none" in i.data['values']: await i.response.defer(); return
                 raw_vals = i.data['values']
                 curr_vals = set(raw_vals)
-                page_vals = set([o.value for o in options])
+                page_vals = set([o.value for o in options if o.value not in ["toggle_page", "toggle_all"]])
                 
-                self.session['profiles'] = [p for p in self.session['profiles'] if not (
-                    (f"child_{p.get('bot_id')}" in page_vals and f"child_{p.get('bot_id')}" not in curr_vals) or
-                    (p.get('method') != 'child_bot' and p['profile_name'] in page_vals and p['profile_name'] not in curr_vals)
-                )]
-                
-                for val in raw_vals:
-                    if val.startswith("child_"):
-                        bid = val.split("_")[1]
-                        if not any(p.get('bot_id') == bid for p in self.session['profiles']):
-                            if len(self.session['profiles']) >= 10: break
-                            bc = self.cog.child_bots.get(bid)
-                            if bc: self.session['profiles'].append({"owner_id": bc['owner_id'], "profile_name": bc['profile_name'], "method": "child_bot", "bot_id": bid, "chance": 100, "wakewords": []})
+                if "toggle_page" in curr_vals:
+                    page_val_list = [f"child_{next((k for k, v in self.cog.child_bots.items() if v is item), None)}" if self.view_source == 'child_bot' else item for item in page_items]
+                    page_set_vals = set(page_val_list)
+                    
+                    already_selected = set()
+                    for p in self.session.get('profiles', []):
+                        val_p = f"child_{p.get('bot_id')}" if p.get('method') == 'child_bot' else p.get('profile_name')
+                        if val_p in page_set_vals:
+                            already_selected.add(val_p)
+                            
+                    if len(already_selected) == len(page_items):
+                        self.session['profiles'] = [p for p in self.session['profiles'] if (f"child_{p.get('bot_id')}" if p.get('method') == 'child_bot' else p.get('profile_name')) not in page_set_vals]
                     else:
-                        if not any(p.get('profile_name') == val and p.get('method') != 'child_bot' for p in self.session['profiles']):
-                            if len(self.session['profiles']) >= 10: break
-                            self.session['profiles'].append({"owner_id": self.original_interaction.user.id, "profile_name": val, "method": "webhook", "chance": 100, "wakewords": []})
+                        for item in page_items:
+                            if self.view_source == 'child_bot':
+                                bid = next((k for k, v in self.cog.child_bots.items() if v is item), None)
+                                if bid and not any(p.get('bot_id') == bid for p in self.session['profiles']):
+                                    if len(self.session['profiles']) >= 200: break
+                                    bc = self.cog.child_bots.get(bid)
+                                    if bc: self.session['profiles'].append({"owner_id": bc['owner_id'], "profile_name": bc['profile_name'], "method": "child_bot", "bot_id": bid, "chance": 100, "wakewords": []})
+                            else:
+                                if not any(p.get('profile_name') == item and p.get('method') != 'child_bot' for p in self.session['profiles']):
+                                    if len(self.session['profiles']) >= 200: break
+                                    self.session['profiles'].append({"owner_id": self.original_interaction.user.id, "profile_name": item, "method": "webhook", "chance": 100, "wakewords": []})
+                
+                elif "toggle_all" in curr_vals:
+                    all_val_list = [f"child_{next((k for k, v in self.cog.child_bots.items() if v is item), None)}" if self.view_source == 'child_bot' else item for item in ordered_list]
+                    all_set_vals = set(all_val_list)
+                    
+                    already_selected_all = set()
+                    for p in self.session.get('profiles', []):
+                        val_p = f"child_{p.get('bot_id')}" if p.get('method') == 'child_bot' else p.get('profile_name')
+                        if val_p in all_set_vals:
+                            already_selected_all.add(val_p)
+                            
+                    if len(already_selected_all) == len(ordered_list):
+                        self.session['profiles'] = [p for p in self.session['profiles'] if (f"child_{p.get('bot_id')}" if p.get('method') == 'child_bot' else p.get('profile_name')) not in all_set_vals]
+                    else:
+                        for item in ordered_list:
+                            if self.view_source == 'child_bot':
+                                bid = next((k for k, v in self.cog.child_bots.items() if v is item), None)
+                                if bid and not any(p.get('bot_id') == bid for p in self.session['profiles']):
+                                    if len(self.session['profiles']) >= 200: break
+                                    bc = self.cog.child_bots.get(bid)
+                                    if bc: self.session['profiles'].append({"owner_id": bc['owner_id'], "profile_name": bc['profile_name'], "method": "child_bot", "bot_id": bid, "chance": 100, "wakewords": []})
+                            else:
+                                if not any(p.get('profile_name') == item and p.get('method') != 'child_bot' for p in self.session['profiles']):
+                                    if len(self.session['profiles']) >= 200: break
+                                    self.session['profiles'].append({"owner_id": self.original_interaction.user.id, "profile_name": item, "method": "webhook", "chance": 100, "wakewords": []})
+                
+                else:
+                    self.session['profiles'] = [p for p in self.session['profiles'] if not (
+                        (f"child_{p.get('bot_id')}" in page_vals and f"child_{p.get('bot_id')}" not in curr_vals) or
+                        (p.get('method') != 'child_bot' and p['profile_name'] in page_vals and p['profile_name'] not in curr_vals)
+                    )]
+                    
+                    for val in raw_vals:
+                        if val.startswith("child_"):
+                            bid = val.split("_")[1]
+                            if not any(p.get('bot_id') == bid for p in self.session['profiles']):
+                                if len(self.session['profiles']) >= 200: break
+                                bc = self.cog.child_bots.get(bid)
+                                if bc: self.session['profiles'].append({"owner_id": bc['owner_id'], "profile_name": bc['profile_name'], "method": "child_bot", "bot_id": bid, "chance": 100, "wakewords": []})
+                        else:
+                            if not any(p.get('profile_name') == val and p.get('method') != 'child_bot' for p in self.session['profiles']):
+                                if len(self.session['profiles']) >= 200: break
+                                self.session['profiles'].append({"owner_id": self.original_interaction.user.id, "profile_name": val, "method": "webhook", "chance": 100, "wakewords": []})
                 
                 self.cog._save_multi_profile_sessions()
                 await i.response.defer(); await self.update_display()
@@ -3201,7 +3455,22 @@ class SessionConfigView(ui.View):
                 async def n_cb(i): self.current_page += 1; await i.response.defer(); await self.update_display()
                 build_pagination_controls(self, self.current_page, num_pages, 1, p_cb, n_cb)
 
-            cast_list = "\n".join(f"{idx+1}. `{p['profile_name']}` ({'Child Bot' if p.get('method') == 'child_bot' else 'Webhook'})" for idx, p in enumerate(self.session['profiles'])) or "*No participants*"
+            profiles = self.session.get('profiles', [])
+            total_active = len(profiles)
+            
+            if total_active <= 20:
+                cast_list = "\n".join(f"{idx+1}. `{p['profile_name']}` ({'Child Bot' if p.get('method') == 'child_bot' else 'Webhook'})" for idx, p in enumerate(profiles)) or "*No participants*"
+            else:
+                start_p = self.current_page * 20
+                end_p = start_p + 20
+                page_profiles_cast = profiles[start_p:end_p]
+                
+                cast_lines = []
+                for idx, p in enumerate(page_profiles_cast, start=start_p + 1):
+                    method_lbl = 'Child Bot' if p.get('method') == 'child_bot' else 'Webhook'
+                    cast_lines.append(f"{idx}. `{p['profile_name']}` ({method_lbl})")
+                cast_list = "\n".join(cast_lines) or "*No participants*"
+                
             embed.add_field(name="Current Cast", value=cast_list, inline=False)
 
         elif self.current_tab == "config":
@@ -3215,7 +3484,7 @@ class SessionConfigView(ui.View):
             embed.add_field(name="Master Prompt", value=f"`{'Set' if mp else 'Not Set'}`", inline=True)
             embed.add_field(name="\u200b", value="\u200b", inline=True)
             
-            embed.add_field(name="TTS Status", value=f"{tts_status}", inline=True)
+            embed.add_field(name="Text-to-Speech", value=f"{tts_status}", inline=True)
             embed.add_field(name="Response Limit", value=f"`{response_limit}`", inline=True)
             embed.add_field(name="\u200b", value="\u200b", inline=True)
             
@@ -3249,20 +3518,124 @@ class SessionConfigView(ui.View):
 
         elif self.current_tab == "reactivity":
             embed.description = "Manage how likely participants are to respond to messages."
-            opts = [discord.SelectOption(label=f"{p['profile_name']} (Chance: {p.get('chance', 100)}%)", value=str(idx)) for idx, p in enumerate(self.session['profiles'])]
+            profiles = self.session.get('profiles', [])
+            total_items = len(profiles)
+            num_pages = max(1, (total_items - 1) // 20 + 1)
             
-            if opts:
-                sel = ui.Select(placeholder="Select a participant to edit reactivity...", options=opts[:25], row=0)
-                async def react_cb(i: discord.Interaction):
-                    idx = int(i.data['values'][0])
-                    await i.response.send_modal(ReactivitySettingsModal(self, self.session['profiles'][idx]))
-                sel.callback = react_cb
-                self.add_item(sel)
+            if self.current_page >= num_pages:
+                self.current_page = max(0, num_pages - 1)
                 
-                react_list = "\n".join(f"{idx+1}. **{p['profile_name']}**: {p.get('chance', 100)}% (Wakewords: {', '.join(p.get('wakewords', [])) or 'None'})" for idx, p in enumerate(self.session['profiles']))
-                embed.add_field(name="Reactivity Stats", value=react_list, inline=False)
+            start = self.current_page * 20
+            page_profiles = profiles[start : start + 20]
+            
+            page_keys = {(p['owner_id'], p['profile_name']) for p in page_profiles}
+            
+            options = []
+            if page_profiles:
+                page_selected = page_keys.issubset(self.selected_reactivity_profiles)
+                page_label = "Unselect Page" if page_selected else "Select Page"
+                options.append(discord.SelectOption(label=page_label, value="toggle_page", description="Toggle selection for all profiles on this page.", emoji="📄"))
+                
+                all_set = {(p['owner_id'], p['profile_name']) for p in profiles}
+                all_selected = all_set.issubset(self.selected_reactivity_profiles)
+                all_label = "Unselect All" if all_selected else "Select All"
+                options.append(discord.SelectOption(label=all_label, value="toggle_all", description="Toggle selection for all profiles.", emoji="📚"))
+
+                for p in page_profiles:
+                    p_key = (p['owner_id'], p['profile_name'])
+                    is_checked = p_key in self.selected_reactivity_profiles
+                    options.append(discord.SelectOption(
+                        label=f"{p['profile_name']} (Chance: {p.get('chance', 100)}%)",
+                        value=f"{p['owner_id']}:{p['profile_name']}",
+                        default=is_checked
+                    ))
             else:
-                embed.add_field(name="Reactivity Stats", value="*Add profiles in the Cast tab first.*", inline=False)
+                options.append(discord.SelectOption(label="No profiles found", value="none"))
+
+            sel = ui.Select(
+                placeholder="Select participant(s) to edit...", 
+                min_values=0, 
+                max_values=len(options) if page_profiles else 1, 
+                options=options, 
+                row=0,
+                disabled=(not page_profiles)
+            )
+            
+            async def react_select_cb(i: discord.Interaction):
+                if "none" in i.data['values']: await i.response.defer(); return
+                vals = i.data['values']
+                curr_vals = set(vals)
+                
+                page_vals_set = {f"{p['owner_id']}:{p['profile_name']}" for p in page_profiles}
+                
+                if "toggle_page" in curr_vals:
+                    if page_keys.issubset(self.selected_reactivity_profiles):
+                        self.selected_reactivity_profiles.difference_update(page_keys)
+                    else:
+                        self.selected_reactivity_profiles.update(page_keys)
+                elif "toggle_all" in curr_vals:
+                    all_keys = {(p['owner_id'], p['profile_name']) for p in profiles}
+                    if all_keys.issubset(self.selected_reactivity_profiles):
+                        self.selected_reactivity_profiles.difference_update(all_keys)
+                    else:
+                        self.selected_reactivity_profiles.update(all_keys)
+                else:
+                    self.selected_reactivity_profiles.difference_update(page_keys)
+                    for val in vals:
+                        try:
+                            o_id_str, p_name = val.split(":", 1)
+                            self.selected_reactivity_profiles.add((int(o_id_str), p_name))
+                        except ValueError:
+                            pass
+                
+                await i.response.defer()
+                await self.update_display()
+                
+            sel.callback = react_select_cb
+            self.add_item(sel)
+
+            react_lines = []
+            for idx, p in enumerate(page_profiles, start=start + 1):
+                p_key = (p['owner_id'], p['profile_name'])
+                marker = "✅ " if p_key in self.selected_reactivity_profiles else ""
+                react_lines.append(f"{idx}. {marker}**{p['profile_name']}**: {p.get('chance', 100)}% (Wakewords: {', '.join(p.get('wakewords', [])) or 'None'})")
+            react_list = "\n".join(react_lines)
+            embed.add_field(name="Reactivity Stats", value=react_list or "*No participants*", inline=False)
+
+            if num_pages > 1:
+                async def p_cb(i: discord.Interaction):
+                    self.current_page -= 1
+                    await i.response.defer()
+                    await self.update_display()
+                async def n_cb(i: discord.Interaction):
+                    self.current_page += 1
+                    await i.response.defer()
+                    await self.update_display()
+                build_pagination_controls(self, self.current_page, num_pages, 1, p_cb, n_cb)
+
+            selected_count = len(self.selected_reactivity_profiles)
+            btn_label = "Bulk Edit" if selected_count > 1 else "Edit"
+            btn_style = discord.ButtonStyle.primary if selected_count > 0 else discord.ButtonStyle.secondary
+            btn_disabled = (selected_count == 0)
+            
+            edit_btn = ui.Button(label=btn_label, style=btn_style, disabled=btn_disabled, row=2)
+            
+            async def edit_callback(i: discord.Interaction):
+                targets = []
+                for p in profiles:
+                    p_key = (p['owner_id'], p['profile_name'])
+                    if p_key in self.selected_reactivity_profiles:
+                        targets.append(p)
+                
+                if not targets:
+                    await i.response.send_message("❌ No profiles selected.", ephemeral=True)
+                    return
+                    
+                modal = ReactivitySettingsModal(self, targets)
+                await i.response.send_modal(modal)
+                
+            edit_btn.callback = edit_callback
+            self.add_item(edit_btn)
 
         elif self.current_tab == "proactivity":
             pro = self.session.get("proactivity", {})
@@ -5719,12 +6092,27 @@ class SessionView(ui.View):
         self.cog = cog
         self.session = session
         self.channel_id = interaction.channel_id
+        self.current_page = 0
+        self.items_per_page = 20
+        self.update_view()
+
+    def update_view(self):
+        self.clear_items()
+        profiles = self.session.get("profiles", [])
+        total_items = len(profiles)
+        num_pages = max(1, (total_items - 1) // self.items_per_page + 1)
         
+        if self.current_page >= num_pages:
+            self.current_page = num_pages - 1
+            
+        start = self.current_page * self.items_per_page
+        end = start + self.items_per_page
+        page_profiles = profiles[start:end]
+
         options = []
-        for i, p in enumerate(session.get("profiles", [])):
+        for i, p in enumerate(page_profiles, start=start):
             p_name = p.get("profile_name")
             method = p.get("method", "webhook")
-            
             label = p_name
             description = f"Owner ID: {p.get('owner_id')}"
             
@@ -5738,14 +6126,28 @@ class SessionView(ui.View):
                     label = f"Bot {bot_id} ({p_name})"
             
             options.append(discord.SelectOption(label=label[:100], value=str(i), description=description))
-            
-        if not options:
-            self.stop()
-            return
 
-        self.select = ui.Select(placeholder="Select a participant to view details...", options=options[:25])
-        self.select.callback = self.callback
-        self.add_item(self.select)
+        if options:
+            self.select = ui.Select(placeholder="Select a participant to view details...", options=options)
+            self.select.callback = self.callback
+            self.add_item(self.select)
+
+        if num_pages > 1:
+            prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page == 0), row=1)
+            async def prev_cb(i):
+                self.current_page -= 1
+                self.update_view()
+                await i.response.edit_message(view=self)
+            prev_btn.callback = prev_cb
+            self.add_item(prev_btn)
+            
+            next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page == num_pages - 1), row=1)
+            async def next_cb(i):
+                self.current_page += 1
+                self.update_view()
+                await i.response.edit_message(view=self)
+            next_btn.callback = next_cb
+            self.add_item(next_btn)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)

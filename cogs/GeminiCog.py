@@ -567,9 +567,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
     @app_commands.describe(
         profile_name="The profile to swap or add. Leave blank to remove a profile.",
         use_child_bot="Whether to use the linked Child Bot (if available). Defaults to True.",
-        slot="The participant number (1-10) to affect. See '/session swap' with no options for a list."
+        slot="The participant number (1-200) to affect. See '/session swap' with no options for a list."
     )
-    async def swap_session_slash(self, interaction: discord.Interaction, profile_name: Optional[str] = None, use_child_bot: Optional[bool] = None, slot: Optional[app_commands.Range[int, 1, 10]] = None):
+    async def swap_session_slash(self, interaction: discord.Interaction, profile_name: Optional[str] = None, use_child_bot: Optional[bool] = None, slot: Optional[app_commands.Range[int, 1, 200]] = None):
         await interaction.response.defer(ephemeral=True)
         session = self.multi_profile_channels.get(interaction.channel_id)
 
@@ -587,19 +587,9 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 await interaction.followup.send("There is no active session in this channel.", ephemeral=True)
                 return
             
-            profile_list = []
-            for i, p_data in enumerate(session_data_idx["profiles"]):
-                p_name = p_data.get('profile_name')
-                pid = p_data.get('pid', 'Unknown PID')
-                
-                method_str = "Child Bot" if p_data.get('method') == 'child_bot' else "Webhook"
-                profile_list.append(f"**{i+1}.** `{p_name}` ({method_str}) [PID: {pid}]")
-            
-            owner_user = self.bot.get_user(session_data_idx.get('owner_id'))
-            admin_name = owner_user.name if owner_user else "Unknown Admin"
-            
-            msg = f"**Session Admin:** {admin_name}\n\n**Current Participants:**\n" + "\n".join(profile_list)
-            await interaction.followup.send(msg, ephemeral=True)
+            from .mixins.gui import SessionSwapListView
+            view = SessionSwapListView(self, interaction, session_data_idx)
+            await interaction.followup.send(embed=view.embed, view=view, ephemeral=True)
             return
 
         # If no session exists, we must have a profile name to start one
