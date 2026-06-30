@@ -1124,7 +1124,7 @@ class ServicesMixin:
             current_instructions_str += "\n\n" + training_prompt
 
         if recalled_ltm:
-            final_instr_parts.append(f"<recalled_memories>\n{recalled_ltm}\n</recalled_memories>")
+            current_instructions_str += f"\n\n{recalled_ltm}"
 
         if critic_constraints:
             current_instructions_str += f"\n\n<negative_constraints>\nSTRICT ADHERENCE REQUIRED:\n{critic_constraints}\n</negative_constraints>"
@@ -2250,7 +2250,7 @@ class ServicesMixin:
                         ltm_recall_text, training_examples_list = await asyncio.gather(ltm_task, training_task)
 
                         full_system_instruction, _, grounding_enabled, temp, top_p, top_k, primary_model, fallback_model_name = self._construct_system_instructions(
-                            owner_id, profile_name, channel.id, is_multi_profile=True, training_examples_list=training_examples_list
+                            owner_id, profile_name, channel.id, is_multi_profile=True, training_examples_list=training_examples_list, recalled_ltm=ltm_recall_text
                         )
                         
                         # [UPDATED] Critic Persistence Logic (2 Rounds)
@@ -2386,9 +2386,6 @@ class ServicesMixin:
                         
                         if all_current_media:
                             supplementary_parts.extend(all_current_media)
-
-                        if ltm_recall_text:
-                            supplementary_parts.append(ltm_recall_text)
                         
                         if is_image_gen_round:
                             if generated_image_bytes_for_round:
@@ -6476,9 +6473,10 @@ class ServicesMixin:
                         h_turn['parts'].append(whisper_context)
                         break
 
+            ltm_recall_text = await self._get_relevant_ltm_for_prompt((channel.id, p_owner_id, p_name), participant_history, p_owner_id, p_name, trigger_content, "User", channel.guild.id, payload.user_id)
             training_examples = await self._get_relevant_training_examples(p_owner_id, p_name, trigger_content, channel.guild.id)
             full_system_instruction, _, _, _, _, _, _, _ = self._construct_system_instructions(
-                p_owner_id, p_name, channel.id, is_multi_profile=True, training_examples_list=training_examples
+                p_owner_id, p_name, channel.id, is_multi_profile=True, training_examples_list=training_examples, recalled_ltm=ltm_recall_text
             )
             
             if hasattr(model, 'system_instruction'):
@@ -6732,8 +6730,13 @@ class ServicesMixin:
                 "fallback": fallback_used,
                 "training_recalled": len(training_examples) if 'training_examples' in locals() and training_examples else 0,
                 "grounding_sources": regen_grounding_sources,
-                "ltms_recalled":[] # Context carries over natively; we don't re-query LTMs on regen
+                "ltms_recalled": []
             }
+            if 'ltm_recall_text' in locals() and ltm_recall_text:
+                lines = ltm_recall_text.split('\n')
+                clean_lines = [l.strip() for l in lines if l.strip() and not l.startswith("<")]
+                meta["ltms_recalled"] = [l[:100] + "..." if len(l) > 100 else l for l in clean_lines]
+
             if 'parsed_neuro_state' in locals() and parsed_neuro_state:
                 meta["neuro_state"] = parsed_neuro_state
                 

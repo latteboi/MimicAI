@@ -5238,11 +5238,11 @@ class SubmitAPIKeyModal(ui.Modal, title="Edit API Key"):
 
         # --- Validation & Setting Logic ---
         provider = None
-        if raw_key.startswith("AIzaSy"): provider = "gemini"
+        if raw_key.startswith(("AIzaSy", "AQ.")): provider = "gemini"
         elif raw_key.startswith("sk-or-"): provider = "openrouter"
         
         if not provider:
-            await interaction.followup.send("❌ **Invalid Format.** Keys must start with `AIzaSy` or `sk-or-`.", ephemeral=True)
+            await interaction.followup.send("❌ **Invalid Format.** Keys must start with `AIzaSy`, `AQ.`, or `sk-or-`.", ephemeral=True)
             return
 
         is_valid, err, tier = await self.cog._validate_api_keys(

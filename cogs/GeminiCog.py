@@ -247,15 +247,15 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             await interaction.followup.send(f"You have reached the maximum of {limit} personal profiles ({tier_name} tier).", ephemeral=True)
             return
 
-        api_key = self._get_api_key_for_guild(interaction.guild_id) or self._get_api_key_for_user(interaction.user.id)
+        api_key = self._get_api_key_for_user(interaction.user.id)
         is_or = False
         
         if not api_key:
-            api_key = self._get_api_key_for_guild(interaction.guild_id, "openrouter") or self._get_api_key_for_user(interaction.user.id, "openrouter")
+            api_key = self._get_api_key_for_user(interaction.user.id, "openrouter")
             is_or = True
             
         if not api_key:
-            await interaction.followup.send("An API key (Server or Personal) is not configured, so I cannot generate a profile. Please configure one via `/settings`.", ephemeral=True)
+            await interaction.followup.send("A personal API key is not configured, so I cannot generate a profile. Please configure one in your `/settings` DM.", ephemeral=True)
             return
 
         generation_prompt = self.global_prompts.get("PROFILE_GENERATOR", DEFAULT_PROFILE_GENERATOR_PROMPT).format(prompt=prompt)
