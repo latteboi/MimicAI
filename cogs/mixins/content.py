@@ -53,7 +53,7 @@ DOC_CATEGORIES = {
         ),
         "3.2 Chronological & Identity Headers": (
             "To ensure coherent multi-participant tracking, the system forcefully injects a strict header before every single message in the session.\n\n"
-            "**Format:** `Name [ID: XXXXXXXXXXXXXXXX] [Day, DD Mon YYYY, HH:MM AM/PM TZ]:`\n\n"
+            "**Format:** `<Name> [ID: XXXXXXXXXXXXXXXX] [Day, DD Mon YYYY, HH:MM AM/PM TZ]:`\n\n"
             "• **Identity Verification:** The 16-character PID (Profile ID) ensures the AI never confuses two characters with the same name.\n"
             "• **Temporal Awareness:** Embedding the exact timestamp of every message gives the AI perfect chronological awareness. It inherently understands if an hour, a day, or a week has passed between messages without needing explicit reminders, maintaining seamless roleplay continuity."
         ),

@@ -1093,30 +1093,38 @@ class ServicesMixin:
                 final_instr_parts.append(f"<time_context>\nYour current time is {time_str_utc}.\n</time_context>")
 
         if persona_data and any(persona_data.values()):
-            final_instr_parts.append("<persona_profile>")
+            persona_blocks = []
             for key in self.persona_modal_sections_order: 
                 if lines := persona_data.get(key,[]):
-                    decrypted_lines = [self._decrypt_data(line) for line in lines if line.strip()]
+                    decrypted_lines = [self._decrypt_data(line).strip() for line in lines if line.strip()]
                     if any(l.strip() for l in decrypted_lines):
-                        final_instr_parts.extend([f"<{key}>"] + decrypted_lines + [f"</{key}>"])
-            final_instr_parts.append("</persona_profile>")
+                        block_content = "\n".join(decrypted_lines)
+                        persona_blocks.append(f"<{key}>\n{block_content}\n</{key}>")
+            
+            if persona_blocks:
+                persona_str = "<persona_profile>\n" + "\n\n".join(persona_blocks) + "\n</persona_profile>"
+                final_instr_parts.append(persona_str)
         
-        current_instructions_str = "\n".join(final_instr_parts).strip()
+        current_instructions_str = "\n\n".join(final_instr_parts).strip()
         
         decrypted_parts = []
         if isinstance(ai_instr_str, list):
             for part in ai_instr_str:
                 dec = self._decrypt_data(part)
-                if dec.strip(): decrypted_parts.append(dec)
+                if dec.strip():
+                    cleaned_part = "\n".join([line.strip() for line in dec.split("\n")])
+                    decrypted_parts.append(cleaned_part)
         elif isinstance(ai_instr_str, str):
             dec = self._decrypt_data(ai_instr_str)
-            if dec.strip(): decrypted_parts.append(dec)
+            if dec.strip():
+                cleaned_part = "\n".join([line.strip() for line in dec.split("\n")])
+                decrypted_parts.append(cleaned_part)
         
         if decrypted_parts:
             if current_instructions_str: current_instructions_str += "\n\n"
-            current_instructions_str += "<behavior_guidelines>\n"
+            current_instructions_str += "<instructions>\n"
             current_instructions_str += "\n\n".join(decrypted_parts).strip()
-            current_instructions_str += "\n</behavior_guidelines>"
+            current_instructions_str += "\n</instructions>"
 
         if training_examples_list:
             examples_block = "\n---\n".join(training_examples_list)
@@ -1135,7 +1143,7 @@ class ServicesMixin:
         profile_id_val = self._get_profile_id(profile_owner_id, profile_name_to_use)
         rule_block = rule_block.format(profile_id_placeholder=profile_id_val)
         
-        current_instructions_str += "\n\n" + rule_block
+        current_instructions_str += "\n\n" + rule_block.strip()
 
         final_system_instruction = current_instructions_str if current_instructions_str.strip() else DEFAULT_SYSTEM_INSTRUCTION
         return final_system_instruction, False, grounding_enabled, temperature, top_p, top_k, primary_model, fallback_model
@@ -3992,9 +4000,9 @@ class ServicesMixin:
                     
                     final_content = "\n".join(filtered_lines).strip()
                     if final_content:
-                        if not re.match(r'^.+ \[[^\]]+\]:', final_content):
+                        if not re.match(r'^<.+> \[[^\]]+\]:', final_content) and not re.match(r'^.+ \[[^\]]+\]:', final_content):
                             ts_str = datetime.datetime.now(datetime.timezone.utc).strftime("[%a, %d %b %Y, %I:%M %p UTC]")
-                            convo_parts.append(f"{display_name} {ts_str}:\n{final_content}")
+                            convo_parts.append(f"<{display_name}> {ts_str}:\n{final_content}\n</{display_name}>")
                         else:
                             convo_parts.append(final_content)
             except TimeoutError:
@@ -4427,15 +4435,28 @@ class ServicesMixin:
         return None
     
     def _scrub_response_text(self, text: str, participant_names: Optional[List[str]] = None) -> str:
-        """Hard-coded filter to remove any leaked script formatting or XML tags from the AI's response."""
+        """Hard-coded filter to remove any leaked script formatting or specific XML tags from the AI's response."""
         try:
             with Timeout(seconds=2, error_message="Scrubbing timed out due to complex regex."):
                 scrubbed_text = text.strip()
                 scrubbed_text = scrubbed_text.replace("&#x20;", " ")
 
-                # 1. Global XML Tag Scrubber (Internal thoughts, metadata, and context)
-                scrubbed_text = re.sub(r'<([^>]+)>.*?</\1>', '', scrubbed_text, flags=re.DOTALL)
-                scrubbed_text = re.sub(r'<(?!@|#|a?:[a-zA-Z0-9_]+:|t:\d)[^>]+>', '', scrubbed_text)
+                # 1. Targeted XML Tag Scrubber (Internal thoughts, metadata, and context ONLY)
+                system_tags = [
+                    "archive_context", "external_context", "document_context", "time_context",
+                    "whisper_context", "private_whisper", "private_response", "internal_note",
+                    "scene_prompt", "neuro_endocrine_engine", "neuro_update", "persona_profile",
+                    "backstory", "personality_traits", "likes", "dislikes", "appearance",
+                    "instructions", "training_data", "example", "negative_constraints",
+                    "context_rules", "image_context", "target_content", "target_transcript",
+                    "system_note", "reply_context", "thought", "think", "reasoning", "instruction"
+                ]
+                tags_pattern = "|".join(system_tags)
+                
+                # Strip entire blocks of known system tags
+                scrubbed_text = re.sub(rf'<({tags_pattern})>.*?</\1>', '', scrubbed_text, flags=re.DOTALL | re.IGNORECASE)
+                # Strip any orphaned opening/closing system tags
+                scrubbed_text = re.sub(rf'</?({tags_pattern})>', '', scrubbed_text, flags=re.IGNORECASE)
                 
                 # 2. Simplified Header Scrubber
                 # This matches ANY line containing a bracketed block of 15+ characters (the timestamp signature)
@@ -4447,13 +4468,18 @@ class ServicesMixin:
                 pattern_metadata = r'\(?\s*(?:Thought Initiated:)?\s*[^|\n\r]*?\|?\s*Duration: \d+\.\d+s\s*\)?'
                 scrubbed_text = re.sub(pattern_metadata, '', scrubbed_text, flags=re.IGNORECASE)
 
-                # 4. Global Participant Prefix Scrubber (Character Name:)
+                # 4. Global Participant Prefix & Suffix Scrubber (Character Name:)
                 if participant_names:
                     escaped_names = [re.escape(name) for name in participant_names]
                     names_pattern_part = "|".join(escaped_names)
-                    # Searches for "Name:" prefixes anywhere in the text
-                    pattern_name_prefix = rf'(?:^|\s)(?:{names_pattern_part}):\s*'
-                    scrubbed_text = re.sub(pattern_name_prefix, ' ', scrubbed_text, flags=re.IGNORECASE).strip()
+                    
+                    # Searches for "<Name>:" or "Name:" prefixes at the start of lines
+                    pattern_name_prefix = rf'(?:^|\n)<?(?:{names_pattern_part})>?:\s*'
+                    scrubbed_text = re.sub(pattern_name_prefix, '', scrubbed_text, flags=re.IGNORECASE).strip()
+                    
+                    # Hunts down orphaned opening/closing participant XML tags (e.g., </Salty Tongue>)
+                    pattern_name_xml = rf'</?(?:{names_pattern_part})>'
+                    scrubbed_text = re.sub(pattern_name_xml, '', scrubbed_text, flags=re.IGNORECASE).strip()
 
                 scrubbed_text = re.sub(r'Message\s*#[\w-]+', '', scrubbed_text).strip()
                 
@@ -4583,7 +4609,7 @@ class ServicesMixin:
         except Exception:
             time_str = timestamp.strftime("[%a, %d %b %Y, %I:%M %p UTC]")
             
-        return f"{display_name} [ID: {entity_id}] {time_str}:\n{content}\n"
+        return f"<{display_name}> [ID: {entity_id}] {time_str}:\n{content}\n</{display_name}>\n\n"
     
     @tasks.loop(seconds=60.0)
     async def proactive_session_task(self):
