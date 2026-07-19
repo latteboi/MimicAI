@@ -291,14 +291,20 @@ class StorageMixin:
 
     def _get_pid_from_name(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> str:
         index = self._get_user_index(user_id)
-        key = "borrowed" if is_borrowed else "personal"
-        mapping = index.get(key, {})
+        if not is_borrowed:
+            if isinstance(index.get("system"), dict) and profile_name in index.get("system", {}):
+                return index["system"][profile_name]
+            mapping = index.get("personal", {})
+        else:
+            mapping = index.get("borrowed", {})
         if isinstance(mapping, dict):
             return mapping.get(profile_name, profile_name)
         return profile_name
 
     def _get_pid_from_name_any(self, user_id: int, profile_name: str) -> str:
         index = self._get_user_index(user_id)
+        if isinstance(index.get("system"), dict) and profile_name in index["system"]:
+            return index["system"][profile_name]
         if isinstance(index.get("personal"), dict) and profile_name in index["personal"]:
             return index["personal"][profile_name]
         if isinstance(index.get("borrowed"), dict) and profile_name in index["borrowed"]:
@@ -1199,7 +1205,8 @@ class StorageMixin:
     def _repair_user_index(self, user_id: int) -> Dict[str, Any]:
         """Scans the user's profile directory to reconstruct a missing or corrupted index.json."""
         user_id_str = str(user_id)
-        index = {"personal": {}, "borrowed": {}}
+        old_index = IOManager.read_json(os.path.join(self.USERS_DIR, user_id_str, "index.json")) or {}
+        index = {"personal": {}, "borrowed": {}, "system": old_index.get("system", {})}
         profiles_dir = os.path.join(self.USERS_DIR, user_id_str, "profiles")
         
         if os.path.isdir(profiles_dir):
@@ -1350,6 +1357,12 @@ class StorageMixin:
                 pass
 
     def _resolve_effective_profile(self, user_id: int, profile_name: str) -> Tuple[int, str]:
+        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+        if user_id != owner_id:
+            owner_idx = self._get_user_index(owner_id)
+            if profile_name in owner_idx.get("system", {}):
+                return owner_id, profile_name
+
         index = self._get_user_index(user_id)
         if profile_name in index.get("borrowed", []):
             b_config = self._get_profile_config(user_id, profile_name, True) or {}
@@ -1443,6 +1456,61 @@ class StorageMixin:
             self._save_profile_config(user_id, profile_name, config)
             self._save_profile_prompts(user_id, profile_name, prompts)
             return {"config": config, "prompts": prompts}
+            
+        return {"config": self._get_profile_config(user_id, profile_name), "prompts": self._get_profile_prompts(user_id, profile_name)}
+
+    def _get_or_create_system_profile(self, profile_name: str) -> Optional[Dict[str, Any]]:
+        user_id = int(defaultConfig.DISCORD_OWNER_ID)
+        profile_name = profile_name.lower().strip()
+
+        index = self._get_user_index(user_id)
+        if "system" not in index:
+            index["system"] = {}
+            
+        if profile_name not in index["system"]:
+            import uuid
+            pid = f"X{uuid.uuid4().hex[:15].upper()}"
+            index["system"][profile_name] = pid
+            self._save_user_index(user_id, index)
+            
+            config = {
+                "grounding_enabled": False, "stm_length": defaultConfig.CHATBOT_MEMORY_LENGTH,
+                "temperature": 0.2, "top_p": 0.9,
+                "top_k": 40, "training_context_size": 0,
+                "training_relevance_threshold": 0.0,
+                "ltm_context_size": 0, "ltm_relevance_threshold": 1.0, "ltm_creation_interval": 100,
+                "ltm_summarization_context": 10, "ltm_scope": "server", "safety_level": "low",
+                "primary_model": "GOOGLE/gemini-2.5-flash-lite", "fallback_model": "GOOGLE/gemini-2.5-flash-lite",
+                "time_tracking_enabled": True, "timezone": "UTC", "generation_metadata_enabled": False,
+                "realistic_typing_enabled": False, "ltm_creation_enabled": False,
+                "image_generation_enabled": False, "image_generation_model": "GOOGLE/gemini-2.5-flash-image",
+                "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
+                "thinking_level": "none", "thinking_budget": -1, "thinking_signatures_enabled": "off",
+                "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": "Aoede",
+                "speech_model": "GOOGLE/gemini-2.5-flash-preview-tts", "speech_temperature": 1.0,
+                "neuro_engine_enabled": False, "neuro_state": {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20},
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "help_mode_enabled": False
+            }
+            
+            prompts = {
+                "persona": {
+                    "backstory": [self._encrypt_data("You are MimicGuide, the official technical assistant for the MimicAI Discord Bot.")],
+                    "personality_traits": [self._encrypt_data("Helpful, precise, and highly technical.")],
+                    "likes": [], "dislikes": [], "appearance": []
+                },
+                "ai_instructions": [self._encrypt_data("Answer questions concisely using the provided documentation. If you do not know the answer, state that you do not know."), "", "", ""], 
+                "image_generation_prompt": None,
+                "ltm_summarization_instructions": self._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
+            }
+            
+            p_dir = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid)
+            os.makedirs(p_dir, exist_ok=True)
+            with open(os.path.join(p_dir, "name.txt"), "w", encoding="utf-8") as f:
+                f.write(profile_name)
+                
+            self._save_profile_config(user_id, profile_name, config, False)
+            self._save_profile_prompts(user_id, profile_name, prompts)
             
         return {"config": self._get_profile_config(user_id, profile_name), "prompts": self._get_profile_prompts(user_id, profile_name)}
 

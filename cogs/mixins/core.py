@@ -32,6 +32,9 @@ class CoreMixin:
         self.all_bot_ids = {self.bot.user.id} | {int(bot_id) for bot_id in self.child_bots.keys()}
 
         if self.has_lock:
+            self._get_or_create_system_profile("mimicguide")
+            self.bot.loop.create_task(self._load_and_embed_docs())
+            
             presence = self._load_parent_presence()
             status_val = presence.get("status", "online")
             status_map = {"online": discord.Status.online, "idle": discord.Status.idle, "dnd": discord.Status.dnd, "invisible": discord.Status.invisible}
@@ -2359,6 +2362,10 @@ class CoreMixin:
             profile_id = self._get_profile_id(effective_owner_id, effective_profile_name)
             embed.add_field(name="Profile ID (PID)", value=f"`{profile_id}`", inline=True)
             embed.add_field(name="\u200b", value="\u200b", inline=True)
+            
+            if profile_id.startswith("X"):
+                embed.description = f"⚠️ **System Profile.** Global settings managed by Bot Admin.\n\n" + (embed.description or "")
+                profile_type = "System"
 
         embed.add_field(name="Safety Level", value=f"`{safety_level}`", inline=True)
 
@@ -2438,6 +2445,7 @@ class CoreMixin:
         typing = "**`ON`**" if config.get("realistic_typing_enabled", False) else "`OFF`"
         critic = "**`ON`**" if config.get("critic_enabled", False) else "`OFF`"
         neuro = "**`ON`**" if config.get("neuro_engine_enabled", False) else "`OFF`"
+        help_mode = "**`ON`**" if config.get("help_mode_enabled", False) else "`OFF`"
         metadata_vis = "**`ON`**" if config.get("generation_metadata_enabled", False) else "`OFF`"
         resp_mode = config.get("response_mode", "regular").replace('_', ' ').title()
 
@@ -2452,6 +2460,7 @@ class CoreMixin:
             f"Realistic Typing: {typing}\n"
             f"Critic: {critic}\n"
             f"Neuro Engine: {neuro}\n"
+            f"Help Mode: {help_mode}\n"
             f"Placeholder: {ph_text}"
         )
         embed.add_field(name="Tools", value=tools_val, inline=False)
@@ -2569,6 +2578,12 @@ class CoreMixin:
                 choices.append(app_commands.Choice(name=p, value=p))
 
         for p in index.get("borrowed", []):
+            if current_lower in p.lower():
+                choices.append(app_commands.Choice(name=p, value=p))
+                
+        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+        owner_idx = self._get_user_index(owner_id)
+        for p in owner_idx.get("system", {}):
             if current_lower in p.lower():
                 choices.append(app_commands.Choice(name=p, value=p))
 

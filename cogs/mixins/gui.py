@@ -996,12 +996,24 @@ class ProfileManageView(ui.View):
         super().__init__(timeout=600)
         self.cog = cog
         self.original_interaction = original_interaction
-        self.target_user_id = target_user_id or original_interaction.user.id
-        self.user_id = self.target_user_id
+        
+        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+        owner_idx = self.cog._get_user_index(owner_id)
+        if profile_name in owner_idx.get("system", {}):
+            self.target_user_id = owner_id
+            self.user_id = owner_id
+            self.is_system = True
+        else:
+            self.target_user_id = target_user_id or original_interaction.user.id
+            self.user_id = self.target_user_id
+            self.is_system = False
+
         self.profile_name = profile_name
         self.is_borrowed = is_borrowed
         self.is_mod_view = is_mod_view
         self.current_tab = "home"
+        self.is_read_only = self.is_system and original_interaction.user.id != owner_id
+        
         self._build_view()
 
     def _build_view(self):
@@ -1027,53 +1039,58 @@ class ProfileManageView(ui.View):
 
         # --- 1. Category Dropdown (Row 0) ---
         options = []
-        if self.current_tab == "home":
-            if not is_mod:
-                options.append(discord.SelectOption(label="Rename Profile", value="rename", description="Change the local name of this profile."))
+        
+        if self.is_read_only:
+            options.append(discord.SelectOption(label="Read-Only System Profile", value="none", description="Settings are managed globally."))
+        else:
+            if self.current_tab == "home":
+                if not is_mod:
+                    options.append(discord.SelectOption(label="Rename Profile", value="rename", description="Change the local name of this profile."))
+                    
+                    if not self.is_borrowed:
+                        options.append(discord.SelectOption(label="Duplicate Profile", value="duplicate", description="Create a new profile from a copy of this one."))
+                        options.append(discord.SelectOption(label="Share Profile", value="share", description="Share this profile with others or publish it."))
+                        options.append(discord.SelectOption(label="Custom Error Message", value="error_response", description="Set the message shown when generation fails."))
+                        options.append(discord.SelectOption(label="Generation Visual", value="generation_visual", description="Set custom placeholder emoji and child bot behavior."))
+                    
+                    options.append(discord.SelectOption(label="Cycle Content Safety Level", value="safety_level", description="Cycle: Low -> Medium -> High -> Unrestricted 18+."))
                 
+                label = "Remove Borrowed Profile" if self.is_borrowed else "Delete Profile"
+                options.append(discord.SelectOption(label=label, value="delete", description="Permanently remove this profile and its data."))
+
+            elif self.current_tab == "persona":
+                options.append(discord.SelectOption(label="Edit Persona", value="edit_persona", description="Edit backstory, traits, likes, dislikes, and appearance."))
+                options.append(discord.SelectOption(label="Edit Instructions", value="edit_instructions", description="Edit specific AI behavioral instructions."))
+                options.append(discord.SelectOption(label="TTS Instructions", value="tts_instructions", description="Configure the 'Director's Desk' for vocal performance."))
+                if not is_mod and not self.is_borrowed:
+                    options.append(discord.SelectOption(label="Edit Appearance", value="edit_appearance", description="Edit the custom Webhook name and avatar."))
+
+            elif self.current_tab == "params" and not is_mod:
+                options.append(discord.SelectOption(label="Set Models", value="models", description="Choose Primary and Fallback AI models."))
+                options.append(discord.SelectOption(label="Set Generation Parameters & STM", value="gen_params", description="Set Temp, Top P, Top K, and STM Length."))
+                options.append(discord.SelectOption(label="Set Advanced Parameters (OPENROUTER)", value="adv_params", description="Set penalties, Min P, and Top A."))
+                options.append(discord.SelectOption(label="Set Thinking Parameters", value="thinking_params", description="Set thinking persistence, level, and budget."))
+                options.append(discord.SelectOption(label="Set Speech & Voice Settings", value="speech_settings", description="Set TTS voice, model, and temperature."))
+
+            elif self.current_tab == "tools" and not is_mod:
+                options.append(discord.SelectOption(label="Toggle Image Generation", value="image_toggle", description="Allow this profile to generate images via !image/!imagine."))
+                options.append(discord.SelectOption(label="Toggle Grounding (Web Search)", value="grounding", description="Cycle Grounding: OFF -> NATIVE -> RAG."))
+                options.append(discord.SelectOption(label="Toggle URL Context Fetching", value="url_toggle", description="Cycle URL Context: OFF -> NATIVE -> RAG."))
+                options.append(discord.SelectOption(label="Cycle Response Mode", value="cycle_response", description="Cycle: Regular -> Mention -> Reply -> Mention Reply."))
+                options.append(discord.SelectOption(label="Set Time & Timezone", value="time", description="Enable time awareness and set the profile's timezone."))
+                options.append(discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable a human-like delay when the bot sends messages."))
+                options.append(discord.SelectOption(label="Toggle Anti-Repetition Critic", value="critic", description="Enable semantic repetition analysis (Adds latency)."))
+                options.append(discord.SelectOption(label="Toggle Neuro-Endocrine Engine", value="neuro", description="Simulate hormonal states for dynamic emotions."))
+                options.append(discord.SelectOption(label="Toggle Help Mode (Guide RAG)", value="help_mode", description="Allow profile to answer technical bot questions."))
+
+            elif self.current_tab == "memory" and not is_mod:
+                options.append(discord.SelectOption(label="Manage Data (LTM & Training)", value="data", description="Add, list, edit, or delete memories and examples."))
                 if not self.is_borrowed:
-                    options.append(discord.SelectOption(label="Duplicate Profile", value="duplicate", description="Create a new profile from a copy of this one."))
-                    options.append(discord.SelectOption(label="Share Profile", value="share", description="Share this profile with others or publish it."))
-                    options.append(discord.SelectOption(label="Custom Error Message", value="error_response", description="Set the message shown when generation fails."))
-                    options.append(discord.SelectOption(label="Generation Visual", value="generation_visual", description="Set custom placeholder emoji and child bot behavior."))
-                
-                options.append(discord.SelectOption(label="Cycle Content Safety Level", value="safety_level", description="Cycle: Low -> Medium -> High -> Unrestricted 18+."))
-            
-            label = "Remove Borrowed Profile" if self.is_borrowed else "Delete Profile"
-            options.append(discord.SelectOption(label=label, value="delete", description="Permanently remove this profile and its data."))
-
-        elif self.current_tab == "persona":
-            options.append(discord.SelectOption(label="Edit Persona", value="edit_persona", description="Edit backstory, traits, likes, dislikes, and appearance."))
-            options.append(discord.SelectOption(label="Edit Instructions", value="edit_instructions", description="Edit specific AI behavioral instructions."))
-            options.append(discord.SelectOption(label="TTS Instructions", value="tts_instructions", description="Configure the 'Director's Desk' for vocal performance."))
-            if not is_mod and not self.is_borrowed:
-                options.append(discord.SelectOption(label="Edit Appearance", value="edit_appearance", description="Edit the custom Webhook name and avatar."))
-
-        elif self.current_tab == "params" and not is_mod:
-            options.append(discord.SelectOption(label="Set Models", value="models", description="Choose Primary and Fallback AI models."))
-            options.append(discord.SelectOption(label="Set Generation Parameters & STM", value="gen_params", description="Set Temp, Top P, Top K, and STM Length."))
-            options.append(discord.SelectOption(label="Set Advanced Parameters (OPENROUTER)", value="adv_params", description="Set penalties, Min P, and Top A."))
-            options.append(discord.SelectOption(label="Set Thinking Parameters", value="thinking_params", description="Set thinking persistence, level, and budget."))
-            options.append(discord.SelectOption(label="Set Speech & Voice Settings", value="speech_settings", description="Set TTS voice, model, and temperature."))
-
-        elif self.current_tab == "tools" and not is_mod:
-            options.append(discord.SelectOption(label="Toggle Image Generation", value="image_toggle", description="Allow this profile to generate images via !image/!imagine."))
-            options.append(discord.SelectOption(label="Toggle Grounding (Web Search)", value="grounding", description="Cycle Grounding: OFF -> NATIVE -> RAG."))
-            options.append(discord.SelectOption(label="Toggle URL Context Fetching", value="url_toggle", description="Cycle URL Context: OFF -> NATIVE -> RAG."))
-            options.append(discord.SelectOption(label="Cycle Response Mode", value="cycle_response", description="Cycle: Regular -> Mention -> Reply -> Mention Reply."))
-            options.append(discord.SelectOption(label="Set Time & Timezone", value="time", description="Enable time awareness and set the profile's timezone."))
-            options.append(discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable a human-like delay when the bot sends messages."))
-            options.append(discord.SelectOption(label="Toggle Anti-Repetition Critic", value="critic", description="Enable semantic repetition analysis (Adds latency)."))
-            options.append(discord.SelectOption(label="Toggle Neuro-Endocrine Engine", value="neuro", description="Simulate hormonal states for dynamic emotions."))
-
-        elif self.current_tab == "memory" and not is_mod:
-            options.append(discord.SelectOption(label="Manage Data (LTM & Training)", value="data", description="Add, list, edit, or delete memories and examples."))
-            if not self.is_borrowed:
-                options.append(discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training context size and relevance threshold."))
-            options.append(discord.SelectOption(label="Toggle LTM Auto-Creation", value="ltm_creation", description="Automatically create memories from conversations."))
-            options.append(discord.SelectOption(label="Set LTM Parameters", value="ltm_params", description="Set frequency, context, and recall settings."))
-            if not self.is_borrowed:
-                options.append(discord.SelectOption(label="Set LTM Summarization Prompt", value="ltm_summarization", description="Customize how the AI creates memories."))
+                    options.append(discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training context size and relevance threshold."))
+                options.append(discord.SelectOption(label="Toggle LTM Auto-Creation", value="ltm_creation", description="Automatically create memories from conversations."))
+                options.append(discord.SelectOption(label="Set LTM Parameters", value="ltm_params", description="Set frequency, context, and recall settings."))
+                if not self.is_borrowed:
+                    options.append(discord.SelectOption(label="Set LTM Summarization Prompt", value="ltm_summarization", description="Customize how the AI creates memories."))
 
         if options:
             select = ui.Select(placeholder=f"Select an action for {self.current_tab.title()}...", options=options, row=0)
@@ -1256,6 +1273,9 @@ class ProfileManageView(ui.View):
             await self._handle_timezone(interaction, profile, self.is_borrowed)
         elif choice == "critic":
             profile["critic_enabled"] = not profile.get("critic_enabled", False)
+            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
+        elif choice == "help_mode":
+            profile["help_mode_enabled"] = not profile.get("help_mode_enabled", False)
             await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice == "neuro":
             async def refresh_cb(modal_interaction: discord.Interaction):
@@ -5810,6 +5830,7 @@ class BulkManageView(ui.View):
             discord.SelectOption(label="Set Generation Visual", value="generation_visual", description="Apply custom placeholder emoji to multiple profiles."),
             discord.SelectOption(label="Toggle Critic (Anti-Repetition)", value="critic", description="Enable or disable the critic for multiple profiles."),
             discord.SelectOption(label="Toggle Neuro-Endocrine Engine", value="neuro", description="Enable or disable hormonal simulation for multiple profiles."),
+            discord.SelectOption(label="Toggle Help Mode (Guide RAG)", value="help_mode", description="Allow profiles to answer technical bot questions."),
             discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable or disable realistic typing for multiple profiles."),
             discord.SelectOption(label="Set Safety Level", value="safety_level", description="Apply a content safety level to multiple profiles."),
             discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training settings to multiple personal profiles."),
@@ -5942,6 +5963,15 @@ class BulkManageView(ui.View):
             view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("critic_enabled", False), include_borrowed=True)
             sel = ui.Select(placeholder="Select action...", options=opts, row=0)
             async def sel_cb(inter): view.payload = ("critic_enabled", sel.values[0] == "true"); await inter.response.defer()
+            sel.callback = sel_cb
+            view.add_item(sel)
+            await interaction.response.send_message(content="Select action and profiles:", view=view, ephemeral=True)
+            
+        elif choice == "help_mode":
+            opts = [discord.SelectOption(label="Enable Help Mode", value="true"), discord.SelectOption(label="Disable Help Mode", value="false")]
+            view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("help_mode_enabled", False), include_borrowed=True)
+            sel = ui.Select(placeholder="Select action...", options=opts, row=0)
+            async def sel_cb(inter): view.payload = ("help_mode_enabled", sel.values[0] == "true"); await inter.response.defer()
             sel.callback = sel_cb
             view.add_item(sel)
             await interaction.response.send_message(content="Select action and profiles:", view=view, ephemeral=True)
@@ -6231,16 +6261,19 @@ class ModBaseView(ui.View):
         btn_stats = ui.Button(label="Stats", style=discord.ButtonStyle.primary if self.current_tab == "stats" else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab=="stats"))
         btn_prof = ui.Button(label="Profiles", style=discord.ButtonStyle.primary if self.current_tab == "profiles" else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab=="profiles"))
         btn_prompts = ui.Button(label="Prompts", style=discord.ButtonStyle.primary if self.current_tab == "prompts" else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab=="prompts"))
+        btn_docs = ui.Button(label="Docs", style=discord.ButtonStyle.primary if self.current_tab == "docs" else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab=="docs"))
         btn_bl = ui.Button(label="Blacklist", style=discord.ButtonStyle.primary if self.current_tab == "blacklist" else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab=="blacklist"))
 
         btn_stats.callback = self.nav_stats
         btn_prof.callback = self.nav_profiles
         btn_prompts.callback = self.nav_prompts
+        btn_docs.callback = self.nav_docs
         btn_bl.callback = self.nav_blacklist
 
         self.add_item(btn_stats)
         self.add_item(btn_prof)
         self.add_item(btn_prompts)
+        self.add_item(btn_docs)
         self.add_item(btn_bl)
 
     async def nav_stats(self, i: discord.Interaction):
@@ -6252,6 +6285,9 @@ class ModBaseView(ui.View):
     async def nav_prompts(self, i: discord.Interaction):
         await i.response.defer(); view = ModPromptsView(self.cog, self.original_interaction); await view.update_display()
         
+    async def nav_docs(self, i: discord.Interaction):
+        await i.response.defer(); view = ModDocsView(self.cog, self.original_interaction); await view.update_display()
+        
     async def nav_blacklist(self, i: discord.Interaction):
         await i.response.defer(); view = ModBlacklistView(self.cog, self.original_interaction); await view.update_display()
         
@@ -6260,6 +6296,7 @@ class ModBaseView(ui.View):
         btn_stats = ui.Button(label="Stats", style=discord.ButtonStyle.primary if current_tab == "stats" else discord.ButtonStyle.secondary, row=4, disabled=(current_tab=="stats"))
         btn_prof = ui.Button(label="Profiles", style=discord.ButtonStyle.primary if current_tab == "profiles" else discord.ButtonStyle.secondary, row=4, disabled=(current_tab=="profiles"))
         btn_prompts = ui.Button(label="Prompts", style=discord.ButtonStyle.primary if current_tab == "prompts" else discord.ButtonStyle.secondary, row=4, disabled=(current_tab=="prompts"))
+        btn_docs = ui.Button(label="Docs", style=discord.ButtonStyle.primary if current_tab == "docs" else discord.ButtonStyle.secondary, row=4, disabled=(current_tab=="docs"))
         btn_bl = ui.Button(label="Blacklist", style=discord.ButtonStyle.primary if current_tab == "blacklist" else discord.ButtonStyle.secondary, row=4, disabled=(current_tab=="blacklist"))
 
         async def nav_stats(i: discord.Interaction):
@@ -6268,18 +6305,237 @@ class ModBaseView(ui.View):
             await i.response.defer(); view = ModProfilesView(cog, interaction); await view.update_display()
         async def nav_prompts(i: discord.Interaction):
             await i.response.defer(); view = ModPromptsView(cog, interaction); await view.update_display()
+        async def nav_docs(i: discord.Interaction):
+            await i.response.defer(); view = ModDocsView(cog, interaction); await view.update_display()
         async def nav_blacklist(i: discord.Interaction):
             await i.response.defer(); view = ModBlacklistView(cog, interaction); await view.update_display()
 
         btn_stats.callback = nav_stats
         btn_prof.callback = nav_profiles
         btn_prompts.callback = nav_prompts
+        btn_docs.callback = nav_docs
         btn_bl.callback = nav_blacklist
 
         target_view.add_item(btn_stats)
         target_view.add_item(btn_prof)
         target_view.add_item(btn_prompts)
+        target_view.add_item(btn_docs)
         target_view.add_item(btn_bl)
+
+def _sanitise_filename(name: str) -> str:
+    """Removes any special characters or directory traversal dots/slashes."""
+    import re
+    return re.sub(r'[^a-zA-Z0-9_-]', '', name)
+
+class ModDocsCreateModal(ui.Modal, title="Create Document"):
+    category = ui.TextInput(label="Category (Subfolder)", placeholder="e.g. apis, commands", required=True, max_length=50)
+    filename = ui.TextInput(label="File Name (without .txt)", placeholder="e.g. google_gemini", required=True, max_length=50)
+    content = ui.TextInput(label="Content", style=discord.TextStyle.paragraph, required=True, max_length=4000)
+    
+    def __init__(self, view):
+        super().__init__()
+        self.parent_view = view
+        
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        cat = _sanitise_filename(self.category.value.strip().lower())
+        name = _sanitise_filename(self.filename.value.strip().lower())
+        if not cat or not name:
+            await interaction.followup.send("Invalid category or file name.", ephemeral=True)
+            return
+        
+        target_dir = os.path.join(DOCS_DIR, cat)
+        os.makedirs(target_dir, exist_ok=True)
+        filepath = os.path.join(target_dir, f"{name}.txt")
+        
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(self.content.value)
+            
+        self.parent_view.cog.bot.loop.create_task(self.parent_view.cog._load_and_embed_docs())
+        
+        self.parent_view.selected_category = cat
+        self.parent_view.selected_file = f"{name}.txt"
+        self.parent_view._build_view()
+        await self.parent_view.update_display()
+
+class ModDocsEditModal(ui.Modal, title="Edit Document"):
+    content = ui.TextInput(label="Content", style=discord.TextStyle.paragraph, required=True, max_length=4000)
+    
+    def __init__(self, view, current_content):
+        super().__init__()
+        self.parent_view = view
+        self.content.default = current_content
+        
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        cat = self.parent_view.selected_category
+        name = self.parent_view.selected_file
+        filepath = os.path.join(DOCS_DIR, cat, name)
+        
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(self.content.value)
+            
+        self.parent_view.cog.bot.loop.create_task(self.parent_view.cog._load_and_embed_docs())
+        
+        self.parent_view._build_view()
+        await self.parent_view.update_display()
+
+class ModDocsView(ModBaseView):
+    def __init__(self, cog, interaction):
+        super().__init__(cog, interaction, "docs")
+        self.selected_category = None
+        self.selected_file = None
+        self.current_page = 0
+        self._build_view()
+
+    def _build_view(self):
+        self.clear_items()
+        
+        # 1. Scan Categories (Subfolders)
+        categories = []
+        if os.path.exists(DOCS_DIR):
+            categories = sorted([d for d in os.listdir(DOCS_DIR) if os.path.isdir(os.path.join(DOCS_DIR, d))])
+            
+        if categories and not self.selected_category:
+            self.selected_category = categories[0]
+            
+        # 2. Build Category Dropdown
+        if categories:
+            cat_opts = [discord.SelectOption(label=cat.upper(), value=cat, default=(cat == self.selected_category)) for cat in categories[:25]]
+            cat_select = ui.Select(placeholder="Select Category...", options=cat_opts, row=0)
+            
+            async def cat_cb(i: discord.Interaction):
+                self.selected_category = i.data['values'][0]
+                self.selected_file = None
+                self.current_page = 0
+                self._build_view()
+                await i.response.defer()
+                await self.update_display()
+                
+            cat_select.callback = cat_cb
+            self.add_item(cat_select)
+
+        # 3. Scan Files within Selected Category
+        files = []
+        if self.selected_category:
+            cat_dir = os.path.join(DOCS_DIR, self.selected_category)
+            if os.path.exists(cat_dir):
+                files = sorted([f for f in os.listdir(cat_dir) if f.endswith(".txt")])
+                
+        if files and not self.selected_file:
+            self.selected_file = files[0]
+
+        # 4. Build File Dropdown with Sliding Window Pagination
+        if files:
+            num_pages = (len(files) - 1) // DROPDOWN_MAX_OPTIONS + 1
+            if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
+            
+            start = self.current_page * DROPDOWN_MAX_OPTIONS
+            page_files = files[start : start + DROPDOWN_MAX_OPTIONS]
+            
+            file_opts = []
+            for f in page_files:
+                label = f.replace(".txt", "").replace("_", " ").title()
+                file_opts.append(discord.SelectOption(label=label[:100], value=f, default=(f == self.selected_file)))
+                
+            file_select = ui.Select(placeholder="Select Document...", options=file_opts, row=1)
+            
+            async def file_cb(i: discord.Interaction):
+                self.selected_file = i.data['values'][0]
+                self._build_view()
+                await i.response.defer()
+                await self.update_display()
+                
+            file_select.callback = file_cb
+            self.add_item(file_select)
+
+            if num_pages > 1:
+                async def p_cb(i: discord.Interaction):
+                    self.current_page -= 1
+                    self._build_view()
+                    await i.response.defer()
+                    await self.update_display()
+                async def n_cb(i: discord.Interaction):
+                    self.current_page += 1
+                    self._build_view()
+                    await i.response.defer()
+                    await self.update_display()
+                    
+                build_pagination_controls(self, self.current_page, num_pages, 2, p_cb, n_cb)
+
+        # 5. Build Action Buttons
+        action_row = 3 if len(files) > DROPDOWN_MAX_OPTIONS else 2
+        
+        btn_create = ui.Button(label="Create New", style=discord.ButtonStyle.green, row=action_row)
+        async def create_cb(i: discord.Interaction):
+            await i.response.send_modal(ModDocsCreateModal(self))
+        btn_create.callback = create_cb
+        self.add_item(btn_create)
+
+        btn_edit = ui.Button(label="Edit", style=discord.ButtonStyle.primary, disabled=(not self.selected_file), row=action_row)
+        async def edit_cb(i: discord.Interaction):
+            filepath = os.path.join(DOCS_DIR, self.selected_category, self.selected_file)
+            content = ""
+            if os.path.exists(filepath):
+                with open(filepath, "r", encoding="utf-8") as f:
+                    content = f.read()
+            await i.response.send_modal(ModDocsEditModal(self, content))
+        btn_edit.callback = edit_cb
+        self.add_item(btn_edit)
+
+        btn_delete = ui.Button(label="Delete", style=discord.ButtonStyle.danger, disabled=(not self.selected_file), row=action_row)
+        async def delete_cb(i: discord.Interaction):
+            confirm_view = ui.View(timeout=60)
+            async def confirm_action(confirm_i: discord.Interaction):
+                filepath = os.path.join(DOCS_DIR, self.selected_category, self.selected_file)
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                    
+                # Re-index
+                self.cog.bot.loop.create_task(self.cog._load_and_embed_docs())
+                
+                self.selected_file = None
+                self._build_view()
+                await confirm_i.response.edit_message(content=f"Deleted successfully.", view=None, embed=None)
+                await self.update_display()
+                
+            btn_confirm = ui.Button(label="Confirm Delete", style=discord.ButtonStyle.danger)
+            btn_confirm.callback = confirm_action
+            confirm_view.add_item(btn_confirm)
+            await i.response.send_message(f"Are you sure you want to delete `{self.selected_file}`?", view=confirm_view, ephemeral=True)
+            
+        btn_delete.callback = delete_cb
+        self.add_item(btn_delete)
+
+        self._add_nav_buttons()
+
+    def _get_embed(self) -> discord.Embed:
+        embed = discord.Embed(title="Global System Documentation", color=discord.Color.dark_magenta())
+        
+        if self.selected_file and self.selected_category:
+            filepath = os.path.join(DOCS_DIR, self.selected_category, self.selected_file)
+            content = "No content."
+            if os.path.exists(filepath):
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                except Exception as e:
+                    content = f"Error reading file: {e}"
+            
+            clean_name = self.selected_file.replace(".txt", "").replace("_", " ").title()
+            embed.set_author(name=f"Category: {self.selected_category.upper()} | Document: {clean_name}")
+            
+            if len(content) > 2048:
+                embed.description = content[:2045] + "..."
+            else:
+                embed.description = content
+        else:
+            embed.description = "No documentation files found. Click 'Create New' to build your first RAG shard."
+            
+        return embed
+
+    async def update_display(self):
+        await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
 
 class ModBlacklistModal(ui.Modal, title="Enter User ID"):
     user_id_input = ui.TextInput(label="Discord User ID", required=True)
@@ -6598,7 +6854,8 @@ class ModPromptsView(ModBaseView):
             ("Profile Generator", "PROFILE_GENERATOR", DEFAULT_PROFILE_GENERATOR_PROMPT),
             ("Training Analyst", "TRAINING_ANALYST", DEFAULT_TRAINING_ANALYST_PROMPT),
             ("Whisper Injection", "WHISPER_INJECTION", DEFAULT_WHISPER_INJECTION),
-            ("Neuro-Endocrine Engine", "NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION)
+            ("Neuro-Endocrine Engine", "NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION),
+            ("Help Mode Protocol", "HELP_MODE_INJECTION", DEFAULT_HELP_MODE_INJECTION)
         ]
         
         options = [discord.SelectOption(label=lbl, value=key) for lbl, key, _ in prompt_keys]

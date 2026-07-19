@@ -617,6 +617,44 @@ def _yield_message_chunks(content: str, max_length: int = DISCORD_MAX_MESSAGE_LE
 
 class ServicesMixin:
 
+    async def _ensure_guide_vectors(self, guild_id: Optional[int]):
+        if hasattr(self, 'guide_vectors') and self.guide_vectors:
+            return
+            
+        api_key = None
+        if guild_id:
+            api_key = self._get_api_key_for_guild(guild_id)
+        if not api_key:
+            owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+            api_key = self._get_api_key_for_user(owner_id, "gemini")
+        
+        if not api_key: return
+        
+        try:
+            from .content import DOC_CATEGORIES, HELP_CATEGORIES
+            chunks = []
+            for d in [DOC_CATEGORIES, HELP_CATEGORIES]:
+                for cat, pages in d.items():
+                    for page, text in pages.items():
+                        chunks.append(f"[{cat} - {page}]\n{text}")
+            
+            client = genai.Client(api_key=api_key)
+            self.guide_vectors = []
+            for chunk in chunks:
+                try:
+                    result = await asyncio.wait_for(
+                        client.aio.models.embed_content(
+                            model='gemini-embedding-001',
+                            contents=chunk,
+                            config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT", output_dimensionality=256)
+                        ), timeout=5.0)
+                    emb = result.embeddings[0].values
+                    self.guide_vectors.append({"text": chunk, "emb": emb})
+                except Exception as e:
+                    print(f"Guide embedding failed: {e}")
+        except Exception as e:
+            print(f"Failed to generate guide vectors overall: {e}")
+
     def _instantiate_model(self, raw_model_name: str, guild_id: Optional[int], user_id: Optional[int], system_instruction: Optional[str] = None, safety_settings: Optional[Dict] = None, thinking_params: Optional[Dict] = None, tools: Optional[List] = None, profile_settings: Optional[Dict] = None):
         name_upper = raw_model_name.upper()
         actual_name = raw_model_name
@@ -2251,11 +2289,21 @@ class ServicesMixin:
                             # Fallback to the last available turn for vector search context
                             dynamic_context_for_turn = session["unified_log"][-1].get("content", "")
 
-                        # Parallelise Training Examples and LTM retrieval to reduce physical latency
+                        # Parallelise Training Examples, LTM retrieval, and Help Context
                         ltm_task = self._get_relevant_ltm_for_prompt(session_key, contents_for_api_call, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id)
                         training_task = self._get_relevant_training_examples(owner_id, profile_name, dynamic_context_for_turn, channel.guild.id)
                         
-                        ltm_recall_text, training_examples_list = await asyncio.gather(ltm_task, training_task)
+                        help_task = None
+                        if p_settings.get("help_mode_enabled", False):
+                            help_task = self._get_relevant_help_context(dynamic_context_for_turn, channel.guild.id)
+                        
+                        tasks_to_gather = [ltm_task, training_task]
+                        if help_task: tasks_to_gather.append(help_task)
+                            
+                        gathered_results = await asyncio.gather(*tasks_to_gather)
+                        ltm_recall_text = gathered_results[0]
+                        training_examples_list = gathered_results[1]
+                        help_context_text = gathered_results[2] if help_task else None
 
                         full_system_instruction, _, grounding_enabled, temp, top_p, top_k, primary_model, fallback_model_name = self._construct_system_instructions(
                             owner_id, profile_name, channel.id, is_multi_profile=True, training_examples_list=training_examples_list, recalled_ltm=ltm_recall_text
@@ -2385,6 +2433,9 @@ class ServicesMixin:
                         if p_settings.get("url_fetching_enabled", False) and round_url_text_contexts:
                             url_instr = "<document_context>\n" + "\n".join(round_url_text_contexts) + "\n</document_context>"
                             supplementary_parts.append(url_instr)
+                            
+                        if help_context_text:
+                            supplementary_parts.append(help_context_text)
 
                         # [FIXED] Ephemeral Media Injection: Manually add all current round media to the API call
                         # This allows participants to see images this round without them persisting in RAM history.
@@ -6549,6 +6600,11 @@ class ServicesMixin:
             response = None
             fallback_used = False
             
+            all_participant_names = []
+            for p_data_temp in session.get("profiles", []):
+                app_name_temp, _ = self._resolve_appearance_data(p_data_temp['owner_id'], p_data_temp['profile_name'])
+                all_participant_names.append(app_name_temp)
+            
             t_start_regen = time.monotonic()
             try:
                 response, state_container = await self._generate_with_heartbeat(
@@ -6561,7 +6617,7 @@ class ServicesMixin:
                 raw_text_check = getattr(response, 'text', "").strip()
                 temp_clean = re.sub(r'<neuro_update>\s*(.*?)\s*</neuro_update>', '', raw_text_check, flags=re.IGNORECASE | re.DOTALL)
                 temp_clean = re.sub(r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})', '', temp_clean, flags=re.IGNORECASE)
-                temp_scrubbed = self._scrub_response_text(temp_clean)
+                temp_scrubbed = self._scrub_response_text(temp_clean, participant_names=all_participant_names)
                 temp_dedup = self._deduplicate_response(temp_scrubbed)
                 
                 if not temp_dedup:
@@ -6640,7 +6696,7 @@ class ServicesMixin:
                         fb_raw_check = getattr(response, 'text', "").strip()
                         temp_clean = re.sub(r'<neuro_update>\s*(.*?)\s*</neuro_update>', '', fb_raw_check, flags=re.IGNORECASE | re.DOTALL)
                         temp_clean = re.sub(r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})', '', temp_clean, flags=re.IGNORECASE)
-                        temp_scrubbed = self._scrub_response_text(temp_clean)
+                        temp_scrubbed = self._scrub_response_text(temp_clean, participant_names=all_participant_names)
                         temp_dedup = self._deduplicate_response(temp_scrubbed)
                         
                         if not temp_dedup:
@@ -6692,7 +6748,7 @@ class ServicesMixin:
                 
                 raw_text, parsed_neuro_state = self._extract_and_apply_neuro_state(raw_text, p_owner_id, p_name)
                 
-                new_text = self._deduplicate_response(self._scrub_response_text(raw_text))
+                new_text = self._deduplicate_response(self._scrub_response_text(raw_text, participant_names=all_participant_names))
                 
                 if new_text == "[REPETITIVE_CONTENT_ERROR]":
                     new_text = p_profile.get("error_response", ERR_GENERAL_ERROR)

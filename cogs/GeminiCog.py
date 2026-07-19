@@ -4,6 +4,7 @@ from .mixins.services import *
 from .mixins.constants import *
 from .mixins.core import *
 from .mixins.gui import *
+from .mixins.help import HelpMixin
 
 from discord.ext import commands
 import discord
@@ -41,7 +42,7 @@ class LRUCache(OrderedDict):
             oldest = next(iter(self))
             del self[oldest]
 
-class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
+class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixin):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.manager_queue = bot.manager_queue
@@ -50,6 +51,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         
         # [NEW] Client placeholder for session-specific usage
         self.client = None
+        self.guide_vectors = []
         
         self._try_acquire_lock()
 
@@ -335,8 +337,12 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
         index = self._get_user_index(interaction.user.id)
         is_personal = profile_name in index.get("personal", [])
         is_borrowed = profile_name in index.get("borrowed", [])
+        
+        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+        owner_idx = self._get_user_index(owner_id)
+        is_system = profile_name in owner_idx.get("system", {})
 
-        if not is_personal and not is_borrowed:
+        if not is_personal and not is_borrowed and not is_system:
             await interaction.followup.send(f"Profile '{profile_name}' not found.", ephemeral=True)
             return
             
@@ -635,7 +641,12 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             index = self._get_user_index(interaction.user.id)
             is_personal = profile_name in index.get("personal", [])
             is_borrowed = profile_name in index.get("borrowed", [])
-            if not is_personal and not is_borrowed:
+            
+            owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+            owner_idx = self._get_user_index(owner_id)
+            is_system = profile_name in owner_idx.get("system", {})
+            
+            if not is_personal and not is_borrowed and not is_system:
                 await interaction.followup.send(f"You do not have a profile named '{profile_name}'.", ephemeral=True)
                 return
 
@@ -655,9 +666,11 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
                 method = "child_bot"
                 bot_id_to_use = linked_bot_id
             
+            participant_owner = owner_id if is_system else interaction.user.id
+
             # Create new participant object for comparison
             new_participant = {
-                "owner_id": interaction.user.id, "profile_name": profile_name,
+                "owner_id": participant_owner, "profile_name": profile_name,
                 "method": method, "ephemeral": False
             }
             if bot_id_to_use:
@@ -1326,21 +1339,191 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="documentation", description="Interactive guide for prompt engineering, intelligence, pricing, and generation parameters.")
-    @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)
-    async def documentation_slash(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        from .mixins.content import DOC_CATEGORIES
-        view = DropdownContentView(DOC_CATEGORIES, "MimicAI Advanced Documentation")
-        await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
-
-    @app_commands.command(name="help", description="Displays detailed documentation about the bot's features and commands.")
+    @app_commands.command(name="guide", description="Displays detailed documentation about the bot's features and commands.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
-    async def help_slash(self, interaction: discord.Interaction):
+    async def guide_slash(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         from .mixins.content import HELP_CATEGORIES
         view = DropdownContentView(HELP_CATEGORIES, "MimicAI Help & Documentation")
         await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
+
+    @app_commands.command(name="help", description="Toggle MimicGuide into this session, or instantly ask a technical question.")
+    @app_commands.checks.cooldown(2, 60.0, key=lambda i: i.user.id)
+    @app_commands.describe(ask="A technical question to ask the bot directly (Optional).")
+    async def help_slash(self, interaction: discord.Interaction, ask: Optional[str] = None):
+        await interaction.response.defer(ephemeral=True)
+        
+        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+        self._get_or_create_system_profile("mimicguide")
+        
+        if ask:
+            if not hasattr(self, 'doc_vectors') or not self.doc_vectors:
+                await interaction.followup.send("Documentation vectors are not loaded or missing. Ensure the Bot Owner has configured an API key.", ephemeral=True)
+                return
+                
+            guild_id = interaction.guild_id if interaction.guild else 0
+            protocol_block = await self._get_relevant_help_context(ask, guild_id, force_always_respond=True)
+            
+            if not protocol_block:
+                await interaction.followup.send("I couldn't find anything in the documentation related to your question.", ephemeral=True)
+                return
+            
+            # --- Fetch mimicguide configuration ---
+            p_config = self._get_profile_config(owner_id, "mimicguide", False) or {}
+            prompts = self._get_profile_prompts(owner_id, "mimicguide") or {}
+            
+            # --- Construct Base System Instruction (Bypassing Fluff) ---
+            persona_data = prompts.get("persona", {})
+            ai_instr_str = prompts.get("ai_instructions", "")
+            
+            final_instr_parts = []
+            
+            if persona_data and any(persona_data.values()):
+                persona_blocks = []
+                for key in self.persona_modal_sections_order: 
+                    if lines := persona_data.get(key,[]):
+                        decrypted_lines = [self._decrypt_data(line).strip() for line in lines if line.strip()]
+                        if any(l.strip() for l in decrypted_lines):
+                            block_content = "\n".join(decrypted_lines)
+                            persona_blocks.append(f"<{key}>\n{block_content}\n</{key}>")
+                if persona_blocks:
+                    persona_str = "<persona_profile>\n" + "\n\n".join(persona_blocks) + "\n</persona_profile>"
+                    final_instr_parts.append(persona_str)
+                    
+            decrypted_parts = []
+            if isinstance(ai_instr_str, list):
+                for part in ai_instr_str:
+                    dec = self._decrypt_data(part)
+                    if dec.strip():
+                        cleaned_part = "\n".join([line.strip() for line in dec.split("\n")])
+                        decrypted_parts.append(cleaned_part)
+            elif isinstance(ai_instr_str, str):
+                dec = self._decrypt_data(ai_instr_str)
+                if dec.strip():
+                    cleaned_part = "\n".join([line.strip() for line in dec.split("\n")])
+                    decrypted_parts.append(cleaned_part)
+            
+            if decrypted_parts:
+                final_instr_parts.append("<instructions>\n" + "\n\n".join(decrypted_parts).strip() + "\n</instructions>")
+                
+            final_instr_parts.append(protocol_block)
+            
+            sys_prompt = "\n\n".join(final_instr_parts).strip() if final_instr_parts else DEFAULT_SYSTEM_INSTRUCTION
+            
+            # --- Assemble Payload & Parameters ---
+            user_prompt = f"<user_query>\n{ask}\n</user_query>"
+            contents_for_api_call = [{'role': 'user', 'parts': [user_prompt]}]
+            
+            temp = float(p_config.get("temperature", 0.2))
+            top_p = float(p_config.get("top_p", 0.9))
+            top_k = int(p_config.get("top_k", 40))
+            
+            adv_params = {
+                "frequency_penalty": p_config.get("frequency_penalty"),
+                "presence_penalty": p_config.get("presence_penalty"),
+                "repetition_penalty": p_config.get("repetition_penalty"),
+                "min_p": p_config.get("min_p"),
+                "top_a": p_config.get("top_a")
+            }
+            adv_params = {k: v for k, v in adv_params.items() if v is not None}
+            gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "_advanced_params": adv_params}
+            
+            t_params_worker = {
+                "thinking_summary_visible": p_config.get("thinking_summary_visible", "off"),
+                "thinking_level": p_config.get("thinking_level", "none"),
+                "thinking_budget": p_config.get("thinking_budget", -1)
+            }
+            
+            safety_level_str = p_config.get('safety_level', 'low')
+            safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
+            threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
+            d_safe = { cat: threshold for cat in get_args(HarmCategory) }
+            
+            primary_model = p_config.get("primary_model", "GOOGLE/gemini-2.5-flash-lite")
+            fallback_model_name = p_config.get("fallback_model", "GOOGLE/gemini-2.5-flash-lite")
+            custom_error = p_config.get("error_response", "An error has occurred.")
+            
+            model_to_use = primary_model
+            model_instance = None
+            response_text = ""
+            
+            # --- Execute Pipeline ---
+            try:
+                # Intentionally passing None for tools to strictly disable grounding/fetching overrides
+                model_instance = self._instantiate_model(model_to_use, guild_id, owner_id, sys_prompt, d_safe, t_params_worker, None, p_config)
+                resp = await model_instance.generate_content_async(contents_for_api_call, generation_config=gen_config)
+                
+                if not resp or not resp.candidates:
+                    raise ValueError("Empty or blocked response")
+                    
+                response_text = getattr(resp, 'text', "")
+            except Exception as e:
+                try:
+                    model_to_use = fallback_model_name
+                    model_instance = self._instantiate_model(model_to_use, guild_id, owner_id, sys_prompt, d_safe, t_params_worker, None, p_config)
+                    resp = await model_instance.generate_content_async(contents_for_api_call, generation_config=gen_config)
+                    
+                    if not resp or not resp.candidates:
+                        raise ValueError("Empty or blocked response")
+                        
+                    response_text = getattr(resp, 'text', "")
+                except Exception as fb_e:
+                    print(f"/help ask Fallback error: {fb_e}")
+                    response_text = f"{custom_error}\n\n-# (API Failure)"
+                    
+            response_text = self._scrub_response_text(response_text).strip()
+            if not response_text:
+                response_text = custom_error
+                
+            await interaction.followup.send(response_text, ephemeral=True)
+            
+        else:
+            owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+            self._get_or_create_system_profile("mimicguide")
+            
+            session = self.multi_profile_channels.get(interaction.channel_id)
+            action_taken = None
+            result_msg = ""
+            
+            participant = {
+                "owner_id": owner_id,
+                "profile_name": "mimicguide",
+                "method": "webhook",
+                "ephemeral": False
+            }
+            
+            if not session:
+                chat_sessions = {(owner_id, "mimicguide"): None}
+                session = {
+                    "type": "multi", "profiles": [participant], "chat_sessions": chat_sessions,
+                    "unified_log": [], "is_hydrated": False, "owner_id": interaction.user.id, "is_running": False,
+                    "task_queue": asyncio.Queue(), "worker_task": None, "session_mode": "sequential"
+                }
+                self.multi_profile_channels[interaction.channel_id] = session
+                result_msg = "MimicGuide joined and created a new Chat Session."
+            else:
+                participant_index = -1
+                for i, p in enumerate(session['profiles']):
+                    if p.get('owner_id') == owner_id and p.get('profile_name') == "mimicguide":
+                        participant_index = i
+                        break
+                
+                if participant_index != -1:
+                    removed_p = session['profiles'].pop(participant_index)
+                    session['chat_sessions'].pop((removed_p['owner_id'], removed_p['profile_name']), None)
+                    result_msg = "MimicGuide departed the Chat Session."
+                    if not session['profiles']:
+                        self.multi_profile_channels.pop(interaction.channel_id, None)
+                else:
+                    if len(session['profiles']) >= 200:
+                        await interaction.followup.send("The session is full (200 max).", ephemeral=True)
+                        return
+                    session['profiles'].append(participant)
+                    session['chat_sessions'][(owner_id, "mimicguide")] = None
+                    result_msg = "MimicGuide joined the Chat Session."
+            
+            self._save_multi_profile_sessions()
+            await interaction.followup.send(result_msg, ephemeral=True)
 
     @app_commands.command(name="terms", description="View the MimicAI Terms of Service and Privacy Policy.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -1491,7 +1674,8 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin):
             # If it's the speak command, only show profiles owned by the command user (unless bot owner)
             if interaction.command.name == "speak":
                 if owner_id != interaction.user.id and interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
-                    continue
+                    if owner_id != int(defaultConfig.DISCORD_OWNER_ID): # Allow system profiles to pass
+                        continue
             
             value = f"{owner_id}:{profile_name}"
 
