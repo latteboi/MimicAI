@@ -422,14 +422,32 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
     @app_commands.command(name="import", description="Import profiles and memories from a MimicAI export file (DM Only).")
     @app_commands.checks.cooldown(1, 30.0, key=lambda i: i.user.id)
     @app_commands.dm_only()
-    @app_commands.describe(file="The .mimic file exported from a MimicAI instance.", passphrase="Required if the file was exported using the Self-Hosted option.")
-    async def import_command(self, interaction: discord.Interaction, file: discord.Attachment, passphrase: Optional[str] = None):
+    @app_commands.describe(file="The .mimic file exported from a MimicAI instance.")
+    async def import_command(self, interaction: discord.Interaction, file: discord.Attachment):
         if not file.filename.endswith('.mimic'):
             await interaction.response.send_message("❌ Invalid file type. Please upload a `.mimic` file.", ephemeral=True)
             return
         
+        try:
+            file_bytes = await file.read()
+            container = json.loads(file_bytes)
+            auth_mode = container.get("auth_mode")
+            
+            is_official = (self.bot.user and self.bot.user.id == 1376696185947164854)
+            if is_official and auth_mode != "master":
+                await interaction.response.send_message("❌ The official MimicAI instance strictly rejects third-party or self-hosted profile imports. You can only import files exported directly from this official bot.", ephemeral=True)
+                return
+                
+            if auth_mode == "passphrase":
+                from .mixins.gui import ImportPassphraseModal
+                await interaction.response.send_modal(ImportPassphraseModal(self, file_bytes))
+                return
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed to read or parse file: {e}", ephemeral=True)
+            return
+        
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self._execute_import(interaction, file, passphrase)
+        await self._execute_import(interaction, file_bytes)
 
     @app_commands.command(name="privacy", description="Manage your data privacy and account deletion.")
     @app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)

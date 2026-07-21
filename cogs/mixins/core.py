@@ -1656,10 +1656,8 @@ class CoreMixin:
             
         await interaction.followup.send(msg, file=discord_file, ephemeral=True)
 
-    async def _execute_import(self, interaction: discord.Interaction, attachment: discord.Attachment, passphrase: Optional[str] = None):
+    async def _execute_import(self, interaction: discord.Interaction, file_bytes: bytes, passphrase: Optional[str] = None):
         try:
-            file_bytes = await attachment.read()
-            
             try:
                 container = json.loads(file_bytes)
             except json.JSONDecodeError:
@@ -1674,7 +1672,7 @@ class CoreMixin:
 
             if auth_mode == "passphrase":
                 if not passphrase:
-                    raise ValueError("This file is encrypted with a passphrase for self-hosted migration. You must provide the passphrase in the command options to import it.")
+                    raise ValueError("This file is encrypted with a passphrase. Please use the import command properly to enter it.")
                 
                 salt_b64 = container.get("salt")
                 if not salt_b64:

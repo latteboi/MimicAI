@@ -1252,6 +1252,10 @@ class StorageMixin:
                 # Determine profile type
                 if is_borrowed:
                     index["borrowed"][p_name] = pid_folder
+                elif pid_folder.startswith("X"):
+                    if "system" not in index:
+                        index["system"] = {}
+                    index["system"][p_name] = pid_folder
                 else:
                     index["personal"][p_name] = pid_folder
 

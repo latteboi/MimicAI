@@ -6199,6 +6199,18 @@ class ExportPassphraseModal(ui.Modal, title="Self-Hosted Export"):
         passphrase = self.passphrase_input.value
         await self.parent_view.cog._execute_export(interaction, list(self.parent_view.selected_profiles), self.parent_view.export_filters, passphrase=passphrase)
 
+class ImportPassphraseModal(ui.Modal, title="Enter Passphrase"):
+    passphrase_input = ui.TextInput(label="Passphrase", placeholder="Enter the passphrase used for export", required=True, min_length=8, max_length=100)
+
+    def __init__(self, cog, file_bytes: bytes):
+        super().__init__()
+        self.cog = cog
+        self.file_bytes = file_bytes
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.cog._execute_import(interaction, file_bytes=self.file_bytes, passphrase=self.passphrase_input.value)
+
 class BulkExportView(BaseBulkProfileView):
     def __init__(self, cog: 'GeminiAgent', user_id: int):
         super().__init__(cog, user_id, include_borrowed=False)
