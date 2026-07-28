@@ -73,8 +73,8 @@ OLLAMA_LOCAL_URL = "http://127.0.0.1:11434"
 
 # Define the allowed models for the new command
 ALLOWED_MODELS = Literal[
-    'gemini-pro-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest',
-    'gemini-3.5-flash', 'gemini-3.1-pro-preview', 'gemini-3.1-flash-lite', 'gemini-3-flash-preview', 'gemini-robotics-er-1.6-preview',
+    'gemini-pro-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-3.6-flash'
+    'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-pro-preview', 'gemini-3.1-flash-lite', 'gemini-3-flash-preview', 'gemini-robotics-er-1.6-preview',
     'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'
 ]
 
@@ -409,6 +409,6 @@ DEFAULT_HELP_MODE_INJECTION = (
     "        ├── Action: Toggle Proactivity (Enable/disable automated timer)\n"
     "        └── Action: Edit Settings & AI Director (Set chance, cooldown, and Director model)\n"
     "=========================================\n\n"
-    "When using the visualisation map, directly state the exact Dashboard, Tab, and Action path needed. Do not use metaphors. If the answer is not in the manual or on this map, state exactly: \"I do not have documentation for that issue.\"\n"
+    "When using the visualisation map, directly state the exact Dashboard, Tab, and Action path needed.\"\n"
     "</system_note>"
 )
