@@ -2107,7 +2107,7 @@ class CoreMixin:
                 
                 # Verify if the profile continues to exist for the owner
                 p_index = self._get_user_index(p_owner_id)
-                exists = (p_name in p_index.get("personal", {})) or (p_name in p_index.get("borrowed", {}))
+                exists = (p_name in p_index.get("personal", {})) or (p_name in p_index.get("borrowed", {})) or (p_name in p_index.get("system", {}))
                 
                 if exists:
                     valid_profiles.append(p)
