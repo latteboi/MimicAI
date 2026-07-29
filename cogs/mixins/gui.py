@@ -1018,6 +1018,9 @@ class ProfileManageView(ui.View):
 
     def _build_view(self):
         self.clear_items()
+        if self.is_read_only:
+            return
+
         is_mod = getattr(self, 'is_mod_view', False)
 
         def tab_has_options(tab: str) -> bool:
@@ -1040,57 +1043,62 @@ class ProfileManageView(ui.View):
         # --- 1. Category Dropdown (Row 0) ---
         options = []
         
-        if self.is_read_only:
-            options.append(discord.SelectOption(label="Read-Only System Profile", value="none", description="Settings are managed globally."))
-        else:
-            if self.current_tab == "home":
-                if not is_mod:
-                    options.append(discord.SelectOption(label="Rename Profile", value="rename", description="Change the local name of this profile."))
-                    
-                    if not self.is_borrowed:
-                        options.append(discord.SelectOption(label="Duplicate Profile", value="duplicate", description="Create a new profile from a copy of this one."))
-                        options.append(discord.SelectOption(label="Share Profile", value="share", description="Share this profile with others or publish it."))
-                        options.append(discord.SelectOption(label="Custom Error Message", value="error_response", description="Set the message shown when generation fails."))
-                        options.append(discord.SelectOption(label="Generation Visual", value="generation_visual", description="Set custom placeholder emoji and child bot behavior."))
-                    
-                    options.append(discord.SelectOption(label="Cycle Content Safety Level", value="safety_level", description="Cycle: Low -> Medium -> High -> Unrestricted 18+."))
+        if self.current_tab == "home":
+            if not is_mod:
+                options.append(discord.SelectOption(label="Rename Profile", value="rename", description="Change the local name of this profile."))
                 
-                label = "Remove Borrowed Profile" if self.is_borrowed else "Delete Profile"
-                options.append(discord.SelectOption(label=label, value="delete", description="Permanently remove this profile and its data."))
-
-            elif self.current_tab == "persona":
-                options.append(discord.SelectOption(label="Edit Persona", value="edit_persona", description="Edit backstory, traits, likes, dislikes, and appearance."))
-                options.append(discord.SelectOption(label="Edit Instructions", value="edit_instructions", description="Edit specific AI behavioral instructions."))
-                options.append(discord.SelectOption(label="TTS Instructions", value="tts_instructions", description="Configure the 'Director's Desk' for vocal performance."))
-                if not is_mod and not self.is_borrowed:
-                    options.append(discord.SelectOption(label="Edit Appearance", value="edit_appearance", description="Edit the custom Webhook name and avatar."))
-
-            elif self.current_tab == "params" and not is_mod:
-                options.append(discord.SelectOption(label="Set Models", value="models", description="Choose Primary and Fallback AI models."))
-                options.append(discord.SelectOption(label="Set Generation Parameters & STM", value="gen_params", description="Set Temp, Top P, Top K, and STM Length."))
-                options.append(discord.SelectOption(label="Set Advanced Parameters (OPENROUTER)", value="adv_params", description="Set penalties, Min P, and Top A."))
-                options.append(discord.SelectOption(label="Set Thinking Parameters", value="thinking_params", description="Set thinking persistence, level, and budget."))
-                options.append(discord.SelectOption(label="Set Speech & Voice Settings", value="speech_settings", description="Set TTS voice, model, and temperature."))
-
-            elif self.current_tab == "tools" and not is_mod:
-                options.append(discord.SelectOption(label="Toggle Image Generation", value="image_toggle", description="Allow this profile to generate images via !image/!imagine."))
-                options.append(discord.SelectOption(label="Toggle Grounding (Web Search)", value="grounding", description="Cycle Grounding: OFF -> NATIVE -> RAG."))
-                options.append(discord.SelectOption(label="Toggle URL Context Fetching", value="url_toggle", description="Cycle URL Context: OFF -> NATIVE -> RAG."))
-                options.append(discord.SelectOption(label="Cycle Response Mode", value="cycle_response", description="Cycle: Regular -> Mention -> Reply -> Mention Reply."))
-                options.append(discord.SelectOption(label="Set Time & Timezone", value="time", description="Enable time awareness and set the profile's timezone."))
-                options.append(discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable a human-like delay when the bot sends messages."))
-                options.append(discord.SelectOption(label="Toggle Anti-Repetition Critic", value="critic", description="Enable semantic repetition analysis (Adds latency)."))
-                options.append(discord.SelectOption(label="Toggle Neuro-Endocrine Engine", value="neuro", description="Simulate hormonal states for dynamic emotions."))
-                options.append(discord.SelectOption(label="Toggle Help Mode (Guide RAG)", value="help_mode", description="Allow profile to answer technical bot questions."))
-
-            elif self.current_tab == "memory" and not is_mod:
-                options.append(discord.SelectOption(label="Manage Data (LTM & Training)", value="data", description="Add, list, edit, or delete memories and examples."))
                 if not self.is_borrowed:
-                    options.append(discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training context size and relevance threshold."))
-                options.append(discord.SelectOption(label="Toggle LTM Auto-Creation", value="ltm_creation", description="Automatically create memories from conversations."))
-                options.append(discord.SelectOption(label="Set LTM Parameters", value="ltm_params", description="Set frequency, context, and recall settings."))
-                if not self.is_borrowed:
-                    options.append(discord.SelectOption(label="Set LTM Summarization Prompt", value="ltm_summarization", description="Customize how the AI creates memories."))
+                    options.append(discord.SelectOption(label="Duplicate Profile", value="duplicate", description="Create a new profile from a copy of this one."))
+                    options.append(discord.SelectOption(label="Share Profile", value="share", description="Share this profile with others or publish it."))
+                    options.append(discord.SelectOption(label="Custom Error Message", value="error_response", description="Set the message shown when generation fails."))
+                    options.append(discord.SelectOption(label="Generation Visual", value="generation_visual", description="Set custom placeholder emoji and child bot behavior."))
+                    
+                    owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+                    if self.original_interaction.user.id == owner_id:
+                        if self.is_system:
+                            options.append(discord.SelectOption(label="Copy to Personal Profile", value="convert_to_personal", description="Create a Personal Profile copy from this System Profile."))
+                        else:
+                            options.append(discord.SelectOption(label="Copy to System Profile", value="convert_to_system", description="Create a global System Profile copy from this profile."))
+
+                options.append(discord.SelectOption(label="Cycle Content Safety Level", value="safety_level", description="Cycle: Low -> Medium -> High -> Unrestricted 18+."))
+            
+            label = "Remove Borrowed Profile" if self.is_borrowed else "Delete Profile"
+            options.append(discord.SelectOption(label=label, value="delete", description="Permanently remove this profile and its data."))
+
+        elif self.current_tab == "persona":
+            options.append(discord.SelectOption(label="Edit Persona", value="edit_persona", description="Edit backstory, traits, likes, dislikes, and appearance."))
+            options.append(discord.SelectOption(label="Edit Instructions", value="edit_instructions", description="Edit specific AI behavioral instructions."))
+            options.append(discord.SelectOption(label="TTS Instructions", value="tts_instructions", description="Configure the 'Director's Desk' for vocal performance."))
+            if not is_mod and not self.is_borrowed:
+                options.append(discord.SelectOption(label="Edit Appearance", value="edit_appearance", description="Edit the custom Webhook name and avatar."))
+
+        elif self.current_tab == "params" and not is_mod:
+            options.append(discord.SelectOption(label="Set Models", value="models", description="Choose Primary and Fallback AI models."))
+            options.append(discord.SelectOption(label="Set Generation Parameters & STM", value="gen_params", description="Set Temp, Top P, Top K, and STM Length."))
+            options.append(discord.SelectOption(label="Set Advanced Parameters (OPENROUTER)", value="adv_params", description="Set penalties, Min P, and Top A."))
+            options.append(discord.SelectOption(label="Set Thinking Parameters", value="thinking_params", description="Set thinking persistence, level, and budget."))
+            options.append(discord.SelectOption(label="Set Speech & Voice Settings", value="speech_settings", description="Set TTS voice, model, and temperature."))
+
+        elif self.current_tab == "tools" and not is_mod:
+            options.append(discord.SelectOption(label="Toggle Image Generation", value="image_toggle", description="Allow this profile to generate images via !image/!imagine."))
+            options.append(discord.SelectOption(label="Toggle Grounding (Web Search)", value="grounding", description="Cycle Grounding: OFF -> NATIVE -> RAG."))
+            options.append(discord.SelectOption(label="Toggle URL Context Fetching", value="url_toggle", description="Cycle URL Context: OFF -> NATIVE -> RAG."))
+            options.append(discord.SelectOption(label="Cycle Response Mode", value="cycle_response", description="Cycle: Regular -> Mention -> Reply -> Mention Reply."))
+            options.append(discord.SelectOption(label="Set Time & Timezone", value="time", description="Enable time awareness and set the profile's timezone."))
+            options.append(discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable a human-like delay when the bot sends messages."))
+            options.append(discord.SelectOption(label="Toggle Anti-Repetition Critic", value="critic", description="Enable semantic repetition analysis (Adds latency)."))
+            options.append(discord.SelectOption(label="Toggle Neuro-Endocrine Engine", value="neuro", description="Simulate hormonal states for dynamic emotions."))
+            options.append(discord.SelectOption(label="Toggle Help Mode (Guide RAG)", value="help_mode", description="Allow profile to answer technical bot questions."))
+
+        elif self.current_tab == "memory" and not is_mod:
+            options.append(discord.SelectOption(label="Manage Long-Term Memories", value="manage_ltm", description="Add, list, edit, or delete memories."))
+            if not self.is_borrowed:
+                options.append(discord.SelectOption(label="Manage Training Examples", value="manage_training", description="Add, list, edit, or delete training examples."))
+                options.append(discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training context size and relevance threshold."))
+            options.append(discord.SelectOption(label="Toggle LTM Auto-Creation", value="ltm_creation", description="Automatically create memories from conversations."))
+            options.append(discord.SelectOption(label="Set LTM Parameters", value="ltm_params", description="Set frequency, context, and recall settings."))
+            if not self.is_borrowed:
+                options.append(discord.SelectOption(label="Set LTM Summarization Prompt", value="ltm_summarization", description="Customize how the AI creates memories."))
 
         if options:
             select = ui.Select(placeholder=f"Select an action for {self.current_tab.title()}...", options=options, row=0)
@@ -1134,6 +1142,10 @@ class ProfileManageView(ui.View):
             await self._handle_duplicate(interaction)
         elif choice == "share":
             await self._handle_share(interaction)
+        elif choice == "convert_to_system":
+            await self._handle_convert_copy(interaction, to_system=True)
+        elif choice == "convert_to_personal":
+            await self._handle_convert_copy(interaction, to_system=False)
         elif choice == "delete":
             await self._handle_delete(interaction)
         elif choice == "safety_level":
@@ -1285,8 +1297,11 @@ class ProfileManageView(ui.View):
             await interaction.response.send_modal(modal)
 
         # --- Memory Tab Logic ---
-        elif choice == "data":
-            view = DataManageView(self.cog, self.original_interaction, profile_name, self.is_borrowed)
+        elif choice == "manage_ltm":
+            view = DataManageView(self.cog, interaction, profile_name, self.is_borrowed, mode='ltm', parent_manage_view=self)
+            await view.start()
+        elif choice == "manage_training":
+            view = DataManageView(self.cog, interaction, profile_name, self.is_borrowed, mode='training', parent_manage_view=self)
             await view.start()
             await interaction.response.defer()
         elif choice == "ltm_creation":
@@ -1465,6 +1480,36 @@ class ProfileManageView(ui.View):
             self.cog._copy_training_shard(str(self.user_id), self.profile_name, new_name)
             await self.original_interaction.edit_original_response(content=f"Duplicated to '{new_name}'.", view=None, embed=None)
         modal.on_submit = duplicate_submit
+        await interaction.response.send_modal(modal)
+
+    async def _handle_convert_copy(self, interaction: discord.Interaction, to_system: bool):
+        target_type = "System Profile" if to_system else "Personal Profile"
+        modal = ui.Modal(title=f"Copy to {target_type}")
+        new_name_input = ui.TextInput(
+            label="Destination Profile Name",
+            default=self.profile_name,
+            required=True,
+            max_length=30
+        )
+        modal.add_item(new_name_input)
+
+        async def convert_submit(i: discord.Interaction):
+            await i.response.defer(ephemeral=True, thinking=True)
+            target_name = new_name_input.value.lower().strip()
+            
+            success, msg = await self.cog._convert_copy_profile(
+                user_id=i.user.id,
+                source_name=self.profile_name,
+                target_name=target_name,
+                to_system=to_system
+            )
+            
+            if success:
+                await i.followup.send(f"✅ {msg}", ephemeral=True)
+            else:
+                await i.followup.send(f"❌ **Conversion Failed:** {msg}", ephemeral=True)
+
+        modal.on_submit = convert_submit
         await interaction.response.send_modal(modal)
 
     async def _handle_share(self, interaction):
@@ -4790,7 +4835,7 @@ class DataPageJumpModal(ui.Modal, title="Jump to Page"):
             await interaction.response.send_message(f"❌ Please enter a valid number between 1 and {self.parent_view.max_pages}.", ephemeral=True)
 
 class DataManageView(ui.View):
-    def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, profile_name: str, is_borrowed: bool):
+    def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, profile_name: str, is_borrowed: bool, mode: Optional[Literal['training', 'ltm']] = None, parent_manage_view: Optional['ProfileManageView'] = None):
         super().__init__(timeout=600)
         self.cog = cog
         self.original_interaction = interaction
@@ -4798,8 +4843,12 @@ class DataManageView(ui.View):
         self.guild_id = interaction.guild_id
         self.profile_name = profile_name
         self.is_borrowed = is_borrowed
+        self.parent_manage_view = parent_manage_view
         
-        self.mode: Literal['training', 'ltm'] = 'ltm' if self.is_borrowed else 'training'
+        if mode:
+            self.mode: Literal['training', 'ltm'] = mode
+        else:
+            self.mode: Literal['training', 'ltm'] = 'ltm' if self.is_borrowed else 'training'
         self.current_page = 1
         self.items_per_page = 1
         self.max_pages = 1
@@ -5004,7 +5053,7 @@ class DataManageView(ui.View):
                 select.callback = self.select_callback
                 self.add_item(select)
 
-        # [UPDATED] Row 3: Action Buttons
+        # Row 3: Action Buttons
         search_button = ui.Button(label="🔍 Search", style=discord.ButtonStyle.secondary, row=3)
         search_button.callback = self.search_callback
         self.add_item(search_button)
@@ -5026,6 +5075,16 @@ class DataManageView(ui.View):
             delete_all_button.disabled = False
         delete_all_button.callback = self.delete_all_callback
         self.add_item(delete_all_button)
+
+        if self.parent_manage_view:
+            back_button = ui.Button(label="Back to Dashboard", style=discord.ButtonStyle.secondary, emoji="⬅️", row=4)
+            async def back_callback(i: discord.Interaction):
+                await i.response.defer()
+                embed = await self.cog._build_profile_manage_embed(self.original_interaction, self.profile_name, target_user_id=self.parent_manage_view.user_id)
+                self.parent_manage_view._build_view()
+                await self.original_interaction.edit_original_response(embed=embed, view=self.parent_manage_view)
+            back_button.callback = back_callback
+            self.add_item(back_button)
 
     async def delete_all_callback(self, interaction: discord.Interaction):
         if not (self.mode == 'ltm' and self.ltm_filter and self.ltm_filter.startswith("server_")):
@@ -5716,7 +5775,7 @@ class WakewordsModal(ui.Modal, title="Manage Wakewords"):
 
 class AppearanceModal(ui.Modal):
     def __init__(self, cog: 'GeminiAgent', original_interaction: discord.Interaction, profile_name: str):
-        super().__init__(title=f"Appearance: '{profile_name[:30]}'")
+        super().__init__(title=f"Appearance: '{profile_name[:20]}'")
         self.cog = cog
         self.original_interaction = original_interaction
         self.profile_name = profile_name
@@ -5724,7 +5783,7 @@ class AppearanceModal(ui.Modal):
         user_id_str = str(original_interaction.user.id)
         current_data = self.cog.user_appearances.get(user_id_str, {}).get(self.profile_name, {})
         
-        self.display_name_input = ui.TextInput(label="Custom Display Name (Blank to reset)", required=False, max_length=80, default=current_data.get("custom_display_name"))
+        self.display_name_input = ui.TextInput(label="Custom Display Name (Blank to reset)", required=False, max_length=20, default=current_data.get("custom_display_name"))
         self.avatar_url_input = ui.TextInput(label="Avatar URL (Blank to reset)", required=False, default=current_data.get("custom_avatar_url"))
         self.add_item(self.display_name_input)
         self.add_item(self.avatar_url_input)
@@ -5735,9 +5794,11 @@ class AppearanceModal(ui.Modal):
         new_avatar_url = self.avatar_url_input.value.strip() or None
         user_id_str = str(interaction.user.id)
 
-        if new_display_name and new_display_name.lower() == 'clyde':
-            await interaction.followup.send("The name 'clyde' is reserved.", ephemeral=True)
-            return
+        if new_display_name:
+            is_valid, err_msg = self.cog._is_valid_profile_name(new_display_name)
+            if not is_valid:
+                await interaction.followup.send(f"❌ **Invalid Display Name:** {err_msg}", ephemeral=True)
+                return
 
         is_public = self.cog._is_profile_public(interaction.user.id, self.profile_name)
         if is_public and (new_display_name or new_avatar_url):

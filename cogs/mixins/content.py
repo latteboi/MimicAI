@@ -124,7 +124,7 @@ HELP_CATEGORIES = {
     },
     "7. Command Reference": {
         "Administration": "- `/session config`: Opens the interface to initialise standard Chat Sessions.\n- `/suspend`: Terminates the active session and flushes the buffer.\n- `/purge`: Executes a bulk message deletion operation and recursively scrubs associated internal memory indices.\n- `/profile speak`: Forces an anonymous execution of a designated profile payload. (Requires Webhook/Child Bot delivery).",
-        "Configuration": "- `/settings`: Private interface for API key authentication and Child Bot provisioning.\n- `/profile manage`: Central interface for profile manipulation.\n- `/profile bulk manage`: Executes batch manipulation across multiple profiles simultaneously.\n- `/profile data manage`: Interface for manual CRUD operations on vector-embedded databases (LTM/Training).",
+        "Configuration": "- `/settings`: Private interface for API key authentication and Child Bot provisioning.\n- `/profile manage`: Central interface for profile manipulation.\n- `/profile bulk manage`: Executes batch manipulation across multiple profiles simultaneously.\n- `/profile manage -> Memory`: Interface for manual CRUD operations on vector-embedded databases (LTM/Training).",
         "Interaction": "- `/session swap`: Changes the active profile context for the current session.\n- `/profile list`: Enumerates valid user indices.\n- `/session view`: Dumps session variables and participant statuses to chat.\n- `/refresh`: Performs a targeted wipe of the channel's Short-Term Memory buffer without destroying the session structure.\n- `/whisper`: Transmits hidden variables directly to a profile's context window, eliciting an ephemeral response."
     }
 }

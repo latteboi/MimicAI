@@ -162,11 +162,18 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
 
     profile_group = app_commands.Group(name="profile", description="Manage your personal bot profiles (persona, instructions).")
 
-    @profile_group.command(name="create", description="Creates a new, blank personal profile.")
+    @profile_group.command(name="create", description="Creates a new, blank profile.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
-    @app_commands.describe(profile_name="The name for your new profile. Must be unique.")
-    async def create_profile_slash(self, interaction: discord.Interaction, profile_name: str):
+    @app_commands.describe(
+        profile_name="The name for your new profile. Must be unique.",
+        system_profile="Create as a global System Profile (Bot Owner Only)."
+    )
+    async def create_profile_slash(self, interaction: discord.Interaction, profile_name: str, system_profile: bool = False):
         await interaction.response.defer(ephemeral=True)
+
+        if system_profile and interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
+            await interaction.followup.send("❌ **Access Denied:** Creating System Profiles is restricted to the Bot Owner.", ephemeral=True)
+            return
 
         has_access = await self._has_api_key_access(interaction.user.id, interaction.guild_id)
         if not has_access:
@@ -187,13 +194,22 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
             await interaction.followup.send(f"❌ **Invalid Name:** {err_msg}", ephemeral=True)
             return
 
+        if system_profile:
+            owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+            owner_index = self._get_user_index(owner_id)
+            if profile_name in owner_index.get("system", {}):
+                await interaction.followup.send(f"A system profile with the name '{profile_name}' already exists.", ephemeral=True)
+                return
+            new_profile = self._get_or_create_system_profile(profile_name)
+            await interaction.followup.send(f"Successfully created new System Profile '{profile_name}'.\nUse `/profile manage profile_name:{profile_name}` to start editing it.", ephemeral=True)
+            return
+
         index = self._get_user_index(interaction.user.id)
         
         if profile_name in index.get("personal", []) or profile_name in index.get("borrowed", []):
             await interaction.followup.send(f"A profile with the name '{profile_name}' already exists.", ephemeral=True)
             return
 
-        # FIXED: Dynamic Limit Check
         current_count = len(index.get("personal", []))
         is_premium = self.is_user_premium(interaction.user.id)
         limit = defaultConfig.LIMIT_PROFILES_PREMIUM if is_premium else defaultConfig.LIMIT_PROFILES_FREE
@@ -210,7 +226,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
 
         new_profile = self._get_or_create_user_profile(interaction.user.id, profile_name)
         if new_profile:
-            # [NEW] Add Creation Timestamp
             config = new_profile.get('config', {})
             config['created_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             self._save_profile_config(interaction.user.id, profile_name, config)
@@ -330,7 +345,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
     @profile_group.command(name="manage", description="Manage all settings for a specific profile from a unified dashboard.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     @app_commands.describe(profile_name="The name of the personal or borrowed profile to manage.")
-    @app_commands.autocomplete(profile_name=CoreMixin.profile_autocomplete)
+    @app_commands.autocomplete(profile_name=CoreMixin.master_autocomplete)
     async def manage_profile_slash(self, interaction: discord.Interaction, profile_name: str):
         await interaction.response.defer(ephemeral=True)
 
@@ -369,46 +384,44 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
         
         index = self._get_user_index(interaction.user.id)
         
-        personal_dict = index.get("personal", {})
-        borrowed_dict = index.get("borrowed", {})
+        personal_names = sorted(list(index.get("personal", {})))
+        borrowed_names = sorted(list(index.get("borrowed", {})))
         
-        personal_names = sorted(list(personal_dict.keys())) if isinstance(personal_dict, dict) else sorted(list(personal_dict))
-        borrowed_names = sorted(list(borrowed_dict.keys())) if isinstance(borrowed_dict, dict) else sorted(list(borrowed_dict))
-        
-        if not personal_names and not borrowed_names:
+        system_names = []
+        if interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID):
+            system_names = sorted(list(index.get("system", {})))
+
+        if not personal_names and not borrowed_names and not system_names:
             await interaction.followup.send("You have no saved profiles yet.", ephemeral=True)
             return
         
         embed = discord.Embed(title="Your Profiles", color=discord.Color.purple())
-        
-        def split_list_for_columns(data_list):
-            midpoint = (len(data_list) + 1) // 2
-            return data_list[:midpoint], data_list[midpoint:]
 
-        personal_list = [f"- `{name}`" for name in personal_names]
-        if personal_list:
-            col1, col2 = split_list_for_columns(personal_list)
-            embed.add_field(name="Personal Profiles", value="\n".join(col1) if col1 else "\u200b", inline=True)
-            embed.add_field(name="\u200b", value="\n".join(col2) if col2 else "\u200b", inline=True)
+        def build_fields(title, name_list):
+            fields = []
+            current_val = ""
+            chunk_num = 1
+            for name in name_list:
+                tag = f"`{name}`"
+                    
+                if len(current_val) + len(tag) + 2 > 1000:
+                    fields.append((f"{title} (Cont.)" if chunk_num > 1 else title, current_val))
+                    current_val = tag
+                    chunk_num += 1
+                else:
+                    current_val += f", {tag}" if current_val else tag
+            if current_val:
+                fields.append((f"{title} (Cont.)" if chunk_num > 1 else title, current_val))
+            return fields
 
-        borrowed_list = []
-        for name in borrowed_names:
-            b_config = self._get_profile_config(interaction.user.id, name, True) or {}
-            owner_id = int(b_config.get("original_owner_id", 0))
-            try:
-                owner = self.bot.get_user(owner_id) or await self.bot.fetch_user(owner_id)
-                owner_name = owner.display_name if owner else "Unknown"
-            except Exception:
-                owner_name = "Unknown"
-            borrowed_list.append(f"- `{name}` (from {owner_name})")
+        for t, v in build_fields("Personal Profiles", personal_names):
+            embed.add_field(name=t, value=v, inline=False)
 
-        if borrowed_list:
-            if personal_list:
-                embed.add_field(name="\u200b", value="\u200b", inline=False)
+        for t, v in build_fields("Borrowed Profiles", borrowed_names):
+            embed.add_field(name=t, value=v, inline=False)
 
-            col1, col2 = split_list_for_columns(borrowed_list)
-            embed.add_field(name="Borrowed Profiles", value="\n".join(col1) if col1 else "\u200b", inline=True)
-            embed.add_field(name="\u200b", value="\n".join(col2) if col2 else "\u200b", inline=True)
+        for t, v in build_fields("System Profiles", system_names):
+            embed.add_field(name=t, value=v, inline=False)
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -480,32 +493,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
             await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         else:
             await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    data_group = app_commands.Group(name="data", description="Manage LTM and Training data for your profiles.", parent=profile_group)
-
-    @data_group.command(name="manage", description="Manage LTM (all profiles) and Training Examples (personal profiles).")
-    @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
-    @app_commands.describe(profile_name="The name of the profile to manage data for.")
-    @app_commands.autocomplete(profile_name=CoreMixin.profile_autocomplete)
-    async def data_manage_slash(self, interaction: discord.Interaction, profile_name: str):
-        if not self.has_lock: return
-        
-        profile_name = profile_name.lower().strip()
-        index = self._get_user_index(interaction.user.id)
-
-        is_borrowed = profile_name in index.get("borrowed", [])
-        is_personal = profile_name in index.get("personal", [])
-        
-        can_manage = is_personal or is_borrowed
-        if not can_manage:
-            await interaction.response.send_message(f"You do not have a profile named '{profile_name}'.", ephemeral=True)
-            return
-
-        is_view_borrowed = is_borrowed
-
-        await interaction.response.defer(ephemeral=True)
-        view = DataManageView(self, interaction, profile_name, is_borrowed=is_view_borrowed)
-        await view.start()
 
     @profile_group.command(name="hub", description="The unified dashboard for managing profiles, sharing, and the public library.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -587,7 +574,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     @app_commands.guild_only()
     @is_admin_or_owner_check()
-    @app_commands.autocomplete(profile_name=CoreMixin.profile_autocomplete)
+    @app_commands.autocomplete(profile_name=CoreMixin.master_autocomplete)
     @app_commands.describe(
         profile_name="The profile to swap or add. Leave blank to remove a profile.",
         use_child_bot="Whether to use the linked Child Bot (if available). Defaults to True.",
@@ -1216,7 +1203,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
 
     @profile_group.command(name="global_chat", description="Have a persistent, private conversation with a profile.")
     @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)
-    @app_commands.autocomplete(profile_name=CoreMixin.global_chat_profile_autocomplete)
+    @app_commands.autocomplete(profile_name=CoreMixin.master_autocomplete)
     @app_commands.describe(
         profile_name="The profile to chat with. Leave blank to view private history.",
         refresh="Set to True to clear your conversation history with this profile.",
@@ -1670,43 +1657,11 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
             if not is_google and not is_ollama:
                 self._record_model_usage(model_name_str, "openrouter")
 
-    async def session_participant_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        server_id_str = str(interaction.guild_id) if interaction.guild_id else "dm"
-        server_index = self._get_server_index(server_id_str)
-        channel_str = str(interaction.channel_id)
-        
-        active_sessions = server_index.get("active_sessions", {})
-        session_data = {}
-        if isinstance(active_sessions, dict):
-            session_data = active_sessions.get("regular", {}).get(channel_str)
-
-        if not session_data:
-            return[]
-
-        choices = []
-        current_lower = current.lower()
-        for participant in session_data.get("profiles", []):
-            owner_id = participant.get("owner_id")
-            profile_name = participant.get("profile_name")
-            
-            # If it's the speak command, only show profiles owned by the command user (unless bot owner)
-            if interaction.command.name == "speak":
-                if owner_id != interaction.user.id and interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
-                    if owner_id != int(defaultConfig.DISCORD_OWNER_ID): # Allow system profiles to pass
-                        continue
-            
-            value = f"{owner_id}:{profile_name}"
-
-            if current_lower in profile_name.lower():
-                choices.append(app_commands.Choice(name=profile_name, value=value))
-        
-        return choices[:25]
-    
     @app_commands.command(name="speak", description="Anonymously speak as one of your profiles (Admin Only).")
     @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
     @app_commands.guild_only()
     @is_admin_or_owner_check()
-    @app_commands.autocomplete(profile_name=session_participant_autocomplete, method=CoreMixin.speak_method_autocomplete)
+    @app_commands.autocomplete(profile_name=CoreMixin.master_autocomplete, method=CoreMixin.master_autocomplete)
     @app_commands.describe(
         profile_name="Your active session profile to speak as.",
         message="The message to send. If omitted, a multi-line input box will appear.",
@@ -1767,7 +1722,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
     @app_commands.command(name="whisper", description="Send a private message to a profile in an active multi-profile session.")
     @app_commands.checks.cooldown(3, 30.0, key=lambda i: i.user.id)
     @app_commands.guild_only()
-    @app_commands.autocomplete(profile=session_participant_autocomplete)
+    @app_commands.autocomplete(profile=CoreMixin.master_autocomplete)
     @app_commands.describe(
         profile="The participant to whisper to. Leave blank to view history.",
         message="The private message to send. Leave blank to view history."

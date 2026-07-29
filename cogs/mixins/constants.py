@@ -381,7 +381,7 @@ DEFAULT_HELP_MODE_INJECTION = (
     "   │    └── Action: Toggle Neuro-Endocrine Engine (Simulates emotional chemical variables)\n"
     "   │\n"
     "   └── Tab 5: [Memory] (Data Repositories)\n"
-    "        ├── Action: Manage Data (LTM & Training) (CRUD interface for vectors and few-shots)\n"
+    "        ├── Action: Manage Long-Term Memories & Training Examples (CRUD interface for vectors and few-shots)\n"
     "        ├── Action: Set Training Parameters (Few-shot context size & relevance thresholds)\n"
     "        ├── Action: Toggle LTM Auto-Creation (Enable/Disable automated third-person summaries)\n"
     "        ├── Action: Set LTM Parameters (LTM creation interval, summarisation context, LTM context size, LTM threshold)\n"

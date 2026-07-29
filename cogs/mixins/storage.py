@@ -322,11 +322,17 @@ class StorageMixin:
     def _is_valid_profile_name(self, name: str) -> tuple[bool, str]:
         if not name or not name.strip():
             return False, "Profile name cannot be empty."
-        if len(name) > 30:
-            return False, "Profile name must be 30 characters or fewer."
+        if len(name) > 20:
+            return False, "Profile name must be 20 characters or fewer."
         if not re.match(r'^[a-zA-Z0-9_-]+$', name):
             return False, "Profile name can only contain letters, numbers, underscores, and hyphens (no spaces)."
-        if name.lower() in ["clyde", "system", "user", "none", "all"]:
+        reserved = [
+            "clyde", "system", "user", "none", "all", "everyone", "here", 
+            "discord", "null", "undefined", "true", "false", "root", 
+            "mimic", "mimicai", "mimica", "bot", "admin", "mod", "help", 
+            "global", "bulk"
+        ]
+        if name.lower() in reserved:
             return False, "This name is a reserved system keyword and cannot be used."
         return True, ""
 

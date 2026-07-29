@@ -2442,9 +2442,7 @@ class CoreMixin:
         timezone = config.get("timezone", "UTC")
         typing = "**`ON`**" if config.get("realistic_typing_enabled", False) else "`OFF`"
         critic = "**`ON`**" if config.get("critic_enabled", False) else "`OFF`"
-        neuro = "**`ON`**" if config.get("neuro_engine_enabled", False) else "`OFF`"
         help_mode = "**`ON`**" if config.get("help_mode_enabled", False) else "`OFF`"
-        metadata_vis = "**`ON`**" if config.get("generation_metadata_enabled", False) else "`OFF`"
         resp_mode = config.get("response_mode", "regular").replace('_', ' ').title()
 
         ph_text = f"{config.get('placeholder_emoji') or 'Default'}"
@@ -2457,17 +2455,26 @@ class CoreMixin:
             f"Timezone: `{timezone}`\n"
             f"Realistic Typing: {typing}\n"
             f"Critic: {critic}\n"
-            f"Neuro Engine: {neuro}\n"
             f"Help Mode: {help_mode}\n"
             f"Placeholder: {ph_text}"
         )
-        embed.add_field(name="Tools", value=tools_val, inline=False)
+        embed.add_field(name="Tools", value=tools_val, inline=True)
+
+        neuro_status = "**`ON`**" if config.get("neuro_engine_enabled", False) else "`OFF`"
+        neuro_state = config.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
+        neuro_val = (
+            f"Status: {neuro_status}\n"
+            f"Dopamine: `{neuro_state.get('dopamine', 50)}`\n"
+            f"Cortisol: `{neuro_state.get('cortisol', 20)}`\n"
+            f"Oxytocin: `{neuro_state.get('oxytocin', 50)}`\n"
+            f"Adrenaline: `{neuro_state.get('adrenaline', 20)}`"
+        )
+        embed.add_field(name="Neuro Engine", value=neuro_val, inline=True)
 
         s_voice = config.get("speech_voice", "Aoede")
         s_model = config.get("speech_model", "gemini-2.5-flash-preview-tts")
         s_temp = config.get("speech_temperature", 1.0)
         s_enabled = "**`ON`**" if config.get("speech_tts_enabled", False) else "`OFF`"
-        s_model_disp = s_model.replace("gemini-", "").replace("-preview-tts", "").title()
         
         speech_val = (
             f"Enabled: {s_enabled}\n"
@@ -2565,104 +2572,7 @@ class CoreMixin:
         
         embed.set_footer(text="Select an action from the dropdowns below to manage the server.")
         return embed
-    
-    async def profile_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        index = self._get_user_index(interaction.user.id)
-        choices = []
-        current_lower = current.lower()
-        
-        for p in index.get("personal", []):
-            if current_lower in p.lower():
-                choices.append(app_commands.Choice(name=p, value=p))
 
-        for p in index.get("borrowed", []):
-            if current_lower in p.lower():
-                choices.append(app_commands.Choice(name=p, value=p))
-                
-        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-        owner_idx = self._get_user_index(owner_id)
-        for p in owner_idx.get("system", {}):
-            if current_lower in p.lower():
-                choices.append(app_commands.Choice(name=p, value=p))
-
-        return choices[:25]
-    
-    async def global_chat_profile_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        user_id = interaction.user.id
-        index = self._get_user_index(user_id)
-        
-        public_pointers = set()
-        for p_info in self.public_profiles.values():
-            if isinstance(p_info, str) and ":" in p_info:
-                public_pointers.add(p_info)
-            elif isinstance(p_info, dict):
-                oid = str(p_info.get("owner_id"))
-                opid = p_info.get("original_pid")
-                if oid and opid:
-                    public_pointers.add(f"{oid}:{opid}")
-        
-        choices = []
-        current_lower = current.lower()
-
-        for name in index.get("personal", []):
-            pid = self._get_pid_from_name_any(user_id, name)
-            if f"{user_id}:{pid}" in public_pointers and current_lower in name.lower():
-                choices.append(app_commands.Choice(name=name, value=name))
-        
-        for local_name in index.get("borrowed", []):
-            b_config = self._get_profile_config(user_id, local_name, True)
-            if not b_config: continue
-            
-            orig_oid = str(b_config.get("original_owner_id"))
-            orig_pid = b_config.get("original_pid") or b_config.get("original_profile_id")
-            
-            if f"{orig_oid}:{orig_pid}" in public_pointers and current_lower in local_name.lower():
-                choices.append(app_commands.Choice(name=local_name, value=local_name))
-        
-        return choices[:25]
-
-    async def personal_profile_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        index = self._get_user_index(interaction.user.id)
-        choices = []
-        current_lower = current.lower()
-        for p in index.get("personal", []):
-            if current_lower in p.lower():
-                choices.append(app_commands.Choice(name=p, value=p))
-        return choices[:25]
-
-    async def appearance_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        all_tzs = available_timezones()
-        if not current:
-            suggestions = ["UTC", "US/Eastern", "US/Central", "US/Mountain", "US/Pacific", "Europe/London", "Europe/Berlin"]
-            return [app_commands.Choice(name=tz, value=tz) for tz in suggestions]
-
-        current_lower = current.lower()
-        return [
-            app_commands.Choice(name=tz, value=tz)
-            for tz in all_tzs if current_lower in tz.lower()
-        ][:25]
-
-    async def speak_method_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        choices = [
-            app_commands.Choice(name="Auto (Recommended)", value="auto"),
-            app_commands.Choice(name="Webhook", value="webhook")
-        ]
-        
-        profile_name = interaction.namespace.profile_name
-        if profile_name and interaction.guild:
-            index = self._get_user_index(interaction.user.id)
-            is_borrowed = profile_name in index.get("borrowed", [])
-            is_personal = profile_name in index.get("personal", [])
-
-            effective_owner_id, effective_profile_name = self._resolve_effective_profile(interaction.user.id, profile_name)
-            
-            if is_personal or is_borrowed:
-                linked_bot_id = next((bot_id for bot_id, data in self.child_bots.items() if data.get("owner_id") == effective_owner_id and data.get("profile_name") == effective_profile_name), None)
-                if linked_bot_id and interaction.guild.get_member(int(linked_bot_id)):
-                    choices.append(app_commands.Choice(name="Child Bot", value="child_bot"))
-
-        return [choice for choice in choices if current.lower() in choice.name.lower()]
-    
     async def bulk_reset_examples(self, user_id: int, profile_names: List[str]) -> str:
         user_id_str = str(user_id)
         reset_count = 0
@@ -3220,3 +3130,220 @@ class CoreMixin:
             import shutil
             shutil.rmtree(recip_dir, ignore_errors=True)
             return False, f"An unexpected error occurred during cloning: {e}"
+        
+    async def _convert_copy_profile(self, user_id: int, source_name: str, target_name: str, to_system: bool) -> Tuple[bool, str]:
+        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+        if user_id != owner_id:
+            return False, "Only the Bot Owner can perform system profile conversions."
+
+        is_valid, err_msg = self._is_valid_profile_name(target_name)
+        if not is_valid:
+            return False, err_msg
+
+        owner_index = self._get_user_index(owner_id)
+
+        if to_system:
+            if source_name not in owner_index.get("personal", {}):
+                return False, f"Source personal profile '{source_name}' not found."
+            if target_name in owner_index.get("system", {}):
+                return False, f"A system profile named '{target_name}' already exists."
+            source_pid = owner_index["personal"][source_name]
+            import uuid
+            target_pid = f"X{uuid.uuid4().hex[:15].upper()}"
+            target_category = "system"
+        else:
+            if source_name not in owner_index.get("system", {}):
+                return False, f"Source system profile '{source_name}' not found."
+            if target_name in owner_index.get("personal", {}) or target_name in owner_index.get("borrowed", {}):
+                return False, f"A personal profile named '{target_name}' already exists."
+            source_pid = owner_index["system"][source_name]
+            import uuid
+            target_pid = f"A{uuid.uuid4().hex[:15].upper()}"
+            target_category = "personal"
+
+        source_dir = os.path.join(self.USERS_DIR, str(owner_id), "profiles", source_pid)
+        target_dir = os.path.join(self.USERS_DIR, str(owner_id), "profiles", target_pid)
+
+        if not os.path.exists(source_dir):
+            return False, "Source profile directory does not exist on disk."
+
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            import shutil
+
+            for item in ["config.json.gz", "prompts.json.gz", "ltm.json.gz", "training.json.gz"]:
+                src_file = os.path.join(source_dir, item)
+                if os.path.exists(src_file):
+                    shutil.copy2(src_file, os.path.join(target_dir, item))
+
+            with open(os.path.join(target_dir, "name.txt"), "w", encoding="utf-8") as f:
+                f.write(target_name)
+
+            config_path = os.path.join(target_dir, "config.json.gz")
+            if os.path.exists(config_path):
+                config_data = self._load_json_gzip(config_path) or {}
+                config_data["profile_id"] = target_pid
+                config_data["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                self._atomic_json_save_gzip(config_data, config_path)
+
+            if target_category not in owner_index or not isinstance(owner_index[target_category], dict):
+                owner_index[target_category] = {}
+
+            owner_index[target_category][target_name] = target_pid
+            self._save_user_index(owner_id, owner_index)
+
+            return True, f"Successfully copied '{source_name}' to {target_category.title()} Profile '{target_name}'."
+        except Exception as e:
+            import shutil
+            shutil.rmtree(target_dir, ignore_errors=True)
+            return False, f"An unexpected error occurred during copy: {e}"
+    
+    async def master_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+        def get_focused(options):
+            for opt in options:
+                if opt.get('type') in (1, 2):
+                    res = get_focused(opt.get('options', []))
+                    if res: return res
+                elif opt.get('focused'):
+                    return opt.get('name')
+            return None
+        
+        focused = get_focused(interaction.data.get('options', []))
+        cmd_name = interaction.command.name
+
+        if focused == 'method':
+            choices = [
+                app_commands.Choice(name="Auto (Recommended)", value="auto"),
+                app_commands.Choice(name="Webhook", value="webhook")
+            ]
+            profile_val = interaction.namespace.profile_name
+            if profile_val and interaction.guild:
+                try:
+                    p_owner_id_str, p_name = profile_val.split(":", 1)
+                    p_owner_id = int(p_owner_id_str)
+                except ValueError:
+                    p_owner_id = interaction.user.id
+                    p_name = profile_val
+                eff_owner_id, eff_p_name = self._resolve_effective_profile(p_owner_id, p_name)
+                linked_bot_id = next((bot_id for bot_id, data in self.child_bots.items() if data.get("owner_id") == eff_owner_id and data.get("profile_name") == eff_p_name), None)
+                if linked_bot_id and interaction.guild.get_member(int(linked_bot_id)):
+                    choices.append(app_commands.Choice(name="Child Bot", value="child_bot"))
+            return [c for c in choices if current.lower() in c.name.lower()]
+
+        choices = []
+        current_lower = current.lower()
+        
+        def format_choice_name(display_name, internal_name, pid, creator_name, is_system=False):
+            suffix = " ┃ [System Profile]" if is_system else f" ┃ By {creator_name}"
+            base_str = f" ┃ [{pid}]{suffix}"
+            rem_len = 100 - len(base_str)
+            name_str = f"{display_name} ({internal_name})"
+            if len(name_str) > rem_len:
+                half = max(1, (rem_len - 5) // 2)
+                disp_trunc = display_name[:half] + "..." if len(display_name) > half else display_name
+                int_trunc = internal_name[:half] + "..." if len(internal_name) > half else internal_name
+                name_str = f"{disp_trunc} ({int_trunc})"
+                if len(name_str) > rem_len:
+                    name_str = name_str[:max(1, rem_len-3)] + "..."
+            return f"{name_str}{base_str}"
+
+        if cmd_name in ["speak", "whisper"]:
+            server_id_str = str(interaction.guild_id) if interaction.guild_id else "dm"
+            server_index = self._get_server_index(server_id_str)
+            channel_str = str(interaction.channel_id)
+            session_data = server_index.get("active_sessions", {}).get("regular", {}).get(channel_str)
+            if not session_data: return []
+            
+            for p in session_data.get("profiles", []):
+                o_id = p.get("owner_id")
+                p_name = p.get("profile_name")
+                
+                if cmd_name == "speak" and o_id != interaction.user.id and interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
+                    if o_id != int(defaultConfig.DISCORD_OWNER_ID):
+                        continue
+                
+                eff_owner, eff_name = self._resolve_effective_profile(o_id, p_name)
+                app = self._get_user_appearance(eff_owner, eff_name)
+                disp_name = app.get("custom_display_name") or eff_name
+                pid = self._get_pid_from_name_any(o_id, p_name)
+                
+                creator_name = "Unknown"
+                is_sys = pid.startswith("X")
+                if not is_sys:
+                    creator = self.bot.get_user(eff_owner)
+                    creator_name = creator.name if creator else str(eff_owner)
+                    
+                formatted_name = format_choice_name(disp_name, p_name, pid, creator_name, is_sys)
+                val = f"{o_id}:{p_name}"
+                if current_lower in p_name.lower() or current_lower in disp_name.lower():
+                    choices.append(app_commands.Choice(name=formatted_name, value=val))
+        
+        elif cmd_name == "global_chat":
+            user_id = interaction.user.id
+            index = self._get_user_index(user_id)
+            public_pointers = set()
+            for p_info in self.public_profiles.values():
+                if isinstance(p_info, str) and ":" in p_info:
+                    public_pointers.add(p_info)
+                elif isinstance(p_info, dict):
+                    oid = str(p_info.get("owner_id"))
+                    opid = p_info.get("original_pid")
+                    if oid and opid: public_pointers.add(f"{oid}:{opid}")
+            
+            for p_name in index.get("personal", []):
+                pid = self._get_pid_from_name_any(user_id, p_name)
+                if f"{user_id}:{pid}" in public_pointers and current_lower in p_name.lower():
+                    app = self._get_user_appearance(user_id, p_name)
+                    disp_name = app.get("custom_display_name") or p_name
+                    formatted = format_choice_name(disp_name, p_name, pid, interaction.user.name, False)
+                    choices.append(app_commands.Choice(name=formatted, value=p_name))
+                    
+            for b_name in index.get("borrowed", []):
+                b_cfg = self._get_profile_config(user_id, b_name, True)
+                if not b_cfg: continue
+                orig_oid = str(b_cfg.get("original_owner_id"))
+                orig_pid = b_cfg.get("original_pid") or b_cfg.get("original_profile_id")
+                if f"{orig_oid}:{orig_pid}" in public_pointers and current_lower in b_name.lower():
+                    eff_owner, eff_name = self._resolve_effective_profile(user_id, b_name)
+                    app = self._get_user_appearance(eff_owner, eff_name)
+                    disp_name = app.get("custom_display_name") or eff_name
+                    creator = self.bot.get_user(int(orig_oid))
+                    c_name = creator.name if creator else orig_oid
+                    formatted = format_choice_name(disp_name, b_name, orig_pid, c_name, str(orig_pid).startswith("X"))
+                    choices.append(app_commands.Choice(name=formatted, value=b_name))
+        
+        else:
+            user_id = interaction.user.id
+            index = self._get_user_index(user_id)
+            for p_name in index.get("personal", []):
+                if current_lower in p_name.lower():
+                    pid = self._get_pid_from_name_any(user_id, p_name)
+                    app = self._get_user_appearance(user_id, p_name)
+                    disp_name = app.get("custom_display_name") or p_name
+                    formatted = format_choice_name(disp_name, p_name, pid, interaction.user.name, False)
+                    choices.append(app_commands.Choice(name=formatted, value=p_name))
+                    
+            for b_name in index.get("borrowed", []):
+                if current_lower in b_name.lower():
+                    b_cfg = self._get_profile_config(user_id, b_name, True) or {}
+                    orig_oid = b_cfg.get("original_owner_id", user_id)
+                    orig_pid = b_cfg.get("original_pid") or b_cfg.get("original_profile_id", "Unknown")
+                    eff_owner, eff_name = self._resolve_effective_profile(user_id, b_name)
+                    app = self._get_user_appearance(eff_owner, eff_name)
+                    disp_name = app.get("custom_display_name") or eff_name
+                    creator = self.bot.get_user(int(orig_oid))
+                    c_name = creator.name if creator else str(orig_oid)
+                    formatted = format_choice_name(disp_name, b_name, orig_pid, c_name, str(orig_pid).startswith("X"))
+                    choices.append(app_commands.Choice(name=formatted, value=b_name))
+                    
+            if user_id == int(defaultConfig.DISCORD_OWNER_ID):
+                owner_idx = self._get_user_index(user_id)
+                for s_name in owner_idx.get("system", {}):
+                    if current_lower in s_name.lower():
+                        pid = owner_idx["system"][s_name]
+                        app = self._get_user_appearance(user_id, s_name)
+                        disp_name = app.get("custom_display_name") or s_name
+                        formatted = format_choice_name(disp_name, s_name, pid, "System", True)
+                        choices.append(app_commands.Choice(name=formatted, value=s_name))
+                        
+        return choices[:25]
