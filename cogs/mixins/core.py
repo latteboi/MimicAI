@@ -43,7 +43,6 @@ class CoreMixin:
             
             self._purge_legacy_default_profile()
             
-            # Run index self-repair once immediately on boot
             print("Running initial index.json self-repair on boot...")
             await asyncio.to_thread(self._repair_all_user_indices)
             print("Initial index.json self-repair complete.")
@@ -54,6 +53,9 @@ class CoreMixin:
             if not self.proactive_session_task.is_running():
                 self.proactive_session_task.start()
             
+            if not self.pricing_sync_task.is_running():
+                self.pricing_sync_task.start()
+            
             if not self.weekly_cleanup_task.is_running():
                 print("Performing initial data cleanup on boot...")
                 await self._perform_data_cleanup()
@@ -62,10 +64,41 @@ class CoreMixin:
 
         if self.has_lock and not self.image_finisher_worker_task:
             self.image_finisher_worker_task = self.bot.loop.create_task(self._image_finisher_worker())
-            # Start 5 pre-fetching workers
             for i in range(5):
                 worker = self.bot.loop.create_task(self._image_gen_worker(i))
                 self.image_gen_workers.append(worker)
+
+    def _estimate_text_tokens(self, text: str) -> int:
+        if not text: return 0
+        import math
+        return math.ceil(len(text) / 3.8)
+
+    def _get_model_pricing(self, model_name: str) -> Tuple[float, float]:
+        try:
+            if os.path.exists(PRICING_CACHE_FILE):
+                with open(PRICING_CACHE_FILE, "rb") as f:
+                    cache_data = json.loads(f.read())
+                    rates = cache_data.get("rates", {})
+                    # Ensure lookup maps cleanly based on stored structure
+                    mapped_name = model_name
+                    if not mapped_name.startswith(("GOOGLE/", "OPENROUTER/", "OLLAMA/")):
+                        if "/" in mapped_name:
+                            mapped_name = f"OPENROUTER/{mapped_name}"
+                        else:
+                            mapped_name = f"GOOGLE/{mapped_name}"
+                    
+                    pricing = rates.get(mapped_name)
+                    if pricing:
+                        return float(pricing.get("input_1m", 0.0)), float(pricing.get("output_1m", 0.0))
+        except Exception as e:
+            pass
+        return 0.0, 0.0
+
+    def _calculate_turn_cost(self, model_name: str, input_tokens: int, output_tokens: int) -> float:
+        input_rate, output_rate = self._get_model_pricing(model_name)
+        cost_input = (input_tokens / 1000000) * input_rate
+        cost_output = (output_tokens / 1000000) * output_rate
+        return cost_input + cost_output
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):

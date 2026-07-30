@@ -224,17 +224,19 @@ class OpenRouterModel:
                 
                 choice = data['choices'][0]
                 msg_obj = choice['message']
+                usage_obj = data.get('usage', {})
                 
                 class OpenRouterThoughtResponse:
-                    def __init__(self, content, reasoning, finish_reason):
+                    def __init__(self, content, reasoning, finish_reason, input_toks, output_toks):
                         self.text = content
                         self.thought = reasoning or ""
+                        self.input_tokens = input_toks
+                        self.output_tokens = output_toks
+                        self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
                         
-                        # Create mock content and parts for the worker's scrubbing logic
                         mock_part = type('obj', (object,), {'text': content})
                         mock_content = type('obj', (object,), {'parts': [mock_part]})
                         
-                        # Create the candidate object
                         self.candidates = [type('obj', (object,), {
                             'content': mock_content,
                             'finish_reason': type('obj', (object,), {'name': finish_reason})
@@ -242,7 +244,13 @@ class OpenRouterModel:
                         
                     def __bool__(self): return True
     
-                return OpenRouterThoughtResponse(msg_obj.get('content', ''), msg_obj.get('reasoning', ''), (choice.get('finish_reason') or 'STOP').upper())
+                return OpenRouterThoughtResponse(
+                    msg_obj.get('content', ''), 
+                    msg_obj.get('reasoning', ''), 
+                    (choice.get('finish_reason') or 'STOP').upper(),
+                    usage_obj.get('prompt_tokens', 0),
+                    usage_obj.get('completion_tokens', 0)
+                )
         except httpx.RequestError as e:
             raise Exception(f"OpenRouter Network Error: {str(e)}")
         except asyncio.CancelledError:
@@ -416,7 +424,45 @@ class OllamaModel:
                                 pass
 
                     msg_obj = {"content": full_content, "reasoning": reasoning_content}
-                    return OllamaResponse(msg_obj, (finish_reason or 'STOP').upper())
+                    
+                    class OllamaResponseWrapper:
+                        def __init__(self, m_obj, f_reason, p_eval, e_count):
+                            self.text = m_obj.get('content', '') or ''
+                            self.thought = m_obj.get('reasoning', '') or ''
+                            self.thought_signature = None
+                            self.input_tokens = p_eval
+                            self.output_tokens = e_count
+                            self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
+                            
+                            if not self.thought and "<think>" in self.text.lower():
+                                text_lower = self.text.lower()
+                                think_start = text_lower.find("<think>")
+                                think_end = text_lower.find("</think>")
+                                
+                                if think_start != -1:
+                                    if think_end != -1:
+                                        self.thought = self.text[think_start+7:think_end].strip()
+                                        self.text = (self.text[:think_start] + self.text[think_end+8:]).strip()
+                                        self.reasoning_tokens = int(len(self.thought) / 3.8)
+                                    else:
+                                        self.thought = self.text[think_start+7:].strip()
+                                        self.text = self.text[:think_start].strip()
+                                        self.reasoning_tokens = int(len(self.thought) / 3.8)
+
+                            mock_part = type('obj', (object,), {'text': self.text})
+                            mock_content = type('obj', (object,), {'parts': [mock_part]})
+                            self.candidates = [type('obj', (object,), {
+                                'content': mock_content,
+                                'finish_reason': type('obj', (object,), {'name': f_reason})
+                            })]
+                            
+                        def __bool__(self): return True
+                    
+                    # Ollama streaming returns eval counts on the final chunk
+                    p_eval_count = chunk.get("prompt_eval_count", 0) if 'chunk' in locals() else 0
+                    eval_count = chunk.get("eval_count", 0) if 'chunk' in locals() else 0
+                    
+                    return OllamaResponseWrapper(msg_obj, (finish_reason or 'STOP').upper(), p_eval_count, eval_count)
             except httpx.RequestError as e:
                 raise Exception(f"Ollama Network Error: {str(e)}")
             except asyncio.CancelledError:
@@ -579,6 +625,9 @@ class GoogleGenAIModel:
                 self.prompt_feedback = getattr(raw_resp, 'prompt_feedback', None)
                 self.usage_metadata = getattr(raw_resp, 'usage_metadata', None)
                 
+                self.input_tokens = getattr(self.usage_metadata, 'prompt_token_count', 0) if self.usage_metadata else 0
+                self.output_tokens = getattr(self.usage_metadata, 'candidates_token_count', 0) if self.usage_metadata else 0
+                
                 if raw_resp.candidates and raw_resp.candidates[0].content and raw_resp.candidates[0].content.parts:
                     for part in raw_resp.candidates[0].content.parts:
                         is_thought = getattr(part, 'thought', False)
@@ -589,6 +638,9 @@ class GoogleGenAIModel:
                         
                         if hasattr(part, 'thought_signature') and part.thought_signature:
                             self.thought_signature = part.thought_signature
+                            
+                self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
+                
             def __bool__(self): return bool(self.candidates)
 
         return ThoughtResponse(response)
@@ -2786,6 +2838,9 @@ class ServicesMixin:
                         "duration": round(duration, 2),
                         "model": model.model_name.replace("models/", "").replace("OPENROUTER/", "").replace("GOOGLE/", "") if hasattr(model, 'model_name') else fallback_model_name,
                         "fallback": fallback_used,
+                        "input_tokens": getattr(response, 'input_tokens', 0) if response else 0,
+                        "output_tokens": getattr(response, 'output_tokens', 0) if response else 0,
+                        "reasoning_tokens": getattr(response, 'reasoning_tokens', 0) if response else 0,
                         "training_recalled": len(training_examples_list) if 'training_examples_list' in locals() and training_examples_list else 0,
                         "grounding_sources":[s.get('uri') for s in turn_grounding_sources if isinstance(s, dict) and s.get('uri')] if 'turn_grounding_sources' in locals() and turn_grounding_sources else [],
                         "ltms_recalled":[]
@@ -3111,6 +3166,18 @@ class ServicesMixin:
 
                     is_last_participant = (participant == profile_order[-1])
                     if not is_last_participant:
+                        # Pipelined visual feedback for next participant
+                        next_p = profile_order[i + 1]
+                        if next_p.get('method') == 'child_bot':
+                            next_p_index = self._get_user_index(next_p['owner_id'])
+                            next_p_is_b = next_p['profile_name'] in next_p_index.get("borrowed", [])
+                            next_p_settings = self._get_profile_config(next_p['owner_id'], next_p['profile_name'], next_p_is_b) or {}
+                            if not next_p_settings.get("child_bot_placeholder", False):
+                                await self.manager_queue.put({
+                                    "action": "send_to_child", "bot_id": next_p['bot_id'],
+                                    "payload": {"action": "start_typing", "channel_id": channel_id}
+                                })
+
                         await asyncio.sleep(1.0)
                         
                         batched_triggers = []
@@ -5793,13 +5860,27 @@ class ServicesMixin:
         if not found_urls:
             return [], [], warnings
 
-        async with httpx.AsyncClient() as client:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1"
+        }
+
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
             for url in found_urls[:2]:
                 try:
                     if not url.startswith(('http://', 'https://')):
                         url = 'http://' + url
                     
-                    async with client.stream("HEAD", url, follow_redirects=True, timeout=5.0) as head_response:
+                    async with client.stream("HEAD", url, timeout=5.0) as head_response:
                         head_response.raise_for_status()
                         content_type = head_response.headers.get('content-type', '').lower()
 
@@ -5808,7 +5889,7 @@ class ServicesMixin:
                         media_parts.append({"url": url, "mime_type": content_type})
                     
                     elif 'text/html' in content_type:
-                        get_response = await client.get(url, follow_redirects=True, timeout=10.0)
+                        get_response = await client.get(url, timeout=10.0)
                         get_response.raise_for_status()
                         page_content = get_response.text
                         
@@ -6405,14 +6486,7 @@ class ServicesMixin:
         if not target_turn:
             session['is_regenerating'] = False
             return
-            
-        session_type = session.get("type", "multi")
-        dummy_key = (channel.id, None, None)
-        
-        # Ensure session state is flushed to disk immediately (Crucial for first-message ad-hoc sessions)
-        self._save_multi_profile_sessions()
-        await self._save_session_to_disk(dummy_key, session_type, session["unified_log"])
-        
+
         p_owner_id = participant['owner_id']
         p_name = participant['profile_name']
         p_key = (p_owner_id, p_name)
@@ -6424,14 +6498,33 @@ class ServicesMixin:
         
         custom_emoji = p_profile.get("placeholder_emoji") or PLACEHOLDER_EMOJI
 
+        # Pre-emptive visual feedback before disk I/O
+        if participant.get('method') == 'child_bot':
+            await self.manager_queue.put({
+                "action": "send_to_child", "bot_id": participant['bot_id'],
+                "payload": {
+                    "action": "regenerate_message", "channel_id": channel.id,
+                    "message_id": payload.message_id, "content": custom_emoji
+                }
+            })
+        else:
+            wh = await self._get_or_create_webhook(channel)
+            if wh:
+                try:
+                    msg = await channel.fetch_message(payload.message_id)
+                    kept_atts = [a for a in msg.attachments if a.content_type and a.content_type.startswith("image/")]
+                    await wh.edit_message(payload.message_id, content=custom_emoji, attachments=kept_atts)
+                except: pass
+
+        session_type = session.get("type", "multi")
+        dummy_key = (channel.id, None, None)
+        
+        # Flush session state to disk
+        self._save_multi_profile_sessions()
+        await self._save_session_to_disk(dummy_key, session_type, session["unified_log"])
+
         try:
-            try:
-                msg = await channel.fetch_message(payload.message_id)
-            except discord.NotFound:
-                session['is_regenerating'] = False
-                return
-                
-            placeholder_message = msg
+            placeholder_message = await channel.fetch_message(payload.message_id)
             message_ids_to_check = target_turn.get("message_ids", [])
             
             # Initial Edit to Placeholder
@@ -6810,6 +6903,9 @@ class ServicesMixin:
                 "duration": round(time.monotonic() - t_start_regen, 2) if 't_start_regen' in locals() else 0.0,
                 "model": model.model_name.replace("models/", "").replace("OPENROUTER/", "").replace("GOOGLE/", "") if hasattr(model, 'model_name') else fallback_model_name,
                 "fallback": fallback_used,
+                "input_tokens": getattr(response, 'input_tokens', 0) if response else 0,
+                "output_tokens": getattr(response, 'output_tokens', 0) if response else 0,
+                "reasoning_tokens": getattr(response, 'reasoning_tokens', 0) if response else 0,
                 "training_recalled": len(training_examples) if 'training_examples' in locals() and training_examples else 0,
                 "grounding_sources": regen_grounding_sources,
                 "ltms_recalled": []
@@ -6997,3 +7093,53 @@ class ServicesMixin:
         
         clean_err = error_str.replace('"', "'").replace('{', '').replace('}', '').replace('\n', ' ')
         return clean_err[:80] + "..." if len(clean_err) > 80 else clean_err
+
+    @tasks.loop(hours=24)
+    async def pricing_sync_task(self):
+        try:
+            os.makedirs(MODELS_DATA_DIR, exist_ok=True)
+            rates = {
+                # Official Google Gemini Standard Tier Pricing (per 1M tokens in USD)
+                "GOOGLE/gemini-3.6-flash": {"input_1m": 1.50, "output_1m": 7.50},
+                "GOOGLE/gemini-3.5-flash": {"input_1m": 1.50, "output_1m": 9.00},
+                "GOOGLE/gemini-3.5-flash-lite": {"input_1m": 0.30, "output_1m": 2.50},
+                "GOOGLE/gemini-3.1-pro-preview": {"input_1m": 2.00, "output_1m": 12.00},
+                "GOOGLE/gemini-3.1-flash-lite": {"input_1m": 0.25, "output_1m": 1.50},
+                "GOOGLE/gemini-3-flash-preview": {"input_1m": 0.50, "output_1m": 3.00},
+                "GOOGLE/gemini-2.5-pro": {"input_1m": 1.25, "output_1m": 10.00},
+                "GOOGLE/gemini-2.5-flash": {"input_1m": 0.30, "output_1m": 2.50},
+                "GOOGLE/gemini-2.5-flash-lite": {"input_1m": 0.10, "output_1m": 0.40},
+                "GOOGLE/gemini-flash-latest": {"input_1m": 1.50, "output_1m": 7.50},
+                "GOOGLE/gemini-pro-latest": {"input_1m": 2.00, "output_1m": 12.00},
+                "GOOGLE/gemini-flash-lite-latest": {"input_1m": 0.30, "output_1m": 2.50}
+            }
+
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get("https://openrouter.ai/api/v1/models", timeout=15.0)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        for model in data.get("data", []):
+                            m_id = model.get("id")
+                            pricing = model.get("pricing", {})
+                            try:
+                                prompt_rate = float(pricing.get("prompt", 0.0)) * 1000000
+                                completion_rate = float(pricing.get("completion", 0.0)) * 1000000
+                                rates[f"OPENROUTER/{m_id}"] = {
+                                    "input_1m": prompt_rate,
+                                    "output_1m": completion_rate
+                                }
+                            except (ValueError, TypeError):
+                                pass
+            except Exception as e:
+                print(f"Warning: Failed to fetch OpenRouter pricing: {e}")
+
+            cache_data = {
+                "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "rates": rates
+            }
+            with open(PRICING_CACHE_FILE, "w", encoding="utf-8") as f:
+                f.write(json.dumps(cache_data, option=json.OPT_INDENT_2).decode('utf-8'))
+                
+        except Exception as e:
+            print(f"Error in pricing_sync_task: {e}")

@@ -7048,3 +7048,232 @@ class InviteView(ui.View):
         super().__init__(timeout=None)
         btn = ui.Button(label="Add MimicAI to Server", url=invite_url, style=discord.ButtonStyle.link)
         self.add_item(btn)
+
+class SessionAuditView(ui.View):
+    def __init__(self, cog, interaction: discord.Interaction, session: dict, channel_id: int):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.original_interaction = interaction
+        self.session = session
+        self.channel_id = channel_id
+        self.mode = "overview"
+        self.selected_turn_id = None
+        self.simulate_profile_key = None
+        self.batch_start_id = None
+        self.batch_end_id = None
+        
+        log = self.session.get("unified_log", [])
+        self.recent_turns = log[-25:] if log else []
+        if self.recent_turns:
+            self.selected_turn_id = self.recent_turns[-1].get("turn_id")
+            self.batch_start_id = self.recent_turns[0].get("turn_id")
+            self.batch_end_id = self.recent_turns[-1].get("turn_id")
+            
+        profiles = self.session.get("profiles", [])
+        if profiles:
+            self.simulate_profile_key = f"{profiles[0]['owner_id']}:{profiles[0]['profile_name']}"
+
+        self._build_view()
+
+    def _build_view(self):
+        self.clear_items()
+        
+        # Row 0: Modes
+        modes = [("Overview", "overview"), ("Turn Inspector", "inspector"), ("Simulator", "simulator"), ("Batch Calculator", "batch")]
+        for label, val in modes:
+            btn = ui.Button(label=label, style=discord.ButtonStyle.primary if self.mode == val else discord.ButtonStyle.secondary, row=0, disabled=(self.mode == val))
+            def make_cb(target_mode):
+                async def nav_cb(i: discord.Interaction):
+                    self.mode = target_mode
+                    self._build_view()
+                    await i.response.edit_message(embed=self._build_embed(), view=self)
+                return nav_cb
+            btn.callback = make_cb(val)
+            self.add_item(btn)
+
+        # Rows 1/2: Contextual Dropdowns
+        if self.mode == "inspector":
+            opts = []
+            for idx, t in enumerate(self.recent_turns):
+                display = "User" if t.get("is_user") else t.get("profile_name", "Bot")
+                content_preview = t.get("content", "").split("\n")[-1][:40].strip()
+                opts.append(discord.SelectOption(label=f"Turn #{len(self.session.get('unified_log', [])) - len(self.recent_turns) + idx + 1} - {display}", value=t.get("turn_id"), description=content_preview, default=(t.get("turn_id") == self.selected_turn_id)))
+            if opts:
+                sel = ui.Select(placeholder="Select a past turn...", options=opts, row=1)
+                async def sel_cb(i: discord.Interaction):
+                    self.selected_turn_id = i.data['values'][0]
+                    self._build_view()
+                    await i.response.edit_message(embed=self._build_embed(), view=self)
+                sel.callback = sel_cb
+                self.add_item(sel)
+
+        elif self.mode == "simulator":
+            opts = []
+            for p in self.session.get("profiles", []):
+                val = f"{p['owner_id']}:{p['profile_name']}"
+                opts.append(discord.SelectOption(label=p['profile_name'], value=val, default=(val == self.simulate_profile_key)))
+            if opts:
+                sel = ui.Select(placeholder="Select a profile to simulate next turn...", options=opts, row=1)
+                async def sel_cb(i: discord.Interaction):
+                    self.simulate_profile_key = i.data['values'][0]
+                    self._build_view()
+                    await i.response.edit_message(embed=self._build_embed(), view=self)
+                sel.callback = sel_cb
+                self.add_item(sel)
+
+        elif self.mode == "batch":
+            opts_start = []
+            opts_end = []
+            for idx, t in enumerate(self.recent_turns):
+                display = "User" if t.get("is_user") else t.get("profile_name", "Bot")
+                label = f"Turn #{len(self.session.get('unified_log', [])) - len(self.recent_turns) + idx + 1} - {display}"
+                opts_start.append(discord.SelectOption(label=label, value=t.get("turn_id"), default=(t.get("turn_id") == self.batch_start_id)))
+                opts_end.append(discord.SelectOption(label=label, value=t.get("turn_id"), default=(t.get("turn_id") == self.batch_end_id)))
+            
+            if opts_start:
+                sel_start = ui.Select(placeholder="Select Start Turn...", options=opts_start, row=1)
+                async def ss_cb(i: discord.Interaction):
+                    self.batch_start_id = i.data['values'][0]
+                    self._build_view()
+                    await i.response.edit_message(embed=self._build_embed(), view=self)
+                sel_start.callback = ss_cb
+                self.add_item(sel_start)
+                
+                sel_end = ui.Select(placeholder="Select End Turn...", options=opts_end, row=2)
+                async def se_cb(i: discord.Interaction):
+                    self.batch_end_id = i.data['values'][0]
+                    self._build_view()
+                    await i.response.edit_message(embed=self._build_embed(), view=self)
+                sel_end.callback = se_cb
+                self.add_item(sel_end)
+
+    def _build_embed(self) -> discord.Embed:
+        try:
+            embed = discord.Embed(title=f"Chat Session Diagnostic: #{self.original_interaction.channel.name}", color=discord.Color.brand_green())
+            log = self.session.get("unified_log", [])
+
+            if self.mode == "overview":
+                total_in = 0
+                total_out = 0
+                total_cost = 0.0
+                durations = []
+                
+                for t in log:
+                    if not t.get("is_user"):
+                        meta = t.get("meta") or {}
+                        i_toks = meta.get("input_tokens", 0)
+                        o_toks = meta.get("output_tokens", 0)
+                        total_in += i_toks
+                        total_out += o_toks
+                        total_cost += self.cog._calculate_turn_cost(meta.get("model", ""), i_toks, o_toks)
+                        dur = meta.get("duration")
+                        if dur: durations.append(dur)
+                
+                embed.description = "Session Overview"
+                embed.add_field(name="1. Overall Session Telemetry", value=f"├── Active Participants: `{len(self.session.get('profiles', []))}` Profiles\n├── Total Session Turns: `{len(log)}`\n├── Total Input Tokens Processed: `{total_in:,}`\n├── Total Output Tokens Generated: `{total_out:,}`\n└── Estimated Session API Cost: `~${total_cost:.4f} USD`", inline=False)
+                
+                avg_lat = sum(durations) / len(durations) if durations else 0.0
+
+                embed.add_field(name="2. System Health Checks", value=f"└── Model Latency Average: `{avg_lat:.2f}s`", inline=False)
+
+            elif self.mode == "inspector":
+                target = next((t for t in log if t.get("turn_id") == self.selected_turn_id), None)
+                if not target:
+                    embed.description = "Select a turn to inspect."
+                elif target.get("is_user"):
+                    embed.description = "Turn Inspector: User Message\n*User messages do not consume generation tokens directly, but contribute to the STM history buffer footprint.*"
+                    content = target.get("content", "")
+                    est_tokens = self.cog._estimate_text_tokens(content)
+                    embed.add_field(name="Payload Data", value=f"├── Speaker: `{target.get('speaker_pid')}`\n├── Timestamp: `{target.get('timestamp')}`\n└── Footprint: `~{est_tokens:,} tokens added to STM`", inline=False)
+                    if len(content) > 1024: content = content[:1021] + "..."
+                    embed.add_field(name="Raw Content", value=f"```xml\n{content}\n```", inline=False)
+                else:
+                    meta = target.get("meta") or {}
+                    mod = meta.get("model", "Unknown")
+                    i_tok = meta.get("input_tokens", 0)
+                    o_tok = meta.get("output_tokens", 0)
+                    r_tok = meta.get("reasoning_tokens", 0)
+                    cost = self.cog._calculate_turn_cost(mod, i_tok, o_tok)
+                    
+                    embed.add_field(name="Turn Telemetry", value=f"├── Speaker: `{target.get('profile_name')}`\n├── Model Used: `{mod}`\n├── Duration: `{meta.get('duration', 0.0)}s`\n├── Input Tokens: `{i_tok:,}`\n├── Output Tokens: `{o_tok:,}` (Reasoning: `{r_tok:,}`)\n└── Turn Cost: `~${cost:.6f} USD`", inline=False)
+                    
+                    recalled = len(meta.get("ltms_recalled", []))
+                    trained = meta.get("training_recalled", 0)
+                    grounded = len(meta.get("grounding_sources", []))
+                    
+                    embed.add_field(name="Context Injections", value=f"├── LTM Archive: `{recalled} memories`\n├── Training Examples: `{trained} injected`\n└── Web Grounding: `{grounded} sources`", inline=False)
+
+            elif self.mode == "simulator":
+                if not self.simulate_profile_key:
+                    embed.description = "Select a profile to simulate."
+                else:
+                    try:
+                        o_id_str, p_name = self.simulate_profile_key.split(":", 1)
+                        o_id = int(o_id_str)
+                        
+                        sys_instr, _, _, _, _, _, prim_mod, _ = self.cog._construct_system_instructions(o_id, p_name, self.channel_id, is_multi_profile=True)
+                        
+                        p_idx = self.cog._get_user_index(o_id)
+                        is_b = p_name in p_idx.get("borrowed", [])
+                        p_cfg = self.cog._get_profile_config(o_id, p_name, is_b) or {}
+                        stm_len = int(p_cfg.get("stm_length", 20))
+                        
+                        sys_toks = self.cog._estimate_text_tokens(sys_instr)
+                        
+                        recent_hist = log[-stm_len:] if stm_len > 0 else []
+                        hist_str = "\n".join([t.get("content", "") for t in recent_hist])
+                        hist_toks = self.cog._estimate_text_tokens(hist_str)
+                        
+                        total_est = sys_toks + hist_toks
+                        est_cost = self.cog._calculate_turn_cost(prim_mod, total_est, 300) # Assumes avg 300 output
+                        
+                        embed.add_field(name="Pre-Inference Budget Estimate (Per Turn)", value=f"├── Target: `{p_name}`\n├── Expected Model: `{prim_mod}`\n├── System & Instructions: `~{sys_toks:,} tokens`\n├── STM History Buffer: `~{hist_toks:,} tokens`\n└── **ESTIMATED INPUT TOTAL**: `~{total_est:,} tokens`", inline=False)
+                        embed.add_field(name="Financial Projection", value=f"Projected cost for next generation: `~${est_cost:.6f} USD`\n*(Assuming ~300 output tokens)*", inline=False)
+                    except Exception as e:
+                        embed.description = f"Simulation failed: {e}"
+
+            elif self.mode == "batch":
+                if not self.batch_start_id or not self.batch_end_id:
+                    embed.description = "Select start and end turns to calculate."
+                else:
+                    s_idx = next((i for i, t in enumerate(self.recent_turns) if t.get("turn_id") == self.batch_start_id), -1)
+                    e_idx = next((i for i, t in enumerate(self.recent_turns) if t.get("turn_id") == self.batch_end_id), -1)
+                    
+                    if s_idx == -1 or e_idx == -1 or s_idx > e_idx:
+                        embed.description = "Invalid range selection. Start turn must occur before End turn."
+                    else:
+                        batch_turns = self.recent_turns[s_idx:e_idx+1]
+                        
+                        total_in = 0
+                        total_out = 0
+                        total_cost = 0.0
+                        models_used = {}
+                        bot_turns = 0
+                        
+                        for t in batch_turns:
+                            if not t.get("is_user"):
+                                meta = t.get("meta") or {}
+                                m = meta.get("model", "Unknown")
+                                i_toks = meta.get("input_tokens", 0)
+                                o_toks = meta.get("output_tokens", 0)
+                                
+                                total_in += i_toks
+                                total_out += o_toks
+                                total_cost += self.cog._calculate_turn_cost(m, i_toks, o_toks)
+                                
+                                models_used[m] = models_used.get(m, 0) + 1
+                                bot_turns += 1
+                                
+                        dist_str = "\n".join([f"├── {m}: `{c}/{bot_turns} turns`" for m, c in models_used.items()])
+                        if not dist_str: dist_str = "├── No bot generations in range."
+                        
+                        embed.add_field(name="Batch Execution Totals", value=f"├── Turns Evaluated: `{len(batch_turns)}`\n├── Cumulative Input Tokens: `{total_in:,}`\n├── Cumulative Output Tokens: `{total_out:,}`\n└── Combined Range Cost: `~${total_cost:.6f} USD`", inline=False)
+                        embed.add_field(name="Model Distribution", value=dist_str, inline=False)
+
+            return embed
+        except Exception as e:
+            import traceback
+            err_trace = traceback.format_exc()
+            print(f"Error building audit embed: {err_trace}")
+            err_embed = discord.Embed(title="Audit Error", description=f"An error occurred while building the telemetry report:\n```\n{e}\n```", color=discord.Color.red())
+            return err_embed

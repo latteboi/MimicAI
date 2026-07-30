@@ -91,6 +91,9 @@ COGS_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(COGS_BASE, "data")
 MOD_DATA_DIR = os.path.join(DATA_DIR, "mod")
 
+MODELS_DATA_DIR = os.path.join(DATA_DIR, "models")
+PRICING_CACHE_FILE = os.path.join(MODELS_DATA_DIR, "pricing_cache.json")
+
 SESSIONS_DIR = os.path.join(DATA_DIR, "sessions")
 SESSIONS_GLOBAL_DIR = os.path.join(SESSIONS_DIR, "global_chat")
 

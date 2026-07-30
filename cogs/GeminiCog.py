@@ -485,7 +485,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
         )
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
         
-        embed.add_field(name="Version", value="v0.3.2 Beta", inline=True)
+        embed.add_field(name="Version", value="v0.4.0 Beta", inline=True)
         embed.add_field(name="Global Scope", value=f"{len(self.bot.guilds)} Servers", inline=True)
 
         if is_owner:
@@ -786,6 +786,28 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
             self._save_multi_profile_sessions()
             await interaction.followup.send(action_description, ephemeral=True)
             return
+
+    @session_group.command(name="audit", description="Run a diagnostic and token telemetry audit on the active session.")
+    @app_commands.checks.cooldown(2, 60.0, key=lambda i: i.user.id)
+    @app_commands.guild_only()
+    @is_admin_or_owner_check()
+    async def session_audit_slash(self, interaction: discord.Interaction):
+        if not self.has_lock: return
+        
+        session = self.multi_profile_channels.get(interaction.channel_id)
+        if session and not session.get("is_hydrated"):
+            session = await self._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi"))
+
+        if not session:
+            session = await self._ensure_session_hydrated(interaction.channel_id, "multi")
+
+        if not session:
+            await interaction.response.send_message("There is no active session in this channel to audit.", ephemeral=True)
+            return
+            
+        await interaction.response.defer(ephemeral=True)
+        view = SessionAuditView(self, interaction, session, interaction.channel_id)
+        await interaction.followup.send(embed=view._build_embed(), view=view, ephemeral=True)
 
     @session_group.command(name="trigger", description="Manually triggers a new round of the current regular session.")
     @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
