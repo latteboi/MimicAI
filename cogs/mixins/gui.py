@@ -6094,7 +6094,7 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
         super().__init__()
         self.cog = cog
         self.parent_view = view
-        self.profile_id_input = ui.TextInput(label="Personal Profile ID", placeholder="e.g. A1B2C3D4E5F6789", required=True, min_length=16, max_length=16)
+        self.profile_id_input = ui.TextInput(label="Profile ID (PID)", placeholder="e.g. A1B2C3D4E5F6789 or X1B2C3D4E5F6789", required=True, min_length=16, max_length=16)
         self.token_input = ui.TextInput(
             label="Bot Token", 
             placeholder="Applications -> Bot -> Token", 
@@ -6107,30 +6107,29 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         if interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
-            await interaction.followup.send("❌ **Error:** Only the bot owner can create Child Bots.", ephemeral=True)
+            await interaction.followup.send("Error: Only the bot owner can create Child Bots.", ephemeral=True)
             return
             
         token = self.token_input.value.strip()
         pid = self.profile_id_input.value.strip().upper()
         owner_id = interaction.user.id
 
-        if not pid.startswith("A"):
-            await interaction.followup.send("❌ **Error:** Child bots can only be linked to Personal Profiles (PIDs starting with 'A').", ephemeral=True)
+        if not (pid.startswith("A") or pid.startswith("X")):
+            await interaction.followup.send("Error: Child bots can only be linked to Personal Profiles (PIDs starting with 'A') or System Profiles (PIDs starting with 'X').", ephemeral=True)
             return
 
         index = self.cog._get_user_index(owner_id)
         profile_name = None
-        if isinstance(index.get("personal"), dict):
-            for name, mapped_pid in index["personal"].items():
-                if mapped_pid == pid:
-                    profile_name = name
-                    break
-        else:
-            await interaction.followup.send("❌ **Error:** Profile index is not in the updated PID format.", ephemeral=True)
-            return
+        for cat in ["personal", "system"]:
+            if isinstance(index.get(cat), dict):
+                for name, mapped_pid in index[cat].items():
+                    if mapped_pid == pid:
+                        profile_name = name
+                        break
+            if profile_name: break
 
         if not profile_name:
-            await interaction.followup.send(f"❌ **Error:** You do not own a personal profile with the PID '{pid}'.", ephemeral=True)
+            await interaction.followup.send(f"Error: You do not own a profile with the PID '{pid}'.", ephemeral=True)
             return
 
         temp_client = discord.Client(intents=discord.Intents.none())
@@ -6139,18 +6138,21 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
             bot_user_id = str(temp_client.user.id)
             await temp_client.close()
         except discord.LoginFailure:
-            await interaction.followup.send("❌ **Error:** The provided token is invalid. Please double-check it.", ephemeral=True)
+            await interaction.followup.send("Error: The provided token is invalid. Please double-check it.", ephemeral=True)
             return
         except Exception as e:
             await temp_client.close()
-            await interaction.followup.send(f"❌ **Error:** An unexpected error occurred while validating the token: {e}", ephemeral=True)
+            await interaction.followup.send(f"Error: An unexpected error occurred while validating the token: {e}", ephemeral=True)
             return
 
         if bot_user_id in self.cog.child_bots:
-            await interaction.followup.send("❌ **Error:** This bot application is already registered as a child bot.", ephemeral=True)
+            await interaction.followup.send("Error: This bot application is already registered as a child bot.", ephemeral=True)
             return
 
-        encrypted_token = self.cog._encrypt_data(token)
+        try:
+            encrypted_token = self.cog.fernet.encrypt(token.encode()).decode()
+        except Exception:
+            encrypted_token = token
         
         bot_config = {
             "token_encrypted": encrypted_token,
@@ -6162,7 +6164,7 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
         from .storage import IOManager
         IOManager.write_json_gzip(bot_config, bot_file, encrypted=False)
         
-        self.cog._load_child_bots() # Reload all bots into memory
+        self.cog._load_child_bots()
         
         new_bot_config = self.cog.child_bots.get(bot_user_id)
         if new_bot_config:
@@ -6173,8 +6175,7 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
                 "config": new_bot_config
             })
         
-        await interaction.followup.send(f"✅ **Success!** Child bot '{temp_client.user.name}' has been linked to your profile '{profile_name}'.", ephemeral=True)
-        # Call the update alias which points to setup_items + update_display
+        await interaction.followup.send(f"Success! Child bot '{temp_client.user.name}' has been linked to profile '{profile_name}'.", ephemeral=True)
         await self.parent_view.update_rebuild(interaction)
 
 class SessionView(ui.View):
@@ -7061,13 +7062,15 @@ class SessionAuditView(ui.View):
         self.simulate_profile_key = None
         self.batch_start_id = None
         self.batch_end_id = None
+        self.current_page = 0
+        self.num_pages = 1
         
-        log = self.session.get("unified_log", [])
-        self.recent_turns = log[-25:] if log else []
-        if self.recent_turns:
-            self.selected_turn_id = self.recent_turns[-1].get("turn_id")
-            self.batch_start_id = self.recent_turns[0].get("turn_id")
-            self.batch_end_id = self.recent_turns[-1].get("turn_id")
+        self.all_turns = self.session.get("unified_log", []) or []
+        if self.all_turns:
+            self.selected_turn_id = self.all_turns[-1].get("turn_id")
+            self.batch_start_id = self.all_turns[0].get("turn_id")
+            self.batch_end_id = self.all_turns[-1].get("turn_id")
+            self.current_page = max(0, (len(self.all_turns) - 1) // 20)
             
         profiles = self.session.get("profiles", [])
         if profiles:
@@ -7075,11 +7078,40 @@ class SessionAuditView(ui.View):
 
         self._build_view()
 
+    def _resolve_turn_speaker_name(self, turn: dict) -> str:
+        if turn.get("is_user"):
+            name = turn.get("display_name")
+            if not name and turn.get("speaker_pid", "").isdigit():
+                u_obj = self.cog.bot.get_user(int(turn.get("speaker_pid")))
+                if u_obj: name = u_obj.name
+            if not name:
+                import re
+                m = re.search(r'<([^>]+)>', turn.get("content", ""))
+                if m: name = m.group(1)
+            return name or f"User ({turn.get('speaker_pid', 'Unknown')})"
+        return turn.get("profile_name", "Bot")
+
+    def _extract_turn_preview(self, turn: dict) -> str:
+        content = turn.get("content", "")
+        import re
+        clean_text = re.sub(r'<([a-zA-Z0-9_]+)>.*?</\1>', '', content, flags=re.DOTALL | re.IGNORECASE)
+        clean_text = re.sub(r'</?[^>]+>', '', clean_text)
+        clean_text = re.sub(r'\[ID:[^\]]+\]\s*\[[^\]]+\]:\s*', '', clean_text)
+        clean_text = re.sub(r'\(\s*Thought Initiated:.*?\)\s*', '', clean_text)
+        clean_text = " ".join(clean_text.split()).strip()
+        
+        if not clean_text:
+            clean_text = "No text content"
+        
+        if len(clean_text) > 15:
+            return f"{clean_text[:15]}..."
+        return clean_text
+
     def _build_view(self):
         self.clear_items()
         
-        # Row 0: Modes
-        modes = [("Overview", "overview"), ("Turn Inspector", "inspector"), ("Simulator", "simulator"), ("Batch Calculator", "batch")]
+        # Row 0: Modes (Simulator before Turn Inspector)
+        modes = [("Overview", "overview"), ("Simulator", "simulator"), ("Turn Inspector", "inspector"), ("Batch Calculator", "batch")]
         for label, val in modes:
             btn = ui.Button(label=label, style=discord.ButtonStyle.primary if self.mode == val else discord.ButtonStyle.secondary, row=0, disabled=(self.mode == val))
             def make_cb(target_mode):
@@ -7091,59 +7123,164 @@ class SessionAuditView(ui.View):
             btn.callback = make_cb(val)
             self.add_item(btn)
 
-        # Rows 1/2: Contextual Dropdowns
+        # Contextual Dropdowns
         if self.mode == "inspector":
+            self.all_turns = self.session.get("unified_log", []) or []
+            self.num_pages = max(1, (len(self.all_turns) - 1) // 20 + 1)
+            self.current_page = max(0, min(self.current_page, self.num_pages - 1))
+            
+            start = self.current_page * 20
+            page_turns = self.all_turns[start : start + 20]
+            
             opts = []
-            for idx, t in enumerate(self.recent_turns):
-                display = "User" if t.get("is_user") else t.get("profile_name", "Bot")
-                content_preview = t.get("content", "").split("\n")[-1][:40].strip()
-                opts.append(discord.SelectOption(label=f"Turn #{len(self.session.get('unified_log', [])) - len(self.recent_turns) + idx + 1} - {display}", value=t.get("turn_id"), description=content_preview, default=(t.get("turn_id") == self.selected_turn_id)))
+            if self.current_page > 0:
+                opts.append(discord.SelectOption(label="◀ Previous Page", value="prev_page", description="Navigate to previous page of turns"))
+            
+            opts.append(discord.SelectOption(label=f"📄 Page {self.current_page + 1}/{self.num_pages} (Jump)", value="jump_page", description="Click to jump to a page number"))
+            
+            if self.current_page < self.num_pages - 1:
+                opts.append(discord.SelectOption(label="▶ Next Page", value="next_page", description="Navigate to next page of turns"))
+            
+            for idx, t in enumerate(page_turns):
+                abs_turn_num = start + idx + 1
+                display = self._resolve_turn_speaker_name(t)
+                preview = self._extract_turn_preview(t)
+                label = f"Turn #{abs_turn_num} - {display} ({preview})"
+                opts.append(discord.SelectOption(label=label[:100], value=t.get("turn_id"), default=(t.get("turn_id") == self.selected_turn_id)))
+            
             if opts:
-                sel = ui.Select(placeholder="Select a past turn...", options=opts, row=1)
+                sel = ui.Select(placeholder="Select a turn to inspect...", options=opts, row=1)
                 async def sel_cb(i: discord.Interaction):
-                    self.selected_turn_id = i.data['values'][0]
-                    self._build_view()
-                    await i.response.edit_message(embed=self._build_embed(), view=self)
+                    val = i.data['values'][0]
+                    if val == "prev_page":
+                        self.current_page -= 1
+                        self._build_view()
+                        await i.response.edit_message(embed=self._build_embed(), view=self)
+                    elif val == "next_page":
+                        self.current_page += 1
+                        self._build_view()
+                        await i.response.edit_message(embed=self._build_embed(), view=self)
+                    elif val == "jump_page":
+                        await i.response.send_modal(AuditPageJumpModal(self))
+                    else:
+                        self.selected_turn_id = val
+                        self._build_view()
+                        await i.response.edit_message(embed=self._build_embed(), view=self)
                 sel.callback = sel_cb
                 self.add_item(sel)
 
         elif self.mode == "simulator":
+            profiles = self.session.get("profiles", []) or []
+            self.num_pages = max(1, (len(profiles) - 1) // 20 + 1)
+            self.current_page = max(0, min(self.current_page, self.num_pages - 1))
+            
+            start = self.current_page * 20
+            page_profiles = profiles[start : start + 20]
+            
             opts = []
-            for p in self.session.get("profiles", []):
+            if self.current_page > 0:
+                opts.append(discord.SelectOption(label="◀ Previous Page", value="prev_page", description="Navigate to previous page of profiles"))
+            
+            if self.num_pages > 1:
+                opts.append(discord.SelectOption(label=f"📄 Page {self.current_page + 1}/{self.num_pages} (Jump)", value="jump_page", description="Click to jump to a page number"))
+            
+            if self.current_page < self.num_pages - 1:
+                opts.append(discord.SelectOption(label="▶ Next Page", value="next_page", description="Navigate to next page of profiles"))
+            
+            for p in page_profiles:
                 val = f"{p['owner_id']}:{p['profile_name']}"
-                opts.append(discord.SelectOption(label=p['profile_name'], value=val, default=(val == self.simulate_profile_key)))
+                opts.append(discord.SelectOption(label=p['profile_name'][:100], value=val, default=(val == self.simulate_profile_key)))
+                
             if opts:
                 sel = ui.Select(placeholder="Select a profile to simulate next turn...", options=opts, row=1)
                 async def sel_cb(i: discord.Interaction):
-                    self.simulate_profile_key = i.data['values'][0]
-                    self._build_view()
-                    await i.response.edit_message(embed=self._build_embed(), view=self)
+                    val = i.data['values'][0]
+                    if val == "prev_page":
+                        self.current_page -= 1
+                        self._build_view()
+                        await i.response.edit_message(embed=self._build_embed(), view=self)
+                    elif val == "next_page":
+                        self.current_page += 1
+                        self._build_view()
+                        await i.response.edit_message(embed=self._build_embed(), view=self)
+                    elif val == "jump_page":
+                        await i.response.send_modal(AuditPageJumpModal(self))
+                    else:
+                        self.simulate_profile_key = val
+                        self._build_view()
+                        await i.response.edit_message(embed=self._build_embed(), view=self)
                 sel.callback = sel_cb
                 self.add_item(sel)
 
         elif self.mode == "batch":
+            self.all_turns = self.session.get("unified_log", []) or []
+            self.num_pages = max(1, (len(self.all_turns) - 1) // 20 + 1)
+            self.current_page = max(0, min(self.current_page, self.num_pages - 1))
+            
+            start = self.current_page * 20
+            page_turns = self.all_turns[start : start + 20]
+            
             opts_start = []
             opts_end = []
-            for idx, t in enumerate(self.recent_turns):
-                display = "User" if t.get("is_user") else t.get("profile_name", "Bot")
-                label = f"Turn #{len(self.session.get('unified_log', [])) - len(self.recent_turns) + idx + 1} - {display}"
-                opts_start.append(discord.SelectOption(label=label, value=t.get("turn_id"), default=(t.get("turn_id") == self.batch_start_id)))
-                opts_end.append(discord.SelectOption(label=label, value=t.get("turn_id"), default=(t.get("turn_id") == self.batch_end_id)))
+            
+            if self.current_page > 0:
+                opts_start.append(discord.SelectOption(label="◀ Previous Page", value="prev_page", description="Navigate to previous page"))
+                opts_end.append(discord.SelectOption(label="◀ Previous Page", value="prev_page", description="Navigate to previous page"))
+            
+            if self.num_pages > 1:
+                opts_start.append(discord.SelectOption(label=f"📄 Page {self.current_page + 1}/{self.num_pages} (Jump)", value="jump_page", description="Click to jump to a page number"))
+                opts_end.append(discord.SelectOption(label=f"📄 Page {self.current_page + 1}/{self.num_pages} (Jump)", value="jump_page", description="Click to jump to a page number"))
+            
+            if self.current_page < self.num_pages - 1:
+                opts_start.append(discord.SelectOption(label="▶ Next Page", value="next_page", description="Navigate to next page"))
+                opts_end.append(discord.SelectOption(label="▶ Next Page", value="next_page", description="Navigate to next page"))
+
+            for idx, t in enumerate(page_turns):
+                abs_turn_num = start + idx + 1
+                display = self._resolve_turn_speaker_name(t)
+                preview = self._extract_turn_preview(t)
+                label = f"Turn #{abs_turn_num} - {display} ({preview})"
+                opts_start.append(discord.SelectOption(label=label[:100], value=t.get("turn_id"), default=(t.get("turn_id") == self.batch_start_id)))
+                opts_end.append(discord.SelectOption(label=label[:100], value=t.get("turn_id"), default=(t.get("turn_id") == self.batch_end_id)))
             
             if opts_start:
                 sel_start = ui.Select(placeholder="Select Start Turn...", options=opts_start, row=1)
                 async def ss_cb(i: discord.Interaction):
-                    self.batch_start_id = i.data['values'][0]
-                    self._build_view()
-                    await i.response.edit_message(embed=self._build_embed(), view=self)
+                    val = i.data['values'][0]
+                    if val == "prev_page":
+                        self.current_page -= 1
+                        self._build_view()
+                        await i.response.edit_message(embed=self._build_embed(), view=self)
+                    elif val == "next_page":
+                        self.current_page += 1
+                        self._build_view()
+                        await i.response.edit_message(embed=self._build_embed(), view=self)
+                    elif val == "jump_page":
+                        await i.response.send_modal(AuditPageJumpModal(self))
+                    else:
+                        self.batch_start_id = val
+                        self._build_view()
+                        await i.response.edit_message(embed=self._build_embed(), view=self)
                 sel_start.callback = ss_cb
                 self.add_item(sel_start)
                 
                 sel_end = ui.Select(placeholder="Select End Turn...", options=opts_end, row=2)
                 async def se_cb(i: discord.Interaction):
-                    self.batch_end_id = i.data['values'][0]
-                    self._build_view()
-                    await i.response.edit_message(embed=self._build_embed(), view=self)
+                    val = i.data['values'][0]
+                    if val == "prev_page":
+                        self.current_page -= 1
+                        self._build_view()
+                        await i.response.edit_message(embed=self._build_embed(), view=self)
+                    elif val == "next_page":
+                        self.current_page += 1
+                        self._build_view()
+                        await i.response.edit_message(embed=self._build_embed(), view=self)
+                    elif val == "jump_page":
+                        await i.response.send_modal(AuditPageJumpModal(self))
+                    else:
+                        self.batch_end_id = val
+                        self._build_view()
+                        await i.response.edit_message(embed=self._build_embed(), view=self)
                 sel_end.callback = se_cb
                 self.add_item(sel_end)
 
@@ -7173,7 +7310,6 @@ class SessionAuditView(ui.View):
                 embed.add_field(name="1. Overall Session Telemetry", value=f"├── Active Participants: `{len(self.session.get('profiles', []))}` Profiles\n├── Total Session Turns: `{len(log)}`\n├── Total Input Tokens Processed: `{total_in:,}`\n├── Total Output Tokens Generated: `{total_out:,}`\n└── Estimated Session API Cost: `~${total_cost:.4f} USD`", inline=False)
                 
                 avg_lat = sum(durations) / len(durations) if durations else 0.0
-
                 embed.add_field(name="2. System Health Checks", value=f"└── Model Latency Average: `{avg_lat:.2f}s`", inline=False)
 
             elif self.mode == "inspector":
@@ -7181,12 +7317,17 @@ class SessionAuditView(ui.View):
                 if not target:
                     embed.description = "Select a turn to inspect."
                 elif target.get("is_user"):
-                    embed.description = "Turn Inspector: User Message\n*User messages do not consume generation tokens directly, but contribute to the STM history buffer footprint.*"
+                    speaker_name = self._resolve_turn_speaker_name(target)
                     content = target.get("content", "")
-                    est_tokens = self.cog._estimate_text_tokens(content)
-                    embed.add_field(name="Payload Data", value=f"├── Speaker: `{target.get('speaker_pid')}`\n├── Timestamp: `{target.get('timestamp')}`\n└── Footprint: `~{est_tokens:,} tokens added to STM`", inline=False)
-                    if len(content) > 1024: content = content[:1021] + "..."
-                    embed.add_field(name="Raw Content", value=f"```xml\n{content}\n```", inline=False)
+                    if target.get("url_context"):
+                        content += f"\n<document_context>\n{target.get('url_context')}\n</document_context>"
+                    input_tokens = self.cog._estimate_text_tokens(content)
+                    
+                    embed.add_field(
+                        name="Payload Data",
+                        value=f"├── Speaker: `{speaker_name}`\n├── Speaker ID: `{target.get('speaker_pid')}`\n├── Timestamp: `{target.get('timestamp')}`\n└── Input Tokens: `{input_tokens:,}`",
+                        inline=False
+                    )
                 else:
                     meta = target.get("meta") or {}
                     mod = meta.get("model", "Unknown")
@@ -7216,7 +7357,7 @@ class SessionAuditView(ui.View):
                         p_idx = self.cog._get_user_index(o_id)
                         is_b = p_name in p_idx.get("borrowed", [])
                         p_cfg = self.cog._get_profile_config(o_id, p_name, is_b) or {}
-                        stm_len = int(p_cfg.get("stm_length", 20))
+                        stm_len = int(p_cfg.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
                         
                         sys_toks = self.cog._estimate_text_tokens(sys_instr)
                         
@@ -7225,7 +7366,7 @@ class SessionAuditView(ui.View):
                         hist_toks = self.cog._estimate_text_tokens(hist_str)
                         
                         total_est = sys_toks + hist_toks
-                        est_cost = self.cog._calculate_turn_cost(prim_mod, total_est, 300) # Assumes avg 300 output
+                        est_cost = self.cog._calculate_turn_cost(prim_mod, total_est, 300)
                         
                         embed.add_field(name="Pre-Inference Budget Estimate (Per Turn)", value=f"├── Target: `{p_name}`\n├── Expected Model: `{prim_mod}`\n├── System & Instructions: `~{sys_toks:,} tokens`\n├── STM History Buffer: `~{hist_toks:,} tokens`\n└── **ESTIMATED INPUT TOTAL**: `~{total_est:,} tokens`", inline=False)
                         embed.add_field(name="Financial Projection", value=f"Projected cost for next generation: `~${est_cost:.6f} USD`\n*(Assuming ~300 output tokens)*", inline=False)
@@ -7236,13 +7377,13 @@ class SessionAuditView(ui.View):
                 if not self.batch_start_id or not self.batch_end_id:
                     embed.description = "Select start and end turns to calculate."
                 else:
-                    s_idx = next((i for i, t in enumerate(self.recent_turns) if t.get("turn_id") == self.batch_start_id), -1)
-                    e_idx = next((i for i, t in enumerate(self.recent_turns) if t.get("turn_id") == self.batch_end_id), -1)
+                    s_idx = next((i for i, t in enumerate(log) if t.get("turn_id") == self.batch_start_id), -1)
+                    e_idx = next((i for i, t in enumerate(log) if t.get("turn_id") == self.batch_end_id), -1)
                     
                     if s_idx == -1 or e_idx == -1 or s_idx > e_idx:
                         embed.description = "Invalid range selection. Start turn must occur before End turn."
                     else:
-                        batch_turns = self.recent_turns[s_idx:e_idx+1]
+                        batch_turns = log[s_idx:e_idx+1]
                         
                         total_in = 0
                         total_out = 0
@@ -7277,3 +7418,28 @@ class SessionAuditView(ui.View):
             print(f"Error building audit embed: {err_trace}")
             err_embed = discord.Embed(title="Audit Error", description=f"An error occurred while building the telemetry report:\n```\n{e}\n```", color=discord.Color.red())
             return err_embed
+
+class AuditPageJumpModal(ui.Modal, title="Jump to Page"):
+    def __init__(self, parent_view: 'SessionAuditView'):
+        super().__init__()
+        self.parent_view = parent_view
+        self.page_input = ui.TextInput(
+            label="Page Number",
+            placeholder=f"Enter a number between 1 and {parent_view.num_pages}",
+            required=True,
+            min_length=1,
+            max_length=5
+        )
+        self.add_item(self.page_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            page_num = int(self.page_input.value.strip())
+            if page_num < 1 or page_num > self.parent_view.num_pages:
+                raise ValueError("Out of range")
+            self.parent_view.current_page = page_num - 1
+            self.parent_view._build_view()
+            await interaction.response.defer()
+            await interaction.edit_original_response(embed=self.parent_view._build_embed(), view=self.parent_view)
+        except ValueError:
+            await interaction.response.send_message(f"Please enter a valid number between 1 and {self.parent_view.num_pages}.", ephemeral=True)

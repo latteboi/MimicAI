@@ -65,7 +65,10 @@ async def ipc_server_handler(websocket, path=None):
             print(f"IPC: Launching {len(bot.child_bot_config)} bots into the Hive...")
             for bot_id, config in bot.child_bot_config.items():
                 try:
-                    token = fernet.decrypt(config['token_encrypted'].encode()).decode()
+                    try:
+                        token = fernet.decrypt(config['token_encrypted'].encode()).decode()
+                    except Exception:
+                        token = config['token_encrypted']
                     await websocket.send(json.dumps({
                         "action": "launch",
                         "bot_id": bot_id,
