@@ -205,7 +205,7 @@ class CoreMixin:
             image_prefixes = ("!image", "!imagine")
             is_image_request = content_lower.startswith(image_prefixes)
 
-            attachments_data = [{"url": a.url, "content_type": a.content_type} for a in message.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))]
+            attachments_data = [{"url": a.url, "filename": a.filename, "content_type": a.content_type} for a in message.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/") or a.content_type.startswith("text/") or a.filename.lower().endswith(('.txt', '.log', '.md', '.csv', '.json', '.py', '.js', '.html', '.css', '.xml')))]
             
             reply_data = None
             if ref_msg:

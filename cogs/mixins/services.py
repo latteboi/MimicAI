@@ -1550,7 +1550,14 @@ class ServicesMixin:
                             reply_context = await self._resolve_reply_context(message_trigger)
 
                         content = trigger_obj['content'] if is_child_mention else trigger_obj.clean_content
-                        # [UPDATED] Standardised XML context with newline separator for cleaner transcript integration
+                        
+                        raw_att_list = trigger_obj['attachments'] if is_child_mention else trigger_obj.attachments
+                        async with httpx.AsyncClient(timeout=10.0) as text_client:
+                            text_att_content = await self._process_text_attachments(raw_att_list, text_client)
+                        
+                        if text_att_content:
+                            content = f"{content}\n\n{text_att_content}"
+
                         content = f"{reply_context}\n{content}" if reply_context else content
                         
                         # [NEW] URL Context Logic: Enforce Profile Setting & Separation
@@ -4453,6 +4460,15 @@ class ServicesMixin:
                 print(f"Realistic typing failed, falling back to standard send. Error: {e}")
                 traceback.print_exc()
 
+        if reply_to and not is_placeholder and profile_owner_id_for_appearance is not None and profile_name_for_appearance:
+            index = self._get_user_index(profile_owner_id_for_appearance)
+            is_borrowed = profile_name_for_appearance in index.get("borrowed", [])
+            target_profile_settings = self._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, is_borrowed) or {}
+            
+            rmode = target_profile_settings.get("response_mode", "regular")
+            if rmode in ["mention", "mention_reply"]:
+                content = f"{reply_to.author.mention} {content}"
+
         is_first_chunk = True
         
         for chunk in _yield_message_chunks(content):
@@ -4470,14 +4486,6 @@ class ServicesMixin:
                 current_target_to_edit = None
 
             final_content_for_send = chunk
-            if is_first_chunk and reply_to and not is_placeholder:
-                index = self._get_user_index(profile_owner_id_for_appearance)
-                is_borrowed = profile_name_for_appearance in index.get("borrowed", [])
-                target_profile_settings = self._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, is_borrowed) or {}
-                
-                rmode = target_profile_settings.get("response_mode", "regular")
-                if rmode in ["mention", "mention_reply"]:
-                    final_content_for_send = f"{reply_to.author.mention} {final_content_for_send}"
 
             sent_message_part: Optional[discord.Message] = None
 
@@ -4554,60 +4562,70 @@ class ServicesMixin:
     
     def _scrub_response_text(self, text: str, participant_names: Optional[List[str]] = None) -> str:
         """Hard-coded filter to remove any leaked script formatting or specific XML tags from the AI's response."""
+        if not text or not text.strip():
+            return ""
+
+        raw_original = text.strip()
+
         try:
             with Timeout(seconds=2, error_message="Scrubbing timed out due to complex regex."):
-                scrubbed_text = text.strip()
-                scrubbed_text = scrubbed_text.replace("&#x20;", " ")
+                scrubbed_text = raw_original.replace("&#x20;", " ")
 
-                # 1. Targeted XML Tag Scrubber (Internal thoughts, metadata, and context ONLY)
+                # 1. Targeted Internal System XML Tag Scrubber (Pipeline Tags ONLY)
                 system_tags = [
                     "archive_context", "external_context", "document_context", "time_context",
                     "whisper_context", "private_whisper", "private_response", "internal_note",
                     "scene_prompt", "neuro_endocrine_engine", "neuro_update", "persona_profile",
-                    "backstory", "personality_traits", "likes", "dislikes", "appearance",
-                    "instructions", "training_data", "example", "negative_constraints",
-                    "context_rules", "image_context", "target_content", "target_transcript",
-                    "system_note", "reply_context", "thought", "think", "reasoning", "instruction"
+                    "technical_manual", "training_data", "context_rules", "image_context",
+                    "system_note", "reply_context", "negative_constraints"
                 ]
                 tags_pattern = "|".join(system_tags)
                 
-                # Strip entire blocks of known system tags
+                # Strip entire blocks of known internal pipeline system tags
                 scrubbed_text = re.sub(rf'<({tags_pattern})>.*?</\1>', '', scrubbed_text, flags=re.DOTALL | re.IGNORECASE)
-                # Strip any orphaned opening/closing system tags
+                # Strip any orphaned opening/closing internal system tags
                 scrubbed_text = re.sub(rf'</?({tags_pattern})>', '', scrubbed_text, flags=re.IGNORECASE)
+
+                # Reasoning/Thinking tags (<think>...</think> or <thought>...</thought>)
+                scrubbed_text = re.sub(r'<(think|thought|reasoning)>.*?</\1>', '', scrubbed_text, flags=re.DOTALL | re.IGNORECASE)
+                scrubbed_text = re.sub(r'</?(think|thought|reasoning)>', '', scrubbed_text, flags=re.IGNORECASE)
                 
-                # 2. Simplified Header Scrubber
-                # This matches ANY line containing a bracketed block of 15+ characters (the timestamp signature)
-                # and removes that entire line. Multiline mode (?m) ensures it catches mid-paragraph hallucinations.
-                pattern_timestamp_line = r'(?m)^.*\[[^\]\r\n]{15,}\].*$'
-                scrubbed_text = re.sub(pattern_timestamp_line, '', scrubbed_text)
+                # 2. Precise System Header Scrubber
+                pattern_system_header = r'(?m)^<[^>\r\n]+>\s*\[ID:[^\]\r\n]+\]\s*\[[^\]\r\n]+\]:\s*$'
+                scrubbed_text = re.sub(pattern_system_header, '', scrubbed_text)
 
                 # 3. Global Technical Metadata Scrubber
                 pattern_metadata = r'\(?\s*(?:Thought Initiated:)?\s*[^|\n\r]*?\|?\s*Duration: \d+\.\d+s\s*\)?'
                 scrubbed_text = re.sub(pattern_metadata, '', scrubbed_text, flags=re.IGNORECASE)
 
-                # 4. Global Participant Prefix & Suffix Scrubber (Character Name:)
+                # 4. Global Participant Prefix & Suffix Scrubber
                 if participant_names:
-                    escaped_names = [re.escape(name) for name in participant_names]
-                    names_pattern_part = "|".join(escaped_names)
-                    
-                    # Searches for "<Name>:" or "Name:" prefixes at the start of lines
-                    pattern_name_prefix = rf'(?:^|\n)<?(?:{names_pattern_part})>?:\s*'
-                    scrubbed_text = re.sub(pattern_name_prefix, '', scrubbed_text, flags=re.IGNORECASE).strip()
-                    
-                    # Hunts down orphaned opening/closing participant XML tags (e.g., </Salty Tongue>)
-                    pattern_name_xml = rf'</?(?:{names_pattern_part})>'
-                    scrubbed_text = re.sub(pattern_name_xml, '', scrubbed_text, flags=re.IGNORECASE).strip()
+                    escaped_names = [re.escape(name) for name in participant_names if name]
+                    if escaped_names:
+                        names_pattern_part = "|".join(escaped_names)
+                        
+                        pattern_name_prefix = rf'(?:^|\n)<?(?:{names_pattern_part})>?:\s*'
+                        scrubbed_text = re.sub(pattern_name_prefix, '', scrubbed_text, flags=re.IGNORECASE).strip()
+                        
+                        pattern_name_xml = rf'</?(?:{names_pattern_part})>'
+                        scrubbed_text = re.sub(pattern_name_xml, '', scrubbed_text, flags=re.IGNORECASE).strip()
 
                 scrubbed_text = re.sub(r'Message\s*#[\w-]+', '', scrubbed_text).strip()
                 
-                # Cleanup excess whitespace left by removals
-                scrubbed_text = re.sub(r'\n{3,}', '\n\n', scrubbed_text)
+                # Cleanup excess whitespace
+                scrubbed_text = re.sub(r'\n{3,}', '\n\n', scrubbed_text).strip()
                 
+                # Diagnostic Safeguard: If scrubbing wiped out non-empty content, log and recover
+                if not scrubbed_text and raw_original:
+                    print(f"[SCRUBBER DIAGNOSTIC] Warning: Aggressive scrubbing deleted response text. Falling back to sanitized raw text.")
+                    fallback_text = re.sub(rf'<({tags_pattern})>.*?</\1>', '', raw_original, flags=re.DOTALL | re.IGNORECASE)
+                    fallback_text = re.sub(rf'</?({tags_pattern})>', '', fallback_text, flags=re.IGNORECASE).strip()
+                    return fallback_text if fallback_text else raw_original
+
                 return scrubbed_text
         except TimeoutError as e:
             print(f"Warning: {e}. Returning original text.")
-            return text
+            return raw_original
         
     def _deduplicate_response(self, text: str) -> str:
         try:
@@ -5784,6 +5802,54 @@ class ServicesMixin:
 
         except Exception as e:
             await interaction.followup.send(f"❌ **Analysis Failed:** {e}", ephemeral=True)
+
+    async def _process_text_attachments(self, attachments: List[Any], client: httpx.AsyncClient) -> str:
+        text_blocks = []
+        text_extensions = ('.txt', '.log', '.md', '.csv', '.json', '.py', '.js', '.html', '.css', '.xml')
+        
+        count = 0
+        for att in attachments:
+            if count >= 2: break
+            
+            if isinstance(att, dict):
+                url = att.get('url')
+                filename = att.get('filename', 'attachment.txt')
+                content_type = (att.get('content_type') or '').lower()
+            else:
+                url = att.url
+                filename = att.filename
+                content_type = (att.content_type or '').lower()
+                
+            is_text = content_type.startswith("text/") or filename.lower().endswith(text_extensions)
+            if not is_text or not url:
+                continue
+                
+            try:
+                resp = await client.get(url, follow_redirects=True, timeout=10.0)
+                resp.raise_for_status()
+                
+                raw_bytes = resp.content
+                if len(raw_bytes) > 5 * 1024 * 1024:
+                    raw_bytes = raw_bytes[:5 * 1024 * 1024]
+                    
+                decoded = raw_bytes.decode('utf-8', errors='replace')
+                
+                if '\x00' in decoded[:1000]:
+                    continue
+                    
+                clean_text = decoded.strip()
+                if not clean_text:
+                    continue
+                    
+                if len(clean_text) > 40000:
+                    clean_text = clean_text[:40000] + "\n[Content truncated at 40,000 characters]"
+                    
+                text_blocks.append(f"<text_attachment filename='{filename}'>\n{clean_text}\n</text_attachment>")
+                count += 1
+            except Exception as e:
+                print(f"Failed to fetch or process text attachment {filename}: {e}")
+                
+        return "\n\n".join(text_blocks)
 
     def _add_inline_citations(self, text: str, grounding_metadata) -> str:
         if not grounding_metadata: return text
