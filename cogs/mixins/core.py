@@ -1857,7 +1857,7 @@ class CoreMixin:
         user_id_str = str(user_id)
         
         # 1. Shutdown Child Bots
-        child_bots_to_kill =[bot_id for bot_id, data in self.child_bots.items() if str(data.get("owner_id")) == user_id_str]
+        child_bots_to_kill = [bot_id for bot_id, data in self.child_bots.items() if str(data.get("owner_id")) == user_id_str]
         for bot_id in child_bots_to_kill:
             await self.manager_queue.put({"action": "shutdown_bot", "bot_id": bot_id})
             self.child_bots.pop(bot_id, None)
@@ -1880,7 +1880,7 @@ class CoreMixin:
         keys_changed = False
         for guild_id_str, submissions in list(self.key_submissions.items()):
             original_len = len(submissions)
-            self.key_submissions[guild_id_str] =[s for s in submissions if str(s.get("submitter_id")) != user_id_str]
+            self.key_submissions[guild_id_str] = [s for s in submissions if str(s.get("submitter_id")) != user_id_str]
             if len(self.key_submissions[guild_id_str]) < original_len:
                 keys_changed = True
                 
@@ -1892,36 +1892,26 @@ class CoreMixin:
         if keys_changed:
             self._save_key_submissions()
             
-        # 4. Scrub from Freewill
-        freewill_changed = False
-        for guild_id_str, srv_data in list(self.freewill_participation.items()):
-            for channel_id_str, ch_data in list(srv_data.items()):
-                if user_id_str in ch_data:
-                    del ch_data[user_id_str]
-                    freewill_changed = True
-            if freewill_changed:
-                self._save_freewill_for_server(int(guild_id_str))
-                
-        # 5. Delete Core User Directory
+        # 4. Delete Core User Directory
         import shutil
         user_dir = os.path.join(self.USERS_DIR, user_id_str)
         if os.path.exists(user_dir):
             shutil.rmtree(user_dir, ignore_errors=True)
             
-        # 6. Remove from In-Memory Dicts
+        # 5. Remove from In-Memory Dicts
         self.user_indices.pop(user_id_str, None)
         self.user_appearances.pop(user_id_str, None)
         self.profile_shares.pop(user_id_str, None)
         self.personal_api_keys.pop(user_id_str, None)
         
-        # 7. Cancel/Delete active global chat sessions
-        keys_to_del =[k for k in self.global_chat_sessions.keys() if isinstance(k, tuple) and len(k) == 3 and k[0] == 'global' and k[1] == user_id]
+        # 6. Cancel/Delete active global chat sessions
+        keys_to_del = [k for k in self.global_chat_sessions.keys() if isinstance(k, tuple) and len(k) == 3 and k[0] == 'global' and k[1] == user_id]
         for k in keys_to_del:
             self.global_chat_sessions.pop(k, None)
             self.session_last_accessed.pop(k, None)
             self.ltm_recall_history.pop(k, None)
 
-        await interaction.followup.send("✅ **Account Deleted.** All your profiles, memories, and settings have been permanently erased from this instance.", ephemeral=True)
+        await interaction.followup.send("Account Deleted. All your profiles, memories, and settings have been permanently erased from this instance.", ephemeral=True)
 
     def _try_acquire_lock(self):
         try:

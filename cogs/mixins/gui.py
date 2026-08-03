@@ -7094,9 +7094,18 @@ class SessionAuditView(ui.View):
     def _extract_turn_preview(self, turn: dict) -> str:
         content = turn.get("content", "")
         import re
-        clean_text = re.sub(r'<([a-zA-Z0-9_]+)>.*?</\1>', '', content, flags=re.DOTALL | re.IGNORECASE)
+        system_tags = [
+            "archive_context", "external_context", "document_context", "time_context",
+            "whisper_context", "private_whisper", "private_response", "internal_note",
+            "scene_prompt", "neuro_endocrine_engine", "neuro_update", "persona_profile",
+            "technical_manual", "training_data", "context_rules", "image_context",
+            "system_note", "reply_context", "negative_constraints"
+        ]
+        tags_pattern = "|".join(system_tags)
+        clean_text = re.sub(rf'<({tags_pattern})>.*?</\1>', '', content, flags=re.DOTALL | re.IGNORECASE)
+        clean_text = re.sub(rf'</?({tags_pattern})>', '', clean_text, flags=re.IGNORECASE)
+        clean_text = re.sub(r'<[^>]+>\s*\[ID:[^\]]+\]\s*\[[^\]]+\]:\s*', '', clean_text)
         clean_text = re.sub(r'</?[^>]+>', '', clean_text)
-        clean_text = re.sub(r'\[ID:[^\]]+\]\s*\[[^\]]+\]:\s*', '', clean_text)
         clean_text = re.sub(r'\(\s*Thought Initiated:.*?\)\s*', '', clean_text)
         clean_text = " ".join(clean_text.split()).strip()
         
