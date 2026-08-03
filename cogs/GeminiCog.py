@@ -89,8 +89,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
         
         self.user_indices: LRUCache = LRUCache(max_size=20)
         self.server_indices: LRUCache = LRUCache(max_size=50)
-        self.profile_configs: LRUCache = LRUCache(max_size=50)
-        self.profile_prompts: LRUCache = LRUCache(max_size=20)
         
         self.user_appearances: Dict[str, Dict[str, Dict[str, Optional[str]]]] = {}
         self._load_channel_webhooks()

@@ -1325,8 +1325,6 @@ class StorageMixin:
 
     def _get_profile_config(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> Optional[Dict[str, Any]]:
         if not profile_name: return None
-        cache_key = f"{user_id}:{profile_name}:{'b' if is_borrowed else 'p'}"
-        if cache_key in self.profile_configs: return self.profile_configs[cache_key]
         
         pid = self._get_pid_from_name(user_id, profile_name, is_borrowed)
         if not pid: return None
@@ -1340,14 +1338,12 @@ class StorageMixin:
                 local_data["profile_id"] = str(uuid.uuid4().hex[:8].upper())
                 IOManager.write_json_gzip(local_data, path, self.fernet)
                 
-            self.profile_configs[cache_key] = local_data
             return local_data
             
         return None
 
     def _save_profile_config(self, user_id: int, profile_name: str, data: Dict[str, Any], is_borrowed: bool = False):
         if not profile_name: return
-        cache_key = f"{user_id}:{profile_name}:{'b' if is_borrowed else 'p'}"
         pid = self._get_pid_from_name(user_id, profile_name, is_borrowed)
         if not pid: return
         filename = "borrowed_config.json.gz" if is_borrowed else "config.json.gz"
@@ -1356,7 +1352,6 @@ class StorageMixin:
         path = os.path.join(p_dir, filename)
         
         IOManager.write_json_gzip(data, path, self.fernet)
-        self.profile_configs[cache_key] = data
 
         name_file = os.path.join(p_dir, "name.txt")
         if not os.path.exists(name_file):
@@ -1397,26 +1392,20 @@ class StorageMixin:
 
     def _get_profile_prompts(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
         if not profile_name: return None
-        cache_key = f"{user_id}:{profile_name}"
-        if cache_key in self.profile_prompts: return self.profile_prompts[cache_key]
         
         pid = self._get_pid_from_name_any(user_id, profile_name)
         if not pid: return None
         path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "prompts.json.gz")
         data = IOManager.read_json_gzip(path, self.fernet)
         
-        if data is not None:
-            self.profile_prompts[cache_key] = data
         return data
 
     def _save_profile_prompts(self, user_id: int, profile_name: str, data: Dict[str, Any]):
         if not profile_name: return
-        cache_key = f"{user_id}:{profile_name}"
         pid = self._get_pid_from_name_any(user_id, profile_name)
         if not pid: return
         path = os.path.join(self.USERS_DIR, str(user_id), "profiles", pid, "prompts.json.gz")
         IOManager.write_json_gzip(data, path, self.fernet)
-        self.profile_prompts[cache_key] = data
 
     def _get_or_create_user_profile(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
         profile_name = profile_name.lower().strip()

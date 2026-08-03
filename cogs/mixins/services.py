@@ -506,13 +506,33 @@ class GoogleGenAIModel:
                         mime_type = p.get('mime_type', '')
                         if url.startswith(('http://', 'https://')):
                             try:
-                                # Fetch HTTP URLs to bytes for Google SDK v2
-                                async with httpx.AsyncClient() as client:
-                                    resp = await client.get(url, follow_redirects=True, timeout=15.0)
-                                    resp.raise_for_status()
-                                    parts.append(types.Part.from_bytes(data=resp.content, mime_type=mime_type or 'image/png'))
+                                import tempfile
+                                import os
+                                
+                                # 1. Stream directly to disk to prevent RAM spikes
+                                fd, temp_path = tempfile.mkstemp(suffix=".tmp")
+                                async with httpx.AsyncClient() as client_http:
+                                    async with client_http.stream("GET", url, follow_redirects=True, timeout=15.0) as resp:
+                                        resp.raise_for_status()
+                                        with os.fdopen(fd, 'wb') as f:
+                                            async for chunk in resp.aiter_bytes(chunk_size=8192):
+                                                f.write(chunk)
+                                
+                                # 2. Upload via File API (Disk Overloading)
+                                # Using asyncio.to_thread to prevent blocking the event loop with the sync upload
+                                upload_config = {'mime_type': mime_type or 'image/jpeg'}
+                                uploaded_file = await asyncio.to_thread(self.client.files.upload, file=temp_path, config=upload_config)
+                                
+                                # 3. Pass the URI reference instead of raw bytes
+                                parts.append(types.Part.from_uri(file_uri=uploaded_file.uri, mime_type=mime_type or 'image/jpeg'))
+                                
+                                # 4. Cleanup temp file
+                                os.remove(temp_path)
+                                
                             except Exception as e:
                                 print(f"Failed to fetch media from URL {url}: {e}")
+                                if 'temp_path' in locals() and os.path.exists(temp_path):
+                                    os.remove(temp_path)
                         else:
                             parts.append(types.Part.from_uri(file_uri=url, mime_type=mime_type))
                 
@@ -1422,6 +1442,7 @@ class ServicesMixin:
                 # [NEW] Standardized initialization to prevent UnboundLocalErrors
                 url_media_parts = []
                 pre_generation_warnings = []
+                pending_url_fetches = []
 
                 if is_proactive_auto_round and session.get("proactive_initial_rounds") == 1:
                     cast = session['profiles']
@@ -1581,14 +1602,12 @@ class ServicesMixin:
                         trigger_media_parts = []
                         
                         if any_url_enabled and any_url_rag:
-                            url_text_list, url_media, url_warnings = await self._process_urls_in_content(content, trigger_obj['guild_id'] if is_child_mention else trigger_obj.guild.id, {"url_fetching_enabled": True})
-                            pre_generation_warnings.extend(url_warnings)
-                            if url_text_list:
-                                url_text_content = "\n".join(url_text_list)
-                            
-                            # [UPDATED] Ensure URL media is tracked for the whole round
-                            url_media_parts.extend(url_media)
-                            trigger_media_parts = url_media
+                            # Defer URL fetching until after placeholder is sent
+                            pending_url_fetches.append({
+                                "content": content,
+                                "guild_id": trigger_obj['guild_id'] if is_child_mention else trigger_obj.guild.id,
+                                "turn_data_index": len(new_round_turn_data)
+                            })
 
                         # [NEW] Localized User Timestamp Logic
                         u_index_author = self._get_user_index(triggering_user_id)
@@ -1619,6 +1638,9 @@ class ServicesMixin:
                             turn_object["url_context"] = url_text_content
                             
                         session.setdefault("unified_log", []).append(turn_object)
+                        
+                        if pending_url_fetches and pending_url_fetches[-1]["turn_data_index"] == len(new_round_turn_data):
+                            pending_url_fetches[-1]["turn_object"] = turn_object
 
                         # [NEW] Immediate persistence for user turns
                         await self._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
@@ -1844,10 +1866,6 @@ class ServicesMixin:
                 round_audio_segments = []
                 # [FIXED] Populate initial context immediately from batched triggers
                 initial_round_context = "\n".join([t[0] for t in new_round_turn_data])
-                
-                # [NEW] Batch Intent Tracking
-                batched_url_research_content = []
-                # ----------------------------
 
                 # [NEW] Determine Anchor Message for Response Modes
                 anchor_message = None
@@ -1865,6 +1883,8 @@ class ServicesMixin:
                 # --- Synchronised Feedback Step ---
                 first_participant = profile_order[0] if profile_order else None
                 first_placeholder_message = None
+                feedback_task = None
+                
                 if first_participant:
                     if first_participant.get('method') == 'child_bot':
                         p_index = self._get_user_index(first_participant['owner_id'])
@@ -1873,22 +1893,18 @@ class ServicesMixin:
                         
                         if fp_settings.get("child_bot_placeholder", False):
                             custom_emoji = fp_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
-                            msg_id = await self._send_child_bot_placeholder(first_participant['bot_id'], channel_id, custom_emoji)
-                            if msg_id:
-                                try: first_placeholder_message = await channel.fetch_message(msg_id)
-                                except: pass
+                            feedback_task = asyncio.create_task(self._send_child_bot_placeholder(first_participant['bot_id'], channel_id, custom_emoji))
                         else:
                             await self.manager_queue.put({
                                 "action": "send_to_child", "bot_id": first_participant['bot_id'],
                                 "payload": {"action": "start_typing", "channel_id": channel_id}
                             })
                     else: # Webhook
-                        thinking_messages = await self._send_channel_message(
+                        feedback_task = asyncio.create_task(self._send_channel_message(
                             channel, f"{PLACEHOLDER_EMOJI}",
                             profile_owner_id_for_appearance=first_participant['owner_id'], 
                             profile_name_for_appearance=first_participant['profile_name']
-                        )
-                        if thinking_messages: first_placeholder_message = thinking_messages[0]
+                        ))
 
                 grounding_context, grounding_sources = None, []
                 grounding_profile_key = None
@@ -1935,19 +1951,10 @@ class ServicesMixin:
                 ## [NEW] Phase: Research Once (URL Context)
                 round_url_text_contexts = []
                 
-                any_url_enabled = False
-                for p in session['profiles']:
-                    p_index = self._get_user_index(p['owner_id'])
-                    p_is_b = p['profile_name'] in p_index.get("borrowed", [])
-                    p_settings = self._get_profile_config(p['owner_id'], p['profile_name'], p_is_b) or {}
-                    if p_settings.get("url_fetching_enabled", False):
-                        any_url_enabled = True; break
-                
                 url_tasks = []
-                if any_url_enabled and batched_url_research_content and any_url_rag:
-                    print(f"[DEBUG: URL-Multi] Scheduling parallel round research on {len(batched_url_research_content)} items.")
-                    for content_str, g_id in batched_url_research_content:
-                        url_tasks.append(self._process_urls_in_content(content_str, g_id, {"url_fetching_enabled": True}))
+                if pending_url_fetches:
+                    for fetch in pending_url_fetches:
+                        url_tasks.append(self._process_urls_in_content(fetch["content"], fetch["guild_id"], {"url_fetching_enabled": True}))
 
                 # Gather Grounding and URL tasks to run concurrently
                 tasks_to_gather = []
@@ -1991,9 +1998,34 @@ class ServicesMixin:
                     grounding_profile_key = (g_owner_id, g_profile_name)
 
                 # Unpack and apply URL results
-                for u_t, _, u_w in url_results:
+                url_updates_made = False
+                for i, (u_t, u_m, u_w) in enumerate(url_results):
+                    fetch_info = pending_url_fetches[i]
                     pre_generation_warnings.extend(u_w)
-                    round_url_text_contexts.extend(u_t)
+                    
+                    if u_t:
+                        url_text_content = "\n".join(u_t)
+                        round_url_text_contexts.append(url_text_content)
+                        
+                        # Update turn_object
+                        if "turn_object" in fetch_info:
+                            fetch_info["turn_object"]["url_context"] = url_text_content
+                            url_updates_made = True
+                            # Clear previous URL contexts from log
+                            for turn in session.get("unified_log", []):
+                                if turn is not fetch_info["turn_object"] and "url_context" in turn:
+                                    del turn["url_context"]
+                                    
+                    if u_m:
+                        url_media_parts.extend(u_m)
+                        # Update new_round_turn_data
+                        idx = fetch_info["turn_data_index"]
+                        user_line, old_url_text, old_media = new_round_turn_data[idx]
+                        old_media.extend(u_m)
+                        new_round_turn_data[idx] = (user_line, url_text_content if u_t else old_url_text, old_media)
+                        
+                if url_updates_made:
+                    await self._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
 
                 # --- NEW IMAGE GENERATION LOGIC ---
                 if is_image_gen_round and generator_profile_key:
@@ -2067,7 +2099,13 @@ class ServicesMixin:
                                 else:
                                     img_bytes = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
                                     if img_bytes:
-                                        generated_image_bytes_for_round = img_bytes
+                                        def _write_img():
+                                            import tempfile
+                                            fd, path = tempfile.mkstemp(suffix=".png")
+                                            with os.fdopen(fd, 'wb') as f:
+                                                f.write(img_bytes)
+                                            return path
+                                        generated_image_path_for_round = await asyncio.to_thread(_write_img)
                                     else:
                                         image_gen_error_msg = "no image data returned"
                                         
@@ -2284,27 +2322,24 @@ class ServicesMixin:
                         msg_a_id = None
                         app_name, app_avatar = self._resolve_appearance_data(owner_id, profile_name)
                         
-                        if i == 0 and first_placeholder_message:
-                            msg_a_id = first_placeholder_message.id
+                        feedback_task_i = None
+                        if i == 0:
+                            feedback_task_i = feedback_task
                         elif i > 0:
                             if participant.get('method') == 'child_bot':
                                 if p_settings.get("child_bot_placeholder", False):
                                     custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
-                                    msg_a_id = await self._send_child_bot_placeholder(participant['bot_id'], channel_id, custom_emoji)
-                                    if msg_a_id:
-                                        try: first_placeholder_message = await channel.fetch_message(msg_a_id)
-                                        except: pass
+                                    feedback_task_i = asyncio.create_task(self._send_child_bot_placeholder(participant['bot_id'], channel_id, custom_emoji))
                                 else:
                                     await self.manager_queue.put({
                                         "action": "send_to_child", "bot_id": participant['bot_id'],
                                         "payload": {"action": "start_typing", "channel_id": channel_id}
                                     })
                             else:
-                                thinking_messages = await self._send_channel_message(
+                                feedback_task_i = asyncio.create_task(self._send_channel_message(
                                     channel, f"{PLACEHOLDER_EMOJI}",
                                     profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name
-                                )
-                                if thinking_messages: msg_a_id = thinking_messages[0].id
+                                ))
 
                         # Initialise the persistent state container before we generate any media
                         custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
@@ -2583,9 +2618,29 @@ class ServicesMixin:
                         
                         if model:
                             try:
-                                response, state_container = await self._generate_with_heartbeat(
+                                gen_task = asyncio.create_task(self._generate_with_heartbeat(
                                     model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
-                                )
+                                ))
+
+                                if feedback_task_i:
+                                    try:
+                                        feedback_result_i = await feedback_task_i
+                                        if participant.get('method') == 'child_bot' and p_settings.get("child_bot_placeholder", False):
+                                            if feedback_result_i:
+                                                try: first_placeholder_message = await channel.fetch_message(feedback_result_i)
+                                                except: pass
+                                                msg_a_id = feedback_result_i
+                                        else:
+                                            if feedback_result_i:
+                                                first_placeholder_message = feedback_result_i[0]
+                                                msg_a_id = first_placeholder_message.id
+                                                
+                                        if state_container:
+                                            state_container['msg_a_id'] = msg_a_id
+                                    except Exception as e:
+                                        print(f"Feedback task error: {e}")
+
+                                response, state_container = await gen_task
 
                                 if not response or not response.candidates:
                                     raise ValueError("Response blocked or empty")
@@ -2954,8 +3009,8 @@ class ServicesMixin:
 
                     file_to_send = None
                     extra_audio_file = None
-                    if is_generator and generated_image_bytes_for_round:
-                        file_to_send = discord.File(io.BytesIO(generated_image_bytes_for_round), filename="generated_image.png")
+                    if is_generator and generated_image_path_for_round:
+                        file_to_send = discord.File(generated_image_path_for_round, filename="generated_image.png")
                         if audio_file_for_send:
                             extra_audio_file = audio_file_for_send
                     elif audio_file_for_send:
@@ -3007,10 +3062,15 @@ class ServicesMixin:
                         
                         if file_to_send:
                             attachment_data = None
-                            if is_generator and generated_image_bytes_for_round:
+                            if is_generator and generated_image_path_for_round:
+                                def _read_b64():
+                                    import base64
+                                    with open(generated_image_path_for_round, 'rb') as f:
+                                        return base64.b64encode(f.read()).decode('utf-8')
+                                b64_data = await asyncio.to_thread(_read_b64)
                                 attachment_data = {
                                     "filename": "generated_image.png",
-                                    "data_base64": base64.b64encode(generated_image_bytes_for_round).decode('utf-8')
+                                    "data_base64": b64_data
                                 }
                             elif audio_file_for_send:
                                 turn_audio_stream.seek(0)
@@ -3324,8 +3384,10 @@ class ServicesMixin:
                 if 'shared_media_content_obj' in locals():
                     del shared_media_content_obj
 
-                if 'generated_image_bytes_for_round' in locals():
-                    del generated_image_bytes_for_round
+                if 'generated_image_path_for_round' in locals() and generated_image_path_for_round:
+                    if os.path.exists(generated_image_path_for_round):
+                        os.remove(generated_image_path_for_round)
+                    del generated_image_path_for_round
 
                 # Force full garbage collection for large byte arrays
                 gc.collect()
@@ -3586,7 +3648,15 @@ class ServicesMixin:
                             except Exception as e: 
                                 if not failure_reason: failure_reason = f"an unexpected error: `{e}`"
                             
-                            package['generated_image_bytes'] = image_bytes
+                            if image_bytes:
+                                def _write_img():
+                                    import tempfile
+                                    fd, path = tempfile.mkstemp(suffix=".png")
+                                    with os.fdopen(fd, 'wb') as f:
+                                        f.write(image_bytes)
+                                    return path
+                                package['generated_image_path'] = await asyncio.to_thread(_write_img)
+                            
                             package['failure_reason'] = failure_reason
                         
                         # --- Text Generation ---
@@ -3603,12 +3673,17 @@ class ServicesMixin:
                         
                         turn_id = str(uuid.uuid4())
 
-                        if package['generated_image_bytes'] and not package['failure_reason']:
+                        if package.get('generated_image_path') and not package.get('failure_reason'):
                             system_note = f"<image_context>You have just generated the following image based on the prompt: '{package['prompt_text']}'. Present it.</image_context>"
+                            
+                            def _read_img():
+                                with open(package['generated_image_path'], 'rb') as f:
+                                    return f.read()
+                            img_data = await asyncio.to_thread(_read_img)
                             
                             final_user_parts = [
                                 system_note, 
-                                {"mime_type": "image/jpeg", "data": package['generated_image_bytes']}
+                                {"mime_type": "image/jpeg", "data": img_data}
                             ]
                             
                             user_turn = {'role': 'user', 'parts': final_user_parts}
@@ -3693,8 +3768,8 @@ class ServicesMixin:
                             except: pass
 
                         # --- Final Message Sending ---
-                        if package['generated_image_bytes'] and not package['failure_reason']:
-                            image_file_to_send = discord.File(io.BytesIO(package['generated_image_bytes']), filename="generated_image.png")
+                        if package.get('generated_image_path') and not package.get('failure_reason'):
+                            image_file_to_send = discord.File(package['generated_image_path'], filename="generated_image.png")
                         
                         final_response_text = response_text
                         owner_id = package['effective_profile_owner_id']
@@ -3746,7 +3821,12 @@ class ServicesMixin:
                             "reply_to_id": reply_id, "ping": should_ping
                         }
                         if image_file_to_send:
-                            payload["attachment"] = { "filename": "generated_image.png", "data_base64": base64.b64encode(package['generated_image_bytes']).decode('utf-8') }
+                            def _read_b64():
+                                import base64
+                                with open(package['generated_image_path'], 'rb') as f:
+                                    return base64.b64encode(f.read()).decode('utf-8')
+                            b64_data = await asyncio.to_thread(_read_b64)
+                            payload["attachment"] = { "filename": "generated_image.png", "data_base64": b64_data }
                         await self.manager_queue.put({"action": "send_to_child", "bot_id": package['bot_id'], "payload": payload})
                     else:
                         # [UPDATED] Fix undefined 'i' by resolving anchor_message from package
@@ -3785,9 +3865,8 @@ class ServicesMixin:
                     image_file_to_send.close()
                     del image_file_to_send
                 
-                # Clear references to large byte objects in the dictionary
-                if 'generated_image_bytes' in package:
-                    package['generated_image_bytes'] = None
+                if package.get('generated_image_path') and os.path.exists(package['generated_image_path']):
+                    os.remove(package['generated_image_path'])
                 
                 # Delete the dictionary itself
                 del package
@@ -3863,7 +3942,15 @@ class ServicesMixin:
                 except Exception as e:
                     failure_reason = f"an unexpected error: `{e}`"
                 
-                request_data['generated_image_bytes'] = image_bytes
+                if image_bytes:
+                    def _write_img():
+                        import tempfile
+                        fd, path = tempfile.mkstemp(suffix=".png")
+                        with os.fdopen(fd, 'wb') as f:
+                            f.write(image_bytes)
+                        return path
+                    request_data['generated_image_path'] = await asyncio.to_thread(_write_img)
+                
                 request_data['failure_reason'] = failure_reason
                 
                 # Pass priority to next stage
@@ -4591,8 +4678,10 @@ class ServicesMixin:
                 scrubbed_text = re.sub(r'</?(think|thought|reasoning)>', '', scrubbed_text, flags=re.IGNORECASE)
                 
                 # 2. Precise System Header Scrubber
-                pattern_system_header = r'(?m)^<[^>\r\n]+>\s*\[ID:[^\]\r\n]+\]\s*\[[^\]\r\n]+\]:\s*$'
+                pattern_system_header = r'(?i)(?:^|\n)(?:<[^>\r\n]+>\s*)?\[ID:[^\]\r\n]+\](?:\s*\[[^\]\r\n]+\])?:\s*'
+                pattern_timestamp_header = r'(?i)(?:^|\n)(?:<[^>\r\n]+>\s*)?\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\]\r\n]+\]:\s*'
                 scrubbed_text = re.sub(pattern_system_header, '', scrubbed_text)
+                scrubbed_text = re.sub(pattern_timestamp_header, '', scrubbed_text)
 
                 # 3. Global Technical Metadata Scrubber
                 pattern_metadata = r'\(?\s*(?:Thought Initiated:)?\s*[^|\n\r]*?\|?\s*Duration: \d+\.\d+s\s*\)?'
