@@ -1,5 +1,5 @@
 from .mixins.storage import *
-from .mixins.storage import StorageMixin, _delete_file_shard, _atomic_json_save, _quantize_embedding, _dequantize_embedding, cosine_similarity
+from .mixins.storage import StorageMixin, _delete_file_shard, _atomic_json_save, encode_embedding_b64, decode_embedding_b64, calculate_similarities
 from .mixins.services import *
 from .mixins.constants import *
 from .mixins.core import *

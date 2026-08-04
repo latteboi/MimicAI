@@ -14,6 +14,7 @@ import io
 import base64
 import httpx
 import gc
+import numpy as np
 import pathlib
 import warnings
 import orjson as json
@@ -39,9 +40,9 @@ from .constants import (
 )
 from .storage import (
     _delete_file_shard, 
-    _quantize_embedding, 
-    _dequantize_embedding, 
-    cosine_similarity, 
+    encode_embedding_b64, 
+    decode_embedding_b64, 
+    calculate_similarities, 
 )
 
 from google import genai
@@ -4029,65 +4030,65 @@ class ServicesMixin:
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         session_cooldown_history = self.ltm_recall_history.get(session_key, {})
         
-        candidate_ltms = []
-        for ltm in all_profile_ltms:
-            ltm_id = ltm.get('id')
-            if ltm_id in session_cooldown_history:
-                last_turn, last_sim = session_cooldown_history[ltm_id]
-                dynamic_cooldown = 5 + (1 - last_sim) * 25 
-                if current_turn - last_turn < dynamic_cooldown:
-                    continue
+        def _thread_search_ltm():
+            owner_id_str = str(ltm_user_id)
+            ltm_data = self._load_ltm_shard(owner_id_str, ltm_profile_name)
+            if not ltm_data: return None
+            all_profile_ltms = ltm_data.get(context_type, [])
+            if not all_profile_ltms: return None
 
-            context_id = str(ltm.get('context_id')) if ltm.get('context_id') is not None else None
-            if context_id != str(guild_id):
-                continue
+            valid_ltms = []
+            b64_embs = []
+            
+            for ltm in all_profile_ltms:
+                ltm_id = ltm.get('id')
+                if ltm_id in session_cooldown_history:
+                    last_turn, last_sim = session_cooldown_history[ltm_id]
+                    if current_turn - last_turn < (5 + (1 - last_sim) * 25): continue
 
-            if "s_emb" in ltm and ltm["s_emb"]:
-                dequantized_embedding = _dequantize_embedding(ltm["s_emb"])
-                similarity = cosine_similarity(prompt_embedding, dequantized_embedding)
-                
-                created_ts_str = ltm.get('created_ts') or ltm.get('ts')
-                if created_ts_str:
+                if str(ltm.get('context_id')) != str(guild_id): continue
+
+                if "s_emb_b64" in ltm:
+                    valid_ltms.append(ltm)
+                    b64_embs.append(ltm["s_emb_b64"])
+
+            if not valid_ltms: return None
+
+            similarities = calculate_similarities(prompt_embedding, b64_embs)
+            candidate_ltms = []
+            
+            for i, ltm in enumerate(valid_ltms):
+                sim = float(similarities[i])
+                ts_str = ltm.get('created_ts') or ltm.get('ts')
+                if ts_str:
                     try:
-                        created_dt = datetime.datetime.fromisoformat(created_ts_str)
-                        days_old = (now_utc - created_dt).total_seconds() / 86400.0
-                        decay_factor = 0.995
-                        decayed_similarity = similarity * (decay_factor ** days_old)
-                    except (ValueError, TypeError):
-                        decayed_similarity = similarity
-                else:
-                    decayed_similarity = similarity
+                        days_old = (now_utc - datetime.datetime.fromisoformat(ts_str)).total_seconds() / 86400.0
+                        sim *= (0.995 ** days_old)
+                    except: pass
 
-                if decayed_similarity >= ltm_relevance_threshold:
-                    candidate_ltms.append({
-                        "ltm": ltm, 
-                        "sim": decayed_similarity, 
-                        "original_sim": similarity,
-                        "embedding": dequantized_embedding
-                    })
+                if sim >= ltm_relevance_threshold:
+                    candidate_ltms.append({"ltm": ltm, "sim": sim, "original_sim": float(similarities[i]), "b64": b64_embs[i]})
 
-        if not candidate_ltms:
-            return None
-
-        candidate_ltms.sort(key=lambda x: x["sim"], reverse=True)
-
-        final_memories = []
-        saturation_penalty_factor = 0.75
-        
-        while len(final_memories) < ltm_context_size and candidate_ltms:
-            best_memory = candidate_ltms.pop(0)
-            final_memories.append(best_memory)
-            
-            if not candidate_ltms:
-                break
-
-            selected_embedding = best_memory["embedding"]
-            for other_memory in candidate_ltms:
-                saturation_similarity = cosine_similarity(selected_embedding, other_memory["embedding"])
-                penalty = (1.0 - (saturation_similarity * saturation_penalty_factor))
-                other_memory["sim"] *= penalty
-            
+            if not candidate_ltms: return None
             candidate_ltms.sort(key=lambda x: x["sim"], reverse=True)
+
+            final_memories = []
+            while len(final_memories) < ltm_context_size and candidate_ltms:
+                best = candidate_ltms.pop(0)
+                final_memories.append(best)
+                if not candidate_ltms: break
+                
+                rem_b64 = [m["b64"] for m in candidate_ltms]
+                best_emb = decode_embedding_b64(best["b64"]).tolist()
+                sat_sims = calculate_similarities(best_emb, rem_b64)
+                
+                for j, other in enumerate(candidate_ltms):
+                    other["sim"] *= (1.0 - (float(sat_sims[j]) * 0.75))
+                candidate_ltms.sort(key=lambda x: x["sim"], reverse=True)
+                
+            return final_memories
+
+        final_memories = await asyncio.to_thread(_thread_search_ltm)
 
         if not final_memories:
             return None
@@ -4117,27 +4118,30 @@ class ServicesMixin:
         owner_id_str = str(profile_owner_id)
         effective_owner_id_for_training, effective_profile_name_for_training = self._resolve_effective_profile(profile_owner_id, profile_name)
 
-        profile_examples = self._load_training_shard(str(effective_owner_id_for_training), effective_profile_name_for_training)
-
-        if not profile_examples: return []
-        msg_emb=await self._get_embedding(msg_content, guild_id, task_type="RETRIEVAL_QUERY")
-        if not msg_emb:return[]
+        msg_emb = await self._get_embedding(msg_content, guild_id, task_type="RETRIEVAL_QUERY")
+        if not msg_emb: return []
         
-        sc = []
-        for ex in profile_examples:
-            if ex.get("u_emb"):
-                dequantized_emb = _dequantize_embedding(ex.get("u_emb", []))
-                sc.append({"ex": ex, "sim": cosine_similarity(msg_emb, dequantized_emb)})
+        def _thread_search_training():
+            profile_examples = self._load_training_shard(str(effective_owner_id_for_training), effective_profile_name_for_training)
+            if not profile_examples: return []
+            
+            valid_ex = []
+            b64_embs = []
+            for ex in profile_examples:
+                if "u_emb_b64" in ex:
+                    valid_ex.append(ex)
+                    b64_embs.append(ex["u_emb_b64"])
+                    
+            if not valid_ex: return []
+            
+            similarities = calculate_similarities(msg_emb, b64_embs)
+            
+            sc = [{"ex": ex, "sim": float(similarities[i])} for i, ex in enumerate(valid_ex) if float(similarities[i]) >= training_relevance_threshold]
+            sc.sort(key=lambda x: x["sim"], reverse=True)
+            
+            return [f"<example>\nUser: {self._decrypt_data(i['ex']['u_in'])}\nYou: {self._decrypt_data(i['ex']['b_out'])}\n</example>" for i in sc[:training_context_size]]
 
-        sc.sort(key=lambda x:x["sim"],reverse=True)
-        
-        relevant_examples = []
-        for i in sc:
-            if i["sim"] >= training_relevance_threshold:
-                decrypted_u_in = self._decrypt_data(i['ex']['u_in'])
-                decrypted_b_out = self._decrypt_data(i['ex']['b_out'])
-                relevant_examples.append(f"<example>\nUser: {decrypted_u_in}\nYou: {decrypted_b_out}\n</example>")
-        return relevant_examples[:training_context_size]
+        return await asyncio.to_thread(_thread_search_training)
     
     async def _get_embedding(self, text: str, guild_id: int, task_type: str = "RETRIEVAL_QUERY") -> Optional[List[float]]:
         if not text or not text.strip():
@@ -4331,10 +4335,10 @@ class ServicesMixin:
             if summary:
                 summary_embedding = await self._get_embedding(summary, guild_id, task_type="RETRIEVAL_DOCUMENT")
                 if summary_embedding:
-                    quantized_embedding = _quantize_embedding(summary_embedding)
-                    self._add_ltm(profile_owner_id, profile_name, summary, quantized_embedding, guild.id if guild else None, triggering_user_id, sanitized_author)
+                    b64_emb = encode_embedding_b64(summary_embedding)
+                    self._add_ltm(profile_owner_id, profile_name, summary, b64_emb, guild.id if guild else None, triggering_user_id, sanitized_author)
 
-    async def _send_channel_message(self, 
+    async def _send_channel_message(self,
                                    channel: discord.abc.Messageable, 
                                    content: str, 
                                    embeds: Optional[List[discord.Embed]] = None, 
@@ -6286,12 +6290,11 @@ class ServicesMixin:
         emb=await self._get_embedding(usr_in, guild_id, task_type="RETRIEVAL_DOCUMENT")
         if not emb: return False,"Embedding failed. Ensure the server API key is valid."
 
-        quantized_emb = _quantize_embedding(emb)
+        b64_emb = encode_embedding_b64(emb)
         now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        entry={"id":str(uuid.uuid4())[:8],"created_ts":now_ts, "modified_ts": now_ts, "u_in":usr_in.strip(),"b_out":bot_out.strip(),"u_emb":quantized_emb}
+        entry={"id":str(uuid.uuid4())[:8],"created_ts":now_ts, "modified_ts": now_ts, "u_in":usr_in.strip(),"b_out":bot_out.strip(),"u_emb_b64":b64_emb}
         training_shard.append(entry)
         
-        # Note: We removed the slicing [-MAX_TRAINING...] here because the limit check above handles it.
         self._save_training_shard(owner_id_str, profile_name, training_shard)
         return True,f"Example added for profile '{profile_name}'. Total: {len(training_shard)}/{limit}"
 
@@ -6311,11 +6314,12 @@ class ServicesMixin:
                 if not new_embedding:
                     return False, "Failed to generate embedding for the new input. The example was not updated."
 
-                quantized_embedding = _quantize_embedding(new_embedding)
+                b64_emb = encode_embedding_b64(new_embedding)
 
                 example_list[i]["u_in"] = new_user_input.strip()
                 example_list[i]["b_out"] = new_bot_response.strip()
-                example_list[i]["u_emb"] = quantized_embedding
+                example_list[i]["u_emb_b64"] = b64_emb
+                if "u_emb" in example_list[i]: del example_list[i]["u_emb"]
                 example_list[i]["modified_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 
                 self._save_training_shard(owner_id_str, profile_name, example_list)

@@ -1,5 +1,5 @@
 from .constants import *
-from .storage import _quantize_embedding
+from .storage import encode_embedding_b64
 
 import collections
 import discord
@@ -15,9 +15,6 @@ import orjson as json
 from typing import TYPE_CHECKING, List, Dict, Tuple, Set, Literal, Any, Optional, get_args
 from .constants import IMAGE_MODELS, AUDIO_MODELS
 from .content import OLLAMA_GUIDE_TEXT
-from .storage import (
-    _quantize_embedding, 
-)
 from .services import GoogleGenAIChatSession
 
 if TYPE_CHECKING:
@@ -2763,8 +2760,8 @@ class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
             await i.followup.send("Failed to generate embedding for the new summary. The memory was not updated.", ephemeral=True)
             return
 
-        quantized_embedding = _quantize_embedding(new_embedding)
-        success = self.cog.update_ltm(self.profile_owner_id, self.profile_name, self.ltm_id, new_summary, quantized_embedding)
+        b64_emb = encode_embedding_b64(new_embedding)
+        success = self.cog.update_ltm(self.profile_owner_id, self.profile_name, self.ltm_id, new_summary, b64_emb)
         if success:
             await i.followup.send(f"LTM entry `{self.ltm_id}` for profile '{self.profile_name}' has been updated.", ephemeral=True)
         else:
@@ -2811,10 +2808,10 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
             await i.followup.send("Failed to generate embedding for the summary. The memory was not added.", ephemeral=True)
             return
 
-        quantized_embedding = _quantize_embedding(embedding)
+        b64_emb = encode_embedding_b64(embedding)
         
         # The _add_ltm method now handles the rolling window logic automatically.
-        self.cog._add_ltm(self.profile_owner_id, self.profile_name, summary, quantized_embedding, self.guild_id, i.user.id, i.user.display_name)
+        self.cog._add_ltm(self.profile_owner_id, self.profile_name, summary, b64_emb, self.guild_id, i.user.id, i.user.display_name)
         
         # Fetch new count for feedback
         ltm_shard = self.cog._load_ltm_shard(str(self.profile_owner_id), self.profile_name)

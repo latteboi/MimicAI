@@ -14,6 +14,7 @@ import traceback
 import time
 import random
 import numpy as np
+import base64
 from .constants import *
 
 def _delete_file_shard(file_path: str):
@@ -46,13 +47,26 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     np_vec1=np.array(vec1); np_vec2=np.array(vec2); dot=np.dot(np_vec1,np_vec2); n1=np.linalg.norm(np_vec1); n2=np.linalg.norm(np_vec2)
     return 0.0 if n1==0 or n2==0 else float(dot/(n1*n2))
 
-def _quantize_embedding(embedding: List[float]) -> List[float]:
-    if not embedding: return []
-    return np.array(embedding, dtype=np.float32).astype(np.float16).tolist()
+def encode_embedding_b64(embedding: List[float]) -> str:
+    if not embedding: return ""
+    return base64.b64encode(np.array(embedding, dtype=np.float16).tobytes()).decode('ascii')
 
-def _dequantize_embedding(quantized_embedding: List[float]) -> List[float]:
-    if not quantized_embedding: return []
-    return np.array(quantized_embedding, dtype=np.float16).astype(np.float32).tolist()
+def decode_embedding_b64(b64_str: str) -> np.ndarray:
+    if not b64_str: return np.array([], dtype=np.float32)
+    return np.frombuffer(base64.b64decode(b64_str), dtype=np.float16).astype(np.float32)
+
+def calculate_similarities(prompt_emb: List[float], b64_embs: List[str]) -> np.ndarray:
+    if not b64_embs or not prompt_emb: return np.array([])
+    matrix = np.stack([np.frombuffer(base64.b64decode(s), dtype=np.float16).astype(np.float32) for s in b64_embs])
+    prompt_vec = np.array(prompt_emb, dtype=np.float32)
+    
+    emb_norms = np.linalg.norm(matrix, axis=1)
+    prompt_norm = np.linalg.norm(prompt_vec)
+    
+    emb_norms[emb_norms == 0] = 1e-10
+    prompt_norm = prompt_norm if prompt_norm != 0 else 1e-10
+    
+    return np.dot(matrix, prompt_vec) / (emb_norms * prompt_norm)
 
 class IOManager:
     """Centralised I/O Helper Block for MimicAI Data Ops."""
@@ -244,50 +258,50 @@ class StorageMixin:
                 if not has_keys and not has_shares:
                     shutil.rmtree(str(user_dir), ignore_errors=True)
 
-    def _migrate_to_pid_v2(self):
+    def _migrate_embeddings_to_b64(self):
         users_dir = pathlib.Path(self.USERS_DIR)
         if not users_dir.exists(): return
-        print("Phase 4 Migration: Upgrading to A/B 16-Hex PID Architecture...")
-        import uuid
+        print("Phase 5 Migration: Upgrading embeddings to Base64...")
         migrated_any = False
         
         for user_dir in users_dir.iterdir():
             if not user_dir.is_dir() or not user_dir.name.isdigit(): continue
-            index_path = user_dir / "index.json"
-            if not index_path.exists(): continue
+            profiles_dir = user_dir / "profiles"
+            if not profiles_dir.exists(): continue
             
-            index = IOManager.read_json(str(index_path))
-            if not index: continue
-            
-            migrated = False
-            
-            if "channel_active_profiles" in index:
-                del index["channel_active_profiles"]
-                migrated = True
-
-            for p_type, prefix in [("personal", "A"), ("borrowed", "B")]:
-                p_data = index.get(p_type)
-                if isinstance(p_data, list):
-                    new_dict = {}
-                    for pname in p_data:
-                        pid = f"{prefix}{uuid.uuid4().hex[:15].upper()}"
-                        new_dict[pname] = pid
-                        
-                        old_p_dir = user_dir / "profiles" / pname
-                        new_p_dir = user_dir / "profiles" / pid
-                        if old_p_dir.exists() and old_p_dir.is_dir():
-                            old_p_dir.rename(new_p_dir)
-                            with open(new_p_dir / "name.txt", "w", encoding="utf-8") as f:
-                                f.write(pname)
-                    index[p_type] = new_dict
-                    migrated = True
-                    migrated_any = True
-            
-            if migrated:
-                IOManager.write_json(index, str(index_path))
+            for p_dir in profiles_dir.iterdir():
+                if not p_dir.is_dir(): continue
                 
+                ltm_path = p_dir / "ltm.json.gz"
+                if ltm_path.exists():
+                    ltm_data = self._load_json_gzip(str(ltm_path))
+                    if ltm_data and "guild" in ltm_data:
+                        changed = False
+                        for item in ltm_data["guild"]:
+                            if "s_emb" in item and isinstance(item["s_emb"], list):
+                                item["s_emb_b64"] = encode_embedding_b64(item["s_emb"])
+                                del item["s_emb"]
+                                changed = True
+                        if changed:
+                            self._atomic_json_save_gzip(ltm_data, str(ltm_path))
+                            migrated_any = True
+                            
+                train_path = p_dir / "training.json.gz"
+                if train_path.exists():
+                    train_data = self._load_json_gzip(str(train_path))
+                    if train_data and isinstance(train_data, list):
+                        changed = False
+                        for item in train_data:
+                            if "u_emb" in item and isinstance(item["u_emb"], list):
+                                item["u_emb_b64"] = encode_embedding_b64(item["u_emb"])
+                                del item["u_emb"]
+                                changed = True
+                        if changed:
+                            self._atomic_json_save_gzip(train_data, str(train_path))
+                            migrated_any = True
+                            
         if migrated_any:
-            print("Phase 4 Migration complete. Immutable PID directories created and legacy keys purged.")
+            print("Phase 5 Migration complete. Embeddings compressed to Base64.")
 
     def _get_pid_from_name(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> str:
         index = self._get_user_index(user_id)
@@ -388,9 +402,6 @@ class StorageMixin:
     def _delete_ltm_shard(self, user_id: str, profile_name: str):
         self._delete_shard("ltm", user_id, profile_name)
 
-    def _rename_ltm_shards(self, user_id: str, old_profile_name: str, new_profile_name: str):
-        pass # Obsolete. Data moves seamlessly when string changes in index.json
-
     def _copy_ltm_shard(self, user_id: str, source_profile_name: str, new_profile_name: str):
         src_path = self._get_shard_path("ltm", user_id, source_profile_name)
         new_path = self._get_shard_path("ltm", user_id, new_profile_name)
@@ -399,7 +410,7 @@ class StorageMixin:
             import shutil
             shutil.copy2(src_path, new_path)
 
-    def _add_ltm(self, profile_owner_id: int, profile_name: str, summary: str, summary_embedding: List[float], guild_id: Optional[int], triggering_user_id: int, user_dn: Optional[str] = None):
+    def _add_ltm(self, profile_owner_id: int, profile_name: str, summary: str, summary_embedding_b64: str, guild_id: Optional[int], triggering_user_id: int, user_dn: Optional[str] = None):
         if not guild_id: return
         
         # Redirect LTM saves to the borrower's folder if running in a borrowed session
@@ -447,7 +458,7 @@ class StorageMixin:
             "created_ts": now_ts,
             "modified_ts": now_ts,
             "sum": summary.strip(),
-            "s_emb": summary_embedding,
+            "s_emb_b64": summary_embedding_b64,
             "usr": user_dn,
             "scope": "server",
             "context_id": str(guild_id)
@@ -458,7 +469,7 @@ class StorageMixin:
         ltm_data[context_type] = sorted(ltm_list, key=lambda x: x.get('created_ts', x.get('ts')))[-max_safe_clamp:]
         self._save_ltm_shard(owner_id_str, ltm_profile_name, ltm_data)
 
-    def update_ltm(self, profile_owner_id: int, profile_name: str, ltm_id: str, new_summary: str, new_embedding: List[float]) -> bool:
+    def update_ltm(self, profile_owner_id: int, profile_name: str, ltm_id: str, new_summary: str, new_embedding_b64: str) -> bool:
         owner_id_str = str(profile_owner_id)
         ltm_data = self._load_ltm_shard(owner_id_str, profile_name)
         if not ltm_data:
@@ -468,7 +479,8 @@ class StorageMixin:
         for i, ltm_entry in enumerate(ltm_list):
             if ltm_entry.get("id") == ltm_id:
                 ltm_data["guild"][i]["sum"] = new_summary.strip()
-                ltm_data["guild"][i]["s_emb"] = new_embedding
+                ltm_data["guild"][i]["s_emb_b64"] = new_embedding_b64
+                if "s_emb" in ltm_data["guild"][i]: del ltm_data["guild"][i]["s_emb"]
                 ltm_data["guild"][i]["modified_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 if "kw" in ltm_data["guild"][i]:
                     del ltm_data["guild"][i]["kw"]
@@ -484,9 +496,6 @@ class StorageMixin:
 
     def _delete_training_shard(self, user_id: str, profile_name: str):
         self._delete_shard("training", user_id, profile_name)
-
-    def _rename_training_shards(self, user_id: str, old_profile_name: str, new_profile_name: str):
-        pass # Obsolete. Data moves seamlessly when string changes in index.json
 
     def _copy_training_shard(self, user_id: str, source_profile_name: str, new_profile_name: str):
         src_path = self._get_shard_path("training", user_id, source_profile_name)

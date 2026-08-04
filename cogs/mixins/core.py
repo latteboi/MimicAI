@@ -18,7 +18,7 @@ import orjson as json
 from zoneinfo import available_timezones
 from typing import List, Dict, Set, Any, Optional, get_args
 from .constants import *
-from .storage import _delete_file_shard, _atomic_json_save, _quantize_embedding, _dequantize_embedding
+from .storage import _delete_file_shard, _atomic_json_save, encode_embedding_b64
 from .services import GoogleGenAIChatSession
 
 class CoreMixin:
@@ -46,6 +46,8 @@ class CoreMixin:
             print("Running initial index.json self-repair on boot...")
             await asyncio.to_thread(self._repair_all_user_indices)
             print("Initial index.json self-repair complete.")
+            
+            await asyncio.to_thread(self._migrate_embeddings_to_b64)
             
             if not self.hourly_self_repair_task.is_running():
                 self.hourly_self_repair_task.start()
@@ -3007,87 +3009,6 @@ class CoreMixin:
                     # For multi-profile, the session_key is just the channel_id for path generation
                     dummy_session_key = (ch_id, None, None)
                     await self._save_session_to_disk(dummy_session_key, session_type, unified_log)
-
-    async def _patch_profile_ids(self):
-        """One-time patch to remove 'pid' fields and standardise 'profile_id' to 8 characters."""
-        print("Starting Profile ID cleanup and standardisation...")
-        users_path = pathlib.Path(self.USERS_DIR)
-        if not users_path.exists():
-            return
-
-        import uuid
-        count = 0
-
-        for user_dir in users_path.iterdir():
-            if not user_dir.is_dir() or not user_dir.name.isdigit():
-                continue
-            
-            profiles_dir = user_dir / "profiles"
-            if not profiles_dir.exists():
-                continue
-
-            for p_dir in profiles_dir.iterdir():
-                if not p_dir.is_dir():
-                    continue
-                
-                # Check for Personal Profile Config
-                config_path = p_dir / "config.json.gz"
-                if config_path.exists():
-                    config = self._load_json_gzip(str(config_path))
-                    if config:
-                        changed = False
-                        
-                        # 1. Remove the failed 'pid' field
-                        if "pid" in config:
-                            del config["pid"]
-                            changed = True
-                        
-                        # 2. Check and fix 'profile_id'
-                        p_id = config.get("profile_id")
-                        if not p_id or len(str(p_id)) != 8:
-                            config["profile_id"] = str(uuid.uuid4().hex[:8].upper())
-                            changed = True
-                        
-                        if changed:
-                            self._save_profile_config(int(user_dir.name), p_dir.name, config, False)
-                            count += 1
-
-                # Check for Borrowed Profile Config
-                borrowed_path = p_dir / "borrowed_config.json.gz"
-                if borrowed_path.exists():
-                    b_config = self._load_json_gzip(str(borrowed_path))
-                    if b_config:
-                        changed_b = False
-                        
-                        if "pid" in b_config:
-                            del b_config["pid"]
-                            changed_b = True
-                            
-                        # Borrowed profiles should inherit the 8-character ID from source
-                        # but if we can't find it, we standardise the existing one
-                        b_id = b_config.get("original_profile_id")
-                        if not b_id or len(str(b_id)) != 8:
-                            # Try to fetch from source
-                            src_owner = b_config.get("original_owner_id")
-                            src_name = b_config.get("original_profile_name")
-                            if src_owner and src_name:
-                                src_cfg = self._get_profile_config(int(src_owner), src_name, False)
-                                if src_cfg and src_cfg.get("profile_id") and len(src_cfg["profile_id"]) == 8:
-                                    b_config["original_profile_id"] = src_cfg["profile_id"]
-                                else:
-                                    b_config["original_profile_id"] = str(uuid.uuid4().hex[:8].upper())
-                            else:
-                                b_config["original_profile_id"] = str(uuid.uuid4().hex[:8].upper())
-                            changed_b = True
-                            
-                        if changed_b:
-                            self._save_profile_config(int(user_dir.name), p_dir.name, b_config, True)
-                            count += 1
-        
-        if count > 0:
-            print(f"Cleanup complete. Standardised IDs for {count} profile entities.")
-        else:
-            print("No legacy ID fields found. System is up to date.")
 
     async def _execute_clone_handshake(self, owner_id: int, source_pid: str, recipient_id: int, desired_name: str) -> Tuple[bool, str]:
         owner_id_str = str(owner_id)
