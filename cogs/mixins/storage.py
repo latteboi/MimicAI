@@ -28,7 +28,7 @@ def _atomic_json_save(data: Any, file_path: str):
     temp_file_path = file_path + ".tmp"
     try:
         with open(temp_file_path, 'wb') as f:
-            f.write(json.dumps(data, option=json.OPT_INDENT_2))
+            f.write(json.dumps(data))
         os.replace(temp_file_path, file_path) 
     except IOError as e:
         print(f"Error saving data to {file_path}: {e}")
@@ -87,7 +87,7 @@ class IOManager:
         try:
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             with open(temp, 'wb') as f:
-                f.write(json.dumps(data, option=json.OPT_INDENT_2))
+                f.write(json.dumps(data))
             os.replace(temp, file_path)
         except Exception as e:
             print(f"IOManager write_json Error ({file_path}): {e}")
@@ -118,7 +118,7 @@ class IOManager:
         temp_file_path = file_path + ".tmp"
         try:
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            json_bytes = json.dumps(data, option=json.OPT_INDENT_2)
+            json_bytes = json.dumps(data)
             compressed_bytes = gzip.compress(json_bytes)
             
             bytes_to_write = compressed_bytes
@@ -561,13 +561,13 @@ class StorageMixin:
             path = self._get_session_path(session_key, session_type)
             path.parent.mkdir(parents=True, exist_ok=True)
             
-            import copy
-            data_copy = copy.deepcopy(data_to_save)
+            # Shallow copy to prevent iteration mutation errors during serialization, eliminating deepcopy CPU overhead
+            data_copy = list(data_to_save) if isinstance(data_to_save, list) else data_to_save.copy()
             
             def _thread_save():
                 # Utilise high-speed Rust-based serialization flags
                 serialized_bytes = json.dumps(data_copy, option=json.OPT_SERIALIZE_NUMPY | json.OPT_NON_STR_KEYS)
-                compressed_bytes = gzip.compress(serialized_bytes)
+                compressed_bytes = gzip.compress(serialized_bytes, compresslevel=1)
                 encrypted_compressed_bytes = self.fernet.encrypt(compressed_bytes)
 
                 temp_path = path.with_suffix(path.suffix + '.tmp')
@@ -766,7 +766,7 @@ class StorageMixin:
         index_path = os.path.join(self.PUBLIC_PROFILES_DIR, "index.json")
         try:
             with open(index_path, "wb") as f:
-                f.write(json.dumps(self.public_profiles, option=json.OPT_INDENT_2))
+                f.write(json.dumps(self.public_profiles))
         except Exception as e:
             print(f"Error saving public index: {e}")
 

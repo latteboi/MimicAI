@@ -58,11 +58,11 @@ class CoreMixin:
             if not self.pricing_sync_task.is_running():
                 self.pricing_sync_task.start()
             
-            if not self.weekly_cleanup_task.is_running():
+            if not self.daily_cleanup_task.is_running():
                 print("Performing initial data cleanup on boot...")
                 await self._perform_data_cleanup()
-                print("Initial cleanup finished. Starting weekly cleanup task.")
-                self.weekly_cleanup_task.start()
+                print("Initial cleanup finished. Starting daily cleanup task.")
+                self.daily_cleanup_task.start()
 
         if self.has_lock and not self.image_finisher_worker_task:
             self.image_finisher_worker_task = self.bot.loop.create_task(self._image_finisher_worker())
@@ -995,12 +995,9 @@ class CoreMixin:
                 temp_clean = re.sub(r'<neuro_update>\s*(.*?)\s*</neuro_update>', '', raw_text_check, flags=re.IGNORECASE | re.DOTALL)
                 temp_clean = re.sub(r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})', '', temp_clean, flags=re.IGNORECASE)
                 temp_scrubbed = self._scrub_response_text(temp_clean, participant_names=[app_name])
-                temp_dedup = self._deduplicate_response(temp_scrubbed)
                 
-                if not temp_dedup:
+                if not temp_scrubbed:
                     raise ValueError("Empty Response (AI produced no text content)")
-                if temp_dedup == "[REPETITIVE_CONTENT_ERROR]":
-                    raise ValueError("[REPETITIVE_CONTENT_ERROR]")
 
                 status = "success"
             except asyncio.CancelledError:
@@ -1105,12 +1102,9 @@ class CoreMixin:
                                 temp_clean = re.sub(r'<neuro_update>\s*(.*?)\s*</neuro_update>', '', fb_raw_check, flags=re.IGNORECASE | re.DOTALL)
                                 temp_clean = re.sub(r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})', '', temp_clean, flags=re.IGNORECASE)
                                 temp_scrubbed = self._scrub_response_text(temp_clean, participant_names=[app_name])
-                                temp_dedup = self._deduplicate_response(temp_scrubbed)
                                 
-                                if not temp_dedup:
+                                if not temp_scrubbed:
                                     raise ValueError("Empty Response (AI produced no text content)")
-                                if temp_dedup == "[REPETITIVE_CONTENT_ERROR]":
-                                    raise ValueError("[REPETITIVE_CONTENT_ERROR]")
 
                                 fallback_used = True
                                 self._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat_fallback", model_used=fb_name, status="success")
@@ -1170,10 +1164,9 @@ class CoreMixin:
             raw_text, _ = self._extract_and_apply_neuro_state(raw_text, host_user_id, profile_name)
 
             # Apply filters
-            scrubbed_text = self._scrub_response_text(raw_text, participant_names=[app_name])
-            response_text = self._deduplicate_response(scrubbed_text)
+            response_text = self._scrub_response_text(raw_text, participant_names=[app_name])
 
-            if response_text and response_text != "[REPETITIVE_CONTENT_ERROR]":
+            if response_text:
                 grounding_sources = []
                 grounding_sources.extend(global_rag_sources)
                 if hasattr(response, 'raw') and response.raw.candidates:
@@ -1387,8 +1380,7 @@ class CoreMixin:
         response_text = re.sub(r'</?whisper_context>', '', response_text, flags=re.IGNORECASE)
         response_text = re.sub(r'</?private_context>', '', response_text, flags=re.IGNORECASE)
 
-        scrubbed_text = self._scrub_response_text(response_text, participant_names=[display_name])
-        response_text = self._deduplicate_response(scrubbed_text)
+        response_text = self._scrub_response_text(response_text, participant_names=[display_name])
         
         # [NEW] Safety Fallback for empty responses
         if not response_text or not response_text.strip():
@@ -1397,7 +1389,7 @@ class CoreMixin:
             p_settings = self._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
             response_text = p_settings.get("error_response", "...")
 
-        if response_text != "[REPETITIVE_CONTENT_ERROR]":
+        if response_text:
             grounding_sources = []
             if hasattr(response, 'raw') and response.raw.candidates:
                 if hasattr(response.raw.candidates[0], 'grounding_metadata'):
@@ -1585,7 +1577,7 @@ class CoreMixin:
         response_text, _ = self._extract_and_apply_neuro_state(response_text, owner_id, profile_name)
         
         response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
-        response_text = self._deduplicate_response(self._scrub_response_text(response_text, participant_names=[display_name]))
+        response_text = self._scrub_response_text(response_text, participant_names=[display_name])
         
         # [NEW] Safety Fallback for empty responses
         if not response_text or not response_text.strip():
@@ -2985,7 +2977,7 @@ class CoreMixin:
         self.refresh_lock_task.cancel()
         self.evict_inactive_sessions_task.cancel()
         self.hourly_self_repair_task.cancel()
-        self.weekly_cleanup_task.cancel()
+        self.daily_cleanup_task.cancel()
         self.child_bot_integrity_task.cancel()
 
         if self.image_finisher_worker_task:

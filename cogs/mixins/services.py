@@ -36,10 +36,13 @@ from .constants import (
     ERR_UNKNOWN, ERR_REASON_UNSUPPORTED_IMAGE, ERR_REASON_UNSUPPORTED_AUDIO,
     ERR_REASON_UNSUPPORTED_VIDEO, ERR_REASON_EMPTY_RESPONSE, ERR_REASON_REPETITIVE_CONTENT,
     ERR_REASON_PROVIDER_ERROR, ERR_REASON_TIMEOUT_MAIN, ERR_REASON_TIMEOUT_FALLBACK,
-    ERR_REASON_TIMEOUT_BOTH
+    ERR_REASON_TIMEOUT_BOTH, PATTERN_SYSTEM_XML_BLOCKS, PATTERN_SYSTEM_XML_ORPHANS,
+    PATTERN_REASONING_BLOCKS, PATTERN_REASONING_ORPHANS, PATTERN_SYSTEM_HEADER,
+    PATTERN_TIMESTAMP_HEADER, PATTERN_METADATA, PATTERN_MESSAGE_LINK,
+    PATTERN_WHITESPACE_CLEANUP
 )
 from .storage import (
-    _delete_file_shard, 
+    _delete_file_shard,
     encode_embedding_b64, 
     decode_embedding_b64, 
     calculate_similarities, 
@@ -2650,12 +2653,9 @@ class ServicesMixin:
                                 temp_clean = re.sub(r'<neuro_update>\s*(.*?)\s*</neuro_update>', '', raw_text_check, flags=re.IGNORECASE | re.DOTALL)
                                 temp_clean = re.sub(r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})', '', temp_clean, flags=re.IGNORECASE)
                                 temp_scrubbed = self._scrub_response_text(temp_clean, participant_names=all_participant_names)
-                                temp_dedup = self._deduplicate_response(temp_scrubbed)
                                 
-                                if not temp_dedup:
+                                if not temp_scrubbed:
                                     raise ValueError("Empty Response (AI produced no text content)")
-                                if temp_dedup == "[REPETITIVE_CONTENT_ERROR]":
-                                    raise ValueError("[REPETITIVE_CONTENT_ERROR]")
                                     
                                 status = "success"
                             except asyncio.CancelledError:
@@ -2666,7 +2666,6 @@ class ServicesMixin:
                                 if 'contents_for_api_call' in locals():
                                     contents_for_api_call.clear()
                                     del contents_for_api_call
-                                gc.collect()
                                 raise
                             except Exception as e:
                                 is_timeout_main = isinstance(e, TimeoutError)
@@ -2691,12 +2690,9 @@ class ServicesMixin:
                                         temp_clean = re.sub(r'<neuro_update>\s*(.*?)\s*</neuro_update>', '', fb_raw_check, flags=re.IGNORECASE | re.DOTALL)
                                         temp_clean = re.sub(r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})', '', temp_clean, flags=re.IGNORECASE)
                                         temp_scrubbed = self._scrub_response_text(temp_clean, participant_names=all_participant_names)
-                                        temp_dedup = self._deduplicate_response(temp_scrubbed)
                                         
-                                        if not temp_dedup:
+                                        if not temp_scrubbed:
                                             raise ValueError("Empty Response (AI produced no text content)")
-                                        if temp_dedup == "[REPETITIVE_CONTENT_ERROR]":
-                                            raise ValueError("[REPETITIVE_CONTENT_ERROR]")
 
                                         fallback_used = True
                                         self._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile_fallback", model_used=fb_name, status="success")
@@ -2708,7 +2704,6 @@ class ServicesMixin:
                                         if 'contents_for_api_call' in locals():
                                             contents_for_api_call.clear()
                                             del contents_for_api_call
-                                        gc.collect()
                                         raise
                                     except Exception as retry_e:
                                         is_timeout_fallback = isinstance(retry_e, TimeoutError)
@@ -2756,11 +2751,10 @@ class ServicesMixin:
                                 
                                 raw_text, parsed_neuro_state = self._extract_and_apply_neuro_state(raw_text, p_owner_id, p_name)
 
-                                scrubbed_text = self._scrub_response_text(raw_text, participant_names=all_participant_names)
-                                response_text = self._deduplicate_response(scrubbed_text)
+                                response_text = self._scrub_response_text(raw_text, participant_names=all_participant_names)
                                 
                                 # Extract Native grounding sources & URL context
-                                if response_text and response_text != "[REPETITIVE_CONTENT_ERROR]":
+                                if response_text:
                                     if hasattr(response, 'raw') and response.raw.candidates:
                                         if hasattr(response.raw.candidates[0], 'grounding_metadata'):
                                             metadata = response.raw.candidates[0].grounding_metadata
@@ -2779,13 +2773,7 @@ class ServicesMixin:
                                     sources_text_list = self._format_citation_subtext(turn_grounding_sources)
                                 
                                 # [UPDATED] Differentiated error messaging for spammed vs empty content
-                                if response_text == "[REPETITIVE_CONTENT_ERROR]":
-                                    custom_main = p_settings.get("error_response", ERR_GENERAL_ERROR)
-                                    response_text = custom_main
-                                    warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
-                                    turn_warnings.append(warn_tmp.format(reason=ERR_REASON_REPETITIVE_CONTENT))
-                                    was_blocked = True
-                                elif not response_text:
+                                if not response_text:
                                     custom_main = p_settings.get("error_response", ERR_GENERAL_ERROR)
                                     response_text = custom_main
                                     warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
@@ -3224,9 +3212,6 @@ class ServicesMixin:
                         del contents_for_api_call
                     if 'response' in locals():
                         del response
-                    
-                    # Collect short-lived turn objects
-                    gc.collect(0)
 
                     # Check if session was cancelled mid-turn and stop the round
                     if not session.get('is_running') and not session.get('is_regenerating'):
@@ -3389,9 +3374,6 @@ class ServicesMixin:
                     if os.path.exists(generated_image_path_for_round):
                         os.remove(generated_image_path_for_round)
                     del generated_image_path_for_round
-
-                # Force full garbage collection for large byte arrays
-                gc.collect()
 
                 guild_id = self.bot.get_channel(channel_id).guild.id
                 
@@ -3735,7 +3717,7 @@ class ServicesMixin:
                             
                             raw_text, _ = self._extract_and_apply_neuro_state(raw_text, package['effective_profile_owner_id'], package['effective_profile_name'])
                             
-                            response_text = self._deduplicate_response(self._scrub_response_text(raw_text.strip(), participant_names=[package['bot_display_name']]))
+                            response_text = self._scrub_response_text(raw_text.strip(), participant_names=[package['bot_display_name']])
                             
                             if not response_text:
                                 custom_main = profile_settings.get("error_response", ERR_GENERAL_ERROR)
@@ -3871,9 +3853,6 @@ class ServicesMixin:
                 
                 # Delete the dictionary itself
                 del package
-                
-                # Force garbage collection
-                gc.collect()
 
                 self.text_request_queue.task_done()
             except asyncio.CancelledError:
@@ -4662,166 +4641,39 @@ class ServicesMixin:
             with Timeout(seconds=2, error_message="Scrubbing timed out due to complex regex."):
                 scrubbed_text = raw_original.replace("&#x20;", " ")
 
-                # 1. Targeted Internal System XML Tag Scrubber (Pipeline Tags ONLY)
-                system_tags = [
-                    "archive_context", "external_context", "document_context", "time_context",
-                    "whisper_context", "private_whisper", "private_response", "internal_note",
-                    "scene_prompt", "neuro_endocrine_engine", "neuro_update", "persona_profile",
-                    "technical_manual", "training_data", "context_rules", "image_context",
-                    "system_note", "reply_context", "negative_constraints"
-                ]
-                tags_pattern = "|".join(system_tags)
-                
-                # Strip entire blocks of known internal pipeline system tags
-                scrubbed_text = re.sub(rf'<({tags_pattern})>.*?</\1>', '', scrubbed_text, flags=re.DOTALL | re.IGNORECASE)
-                # Strip any orphaned opening/closing internal system tags
-                scrubbed_text = re.sub(rf'</?({tags_pattern})>', '', scrubbed_text, flags=re.IGNORECASE)
+                scrubbed_text = PATTERN_SYSTEM_XML_BLOCKS.sub('', scrubbed_text)
+                scrubbed_text = PATTERN_SYSTEM_XML_ORPHANS.sub('', scrubbed_text)
+                scrubbed_text = PATTERN_REASONING_BLOCKS.sub('', scrubbed_text)
+                scrubbed_text = PATTERN_REASONING_ORPHANS.sub('', scrubbed_text)
+                scrubbed_text = PATTERN_SYSTEM_HEADER.sub('', scrubbed_text)
+                scrubbed_text = PATTERN_TIMESTAMP_HEADER.sub('', scrubbed_text)
+                scrubbed_text = PATTERN_METADATA.sub('', scrubbed_text)
 
-                # Reasoning/Thinking tags (<think>...</think> or <thought>...</thought>)
-                scrubbed_text = re.sub(r'<(think|thought|reasoning)>.*?</\1>', '', scrubbed_text, flags=re.DOTALL | re.IGNORECASE)
-                scrubbed_text = re.sub(r'</?(think|thought|reasoning)>', '', scrubbed_text, flags=re.IGNORECASE)
-                
-                # 2. Precise System Header Scrubber
-                pattern_system_header = r'(?i)(?:^|\n)(?:<[^>\r\n]+>\s*)?\[ID:[^\]\r\n]+\](?:\s*\[[^\]\r\n]+\])?:\s*'
-                pattern_timestamp_header = r'(?i)(?:^|\n)(?:<[^>\r\n]+>\s*)?\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\]\r\n]+\]:\s*'
-                scrubbed_text = re.sub(pattern_system_header, '', scrubbed_text)
-                scrubbed_text = re.sub(pattern_timestamp_header, '', scrubbed_text)
-
-                # 3. Global Technical Metadata Scrubber
-                pattern_metadata = r'\(?\s*(?:Thought Initiated:)?\s*[^|\n\r]*?\|?\s*Duration: \d+\.\d+s\s*\)?'
-                scrubbed_text = re.sub(pattern_metadata, '', scrubbed_text, flags=re.IGNORECASE)
-
-                # 4. Global Participant Prefix & Suffix Scrubber
                 if participant_names:
                     escaped_names = [re.escape(name) for name in participant_names if name]
                     if escaped_names:
                         names_pattern_part = "|".join(escaped_names)
                         
-                        pattern_name_prefix = rf'(?:^|\n)<?(?:{names_pattern_part})>?:\s*'
-                        scrubbed_text = re.sub(pattern_name_prefix, '', scrubbed_text, flags=re.IGNORECASE).strip()
+                        pattern_name_prefix = re.compile(rf'(?:^|\n)<?(?:{names_pattern_part})>?:\s*', flags=re.IGNORECASE)
+                        scrubbed_text = pattern_name_prefix.sub('', scrubbed_text).strip()
                         
-                        pattern_name_xml = rf'</?(?:{names_pattern_part})>'
-                        scrubbed_text = re.sub(pattern_name_xml, '', scrubbed_text, flags=re.IGNORECASE).strip()
+                        pattern_name_xml = re.compile(rf'</?(?:{names_pattern_part})>', flags=re.IGNORECASE)
+                        scrubbed_text = pattern_name_xml.sub('', scrubbed_text).strip()
 
-                scrubbed_text = re.sub(r'Message\s*#[\w-]+', '', scrubbed_text).strip()
-                
-                # Cleanup excess whitespace
-                scrubbed_text = re.sub(r'\n{3,}', '\n\n', scrubbed_text).strip()
+                scrubbed_text = PATTERN_MESSAGE_LINK.sub('', scrubbed_text).strip()
+                scrubbed_text = PATTERN_WHITESPACE_CLEANUP.sub('\n\n', scrubbed_text).strip()
                 
                 # Diagnostic Safeguard: If scrubbing wiped out non-empty content, log and recover
                 if not scrubbed_text and raw_original:
                     print(f"[SCRUBBER DIAGNOSTIC] Warning: Aggressive scrubbing deleted response text. Falling back to sanitized raw text.")
-                    fallback_text = re.sub(rf'<({tags_pattern})>.*?</\1>', '', raw_original, flags=re.DOTALL | re.IGNORECASE)
-                    fallback_text = re.sub(rf'</?({tags_pattern})>', '', fallback_text, flags=re.IGNORECASE).strip()
+                    fallback_text = PATTERN_SYSTEM_XML_BLOCKS.sub('', raw_original)
+                    fallback_text = PATTERN_SYSTEM_XML_ORPHANS.sub('', fallback_text).strip()
                     return fallback_text if fallback_text else raw_original
 
                 return scrubbed_text
         except TimeoutError as e:
             print(f"Warning: {e}. Returning original text.")
             return raw_original
-        
-    def _deduplicate_response(self, text: str) -> str:
-        try:
-            with Timeout(seconds=2, error_message="Deduplication timed out due to complex regex."):
-                clean_text = text.strip()
-                if not clean_text:
-                    return ""
-
-                final_text = clean_text
-                block_found = False
-
-                # 1. New: Check for sequence repetition (Model Collapse / Spam Loop)
-                lines = [line.strip() for line in clean_text.split('\n') if line.strip()]
-                if len(lines) >= 6:
-                    for window_size in range(1, len(lines) // 3 + 1):
-                        window = lines[:window_size]
-                        repeats = 0
-                        idx = 0
-                        while idx + window_size <= len(lines):
-                            if lines[idx:idx+window_size] == window:
-                                repeats += 1
-                                idx += window_size
-                            else:
-                                break
-                        if repeats >= 3 and idx >= len(lines) - window_size:
-                            return "[REPETITIVE_CONTENT_ERROR]"
-
-                # 2. Check for a large repeating block that constitutes the entire message.
-                min_block_len = 30 # Avoid matching small phrases
-                for block_len in range(len(clean_text) // 2, min_block_len, -1):
-                    block = clean_text[:block_len]
-                    if not block.strip():
-                        continue
-                    
-                    parts = clean_text.split(block)
-                    
-                    if len(parts) > 2 and all(not p.strip() for p in parts):
-                        final_text = block.strip()
-                        block_found = True
-                        break
-                
-                if not block_found:
-                    # 2. Fallback: Perfect AA duplication
-                    length = len(clean_text)
-                    if length > 1 and length % 2 == 0:
-                        half_len = length // 2
-                        if clean_text[:half_len].strip() == clean_text[half_len:].strip():
-                            final_text = clean_text[:half_len]
-
-                    # 3. Fallback: Paragraph-level duplication check
-                    if final_text == clean_text:
-                        paragraphs = clean_text.split('\n\n')
-                        paragraphs = [p.strip() for p in paragraphs if p.strip()]
-                        
-                        if len(paragraphs) > 1:
-                            if len(paragraphs) % 2 == 0:
-                                half = len(paragraphs) // 2
-                                if paragraphs[:half] == paragraphs[half:]:
-                                    final_text = '\n\n'.join(paragraphs[:half])
-                            
-                            if final_text == clean_text:
-                                unique_paragraphs = []
-                                last_p = None
-                                for p in paragraphs:
-                                    if p != last_p:
-                                        unique_paragraphs.append(p)
-                                    last_p = p
-                                if len(unique_paragraphs) < len(paragraphs):
-                                    final_text = '\n\n'.join(unique_paragraphs)
-
-                    # 4. Fallback: Sentence-level duplication check
-                    if final_text == clean_text:
-                        sentences = re.split(r'(?<=[.!?])\s+', clean_text)
-                        sentences = [s.strip() for s in sentences if s.strip()]
-                        if len(sentences) > 1:
-                            if len(sentences) % 2 == 0:
-                                half = len(sentences) // 2
-                                if sentences[:half] == sentences[half:]:
-                                    final_text = ' '.join(sentences[:half])
-
-                            if final_text == clean_text:
-                                unique_sentences = []
-                                last_s = None
-                                for s in sentences:
-                                    if s != last_s:
-                                        unique_sentences.append(s)
-                                    last_s = s
-                                if len(unique_sentences) < len(sentences):
-                                    final_text = ' '.join(unique_sentences)
-                
-                # Check for massive repetition that wasn't caught by other methods
-                match = re.search(r'(.)\1{999,}', final_text)
-                if match:
-                    # If found, it indicates a model failure. Return specific sentinel for the worker.
-                    return "[REPETITIVE_CONTENT_ERROR]"
-
-                # Final sanitization to remove trailing, unclosed code block markers and whitespace
-                final_text = re.sub(r'[`\s]*$', '', final_text)
-
-                return final_text.strip()
-        except TimeoutError as e:
-            print(f"Warning: {e}. Returning original text.")
-            return text
         
     def _format_history_entry(self, display_name: str, timestamp: Union[datetime.datetime, str], content: str, timezone_str: str = "UTC", entity_id: str = "00000000") -> str:
         # Convert string timestamp to datetime object if necessary
@@ -4919,9 +4771,6 @@ class ServicesMixin:
                     if not session_to_evict.get("profiles"):
                         self.multi_profile_channels.pop(key, None)
 
-                    # Give the garbage collector a hint to clean up now.
-                    gc.collect()
-
             # Handle global chat sessions (key is a tuple)
             elif isinstance(key, tuple):
                 session_to_save = self.global_chat_sessions.get(key)
@@ -4933,12 +4782,12 @@ class ServicesMixin:
             # Remove from tracking dict after processing
             self.session_last_accessed.pop(key, None)
 
-    @tasks.loop(hours=168.0) # 168 hours = 7 days
-    async def weekly_cleanup_task(self):
+    @tasks.loop(time=datetime.time(hour=17, minute=0, tzinfo=datetime.timezone.utc)) # 17:00 UTC = 3:00 AM AEST
+    async def daily_cleanup_task(self):
         if self.has_lock:
-            print("Starting weekly data cleanup...")
+            print("Starting daily data cleanup...")
             await self._perform_data_cleanup()
-            print("Weekly data cleanup finished.")
+            print("Daily data cleanup finished.")
 
     async def _perform_data_cleanup(self):
         import shutil
@@ -5028,19 +4877,40 @@ class ServicesMixin:
         if cleaned_server_files > 0:
             log.append(f"🧹 Removed {cleaned_server_files} orphaned server-level data directories/files.")
 
-        # --- 6. Full User Data Cleanup (for users no longer sharing any server with the bot) ---
+        # --- 6. Full User Data Cleanup (Ghost Directories & Missing Users) ---
         cleaned_users_count = 0
         if os.path.isdir(self.USERS_DIR):
             for user_id_str in os.listdir(self.USERS_DIR):
-                if user_id_str.isdigit() and user_id_str not in all_bot_member_ids:
-                    user_dir = os.path.join(self.USERS_DIR, user_id_str)
+                if not user_id_str.isdigit(): continue
+                
+                user_dir = os.path.join(self.USERS_DIR, user_id_str)
+                is_missing = user_id_str not in all_bot_member_ids
+                
+                # Check for ghost directory (no profiles, no keys, no shares)
+                is_ghost = False
+                try:
+                    uid = int(user_id_str)
+                    index = self._get_user_index(uid)
+                    has_personal = bool(index.get("personal"))
+                    has_borrowed = bool(index.get("borrowed"))
+                    has_system = bool(index.get("system"))
+                    has_keys = os.path.exists(os.path.join(user_dir, "keys.json.gz"))
+                    has_shares = os.path.exists(os.path.join(user_dir, "shares.json.gz"))
+                    
+                    if not (has_personal or has_borrowed or has_system or has_keys or has_shares):
+                        is_ghost = True
+                except Exception:
+                    pass
+
+                if is_missing or is_ghost:
                     shutil.rmtree(user_dir, ignore_errors=True)
                     self.user_appearances.pop(user_id_str, None)
                     self.profile_shares.pop(user_id_str, None)
+                    self.user_indices.pop(user_id_str, None)
                     cleaned_users_count += 1
         
         if cleaned_users_count > 0:
-            log.append(f"🧹 Removed all data for {cleaned_users_count} users no longer sharing a server with the bot.")
+            log.append(f"🧹 Removed {cleaned_users_count} ghost user directories or users no longer sharing a server.")
 
         # --- 7. Detailed Per-User & Per-Server Integrity Check ---
         cleaned_borrows = 0
@@ -6870,12 +6740,9 @@ class ServicesMixin:
                 temp_clean = re.sub(r'<neuro_update>\s*(.*?)\s*</neuro_update>', '', raw_text_check, flags=re.IGNORECASE | re.DOTALL)
                 temp_clean = re.sub(r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})', '', temp_clean, flags=re.IGNORECASE)
                 temp_scrubbed = self._scrub_response_text(temp_clean, participant_names=all_participant_names)
-                temp_dedup = self._deduplicate_response(temp_scrubbed)
                 
-                if not temp_dedup:
+                if not temp_scrubbed:
                     raise ValueError("Empty Response (AI produced no text content)")
-                if temp_dedup == "[REPETITIVE_CONTENT_ERROR]":
-                    raise ValueError("[REPETITIVE_CONTENT_ERROR]")
                     
             except asyncio.CancelledError:
                 if state_container:
@@ -6949,12 +6816,9 @@ class ServicesMixin:
                         temp_clean = re.sub(r'<neuro_update>\s*(.*?)\s*</neuro_update>', '', fb_raw_check, flags=re.IGNORECASE | re.DOTALL)
                         temp_clean = re.sub(r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})', '', temp_clean, flags=re.IGNORECASE)
                         temp_scrubbed = self._scrub_response_text(temp_clean, participant_names=all_participant_names)
-                        temp_dedup = self._deduplicate_response(temp_scrubbed)
                         
-                        if not temp_dedup:
+                        if not temp_scrubbed:
                             raise ValueError("Empty Response (AI produced no text content)")
-                        if temp_dedup == "[REPETITIVE_CONTENT_ERROR]":
-                            raise ValueError("[REPETITIVE_CONTENT_ERROR]")
 
                         fallback_used = True
                     except asyncio.CancelledError:
@@ -7000,14 +6864,9 @@ class ServicesMixin:
                 
                 raw_text, parsed_neuro_state = self._extract_and_apply_neuro_state(raw_text, p_owner_id, p_name)
                 
-                new_text = self._deduplicate_response(self._scrub_response_text(raw_text, participant_names=all_participant_names))
+                new_text = self._scrub_response_text(raw_text, participant_names=all_participant_names)
                 
-                if new_text == "[REPETITIVE_CONTENT_ERROR]":
-                    new_text = p_profile.get("error_response", ERR_GENERAL_ERROR)
-                    warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
-                    turn_warnings.append(warn_tmp.format(reason=ERR_REASON_REPETITIVE_CONTENT))
-                    was_blocked = True
-                elif not new_text:
+                if not new_text:
                     new_text = p_profile.get("error_response", ERR_GENERAL_ERROR)
                     warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
                     turn_warnings.append(warn_tmp.format(reason=ERR_REASON_EMPTY_RESPONSE))

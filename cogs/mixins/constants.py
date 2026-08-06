@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Literal
 from google.genai.types import HarmCategory, HarmBlockThreshold
 from cryptography.fernet import Fernet
@@ -415,3 +416,22 @@ DEFAULT_HELP_MODE_INJECTION = (
     "When using the visualisation map, directly state the exact Dashboard, Tab, and Action path needed.\"\n"
     "</system_note>"
 )
+
+SYSTEM_XML_TAGS = [
+    "archive_context", "external_context", "document_context", "time_context",
+    "whisper_context", "private_whisper", "private_response", "internal_note",
+    "scene_prompt", "neuro_endocrine_engine", "neuro_update", "persona_profile",
+    "technical_manual", "training_data", "context_rules", "image_context",
+    "system_note", "reply_context", "negative_constraints"
+]
+_tags_pattern = "|".join(SYSTEM_XML_TAGS)
+
+PATTERN_SYSTEM_XML_BLOCKS = re.compile(rf'<({_tags_pattern})>.*?</\1>', flags=re.DOTALL | re.IGNORECASE)
+PATTERN_SYSTEM_XML_ORPHANS = re.compile(rf'</?({_tags_pattern})>', flags=re.IGNORECASE)
+PATTERN_REASONING_BLOCKS = re.compile(r'<(think|thought|reasoning)>.*?</\1>', flags=re.DOTALL | re.IGNORECASE)
+PATTERN_REASONING_ORPHANS = re.compile(r'</?(think|thought|reasoning)>', flags=re.IGNORECASE)
+PATTERN_SYSTEM_HEADER = re.compile(r'(?i)(?:^|\n)(?:<[^>\r\n]+>\s*)?\[ID:[^\]\r\n]+\](?:\s*\[[^\]\r\n]+\])?:\s*')
+PATTERN_TIMESTAMP_HEADER = re.compile(r'(?i)(?:^|\n)(?:<[^>\r\n]+>\s*)?\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\]\r\n]+\]:\s*')
+PATTERN_METADATA = re.compile(r'\(?\s*(?:Thought Initiated:)?\s*[^|\n\r]*?\|?\s*Duration: \d+\.\d+s\s*\)?', flags=re.IGNORECASE)
+PATTERN_MESSAGE_LINK = re.compile(r'Message\s*#[\w-]+')
+PATTERN_WHITESPACE_CLEANUP = re.compile(r'\n{3,}')

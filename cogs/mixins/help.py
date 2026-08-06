@@ -80,11 +80,25 @@ class HelpMixin:
                 return template.replace("{docs}", docs)
             return None
             
-        sims = [(doc["text"], cosine_similarity(emb, doc["emb"])) for doc in self.doc_vectors]
-        sims.sort(key=lambda x: x[1], reverse=True)
+        import numpy as np
+        
+        # Vectorized Cosine Similarity for Help Docs
+        doc_embs = np.array([doc["emb"] for doc in self.doc_vectors], dtype=np.float32)
+        prompt_vec = np.array(emb, dtype=np.float32)
+        
+        emb_norms = np.linalg.norm(doc_embs, axis=1)
+        prompt_norm = np.linalg.norm(prompt_vec)
+        
+        emb_norms[emb_norms == 0] = 1e-10
+        prompt_norm = prompt_norm if prompt_norm != 0 else 1e-10
+        
+        similarities = np.dot(doc_embs, prompt_vec) / (emb_norms * prompt_norm)
+        
+        sims = [{"text": doc["text"], "sim": float(similarities[i])} for i, doc in enumerate(self.doc_vectors)]
+        sims.sort(key=lambda x: x["sim"], reverse=True)
         
         # High relevance threshold ensures we only answer actual technical questions
-        top_chunks = [x[0] for x in sims if x[1] >= 0.60][:5]
+        top_chunks = [x["text"] for x in sims if x["sim"] >= 0.60][:5]
         
         if top_chunks:
             docs = "\n---\n".join(top_chunks)
