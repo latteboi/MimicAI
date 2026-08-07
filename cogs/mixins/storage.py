@@ -57,7 +57,8 @@ def decode_embedding_b64(b64_str: str) -> np.ndarray:
 
 def calculate_similarities(prompt_emb: List[float], b64_embs: List[str]) -> np.ndarray:
     if not b64_embs or not prompt_emb: return np.array([])
-    matrix = np.stack([np.frombuffer(base64.b64decode(s), dtype=np.float16).astype(np.float32) for s in b64_embs])
+    raw_bytes = b"".join(base64.b64decode(s) for s in b64_embs)
+    matrix = np.frombuffer(raw_bytes, dtype=np.float16).reshape(len(b64_embs), -1).astype(np.float32)
     prompt_vec = np.array(prompt_emb, dtype=np.float32)
     
     emb_norms = np.linalg.norm(matrix, axis=1)
@@ -119,7 +120,7 @@ class IOManager:
         try:
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             json_bytes = json.dumps(data)
-            compressed_bytes = gzip.compress(json_bytes)
+            compressed_bytes = gzip.compress(json_bytes, compresslevel=1)
             
             bytes_to_write = compressed_bytes
             if encrypted and fernet:
@@ -541,7 +542,6 @@ class StorageMixin:
                         return
                     data_to_save = session_data['unified_log']
                 else:
-                    # Non-persistent or dormant global chat state, skip saving
                     return
             elif hasattr(session_data, 'history'):
                  log = []
@@ -561,11 +561,9 @@ class StorageMixin:
             path = self._get_session_path(session_key, session_type)
             path.parent.mkdir(parents=True, exist_ok=True)
             
-            # Shallow copy to prevent iteration mutation errors during serialization, eliminating deepcopy CPU overhead
             data_copy = list(data_to_save) if isinstance(data_to_save, list) else data_to_save.copy()
             
             def _thread_save():
-                # Utilise high-speed Rust-based serialization flags
                 serialized_bytes = json.dumps(data_copy, option=json.OPT_SERIALIZE_NUMPY | json.OPT_NON_STR_KEYS)
                 compressed_bytes = gzip.compress(serialized_bytes, compresslevel=1)
                 encrypted_compressed_bytes = self.fernet.encrypt(compressed_bytes)

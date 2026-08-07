@@ -3453,6 +3453,11 @@ class ServicesMixin:
 
             except asyncio.CancelledError:
                 break
+            except RuntimeError as e:
+                if "Session is closed" in str(e):
+                    break
+                print(f"Error in multi-profile worker for channel {channel_id}: {e}")
+                traceback.print_exc()
             except Exception as e:
                 print(f"Error in multi-profile worker for channel {channel_id}: {e}")
                 traceback.print_exc()
@@ -3857,6 +3862,10 @@ class ServicesMixin:
                 self.text_request_queue.task_done()
             except asyncio.CancelledError:
                 break
+            except RuntimeError as e:
+                if "Session is closed" in str(e):
+                    break
+                print(f"Error in image finisher worker: {e}"); traceback.print_exc()
             except Exception as e:
                 print(f"Error in image finisher worker: {e}"); traceback.print_exc()
                 # Ensure typing is stopped on error for child bots
@@ -3938,6 +3947,10 @@ class ServicesMixin:
                 self.image_request_queue.task_done()
             except asyncio.CancelledError:
                 break
+            except RuntimeError as e:
+                if "Session is closed" in str(e):
+                    break
+                print(f"Error in image generation worker #{worker_id}: {e}"); traceback.print_exc()
             except Exception as e:
                 print(f"Error in image generation worker #{worker_id}: {e}"); traceback.print_exc()
 
@@ -4483,7 +4496,11 @@ class ServicesMixin:
                             try: await target_message_to_edit.delete()
                             except: pass
                             
-                        sent_message = await webhook_to_use.send(**send_kwargs)
+                        try:
+                            sent_message = await webhook_to_use.send(**send_kwargs)
+                        except RuntimeError as e:
+                            if "Session is closed" in str(e): return sent_messages_list
+                            raise
                         sent_messages_list.append(sent_message)
                         if i == 0 and store_prompt_for_id:
                             self.message_id_to_original_prompt[sent_message.id] = store_prompt_for_id
@@ -4495,6 +4512,9 @@ class ServicesMixin:
                             
                         try:
                             await webhook_to_use.edit_message(sent_message.id, content=displayed_text)
+                        except RuntimeError as e:
+                            if "Session is closed" in str(e): return sent_messages_list
+                            print(f"Typing edit failed: {e}")
                         except Exception as e:
                             print(f"Typing edit failed: {e}")
                         last_edit_time = time.monotonic()
@@ -4523,6 +4543,9 @@ class ServicesMixin:
                     else:
                         sent_msg = await webhook_to_use.send(**send_kwargs)
                         sent_messages_list.append(sent_msg)
+                except RuntimeError as e:
+                    if "Session is closed" not in str(e):
+                        print(f"Failed to flush realistic typing on cancel: {e}")
                 except Exception as flush_err:
                     print(f"Failed to flush realistic typing on cancel: {flush_err}")
                 return sent_messages_list
@@ -4576,18 +4599,26 @@ class ServicesMixin:
                     if isinstance(channel, discord.Thread): send_kwargs["thread"] = channel
                     
                     sent_message_part = await webhook_to_use.send(**send_kwargs)
+                except RuntimeError as e:
+                    if "Session is closed" in str(e): return sent_messages_list
+                    print(f"Webhook send failed, falling back to regular message. Error: {e}")
+                    sent_message_part = None 
                 except Exception as e:
                     print(f"Webhook send failed, falling back to regular message. Error: {e}")
                     sent_message_part = None 
             
             if not sent_message_part:
-                if current_target_to_edit:
-                    try:
-                        sent_message_part = await current_target_to_edit.edit(content=final_content_for_send, embeds=current_embeds_for_api)
-                    except discord.HTTPException:
+                try:
+                    if current_target_to_edit:
+                        try:
+                            sent_message_part = await current_target_to_edit.edit(content=final_content_for_send, embeds=current_embeds_for_api)
+                        except discord.HTTPException:
+                            sent_message_part = await channel.send(final_content_for_send, embeds=current_embeds_for_api, file=current_file_for_api)
+                    else:
                         sent_message_part = await channel.send(final_content_for_send, embeds=current_embeds_for_api, file=current_file_for_api)
-                else:
-                    sent_message_part = await channel.send(final_content_for_send, embeds=current_embeds_for_api, file=current_file_for_api)
+                except RuntimeError as e:
+                    if "Session is closed" in str(e): return sent_messages_list
+                    raise
 
             if sent_message_part:
                 sent_messages_list.append(sent_message_part)
@@ -4650,14 +4681,14 @@ class ServicesMixin:
                 scrubbed_text = PATTERN_METADATA.sub('', scrubbed_text)
 
                 if participant_names:
-                    escaped_names = [re.escape(name) for name in participant_names if name]
+                    escaped_names = [re.escape(name.strip()) for name in participant_names if name and name.strip()]
                     if escaped_names:
                         names_pattern_part = "|".join(escaped_names)
                         
-                        pattern_name_prefix = re.compile(rf'(?:^|\n)<?(?:{names_pattern_part})>?:\s*', flags=re.IGNORECASE)
+                        pattern_name_prefix = re.compile(rf'(?:^|\n)(?:<\s*(?:{names_pattern_part})\s*>|{names_pattern_part})\s*:\s*', flags=re.IGNORECASE)
                         scrubbed_text = pattern_name_prefix.sub('', scrubbed_text).strip()
                         
-                        pattern_name_xml = re.compile(rf'</?(?:{names_pattern_part})>', flags=re.IGNORECASE)
+                        pattern_name_xml = re.compile(rf'</?\s*(?:{names_pattern_part})\s*>', flags=re.IGNORECASE)
                         scrubbed_text = pattern_name_xml.sub('', scrubbed_text).strip()
 
                 scrubbed_text = PATTERN_MESSAGE_LINK.sub('', scrubbed_text).strip()
@@ -4767,6 +4798,11 @@ class ServicesMixin:
                     if 'chat_sessions' in session_to_evict:
                         session_to_evict['chat_sessions'].clear()
                     
+                    # Clean up LTM recall history for participants in this channel to prevent RAM leak
+                    for p in session_to_evict.get("profiles", []):
+                        full_key = (key, p.get("owner_id"), p.get("profile_name"))
+                        self.ltm_recall_history.pop(full_key, None)
+
                     # If it's a completely empty dormant session, pop it entirely to save memory.
                     if not session_to_evict.get("profiles"):
                         self.multi_profile_channels.pop(key, None)
@@ -4778,9 +4814,18 @@ class ServicesMixin:
                     await self._save_session_to_disk(key, 'global_chat', session_to_save)
                     
                 self.global_chat_sessions.pop(key, None)
+                self.ltm_recall_history.pop(key, None)
 
             # Remove from tracking dict after processing
             self.session_last_accessed.pop(key, None)
+
+        # Prune stale child bot edit cooldown timestamps
+        for bot_id in list(self.child_bot_edit_cooldowns.keys()):
+            timestamps = [ts for ts in self.child_bot_edit_cooldowns[bot_id] if now - ts < 600]
+            if timestamps:
+                self.child_bot_edit_cooldowns[bot_id] = timestamps
+            else:
+                self.child_bot_edit_cooldowns.pop(bot_id, None)
 
     @tasks.loop(time=datetime.time(hour=17, minute=0, tzinfo=datetime.timezone.utc)) # 17:00 UTC = 3:00 AM AEST
     async def daily_cleanup_task(self):

@@ -5,7 +5,7 @@ from google import genai
 from google.genai import types
 
 from .constants import DOCS_DIR, defaultConfig, DEFAULT_HELP_MODE_INJECTION
-from .storage import cosine_similarity
+from .storage import cosine_similarity, encode_embedding_b64, decode_embedding_b64
 
 class HelpMixin:
     
@@ -23,6 +23,19 @@ class HelpMixin:
         self._ensure_docs_directory()
         self.doc_vectors = []
         
+        cache_path = os.path.join(DOCS_DIR, "embedded_docs_cache.json.gz")
+        if os.path.exists(cache_path):
+            try:
+                cached_data = self._load_json_gzip(cache_path, encrypted=False)
+                if cached_data and isinstance(cached_data, list):
+                    for item in cached_data:
+                        item["emb"] = decode_embedding_b64(item["emb_b64"])
+                    self.doc_vectors = cached_data
+                    print(f"Loaded {len(self.doc_vectors)} embedded documentation shards from local cache.")
+                    return
+            except Exception as e:
+                print(f"Failed to load documentation vectors from cache: {e}")
+
         api_key = self._get_api_key_for_user(int(defaultConfig.DISCORD_OWNER_ID), "gemini")
         if not api_key:
             print("Warning: No Bot Owner Google API Key found. Skipping documentation vector generation.")
@@ -48,6 +61,7 @@ class HelpMixin:
                     except Exception as e:
                         print(f"Failed to read documentation file {filepath}: {e}")
 
+        cache_to_save = []
         for chunk in chunks:
             try:
                 result = await asyncio.wait_for(
@@ -57,10 +71,18 @@ class HelpMixin:
                         config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT", output_dimensionality=256)
                     ), timeout=5.0)
                 emb = result.embeddings[0].values
-                self.doc_vectors.append({"text": chunk, "emb": emb})
+                b64_emb = encode_embedding_b64(emb)
+                self.doc_vectors.append({"text": chunk, "emb": emb, "emb_b64": b64_emb})
+                cache_to_save.append({"text": chunk, "emb_b64": b64_emb})
             except Exception as e:
                 print(f"Failed to embed documentation chunk: {e}")
-                
+
+        if cache_to_save:
+            try:
+                self._atomic_json_save_gzip(cache_to_save, cache_path, encrypted=False)
+            except Exception as e:
+                print(f"Failed to save documentation embedding cache: {e}")
+
         print(f"Loaded and embedded {len(self.doc_vectors)} documentation shards.")
 
     async def _get_relevant_help_context(self, query: str, guild_id: Optional[int], force_always_respond: bool = False) -> Optional[str]:

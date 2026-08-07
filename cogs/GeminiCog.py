@@ -49,7 +49,7 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
         self.cog_id = str(uuid.uuid4()) 
         self.has_lock = False
         
-        # [NEW] Client placeholder for session-specific usage
+        # Client placeholder for session-specific usage
         self.client = None
         self.guide_vectors = []
         
@@ -90,7 +90,11 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
         self.user_indices: LRUCache = LRUCache(max_size=20)
         self.server_indices: LRUCache = LRUCache(max_size=50)
         
-        self.user_appearances: Dict[str, Dict[str, Dict[str, Optional[str]]]] = {}
+        # Memory-bounded caches to prevent RAM growth on long uptime
+        self.user_appearances: LRUCache = LRUCache(max_size=50)
+        self.message_counters_for_ltm: LRUCache = LRUCache(max_size=200)
+        self.child_bot_edit_cooldowns: LRUCache = LRUCache(max_size=50)
+        
         self._load_channel_webhooks()
 
         self.share_codes: Dict[str, Dict[str, Any]] = {}
@@ -115,8 +119,6 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
 
         self.chat_sessions: LRUCache = LRUCache(max_size=CHAT_SESSION_CACHE_MAX_SIZE)
         self.max_history_items = defaultConfig.CHATBOT_MEMORY_LENGTH
-
-        self.message_counters_for_ltm: Dict[Tuple[int, str, Literal["guild", "dm"]], int] = {}
         
         self.model_override_warnings_sent: Set[Tuple[int, int, str]] = set()
         self.debug_users: Set[int] = set()
@@ -133,9 +135,8 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
         self.all_bot_ids: Set[int] = set()
         self.image_gen_semaphore = asyncio.Semaphore(3)
         self.ltm_recall_history: Dict[Any, Dict[str, Tuple[int, float]]] = {}
-        self.child_bot_edit_cooldowns: Dict[str, List[float]] = {}
 
-        # FIXED: Priority Queues for Premium Fast-Lane
+        # Priority Queues for Premium Fast-Lane
         self.image_request_queue = asyncio.PriorityQueue(maxsize=10)
         self.text_request_queue = asyncio.PriorityQueue()
         
@@ -145,8 +146,8 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
         self.background_tasks = set()
         self.child_bot_single_sessions = {}
         
-        # [NEW] API Key Health & Tier Tracking
-        self.api_key_cooldowns: Dict[str, float] = {} # {key: expiry_timestamp}
+        # API Key Health & Tier Tracking
+        self.api_key_cooldowns: Dict[str, float] = {}
         
         # Model Stats Initialization
         self.MODELS_DATA_DIR = os.path.join(DATA_DIR, "models")
