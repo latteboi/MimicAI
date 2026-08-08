@@ -3410,8 +3410,8 @@ class ServicesMixin:
                                 if ltm_d:
                                     summary_embedding = await self._get_embedding(ltm_d, guild_id, task_type="RETRIEVAL_DOCUMENT")
                                     if summary_embedding:
-                                        quantized_embedding = _quantize_embedding(summary_embedding)
-                                        self._add_ltm(owner_id, profile_name, ltm_d, quantized_embedding, guild_id, triggering_user_id, round_author_name)
+                                        b64_emb = encode_embedding_b64(summary_embedding)
+                                        self._add_ltm(owner_id, profile_name, ltm_d, b64_emb, guild_id, triggering_user_id, round_author_name)
                                         
                                         # [NEW] Link LTM creation to the turn metadata for trace transparency
                                         bot_pid = self._get_pid_from_name_any(owner_id, profile_name)
