@@ -820,10 +820,9 @@ class StorageMixin:
                         # Primary key data might now contain 'openrouter_key'
                         self.server_api_keys[server_id_str] = server_keys_data.get("primary")
 
-    def _save_server_api_key_shard(self, server_id_str: str, primary_key_data: Optional[Dict], submissions_data: List):
+    def _save_server_api_key_shard(self, server_id_str: str, primary_key_data: Optional[Dict]):
         self._save_shard("server_keys", server_id_str, {
-            "primary": primary_key_data,
-            "submissions": submissions_data
+            "primary": primary_key_data
         })
 
     def _load_personal_api_keys(self):
@@ -843,21 +842,6 @@ class StorageMixin:
             self._delete_shard("personal_keys", user_id_str)
         else:
             self._save_shard("personal_keys", user_id_str, {"key": encrypted_key})
-
-    def _load_key_submissions(self):
-        self.key_submissions = {}
-        servers_dir = self.SERVERS_DIR
-        if not os.path.isdir(servers_dir):
-            return
-        
-        for server_id_str in os.listdir(servers_dir):
-            server_path = os.path.join(servers_dir, server_id_str)
-            if os.path.isdir(server_path) and server_id_str.isdigit():
-                api_keys_file = os.path.join(server_path, "api_keys.json.gz")
-                if os.path.exists(api_keys_file):
-                    server_keys_data = self._load_json_gzip(api_keys_file)
-                    if server_keys_data and server_keys_data.get("submissions"):
-                        self.key_submissions[server_id_str] = server_keys_data.get("submissions")
 
     def _save_key_submissions_shard(self, server_id_str: str, submissions_data: List):
         primary_key_data = self.server_api_keys.get(server_id_str)
@@ -990,76 +974,86 @@ class StorageMixin:
         except Exception as e:
             print(f"Error saving sharded multi-profile sessions to index: {e}")
 
+    def _get_user_keys_data(self, user_id: int) -> Dict[str, Any]:
+        path = os.path.join(self.USERS_DIR, str(user_id), "keys.json.gz")
+        if not os.path.exists(path):
+            return {"slots": {}, "personal_assignments": {}}
+            
+        data = IOManager.read_json_gzip(path, self.fernet, encrypted=True)
+        
+        # Auto-purge legacy/corrupted files (e.g., the old b'gA' format)
+        if not data or "slots" not in data:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return {"slots": {}, "personal_assignments": {}}
+            
+        return data
+
+    def _save_user_keys_data(self, user_id: int, data: Dict[str, Any]):
+        path = os.path.join(self.USERS_DIR, str(user_id), "keys.json.gz")
+        IOManager.write_json_gzip(data, path, self.fernet, encrypted=True)
+
     def _get_api_key_for_guild(self, guild_id: int, provider: str = "gemini") -> Optional[str]:
         if not self.fernet: return None
         guild_id_str = str(guild_id)
         now = time.time()
         
-        # 1. Prioritize Primary Key
-        primary_key_data = self.server_api_keys.get(guild_id_str)
-        if primary_key_data and isinstance(primary_key_data, dict):
-            field = 'openrouter_key' if provider == "openrouter" else 'key'
-            encrypted_key = primary_key_data.get(field)
-            if encrypted_key:
-                raw_key = encrypted_key
-                try:
-                    # Attempt decryption in case it is legacy encrypted
-                    decrypted = self.fernet.decrypt(encrypted_key.encode()).decode()
-                    raw_key = decrypted
-                except Exception:
-                    pass 
-                
-                # Check if this specific key is currently on rate-limit cooldown
+        cache_key = (guild_id, provider)
+        pointer = self.server_key_pointers.get(cache_key)
+        
+        if not pointer:
+            server_index = self._get_server_index(guild_id_str)
+            assigned = server_index.get("assigned_keys", {}).get(provider)
+            if assigned:
+                pointer = (assigned["user_id"], assigned["slot"])
+                self.server_key_pointers[cache_key] = pointer
+        
+        if pointer:
+            user_id, slot_id = pointer
+            
+            guild = self.bot.get_guild(guild_id)
+            if not guild or not guild.get_member(user_id):
+                self.server_key_pointers.pop(cache_key, None)
+                return None
+            
+            decrypted_key = self.decrypted_key_cache.get((user_id, slot_id))
+            if decrypted_key:
+                if decrypted_key not in self.api_key_cooldowns or now > self.api_key_cooldowns[decrypted_key]:
+                    return decrypted_key
+            
+            user_data = self._get_user_keys_data(user_id)
+            slot_data = user_data.get("slots", {}).get(slot_id)
+            if slot_data and slot_data.get("key"):
+                raw_key = slot_data["key"]
+                self.decrypted_key_cache[(user_id, slot_id)] = raw_key
                 if raw_key not in self.api_key_cooldowns or now > self.api_key_cooldowns[raw_key]:
                     return raw_key
-
-        # 2. Failover to PAID Tier Keys in Pool
-        if guild_id_str in self.key_submissions:
-            pool_candidates = []
-            for submission in self.key_submissions[guild_id_str]:
-                if submission.get("status") == "active" and submission.get("tier") == "paid":
-                    sub_provider = submission.get("provider", "gemini")
-                    if sub_provider == provider:
-                        raw_pool_key = submission["encrypted_key"]
-                        try:
-                            decrypted = self.fernet.decrypt(raw_pool_key.encode()).decode()
-                            raw_pool_key = decrypted
-                        except Exception:
-                            pass
-                        
-                        # Only add if not on cooldown
-                        if raw_pool_key not in self.api_key_cooldowns or now > self.api_key_cooldowns[raw_pool_key]:
-                            pool_candidates.append(raw_pool_key)
-            
-            if pool_candidates:
-                return random.choice(pool_candidates)
-
+                    
         return None
 
     def _get_api_key_for_user(self, user_id: int, provider: str = "gemini") -> Optional[str]:
         if not self.fernet: return None
-        user_id_str = str(user_id)
-
-        file_path = os.path.join(self.USERS_DIR, user_id_str, "keys.json.gz")
-        data = IOManager.read_json_gzip(file_path, self.fernet)
+        now = time.time()
         
-        if not data:
-            return None
-
-        encrypted_key = None
-        if provider == "openrouter":
-            encrypted_key = data.get("openrouter_key")
-        else:
-            encrypted_key = data.get("key")
-
-        if not encrypted_key:
-            return None
-
-        try:
-            return self.fernet.decrypt(encrypted_key.encode()).decode()
-        except Exception:
-            # Fallback if the key was saved in plain text or only value-level encrypted during migration
-            return encrypted_key
+        user_data = self._get_user_keys_data(user_id)
+        slot_id = user_data.get("personal_assignments", {}).get(provider)
+        
+        if slot_id:
+            decrypted_key = self.decrypted_key_cache.get((user_id, slot_id))
+            if decrypted_key:
+                if decrypted_key not in self.api_key_cooldowns or now > self.api_key_cooldowns[decrypted_key]:
+                    return decrypted_key
+                    
+            slot_data = user_data.get("slots", {}).get(slot_id)
+            if slot_data and slot_data.get("key"):
+                raw_key = slot_data["key"]
+                self.decrypted_key_cache[(user_id, slot_id)] = raw_key
+                if raw_key not in self.api_key_cooldowns or now > self.api_key_cooldowns[raw_key]:
+                    return raw_key
+                    
+        return None
 
     def _is_profile_public(self, user_id: int, profile_name: str) -> bool:
         index = self._get_user_index(user_id)

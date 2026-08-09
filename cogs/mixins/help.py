@@ -195,11 +195,6 @@ DEFAULT_HELP_DOCS = {
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Ollama is offline' or 'Network Error'. Fix: Ensure the Ollama app is actively running on your PC, and that the Host URL in the bot matches your tunnel address."
     ),
-    "apis/server_key_pool.txt": (
-        "Capabilities: MimicAI allows users to contribute their personal API keys to a Server Key Pool.\n"
-        "Mechanism: If the Server's Primary Key runs out of quota, the bot will automatically failover and cycle through the valid keys submitted by other users in the server to keep the bot online.\n"
-        "Setup: Users can add keys to the pool via `/settings` -> API Keys -> Select the Server -> Edit Pool Key."
-    ),
     "apis/rate_limits_and_errors.txt": (
         "Concept: API execution errors occur when an external inference endpoint rejects a generation payload. The bot automatically parses these HTTP status codes to provide diagnostics.\n"
         "Status Code Meanings:\n"

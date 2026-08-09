@@ -534,6 +534,8 @@ class HiveMind:
             
             # Note: Discord requires the original Attachment objects to be passed back to keep them
             await message.edit(content=content, attachments=kept_attachments)
+        except discord.NotFound:
+            pass
         except Exception as e:
             print(f"[Hive] Regeneration edit error for {bot_id}: {e}")
 

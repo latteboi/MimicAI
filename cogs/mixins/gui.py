@@ -5266,132 +5266,102 @@ class AnalyseExamplesModal(ui.Modal, title="Analyse Training Examples"):
         await interaction.response.defer(ephemeral=True, thinking=True)
         await self.parent_view.cog._execute_training_analysis(interaction, self.parent_view.profile_name, count, verbosity, model_name)
 
-class SubmitAPIKeyModal(ui.Modal, title="Edit API Key"):
-    key_input = ui.TextInput(label="API Key (Auto Detect)", placeholder="Paste key to set, or leave blank to remove.", required=False)
+class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
+    key_input = ui.TextInput(label="API Key", placeholder="Paste your API key here...", required=True)
 
-    def __init__(self, cog: 'GeminiAgent', target_type: str, guild_id: Optional[int] = None, view: Optional[ui.View] = None):
+    def __init__(self, cog: 'GeminiAgent', slot_id: str, provider: str, view: Optional[ui.View] = None):
         super().__init__()
         self.cog = cog
-        self.target_type = target_type 
-        self.guild_id = guild_id
+        self.slot_id = slot_id
+        self.provider = provider
         self.view = view
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         raw_key = self.key_input.value.strip()
         
-        # --- Deletion Logic ---
-        if not raw_key:
-            if self.target_type == 'personal':
-                self.cog._save_personal_api_key_shard(str(interaction.user.id), None)
-                if str(interaction.user.id) in self.cog.personal_api_keys: del self.cog.personal_api_keys[str(interaction.user.id)]
-                
-                idx = self.cog._get_user_index(interaction.user.id)
-                idx["has_personal_key"] = False
-                self.cog._save_user_index(interaction.user.id, idx)
-                
-                msg = "Personal key removed."
-                
-            elif self.target_type == 'server_primary':
-                sid = str(self.guild_id)
-                if sid in self.cog.server_api_keys:
-                    del self.cog.server_api_keys[sid]
-                    subs = self.cog.key_submissions.get(sid, [])
-                    self.cog._save_server_api_key_shard(sid, None, subs)
-                msg = "Server Primary key removed."
-                
-            elif self.target_type == 'server_pool':
-                sid = str(self.guild_id)
-                subs = self.cog.key_submissions.get(sid, [])
-                new_subs = [s for s in subs if s['submitter_id'] != interaction.user.id]
-                self.cog.key_submissions[sid] = new_subs
-                self.cog._save_key_submissions_shard(sid, new_subs)
-                msg = "Your pool submission removed."
-
-            if self.view: await self.view.update_display()
-            await interaction.followup.send(msg, ephemeral=True)
-            return
-
-        # --- Validation & Setting Logic ---
-        provider = None
-        if raw_key.startswith(("AIzaSy", "AQ.")): provider = "gemini"
-        elif raw_key.startswith("sk-or-"): provider = "openrouter"
-        
-        if not provider:
+        if not raw_key.startswith(("AIzaSy", "AQ.", "sk-or-")):
             await interaction.followup.send("❌ **Invalid Format.** Keys must start with `AIzaSy`, `AQ.`, or `sk-or-`.", ephemeral=True)
             return
 
         is_valid, err, tier = await self.cog._validate_api_keys(
-            raw_key if provider == "gemini" else None, 
-            raw_key if provider == "openrouter" else None
+            raw_key if self.provider == "gemini" else None, 
+            raw_key if self.provider == "openrouter" else None
         )
         
         if not is_valid:
             await interaction.followup.send(f"❌ **Validation Failed:** {err}", ephemeral=True)
             return
-
-        encrypted_key = self.cog._encrypt_data(raw_key)
         
-        if self.target_type == 'personal':
-            user_id_str = str(interaction.user.id)
-            path = os.path.join(self.cog.USERS_DIR, user_id_str, "keys.json.gz")
-            existing_data = self.cog._load_json_gzip(path) or {}
-            
-            key_field = "key" if provider == "gemini" else "openrouter_key"
-            existing_data[key_field] = encrypted_key
-            if provider == "gemini":
-                existing_data["tier"] = tier
-            elif "tier" not in existing_data:
-                existing_data["tier"] = "free"
-            self.cog._atomic_json_save_gzip(existing_data, path)
-            self.cog.personal_api_keys[user_id_str] = existing_data.get("key") 
-            
-            idx = self.cog._get_user_index(interaction.user.id)
-            idx["has_personal_key"] = True
-            self.cog._save_user_index(interaction.user.id, idx)
-            
-            msg = f"✅ Personal {provider.title()} key updated ({tier.title()} Tier)."
+        user_data = self.cog._get_user_keys_data(interaction.user.id)
+        user_data.setdefault("slots", {})[self.slot_id] = {
+            "key": raw_key,
+            "provider": self.provider,
+            "tier": tier
+        }
+        self.cog._save_user_keys_data(interaction.user.id, user_data)
+        
+        self.cog.decrypted_key_cache[(interaction.user.id, self.slot_id)] = raw_key
+        
+        idx = self.cog._get_user_index(interaction.user.id)
+        idx["has_personal_key"] = True
+        self.cog._save_user_index(interaction.user.id, idx)
+        
+        msg = f"✅ {self.provider.title()} key saved to slot `{self.slot_id}` ({tier.title()} Tier)."
 
-        elif self.target_type == 'server_primary':
-            guild_id_str = str(self.guild_id)
-            key_data = self.cog.server_api_keys.get(guild_id_str, {})
-            if not isinstance(key_data, dict): key_data = {}
+        if self.view:
+            self.view.setup_items()
+            await self.view.update_display()
             
-            key_field = "key" if provider == "gemini" else "openrouter_key"
-            key_data[key_field] = encrypted_key
-            key_data["submitter_id"] = interaction.user.id
-            if provider == "gemini":
-                key_data["tier"] = tier
-            elif "tier" not in key_data:
-                key_data["tier"] = "free"
-            
-            self.cog.server_api_keys[guild_id_str] = key_data
-            submissions = self.cog.key_submissions.get(guild_id_str, [])
-            self.cog._save_server_api_key_shard(guild_id_str, key_data, submissions)
-            
-            msg = f"✅ Server Primary {provider.title()} key updated ({tier.title()} Tier)."
-
-        elif self.target_type == 'server_pool':
-            guild_id_str = str(self.guild_id)
-            submission = {
-                "submitter_id": interaction.user.id,
-                "encrypted_key": encrypted_key,
-                "provider": provider,
-                "status": "active",
-                "tier": tier,
-                "submitted_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
-            }
-            
-            current_subs = self.cog.key_submissions.get(guild_id_str, [])
-            new_subs = [s for s in current_subs if s['submitter_id'] != interaction.user.id]
-            new_subs.append(submission)
-            
-            self.cog.key_submissions[guild_id_str] = new_subs
-            self.cog._save_key_submissions_shard(guild_id_str, new_subs)
-            msg = f"✅ {provider.title()} key added to server pool ({tier.title()} Tier)."
-
-        if self.view: await self.view.update_display()
         await interaction.followup.send(msg, ephemeral=True)
+
+class OverrideConfirmView(ui.View):
+    def __init__(self, cog: 'GeminiAgent', user_id: int, slot_id: str, provider: str, new_scopes: List[str], parent_view: ui.View):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.user_id = user_id
+        self.slot_id = slot_id
+        self.provider = provider
+        self.new_scopes = new_scopes
+        self.parent_view = parent_view
+
+    @ui.button(label="Yes, Override", style=discord.ButtonStyle.danger)
+    async def confirm_override(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        user_data = self.cog._get_user_keys_data(self.user_id)
+        
+        if "personal" in self.new_scopes:
+            user_data.setdefault("personal_assignments", {})[self.provider] = self.slot_id
+        else:
+            if user_data.get("personal_assignments", {}).get(self.provider) == self.slot_id:
+                del user_data["personal_assignments"][self.provider]
+                
+        self.cog._save_user_keys_data(self.user_id, user_data)
+        
+        for scope in self.new_scopes:
+            if scope != "personal":
+                server_index = self.cog._get_server_index(scope)
+                server_index.setdefault("assigned_keys", {})[self.provider] = {"user_id": self.user_id, "slot": self.slot_id}
+                self.cog._save_server_index(scope, server_index)
+                self.cog.server_key_pointers[(int(scope), self.provider)] = (self.user_id, self.slot_id)
+                
+        for guild in self.cog.bot.guilds:
+            guild_id_str = str(guild.id)
+            if guild_id_str not in self.new_scopes:
+                server_index = self.cog._get_server_index(guild_id_str)
+                assigned = server_index.get("assigned_keys", {}).get(self.provider)
+                if assigned and assigned.get("user_id") == self.user_id and assigned.get("slot") == self.slot_id:
+                    del server_index["assigned_keys"][self.provider]
+                    self.cog._save_server_index(guild_id_str, server_index)
+                    self.cog.server_key_pointers.pop((guild.id, self.provider), None)
+
+        self.parent_view.setup_items()
+        await self.parent_view.update_display()
+        await interaction.edit_original_response(content="✅ Assignments saved successfully.", view=None)
+
+    @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_override(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.edit_message(content="❌ Assignment update cancelled.", view=None)
 
 class SettingsBaseView(ui.View):
     def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction, current_tab: str):
@@ -5436,16 +5406,14 @@ class SettingsHomeView(SettingsBaseView):
         super().__init__(cog, interaction, "home")
 
     async def update_display(self):
-        # Gather Stats
-        path = os.path.join(self.cog.USERS_DIR, str(self.user_id), "keys.json.gz")
-        u_data = self.cog._load_json_gzip(path)
-        u_tier = u_data.get("tier", "free").title() if u_data else "Free"
-
-        p_key_gemini = self.cog._get_api_key_for_user(self.user_id, "gemini")
-        p_key_or = self.cog._get_api_key_for_user(self.user_id, "openrouter")
+        user_data = self.cog._get_user_keys_data(self.user_id)
+        slots = user_data.get("slots", {})
         
-        stat_gemini = f"✅ **`Set ({u_tier} Tier)`**" if p_key_gemini else "❌ `Not Set`"
-        stat_or = f"✅ **`Set (Paid Tier)`**" if p_key_or else "❌ `Not Set`"
+        has_gem = any(s.get("provider") == "gemini" for s in slots.values())
+        has_or = any(s.get("provider") == "openrouter" for s in slots.values())
+        
+        stat_gemini = f"✅ **`Set`**" if has_gem else "❌ `Not Set`"
+        stat_or = f"✅ **`Set`**" if has_or else "❌ `Not Set`"
         
         if self.user_id == int(defaultConfig.DISCORD_OWNER_ID):
             child_bots = [b for b in self.cog.child_bots.values() if b['owner_id'] == self.user_id]
@@ -5454,130 +5422,236 @@ class SettingsHomeView(SettingsBaseView):
             bot_text = "Child Bots are restricted to the bot owner."
         
         primary_count = 0
-        pool_count = 0
-        for gid_str, key_data in self.cog.server_api_keys.items():
-            if isinstance(key_data, dict) and key_data.get('submitter_id') == self.user_id:
-                primary_count += 1
-        for submissions in self.cog.key_submissions.values():
-            for s in submissions:
-                if s.get('submitter_id') == self.user_id: pool_count += 1
+        for g in self.cog.bot.guilds:
+            idx = self.cog._get_server_index(str(g.id))
+            for assigned in idx.get("assigned_keys", {}).values():
+                if assigned.get("user_id") == self.user_id:
+                    primary_count += 1
+                    break
 
         embed = discord.Embed(title="MimicAI Control Panel", description="Manage your API keys and personal bots from one place.", color=discord.Color.dark_teal())
         embed.set_thumbnail(url="https://cdn.discordapp.com/emojis/1441750712160878643.gif")
         
-        embed.add_field(name="Personal API Keys", value=f"**Gemini:** {stat_gemini}\n**OpenRouter:** {stat_or}", inline=True)
+        embed.add_field(name="API Key Slots", value=f"**Google Gemini:** {stat_gemini}\n**OpenRouter:** {stat_or}", inline=True)
         embed.add_field(name="Child Bots", value=bot_text, inline=True)
-        embed.add_field(name="Server Contributions", value=f"Primary Key Owner: `{primary_count} servers`\nKey Pool Contributor: `{pool_count} servers`", inline=False)
+        embed.add_field(name="Server Contributions", value=f"Active Assignments: `{primary_count} servers`", inline=False)
         
         await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
 
 class SettingsAPIView(SettingsBaseView):
     def __init__(self, cog: 'GeminiAgent', interaction: discord.Interaction):
         super().__init__(cog, interaction, "api")
-        self.selected_server_id = None
-        self.current_page = 0
+        self.selected_slot = None
+        self.selected_scopes = set()
+        self.slots_config = [
+            ("google_key_1", "Google Gemini Key 1", "gemini"),
+            ("google_key_2", "Google Gemini Key 2", "gemini"),
+            ("openrouter_key_1", "OpenRouter Key 1", "openrouter"),
+            ("openrouter_key_2", "OpenRouter Key 2", "openrouter")
+        ]
+        self.admin_guilds = []
+        for g in self.cog.bot.guilds:
+            m = g.get_member(self.user_id)
+            if m and m.guild_permissions.administrator:
+                self.admin_guilds.append(g)
         self.setup_items()
 
     def setup_items(self):
         for item in self.children[:]:
             if item.row != 4: self.remove_item(item)
 
-        # Gather Servers
-        mutual_guilds = []
-        user = self.cog.bot.get_user(self.user_id)
-        if user:
-            for g in self.cog.bot.guilds:
-                if g.get_member(self.user_id):
-                    mutual_guilds.append(g)
-        
-        # We handle "Personal Keys" as a special case or the first option
-        # To simplify pagination logic, let's treat "Personal" as a static option 
-        # and paginate only the server list if needed.
-        
-        all_options = [discord.SelectOption(label="Personal Keys (Global Chat)", value="personal", default=(self.selected_server_id is None))]
-        for g in mutual_guilds:
-            all_options.append(discord.SelectOption(label=f"Server: {g.name}", value=str(g.id), default=(self.selected_server_id == g.id)))
+        user_data = self.cog._get_user_keys_data(self.user_id)
+        slots_data = user_data.get("slots", {})
 
-        # Pagination Logic
-        num_pages = (len(all_options) - 1) // DROPDOWN_MAX_OPTIONS + 1
-        if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
-        
-        start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_options = all_options[start : start + DROPDOWN_MAX_OPTIONS]
-        
-        select = ui.Select(placeholder="Select Context...", options=page_options, row=0)
-        select.callback = self.context_select
-        self.add_item(select)
+        # Row 0: Slot Selection
+        slot_options = []
+        for slot_id, label, provider in self.slots_config:
+            data = slots_data.get(slot_id)
+            if data:
+                tier = data.get("tier", "free").title()
+                desc = f"Set ({tier} Tier)"
+                emoji = "🟢" if provider == "gemini" else "🟣"
+            else:
+                desc = "Empty"
+                emoji = "⚪"
+            slot_options.append(discord.SelectOption(label=label, value=slot_id, description=desc, emoji=emoji, default=(self.selected_slot == slot_id)))
 
-        # Pagination Buttons (Row 1 - If Needed)
-        btn_start_row = 1
-        if num_pages > 1:
-            build_pagination_controls(self, self.current_page, num_pages, 1, self.prev_page, self.next_page)
-            btn_start_row = 2
+        slot_select = ui.Select(placeholder="Select an API Key Slot...", options=slot_options, row=0)
+        slot_select.callback = self.slot_select_callback
+        self.add_item(slot_select)
 
-        # Dynamic Action Buttons (Row 1 or 2)
-        if self.selected_server_id is None:
-            # Personal Mode
-            btn_edit = ui.Button(label="Edit Personal Key", style=discord.ButtonStyle.primary, row=btn_start_row)
-            btn_edit.callback = self.personal_edit
+        # Row 1: Scope Multi-Select
+        if self.selected_slot and self.selected_slot in slots_data:
+            provider = next(p for s, l, p in self.slots_config if s == self.selected_slot)
+            
+            current_assignments = []
+            if user_data.get("personal_assignments", {}).get(provider) == self.selected_slot:
+                current_assignments.append("personal")
+                
+            for g in self.admin_guilds:
+                idx = self.cog._get_server_index(str(g.id))
+                assigned = idx.get("assigned_keys", {}).get(provider)
+                if assigned and assigned.get("user_id") == self.user_id and assigned.get("slot") == self.selected_slot:
+                    current_assignments.append(str(g.id))
+            
+            self.selected_scopes = set(current_assignments)
+            
+            scope_options = [discord.SelectOption(label="Personal (Global Chat / DMs)", value="personal", default=("personal" in self.selected_scopes))]
+            for g in self.admin_guilds[:24]:
+                scope_options.append(discord.SelectOption(label=f"Server: {g.name}"[:100], value=str(g.id), default=(str(g.id) in self.selected_scopes)))
+                
+            if scope_options:
+                scope_select = ui.Select(placeholder="Assign this key to...", options=scope_options, min_values=0, max_values=len(scope_options), row=1)
+                scope_select.callback = self.scope_select_callback
+                self.add_item(scope_select)
+
+            # Row 2: Actions
+            btn_edit = ui.Button(label="Edit Key", style=discord.ButtonStyle.primary, row=2)
+            btn_edit.callback = self.edit_key_callback
             self.add_item(btn_edit)
-        else:
-            # Server Mode
-            guild = self.cog.bot.get_guild(self.selected_server_id)
-            if guild:
-                member = guild.get_member(self.user_id)
-                is_admin = member.guild_permissions.administrator if member else False
-                
-                if is_admin:
-                    btn_prim = ui.Button(label="Edit Primary Key", style=discord.ButtonStyle.primary, row=btn_start_row)
-                    btn_prim.callback = self.server_edit_primary
-                    self.add_item(btn_prim)
-                
-                btn_pool = ui.Button(label="Edit Pool Key", style=discord.ButtonStyle.secondary, row=btn_start_row)
-                btn_pool.callback = self.server_edit_pool
-                self.add_item(btn_pool)
+            
+            btn_del = ui.Button(label="Delete Key", style=discord.ButtonStyle.danger, row=2)
+            btn_del.callback = self.delete_key_callback
+            self.add_item(btn_del)
+            
+            btn_save = ui.Button(label="Save Assignments", style=discord.ButtonStyle.success, row=2)
+            btn_save.callback = self.save_assignments_callback
+            self.add_item(btn_save)
+        elif self.selected_slot:
+            btn_add = ui.Button(label="Submit Key", style=discord.ButtonStyle.success, row=2)
+            btn_add.callback = self.edit_key_callback
+            self.add_item(btn_add)
 
     async def update_display(self):
-        embed = discord.Embed(title="API Key Management", color=discord.Color.blue())
+        embed = discord.Embed(title="API Key Management", description="Manage your 4 API key slots and assign them to your Personal account or Servers you administrate.", color=discord.Color.blue())
         
-        if self.selected_server_id is None:
-            # Personal View
-            path = os.path.join(self.cog.USERS_DIR, str(self.user_id), "keys.json.gz")
-            u_data = self.cog._load_json_gzip(path)
-            u_tier = u_data.get("tier", "free").title() if u_data else "Free"
-
-            has_gem = bool(self.cog._get_api_key_for_user(self.user_id, "gemini"))
-            has_or = bool(self.cog._get_api_key_for_user(self.user_id, "openrouter"))
+        if self.selected_slot:
+            user_data = self.cog._get_user_keys_data(self.user_id)
+            slot_data = user_data.get("slots", {}).get(self.selected_slot)
+            label = next(l for s, l, p in self.slots_config if s == self.selected_slot)
             
-            embed.description = "Managing keys for **Global Chat** (DMs)."
-            embed.add_field(name="Status", value=f"**Google Gemini:** {'✅ **`Set ('+u_tier+' Tier)`**' if has_gem else '❌ `Not Set`'}\n**OpenRouter:** {'✅ **`Set (Paid Tier)`**' if has_or else '❌ `Not Set`'}", inline=False)
-        else:
-            # Server View
-            guild = self.cog.bot.get_guild(self.selected_server_id)
-            name = guild.name if guild else "Unknown"
-            embed.description = f"Managing keys for **{name}**."
-            
-            # Check Primary Key Status
-            pk_data = self.cog.server_api_keys.get(str(self.selected_server_id))
-            pk_tier = "Free"
-            if pk_data and isinstance(pk_data, dict):
-                has_gem_srv = bool(pk_data.get('key'))
-                has_or_srv = bool(pk_data.get('openrouter_key'))
-                pk_tier = pk_data.get("tier", "free").title()
+            if slot_data:
+                tier = slot_data.get("tier", "free").title()
+                embed.add_field(name=f"Slot: {label}", value=f"**Status:** ✅ Set\n**Tier:** `{tier}`", inline=False)
+                
+                provider = next(p for s, l, p in self.slots_config if s == self.selected_slot)
+                assignments = []
+                if user_data.get("personal_assignments", {}).get(provider) == self.selected_slot:
+                    assignments.append("Personal (Global Chat)")
+                for g in self.admin_guilds:
+                    idx = self.cog._get_server_index(str(g.id))
+                    assigned = idx.get("assigned_keys", {}).get(provider)
+                    if assigned and assigned.get("user_id") == self.user_id and assigned.get("slot") == self.selected_slot:
+                        assignments.append(f"Server: {g.name}")
+                
+                assign_str = "\n".join(f"- {a}" for a in assignments) if assignments else "None"
+                embed.add_field(name="Current Assignments", value=assign_str, inline=False)
             else:
-                has_gem_srv = False
-                has_or_srv = False
-            
-            pool = self.cog.key_submissions.get(str(self.selected_server_id), [])
-            user_in_pool = any(s['submitter_id'] == self.user_id for s in pool)
-            
-            embed.add_field(name="Primary Key Status", value=f"**Google Gemini:** {'✅ **`Set ('+pk_tier+' Tier)`**' if has_gem_srv else '❌ `Not Set`'}\n**OpenRouter:** {'✅ **`Set (Paid Tier)`**' if has_or_srv else '❌ `Not Set`'}", inline=False)
-            embed.add_field(name="Key Pool", value=f"**{len(pool)}** user-submitted keys active.", inline=False)
-            
-            if user_in_pool:
-                embed.set_footer(text="You have a key contributed to this server's pool.")
+                embed.add_field(name=f"Slot: {label}", value="**Status:** ❌ Empty\nClick 'Submit Key' to add a key to this slot.", inline=False)
+        else:
+            embed.add_field(name="Overview", value="Select a slot from the dropdown above to view or manage it.", inline=False)
 
         await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
+
+    async def slot_select_callback(self, interaction: discord.Interaction):
+        self.selected_slot = interaction.data['values'][0]
+        self.setup_items()
+        await interaction.response.defer()
+        await self.update_display()
+
+    async def scope_select_callback(self, interaction: discord.Interaction):
+        self.selected_scopes = set(interaction.data['values'])
+        await interaction.response.defer()
+
+    async def edit_key_callback(self, interaction: discord.Interaction):
+        provider = next(p for s, l, p in self.slots_config if s == self.selected_slot)
+        modal = SubmitAPIKeyModal(self.cog, self.selected_slot, provider, view=self)
+        await interaction.response.send_modal(modal)
+
+    async def delete_key_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        user_data = self.cog._get_user_keys_data(self.user_id)
+        provider = next(p for s, l, p in self.slots_config if s == self.selected_slot)
+        
+        if self.selected_slot in user_data.get("slots", {}):
+            del user_data["slots"][self.selected_slot]
+            
+        if user_data.get("personal_assignments", {}).get(provider) == self.selected_slot:
+            del user_data["personal_assignments"][provider]
+            
+        self.cog._save_user_keys_data(self.user_id, user_data)
+        self.cog.decrypted_key_cache.pop((self.user_id, self.selected_slot), None)
+        
+        for guild in self.cog.bot.guilds:
+            guild_id_str = str(guild.id)
+            server_index = self.cog._get_server_index(guild_id_str)
+            assigned = server_index.get("assigned_keys", {}).get(provider)
+            if assigned and assigned.get("user_id") == self.user_id and assigned.get("slot") == self.selected_slot:
+                del server_index["assigned_keys"][provider]
+                self.cog._save_server_index(guild_id_str, server_index)
+                self.cog.server_key_pointers.pop((guild.id, provider), None)
+                
+        self.setup_items()
+        await self.update_display()
+        await interaction.followup.send("✅ Key and all its assignments deleted.", ephemeral=True)
+
+    async def save_assignments_callback(self, interaction: discord.Interaction):
+        provider = next(p for s, l, p in self.slots_config if s == self.selected_slot)
+        user_data = self.cog._get_user_keys_data(self.user_id)
+        
+        conflicts = []
+        
+        if "personal" in self.selected_scopes:
+            curr_personal = user_data.get("personal_assignments", {}).get(provider)
+            if curr_personal and curr_personal != self.selected_slot:
+                conflicts.append(f"Personal Scope (Currently uses {curr_personal})")
+                
+        for scope in self.selected_scopes:
+            if scope != "personal":
+                server_index = self.cog._get_server_index(scope)
+                assigned = server_index.get("assigned_keys", {}).get(provider)
+                if assigned and (assigned.get("user_id") != self.user_id or assigned.get("slot") != self.selected_slot):
+                    guild = self.cog.bot.get_guild(int(scope))
+                    g_name = guild.name if guild else scope
+                    conflicts.append(f"Server: {g_name} (Currently assigned by another key/user)")
+                    
+        if conflicts:
+            conflict_str = "\n".join(f"- {c}" for c in conflicts)
+            msg = f"⚠️ **Key Assignment Override**\nAssigning this key will overwrite existing assignments for the following scopes:\n{conflict_str}\n\nDo you want to proceed?"
+            view = OverrideConfirmView(self.cog, self.user_id, self.selected_slot, provider, list(self.selected_scopes), self)
+            await interaction.response.send_message(msg, view=view, ephemeral=True)
+            return
+            
+        await interaction.response.defer(ephemeral=True)
+        
+        if "personal" in self.selected_scopes:
+            user_data.setdefault("personal_assignments", {})[provider] = self.selected_slot
+        else:
+            if user_data.get("personal_assignments", {}).get(provider) == self.selected_slot:
+                del user_data["personal_assignments"][provider]
+                
+        self.cog._save_user_keys_data(self.user_id, user_data)
+        
+        for scope in self.selected_scopes:
+            if scope != "personal":
+                server_index = self.cog._get_server_index(scope)
+                server_index.setdefault("assigned_keys", {})[provider] = {"user_id": self.user_id, "slot": self.selected_slot}
+                self.cog._save_server_index(scope, server_index)
+                self.cog.server_key_pointers[(int(scope), provider)] = (self.user_id, self.selected_slot)
+                
+        for guild in self.admin_guilds:
+            guild_id_str = str(guild.id)
+            if guild_id_str not in self.selected_scopes:
+                server_index = self.cog._get_server_index(guild_id_str)
+                assigned = server_index.get("assigned_keys", {}).get(provider)
+                if assigned and assigned.get("user_id") == self.user_id and assigned.get("slot") == self.selected_slot:
+                    del server_index["assigned_keys"][provider]
+                    self.cog._save_server_index(guild_id_str, server_index)
+                    self.cog.server_key_pointers.pop((guild.id, provider), None)
+
+        self.setup_items()
+        await self.update_display()
+        await interaction.followup.send("✅ Assignments saved successfully.", ephemeral=True)
 
     async def context_select(self, i: discord.Interaction):
         val = i.data['values'][0]
@@ -5604,10 +5678,6 @@ class SettingsAPIView(SettingsBaseView):
 
     async def server_edit_primary(self, i: discord.Interaction):
         modal = SubmitAPIKeyModal(self.cog, "server_primary", self.selected_server_id, view=self)
-        await i.response.send_modal(modal)
-
-    async def server_edit_pool(self, i: discord.Interaction):
-        modal = SubmitAPIKeyModal(self.cog, "server_pool", self.selected_server_id, view=self)
         await i.response.send_modal(modal)
 
 class SettingsChildBotView(SettingsBaseView):

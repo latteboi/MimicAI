@@ -3700,20 +3700,29 @@ class ServicesMixin:
                             'custom_emoji': PLACEHOLDER_EMOJI
                         }
                         
-                        text_response, state_container = await self._generate_with_heartbeat(
-                            text_model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type=state_container['message_type']
-                        )
+                        text_failure_reason = None
+                        try:
+                            text_response, state_container = await self._generate_with_heartbeat(
+                                text_model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type=state_container['message_type']
+                            )
+                        except Exception as e:
+                            if 'state_container' in locals() and state_container and state_container.get('sending_task'):
+                                state_container['sending_task'].cancel()
+                            text_response = None
+                            text_failure_reason = self._format_api_error(e)
                         
                         response_text = "Here is the image you requested."
                         was_blocked = False
                         if not text_response or not text_response.candidates:
-                            reason = "Safety Filter"
+                            reason = "Unknown Error"
                             if text_response and text_response.prompt_feedback and text_response.prompt_feedback.block_reason:
                                 reason = text_response.prompt_feedback.block_reason.name.replace('_', ' ').title()
+                            elif text_failure_reason:
+                                reason = text_failure_reason
                             
                             custom_main = profile_settings.get("error_response", ERR_GENERAL_ERROR)
                             response_text = custom_main
-                            turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=reason))
+                            turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=reason) if "Safety" in reason else WARN_MAIN_MODEL_FAILED.format(reason=reason))
                             was_blocked = True
                         elif text_response.candidates[0].finish_reason.name == 'STOP':
                             raw_text = getattr(text_response, 'text', "")
@@ -3869,7 +3878,7 @@ class ServicesMixin:
             except Exception as e:
                 print(f"Error in image finisher worker: {e}"); traceback.print_exc()
                 # Ensure typing is stopped on error for child bots
-                if package.get("is_child_bot"):
+                if 'package' in locals() and package and package.get("is_child_bot"):
                     try:
                         await self.manager_queue.put({
                             "action": "send_to_child", "bot_id": package['bot_id'],
@@ -3877,6 +3886,12 @@ class ServicesMixin:
                         })
                     except Exception as e_stop:
                         print(f"Failed to send stop_typing on error: {e_stop}")
+                if 'placeholder_message' in locals() and placeholder_message:
+                    try:
+                        await placeholder_message.delete()
+                    except: pass
+                if 'state_container' in locals() and state_container and state_container.get('sending_task'):
+                    state_container['sending_task'].cancel()
 
     async def _image_gen_worker(self, worker_id: int):
         """Pre-fetches image generation for text-only prompts."""
@@ -4878,25 +4893,22 @@ class ServicesMixin:
         if cleaned_shares > 0:
             log.append(f"🧹 Removed {cleaned_shares} stale or broken profile share requests.")
 
-        # --- 3. Stale Key Submissions ---
-        cleaned_keys = 0
-        keys_changed = False
-        for guild_id_str, submissions in list(self.key_submissions.items()):
-            guild = self.bot.get_guild(int(guild_id_str))
-            if not guild:
-                cleaned_keys += len(self.key_submissions.pop(guild_id_str, []))
-                keys_changed = True
-                continue
-
-            original_len = len(submissions)
-            self.key_submissions[guild_id_str] = [s for s in submissions if guild.get_member(s.get("submitter_id"))]
-            if len(self.key_submissions[guild_id_str]) < original_len:
-                cleaned_keys += original_len - len(self.key_submissions[guild_id_str])
-                keys_changed = True
-        if keys_changed:
-            self._save_key_submissions()
-        if cleaned_keys > 0:
-            log.append(f"🧹 Removed {cleaned_keys} stale API key submissions.")
+        # --- 3. Orphaned Server Pointers ---
+        cleaned_pointers = 0
+        for g in self.bot.guilds:
+            idx = self._get_server_index(str(g.id))
+            changed = False
+            for prov in list(idx.get("assigned_keys", {}).keys()):
+                uid = idx["assigned_keys"][prov].get("user_id")
+                if uid and str(uid) not in all_bot_member_ids:
+                    del idx["assigned_keys"][prov]
+                    self.server_key_pointers.pop((g.id, prov), None)
+                    changed = True
+                    cleaned_pointers += 1
+            if changed:
+                self._save_server_index(str(g.id), idx)
+        if cleaned_pointers > 0:
+            log.append(f"🧹 Removed {cleaned_pointers} orphaned server key assignments.")
 
         # --- 4. Orphaned Channel Webhooks ---
         cleaned_webhooks = 0
@@ -7072,14 +7084,9 @@ class ServicesMixin:
 
                 await do_update(sending_text)
 
-                # Loop to tick exactly on every 10s interval
+                # Fixed 10-second heartbeat loop
                 while True:
-                    elapsed = time.monotonic() - start_time_mono
-                    next_tick = ((int(elapsed) // 10) + 1) * 10
-                    sleep_time = next_tick - elapsed
-                    
-                    if sleep_time > 0:
-                        await asyncio.sleep(sleep_time)
+                    await asyncio.sleep(10)
                         
                     elapsed = time.monotonic() - start_time_mono
                     mins = int(elapsed) // 60

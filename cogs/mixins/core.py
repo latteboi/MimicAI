@@ -493,7 +493,7 @@ class CoreMixin:
             self.purged_message_ids.discard(deleted_message_id)
             return
         
-        # 1. Check Global Chat Sessions (DMs)
+        # 1. Check Global Chat Sessions
         if not payload.guild_id:
             channel = self.bot.get_channel(payload.channel_id)
             user_id = None
@@ -1870,22 +1870,18 @@ class CoreMixin:
         if pids_to_unpublish:
             self._save_public_index()
             
-        # 3. Scrub from Server Key Pools & Primary Keys
-        keys_changed = False
-        for guild_id_str, submissions in list(self.key_submissions.items()):
-            original_len = len(submissions)
-            self.key_submissions[guild_id_str] = [s for s in submissions if str(s.get("submitter_id")) != user_id_str]
-            if len(self.key_submissions[guild_id_str]) < original_len:
-                keys_changed = True
+        # 3. Scrub from Server Pointers
+        for g in self.bot.guilds:
+            idx = self._get_server_index(str(g.id))
+            changed = False
+            for prov in list(idx.get("assigned_keys", {}).keys()):
+                if idx["assigned_keys"][prov].get("user_id") == user_id:
+                    del idx["assigned_keys"][prov]
+                    self.server_key_pointers.pop((g.id, prov), None)
+                    changed = True
+            if changed:
+                self._save_server_index(str(g.id), idx)
                 
-        for guild_id_str, primary_data in list(self.server_api_keys.items()):
-            if isinstance(primary_data, dict) and str(primary_data.get("submitter_id")) == user_id_str:
-                self.server_api_keys.pop(guild_id_str, None)
-                keys_changed = True
-                
-        if keys_changed:
-            self._save_key_submissions()
-            
         # 4. Delete Core User Directory
         import shutil
         user_dir = os.path.join(self.USERS_DIR, user_id_str)
@@ -1896,7 +1892,10 @@ class CoreMixin:
         self.user_indices.pop(user_id_str, None)
         self.user_appearances.pop(user_id_str, None)
         self.profile_shares.pop(user_id_str, None)
-        self.personal_api_keys.pop(user_id_str, None)
+        
+        keys_to_del_cache = [k for k in self.decrypted_key_cache.keys() if k[0] == user_id]
+        for k in keys_to_del_cache:
+            self.decrypted_key_cache.pop(k, None)
         
         # 6. Cancel/Delete active global chat sessions
         keys_to_del = [k for k in self.global_chat_sessions.keys() if isinstance(k, tuple) and len(k) == 3 and k[0] == 'global' and k[1] == user_id]
@@ -2536,11 +2535,12 @@ class CoreMixin:
         embed = discord.Embed(title=f"Server Management Dashboard for {guild.name}", color=discord.Color.dark_red())
 
         # API Key Status
-        primary_key_status = "SET" if str(guild.id) in self.server_api_keys else "NOT SET"
-        user_keys = self.key_submissions.get(str(guild.id), [])
-        active_keys = sum(1 for k in user_keys if k.get("status") == "active")
-        pending_keys = sum(1 for k in user_keys if k.get("status") == "pending")
-        api_key_value = f"**Primary Key:** {primary_key_status}\n**User Key Pool:** {active_keys} Active / {pending_keys} Pending"
+        idx = self._get_server_index(str(guild.id))
+        assigned = idx.get("assigned_keys", {})
+        gem_status = "SET" if "gemini" in assigned else "NOT SET"
+        or_status = "SET" if "openrouter" in assigned else "NOT SET"
+        
+        api_key_value = f"**Google Gemini:** {gem_status}\n**OpenRouter:** {or_status}"
         embed.add_field(name="🔑 API Key Status", value=api_key_value, inline=False)
 
         # Global Feature Toggles
@@ -2743,18 +2743,13 @@ class CoreMixin:
         return True
     
     async def _has_api_key_access(self, user_id: int, guild_id: Optional[int] = None) -> bool:
-        # 1. Check for cached personal key flag
-        index = self._get_user_index(user_id)
-        if index.get("has_personal_key", False):
+        keys_data = self._get_user_keys_data(user_id)
+        if keys_data.get("slots"): 
             return True
         
-        # Fallback direct check just in case index is out of sync
-        if self._get_api_key_for_user(user_id, "gemini") or self._get_api_key_for_user(user_id, "openrouter"):
-            return True
-        
-        # 2. Check localized guild context
         if guild_id:
-            if self._get_api_key_for_guild(guild_id, "gemini") or self._get_api_key_for_guild(guild_id, "openrouter"):
+            idx = self._get_server_index(str(guild_id))
+            if idx.get("assigned_keys"): 
                 return True
         
         return False

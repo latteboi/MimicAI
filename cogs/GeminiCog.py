@@ -105,8 +105,8 @@ class GeminiAgent(commands.Cog, StorageMixin, ServicesMixin, CoreMixin, HelpMixi
         self._load_server_api_keys()
         self.personal_api_keys: Dict[str, str] = {}
         self._load_personal_api_keys()
-        self.key_submissions: Dict[str, List[Dict[str, Any]]] = {}
-        self._load_key_submissions()
+        self.decrypted_key_cache: LRUCache = LRUCache(max_size=100)
+        self.server_key_pointers: LRUCache = LRUCache(max_size=200)
         self.profile_shares: Dict[str, List[Dict[str, Any]]] = {}
         self._load_profile_shares()
         self.public_profiles: Dict[str, Dict[str, Any]] = {}
