@@ -1253,29 +1253,7 @@ class SessionConfigView(ui.View):
                                 if len(self.session['profiles']) >= 200: break
                                 self.session['profiles'].append({"owner_id": self.original_interaction.user.id, "profile_name": val, "method": "webhook", "chance": 100, "wakewords": []})
                 
-                self.cog.session_manager._save_multi_profile_sessions()
-                await i.response.defer(); await self.update_display()
-            sel.callback = cast_cb
-            self.add_item(sel)
-
-            source_btn = ui.Button(label=f"Source: {self.view_source.title().replace('_', ' ')}", style=discord.ButtonStyle.blurple, row=1)
-            async def src_cb(i): 
-                cycle = ['personal', 'borrowed', 'child_bot']
-                self.view_source = cycle[(cycle.index(self.view_source) + 1) % 3]
-                self.current_page = 0
-                await i.response.defer(); await self.update_display()
-            source_btn.callback = src_cb
-            self.add_item(source_btn)
-
-            if num_pages > 1:
-                async def p_cb(i): self.current_page -= 1; await i.response.defer(); await self.update_display()
-                async def n_cb(i): self.current_page += 1; await i.response.defer(); await self.update_display()
-                build_pagination_controls(self, self.current_page, num_pages, 1, p_cb, n_cb)
-
-            # [NEW] Apply Cast Changes Button
-            apply_btn = ui.Button(label="Apply Cast Changes", style=discord.ButtonStyle.success, row=2)
-            async def apply_cb(i: discord.Interaction):
-                # Sync chat_sessions dynamically
+                # [NEW] Sync chat_sessions dynamically immediately upon selection
                 existing_keys = set(self.session.get("chat_sessions", {}).keys())
                 new_keys = { (p['owner_id'], p['profile_name']) for p in self.session.get('profiles', []) }
                 
@@ -1293,18 +1271,31 @@ class SessionConfigView(ui.View):
                     
                 self.cog.session_manager._save_multi_profile_sessions()
                 
-                # Dispatch child bot presence updates
+                # [NEW] Dispatch child bot presence updates
                 for p_data in self.session.get('profiles', []):
                     if p_data.get('method') == 'child_bot':
                         await self.cog.manager_queue.put({
                             "action": "send_to_child", "bot_id": p_data['bot_id'],
                             "payload": {"action": "session_update_add", "channel_id": self.original_interaction.channel_id}
                         })
-                        
-                await i.response.send_message("✅ Cast changes applied successfully.", ephemeral=True)
-                await self.update_display()
-            apply_btn.callback = apply_cb
-            self.add_item(apply_btn)
+
+                await i.response.defer(); await self.update_display()
+            sel.callback = cast_cb
+            self.add_item(sel)
+
+            source_btn = ui.Button(label=f"Source: {self.view_source.title().replace('_', ' ')}", style=discord.ButtonStyle.blurple, row=1)
+            async def src_cb(i): 
+                cycle = ['personal', 'borrowed', 'child_bot']
+                self.view_source = cycle[(cycle.index(self.view_source) + 1) % 3]
+                self.current_page = 0
+                await i.response.defer(); await self.update_display()
+            source_btn.callback = src_cb
+            self.add_item(source_btn)
+
+            if num_pages > 1:
+                async def p_cb(i): self.current_page -= 1; await i.response.defer(); await self.update_display()
+                async def n_cb(i): self.current_page += 1; await i.response.defer(); await self.update_display()
+                build_pagination_controls(self, self.current_page, num_pages, 1, p_cb, n_cb)
 
             profiles = self.session.get('profiles', [])
             total_active = len(profiles)
