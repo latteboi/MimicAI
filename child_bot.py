@@ -47,31 +47,6 @@ class HiveMind:
         self.typing_tasks = {} # { (bot_id, channel_id): asyncio.Task }
         self.pending_toggles = {}
 
-    async def execute_typing(self, bot_id, payload):
-        bot = self.clients.get(bot_id)
-        if not bot or not bot.is_ready(): return
-        
-        channel_id = payload.get("channel_id")
-        task_key = (bot_id, channel_id)
-        
-        if task_key in self.typing_tasks: return
-
-        async def typing_loop():
-            try:
-                channel = await bot.fetch_channel(channel_id)
-                if not channel: return
-                while True:
-                    # Triggering typing() context manager or raw call
-                    # raw call lasts ~10 seconds. We refresh every 8.
-                    await channel.typing()
-                    await asyncio.sleep(8)
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                print(f"[Hive] Typing loop error for {bot_id}: {e}")
-
-        self.typing_tasks[task_key] = asyncio.create_task(typing_loop())
-
     async def launch_bot(self, bot_id, token, parent_id, parent_name="MimicAI", owner_id=None, profile_name=None, profile_id=None, presence=None):
         if bot_id in self.clients: return
 

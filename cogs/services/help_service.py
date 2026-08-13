@@ -1,13 +1,62 @@
 import os
 import asyncio
-from typing import Optional, List, Dict
+from typing import Optional
+
 from google import genai
 from google.genai import types
 
-from .constants import DOCS_DIR, defaultConfig, DEFAULT_HELP_MODE_INJECTION
-from .storage import cosine_similarity, encode_embedding_b64, decode_embedding_b64
+from ..utils.constants import defaultConfig, DOCS_DIR, DEFAULT_HELP_MODE_INJECTION
+from ..managers.memory_manager import encode_embedding_b64, decode_embedding_b64
 
-class HelpMixin:
+
+class HelpService:
+    """Owns RAG guide-vector generation and search for /help and documentation lookups.
+
+    Holds a back-reference to the parent cog for shared instance caches and cross-manager lookups,
+    per the transitional Dependency Injection pattern in CLAUDE.md.
+    """
+
+    def __init__(self, cog):
+        self.cog = cog
+
+    async def _ensure_guide_vectors(self, guild_id: Optional[int]):
+        if hasattr(self.cog, 'guide_vectors') and self.cog.guide_vectors:
+            return
+            
+        api_key = None
+        if guild_id:
+            api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id)
+        if not api_key:
+            owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+            api_key = self.cog.storage_manager._get_api_key_for_user(owner_id, "gemini")
+        
+        if not api_key: return
+        
+        try:
+            from ..utils.content import DOC_CATEGORIES, HELP_CATEGORIES
+            chunks = []
+            for d in [DOC_CATEGORIES, HELP_CATEGORIES]:
+                for cat, pages in d.items():
+                    for page, text in pages.items():
+                        chunks.append(f"[{cat} - {page}]\n{text}")
+            
+            client = genai.Client(api_key=api_key)
+            self.cog.guide_vectors = []
+            for chunk in chunks:
+                try:
+                    result = await asyncio.wait_for(
+                        client.aio.models.embed_content(
+                            model='gemini-embedding-001',
+                            contents=chunk,
+                            config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT", output_dimensionality=256)
+                        ), timeout=5.0)
+                    emb = result.embeddings[0].values
+                    self.cog.guide_vectors.append({"text": chunk, "emb": emb})
+                except Exception as e:
+                    print(f"Guide embedding failed: {e}")
+        except Exception as e:
+            print(f"Failed to generate guide vectors overall: {e}")
+
     
     def _ensure_docs_directory(self):
         """Creates the documentation directory structure and writes default shards if missing."""
@@ -20,46 +69,57 @@ class HelpMixin:
 
     async def _load_and_embed_docs(self):
         """Reads all .txt shards, tags them semantically, and builds the vector database."""
-        self._ensure_docs_directory()
-        self.doc_vectors = []
-        
         cache_path = os.path.join(DOCS_DIR, "embedded_docs_cache.json.gz")
-        if os.path.exists(cache_path):
-            try:
-                cached_data = self._load_json_gzip(cache_path, encrypted=False)
-                if cached_data and isinstance(cached_data, list):
-                    for item in cached_data:
-                        item["emb"] = decode_embedding_b64(item["emb_b64"])
-                    self.doc_vectors = cached_data
-                    print(f"Loaded {len(self.doc_vectors)} embedded documentation shards from local cache.")
-                    return
-            except Exception as e:
-                print(f"Failed to load documentation vectors from cache: {e}")
 
-        api_key = self._get_api_key_for_user(int(defaultConfig.DISCORD_OWNER_ID), "gemini")
+        def _sync_ensure_and_load_cache():
+            self._ensure_docs_directory()
+            if os.path.exists(cache_path):
+                try:
+                    cached_data = self.cog.storage_manager._load_json_gzip(cache_path, encrypted=False)
+                    if cached_data and isinstance(cached_data, list):
+                        for item in cached_data:
+                            item["emb"] = decode_embedding_b64(item["emb_b64"])
+                        return cached_data
+                except Exception as e:
+                    print(f"Failed to load documentation vectors from cache: {e}")
+            return None
+
+        cached_data = await asyncio.to_thread(_sync_ensure_and_load_cache)
+        if cached_data is not None:
+            self.cog.doc_vectors = cached_data
+            print(f"Loaded {len(self.cog.doc_vectors)} embedded documentation shards from local cache.")
+            return
+
+        self.cog.doc_vectors = []
+
+        api_key = self.cog.storage_manager._get_api_key_for_user(int(defaultConfig.DISCORD_OWNER_ID), "gemini")
         if not api_key:
             print("Warning: No Bot Owner Google API Key found. Skipping documentation vector generation.")
             return
 
         client = genai.Client(api_key=api_key)
-        chunks = []
 
-        for root, dirs, files in os.walk(DOCS_DIR):
-            for file in files:
-                if file.endswith(".txt"):
-                    filepath = os.path.join(root, file)
-                    category = os.path.basename(root).replace("_", " ").title()
-                    doc_name = file.replace(".txt", "").replace("_", " ").title()
-                    
-                    try:
-                        with open(filepath, "r", encoding="utf-8") as f:
-                            content = f.read().strip()
-                            if content:
-                                # Prepend semantic tags based on file architecture
-                                tagged_content = f"[Category: {category} - {doc_name}]\n{content}"
-                                chunks.append(tagged_content)
-                    except Exception as e:
-                        print(f"Failed to read documentation file {filepath}: {e}")
+        def _sync_walk_docs():
+            chunks = []
+            for root, dirs, files in os.walk(DOCS_DIR):
+                for file in files:
+                    if file.endswith(".txt"):
+                        filepath = os.path.join(root, file)
+                        category = os.path.basename(root).replace("_", " ").title()
+                        doc_name = file.replace(".txt", "").replace("_", " ").title()
+
+                        try:
+                            with open(filepath, "r", encoding="utf-8") as f:
+                                content = f.read().strip()
+                                if content:
+                                    # Prepend semantic tags based on file architecture
+                                    tagged_content = f"[Category: {category} - {doc_name}]\n{content}"
+                                    chunks.append(tagged_content)
+                        except Exception as e:
+                            print(f"Failed to read documentation file {filepath}: {e}")
+            return chunks
+
+        chunks = await asyncio.to_thread(_sync_walk_docs)
 
         cache_to_save = []
         for chunk in chunks:
@@ -72,40 +132,40 @@ class HelpMixin:
                     ), timeout=5.0)
                 emb = result.embeddings[0].values
                 b64_emb = encode_embedding_b64(emb)
-                self.doc_vectors.append({"text": chunk, "emb": emb, "emb_b64": b64_emb})
+                self.cog.doc_vectors.append({"text": chunk, "emb": emb, "emb_b64": b64_emb})
                 cache_to_save.append({"text": chunk, "emb_b64": b64_emb})
             except Exception as e:
                 print(f"Failed to embed documentation chunk: {e}")
 
         if cache_to_save:
             try:
-                self._atomic_json_save_gzip(cache_to_save, cache_path, encrypted=False)
+                await asyncio.to_thread(self.cog.storage_manager._atomic_json_save_gzip, cache_to_save, cache_path, encrypted=False)
             except Exception as e:
                 print(f"Failed to save documentation embedding cache: {e}")
 
-        print(f"Loaded and embedded {len(self.doc_vectors)} documentation shards.")
+        print(f"Loaded and embedded {len(self.cog.doc_vectors)} documentation shards.")
 
     async def _get_relevant_help_context(self, query: str, guild_id: Optional[int], force_always_respond: bool = False) -> Optional[str]:
         """Performs vector search and returns a strict Protocol Override XML block."""
-        if not hasattr(self, 'doc_vectors') or not self.doc_vectors:
+        if not hasattr(self.cog, 'doc_vectors') or not self.cog.doc_vectors:
             if force_always_respond:
                 docs = "No relevant documentation found."
-                template = self.global_prompts.get("HELP_MODE_INJECTION", DEFAULT_HELP_MODE_INJECTION)
+                template = self.cog.global_prompts.get("HELP_MODE_INJECTION", DEFAULT_HELP_MODE_INJECTION)
                 return template.replace("{docs}", docs)
             return None
             
-        emb = await self._get_embedding(query, guild_id if guild_id else 0, "RETRIEVAL_QUERY")
+        emb = await self.cog.memory_manager._get_embedding(query, guild_id if guild_id else 0, "RETRIEVAL_QUERY")
         if not emb:
             if force_always_respond:
                 docs = "No relevant documentation found."
-                template = self.global_prompts.get("HELP_MODE_INJECTION", DEFAULT_HELP_MODE_INJECTION)
+                template = self.cog.global_prompts.get("HELP_MODE_INJECTION", DEFAULT_HELP_MODE_INJECTION)
                 return template.replace("{docs}", docs)
             return None
             
         import numpy as np
         
         # Vectorized Cosine Similarity for Help Docs
-        doc_embs = np.array([doc["emb"] for doc in self.doc_vectors], dtype=np.float32)
+        doc_embs = np.array([doc["emb"] for doc in self.cog.doc_vectors], dtype=np.float32)
         prompt_vec = np.array(emb, dtype=np.float32)
         
         emb_norms = np.linalg.norm(doc_embs, axis=1)
@@ -116,7 +176,7 @@ class HelpMixin:
         
         similarities = np.dot(doc_embs, prompt_vec) / (emb_norms * prompt_norm)
         
-        sims = [{"text": doc["text"], "sim": float(similarities[i])} for i, doc in enumerate(self.doc_vectors)]
+        sims = [{"text": doc["text"], "sim": float(similarities[i])} for i, doc in enumerate(self.cog.doc_vectors)]
         sims.sort(key=lambda x: x["sim"], reverse=True)
         
         # High relevance threshold ensures we only answer actual technical questions
@@ -129,12 +189,10 @@ class HelpMixin:
         else:
             return None # Return None to let standard roleplay characters continue standard chat
             
-        template = self.global_prompts.get("HELP_MODE_INJECTION", DEFAULT_HELP_MODE_INJECTION)
+        template = self.cog.global_prompts.get("HELP_MODE_INJECTION", DEFAULT_HELP_MODE_INJECTION)
         # String replacement used instead of .format() to prevent KeyError if documentation contains curly braces
         protocol_block = template.replace("{docs}", docs)
         return protocol_block
-            
-        return None
 
 # --- Default Help Document Shards ---
 DEFAULT_HELP_DOCS = {

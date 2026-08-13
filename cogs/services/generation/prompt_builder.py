@@ -1,0 +1,199 @@
+import re
+import datetime
+import discord
+from zoneinfo import ZoneInfo
+from typing import Optional, Dict, List, Tuple
+
+from ...utils.constants import (
+    defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
+    DEFAULT_SYSTEM_INSTRUCTION, DEFAULT_CONTEXT_RULES, DEFAULT_NEURO_INSTRUCTION,
+    DEFAULT_TRAINING_DATA_INJECTION,
+)
+from ...utils.helpers import Timeout
+
+
+class PromptBuilderMixin:
+    """Persona/system-instruction assembly and the neuro-state extraction that
+    reads the model's <neuro_update> block back out of its response text.
+    """
+
+    def _resolve_appearance_data(self, owner_id: int, profile_name: str) -> Tuple[str, str]:
+        app = self.cog.profile_manager._get_user_appearance(owner_id, profile_name)
+        display_name = app.get("custom_display_name") or profile_name
+        avatar_url = app.get("custom_avatar_url") or (self.cog.bot.user.display_avatar.url if self.cog.bot.user else "")
+        return display_name, avatar_url
+
+    async def _send_session_warning(self, channel: discord.abc.Messageable, message: str):
+        if not channel: return
+        try:
+            await channel.send(f"⚠️ **Session Notice:** {message}", delete_after=10)
+        except Exception:
+            pass
+
+    def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None) -> Tuple[str, bool, bool, float, float, int, str, str]:
+        persona_data: Dict[str, List[str]] = {}
+        ai_instr_str: str = ""
+        grounding_enabled = False
+        temperature = defaultConfig.GEMINI_TEMPERATURE
+        top_p = defaultConfig.GEMINI_TOP_P
+        top_k = defaultConfig.GEMINI_TOP_K
+        primary_model = PRIMARY_MODEL_NAME
+        fallback_model = FALLBACK_MODEL_NAME
+        time_tracking_enabled = False
+        timezone_str = "UTC"
+        neuro_enabled = False
+        neuro_state = {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20}
+
+        if profile_owner_id is not None:
+            user_index = self.cog.profile_manager._get_user_index(profile_owner_id)
+            is_borrowed = profile_name_to_use in user_index.get("borrowed",[])
+            profile_data = self.cog.profile_manager._get_profile_config(profile_owner_id, profile_name_to_use, is_borrowed) or {}
+
+            persona_data, ai_instr_str, grounding_enabled, temperature, top_p, top_k, _, _, primary_model, fallback_model = self.cog.session_manager._get_user_profile_for_model(profile_owner_id, channel_id, profile_name_to_use)
+
+        if profile_data:
+            time_tracking_enabled = profile_data.get("time_tracking_enabled", False)
+            timezone_str = profile_data.get("timezone", "UTC")
+            neuro_enabled = profile_data.get("neuro_engine_enabled", False)
+            neuro_state = profile_data.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
+
+        final_instr_parts =[]
+
+        if is_multi_profile:
+            session = self.cog.multi_profile_channels.get(channel_id)
+            if session and session.get("session_prompt"):
+                final_instr_parts.append(f"<scene_prompt>\n{session['session_prompt']}\n</scene_prompt>")
+
+        if neuro_enabled:
+            neuro_block = self.cog.global_prompts.get("NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION).format(
+                d=neuro_state.get('dopamine', 50),
+                c=neuro_state.get('cortisol', 20),
+                o=neuro_state.get('oxytocin', 50),
+                a=neuro_state.get('adrenaline', 20)
+            )
+            final_instr_parts.append(neuro_block)
+
+        if time_tracking_enabled:
+            try:
+                tz = ZoneInfo(timezone_str)
+                now = datetime.datetime.now(tz)
+                time_str = now.strftime("%A, %d %B %Y, %I:%M %p (%Z)")
+                final_instr_parts.append(f"<time_context>\nYour current time is {time_str}.\n</time_context>")
+            except Exception as e:
+                print(f"Error processing timezone '{timezone_str}': {e}. Defaulting to UTC.")
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+                time_str_utc = now_utc.strftime("%A, %d %B %Y, %I:%M %p (UTC)")
+                final_instr_parts.append(f"<time_context>\nYour current time is {time_str_utc}.\n</time_context>")
+
+        if persona_data and any(persona_data.values()):
+            persona_blocks = []
+            for key in self.cog.persona_modal_sections_order:
+                if lines := persona_data.get(key,[]):
+                    decrypted_lines = [self.cog.storage_manager._decrypt_data(line).strip() for line in lines if line.strip()]
+                    if any(l.strip() for l in decrypted_lines):
+                        block_content = "\n".join(decrypted_lines)
+                        persona_blocks.append(f"<{key}>\n{block_content}\n</{key}>")
+
+            if persona_blocks:
+                persona_str = "<persona_profile>\n" + "\n\n".join(persona_blocks) + "\n</persona_profile>"
+                final_instr_parts.append(persona_str)
+
+        current_instructions_str = "\n\n".join(final_instr_parts).strip()
+
+        decrypted_parts = []
+        if isinstance(ai_instr_str, list):
+            for part in ai_instr_str:
+                dec = self.cog.storage_manager._decrypt_data(part)
+                if dec.strip():
+                    cleaned_part = "\n".join([line.strip() for line in dec.split("\n")])
+                    decrypted_parts.append(cleaned_part)
+        elif isinstance(ai_instr_str, str):
+            dec = self.cog.storage_manager._decrypt_data(ai_instr_str)
+            if dec.strip():
+                cleaned_part = "\n".join([line.strip() for line in dec.split("\n")])
+                decrypted_parts.append(cleaned_part)
+
+        if decrypted_parts:
+            if current_instructions_str: current_instructions_str += "\n\n"
+            current_instructions_str += "<instructions>\n"
+            current_instructions_str += "\n\n".join(decrypted_parts).strip()
+            current_instructions_str += "\n</instructions>"
+
+        if training_examples_list:
+            examples_block = "\n---\n".join(training_examples_list)
+            training_prompt = self.cog.global_prompts.get("TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION).format(examples_block=examples_block)
+            current_instructions_str += "\n\n" + training_prompt
+
+        if recalled_ltm:
+            current_instructions_str += f"\n\n{recalled_ltm}"
+
+        if critic_constraints:
+            current_instructions_str += f"\n\n<negative_constraints>\nSTRICT ADHERENCE REQUIRED:\n{critic_constraints}\n</negative_constraints>"
+
+        rule_block = self.cog.global_prompts.get("CONTEXT_RULES", DEFAULT_CONTEXT_RULES)
+
+        # [NEW] Dynamically inject the profile's ID into the context rules
+        profile_id_val = self.cog.profile_manager._get_profile_id(profile_owner_id, profile_name_to_use)
+        rule_block = rule_block.format(profile_id_placeholder=profile_id_val)
+
+        current_instructions_str += "\n\n" + rule_block.strip()
+
+        final_system_instruction = current_instructions_str if current_instructions_str.strip() else DEFAULT_SYSTEM_INSTRUCTION
+        return final_system_instruction, False, grounding_enabled, temperature, top_p, top_k, primary_model, fallback_model
+
+    def _extract_and_apply_neuro_state(self, raw_text: str, owner_id: int, profile_name: str) -> Tuple[str, Optional[Dict[str, int]]]:
+        xml_pattern = r'<neuro_update>\s*(.*?)\s*</neuro_update>'
+        data_str = None
+        clean_text = raw_text
+
+        try:
+            with Timeout(seconds=1, error_message="Neuro extraction timed out"):
+                match = re.search(xml_pattern, raw_text, flags=re.IGNORECASE | re.DOTALL)
+                if match:
+                    data_str = match.group(1)
+                    clean_text = re.sub(xml_pattern, '', raw_text, flags=re.IGNORECASE | re.DOTALL)
+                else:
+                    relaxed_pattern = r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})'
+                    match = re.search(relaxed_pattern, raw_text, flags=re.IGNORECASE)
+                    if match:
+                        data_str = match.group(0)
+                        clean_text = re.sub(relaxed_pattern, '', raw_text, flags=re.IGNORECASE)
+        except TimeoutError:
+            return raw_text.strip(), None
+
+        if not data_str:
+            return raw_text.strip(), None
+
+        new_state = {}
+        # Normalise separators for splitting
+        normalised_data = data_str.replace('|', ':').replace(' ', '')
+        kv_pairs = normalised_data.split(':')
+
+        # Iterating pairs (K, V)
+        for i in range(0, len(kv_pairs) - 1, 2):
+            k = kv_pairs[i].strip().upper()
+            try:
+                v = int(kv_pairs[i+1].strip())
+                v = max(0, min(100, v))
+                if k == 'D': new_state['dopamine'] = v
+                elif k == 'C': new_state['cortisol'] = v
+                elif k == 'O': new_state['oxytocin'] = v
+                elif k == 'A': new_state['adrenaline'] = v
+            except (ValueError, IndexError):
+                continue
+
+        clean_text = clean_text.strip()
+        final_state = None
+        if new_state:
+            index = self.cog.profile_manager._get_user_index(owner_id)
+            is_borrowed = profile_name in index.get("borrowed", [])
+            p_config = self.cog.profile_manager._get_profile_config(owner_id, profile_name, is_borrowed)
+
+            if p_config and p_config.get("neuro_engine_enabled"):
+                current_state = p_config.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20}).copy()
+                current_state.update(new_state)
+                p_config["neuro_state"] = current_state
+                self.cog.profile_manager._save_profile_config(owner_id, profile_name, p_config, is_borrowed)
+                final_state = current_state
+
+        return clean_text, final_state

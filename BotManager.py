@@ -1,14 +1,3 @@
-# --- MimicAI & Assistant Workflow Documentation ---
-# The development workflow with the AI assistant for MimicAI is strictly modular and compliance-based.
-# 1. No Interpretation: The assistant must not guess intent, refactor existing stable code, or add unsolicited features.
-# 2. Strict Scope: Only the exact requested logic is to be modified. Large rewrites of functions are NOT recommended.
-# 3. Literal Formatting: The exact spacing, capitalization, and naming conventions must be matched flawlessly.
-# 4. Ephemeral Edit Location Reporting: Code replacements are provided in isolated blocks wrapped with precise
-#    "Location of change:" identifiers (e.g., `Class.method` or specific code anchors) to allow rapid copy-pasting.
-# 5. Technical Debt Avoidance: Band-aid fixes are rejected in favor of addressing the root mechanical failure.
-# This workflow guarantees stable iterations without breaking the complex asynchronous state management of the bot.
-# --------------------------------------------------
-
 import asyncio
 import discord
 from discord.ext import commands
@@ -31,7 +20,7 @@ if os.getenv("MANUAL_AUTH_MODE", "False").lower() == "true":
     if not os.getenv("DISCORD_OWNER_ID"): os.environ["DISCORD_OWNER_ID"] = "MANUAL_MODE_PENDING"
     if not os.getenv("ENCRYPTION_KEY"): os.environ["ENCRYPTION_KEY"] = "MANUAL_MODE_PENDING"
 
-from cogs.mixins.constants import defaultConfig
+from cogs.utils.constants import defaultConfig
 
 # --- Global State for Orchestration ---
 active_child_processes = {}  # Maps bot_id_str -> subprocess.Popen object
@@ -43,7 +32,7 @@ IPC_PORT = 8765
 # --- IPC Server Logic ---
 async def ipc_server_handler(websocket, path=None):
     # We only expect ONE connection now: The Hive.
-    # But we keep the dict structure for compatibility with GeminiCog sending to "bot_id"
+    # But we keep the dict structure for compatibility with MimicCog sending to "bot_id"
     try:
         # Wait for identification
         msg = await websocket.recv()
@@ -53,11 +42,15 @@ async def ipc_server_handler(websocket, path=None):
             print("IPC: Hive Connected.")
             
             # Ensure the main bot is logged in so we have its user ID
-            await bot.wait_until_ready()
+            while not bot.is_ready():
+                if bot.is_closed():
+                    print("IPC: Main bot is closed, aborting handler.")
+                    return
+                await asyncio.sleep(0.5)
             
             # Register this SINGLE socket as the route for ALL known child bots
-            # This is a bit of a hack to make GeminiCog's "send_to_child" logic work seamlessly.
-            # GeminiCog sends to "12345", we need to know "12345" lives on this socket.
+            # This is a bit of a hack to make MimicCog's "send_to_child" logic work seamlessly.
+            # MimicCog sends to "12345", we need to know "12345" lives on this socket.
             # Since we only have one Hive, we can just map 'hive' -> websocket
             ipc_connections['hive'] = websocket
             
@@ -86,17 +79,17 @@ async def ipc_server_handler(websocket, path=None):
             # Listen for events from Hive
             async for message in websocket:
                 event_data = json.loads(message)
-                gemini_cog = bot.get_cog("GeminiAgent")
-                if gemini_cog:
+                mimic_cog = bot.get_cog("MimicCog")
+                if mimic_cog:
                     event_type = event_data.get("event_type")
                     action = event_data.get("action")
 
                     if event_type == "message_sent_confirmation":
-                        asyncio.create_task(gemini_cog.handle_child_bot_confirmation(event_data))
+                        asyncio.create_task(mimic_cog.child_bot_manager.handle_child_bot_confirmation(event_data))
                     elif action == "toggle_session_participation":
-                        asyncio.create_task(gemini_cog.handle_child_bot_toggle(event_data))
+                        asyncio.create_task(mimic_cog.child_bot_manager.handle_child_bot_toggle(event_data))
                     elif action == "update_presence":
-                        asyncio.create_task(gemini_cog.handle_child_bot_presence(event_data))
+                        asyncio.create_task(mimic_cog.child_bot_manager.handle_child_bot_presence(event_data))
 
     except websockets.exceptions.ConnectionClosed:
         print("IPC: Hive disconnected.")
@@ -212,7 +205,7 @@ async def main():
             k_h = hashlib.sha256(defaultConfig.ENCRYPTION_KEY.encode()).hexdigest()
             
             mismatches = []
-            if lock_data.get("sdk_hash") != s_h: mismatches.append("DISCORD_SDK")
+            # We no longer strictly lock the DISCORD_SDK token, as it doesn't encrypt data and can be reset.
             if lock_data.get("owner_hash") != o_h: mismatches.append("DISCORD_OWNER_ID")
             if lock_data.get("key_hash") != k_h: mismatches.append("ENCRYPTION_KEY")
             
@@ -220,6 +213,16 @@ async def main():
                 print(f"\nCRITICAL ERROR: Authentication mismatch in: {', '.join(mismatches)}")
                 print("The provided credentials do not match the original setup. Bot startup aborted to prevent data corruption.")
                 return
+                
+            # If only the SDK token changed, update the lock file silently
+            if lock_data.get("sdk_hash") != s_h:
+                lock_data["sdk_hash"] = s_h
+                try:
+                    with open(lock_path, "wb") as f:
+                        f.write(json.dumps(lock_data))
+                except Exception as e:
+                    print(f"Warning: Failed to update system lock file with new SDK hash: {e}")
+                    
         except Exception as e:
             print(f"\nCRITICAL ERROR: Failed to read system lock file: {e}")
             return
@@ -278,8 +281,8 @@ async def main():
 
     # Load main bot cog
     print("Loading main bot cogs...")
-    await bot.load_extension("cogs.GeminiCog")
-    print("GeminiCog loaded successfully.")
+    await bot.load_extension("cogs.MimicCog")
+    print("MimicCog loaded successfully.")
 
     # Start IPC Server and Manager Task
     ipc_server = await websockets.serve(ipc_server_handler, IPC_HOST, IPC_PORT, max_size=2**24)
@@ -310,15 +313,19 @@ async def main():
     finally:
         # Graceful shutdown
         print("Shutting down main bot and child processes...")
-        if ipc_server.is_serving():
-            ipc_server.close()
-            await ipc_server.wait_closed()
         
         manager_task_handle.cancel()
         
         for bot_id, proc in list(active_child_processes.items()):
             print(f" - Terminating child bot {bot_id}...")
             proc.terminate()
+            
+        if ipc_server.is_serving():
+            ipc_server.close()
+            try:
+                await asyncio.wait_for(ipc_server.wait_closed(), timeout=3.0)
+            except asyncio.TimeoutError:
+                print("IPC server wait_closed timed out.")
         
         # Wait for all processes to terminate
         for bot_id, proc in list(active_child_processes.items()):

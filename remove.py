@@ -35,7 +35,8 @@ def remove_mimic():
         shutil.rmtree(".venv")
 
     # 3. Delete Data and Configs
-    to_delete = [".env", "cogs/data", "mimicai.service"]
+    # Included cogs/gemini_agent.lock to cleanly destroy any ghost states left over from crashes
+    to_delete = [".env", "cogs/data", "cogs/gemini_agent.lock", "mimicai.service"]
     for path in to_delete:
         if os.path.exists(path):
             print(f" - Deleting: {path}")

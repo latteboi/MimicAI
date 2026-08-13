@@ -30,16 +30,13 @@ def setup_mimic():
     # 0. Linux-specific preparation
     if platform.system() == "Linux":
         print("\n[1/5] Checking Linux system dependencies...")
-        # Note: venv is now imported at the top level
         
-        # Check for build-essential if the user is on a very stripped instance
         if subprocess.run(["which", "gcc"], capture_output=True).returncode != 0:
             print(" ! Warning: GCC compiler not found. Some libraries may fail to install.")
             print(" ! Recommendation: sudo apt install build-essential -y")
 
     # 1. Create Virtual Environment
     venv_dir = ".venv"
-    # Determine the expected activation script path to verify health
     activate_script = os.path.join(venv_dir, "Scripts", "activate") if platform.system() == "Windows" else os.path.join(venv_dir, "bin", "activate")
     
     if os.path.exists(venv_dir) and not os.path.exists(activate_script):
@@ -60,7 +57,6 @@ def setup_mimic():
 
     venv_python = get_venv_python()
 
-    # Verify pip is actually functional
     try:
         subprocess.check_call([venv_python, "-m", "pip", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError:
@@ -75,8 +71,8 @@ def setup_mimic():
 
     # 2. Install Dependencies inside Venv
     print("\n[3/5] Installing required libraries into the environment...")
-    # Standard dependencies list
-    deps = ["discord.py", "google-genai", "google-generativeai", "websockets", "orjson", "cryptography", "aiohttp", "httpx", "numpy", "python-dotenv", "Pillow", "tzdata"]
+    # NOTE: legacy google-generativeai removed to enforce strict v2 SDK usage.
+    deps = ["discord.py", "google-genai", "websockets", "orjson", "cryptography", "aiohttp", "httpx", "numpy", "python-dotenv", "Pillow", "tzdata"]
     
     if os.path.exists("requirements.txt"):
         run_pip(venv_python, ["-r", "requirements.txt"])
@@ -90,7 +86,8 @@ def setup_mimic():
         "cogs/data/servers",
         "cogs/data/public_profiles",
         "cogs/data/models",
-        "cogs/data/mod"
+        "cogs/data/mod/docs",
+        "cogs/data/sessions/global_chat"
     ]
     for directory in directories:
         os.makedirs(directory, exist_ok=True)
@@ -102,11 +99,9 @@ def setup_mimic():
     def _clean_key(val):
         if not val: return ""
         import re
-        # Aggressively strip all quotes, spaces, tabs, and newlines
         return re.sub(r'\s+', '', str(val).replace('"', '').replace("'", ""))
 
     if not os.path.exists(".env"):
-        # We run the key generation via the venv python to ensure cryptography is available
         print(" - Generating secure encryption key...")
         gen_key_code = "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
         fernet_key = _clean_key(subprocess.check_output([venv_python, "-c", gen_key_code]).decode())
@@ -180,12 +175,10 @@ RestartSec=10
 WantedBy=multi-user.target
 """
             try:
-                # Write locally first
                 with open(service_name, "w") as f:
                     f.write(service_content)
                 
                 print("\n - Requesting permissions to install service...")
-                # Chain commands with sudo
                 cmds = [
                     ["sudo", "mv", os.path.join(current_dir, service_name), service_path],
                     ["sudo", "chown", "root:root", service_path],
@@ -206,7 +199,6 @@ WantedBy=multi-user.target
             except Exception as e:
                 print(f" ! Error installing service: {e}")
 
-    # Final Instructions
     activate_cmd = "source .venv/bin/activate" if platform.system() != "Windows" else ".venv\\Scripts\\activate"
     service_installed = (platform.system() == "Linux" and os.path.exists("/etc/systemd/system/mimicai.service"))
     
