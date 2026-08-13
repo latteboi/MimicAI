@@ -110,8 +110,6 @@ class GlobalChatMixin:
                         parts.append(f"\n{t.get('grounding_context')}")
 
                 content_obj = {'role': t_role, 'parts': parts}
-                if t_role == 'model' and t.get('thought_signature'):
-                    content_obj['thought_signature'] = t.get('thought_signature')
                 rebuilt_history.append(content_obj)
 
             chat.history = rebuilt_history
@@ -430,11 +428,7 @@ class GlobalChatMixin:
             model_log = {
                 "turn_id": model_turn_id, "role": "model", "content": response_text, "timestamp": timestamp
             }
-            if profile_data.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
-                sig = response.thought_signature
-                if isinstance(sig, bytes):
-                    sig = base64.b64encode(sig).decode('utf-8')
-                model_log['thought_signature'] = sig
+            
             session_data.setdefault('unified_log', []).append(model_log)
 
             text_for_embed = response_text
@@ -471,8 +465,6 @@ class GlobalChatMixin:
             if chat.history and chat.history[-1].get('role', 'user') == 'model':
                 old_turn = chat.history[-1]
                 new_turn = {'role': 'model', 'parts': [bot_response_formatted]}
-                if 'thought_signature' in old_turn:
-                    new_turn['thought_signature'] = old_turn['thought_signature']
                 chat.history[-1] = new_turn
 
             await self.cog.session_manager._save_session_to_disk(model_cache_key, 'global_chat', session_data)

@@ -112,31 +112,13 @@ class HeartbeatMixin:
                     try:
                         if participant and participant.get('method') == 'child_bot':
                             bot_id = participant.get('bot_id')
-                            if not msg_b_id:
-                                corr_id = str(uuid.uuid4())
-                                conf_event = asyncio.Event()
-                                conf_data_ref = {"event": conf_event, "type": "heartbeat_placeholder"}
-                                self.cog.pending_child_confirmations[corr_id] = conf_data_ref
-
-                                await self.cog.manager_queue.put({
-                                    "action": "send_to_child", "bot_id": bot_id,
-                                    "payload": {
-                                        "action": "send_message", "channel_id": channel.id,
-                                        "content": text, "realistic_typing": False, "correlation_id": corr_id
-                                    }
-                                })
-                                try:
-                                    await asyncio.wait_for(conf_event.wait(), timeout=5.0)
-                                    msg_ids = conf_data_ref.get("message_ids", [])
-                                    if msg_ids: state_container['msg_b_id'] = msg_ids[-1]
-                                except asyncio.TimeoutError: pass
-                                finally: self.cog.pending_child_confirmations.pop(corr_id, None)
-                            else:
+                            msg_a_id = state_container.get('msg_a_id')
+                            if msg_a_id:
                                 await self.cog.manager_queue.put({
                                     "action": "send_to_child", "bot_id": bot_id,
                                     "payload": {
                                         "action": "regenerate_message", "channel_id": channel.id,
-                                        "message_id": msg_b_id, "content": text
+                                        "message_id": msg_a_id, "content": f"{state_container['custom_emoji']}\n\n{text}"
                                     }
                                 })
                         else:
@@ -152,16 +134,9 @@ class HeartbeatMixin:
                                 # Webhooks
                                 webhook = await self.cog.server_manager._get_or_create_webhook(channel)
                                 if webhook:
-                                    if not msg_b_id:
-                                        sent_msg = await webhook.send(
-                                            content=text,
-                                            username=state_container.get('app_name', 'Bot'),
-                                            avatar_url=state_container.get('app_avatar'),
-                                            wait=True
-                                        )
-                                        if sent_msg: state_container['msg_b_id'] = sent_msg.id
-                                    else:
-                                        await webhook.edit_message(msg_b_id, content=text)
+                                    msg_a_id = state_container.get('msg_a_id')
+                                    if msg_a_id:
+                                        await webhook.edit_message(msg_a_id, content=f"{state_container['custom_emoji']}\n\n{text}")
                     except Exception:
                         pass
 
@@ -201,8 +176,10 @@ class HeartbeatMixin:
                         except Exception: pass
                         return
 
-                    target_msg_id = state_container.get('msg_b_id') or state_container.get('msg_a_id')
+                    target_msg_id = state_container.get('msg_a_id')
                     if not target_msg_id: return
+                    
+                    full_text = f"{state_container.get('custom_emoji', PLACEHOLDER_EMOJI)}\n\n{text}"
 
                     try:
                         if participant_method == 'child_bot' and bot_id:
@@ -210,13 +187,13 @@ class HeartbeatMixin:
                                 "action": "send_to_child", "bot_id": bot_id,
                                 "payload": {
                                     "action": "regenerate_message", "channel_id": channel.id,
-                                    "message_id": target_msg_id, "content": text
+                                    "message_id": target_msg_id, "content": full_text
                                 }
                             })
                         else:
                             wh = await self.cog.server_manager._get_or_create_webhook(channel)
                             if wh:
-                                await wh.edit_message(target_msg_id, content=text)
+                                await wh.edit_message(target_msg_id, content=full_text)
                     except Exception:
                         pass
 

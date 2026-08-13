@@ -175,7 +175,6 @@ class OllamaResponse:
     def __init__(self, message_dict, finish_reason):
         self.text = message_dict.get('content', '') or ''
         self.thought = message_dict.get('reasoning', '') or message_dict.get('reasoning_content', '') or ''
-        self.thought_signature = None
 
         if not self.thought and "<think>" in self.text.lower():
             text_lower = self.text.lower()
@@ -335,7 +334,6 @@ class OllamaModel:
                         def __init__(self, m_obj, f_reason, p_eval, e_count):
                             self.text = m_obj.get('content', '') or ''
                             self.thought = m_obj.get('reasoning', '') or ''
-                            self.thought_signature = None
                             self.input_tokens = p_eval
                             self.output_tokens = e_count
                             self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
@@ -441,14 +439,6 @@ class GoogleGenAIModel:
                         else:
                             parts.append(types.Part.from_uri(file_uri=url, mime_type=mime_type))
 
-                if item.get('thought_signature') and parts:
-                    sig = item['thought_signature']
-                    if isinstance(sig, str):
-                        try:
-                            sig = base64.b64decode(sig)
-                        except Exception: pass
-                    parts[-1].thought_signature = sig
-
                 formatted_contents.append(types.Content(role=role, parts=parts))
             elif hasattr(item, 'role') and hasattr(item, 'parts'):
                 # Fallback for legacy objects
@@ -545,7 +535,6 @@ class GoogleGenAIModel:
                 self.raw = raw_resp
                 self.text = ""
                 self.thought = ""
-                self.thought_signature = None
                 self.candidates = raw_resp.candidates
                 self.prompt_feedback = getattr(raw_resp, 'prompt_feedback', None)
                 self.usage_metadata = getattr(raw_resp, 'usage_metadata', None)
@@ -560,9 +549,6 @@ class GoogleGenAIModel:
                             self.thought += part.text or ""
                         elif part.text:
                             self.text += part.text
-
-                        if hasattr(part, 'thought_signature') and part.thought_signature:
-                            self.thought_signature = part.thought_signature
 
                 self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
 

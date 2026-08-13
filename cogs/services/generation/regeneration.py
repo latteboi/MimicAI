@@ -369,9 +369,11 @@ class RegenerationMixin:
                 turn_warnings.append(WARN_FALLBACK_USED)
                 turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=main_api_error))
 
+            # [FIX] Separate display text from history text to prevent AI hallucinations
+            display_text = new_text
             if turn_warnings:
                 warning_str = "\n\n" + "\n".join([f"-# {i+1}. {w}" for i, w in enumerate(turn_warnings)])
-                new_text += warning_str
+                display_text += warning_str
 
             if state_container:
                 await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
@@ -389,6 +391,8 @@ class RegenerationMixin:
             if app_data.get("custom_display_name"): sp_name = app_data["custom_display_name"]
 
             profile_id = self.cog.profile_manager._get_profile_id(p_owner_id, p_name)
+            
+            # [FIX] Save new_text (WITHOUT warnings) to history
             new_history_line = _format_history_entry(sp_name, sent_timestamp, new_text, tz_str, entity_id=profile_id)
 
             final_target_turn = next((t for t in session.get("unified_log", []) if t.get("turn_id") == turn_id), None)
@@ -431,19 +435,14 @@ class RegenerationMixin:
 
             final_target_turn["meta"] = meta
 
-            if p_profile.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
-                sig = response.thought_signature
-                if isinstance(sig, bytes):
-                    sig = base64.b64encode(sig).decode('utf-8')
-                final_target_turn['thought_signature'] = sig
-            else:
-                final_target_turn.pop('thought_signature', None)
+            # Clean up legacy signatures from the turn if they exist
+            final_target_turn.pop('thought_signature', None)
 
             if state_container and state_container.get('sending_task'):
                 state_container['sending_task'].cancel()
 
             # Truncate text strictly for Discord's 2000 character limit on edits
-            safe_text = new_text
+            safe_text = display_text
             if len(safe_text) > 2000:
                 safe_text = safe_text[:1997] + "..."
 

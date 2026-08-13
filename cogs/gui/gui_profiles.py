@@ -784,9 +784,8 @@ def ProfileTrainingParamsModal(cog, profile_name: str, current_params: Dict[str,
 def ProfileThinkingParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
     fields = [
         {"label": "Thinking Summary (on/off)", "custom_id": "thinking_summary_visible", "default": current_params.get("thinking_summary_visible", "off"), "required": False, "placeholder": "Display reasoning tokens below your message."},
-        {"label": "Reasoning Effort / Level", "custom_id": "thinking_level", "default": current_params.get("thinking_level", "high"), "required": False, "placeholder": "xhigh, high, medium, low, minimal, none"},
-        {"label": "Reasoning Token Budget (-1=dyn)", "custom_id": "thinking_budget", "default": str(current_params.get("thinking_budget", -1)), "required": False, "placeholder": "-1 = dynamic, 128+ = token limit"},
-        {"label": "Thought Signatures (on/off)", "custom_id": "thinking_signatures_enabled", "default": current_params.get("thinking_signatures_enabled", "off"), "required": False, "placeholder": "Preserve reasoning context across turns."}
+        {"label": "Reasoning Effort / Level", "custom_id": "thinking_level", "default": current_params.get("thinking_level", "low"), "required": False, "placeholder": "xhigh, high, medium, low, minimal, none"},
+        {"label": "Reasoning Token Budget (-1=dyn)", "custom_id": "thinking_budget", "default": str(current_params.get("thinking_budget", -1)), "required": False, "placeholder": "-1 = dynamic, 128+ = token limit"}
     ]
     def parser(v):
         c = {}
@@ -799,8 +798,6 @@ def ProfileThinkingParamsModal(cog, profile_name: str, current_params: Dict[str,
         bv = _pi(v["thinking_budget"])
         c["thinking_budget"] = min(bv if bv is not None and bv >= -1 else -1, 32768)
         
-        ts = _ps(v["thinking_signatures_enabled"])
-        c["thinking_signatures_enabled"] = "on" if ts and ts.lower() == "on" else "off"
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Thinking & Reasoning Parameters", fields, parser, callback)
 

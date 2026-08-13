@@ -148,15 +148,11 @@ class SessionManager:
                             "content": content,
                             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
                         }
-                        if item.get('thought_signature'):
-                            log_item['thought_signature'] = item.get('thought_signature')
                         unified_log.append(log_item)
 
                     history = []
                     for t in unified_log:
                         obj = {'role': t['role'], 'parts': [t['content']]}
-                        if t.get('thought_signature'):
-                            obj['thought_signature'] = t.get('thought_signature')
                         history.append(obj)
                     chat_session = GoogleGenAIChatSession(history=history)
 
@@ -166,8 +162,6 @@ class SessionManager:
                     history = []
                     for t in data:
                         obj = {'role': t['role'], 'parts': [t['content']]}
-                        if t.get('thought_signature'):
-                            obj['thought_signature'] = t.get('thought_signature')
                         history.append(obj)
                     chat_session = GoogleGenAIChatSession(history=history)
                     return {'chat_session': chat_session, 'unified_log': data}
@@ -753,12 +747,8 @@ class SessionManager:
                 
                 if participant_history and participant_history[-1]['role'] == role:
                     participant_history[-1]['parts'].extend(parts)
-                    if role == 'model' and turn.get('thought_signature'):
-                        participant_history[-1]['thought_signature'] = turn.get('thought_signature')
                 else:
                     content_obj = {'role': role, 'parts': parts}
-                    if role == 'model' and turn.get('thought_signature'):
-                        content_obj['thought_signature'] = turn.get('thought_signature')
                     participant_history.append(content_obj)
                     
             elif turn_type == "whisper":
@@ -778,12 +768,8 @@ class SessionManager:
                     wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
                     if participant_history and participant_history[-1]['role'] == 'model':
                         participant_history[-1]['parts'].append(wrapped)
-                        if turn.get('thought_signature'):
-                            participant_history[-1]['thought_signature'] = turn.get('thought_signature')
                     else:
                         obj = {'role': 'model', 'parts': [wrapped]}
-                        if turn.get('thought_signature'):
-                            obj['thought_signature'] = turn.get('thought_signature')
                         participant_history.append(obj)
                         
         return participant_history

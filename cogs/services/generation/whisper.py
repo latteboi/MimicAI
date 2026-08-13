@@ -206,11 +206,6 @@ class WhisperMixin:
             "content": response_content,
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
-        if p_settings.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
-            sig = response.thought_signature
-            if isinstance(sig, bytes):
-                sig = base64.b64encode(sig).decode('utf-8')
-            resp_log['thought_signature'] = sig
 
         session.setdefault("unified_log", []).append(resp_log)
 
@@ -222,8 +217,6 @@ class WhisperMixin:
         header_r, body_r = response_content.split('\n', 1)
         wrapped_response = f"{header_r}\n<private_response>\n{body_r.strip()}\n</private_response>\n"
         model_obj = {'role': 'model', 'parts': [wrapped_response]}
-        if 'thought_signature' in resp_log:
-            model_obj['thought_signature'] = resp_log['thought_signature']
         chat_session.history.append(model_obj)
 
         # Add to pending whispers to be injected into the next public turn
@@ -365,8 +358,7 @@ class WhisperMixin:
         for turn in log:
             if turn.get("turn_id") == response_turn_id:
                 turn["content"] = new_content
-                if hasattr(response, 'thought_signature') and response.thought_signature:
-                    turn['thought_signature'] = base64.b64encode(response.thought_signature).decode('utf-8')
+                turn.pop('thought_signature', None) # Clean up legacy signature
                 break
 
         await self.cog.session_manager._save_session_to_disk((interaction.channel_id, None, None), session.get("type", "multi"), log)

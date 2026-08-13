@@ -65,8 +65,8 @@ class DefaultConfigNamespace:
 
 defaultConfig = DefaultConfigNamespace()
 
-PRIMARY_MODEL_NAME = 'GOOGLE/gemini-3.1-flash-lite'
-FALLBACK_MODEL_NAME = 'GOOGLE/gemini-2.5-flash-lite'
+PRIMARY_MODEL_NAME = 'GOOGLE/gemini-3.5-flash-lite'
+FALLBACK_MODEL_NAME = 'GOOGLE/gemini-3.1-flash-lite'
 DEFAULT_SYSTEM_INSTRUCTION = "."
 
 DEFAULT_SYSTEM_INSTRUCTION = "."

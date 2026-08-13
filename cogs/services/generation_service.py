@@ -1638,11 +1638,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         "content": history_line,
                         "meta": meta
                     }
-                    if profile_settings.get("thinking_signatures_enabled", "off") == "on" and hasattr(response, 'thought_signature') and response.thought_signature:
-                        sig = response.thought_signature
-                        if isinstance(sig, bytes):
-                            sig = base64.b64encode(sig).decode('utf-8')
-                        turn_object['thought_signature'] = sig
+                    
+                    # Clean up any legacy signature if it exists
+                    turn_object.pop('thought_signature', None)
+                    
                     session.setdefault("unified_log", []).append(turn_object)
                     session['last_speaker_key'] = participant_key
 
