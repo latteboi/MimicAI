@@ -570,18 +570,19 @@ class APIService:
         self.cog = cog
 
     def _instantiate_model(self, raw_model_name: str, guild_id, user_id, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, profile_settings=None, openrouter_key_error: str = None, google_key_error: str = None, use_broad_openrouter_heuristic: bool = True):
-        name_upper = raw_model_name.upper()
+        # System prefixes 'GOOGLE/', 'OPENROUTER/', and 'OLLAMA/' are strictly case-sensitive.
+        # OpenRouter hosts models under lowercase creator namespaces like 'google/gemini-2.5-flash'.
         actual_name = raw_model_name
         is_openrouter = False
         is_ollama = False
 
-        if name_upper.startswith("OPENROUTER/"):
+        if raw_model_name.startswith("OPENROUTER/"):
             actual_name = raw_model_name[11:]
             is_openrouter = True
-        elif name_upper.startswith("OLLAMA/"):
+        elif raw_model_name.startswith("OLLAMA/"):
             actual_name = raw_model_name[7:]
             is_ollama = True
-        elif name_upper.startswith("GOOGLE/"):
+        elif raw_model_name.startswith("GOOGLE/"):
             actual_name = raw_model_name[7:]
         elif "/" in raw_model_name or (use_broad_openrouter_heuristic and ("grok" in raw_model_name.lower() or "anthropic" in raw_model_name.lower())):
             is_openrouter = True
@@ -866,6 +867,7 @@ class APIService:
             os.makedirs(MODELS_DATA_DIR, exist_ok=True)
             rates = {
                 # Official Google Gemini Standard Tier Pricing (per 1M tokens in USD)
+                "GOOGLE/gemini-3.7-flash": {"input_1m": 0.75, "output_1m": 3.75},
                 "GOOGLE/gemini-3.6-flash": {"input_1m": 1.50, "output_1m": 7.50},
                 "GOOGLE/gemini-3.5-flash": {"input_1m": 1.50, "output_1m": 9.00},
                 "GOOGLE/gemini-3.5-flash-lite": {"input_1m": 0.30, "output_1m": 2.50},

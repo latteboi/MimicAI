@@ -165,6 +165,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 is_image_gen_round = False
                 image_gen_prompt = ""
                 image_gen_anchor_message = None
+                generated_image_bytes_for_round = None
+                generated_image_path_for_round = None
                 # [UPDATED] Store tuples of (base_text, url_context_text, media_parts) 
                 new_round_turn_data = [] 
                 round_author_name = "A user"
@@ -830,6 +832,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 else:
                                     img_bytes = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
                                     if img_bytes:
+                                        generated_image_bytes_for_round = img_bytes
                                         def _write_img():
                                             import tempfile
                                             fd, path = tempfile.mkstemp(suffix=".png")
@@ -1161,18 +1164,17 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         dynamic_safety_settings = _resolve_safety_settings(safety_level_str)
 
                         # Factory Logic
-                        name_upper = primary_model.upper()
                         actual_name = primary_model
                         is_openrouter = False
                         is_ollama = False
                         
-                        if name_upper.startswith("OPENROUTER/"):
+                        if primary_model.startswith("OPENROUTER/"):
                             actual_name = primary_model[11:]
                             is_openrouter = True
-                        elif name_upper.startswith("OLLAMA/"):
+                        elif primary_model.startswith("OLLAMA/"):
                             actual_name = primary_model[7:]
                             is_ollama = True
-                        elif name_upper.startswith("GOOGLE/"):
+                        elif primary_model.startswith("GOOGLE/"):
                             actual_name = primary_model[7:]
                         elif "/" in primary_model or "grok" in primary_model.lower():
                             # Heuristic for OpenRouter models without explicit prefix
@@ -1387,8 +1389,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             except asyncio.CancelledError:
                                 if state_container and state_container.get('sending_task'):
                                     state_container['sending_task'].cancel()
-                                await self._safe_delete_placeholder(channel, state_container.get('msg_a_id') if state_container else msg_a_id)
-                                await self._safe_delete_placeholder(channel, state_container.get('msg_b_id') if state_container else None)
+                                await self._safe_delete_placeholder(channel, state_container.get('msg_a_id') if state_container else msg_a_id, bot_id=participant.get('bot_id'))
+                                await self._safe_delete_placeholder(channel, state_container.get('msg_b_id') if state_container else None, bot_id=participant.get('bot_id'))
                                 if 'contents_for_api_call' in locals():
                                     contents_for_api_call.clear()
                                     del contents_for_api_call
@@ -1423,8 +1425,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     except asyncio.CancelledError:
                                         if state_container and state_container.get('sending_task'):
                                             state_container['sending_task'].cancel()
-                                        await self._safe_delete_placeholder(channel, state_container.get('msg_a_id') if state_container else msg_a_id)
-                                        await self._safe_delete_placeholder(channel, state_container.get('msg_b_id') if state_container else None)
+                                        await self._safe_delete_placeholder(channel, state_container.get('msg_a_id') if state_container else msg_a_id, bot_id=participant.get('bot_id'))
+                                        await self._safe_delete_placeholder(channel, state_container.get('msg_b_id') if state_container else None, bot_id=participant.get('bot_id'))
                                         if 'contents_for_api_call' in locals():
                                             contents_for_api_call.clear()
                                             del contents_for_api_call
@@ -1914,8 +1916,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
                     msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
 
-                    await self._safe_delete_placeholder(channel, msg_a_to_delete)
-                    await self._safe_delete_placeholder(channel, msg_b_to_delete)
+                    await self._safe_delete_placeholder(channel, msg_a_to_delete, bot_id=participant.get('bot_id'))
+                    await self._safe_delete_placeholder(channel, msg_b_to_delete, bot_id=participant.get('bot_id'))
 
                     if state_container:
                         state_container['msg_a_id'] = None
@@ -2093,10 +2095,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 if 'shared_media_content_obj' in locals():
                     del shared_media_content_obj
 
-                if 'generated_image_path_for_round' in locals() and generated_image_path_for_round:
+                if generated_image_path_for_round:
                     if os.path.exists(generated_image_path_for_round):
-                        os.remove(generated_image_path_for_round)
-                    del generated_image_path_for_round
+                        try: os.remove(generated_image_path_for_round)
+                        except OSError: pass
+                    generated_image_path_for_round = None
+                generated_image_bytes_for_round = None
 
                 guild_id = self.cog.bot.get_channel(channel_id).guild.id
                 

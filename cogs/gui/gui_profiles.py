@@ -293,7 +293,7 @@ class ProfileManageView(ui.View):
 
         # --- Params Tab Logic ---
         elif choice == "models":
-            view = SingleProfileModelView(self.cog, self.original_interaction, profile_name)
+            view = SingleProfileModelView(self.cog, self.original_interaction, profile_name, is_borrowed=self.is_borrowed, user_id=self.user_id)
             await interaction.response.send_message(view._get_selection_feedback_message(), view=view, ephemeral=True)
         elif choice == "gen_params":
             # Callback logic updated to edit the view on the original message, but not try to defer again
@@ -880,17 +880,20 @@ def ProfileImageGenSettingsModal(cog, profile_name: str, current_params: Dict[st
     return ConfigModal(cog, profile_name, is_borrowed, "Image Generation Settings", fields, parser, callback)
 
 class SingleProfileModelView(ui.View):
-    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str):
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str, is_borrowed: Optional[bool] = None, user_id: Optional[int] = None):
         super().__init__(timeout=300)
         self.cog = cog
         self.original_interaction = interaction
-        self.user_id = interaction.user.id
+        self.user_id = user_id or interaction.user.id
         self.profile_name = profile_name
         self.view_mode = 'google'
         self.category = 'response' # 'response', 'media', 'tools', 'ltm'
 
-        index = self.cog.profile_manager._get_user_index(self.user_id)
-        self.is_borrowed = profile_name in index.get("borrowed", [])
+        if is_borrowed is not None:
+            self.is_borrowed = is_borrowed
+        else:
+            index = self.cog.profile_manager._get_user_index(self.user_id)
+            self.is_borrowed = profile_name in index.get("borrowed", [])
         
         self._build_view()
 
@@ -925,7 +928,11 @@ class SingleProfileModelView(ui.View):
         
         def clean(val):
             if not val: return "None"
-            return str(val).replace("GOOGLE/", "").replace("OPENROUTER/", "").replace("OLLAMA/", "")
+            s = str(val)
+            for prefix in ("GOOGLE/", "OPENROUTER/", "OLLAMA/"):
+                if s.startswith(prefix):
+                    return s[len(prefix):]
+            return s
             
         msg = f"**Profile:** `{self.profile_name}`\n"
         if self.view_mode == 'openrouter':
@@ -955,31 +962,13 @@ class SingleProfileModelView(ui.View):
     def _get_top_models(self, provider: str, target_config_key: str) -> List[str]:
         return self.cog.api_service.get_top_models(provider, target_config_key)
 
-    async def _update_ollama_status(self):
-        host_url = OLLAMA_LOCAL_URL
-        if hasattr(self, 'profile_name') and self.profile_name != "BULK_APPLY":
-            cfg = self.cog.profile_manager._get_profile_config(self.user_id, self.profile_name, getattr(self, 'is_borrowed', False)) or {}
-            host_url = cfg.get("ollama_host_url", OLLAMA_LOCAL_URL)
-        
-        try:
-            import httpx
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(f"{host_url.rstrip('/')}/api/tags", timeout=2.0)
-                self.ollama_working = (resp.status_code == 200)
-                if self.ollama_working:
-                    data = resp.json()
-                    self.cached_ollama_models = [m['name'] for m in data.get('models', [])]
-        except Exception:
-            self.ollama_working = False
-            self.cached_ollama_models = []
-
     class GenericModelSelect(ui.Select):
         def __init__(self, placeholder: str, options: list, row: int, target_config_key: str):
             super().__init__(placeholder=placeholder, options=options, row=row)
             self.target_config_key = target_config_key
 
         async def callback(self, interaction: discord.Interaction):
-            view: SingleProfileModelView = self.view
+            view = self.view
             if self.values[0] == "ollama_offline":
                 await interaction.response.send_message("Ollama is offline or has no models downloaded.", ephemeral=True)
                 return
@@ -995,7 +984,7 @@ class SingleProfileModelView(ui.View):
         opts = [discord.SelectOption(label="Custom Model...", value="custom_option", description="Enter manually via modal")]
         
         if current_val:
-            opts.append(discord.SelectOption(label=f"Current: {current_val}", value=current_val, default=True))
+            opts.append(discord.SelectOption(label=f"Current: {current_val}"[:100], value=current_val, default=True))
         
         prefix = "GOOGLE/"
         if self.view_mode == 'openrouter': prefix = "OPENROUTER/"
@@ -1016,6 +1005,21 @@ class SingleProfileModelView(ui.View):
             opts.append(discord.SelectOption(label="⚠️ Ollama Offline / No Models", value="ollama_offline", description=f"Check {OLLAMA_LOCAL_URL}"))
             
         return opts
+
+    async def _update_ollama_status(self):
+        data = self._get_current_profile_data()
+        host_url = data.get("ollama_host_url") or OLLAMA_LOCAL_URL
+        try:
+            import httpx
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{host_url.rstrip('/')}/api/tags", timeout=2.0)
+                self.ollama_working = (resp.status_code == 200)
+                if self.ollama_working:
+                    data = resp.json()
+                    self.cached_ollama_models = [m['name'] for m in data.get('models', [])]
+        except Exception:
+            self.ollama_working = False
+            self.cached_ollama_models = []
 
     def _build_view(self):
         self.clear_items()
@@ -1127,7 +1131,6 @@ class SingleProfileModelView(ui.View):
             btn_style = discord.ButtonStyle.primary if self.category == val else discord.ButtonStyle.secondary
             btn = ui.Button(label=label, style=btn_style, row=4, disabled=(self.category == val))
             
-            # Closure for callback
             def make_nav_cb(target_cat):
                 async def nav_cb(i: discord.Interaction):
                     self.category = target_cat
@@ -1137,6 +1140,14 @@ class SingleProfileModelView(ui.View):
                 
             btn.callback = make_nav_cb(val)
             self.add_item(btn)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: ui.Item):
+        print(f"Error in SingleProfileModelView: {error}")
+        traceback.print_exc()
+        if not interaction.response.is_done():
+            await interaction.response.send_message("An unexpected error occurred with this view.", ephemeral=True)
+        else:
+            await interaction.followup.send("An unexpected error occurred with this view.", ephemeral=True)
 
 class ModelApplyView(ui.View):
     def __init__(self, cog: 'MimicCog', user_id: int, interaction: discord.Interaction):
@@ -1184,7 +1195,11 @@ class ModelApplyView(ui.View):
         
         def clean(val):
             if not val: return "Unchanged"
-            return str(val).replace("GOOGLE/", "").replace("OPENROUTER/", "").replace("OLLAMA/", "")
+            s = str(val)
+            for prefix in ("GOOGLE/", "OPENROUTER/", "OLLAMA/"):
+                if s.startswith(prefix):
+                    return s[len(prefix):]
+            return s
             
         msg = f"**Category:** `{self.category.title()}`\n"
         if self.view_mode == 'openrouter':

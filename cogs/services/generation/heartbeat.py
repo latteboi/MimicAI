@@ -7,13 +7,35 @@ from typing import Optional
 from ...utils.constants import PLACEHOLDER_EMOJI
 
 
+import time
+import uuid
+import asyncio
+import discord
+from typing import Optional
+
+from ...utils.constants import PLACEHOLDER_EMOJI
+
+
 class HeartbeatMixin:
     """Placeholder message lifecycle and the heartbeat-driven generation call
     that keeps a live status update in Discord while the model responds.
     """
 
-    async def _safe_delete_placeholder(self, channel, message_id):
+    async def _safe_delete_placeholder(self, channel, message_id, bot_id=None):
         if not message_id: return
+
+        if bot_id:
+            try:
+                await self.cog.manager_queue.put({
+                    "action": "send_to_child", "bot_id": bot_id,
+                    "payload": {
+                        "action": "delete_message",
+                        "channel_id": channel.id,
+                        "message_id": message_id
+                    }
+                })
+            except Exception:
+                pass
 
         max_retries = 3
         backoff = 1.0
@@ -65,7 +87,7 @@ class HeartbeatMixin:
         return None
 
     async def _generate_with_heartbeat(self, model, contents, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name='Bot', app_avatar=None, existing_state=None, message_type="text"):
-        # Hard DIY Limits: 4 minutes for Main, 3 minutes for Fallback
+        # Hard Limits: 4 minutes for Main, 3 minutes for Fallback
         hard_timeout = 180.0 if is_fallback else 240.0
 
         state_container = existing_state or {}
@@ -95,7 +117,17 @@ class HeartbeatMixin:
                     err.state_container = state_container
                     raise err
 
-                # Every 10 seconds, handle Message B
+                # Periodic typing pulse for Child Bots without a placeholder (Discord typing expires in 9s)
+                if participant and participant.get('method') == 'child_bot':
+                    bot_id = participant.get('bot_id')
+                    current_msg_a_id = state_container.get('msg_a_id')
+                    if not current_msg_a_id and int(elapsed) > 0 and int(elapsed) % 5 == 0:
+                        await self.cog.manager_queue.put({
+                            "action": "send_to_child", "bot_id": bot_id,
+                            "payload": {"action": "start_typing", "channel_id": channel.id}
+                        })
+
+                # Every 10 seconds, update or create the placeholder message
                 current_interval = int(elapsed // 10)
                 if current_interval > last_interval:
                     last_interval = current_interval
@@ -107,36 +139,39 @@ class HeartbeatMixin:
                     base_text = "Using fallback model" if is_fallback else "Still generating"
                     text = f"-# {base_text}... ({time_str})"
 
-                    msg_b_id = state_container.get('msg_b_id')
+                    msg_a_id = state_container.get('msg_a_id')
+                    custom_emoji = state_container.get('custom_emoji', PLACEHOLDER_EMOJI)
 
                     try:
                         if participant and participant.get('method') == 'child_bot':
                             bot_id = participant.get('bot_id')
-                            msg_a_id = state_container.get('msg_a_id')
                             if msg_a_id:
                                 await self.cog.manager_queue.put({
                                     "action": "send_to_child", "bot_id": bot_id,
                                     "payload": {
                                         "action": "regenerate_message", "channel_id": channel.id,
-                                        "message_id": msg_a_id, "content": f"{state_container['custom_emoji']}\n\n{text}"
+                                        "message_id": msg_a_id, "content": f"{custom_emoji}\n\n{text}"
                                     }
                                 })
+                            else:
+                                new_msg_id = await self._send_child_bot_placeholder(bot_id, channel.id, f"{custom_emoji}\n\n{text}")
+                                if new_msg_id:
+                                    state_container['msg_a_id'] = new_msg_id
+                                    msg_a_id = new_msg_id
                         else:
                             if state_container.get('message_type') == "embed" and state_container.get('placeholder_msg'):
                                 try:
                                     msg_obj = state_container['placeholder_msg']
                                     if msg_obj and msg_obj.embeds:
                                         embed = msg_obj.embeds[0]
-                                        embed.description = f"{state_container['custom_emoji']}\n\n{text}"
+                                        embed.description = f"{custom_emoji}\n\n{text}"
                                         await msg_obj.edit(embed=embed)
                                 except Exception: pass
                             else:
                                 # Webhooks
                                 webhook = await self.cog.server_manager._get_or_create_webhook(channel)
-                                if webhook:
-                                    msg_a_id = state_container.get('msg_a_id')
-                                    if msg_a_id:
-                                        await webhook.edit_message(msg_a_id, content=f"{state_container['custom_emoji']}\n\n{text}")
+                                if webhook and msg_a_id:
+                                    await webhook.edit_message(msg_a_id, content=f"{custom_emoji}\n\n{text}")
                     except Exception:
                         pass
 
@@ -177,23 +212,27 @@ class HeartbeatMixin:
                         return
 
                     target_msg_id = state_container.get('msg_a_id')
-                    if not target_msg_id: return
-                    
                     full_text = f"{state_container.get('custom_emoji', PLACEHOLDER_EMOJI)}\n\n{text}"
 
                     try:
                         if participant_method == 'child_bot' and bot_id:
-                            await self.cog.manager_queue.put({
-                                "action": "send_to_child", "bot_id": bot_id,
-                                "payload": {
-                                    "action": "regenerate_message", "channel_id": channel.id,
-                                    "message_id": target_msg_id, "content": full_text
-                                }
-                            })
+                            if target_msg_id:
+                                await self.cog.manager_queue.put({
+                                    "action": "send_to_child", "bot_id": bot_id,
+                                    "payload": {
+                                        "action": "regenerate_message", "channel_id": channel.id,
+                                        "message_id": target_msg_id, "content": full_text
+                                    }
+                                })
+                            else:
+                                new_msg_id = await self._send_child_bot_placeholder(bot_id, channel.id, full_text)
+                                if new_msg_id:
+                                    state_container['msg_a_id'] = new_msg_id
                         else:
-                            wh = await self.cog.server_manager._get_or_create_webhook(channel)
-                            if wh:
-                                await wh.edit_message(target_msg_id, content=full_text)
+                            if target_msg_id:
+                                wh = await self.cog.server_manager._get_or_create_webhook(channel)
+                                if wh:
+                                    await wh.edit_message(target_msg_id, content=full_text)
                     except Exception:
                         pass
 

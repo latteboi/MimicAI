@@ -320,7 +320,7 @@ class GlobalChatPlayView(ui.View):
         await interaction.edit_original_response(embed=self.get_embed(), view=self)
 
 class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
-    model_id_input = ui.TextInput(label="Model ID", placeholder="e.g. anthropic/claude-3", required=True)
+    model_id_input = ui.TextInput(label="Model ID", placeholder="e.g. anthropic/claude-3 or google/gemini-2.5-flash", required=True)
 
     def __init__(self, view: Any, target_config_key: str):
         super().__init__()
@@ -330,19 +330,35 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
     async def on_submit(self, interaction: discord.Interaction):
         value = self.model_id_input.value.strip()
         
-        if value.startswith("GOOGLE/"): value = value[7:]
-        elif value.startswith("OPENROUTER/"): value = value[11:]
-        elif value.startswith("OLLAMA/"): value = value[7:]
+        # -----------------------------------------------------------------------------
+        # DETAILED SYSTEM PREFIX RESOLUTION ARCHITECTURE:
+        # 'GOOGLE/', 'OPENROUTER/', and 'OLLAMA/' are dedicated, case-sensitive system
+        # routing prefixes used internally by MimicAI to route calls to the correct API adapter.
+        #
+        # Many providers (especially OpenRouter) host models under vendor namespaces with
+        # lowercase names, such as 'google/gemini-2.5-flash' or 'meta-llama/llama-3.3-70b'.
+        #
+        # 1. If the user explicitly prefixes their input with one of the 3 system prefixes
+        #    ('GOOGLE/', 'OPENROUTER/', 'OLLAMA/'), we honour that override directly.
+        # 2. Otherwise, we automatically prepend the system prefix corresponding to the
+        #    currently active view_mode (e.g. 'OPENROUTER/' if on the OpenRouter tab).
+        # -----------------------------------------------------------------------------
+        system_prefixes = ("GOOGLE/", "OPENROUTER/", "OLLAMA/")
         
-        prefix = "GOOGLE/"
-        if self.parent_view.view_mode == "openrouter": prefix = "OPENROUTER/"
-        elif self.parent_view.view_mode == "ollama": prefix = "OLLAMA/"
+        has_explicit_prefix = any(value.startswith(p) for p in system_prefixes)
         
-        value = prefix + value
-        
+        if not has_explicit_prefix:
+            prefix = "GOOGLE/"
+            if getattr(self.parent_view, 'view_mode', None) == "openrouter":
+                prefix = "OPENROUTER/"
+            elif getattr(self.parent_view, 'view_mode', None) == "ollama":
+                prefix = "OLLAMA/"
+            
+            value = prefix + value
+
         self.parent_view._save_changes(self.target_config_key, value)
-        
         self.parent_view._build_view()
+        await interaction.response.edit_message(content=self.parent_view._get_selection_feedback_message(), view=self.parent_view)
         await interaction.response.edit_message(content=self.parent_view._get_selection_feedback_message(), view=self.parent_view)
 
 class GlobalChatHistoryView(ui.View):

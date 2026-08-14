@@ -257,12 +257,12 @@ class GlobalChatMixin:
                         fb_is_or = False
                         fb_is_ollama = False
 
-                        if fb_name.upper().startswith("OPENROUTER/"):
+                        if fb_name.startswith("OPENROUTER/"):
                             fb_name = fb_name[11:]
                             fb_is_or = True
-                        elif fb_name.upper().startswith("GOOGLE/"):
+                        elif fb_name.startswith("GOOGLE/"):
                             fb_name = fb_name[7:]
-                        elif fb_name.upper().startswith("OLLAMA/"):
+                        elif fb_name.startswith("OLLAMA/"):
                             fb_name = fb_name[7:]
                             fb_is_ollama = True
                         elif "/" in fb_name:

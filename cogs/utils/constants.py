@@ -74,7 +74,7 @@ OLLAMA_LOCAL_URL = "http://127.0.0.1:11434"
 
 # Define the allowed models for the new command
 ALLOWED_MODELS = Literal[
-    'gemini-pro-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-3.6-flash',
+    'gemini-pro-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-3.7-flash', 'gemini-3.6-flash',
     'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-pro-preview', 'gemini-3.1-flash-lite', 'gemini-3-flash-preview', 'gemini-robotics-er-1.6-preview',
     'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'
 ]
