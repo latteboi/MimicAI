@@ -154,10 +154,16 @@ class HeartbeatMixin:
                                     }
                                 })
                             else:
-                                new_msg_id = await self._send_child_bot_placeholder(bot_id, channel.id, f"{custom_emoji}\n\n{text}")
-                                if new_msg_id:
-                                    state_container['msg_a_id'] = new_msg_id
-                                    msg_a_id = new_msg_id
+                                # Only spawn a placeholder if generation is actively still running
+                                if not gen_task.done():
+                                    new_msg_id = await self._send_child_bot_placeholder(bot_id, channel.id, f"{custom_emoji}\n\n{text}")
+                                    if new_msg_id:
+                                        if gen_task.done():
+                                            # If generation completed while awaiting placeholder creation, delete immediately
+                                            await self._safe_delete_placeholder(channel, new_msg_id, bot_id=bot_id)
+                                        else:
+                                            state_container['msg_a_id'] = new_msg_id
+                                            msg_a_id = new_msg_id
                         else:
                             if state_container.get('message_type') == "embed" and state_container.get('placeholder_msg'):
                                 try:
@@ -190,6 +196,10 @@ class HeartbeatMixin:
 
     async def _update_sending_placeholder(self, channel, participant_method, bot_id, state_container, start_time_mono):
         if not state_container: return
+        
+        # If no placeholder was ever created during generation, do not spawn a new one during sending
+        if not state_container.get('msg_a_id') and not (state_container.get('message_type') == 'embed' and state_container.get('placeholder_msg')):
+            return
 
         async def heartbeat_loop():
             try:
@@ -212,27 +222,24 @@ class HeartbeatMixin:
                         return
 
                     target_msg_id = state_container.get('msg_a_id')
+                    if not target_msg_id:
+                        return
+
                     full_text = f"{state_container.get('custom_emoji', PLACEHOLDER_EMOJI)}\n\n{text}"
 
                     try:
                         if participant_method == 'child_bot' and bot_id:
-                            if target_msg_id:
-                                await self.cog.manager_queue.put({
-                                    "action": "send_to_child", "bot_id": bot_id,
-                                    "payload": {
-                                        "action": "regenerate_message", "channel_id": channel.id,
-                                        "message_id": target_msg_id, "content": full_text
-                                    }
-                                })
-                            else:
-                                new_msg_id = await self._send_child_bot_placeholder(bot_id, channel.id, full_text)
-                                if new_msg_id:
-                                    state_container['msg_a_id'] = new_msg_id
+                            await self.cog.manager_queue.put({
+                                "action": "send_to_child", "bot_id": bot_id,
+                                "payload": {
+                                    "action": "regenerate_message", "channel_id": channel.id,
+                                    "message_id": target_msg_id, "content": full_text
+                                }
+                            })
                         else:
-                            if target_msg_id:
-                                wh = await self.cog.server_manager._get_or_create_webhook(channel)
-                                if wh:
-                                    await wh.edit_message(target_msg_id, content=full_text)
+                            wh = await self.cog.server_manager._get_or_create_webhook(channel)
+                            if wh:
+                                await wh.edit_message(target_msg_id, content=full_text)
                     except Exception:
                         pass
 

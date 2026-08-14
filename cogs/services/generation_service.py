@@ -1732,20 +1732,17 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                     is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
 
-                    if is_realistic_typing:
+                    if participant.get('method') == 'child_bot':
+                        # Stop any pending sending heartbeat task immediately
                         if state_container and state_container.get('sending_task'):
                             state_container['sending_task'].cancel()
-                        msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
-                        await self._safe_delete_placeholder(channel, msg_b_to_delete)
-                        if state_container:
-                            state_container['msg_b_id'] = None
-
-                    if participant.get('method') == 'child_bot':
-                        if placeholder_message and hasattr(placeholder_message, 'id'):
-                            try:
-                                msg_to_del = await channel.fetch_message(placeholder_message.id)
-                                await msg_to_del.delete()
-                            except Exception: pass
+                            
+                        # Delete any active placeholder message before child bot begins delivering the final response
+                        msg_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
+                        if msg_to_delete:
+                            await self._safe_delete_placeholder(channel, msg_to_delete, bot_id=participant.get('bot_id'))
+                            if state_container:
+                                state_container['msg_a_id'] = None
                             
                         correlation_id = str(uuid.uuid4())
                         confirmation_event = asyncio.Event()
