@@ -107,10 +107,12 @@ class StorageManager:
     def _decrypt_data(self, encrypted_text: str) -> str:
         if not self.fernet or not encrypted_text:
             return encrypted_text
+        # Fast prefix guard: Fernet tokens always begin with 'gAAAAA' in Base64
+        if not isinstance(encrypted_text, str) or not encrypted_text.startswith("gAAAAA"):
+            return encrypted_text
         try:
             return self.fernet.decrypt(encrypted_text.encode()).decode()
         except Exception:
-            # If decryption fails (e.g. text is already plain), return as is
             return encrypted_text
 
     def _atomic_json_save_gzip(self, data: Any, file_path: str, encrypted: bool = True):
@@ -195,51 +197,6 @@ class StorageManager:
                 has_shares = (user_dir / "shares.json.gz").exists()
                 if not has_keys and not has_shares:
                     shutil.rmtree(str(user_dir), ignore_errors=True)
-
-    def _migrate_embeddings_to_b64(self):
-        from .memory_manager import encode_embedding_b64
-        users_dir = pathlib.Path(self.cog.USERS_DIR)
-        if not users_dir.exists(): return
-        migrated_any = False
-
-        for user_dir in users_dir.iterdir():
-            if not user_dir.is_dir() or not user_dir.name.isdigit(): continue
-            profiles_dir = user_dir / "profiles"
-            if not profiles_dir.exists(): continue
-
-            for p_dir in profiles_dir.iterdir():
-                if not p_dir.is_dir(): continue
-
-                ltm_path = p_dir / "ltm.json.gz"
-                if ltm_path.exists():
-                    ltm_data = self._load_json_gzip(str(ltm_path))
-                    if ltm_data and "guild" in ltm_data:
-                        changed = False
-                        for item in ltm_data["guild"]:
-                            if "s_emb" in item and isinstance(item["s_emb"], list):
-                                item["s_emb_b64"] = encode_embedding_b64(item["s_emb"])
-                                del item["s_emb"]
-                                changed = True
-                        if changed:
-                            self._atomic_json_save_gzip(ltm_data, str(ltm_path))
-                            migrated_any = True
-
-                train_path = p_dir / "training.json.gz"
-                if train_path.exists():
-                    train_data = self._load_json_gzip(str(train_path))
-                    if train_data and isinstance(train_data, list):
-                        changed = False
-                        for item in train_data:
-                            if "u_emb" in item and isinstance(item["u_emb"], list):
-                                item["u_emb_b64"] = encode_embedding_b64(item["u_emb"])
-                                del item["u_emb"]
-                                changed = True
-                        if changed:
-                            self._atomic_json_save_gzip(train_data, str(train_path))
-                            migrated_any = True
-
-        if migrated_any:
-            print("Phase 5 Migration complete. Embeddings compressed to Base64.")
 
     def _load_server_api_keys(self):
         self.cog.server_api_keys = {}

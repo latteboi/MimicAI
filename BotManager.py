@@ -254,7 +254,7 @@ async def main():
     users_dir = os.path.join(os.path.dirname(__file__), "cogs", "data", "users")
     bot.child_bot_config = {}
     if os.path.isdir(users_dir):
-        import gzip
+        from cogs.managers.storage_manager import IOManager
         for user_id_str in os.listdir(users_dir):
             if not user_id_str.isdigit(): continue
             profiles_dir = os.path.join(users_dir, user_id_str, "profiles")
@@ -262,19 +262,15 @@ async def main():
             for pid_folder in os.listdir(profiles_dir):
                 bot_file = os.path.join(profiles_dir, pid_folder, "child_bot.json.gz")
                 if os.path.exists(bot_file):
-                    try:
-                        with gzip.open(bot_file, 'rb') as f:
-                            bot_data = json.loads(f.read())
-                        if "bot_id" in bot_data:
-                            bot_data["owner_id"] = int(user_id_str)
-                            bot_data["pid"] = pid_folder
-                            name_file = os.path.join(profiles_dir, pid_folder, "name.txt")
-                            if os.path.exists(name_file):
-                                with open(name_file, 'r', encoding='utf-8') as nf:
-                                    bot_data["profile_name"] = nf.read().strip()
-                            bot.child_bot_config[bot_data["bot_id"]] = bot_data
-                    except Exception as e:
-                        print(f"Failed to load child bot for {pid_folder}: {e}")
+                    bot_data = IOManager.read_json_gzip(bot_file, encrypted=False)
+                    if bot_data and "bot_id" in bot_data:
+                        bot_data["owner_id"] = int(user_id_str)
+                        bot_data["pid"] = pid_folder
+                        name_file = os.path.join(profiles_dir, pid_folder, "name.txt")
+                        if os.path.exists(name_file):
+                            with open(name_file, 'r', encoding='utf-8') as nf:
+                                bot_data["profile_name"] = nf.read().strip()
+                        bot.child_bot_config[bot_data["bot_id"]] = bot_data
     
     # Attach manager queue to bot object for cog access
     bot.manager_queue = manager_queue

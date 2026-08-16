@@ -4,6 +4,7 @@ import re
 import uuid
 import shutil
 import base64
+import gzip
 import datetime
 import asyncio
 import traceback
@@ -101,22 +102,13 @@ class ProfileManager:
     def _load_public_profiles(self):
         self.cog.public_profiles = {}
         index_path = os.path.join(PUBLIC_PROFILES_DIR, "index.json")
-        if os.path.exists(index_path):
-            try:
-                with open(index_path, "r", encoding="utf-8") as f:
-                    data = json.loads(f.read())
-                if data:
-                    self.cog.public_profiles = data
-            except Exception as e:
-                print(f"Error loading public index: {e}")
+        data = IOManager.read_json(index_path)
+        if data:
+            self.cog.public_profiles = data
 
     def _save_public_index(self):
         index_path = os.path.join(PUBLIC_PROFILES_DIR, "index.json")
-        try:
-            with open(index_path, "wb") as f:
-                f.write(json.dumps(self.cog.public_profiles))
-        except Exception as e:
-            print(f"Error saving public index: {e}")
+        IOManager.write_json(self.cog.public_profiles, index_path)
 
     def _load_profile_shares(self):
         self.cog.profile_shares = {}
@@ -769,6 +761,7 @@ class ProfileManager:
             raw_export_data["profiles"][name] = p_entry
 
         raw_json_bytes = json.dumps(raw_export_data)
+        compressed_payload = gzip.compress(raw_json_bytes, compresslevel=1)
         export_container = {
             "mimic_version": "3.0",
         }
@@ -779,12 +772,12 @@ class ProfileManager:
             derived_key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode('utf-8')))
             temp_fernet = Fernet(derived_key)
             
-            encrypted_payload = temp_fernet.encrypt(raw_json_bytes)
+            encrypted_payload = temp_fernet.encrypt(compressed_payload)
             export_container["auth_mode"] = "passphrase"
             export_container["salt"] = base64.b64encode(salt).decode('utf-8')
             export_container["payload"] = encrypted_payload.decode('utf-8')
         else:
-            encrypted_payload = self.cog.fernet.encrypt(raw_json_bytes)
+            encrypted_payload = self.cog.fernet.encrypt(compressed_payload)
             export_container["auth_mode"] = "master"
             export_container["payload"] = encrypted_payload.decode('utf-8')
 
@@ -830,14 +823,20 @@ class ProfileManager:
                 temp_fernet = Fernet(derived_key)
                 
                 try:
-                    raw_json_bytes = temp_fernet.decrypt(encrypted_payload)
+                    decrypted_bytes = temp_fernet.decrypt(encrypted_payload)
                 except InvalidToken:
                     raise ValueError("Decryption failed. The passphrase provided is incorrect.")
             else:
                 try:
-                    raw_json_bytes = self.cog.fernet.decrypt(encrypted_payload)
+                    decrypted_bytes = self.cog.fernet.decrypt(encrypted_payload)
                 except InvalidToken:
                     raise ValueError("Master key decryption failed. This file belongs to a different MimicAI instance and cannot be imported here without a passphrase migration export.")
+
+            try:
+                raw_json_bytes = gzip.decompress(decrypted_bytes)
+            except gzip.BadGzipFile:
+                # Backward compatibility fallback for uncompressed legacy v3 exports
+                raw_json_bytes = decrypted_bytes
 
             data = json.loads(raw_json_bytes)
             
