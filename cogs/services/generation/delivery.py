@@ -37,46 +37,20 @@ class DeliveryMixin:
 
         is_placeholder = (content == f"{PLACEHOLDER_EMOJI}")
 
-        if is_placeholder:
-            custom_emoji = None
-            if profile_owner_id_for_appearance is not None and profile_name_for_appearance:
-                index = self.cog.profile_manager._get_user_index(profile_owner_id_for_appearance)
-                is_borrowed = profile_name_for_appearance in index.get("borrowed", [])
-                profile_data_to_use = self.cog.profile_manager._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, is_borrowed) or {}
-                custom_emoji = profile_data_to_use.get("placeholder_emoji")
-
-            if custom_emoji:
-                content = custom_emoji
-
-        custom_display_name_to_use = self.cog.bot.user.name if self.cog.bot.user else "Bot"
-        custom_avatar_url_to_use = self.cog.bot.user.display_avatar.url if self.cog.bot.user else None
-        use_webhook = False
-        is_realistic_typing = False
-        typing_cps = 30.0
-        typing_max_delay = 2.5
-
-        is_placeholder = (content == f"{PLACEHOLDER_EMOJI}")
-
         if profile_owner_id_for_appearance is not None and profile_name_for_appearance:
             index = self.cog.profile_manager._get_user_index(profile_owner_id_for_appearance)
             is_borrowed = profile_name_for_appearance in index.get("borrowed", [])
+            profile_data_to_use = self.cog.profile_manager._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, is_borrowed) or {}
+            
+            custom_emoji = profile_data_to_use.get("placeholder_emoji")
+            if is_placeholder and custom_emoji:
+                content = custom_emoji
 
-            if is_borrowed:
-                borrowed_data = self.cog.profile_manager._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, True) or {}
-                is_realistic_typing = borrowed_data.get("realistic_typing_enabled", False)
-                typing_cps = borrowed_data.get("typing_cps", 30.0)
-                typing_max_delay = borrowed_data.get("typing_max_delay", 2.5)
-            else:
-                personal_profile_data = self.cog.profile_manager._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, False) or {}
-                is_realistic_typing = personal_profile_data.get("realistic_typing_enabled", False)
-                typing_cps = personal_profile_data.get("typing_cps", 30.0)
-                typing_max_delay = personal_profile_data.get("typing_max_delay", 2.5)
+            is_realistic_typing = profile_data_to_use.get("realistic_typing_enabled", False)
+            typing_cps = profile_data_to_use.get("typing_cps", 30.0)
+            typing_max_delay = profile_data_to_use.get("typing_max_delay", 2.5)
 
             effective_owner_id, effective_profile_name = self.cog.profile_manager._resolve_effective_profile(profile_owner_id_for_appearance, profile_name_for_appearance)
-
-            # [NEW] Enforce bypass if flag is set
-            if bypass_typing:
-                is_realistic_typing = False
 
             owner_id_str = str(effective_owner_id)
             appearance_data = self.cog.profile_manager._get_user_appearance(effective_owner_id, effective_profile_name)
@@ -88,7 +62,6 @@ class DeliveryMixin:
                 if appearance_data.get("custom_avatar_url"):
                     custom_avatar_url_to_use = appearance_data["custom_avatar_url"]
                 else:
-                    # Use generic Discord default avatar if display name is set but avatar is not
                     avatar_index = hash(effective_profile_name) % 6
                     custom_avatar_url_to_use = f"https://cdn.discordapp.com/embed/avatars/{avatar_index}.png"
 
@@ -97,6 +70,10 @@ class DeliveryMixin:
                 custom_display_name_to_use = profile_name_for_appearance
                 avatar_index = hash(profile_name_for_appearance) % 6
                 custom_avatar_url_to_use = f"https://cdn.discordapp.com/embed/avatars/{avatar_index}.png"
+
+        # [FIX] Never execute realistic typing on placeholder dispatches or when bypassed
+        if is_placeholder or bypass_typing:
+            is_realistic_typing = False
 
         if target_message_to_edit and use_webhook and content != f"{PLACEHOLDER_EMOJI}":
             try:
@@ -232,6 +209,14 @@ class DeliveryMixin:
                         print(f"Failed to flush realistic typing on cancel: {e}")
                 except Exception as flush_err:
                     print(f"Failed to flush realistic typing on cancel: {flush_err}")
+                return sent_messages_list
+            except asyncio.CancelledError:
+                # Discard cleanly if cancelled during placeholder setup without forcing un-sent text
+                if not is_placeholder and sent_messages_list and webhook_to_use:
+                    try:
+                        await webhook_to_use.edit_message(sent_messages_list[0].id, content=content)
+                    except Exception:
+                        pass
                 return sent_messages_list
             except Exception as e:
                 print(f"Realistic typing failed, falling back to standard send. Error: {e}")

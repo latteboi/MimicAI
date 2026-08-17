@@ -72,7 +72,7 @@ def setup_mimic():
     # 2. Install Dependencies inside Venv
     print("\n[3/5] Installing required libraries into the environment...")
     # NOTE: legacy google-generativeai removed to enforce strict v2 SDK usage.
-    deps = ["discord.py", "google-genai", "websockets", "orjson", "cryptography", "aiohttp", "httpx", "numpy", "python-dotenv", "Pillow", "tzdata"]
+    deps = ["discord.py", "google-genai", "websockets", "orjson", "cryptography", "aiohttp", "httpx", "numpy", "python-dotenv", "Pillow", "tzdata", "zstandard"]
     
     if os.path.exists("requirements.txt"):
         run_pip(venv_python, ["-r", "requirements.txt"])

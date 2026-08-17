@@ -1,5 +1,6 @@
 import os
 import gzip
+import zstandard as zstd
 import pathlib
 import time
 import datetime
@@ -11,6 +12,9 @@ from cryptography.fernet import Fernet, InvalidToken
 import orjson as json
 
 from ..utils.constants import SERVERS_DIR
+
+_ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
+_ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
 
 
 def _delete_file_shard(file_path: str):
@@ -55,13 +59,16 @@ class IOManager:
                 file_bytes = f.read()
 
             if encrypted and fernet:
-                decrypted_bytes = fernet.decrypt(file_bytes)
-                decompressed_bytes = gzip.decompress(decrypted_bytes)
-            else:
+                file_bytes = fernet.decrypt(file_bytes)
+
+            try:
+                decompressed_bytes = _ZSTD_DECOMPRESSOR.decompress(file_bytes)
+            except zstd.ZstdError:
+                # Automatic fallback for legacy gzip files on disk
                 decompressed_bytes = gzip.decompress(file_bytes)
 
             return json.loads(decompressed_bytes)
-        except (IOError, json.JSONDecodeError, gzip.BadGzipFile, InvalidToken) as e:
+        except (IOError, json.JSONDecodeError, gzip.BadGzipFile, InvalidToken, zstd.ZstdError) as e:
             print(f"IOManager Read Error ({file_path}): {e}")
             return None
 
@@ -71,7 +78,7 @@ class IOManager:
         try:
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             json_bytes = json.dumps(data)
-            compressed_bytes = gzip.compress(json_bytes, compresslevel=1)
+            compressed_bytes = _ZSTD_COMPRESSOR.compress(json_bytes)
 
             bytes_to_write = compressed_bytes
             if encrypted and fernet:

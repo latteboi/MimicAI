@@ -28,8 +28,10 @@ class EventListeners:
         if not self.sessions_loaded:
             await self.session_manager._load_multi_profile_sessions()
             self.sessions_loaded = True
-        
+
+        self.child_bot_manager._load_child_bots()
         self.all_bot_ids = {self.bot.user.id} | {int(bot_id) for bot_id in self.child_bots.keys()}
+        await self.child_bot_manager.start_all_child_bots()
 
         if self.has_lock:
             self.profile_manager._get_or_create_system_profile("mimicguide")
@@ -210,7 +212,11 @@ class EventListeners:
         session = self.multi_profile_channels.get(message.channel.id)
 
         if session:
+            if 'task_queue' not in session or session['task_queue'] is None:
+                session['task_queue'] = asyncio.Queue()
+
             await session['task_queue'].put(message)
+            
             if not session.get('worker_task') or session['worker_task'].done():
                 task = self.bot.loop.create_task(self.generation_service._multi_profile_worker(message.channel.id))
                 session['worker_task'] = task
@@ -257,14 +263,20 @@ class EventListeners:
             turn_id_to_find = turn_object["turn_id"]
             if is_mute:
                 turn_object["is_hidden"] = True
+                
+                # Optimistically acknowledge reaction immediately
+                async def _ack_mute():
+                    try:
+                        ch = self.bot.get_channel(payload.channel_id)
+                        if ch:
+                            msg = await ch.fetch_message(payload.message_id)
+                            await msg.add_reaction(payload.emoji)
+                    except Exception: pass
+                asyncio.create_task(_ack_mute())
+
                 await self.session_manager._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
                 session["is_hydrated"] = False
                 await self.session_manager._ensure_session_hydrated(channel_id, session_type)
-                try:
-                    channel = self.bot.get_channel(payload.channel_id)
-                    msg = await channel.fetch_message(payload.message_id)
-                    await msg.add_reaction(payload.emoji)
-                except: pass
                 return
 
             if turn_object.get("is_user") is True:
@@ -281,30 +293,31 @@ class EventListeners:
             if reacted_to_participant:
                 if is_regen:
                     is_busy = session.get('is_running') or session.get('is_regenerating') or session.get('is_purging')
-                    msg_ref = None
-                    try:
-                        channel = self.bot.get_channel(payload.channel_id)
-                        if channel:
-                            msg_ref = await channel.fetch_message(payload.message_id)
-                            if is_busy:
-                                await msg_ref.add_reaction(payload.emoji)
-                            else:
-                                await msg_ref.clear_reaction(payload.emoji)
-                    except: pass
+                    
+                    async def _ack_regen_reaction(busy: bool):
+                        try:
+                            ch = self.bot.get_channel(payload.channel_id)
+                            if ch:
+                                msg = await ch.fetch_message(payload.message_id)
+                                if busy:
+                                    await msg.add_reaction(payload.emoji)
+                                else:
+                                    await msg.clear_reaction(payload.emoji)
+                        except Exception: pass
+                    
+                    asyncio.create_task(_ack_regen_reaction(is_busy))
 
                     async def queue_regeneration():
                         was_busy = is_busy
                         while session.get('is_running') or session.get('is_regenerating') or session.get('is_purging'):
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(0.5)
                         
                         session.get('regen_tasks', {}).pop(payload.message_id, None)
                         
-                        if was_busy and msg_ref:
-                            try:
-                                await msg_ref.clear_reaction(payload.emoji)
-                            except: pass
+                        if was_busy:
+                            asyncio.create_task(_ack_regen_reaction(False))
                         
-                        still_exists = any(t.get("turn_id") == turn_id_to_find for t in session.get("unified_log",[]))
+                        still_exists = any(t.get("turn_id") == turn_id_to_find for t in session.get("unified_log", []))
                         if still_exists:
                             await self.generation_service._execute_regeneration(payload, session, turn_id_to_find, reacted_to_participant)
 
@@ -314,12 +327,18 @@ class EventListeners:
                 
                 if is_skip:
                     reacted_to_participant["is_skipped"] = True
+                    
+                    # Optimistically acknowledge reaction immediately
+                    async def _ack_skip():
+                        try:
+                            ch = self.bot.get_channel(payload.channel_id)
+                            if ch:
+                                msg = await ch.fetch_message(payload.message_id)
+                                await msg.add_reaction(payload.emoji)
+                        except Exception: pass
+                    asyncio.create_task(_ack_skip())
+
                     self.session_manager._save_multi_profile_sessions()
-                    try:
-                        channel = self.bot.get_channel(payload.channel_id)
-                        msg = await channel.fetch_message(payload.message_id)
-                        await msg.add_reaction(payload.emoji)
-                    except: pass
                     return
 
                 try:
@@ -359,17 +378,26 @@ class EventListeners:
                                 pass
 
                         is_busy = session.get('is_running') or session.get('is_regenerating') or session.get('is_purging')
-                        try:
-                            channel = self.bot.get_channel(payload.channel_id)
-                            msg_ref = await channel.fetch_message(payload.message_id)
-                            if is_busy:
-                                await msg_ref.add_reaction(payload.emoji)
-                            else:
-                                await msg_ref.clear_reaction(payload.emoji)
-                        except: pass
+                        
+                        async def _ack_nav_reaction(busy: bool):
+                            try:
+                                ch = self.bot.get_channel(payload.channel_id)
+                                if ch:
+                                    msg = await ch.fetch_message(payload.message_id)
+                                    if busy:
+                                        await msg.add_reaction(payload.emoji)
+                                    else:
+                                        await msg.clear_reaction(payload.emoji)
+                            except Exception: pass
+
+                        asyncio.create_task(_ack_nav_reaction(is_busy))
 
                         trigger_type = 'reaction_single' if is_next else 'reaction'
                         reaction_trigger = (trigger_type, payload, next_participant)
+                        
+                        if 'task_queue' not in session or session['task_queue'] is None:
+                            session['task_queue'] = asyncio.Queue()
+
                         await session['task_queue'].put(reaction_trigger)
                         if not session.get('worker_task') or session['worker_task'].done():
                             task = self.bot.loop.create_task(self.generation_service._multi_profile_worker(payload.channel_id))
@@ -666,7 +694,8 @@ class EventListeners:
                 print(f"OSError releasing lock file: {e}")
             except Exception as e:
                 print(f"Unexpected error releasing lock file: {e}")
-        
+
+        await self.child_bot_manager.shutdown_all()
         self.bot.tree.remove_command(self.trace_ctx_menu.name, type=self.trace_ctx_menu.type)
         
         self.refresh_lock_task.cancel()

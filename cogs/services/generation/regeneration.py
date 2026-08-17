@@ -49,7 +49,7 @@ class RegenerationMixin:
 
         custom_emoji = p_profile.get("placeholder_emoji") or PLACEHOLDER_EMOJI
 
-        # Pre-emptive visual feedback before disk I/O
+        # Pre-emptive visual feedback before disk I/O and context gathering
         if participant.get('method') == 'child_bot':
             await self.cog.manager_queue.put({
                 "action": "send_to_child", "bot_id": participant['bot_id'],
@@ -65,36 +65,17 @@ class RegenerationMixin:
                     msg = await channel.fetch_message(payload.message_id)
                     kept_atts = [a for a in msg.attachments if a.content_type and a.content_type.startswith("image/")]
                     await wh.edit_message(payload.message_id, content=custom_emoji, attachments=kept_atts)
-                except: pass
+                except Exception: pass
 
         session_type = session.get("type", "multi")
         dummy_key = (channel.id, None, None)
 
-        # Flush session state to disk
+        # Flush session state to disk in parallel with initial cleanups
         self.cog.session_manager._save_multi_profile_sessions()
         await self.cog.session_manager._save_session_to_disk(dummy_key, session_type, session["unified_log"])
 
         try:
-            placeholder_message = await channel.fetch_message(payload.message_id)
             message_ids_to_check = target_turn.get("message_ids", [])
-
-            # Initial Edit to Placeholder
-            if participant.get('method') == 'child_bot':
-                await self.cog.manager_queue.put({
-                    "action": "send_to_child", "bot_id": participant['bot_id'],
-                    "payload": {
-                        "action": "regenerate_message", "channel_id": channel.id,
-                        "message_id": payload.message_id, "content": custom_emoji
-                    }
-                })
-            else:
-                wh = await self.cog.server_manager._get_or_create_webhook(channel)
-                if wh:
-                    try:
-                        msg = await channel.fetch_message(payload.message_id)
-                        kept_atts = [a for a in msg.attachments if a.content_type and a.content_type.startswith("image/")]
-                        await wh.edit_message(payload.message_id, content=custom_emoji, attachments=kept_atts)
-                    except: pass
 
             # 2. Cleanup follow-up messages
             for msg_id in message_ids_to_check:
@@ -107,7 +88,7 @@ class RegenerationMixin:
                     if not is_sources and not has_image:
                         self.cog.purged_message_ids.add(msg_id)
                         await msg.delete()
-                except: pass
+                except Exception: pass
 
             # 3. History Slicing (Time Travel)
             sliced_unified_log = session["unified_log"][:actual_turn_index]

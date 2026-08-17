@@ -1,5 +1,6 @@
 import os
 import gzip
+import zstandard as zstd
 import uuid
 import heapq
 import asyncio
@@ -98,7 +99,7 @@ class SessionManager:
             def _thread_save():
                 path.parent.mkdir(parents=True, exist_ok=True)
                 serialized_bytes = json.dumps(data_copy, option=json.OPT_SERIALIZE_NUMPY | json.OPT_NON_STR_KEYS)
-                compressed_bytes = gzip.compress(serialized_bytes, compresslevel=1)
+                compressed_bytes = zstd.ZstdCompressor(level=1).compress(serialized_bytes)
                 encrypted_compressed_bytes = self.cog.fernet.encrypt(compressed_bytes)
 
                 temp_path = path.with_suffix(path.suffix + '.tmp')
@@ -125,7 +126,10 @@ class SessionManager:
                 with open(path, 'rb') as f:
                     encrypted_compressed_bytes = f.read()
                 decrypted_compressed_bytes = self.cog.fernet.decrypt(encrypted_compressed_bytes)
-                json_bytes = gzip.decompress(decrypted_compressed_bytes)
+                try:
+                    json_bytes = zstd.ZstdDecompressor().decompress(decrypted_compressed_bytes)
+                except zstd.ZstdError:
+                    json_bytes = gzip.decompress(decrypted_compressed_bytes)
                 if not json_bytes: return None
                 return json.loads(json_bytes)
 
@@ -170,7 +174,7 @@ class SessionManager:
 
             else:
                 return data
-        except (gzip.BadGzipFile, json.JSONDecodeError, InvalidToken):
+        except (gzip.BadGzipFile, zstd.ZstdError, json.JSONDecodeError, InvalidToken):
              print(f"Warning: Corrupted or old-format session file for key {session_key}. Deleting file.")
              await self._delete_session_from_disk(session_key, session_type)
         except Exception as e:
@@ -858,3 +862,40 @@ class SessionManager:
             task.cancel()
             self.cog.background_tasks.add(task)
             task.add_done_callback(self.cog.background_tasks.discard)
+
+    async def cancel_channel_operations(self, channel_id: int):
+        """Forcefully cancels all active generation, workers, typing, and queued tasks for a channel."""
+        session = self.cog.multi_profile_channels.get(channel_id)
+        if session:
+            session['is_running'] = False
+            session['is_regenerating'] = False
+            session['is_purging'] = False
+
+            # Drain task queue completely
+            q = session.get('task_queue')
+            if q:
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                        q.task_done()
+                    except (asyncio.QueueEmpty, ValueError):
+                        break
+
+            # Cancel running session worker task
+            worker_task = session.get('worker_task')
+            if worker_task and not worker_task.done():
+                self._safe_cancel_task(worker_task)
+                session['worker_task'] = None
+
+            # Cancel any in-flight regeneration tasks
+            for msg_id, r_task in list(session.get('regen_tasks', {}).items()):
+                if r_task and not r_task.done():
+                    r_task.cancel()
+            session.get('regen_tasks', {}).clear()
+
+        # Stop active child bot typing tasks in this channel
+        for bot_id in list(self.cog.child_bots.keys()):
+            await self.cog.child_bot_manager.stop_typing(bot_id, channel_id)
+
+        # Purge pending image generation requests
+        self.cog.media_service._purge_channel_image_requests(channel_id)

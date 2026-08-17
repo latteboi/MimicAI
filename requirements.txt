@@ -11,3 +11,4 @@ dotenv
 fernet
 Pillow
 google-cloud-secret-manager
+zstandard

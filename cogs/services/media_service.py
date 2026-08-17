@@ -771,3 +771,33 @@ class MediaService:
         except Exception as e:
             await message.reply(f"An error occurred while queueing your request: {e}", delete_after=10)
             traceback.print_exc()
+
+    def _purge_channel_image_requests(self, channel_id: int):
+        """Purges any pending image generation requests for a given channel from queues."""
+        items = []
+        while not self.cog.image_request_queue.empty():
+            try:
+                item = self.cog.image_request_queue.get_nowait()
+                _, _, req_data = item
+                if req_data.get('channel_id') != channel_id:
+                    items.append(item)
+                else:
+                    self.cog.image_request_queue.task_done()
+            except (asyncio.QueueEmpty, ValueError):
+                break
+        for item in items:
+            self.cog.image_request_queue.put_nowait(item)
+
+        text_items = []
+        while not self.cog.text_request_queue.empty():
+            try:
+                item = self.cog.text_request_queue.get_nowait()
+                _, _, req_data = item
+                if req_data.get('channel_id') != channel_id:
+                    text_items.append(item)
+                else:
+                    self.cog.text_request_queue.task_done()
+            except (asyncio.QueueEmpty, ValueError):
+                break
+        for item in text_items:
+            self.cog.text_request_queue.put_nowait(item)

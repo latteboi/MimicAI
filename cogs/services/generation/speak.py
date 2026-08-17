@@ -121,27 +121,15 @@ class SpeakAsMixin:
 
         sent_messages = []
         if delivery_method == 'child_bot' and child_bot_id:
-            correlation_id = str(uuid.uuid4())
-
-            if session:
-                participant_data = next((p for p in session.get("profiles", []) if p.get("owner_id") == user_id and p.get("profile_name") == profile_name), None)
-                self.cog.pending_child_confirmations[correlation_id] = {
-                    "type": "multi_profile", "participant": participant_data,
-                    "history_line": history_line, "channel_id": channel.id, "turn_id": turn_id,
-                    "is_speak_as": True
-                }
-
-            await self.cog.manager_queue.put({
-                "action": "send_to_child", "bot_id": child_bot_id,
-                "payload": {
-                    "action": "send_message", "channel_id": channel.id, "content": display_message,
-                    "realistic_typing": profile_data_source.get("realistic_typing_enabled", False),
-                    "typing_cps": profile_data_source.get("typing_cps", 30.0),
-                    "typing_max_delay": profile_data_source.get("typing_max_delay", 2.5),
-                    "typing_mode": profile_data_source.get("typing_mode", "sentence"),
-                    "correlation_id": correlation_id
-                }
-            })
+            payload = {
+                "channel_id": channel.id,
+                "content": display_message,
+                "realistic_typing": profile_data_source.get("realistic_typing_enabled", False),
+                "typing_cps": profile_data_source.get("typing_cps", 30.0),
+                "typing_max_delay": profile_data_source.get("typing_max_delay", 2.5),
+                "typing_mode": profile_data_source.get("typing_mode", "sentence")
+            }
+            sent_messages = await self.cog.child_bot_manager.execute_send(child_bot_id, payload)
         else:
             sent_messages = await self._send_channel_message(
                 channel, display_message,
@@ -149,9 +137,10 @@ class SpeakAsMixin:
                 profile_name_for_appearance=effective_profile_name
             )
 
-        if sent_messages and turn_object:
+        if sent_messages and turn_object and session:
             for msg in sent_messages:
                 turn_object.setdefault("message_ids", []).append(msg.id)
+            session['last_bot_message_id'] = sent_messages[-1].id
             await self.cog.session_manager._save_session_to_disk((channel.id, None, None), session.get("type", "multi"), session["unified_log"])
 
         await interaction_to_respond.followup.send("Message sent.", ephemeral=True)

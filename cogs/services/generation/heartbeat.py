@@ -66,24 +66,13 @@ class HeartbeatMixin:
             backoff *= 2.0
 
     async def _send_child_bot_placeholder(self, bot_id: str, channel_id: int, custom_emoji: str) -> Optional[int]:
-        corr_id = str(uuid.uuid4())
-        conf_event = asyncio.Event()
-        conf_data = {"event": conf_event, "type": "heartbeat_placeholder"}
-        self.cog.pending_child_confirmations[corr_id] = conf_data
-
-        await self.cog.manager_queue.put({
-            "action": "send_to_child", "bot_id": bot_id,
-            "payload": {
-                "action": "send_message", "channel_id": channel_id,
-                "content": custom_emoji, "realistic_typing": False, "correlation_id": corr_id
-            }
+        sent = await self.cog.child_bot_manager.execute_send(bot_id, {
+            "channel_id": channel_id,
+            "content": custom_emoji,
+            "realistic_typing": False
         })
-        try:
-            await asyncio.wait_for(conf_event.wait(), timeout=5.0)
-            msg_ids = conf_data.get("message_ids", [])
-            if msg_ids: return msg_ids[-1]
-        except asyncio.TimeoutError: pass
-        finally: self.cog.pending_child_confirmations.pop(corr_id, None)
+        if sent:
+            return sent[-1].id
         return None
 
     async def _generate_with_heartbeat(self, model, contents, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name='Bot', app_avatar=None, existing_state=None, message_type="text"):

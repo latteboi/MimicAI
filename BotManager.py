@@ -1,10 +1,8 @@
 import asyncio
 import discord
 from discord.ext import commands
-import subprocess
 import orjson as json
 from cryptography.fernet import Fernet
-import websockets
 import signal
 import platform
 import os
@@ -22,127 +20,8 @@ if os.getenv("MANUAL_AUTH_MODE", "False").lower() == "true":
 
 from cogs.utils.constants import defaultConfig
 
-# --- Global State for Orchestration ---
-active_child_processes = {}  # Maps bot_id_str -> subprocess.Popen object
-ipc_connections = {}         # Maps bot_id_str -> websocket connection
+# --- Global Queue for Cog Dispatch ---
 manager_queue = asyncio.Queue()
-IPC_HOST = "127.0.0.1"
-IPC_PORT = 8765
-
-# --- IPC Server Logic ---
-async def ipc_server_handler(websocket, path=None):
-    # We only expect ONE connection now: The Hive.
-    # But we keep the dict structure for compatibility with MimicCog sending to "bot_id"
-    try:
-        # Wait for identification
-        msg = await websocket.recv()
-        data = json.loads(msg)
-        
-        if data.get('action') == 'identify_hive':
-            print("IPC: Hive Connected.")
-            
-            # Ensure the main bot is logged in so we have its user ID
-            while not bot.is_ready():
-                if bot.is_closed():
-                    print("IPC: Main bot is closed, aborting handler.")
-                    return
-                await asyncio.sleep(0.5)
-            
-            # Register this SINGLE socket as the route for ALL known child bots
-            # This is a bit of a hack to make MimicCog's "send_to_child" logic work seamlessly.
-            # MimicCog sends to "12345", we need to know "12345" lives on this socket.
-            # Since we only have one Hive, we can just map 'hive' -> websocket
-            ipc_connections['hive'] = websocket
-            
-            # Launch all configured bots
-            print(f"IPC: Launching {len(bot.child_bot_config)} bots into the Hive...")
-            for bot_id, config in bot.child_bot_config.items():
-                try:
-                    try:
-                        token = fernet.decrypt(config['token_encrypted'].encode()).decode()
-                    except Exception:
-                        token = config['token_encrypted']
-                    await websocket.send(json.dumps({
-                        "action": "launch",
-                        "bot_id": bot_id,
-                        "token": token,
-                        "parent_id": bot.user.id,
-                        "parent_name": bot.user.name,
-                        "owner_id": config.get("owner_id"),
-                        "profile_name": config.get("profile_name"),
-                        "profile_id": config.get("pid"),
-                        "presence": config.get("presence")
-                    }))
-                except Exception as e:
-                    print(f"Failed to launch {bot_id}: {e}")
-
-            # Listen for events from Hive
-            async for message in websocket:
-                event_data = json.loads(message)
-                mimic_cog = bot.get_cog("MimicCog")
-                if mimic_cog:
-                    event_type = event_data.get("event_type")
-                    action = event_data.get("action")
-
-                    if event_type == "message_sent_confirmation":
-                        asyncio.create_task(mimic_cog.child_bot_manager.handle_child_bot_confirmation(event_data))
-                    elif action == "toggle_session_participation":
-                        asyncio.create_task(mimic_cog.child_bot_manager.handle_child_bot_toggle(event_data))
-                    elif action == "update_presence":
-                        asyncio.create_task(mimic_cog.child_bot_manager.handle_child_bot_presence(event_data))
-
-    except websockets.exceptions.ConnectionClosed:
-        print("IPC: Hive disconnected.")
-        ipc_connections.pop('hive', None)
-
-# --- Manager Task for Real-Time Actions ---
-async def manager_task():
-    print("Manager task started.")
-    while True:
-        command = await manager_queue.get()
-        action = command.get('action')
-        
-        ws = ipc_connections.get('hive')
-
-        if action == 'launch_bot':
-            # New bot created at runtime
-            bot_id = command.get('bot_id')
-            token = command.get('token')
-            config = command.get('config')
-            bot.child_bot_config[bot_id] = config
-            
-            if ws:
-                await ws.send(json.dumps({
-                    "action": "launch",
-                    "bot_id": bot_id,
-                    "token": token,
-                    "parent_id": bot.user.id,
-                    "parent_name": bot.user.name,
-                    "owner_id": config.get("owner_id"),
-                    "profile_name": config.get("profile_name"),
-                    "profile_id": config.get("pid"),
-                    "presence": config.get("presence")
-                }))
-
-        elif action == 'shutdown_bot':
-            bot_id = command.get('bot_id')
-            bot.child_bot_config.pop(bot_id, None)
-            if ws:
-                await ws.send(json.dumps({
-                    "action": "shutdown",
-                    "bot_id": bot_id
-                }))
-        
-        elif action == 'send_to_child':
-            # Route to Hive
-            if ws:
-                # Wrap the payload to tell Hive which bot it's for
-                wrapper = {
-                    "action": "send_to_child",
-                    "bot_id": command.get('bot_id'),
-                    "payload": command.get('payload')
-                }
-                await ws.send(json.dumps(wrapper))
 
 # --- Intents Setup ---
 intents = discord.Intents.default()
@@ -280,18 +159,6 @@ async def main():
     await bot.load_extension("cogs.MimicCog")
     print("MimicCog loaded successfully.")
 
-    # Start IPC Server and Manager Task
-    ipc_server = await websockets.serve(ipc_server_handler, IPC_HOST, IPC_PORT, max_size=2**24)
-    print(f"IPC Server started on ws://{IPC_HOST}:{IPC_PORT}")
-    manager_task_handle = asyncio.create_task(manager_task())
-
-    # Initial launch of child bots
-    print("Launching Hive process...")
-    # Use absolute path for Windows compatibility
-    script_path = os.path.join(os.path.dirname(__file__), 'child_bot.py')
-    proc = subprocess.Popen([sys.executable, script_path, f"ws://{IPC_HOST}:{IPC_PORT}"])
-    active_child_processes['hive'] = proc
-
     # Start the main bot
     async def runner():
         async with bot:
@@ -308,29 +175,10 @@ async def main():
         await runner()
     finally:
         # Graceful shutdown
-        print("Shutting down main bot and child processes...")
-        
-        manager_task_handle.cancel()
-        
-        for bot_id, proc in list(active_child_processes.items()):
-            print(f" - Terminating child bot {bot_id}...")
-            proc.terminate()
-            
-        if ipc_server.is_serving():
-            ipc_server.close()
-            try:
-                await asyncio.wait_for(ipc_server.wait_closed(), timeout=3.0)
-            except asyncio.TimeoutError:
-                print("IPC server wait_closed timed out.")
-        
-        # Wait for all processes to terminate
-        for bot_id, proc in list(active_child_processes.items()):
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                print(f"   - Child bot {bot_id} did not terminate gracefully, killing.")
-                proc.kill()
-        
+        print("Shutting down bot instance...")
+        mimic_cog = bot.get_cog("MimicCog")
+        if mimic_cog and hasattr(mimic_cog, "child_bot_manager"):
+            await mimic_cog.child_bot_manager.shutdown_all()
         print("All processes terminated. Exiting.")
 
 # --- Run the bot ---

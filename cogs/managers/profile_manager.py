@@ -5,6 +5,7 @@ import uuid
 import shutil
 import base64
 import gzip
+import zstandard as zstd
 import datetime
 import asyncio
 import traceback
@@ -761,7 +762,7 @@ class ProfileManager:
             raw_export_data["profiles"][name] = p_entry
 
         raw_json_bytes = json.dumps(raw_export_data)
-        compressed_payload = gzip.compress(raw_json_bytes, compresslevel=1)
+        compressed_payload = zstd.ZstdCompressor(level=1).compress(raw_json_bytes)
         export_container = {
             "mimic_version": "3.0",
         }
@@ -833,10 +834,13 @@ class ProfileManager:
                     raise ValueError("Master key decryption failed. This file belongs to a different MimicAI instance and cannot be imported here without a passphrase migration export.")
 
             try:
-                raw_json_bytes = gzip.decompress(decrypted_bytes)
-            except gzip.BadGzipFile:
-                # Backward compatibility fallback for uncompressed legacy v3 exports
-                raw_json_bytes = decrypted_bytes
+                raw_json_bytes = zstd.ZstdDecompressor().decompress(decrypted_bytes)
+            except zstd.ZstdError:
+                try:
+                    raw_json_bytes = gzip.decompress(decrypted_bytes)
+                except gzip.BadGzipFile:
+                    # Backward compatibility fallback for uncompressed legacy v3 exports
+                    raw_json_bytes = decrypted_bytes
 
             data = json.loads(raw_json_bytes)
             

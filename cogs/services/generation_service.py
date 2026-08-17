@@ -57,10 +57,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             print(f"Worker for channel {channel_id} could not hydrate session. Aborting.")
             return
 
-        # Flag starts as False; it will be toggled within the loop
+        # Ensure task queue is firmly initialised
+        if 'task_queue' not in session or session['task_queue'] is None:
+            session['task_queue'] = asyncio.Queue()
+
         session['is_running'] = False
-        
-        # Local cache to prevent processing the same message ID multiple times in a short loop
         recent_processed_ids = collections.deque(maxlen=20)
         
         while True:
@@ -74,7 +75,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     while session.get('is_purging') or session.get('is_regenerating'):
                         await asyncio.sleep(0.5)
                         
-                    # Round has officially started
                     session['is_running'] = True
 
                 except asyncio.CancelledError:
@@ -87,7 +87,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     except asyncio.QueueEmpty: break
                 
                 # [NEW] Filter out cancelled reaction triggers
-                valid_triggers =[]
+                valid_triggers = []
                 for t in all_triggers_for_round:
                     if isinstance(t, tuple) and t[0] in ['reaction', 'reaction_single']:
                         cancellation_key = (t[1].message_id, str(t[1].emoji))
@@ -640,7 +640,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         feedback_task = asyncio.create_task(self._send_channel_message(
                             channel, f"{PLACEHOLDER_EMOJI}",
                             profile_owner_id_for_appearance=first_participant['owner_id'], 
-                            profile_name_for_appearance=first_participant['profile_name']
+                            profile_name_for_appearance=first_participant['profile_name'],
+                            bypass_typing=True
                         ))
 
                 grounding_context, grounding_sources = None, []
@@ -1352,10 +1353,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         
                         if model:
                             try:
-                                gen_task = asyncio.create_task(self._generate_with_heartbeat(
-                                    model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
-                                ))
-
                                 if feedback_task_i:
                                     try:
                                         feedback_result_i = await feedback_task_i
@@ -1373,6 +1370,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                             state_container['msg_a_id'] = msg_a_id
                                     except Exception as e:
                                         print(f"Feedback task error: {e}")
+
+                                gen_task = asyncio.create_task(self._generate_with_heartbeat(
+                                    model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
+                                ))
 
                                 response, state_container = await gen_task
 
@@ -1736,25 +1737,18 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # Stop any pending sending heartbeat task immediately
                         if state_container and state_container.get('sending_task'):
                             state_container['sending_task'].cancel()
-                            
-                        # Delete any active placeholder message before child bot begins delivering the final response
+
+                        # Delete placeholder before child bot delivers
                         msg_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
                         if msg_to_delete:
                             await self._safe_delete_placeholder(channel, msg_to_delete, bot_id=participant.get('bot_id'))
                             if state_container:
                                 state_container['msg_a_id'] = None
-                            
-                        correlation_id = str(uuid.uuid4())
-                        confirmation_event = asyncio.Event()
-                        self.cog.pending_child_confirmations[correlation_id] = {
-                            "event": confirmation_event, "type": "multi_profile", "participant": participant,
-                            "history_line": history_line, "channel_id": channel.id, "turn_id": turn_id
-                        }
-                        
+
                         rmode = profile_settings.get("response_mode", "regular")
                         reply_id = None
                         should_ping = False
-                        
+
                         if i == 0:
                             if anchor_message and rmode == "mention":
                                 display_text = f"{anchor_message.author.mention} {display_text}"
@@ -1762,15 +1756,14 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             should_ping = (rmode == "mention_reply")
 
                         payload = {
-                            "action": "send_message", "channel_id": channel.id, "content": display_text,
-                            "realistic_typing": is_realistic_typing, 
+                            "channel_id": channel.id, "content": display_text,
+                            "realistic_typing": is_realistic_typing,
                             "typing_cps": profile_settings.get("typing_cps", 30.0),
                             "typing_max_delay": profile_settings.get("typing_max_delay", 2.5),
                             "typing_mode": profile_settings.get("typing_mode", "sentence"),
-                            "correlation_id": correlation_id,
                             "reply_to_id": reply_id, "ping": should_ping
                         }
-                        
+
                         if file_to_send:
                             attachment_data = None
                             if is_generator and generated_image_path_for_round:
@@ -1791,80 +1784,47 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             if attachment_data:
                                 payload["attachment"] = attachment_data
 
-                        await self.cog.manager_queue.put({"action": "send_to_child", "bot_id": participant['bot_id'], "payload": payload})
-                        del payload
+                        # Direct in-process execution (replaces 45-second queue wait)
+                        sent_child_messages = await self.cog.child_bot_manager.execute_send(participant['bot_id'], payload)
+                        
+                        if sent_child_messages:
+                            session['last_bot_message_id'] = sent_child_messages[-1].id
+                            for sm in sent_child_messages:
+                                turn_object.setdefault("message_ids", []).append(sm.id)
 
-                        try: await asyncio.wait_for(confirmation_event.wait(), timeout=45.0)
-                        except asyncio.TimeoutError: self.cog.pending_child_confirmations.pop(correlation_id, None)
-
-                        # Dispatch sources for Child Bot
+                        # Dispatch citation sources directly
                         if sources_text_list:
                             for source_msg in sources_text_list:
-                                s_corr_id = str(uuid.uuid4())
-                                s_conf_event = asyncio.Event()
-                                self.cog.pending_child_confirmations[s_corr_id] = {
-                                    "event": s_conf_event, "type": "multi_profile", "participant": participant,
-                                    "history_line": history_line, "channel_id": channel.id, "turn_id": turn_id
-                                }
-                                await self.cog.manager_queue.put({
-                                    "action": "send_to_child", "bot_id": participant['bot_id'],
-                                    "payload": {
-                                        "action": "send_message", "channel_id": channel.id, 
-                                        "content": source_msg, "realistic_typing": False, "correlation_id": s_corr_id,
-                                        "ping": False
-                                    }
+                                s_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
+                                    "channel_id": channel.id, "content": source_msg,
+                                    "realistic_typing": False, "reply_to_id": None, "ping": False
                                 })
-                                try: await asyncio.wait_for(s_conf_event.wait(), timeout=45.0)
-                                except asyncio.TimeoutError: self.cog.pending_child_confirmations.pop(s_corr_id, None)
+                                if s_msgs:
+                                    for sm in s_msgs:
+                                        turn_object.setdefault("message_ids", []).append(sm.id)
 
-                        # [NEW] Dispatch extra audio follow-up for Child Bot
-                        if extra_audio_file:
-                            a_corr_id = str(uuid.uuid4())
-                            a_conf_event = asyncio.Event()
-                            self.cog.pending_child_confirmations[a_corr_id] = {
-                                "event": a_conf_event, "type": "multi_profile", "participant": participant,
-                                "history_line": history_line, "channel_id": channel.id, "turn_id": turn_id
-                            }
+                        # Dispatch extra audio attachment directly
+                        if extra_audio_file and 'turn_audio_stream' in locals() and turn_audio_stream:
                             turn_audio_stream.seek(0)
-                            audio_base64 = base64.b64encode(turn_audio_stream.read()).decode('utf-8')
-                            await self.cog.manager_queue.put({
-                                "action": "send_to_child", "bot_id": participant['bot_id'],
-                                "payload": {
-                                    "action": "send_message", "channel_id": channel.id, 
-                                    "content": "", "realistic_typing": False, "correlation_id": a_corr_id,
-                                    "attachment": {
-                                        "filename": f"voice_{turn_id[:4]}.wav",
-                                        "data_base64": audio_base64
-                                    }
-                                }
+                            audio_b64 = base64.b64encode(turn_audio_stream.read()).decode('utf-8')
+                            a_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
+                                "channel_id": channel.id, "content": "", "realistic_typing": False,
+                                "attachment": {"filename": f"voice_{turn_id[:4]}.wav", "data_base64": audio_b64}
                             })
-                            try: await asyncio.wait_for(a_conf_event.wait(), timeout=45.0)
-                            except asyncio.TimeoutError: self.cog.pending_child_confirmations.pop(a_corr_id, None)
+                            if a_msgs:
+                                for sm in a_msgs:
+                                    turn_object.setdefault("message_ids", []).append(sm.id)
 
-                        if thought_file_to_send:
-                            t_corr_id = str(uuid.uuid4())
-                            t_conf_event = asyncio.Event()
-                            self.cog.pending_child_confirmations[t_corr_id] = {
-                                "event": t_conf_event, "type": "multi_profile", "participant": participant,
-                                "history_line": history_line, "channel_id": channel.id, "turn_id": turn_id
-                            }
-                            thought_text_bytes = thought_text.encode('utf-8')
-                            thought_base64 = base64.b64encode(thought_text_bytes).decode('utf-8')
-                            
-                            await self.cog.manager_queue.put({
-                                "action": "send_to_child", "bot_id": participant['bot_id'],
-                                "payload": {
-                                    "action": "send_message", "channel_id": channel.id, 
-                                    "content": "",
-                                    "realistic_typing": False, "correlation_id": t_corr_id,
-                                    "attachment": {
-                                        "filename": "thinking_summary.txt",
-                                        "data_base64": thought_base64
-                                    }
-                                }
+                        # Dispatch thinking summary directly
+                        if thought_file_to_send and thought_text:
+                            thought_b64 = base64.b64encode(thought_text.encode('utf-8')).decode('utf-8')
+                            t_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
+                                "channel_id": channel.id, "content": "", "realistic_typing": False,
+                                "attachment": {"filename": "thinking_summary.txt", "data_base64": thought_b64}
                             })
-                            try: await asyncio.wait_for(t_conf_event.wait(), timeout=45.0)
-                            except asyncio.TimeoutError: self.cog.pending_child_confirmations.pop(t_corr_id, None)
+                            if t_msgs:
+                                for sm in t_msgs:
+                                    turn_object.setdefault("message_ids", []).append(sm.id)
 
                     else: # Webhook logic
                         sent_messages = await self._send_channel_message(
@@ -1952,7 +1912,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     "payload": {"action": "start_typing", "channel_id": channel_id}
                                 })
 
-                        await asyncio.sleep(1.0)
+                        # Yield briefly to ensure Discord orders messages correctly
+                        await asyncio.sleep(0.2)
                         
                         batched_triggers = []
                         while not session['task_queue'].empty():
@@ -1960,6 +1921,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             except asyncio.QueueEmpty: break
                         
                         if batched_triggers:
+                            print(f"[DEBUG-WORKER] Found {len(batched_triggers)} mid-round triggers.")
                             for trigger in batched_triggers:
                                 # [UPDATED] Unpack structured tuples in mid-round batches to ensure all messages are read
                                 if isinstance(trigger, tuple) and len(trigger) > 1 and isinstance(trigger[1], discord.Message):
@@ -2076,7 +2038,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                 for trigger in all_triggers_for_round:
                     if trigger is not None:
-                        session['task_queue'].task_done()
+                        try:
+                            session['task_queue'].task_done()
+                        except (ValueError, RuntimeError):
+                            pass
 
                 # [FIXED] Round-End Memory Purge: Purge all generated and context data after all participants finish
                 if 'new_round_turn_data' in locals():
@@ -2129,21 +2094,28 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                         text_val = "\n".join(p if isinstance(p, str) else p.get('text', '') for p in parts)
                                         events_for_summary.append(text_val)
                                 
-                                _, _, _, temp, top_p, top_k, primary_model, _ = await asyncio.to_thread(
-                                    self._construct_system_instructions, owner_id, profile_name, channel_id, is_multi_profile=True
-                                )
-                                ltm_d = await self.cog.memory_manager._generate_ltm_data_from_history(events_for_summary, round_author_name, {"temperature": temp, "top_p": top_p, "top_k": top_k}, primary_model, guild_id, profile_owner_id=owner_id, profile_name=profile_name)
-                                if ltm_d:
-                                    summary_embedding = await self.cog.memory_manager._get_embedding(ltm_d, guild_id, task_type="RETRIEVAL_DOCUMENT")
-                                    if summary_embedding:
-                                        b64_emb = encode_embedding_b64(summary_embedding)
-                                        self.cog.memory_manager._add_ltm(owner_id, profile_name, ltm_d, b64_emb, guild_id, triggering_user_id, round_author_name)
-                                        
-                                        # [NEW] Link LTM creation to the turn metadata for trace transparency
-                                        bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
-                                        last_turn = next((t for t in reversed(session.get("unified_log", [])) if t.get("speaker_pid") == bot_pid), None)
-                                        if last_turn and "meta" in last_turn:
-                                            last_turn["meta"]["ltm_created"] = True
+                                # [FIX] Offload LTM generation to a background task so it doesn't block the queue
+                                async def background_ltm_gen(o_id, p_name, evts, r_author, g_id, t_user_id):
+                                    try:
+                                        _, _, _, temp, top_p, top_k, primary_model, _ = await asyncio.to_thread(
+                                            self._construct_system_instructions, o_id, p_name, channel_id, is_multi_profile=True
+                                        )
+                                        ltm_d = await self.cog.memory_manager._generate_ltm_data_from_history(evts, r_author, {"temperature": temp, "top_p": top_p, "top_k": top_k}, primary_model, g_id, profile_owner_id=o_id, profile_name=p_name)
+                                        if ltm_d:
+                                            summary_embedding = await self.cog.memory_manager._get_embedding(ltm_d, g_id, task_type="RETRIEVAL_DOCUMENT")
+                                            if summary_embedding:
+                                                b64_emb = encode_embedding_b64(summary_embedding)
+                                                self.cog.memory_manager._add_ltm(o_id, p_name, ltm_d, b64_emb, g_id, t_user_id, r_author)
+                                                
+                                                # Link LTM creation to the turn metadata for trace transparency
+                                                bot_pid = self.cog.profile_manager._get_pid_from_name_any(o_id, p_name)
+                                                last_turn = next((t for t in reversed(session.get("unified_log", [])) if t.get("speaker_pid") == bot_pid), None)
+                                                if last_turn and "meta" in last_turn:
+                                                    last_turn["meta"]["ltm_created"] = True
+                                    except Exception as e:
+                                        print(f"Background LTM generation failed for {p_name}: {e}")
+
+                                asyncio.create_task(background_ltm_gen(owner_id, profile_name, events_for_summary, round_author_name, guild_id, triggering_user_id))
                             
                             participant['ltm_counter'] = 0
 
