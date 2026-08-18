@@ -176,6 +176,184 @@ class ProfileManager:
                 pass
         return None
 
+    def _migrate_all_profiles_to_unified(self):
+        """One-time proactive migration that consolidates name.txt, config.json.gz,
+        borrowed_config.json.gz, prompts.json.gz, and child_bot.json.gz into a single profile.json.gz.
+        """
+        if not os.path.isdir(USERS_DIR):
+            return
+        
+        migrated_count = 0
+        for user_id_str in os.listdir(USERS_DIR):
+            if not user_id_str.isdigit():
+                continue
+            profiles_dir = os.path.join(USERS_DIR, user_id_str, "profiles")
+            if not os.path.isdir(profiles_dir):
+                continue
+            
+            for pid_folder in os.listdir(profiles_dir):
+                p_dir = os.path.join(profiles_dir, pid_folder)
+                if not os.path.isdir(p_dir):
+                    continue
+                
+                unified_path = os.path.join(p_dir, "profile.json.gz")
+                name_file = os.path.join(p_dir, "name.txt")
+                config_file = os.path.join(p_dir, "config.json.gz")
+                borrowed_file = os.path.join(p_dir, "borrowed_config.json.gz")
+                prompts_file = os.path.join(p_dir, "prompts.json.gz")
+                child_file = os.path.join(p_dir, "child_bot.json.gz")
+
+                legacy_exists = any(os.path.exists(f) for f in [name_file, config_file, borrowed_file, prompts_file, child_file])
+                if legacy_exists:
+                    p_name = pid_folder
+                    if os.path.exists(name_file):
+                        try:
+                            with open(name_file, 'r', encoding='utf-8') as nf:
+                                p_name = nf.read().strip() or pid_folder
+                        except Exception:
+                            pass
+                    
+                    config_data = None
+                    if os.path.exists(borrowed_file):
+                        config_data = IOManager.read_json_gzip(borrowed_file, self.cog.fernet)
+                    elif os.path.exists(config_file):
+                        config_data = IOManager.read_json_gzip(config_file, self.cog.fernet)
+
+                    prompts_data = None
+                    if os.path.exists(prompts_file):
+                        prompts_data = IOManager.read_json_gzip(prompts_file, self.cog.fernet)
+
+                    child_bot_data = None
+                    if os.path.exists(child_file):
+                        child_bot_data = IOManager.read_json_gzip(child_file, encrypted=False)
+
+                    unified_data = {
+                        "name": p_name,
+                        "config": config_data or {},
+                        "prompts": prompts_data or {},
+                        "child_bot": child_bot_data
+                    }
+                    IOManager.write_json_gzip(unified_data, unified_path, self.cog.fernet)
+
+                    for legacy_path in [name_file, config_file, borrowed_file, prompts_file, child_file]:
+                        if os.path.exists(legacy_path):
+                            try:
+                                os.remove(legacy_path)
+                            except OSError:
+                                pass
+                    migrated_count += 1
+
+        if migrated_count > 0:
+            print(f"[ProfileManager] Successfully migrated {migrated_count} profile(s) to unified profile.json.gz.")
+
+    def _get_profile(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> Optional[Dict[str, Any]]:
+        if not profile_name:
+            return None
+        pid = self._get_pid_from_name(user_id, profile_name, is_borrowed)
+        if not pid:
+            return None
+        return self._get_profile_by_pid(user_id, pid)
+
+    def _save_profile(self, user_id: int, profile_name: str, data: Dict[str, Any], is_borrowed: bool = False):
+        if not profile_name:
+            return
+        pid = self._get_pid_from_name(user_id, profile_name, is_borrowed)
+        if not pid:
+            return
+        self._save_profile_by_pid(user_id, pid, data)
+
+    def _get_profile_by_pid(self, user_id: int, pid: str) -> Optional[Dict[str, Any]]:
+        if not pid:
+            return None
+        path = os.path.join(USERS_DIR, str(user_id), "profiles", pid, "profile.json.gz")
+        return IOManager.read_json_gzip(path, self.cog.fernet)
+
+    def _save_profile_by_pid(self, user_id: int, pid: str, data: Dict[str, Any]):
+        if not pid:
+            return
+        p_dir = os.path.join(USERS_DIR, str(user_id), "profiles", pid)
+        os.makedirs(p_dir, exist_ok=True)
+        path = os.path.join(p_dir, "profile.json.gz")
+        IOManager.write_json_gzip(data, path, self.cog.fernet)
+
+    def _set_child_bot_config(self, user_id: int, profile_name: str, bot_config: Dict[str, Any]):
+        p_data = self._get_profile(user_id, profile_name, is_borrowed=False)
+        if p_data is not None:
+            p_data["child_bot"] = bot_config
+            self._save_profile(user_id, profile_name, p_data, is_borrowed=False)
+
+    def _delete_child_bot_config(self, user_id: int, profile_name: str):
+        p_data = self._get_profile(user_id, profile_name, is_borrowed=False)
+        if p_data is not None and p_data.get("child_bot"):
+            p_data["child_bot"] = None
+            self._save_profile(user_id, profile_name, p_data, is_borrowed=False)
+
+    def _update_child_bot_presence(self, user_id: int, profile_name: str, presence_update: Dict[str, Any]) -> Dict[str, Any]:
+        p_data = self._get_profile(user_id, profile_name, is_borrowed=False)
+        if not p_data:
+            return {}
+        bot_cfg = p_data.get("child_bot") or {}
+        current_presence = bot_cfg.get("presence", {})
+        current_presence.update(presence_update)
+        bot_cfg["presence"] = current_presence
+        p_data["child_bot"] = bot_cfg
+        self._save_profile(user_id, profile_name, p_data, is_borrowed=False)
+        return current_presence
+
+    def _rename_profile(self, user_id: int, old_name: str, new_name: str, is_borrowed: bool = False) -> bool:
+        user_index = self._get_user_index(user_id)
+        list_key = "borrowed" if is_borrowed else "personal"
+        
+        if old_name not in user_index.get(list_key, {}):
+            return False
+            
+        pid = user_index[list_key].pop(old_name)
+        user_index[list_key][new_name] = pid
+        self._save_user_index(user_id, user_index)
+        
+        p_data = self._get_profile_by_pid(user_id, pid)
+        if p_data:
+            p_data["name"] = new_name
+            self._save_profile_by_pid(user_id, pid, p_data)
+        return True
+
+    def _duplicate_profile(self, user_id: int, source_name: str, target_name: str) -> Tuple[bool, str]:
+        user_index = self._get_user_index(user_id)
+        limit = defaultConfig.LIMIT_PROFILES_PREMIUM if self.is_user_premium(user_id) else defaultConfig.LIMIT_PROFILES_FREE
+        if len(user_index.get("personal", {})) >= limit:
+            return False, "Limit reached."
+
+        source_pid = self._get_pid_from_name_any(user_id, source_name)
+        source_data = self._get_profile_by_pid(user_id, source_pid)
+        if not source_data:
+            return False, "Source profile data not found."
+
+        new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
+        new_data = {
+            "name": target_name,
+            "config": source_data.get("config", {}).copy(),
+            "prompts": source_data.get("prompts", {}).copy(),
+            "child_bot": None
+        }
+        new_data["config"]["profile_id"] = str(uuid.uuid4().hex[:8].upper())
+        new_data["config"]["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        self._save_profile_by_pid(user_id, new_pid, new_data)
+
+        if not isinstance(user_index.get("personal"), dict):
+            legacy_personal = user_index.get("personal", [])
+            user_index["personal"] = {}
+            if isinstance(legacy_personal, list):
+                for p_name in legacy_personal:
+                    user_index["personal"][p_name] = p_name
+
+        user_index["personal"][target_name] = new_pid
+        self._save_user_index(user_id, user_index)
+
+        self.cog.memory_manager._copy_ltm_shard(str(user_id), source_name, target_name)
+        self.cog.memory_manager._copy_training_shard(str(user_id), source_name, target_name)
+        return True, f"Duplicated to '{target_name}'."
+
     def _repair_user_index(self, user_id: int) -> Dict[str, Any]:
         """Scans the user's profile directory to reconstruct a missing or corrupted index.json."""
         user_id_str = str(user_id)
@@ -189,41 +367,16 @@ class ProfileManager:
                 if not os.path.isdir(p_dir):
                     continue
 
-                # Determine profile name (fallback to folder name if name.txt is missing)
-                p_name = pid_folder
-                name_file = os.path.join(p_dir, "name.txt")
-                if os.path.exists(name_file):
-                    try:
-                        with open(name_file, 'r', encoding='utf-8') as f:
-                            p_name = f.read().strip()
-                    except Exception:
-                        pass
+                profile_path = os.path.join(p_dir, "profile.json.gz")
+                if not os.path.exists(profile_path):
+                    continue
 
-                is_borrowed = False
-                if os.path.exists(os.path.join(p_dir, "borrowed_config.json.gz")):
-                    is_borrowed = True
-                elif not os.path.exists(os.path.join(p_dir, "config.json.gz")):
-                    continue # Neither exists, invalid folder
+                profile_data = IOManager.read_json_gzip(profile_path, self.cog.fernet) or {}
+                p_name = profile_data.get("name") or pid_folder
+                config_data = profile_data.get("config", {})
 
-                # Deep fallback for missing name.txt
-                if p_name == pid_folder:
-                    config_path = os.path.join(p_dir, "borrowed_config.json.gz" if is_borrowed else "config.json.gz")
-                    try:
-                        config_data = IOManager.read_json_gzip(config_path, self.cog.fernet)
-                        if config_data:
-                            if is_borrowed and config_data.get("original_profile_name"):
-                                p_name = config_data["original_profile_name"]
-                            elif not is_borrowed and config_data.get("custom_display_name"):
-                                p_name = config_data["custom_display_name"]
+                is_borrowed = bool(config_data.get("original_owner_id"))
 
-                            # If we successfully recovered a name, save it for the future
-                            if p_name != pid_folder:
-                                with open(name_file, 'w', encoding='utf-8') as f:
-                                    f.write(p_name)
-                    except Exception:
-                        pass
-
-                # Determine profile type
                 if is_borrowed:
                     index["borrowed"][p_name] = pid_folder
                 elif pid_folder.startswith("X"):
@@ -234,26 +387,20 @@ class ProfileManager:
                     index["personal"][p_name] = pid_folder
 
             keys_path = os.path.join(USERS_DIR, user_id_str, "keys.json.gz")
+            index["has_personal_key"] = False
             if os.path.exists(keys_path):
                 keys_data = IOManager.read_json_gzip(keys_path, self.cog.fernet)
-                if keys_data and (keys_data.get("key") or keys_data.get("openrouter_key")):
+                if keys_data and (keys_data.get("key") or keys_data.get("slots")):
                     index["has_personal_key"] = True
-                else:
-                    index["has_personal_key"] = False
-            else:
-                index["has_personal_key"] = False
 
             self._save_user_index(user_id, index)
         else:
             keys_path = os.path.join(USERS_DIR, user_id_str, "keys.json.gz")
+            index["has_personal_key"] = False
             if os.path.exists(keys_path):
                 keys_data = IOManager.read_json_gzip(keys_path, self.cog.fernet)
-                if keys_data and (keys_data.get("key") or keys_data.get("openrouter_key")):
+                if keys_data and (keys_data.get("key") or keys_data.get("slots")):
                     index["has_personal_key"] = True
-                else:
-                    index["has_personal_key"] = False
-            else:
-                index["has_personal_key"] = False
 
             self._save_user_index(user_id, index)
 
@@ -278,7 +425,6 @@ class ProfileManager:
         path = os.path.join(USERS_DIR, user_id_str, "index.json")
         index = IOManager.read_json(path)
 
-        # Trigger automatic repair if the index is missing or using the deprecated array format
         if not index or not isinstance(index.get("personal"), dict) or not isinstance(index.get("borrowed"), dict):
             index = self._repair_user_index(user_id)
 
@@ -292,41 +438,29 @@ class ProfileManager:
         self.cog.user_indices[user_id_str] = data
 
     def _get_profile_config(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> Optional[Dict[str, Any]]:
-        if not profile_name: return None
-
-        pid = self._get_pid_from_name(user_id, profile_name, is_borrowed)
-        if not pid: return None
-        filename = "borrowed_config.json.gz" if is_borrowed else "config.json.gz"
-        path = os.path.join(USERS_DIR, str(user_id), "profiles", pid, filename)
-        local_data = IOManager.read_json_gzip(path, self.cog.fernet)
-
-        if local_data is not None:
-            if not is_borrowed and "profile_id" not in local_data:
-                local_data["profile_id"] = str(uuid.uuid4().hex[:8].upper())
-                IOManager.write_json_gzip(local_data, path, self.cog.fernet)
-
-            return local_data
-
+        p_data = self._get_profile(user_id, profile_name, is_borrowed)
+        if p_data is not None:
+            config = p_data.get("config", {})
+            if not is_borrowed and "profile_id" not in config:
+                config["profile_id"] = str(uuid.uuid4().hex[:8].upper())
+                p_data["config"] = config
+                self._save_profile(user_id, profile_name, p_data, is_borrowed)
+            return config
         return None
 
     def _save_profile_config(self, user_id: int, profile_name: str, data: Dict[str, Any], is_borrowed: bool = False):
-        if not profile_name: return
-        pid = self._get_pid_from_name(user_id, profile_name, is_borrowed)
-        if not pid: return
-        filename = "borrowed_config.json.gz" if is_borrowed else "config.json.gz"
-
-        p_dir = os.path.join(USERS_DIR, str(user_id), "profiles", pid)
-        path = os.path.join(p_dir, filename)
-
-        IOManager.write_json_gzip(data, path, self.cog.fernet)
-
-        name_file = os.path.join(p_dir, "name.txt")
-        if not os.path.exists(name_file):
-            try:
-                with open(name_file, "w", encoding="utf-8") as f:
-                    f.write(profile_name)
-            except Exception:
-                pass
+        p_data = self._get_profile(user_id, profile_name, is_borrowed)
+        if p_data is None:
+            p_data = {
+                "name": profile_name,
+                "config": data,
+                "prompts": {},
+                "child_bot": None
+            }
+        else:
+            p_data["name"] = profile_name
+            p_data["config"] = data
+        self._save_profile(user_id, profile_name, p_data, is_borrowed)
 
     def _resolve_effective_profile(self, user_id: int, profile_name: str) -> Tuple[int, str]:
         owner_id = int(defaultConfig.DISCORD_OWNER_ID)
@@ -358,21 +492,27 @@ class ProfileManager:
         return data
 
     def _get_profile_prompts(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
-        if not profile_name: return None
-
         pid = self._get_pid_from_name_any(user_id, profile_name)
         if not pid: return None
-        path = os.path.join(USERS_DIR, str(user_id), "profiles", pid, "prompts.json.gz")
-        data = IOManager.read_json_gzip(path, self.cog.fernet)
-
-        return data
+        p_data = self._get_profile_by_pid(user_id, pid)
+        if p_data is not None:
+            return p_data.get("prompts", {})
+        return None
 
     def _save_profile_prompts(self, user_id: int, profile_name: str, data: Dict[str, Any]):
-        if not profile_name: return
         pid = self._get_pid_from_name_any(user_id, profile_name)
         if not pid: return
-        path = os.path.join(USERS_DIR, str(user_id), "profiles", pid, "prompts.json.gz")
-        IOManager.write_json_gzip(data, path, self.cog.fernet)
+        p_data = self._get_profile_by_pid(user_id, pid)
+        if p_data is None:
+            p_data = {
+                "name": profile_name,
+                "config": {},
+                "prompts": data,
+                "child_bot": None
+            }
+        else:
+            p_data["prompts"] = data
+        self._save_profile_by_pid(user_id, pid, p_data)
 
     def _get_or_create_user_profile(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
         profile_name = profile_name.lower().strip()
@@ -418,8 +558,13 @@ class ProfileManager:
                 "ltm_summarization_instructions": self.cog.storage_manager._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
             }
 
-            self._save_profile_config(user_id, profile_name, config)
-            self._save_profile_prompts(user_id, profile_name, prompts)
+            unified_profile = {
+                "name": profile_name,
+                "config": config,
+                "prompts": prompts,
+                "child_bot": None
+            }
+            self._save_profile(user_id, profile_name, unified_profile, False)
             return {"config": config, "prompts": prompts}
 
         return {"config": self._get_profile_config(user_id, profile_name), "prompts": self._get_profile_prompts(user_id, profile_name)}
@@ -468,13 +613,13 @@ class ProfileManager:
                 "ltm_summarization_instructions": self.cog.storage_manager._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
             }
 
-            p_dir = os.path.join(USERS_DIR, str(user_id), "profiles", pid)
-            os.makedirs(p_dir, exist_ok=True)
-            with open(os.path.join(p_dir, "name.txt"), "w", encoding="utf-8") as f:
-                f.write(profile_name)
-
-            self._save_profile_config(user_id, profile_name, config, False)
-            self._save_profile_prompts(user_id, profile_name, prompts)
+            unified_profile = {
+                "name": profile_name,
+                "config": config,
+                "prompts": prompts,
+                "child_bot": None
+            }
+            self._save_profile_by_pid(user_id, pid, unified_profile)
 
         return {"config": self._get_profile_config(user_id, profile_name), "prompts": self._get_profile_prompts(user_id, profile_name)}
 
@@ -733,12 +878,9 @@ class ProfileManager:
             p_dir = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", pid)
             if not os.path.exists(p_dir): continue
 
-            config_path = os.path.join(p_dir, "config.json.gz")
-            prompts_path = os.path.join(p_dir, "prompts.json.gz")
-            
-            config = self.cog.storage_manager._load_json_gzip(config_path) or {}
-            prompts = self.cog.storage_manager._load_json_gzip(prompts_path) or {}
-
+            p_data = self._get_profile_by_pid(user_id, pid) or {}
+            config = p_data.get("config", {}).copy()
+            prompts = p_data.get("prompts", {}).copy()
             config.pop("profile_id", None)
 
             p_entry = {
@@ -867,8 +1009,13 @@ class ProfileManager:
                 config["profile_id"] = new_pid
                 config["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-                self.cog.storage_manager._atomic_json_save_gzip(config, os.path.join(recip_dir, "config.json.gz"))
-                self.cog.storage_manager._atomic_json_save_gzip(prompts, os.path.join(recip_dir, "prompts.json.gz"))
+                unified_profile = {
+                    "name": local_name,
+                    "config": config,
+                    "prompts": prompts,
+                    "child_bot": None
+                }
+                self._save_profile_by_pid(user_id, new_pid, unified_profile)
 
                 ltm_list = p_data.get("ltm", [])
                 if ltm_list:
@@ -883,9 +1030,6 @@ class ProfileManager:
                         "custom_display_name": config.get("custom_display_name"),
                         "custom_avatar_url": config.get("custom_avatar_url")
                     }
-
-                with open(os.path.join(recip_dir, "name.txt"), "w", encoding="utf-8") as f:
-                    f.write(local_name)
 
                 if isinstance(index.get("personal"), dict):
                     index["personal"][local_name] = new_pid
@@ -1573,13 +1717,13 @@ class ProfileManager:
             index["borrowed"][desired_name] = pid
             self._save_user_index(interaction.user.id, index)
 
-            p_dir = os.path.join(self.cog.USERS_DIR, str(interaction.user.id), "profiles", pid)
-            os.makedirs(p_dir, exist_ok=True)
-
-            with open(os.path.join(p_dir, "name.txt"), "w", encoding="utf-8") as f:
-                f.write(desired_name)
-
-            self._save_profile_config(interaction.user.id, desired_name, snapshot_data, is_borrowed=True)
+            unified_borrowed = {
+                "name": desired_name,
+                "config": snapshot_data,
+                "prompts": {},
+                "child_bot": None
+            }
+            self._save_profile_by_pid(interaction.user.id, pid, unified_borrowed)
 
         await asyncio.to_thread(_sync_save)
 
@@ -1661,34 +1805,29 @@ class ProfileManager:
                 return False, "You have reached your personal profile limit."
 
             new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
-
             recip_dir = os.path.join(self.cog.USERS_DIR, recip_id_str, "profiles", new_pid)
-            os.makedirs(recip_dir, exist_ok=True)
 
             try:
-                src_prompts = os.path.join(src_dir, "prompts.json.gz")
-                if os.path.exists(src_prompts):
-                    shutil.copy2(src_prompts, os.path.join(recip_dir, "prompts.json.gz"))
+                src_data = self._get_profile_by_pid(owner_id, source_pid) or {}
+                config_data = src_data.get("config", {}).copy()
+                config_data["profile_id"] = new_pid
+                config_data["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-                src_config_file = os.path.join(src_dir, "config.json.gz")
-                if os.path.exists(src_config_file):
-                    config_data = self.cog.storage_manager._load_json_gzip(src_config_file) or {}
+                new_data = {
+                    "name": desired_name,
+                    "config": config_data,
+                    "prompts": src_data.get("prompts", {}).copy(),
+                    "child_bot": None
+                }
+                self._save_profile_by_pid(recipient_id, new_pid, new_data)
 
-                    config_data["profile_id"] = new_pid
-                    config_data["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-                    self.cog.storage_manager._atomic_json_save_gzip(config_data, os.path.join(recip_dir, "config.json.gz"))
-
-                    disp = config_data.get("custom_display_name")
-                    ava = config_data.get("custom_avatar_url")
-                    if disp or ava:
-                        self.cog.user_appearances.setdefault(recip_id_str, {})[desired_name] = {
-                            "custom_display_name": disp,
-                            "custom_avatar_url": ava
-                        }
-
-                with open(os.path.join(recip_dir, "name.txt"), "w", encoding="utf-8") as f:
-                    f.write(desired_name)
+                disp = config_data.get("custom_display_name")
+                ava = config_data.get("custom_avatar_url")
+                if disp or ava:
+                    self.cog.user_appearances.setdefault(recip_id_str, {})[desired_name] = {
+                        "custom_display_name": disp,
+                        "custom_avatar_url": ava
+                    }
 
                 if not isinstance(index.get("personal"), dict):
                     legacy_personal = index.get("personal", [])
@@ -1698,7 +1837,6 @@ class ProfileManager:
                             index["personal"][p_name] = p_name
 
                 index["personal"][desired_name] = new_pid
-
                 self._save_user_index(recipient_id, index)
                 return True, f"✅ Profile cloned successfully as '{desired_name}'!"
 
@@ -1748,21 +1886,23 @@ class ProfileManager:
 
             try:
                 os.makedirs(target_dir, exist_ok=True)
+                src_data = self._get_profile_by_pid(owner_id, source_pid) or {}
+                config_data = src_data.get("config", {}).copy()
+                config_data["profile_id"] = target_pid
+                config_data["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-                for item in ["config.json.gz", "prompts.json.gz", "ltm.json.gz", "training.json.gz"]:
+                target_data = {
+                    "name": target_name,
+                    "config": config_data,
+                    "prompts": src_data.get("prompts", {}).copy(),
+                    "child_bot": None
+                }
+                self._save_profile_by_pid(owner_id, target_pid, target_data)
+
+                for item in ["ltm.json.gz", "training.json.gz"]:
                     src_file = os.path.join(source_dir, item)
                     if os.path.exists(src_file):
                         shutil.copy2(src_file, os.path.join(target_dir, item))
-
-                with open(os.path.join(target_dir, "name.txt"), "w", encoding="utf-8") as f:
-                    f.write(target_name)
-
-                config_path = os.path.join(target_dir, "config.json.gz")
-                if os.path.exists(config_path):
-                    config_data = self.cog.storage_manager._load_json_gzip(config_path) or {}
-                    config_data["profile_id"] = target_pid
-                    config_data["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                    self.cog.storage_manager._atomic_json_save_gzip(config_data, config_path)
 
                 if target_category not in owner_index or not isinstance(owner_index[target_category], dict):
                     owner_index[target_category] = {}

@@ -508,11 +508,7 @@ class SettingsChildBotView(SettingsBaseView):
             owner_id = bot_to_delete['owner_id']
             profile_name = bot_to_delete['profile_name']
             
-            pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
-            bot_file = os.path.join(self.cog.USERS_DIR, str(owner_id), "profiles", pid, "child_bot.json.gz")
-            from ..managers.storage_manager import _delete_file_shard
-            _delete_file_shard(bot_file)
-
+            self.cog.profile_manager._delete_child_bot_config(owner_id, profile_name)
             await asyncio.to_thread(self.cog.child_bot_manager._load_child_bots)
             await self.cog.manager_queue.put({"action": "shutdown_bot", "bot_id": self.selected_bot_id})
         
@@ -592,10 +588,7 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
             "bot_id": bot_user_id
         }
         
-        bot_file = os.path.join(self.cog.USERS_DIR, str(owner_id), "profiles", pid, "child_bot.json.gz")
-        from ..managers.storage_manager import IOManager
-        IOManager.write_json_gzip(bot_config, bot_file, encrypted=False)
-
+        self.cog.profile_manager._set_child_bot_config(owner_id, profile_name, bot_config)
         await asyncio.to_thread(self.cog.child_bot_manager._load_child_bots)
 
         new_bot_config = self.cog.child_bots.get(bot_user_id)

@@ -33,8 +33,19 @@ def decode_embedding_b64(b64_str: str) -> np.ndarray:
     if not b64_str: return np.array([], dtype=np.float32)
     return np.frombuffer(base64.b64decode(b64_str), dtype=np.float16).astype(np.float32)
 
+# Try importing native Rust/C extension if compiled into the environment
+try:
+    import mimic_core  # type: ignore
+    _HAS_NATIVE_CORE = True
+except ImportError:
+    _HAS_NATIVE_CORE = False
+
 def calculate_similarities(prompt_emb: List[float], b64_embs: List[str]) -> np.ndarray:
-    if not b64_embs or not prompt_emb: return np.array([])
+    if not b64_embs or not prompt_emb: return np.array([], dtype=np.float32)
+    
+    if _HAS_NATIVE_CORE and hasattr(mimic_core, "calculate_similarities_b64"):
+        return np.array(mimic_core.calculate_similarities_b64(prompt_emb, b64_embs), dtype=np.float32)
+
     raw_bytes = b"".join(base64.b64decode(s) for s in b64_embs)
     matrix = np.frombuffer(raw_bytes, dtype=np.float16).reshape(len(b64_embs), -1).astype(np.float32)
     prompt_vec = np.array(prompt_emb, dtype=np.float32)
@@ -71,8 +82,11 @@ class MemoryManager:
                 del data["dm"]
         return data
 
-    def _save_ltm_shard(self, user_id: str, profile_name: str, data: Dict[str, List[Dict]]):
-        self.cog.storage_manager._save_shard("ltm", user_id, data, profile_name)
+    def _save_ltm_shard(self, user_id: str, profile_name: str, data: Optional[Dict[str, List[Dict]]]):
+        if not data or not data.get("guild"):
+            self._delete_ltm_shard(user_id, profile_name)
+        else:
+            self.cog.storage_manager._save_shard("ltm", user_id, data, profile_name)
 
     def _delete_ltm_shard(self, user_id: str, profile_name: str):
         self.cog.storage_manager._delete_shard("ltm", user_id, profile_name)
@@ -169,8 +183,11 @@ class MemoryManager:
     def _load_training_shard(self, user_id: str, profile_name: str) -> Optional[List[Dict]]:
         return self.cog.storage_manager._load_shard("training", user_id, profile_name)
 
-    def _save_training_shard(self, user_id: str, profile_name: str, data: List[Dict]):
-        self.cog.storage_manager._save_shard("training", user_id, data, profile_name)
+    def _save_training_shard(self, user_id: str, profile_name: str, data: Optional[List[Dict]]):
+        if not data:
+            self._delete_training_shard(user_id, profile_name)
+        else:
+            self.cog.storage_manager._save_shard("training", user_id, data, profile_name)
 
     def _delete_training_shard(self, user_id: str, profile_name: str):
         self.cog.storage_manager._delete_shard("training", user_id, profile_name)
@@ -264,37 +281,60 @@ class MemoryManager:
 
             if not valid_ltms: return None
 
-            similarities = calculate_similarities(prompt_embedding, b64_embs)
-            candidate_ltms = []
+            raw_bytes = b"".join(base64.b64decode(s) for s in b64_embs)
+            emb_matrix = np.frombuffer(raw_bytes, dtype=np.float16).reshape(len(b64_embs), -1).astype(np.float32)
+            prompt_vec = np.array(prompt_embedding, dtype=np.float32)
+
+            matrix_norms = np.linalg.norm(emb_matrix, axis=1)
+            prompt_norm = np.linalg.norm(prompt_vec)
+            matrix_norms[matrix_norms == 0] = 1e-10
+            prompt_norm = prompt_norm if prompt_norm != 0 else 1e-10
+
+            raw_similarities = np.dot(emb_matrix, prompt_vec) / (matrix_norms * prompt_norm)
+            candidate_indices = []
 
             for i, ltm in enumerate(valid_ltms):
-                sim = float(similarities[i])
+                sim = float(raw_similarities[i])
                 ts_str = ltm.get('created_ts') or ltm.get('ts')
                 if ts_str:
                     try:
                         days_old = (now_utc - datetime.datetime.fromisoformat(ts_str)).total_seconds() / 86400.0
                         sim *= (0.995 ** days_old)
-                    except: pass
+                    except Exception:
+                        pass
 
                 if sim >= ltm_relevance_threshold:
-                    candidate_ltms.append({"ltm": ltm, "sim": sim, "original_sim": float(similarities[i]), "b64": b64_embs[i]})
+                    candidate_indices.append((i, sim, float(raw_similarities[i])))
 
-            if not candidate_ltms: return None
-            candidate_ltms.sort(key=lambda x: x["sim"], reverse=True)
+            if not candidate_indices: return None
+            candidate_indices.sort(key=lambda x: x[1], reverse=True)
 
+            # High-throughput vectorised MMR diversification (Zero Base64 re-decoding)
             final_memories = []
-            while len(final_memories) < ltm_context_size and candidate_ltms:
-                best = candidate_ltms.pop(0)
-                final_memories.append(best)
-                if not candidate_ltms: break
+            current_candidates = list(candidate_indices)
 
-                rem_b64 = [m["b64"] for m in candidate_ltms]
-                best_emb = decode_embedding_b64(best["b64"]).tolist()
-                sat_sims = calculate_similarities(best_emb, rem_b64)
+            while len(final_memories) < ltm_context_size and current_candidates:
+                best_idx, best_sim, orig_sim = current_candidates.pop(0)
+                final_memories.append({"ltm": valid_ltms[best_idx], "sim": best_sim, "original_sim": orig_sim})
+                if not current_candidates: break
 
-                for j, other in enumerate(candidate_ltms):
-                    other["sim"] *= (1.0 - (float(sat_sims[j]) * 0.75))
-                candidate_ltms.sort(key=lambda x: x["sim"], reverse=True)
+                best_vec = emb_matrix[best_idx]
+                best_norm_val = matrix_norms[best_idx]
+
+                rem_idxs = [c[0] for c in current_candidates]
+                rem_matrix = emb_matrix[rem_idxs]
+                rem_norms = matrix_norms[rem_idxs]
+
+                # Instantaneous BLAS batch projection across remaining candidates
+                inter_sims = np.dot(rem_matrix, best_vec) / (rem_norms * best_norm_val)
+
+                updated = []
+                for j, (c_idx, c_sim, o_sim) in enumerate(current_candidates):
+                    penalised_sim = c_sim * (1.0 - (float(inter_sims[j]) * 0.75))
+                    updated.append((c_idx, penalised_sim, o_sim))
+
+                updated.sort(key=lambda x: x[1], reverse=True)
+                current_candidates = updated
 
             return final_memories
 
@@ -671,8 +711,9 @@ class MemoryManager:
         user_id_str = str(user_id)
         reset_count = 0
         for name in profile_names:
-            file_path = os.path.join(self.cog.TRAINING_DIR, user_id_str, f"{name}.json.gz")
-            if os.path.exists(file_path):
+            pid = self.cog.profile_manager._get_pid_from_name_any(user_id, name)
+            shard_path = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", pid, "training.json.gz")
+            if os.path.exists(shard_path):
                 self._delete_training_shard(user_id_str, name)
                 reset_count += 1
         
@@ -682,8 +723,9 @@ class MemoryManager:
         user_id_str = str(user_id)
         reset_count = 0
         for name in profile_names:
-            file_path = os.path.join(self.cog.LTM_DIR, user_id_str, f"{name}.json.gz")
-            if os.path.exists(file_path):
+            pid = self.cog.profile_manager._get_pid_from_name_any(user_id, name)
+            shard_path = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", pid, "ltm.json.gz")
+            if os.path.exists(shard_path):
                 self._delete_ltm_shard(user_id_str, name)
                 reset_count += 1
         

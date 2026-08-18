@@ -7,7 +7,7 @@ import datetime
 import traceback
 import time
 from zoneinfo import ZoneInfo
-from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional
+from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional, Union
 from ..utils.content import OLLAMA_GUIDE_TEXT
 from ..utils.helpers import _pf, _pi, _ps, _pb
 
@@ -459,24 +459,7 @@ class ProfileManageView(ui.View):
             if new_name in user_index.get("personal", []) or new_name in user_index.get("borrowed", []):
                 await self.original_interaction.edit_original_response(content="Rename failed: Name already exists.", view=None, embed=None); return
             
-            p_dict_key = "borrowed" if self.is_borrowed else "personal"
-            if old_name in user_index.get(p_dict_key, {}):
-                if isinstance(user_index[p_dict_key], dict):
-                    pid = user_index[p_dict_key].pop(old_name)
-                    user_index[p_dict_key][new_name] = pid
-                    # Update local name text file
-                    with open(os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", pid, "name.txt"), "w", encoding="utf-8") as f:
-                        f.write(new_name)
-                else:
-                    user_index[p_dict_key].remove(old_name)
-                    user_index[p_dict_key].append(new_name)
-                    old_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", old_name)
-                    new_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", new_name)
-                    if os.path.exists(old_dir):
-                        os.rename(old_dir, new_dir)
-                
-                self.cog.profile_manager._save_user_index(self.user_id, user_index)
-
+            if self.cog.profile_manager._rename_profile(self.user_id, old_name, new_name, self.is_borrowed):
                 # Hot-swap live sessions and models to prevent corruption
                 for ch_id, session in self.cog.multi_profile_channels.items():
                     for p in session.get("profiles", []):
@@ -517,53 +500,11 @@ class ProfileManageView(ui.View):
             if len(user_index.get("personal", {})) >= limit:
                 await self.original_interaction.edit_original_response(content="Limit reached.", view=None, embed=None); return
             
-            old_pid = self.cog.profile_manager._get_pid_from_name_any(self.user_id, self.profile_name)
-            old_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", old_pid)
-            
-            import uuid
-            if not isinstance(user_index.get("personal"), dict):
-                legacy_personal = user_index.get("personal", [])
-                user_index["personal"] = {}
-                if isinstance(legacy_personal, list):
-                    for p_name in legacy_personal:
-                        user_index["personal"][p_name] = p_name
-            
-            new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
-            user_index["personal"][new_name] = new_pid
-                
-            new_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", new_pid)
-            
-            import shutil
-            try:
-                os.makedirs(new_dir, exist_ok=True)
-                for item in os.listdir(old_dir):
-                    if item in ["child_bot.json.gz", "global_chat.json.gz", "ltm.json.gz"]:
-                        continue
-                    s = os.path.join(old_dir, item)
-                    d = os.path.join(new_dir, item)
-                    if os.path.isdir(s):
-                        shutil.copytree(s, d)
-                    else:
-                        shutil.copy2(s, d)
-                
-                if isinstance(user_index.get("personal"), dict):
-                    with open(os.path.join(new_dir, "name.txt"), "w", encoding="utf-8") as f:
-                        f.write(new_name)
-            except Exception as e:
-                print(f"Error duplicating profile directory: {e}")
-            
-            self.cog.profile_manager._save_user_index(self.user_id, user_index)
-            
-            config = self.cog.profile_manager._get_profile_config(self.user_id, new_name, False)
-            if config:
-                import uuid
-                config['profile_id'] = str(uuid.uuid4().hex[:8].upper()) # Force unique PID for duplicate
-                config['created_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                self.cog.profile_manager._save_profile_config(self.user_id, new_name, config, False)
-
-            self.cog.memory_manager._copy_ltm_shard(str(self.user_id), self.profile_name, new_name)
-            self.cog.memory_manager._copy_training_shard(str(self.user_id), self.profile_name, new_name)
-            await self.original_interaction.edit_original_response(content=f"Duplicated to '{new_name}'.", view=None, embed=None)
+            success, msg = self.cog.profile_manager._duplicate_profile(self.user_id, self.profile_name, new_name)
+            if success:
+                await self.original_interaction.edit_original_response(content=f"Duplicated to '{new_name}'.", view=None, embed=None)
+            else:
+                await self.original_interaction.edit_original_response(content=f"Duplicate failed: {msg}", view=None, embed=None)
         modal.on_submit = duplicate_submit
         await interaction.response.send_modal(modal)
 
@@ -638,35 +579,8 @@ class ProfileManageView(ui.View):
         await interaction.response.send_message(f"Delete profile '{self.profile_name}'?", view=confirm_view, ephemeral=True)
 
     async def _handle_timezone(self, interaction, profile, is_borrowed):
-        view = ui.View(timeout=180)
-        common_tzs = ["UTC", "GMT", "US/Pacific", "US/Central", "US/Eastern", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Australia/Sydney"]
-        opts = [discord.SelectOption(label=tz, value=tz) for tz in common_tzs]
-        opts.append(discord.SelectOption(label="Set Custom Timezone...", value="custom"))
-        select = ui.Select(placeholder="Choose a timezone...", options=opts)
-        async def tz_cb(i: discord.Interaction):
-            if select.values[0] == "custom":
-                modal = ui.Modal(title="Set Custom Timezone")
-                inp = ui.TextInput(label="Enter IANA Timezone (e.g. Asia/Tokyo)", required=True)
-                modal.add_item(inp)
-                async def custom_sub(mi: discord.Interaction):
-                    try: 
-                        ZoneInfo(inp.value); profile['timezone'] = inp.value
-                        self.cog.profile_manager._save_profile_config(self.user_id, self.profile_name, profile, is_borrowed)
-                        new_embed = await self.cog.profile_manager._build_profile_manage_embed(mi, self.profile_name)
-                        await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-                        await mi.response.send_message("Updated.", ephemeral=True, delete_after=3)
-                    except: await mi.response.send_message("Invalid.", ephemeral=True, delete_after=5)
-                modal.on_submit = custom_sub
-                await i.response.send_modal(modal)
-            else:
-                profile['timezone'] = select.values[0]
-                self.cog.profile_manager._save_profile_config(self.user_id, self.profile_name, profile, is_borrowed)
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(i, self.profile_name)
-                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-                await i.response.defer()
-        select.callback = tz_cb
-        view.add_item(select)
-        await interaction.response.send_message("Select Timezone:", view=view, ephemeral=True)
+        view = SingleProfileTimezoneView(self.cog, self, profile, is_borrowed)
+        await interaction.response.send_message(content=view._get_header_content(), view=view, ephemeral=True)
 
     async def on_timeout(self):
         try: await self.original_interaction.edit_original_response(content="Manager timed out.", view=None)
@@ -1586,50 +1500,273 @@ class UnifiedBulkTargetView(BaseBulkProfileView):
 
         await interaction.edit_original_response(content=f"Successfully applied settings to {success_count} profile(s).", view=None)
 
-class BulkTimezoneModal(ui.Modal, title="Enter Custom Timezone"):
-    tz_input = ui.TextInput(label="IANA Timezone ID", placeholder="e.g. Asia/Tokyo or America/New_York", required=True)
+from ..utils.helpers import _resolve_zoneinfo
 
-    def __init__(self, parent_view):
+EXTENSIVE_TIMEZONES = [
+    # --- Page 0: Americas (North & Central) ---
+    ("US / Pacific (Los Angeles)", "America/Los_Angeles", "UTC-8 / UTC-7 (PT)"),
+    ("US / Mountain (Denver)", "America/Denver", "UTC-7 / UTC-6 (MT)"),
+    ("US / Central (Chicago)", "America/Chicago", "UTC-6 / UTC-5 (CT)"),
+    ("US / Eastern (New York)", "America/New_York", "UTC-5 / UTC-4 (ET)"),
+    ("US / Alaska (Anchorage)", "America/Anchorage", "UTC-9 / UTC-8 (AKST)"),
+    ("US / Hawaii (Honolulu)", "Pacific/Honolulu", "UTC-10 (HST)"),
+    ("US / Arizona (Phoenix - No DST)", "America/Phoenix", "UTC-7 (MST)"),
+    ("Canada / Pacific (Vancouver)", "America/Vancouver", "UTC-8 / UTC-7 (PT)"),
+    ("Canada / Mountain (Edmonton)", "America/Edmonton", "UTC-7 / UTC-6 (MT)"),
+    ("Canada / Central (Winnipeg)", "America/Winnipeg", "UTC-6 / UTC-5 (CT)"),
+    ("Canada / Eastern (Toronto)", "America/Toronto", "UTC-5 / UTC-4 (ET)"),
+    ("Canada / Atlantic (Halifax)", "America/Halifax", "UTC-4 / UTC-3 (AT)"),
+    ("Canada / Newfoundland (St. Johns)", "America/St_Johns", "UTC-3:30 / UTC-2:30 (NT)"),
+    ("Mexico / Pacific (Tijuana)", "America/Tijuana", "UTC-8 / UTC-7"),
+    ("Mexico / Central (Mexico City)", "America/Mexico_City", "UTC-6 (CST)"),
+    ("Mexico / Mountain (Hermosillo)", "America/Hermosillo", "UTC-7 (MST)"),
+    ("Guatemala (Central America)", "America/Guatemala", "UTC-6 (CST)"),
+    ("Costa Rica (San Jose)", "America/Costa_Rica", "UTC-6 (CST)"),
+    ("Panama (Panama City)", "America/Panama", "UTC-5 (EST)"),
+    ("Jamaica (Kingston)", "America/Jamaica", "UTC-5 (EST)"),
+
+    # --- Page 1: South America & Atlantic ---
+    ("Brazil / Southeast (Sao Paulo)", "America/Sao_Paulo", "UTC-3 (BRT)"),
+    ("Brazil / East (Rio de Janeiro)", "America/Bahia", "UTC-3 (BRT)"),
+    ("Brazil / Amazon (Manaus)", "America/Manaus", "UTC-4 (AMT)"),
+    ("Argentina (Buenos Aires)", "America/Argentina/Buenos_Aires", "UTC-3 (ART)"),
+    ("Chile (Santiago)", "America/Santiago", "UTC-4 / UTC-3 (CLT)"),
+    ("Colombia (Bogota)", "America/Bogota", "UTC-5 (COT)"),
+    ("Peru (Lima)", "America/Lima", "UTC-5 (PET)"),
+    ("Venezuela (Caracas)", "America/Caracas", "UTC-4 (VET)"),
+    ("Ecuador (Quito)", "America/Guayaquil", "UTC-5 (ECT)"),
+    ("Bolivia (La Paz)", "America/La_Paz", "UTC-4 (BOT)"),
+    ("Paraguay (Asuncion)", "America/Asuncion", "UTC-4 / UTC-3 (PYT)"),
+    ("Uruguay (Montevideo)", "America/Montevideo", "UTC-3 (UYT)"),
+    ("Puerto Rico (San Juan)", "America/Puerto_Rico", "UTC-4 (AST)"),
+    ("Dominican Republic (Santo Domingo)", "America/Santo_Domingo", "UTC-4 (AST)"),
+    ("Greenland (Nuuk)", "America/Nuuk", "UTC-2 / UTC-1 (WGT)"),
+    ("Azores (Ponta Delgada)", "Atlantic/Azores", "UTC-1 / UTC+0 (AZOT)"),
+    ("Cape Verde (Praia)", "Atlantic/Cape_Verde", "UTC-1 (CVT)"),
+    ("Iceland (Reykjavik)", "Atlantic/Reykjavik", "UTC+0 (GMT)"),
+    ("UTC (Coordinated Universal Time)", "UTC", "UTC+0 (Universal Standard)"),
+    ("GMT (Greenwich Mean Time)", "GMT", "UTC+0 (Standard)"),
+
+    # --- Page 2: Europe & Africa ---
+    ("UK (London / GMT / BST)", "Europe/London", "UTC+0 / UTC+1 (GMT/BST)"),
+    ("Ireland (Dublin)", "Europe/Dublin", "UTC+0 / UTC+1 (IST)"),
+    ("France (Paris)", "Europe/Paris", "UTC+1 / UTC+2 (CET/CEST)"),
+    ("Germany (Berlin)", "Europe/Berlin", "UTC+1 / UTC+2 (CET/CEST)"),
+    ("Italy (Rome)", "Europe/Rome", "UTC+1 / UTC+2 (CET/CEST)"),
+    ("Spain (Madrid)", "Europe/Madrid", "UTC+1 / UTC+2 (CET/CEST)"),
+    ("Netherlands (Amsterdam)", "Europe/Amsterdam", "UTC+1 / UTC+2 (CET/CEST)"),
+    ("Belgium (Brussels)", "Europe/Brussels", "UTC+1 / UTC+2 (CET/CEST)"),
+    ("Switzerland (Zurich)", "Europe/Zurich", "UTC+1 / UTC+2 (CET/CEST)"),
+    ("Sweden (Stockholm)", "Europe/Stockholm", "UTC+1 / UTC+2 (CET/CEST)"),
+    ("Norway (Oslo)", "Europe/Oslo", "UTC+1 / UTC+2 (CET/CEST)"),
+    ("Poland (Warsaw)", "Europe/Warsaw", "UTC+1 / UTC+2 (CET/CEST)"),
+    ("Austria (Vienna)", "Europe/Vienna", "UTC+1 / UTC+2 (CET/CEST)"),
+    ("Greece (Athens)", "Europe/Athens", "UTC+2 / UTC+3 (EET/EEST)"),
+    ("Finland (Helsinki)", "Europe/Helsinki", "UTC+2 / UTC+3 (EET/EEST)"),
+    ("Ukraine (Kyiv)", "Europe/Kyiv", "UTC+2 / UTC+3 (EET/EEST)"),
+    ("Romania (Bucharest)", "Europe/Bucharest", "UTC+2 / UTC+3 (EET/EEST)"),
+    ("Egypt (Cairo)", "Africa/Cairo", "UTC+2 / UTC+3 (EET)"),
+    ("South Africa (Johannesburg)", "Africa/Johannesburg", "UTC+2 (SAST)"),
+    ("Nigeria (Lagos)", "Africa/Lagos", "UTC+1 (WAT)"),
+
+    # --- Page 3: Middle East, Asia & Australasia ---
+    ("Turkey (Istanbul)", "Europe/Istanbul", "UTC+3 (TRT)"),
+    ("Russia (Moscow)", "Europe/Moscow", "UTC+3 (MSK)"),
+    ("United Arab Emirates (Dubai)", "Asia/Dubai", "UTC+4 (GST)"),
+    ("Saudi Arabia (Riyadh)", "Asia/Riyadh", "UTC+3 (AST)"),
+    ("India (Kolkata / New Delhi)", "Asia/Kolkata", "UTC+5:30 (IST)"),
+    ("Pakistan (Karachi)", "Asia/Karachi", "UTC+5 (PKT)"),
+    ("Bangladesh (Dhaka)", "Asia/Dhaka", "UTC+6 (BST)"),
+    ("Thailand (Bangkok)", "Asia/Bangkok", "UTC+7 (ICT)"),
+    ("Vietnam (Ho Chi Minh)", "Asia/Ho_Chi_Minh", "UTC+7 (ICT)"),
+    ("Indonesia (Jakarta)", "Asia/Jakarta", "UTC+7 (WIB)"),
+    ("China (Beijing / Shanghai)", "Asia/Shanghai", "UTC+8 (CST)"),
+    ("Hong Kong", "Asia/Hong_Kong", "UTC+8 (HKT)"),
+    ("Singapore", "Asia/Singapore", "UTC+8 (SGT)"),
+    ("Japan (Tokyo)", "Asia/Tokyo", "UTC+9 (JST)"),
+    ("South Korea (Seoul)", "Asia/Seoul", "UTC+9 (KST)"),
+    ("Australia / NSW & VIC (Sydney)", "Australia/Sydney", "UTC+10 / UTC+11 (AEST/AEDT)"),
+    ("Australia / QLD (Brisbane - No DST)", "Australia/Brisbane", "UTC+10 (AEST)"),
+    ("Australia / SA (Adelaide)", "Australia/Adelaide", "UTC+9:30 / UTC+10:30 (ACST/ACDT)"),
+    ("Australia / WA (Perth)", "Australia/Perth", "UTC+8 (AWST)"),
+    ("New Zealand (Auckland)", "Pacific/Auckland", "UTC+12 / UTC+13 (NZST/NZDT)"),
+]
+
+PARTITION_NAMES = [
+    "Americas (North & Central)",
+    "South America & Atlantic",
+    "Europe & Africa",
+    "Asia, Middle East & Australasia"
+]
+
+class SingleProfileTimezoneView(ui.View):
+    def __init__(self, cog: 'MimicCog', parent_manage_view: ProfileManageView, profile_config: Dict[str, Any], is_borrowed: bool):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.parent_manage_view = parent_manage_view
+        self.profile_config = profile_config
+        self.is_borrowed = is_borrowed
+        self.current_page = 0
+        self.total_pages = (len(EXTENSIVE_TIMEZONES) - 1) // 20 + 1
+        self._build_view()
+
+    def _get_header_content(self) -> str:
+        current_tz = self.profile_config.get("timezone", "UTC")
+        try:
+            tz_obj, _ = _resolve_zoneinfo(current_tz)
+            now_str = datetime.datetime.now(tz_obj).strftime("%I:%M %p (%Z)")
+        except Exception:
+            now_str = "Unknown"
+        return f"**Timezone Selector for '{self.parent_manage_view.profile_name}'**\n**Active Setting:** `{current_tz}` (Local Time: `{now_str}`)\nSelect a timezone below or jump between regional partitions:"
+
+    def _build_view(self):
+        self.clear_items()
+        per_page = 20
+        start = self.current_page * per_page
+        page_tzs = EXTENSIVE_TIMEZONES[start:start + per_page]
+
+        options = [
+            discord.SelectOption(label="⚙️ Custom / Manual Timezone ID...", value="custom", description="Enter any custom IANA timezone ID manually.", emoji="✏️")
+        ]
+
+        # Add 3 Partition Jump options (excluding current page)
+        for page_idx, p_name in enumerate(PARTITION_NAMES):
+            if page_idx != self.current_page:
+                options.append(discord.SelectOption(
+                    label=f"🌍 Jump: {p_name}",
+                    value=f"jump_{page_idx}",
+                    description=f"Switch to page {page_idx + 1} ({p_name})",
+                    emoji="📑"
+                ))
+
+        # Add 20 Timezone options for the active page
+        current_setting = self.profile_config.get("timezone", "UTC")
+        for label, tz_val, desc in page_tzs:
+            options.append(discord.SelectOption(
+                label=label[:100],
+                value=tz_val,
+                description=desc[:100],
+                default=(tz_val == current_setting)
+            ))
+
+        select = ui.Select(placeholder=f"Timezones: {PARTITION_NAMES[self.current_page]} ({self.current_page + 1}/{self.total_pages})...", options=options, row=0)
+        select.callback = self.select_callback
+        self.add_item(select)
+
+        # Pagination controls on Row 1
+        async def prev_cb(i: discord.Interaction):
+            self.current_page = max(0, self.current_page - 1)
+            self._build_view()
+            await i.response.edit_message(content=self._get_header_content(), view=self)
+
+        async def next_cb(i: discord.Interaction):
+            self.current_page = min(self.total_pages - 1, self.current_page + 1)
+            self._build_view()
+            await i.response.edit_message(content=self._get_header_content(), view=self)
+
+        build_pagination_controls(self, self.current_page, self.total_pages, 1, prev_cb, next_cb)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        choice = interaction.data['values'][0]
+
+        if choice == "custom":
+            modal = CustomTimezoneModal(self)
+            await interaction.response.send_modal(modal)
+            return
+
+        if choice.startswith("jump_"):
+            target_page = int(choice.split("_")[1])
+            self.current_page = target_page
+            self._build_view()
+            await interaction.response.edit_message(content=self._get_header_content(), view=self)
+            return
+
+        # Direct timezone selection
+        _, canonical_tz = _resolve_zoneinfo(choice)
+        self.profile_config["timezone"] = canonical_tz
+        self.profile_config["time_tracking_enabled"] = True
+        self.cog.profile_manager._save_profile_config(self.parent_manage_view.user_id, self.parent_manage_view.profile_name, self.profile_config, self.is_borrowed)
+
+        # Flush model cache for this profile
+        keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.parent_manage_view.user_id]
+        for k in keys:
+            self.cog.channel_models.pop(k, None)
+            self.cog.chat_sessions.pop(k, None)
+
+        new_embed = await self.cog.profile_manager._build_profile_manage_embed(interaction, self.parent_manage_view.profile_name)
+        await self.parent_manage_view.original_interaction.edit_original_response(embed=new_embed, view=self.parent_manage_view)
+        await interaction.response.edit_message(content=f"✅ Timezone set to **{canonical_tz}**.", view=None)
+
+class CustomTimezoneModal(ui.Modal, title="Enter Custom Timezone"):
+    tz_input = ui.TextInput(label="Timezone ID / Acronym", placeholder="e.g. Australia/Sydney, AEST, America/New_York", required=True)
+
+    def __init__(self, parent_view: Union[SingleProfileTimezoneView, 'BulkTimezoneView']):
         super().__init__()
         self.parent_view = parent_view
 
     async def on_submit(self, interaction: discord.Interaction):
-        tz_str = self.tz_input.value.strip()
-        try:
-            # Validate timezone string
-            ZoneInfo(tz_str)
-            self.parent_view.selected_tz = tz_str
+        raw_val = self.tz_input.value.strip()
+        tz_obj, canonical_tz = _resolve_zoneinfo(raw_val)
+
+        if isinstance(self.parent_view, SingleProfileTimezoneView):
+            self.parent_view.profile_config["timezone"] = canonical_tz
+            self.parent_view.profile_config["time_tracking_enabled"] = True
+            self.parent_view.cog.profile_manager._save_profile_config(self.parent_view.parent_manage_view.user_id, self.parent_view.parent_manage_view.profile_name, self.parent_view.profile_config, self.parent_view.is_borrowed)
+
+            keys = [k for k in self.parent_view.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.parent_view.parent_manage_view.user_id]
+            for k in keys:
+                self.parent_view.cog.channel_models.pop(k, None)
+                self.parent_view.cog.chat_sessions.pop(k, None)
+
+            new_embed = await self.parent_view.cog.profile_manager._build_profile_manage_embed(interaction, self.parent_view.parent_manage_view.profile_name)
+            await self.parent_view.parent_manage_view.original_interaction.edit_original_response(embed=new_embed, view=self.parent_view.parent_manage_view)
+            await interaction.response.edit_message(content=f"✅ Timezone set to **{canonical_tz}**.", view=None)
+        else:
+            self.parent_view.selected_tz = canonical_tz
             self.parent_view._build_view()
             await interaction.response.edit_message(content=self.parent_view._get_selection_feedback_message(), view=self.parent_view)
-        except Exception:
-            await interaction.response.send_message(f"❌ `{tz_str}` is not a valid IANA timezone. Please check your spelling.", ephemeral=True)
+
+# Alias for backward compatibility
+BulkTimezoneModal = CustomTimezoneModal
 
 class BulkTimezoneView(BaseBulkProfileView):
     def __init__(self, cog: 'MimicCog', user_id: int):
         super().__init__(cog, user_id, include_borrowed=True)
         self.selected_tz = None
+        self.tz_page = 0
+        self.tz_total_pages = (len(EXTENSIVE_TIMEZONES) - 1) // 20 + 1
         self._build_view()
 
     def _build_view(self):
         self.clear_items()
-        
-        common_tzs = [
-            ("Custom / Manual...", "custom"),
-            ("UTC / GMT", "UTC"),
-            ("US/Pacific (PT)", "US/Pacific"),
-            ("US/Central (CT)", "US/Central"),
-            ("US/Eastern (ET)", "US/Eastern"),
-            ("Europe/London (GMT/BST)", "Europe/London"),
-            ("Europe/Berlin (CET)", "Europe/Berlin"),
-            ("Asia/Tokyo (JST)", "Asia/Tokyo"),
-            ("Australia/Sydney (AEST)", "Australia/Sydney")
-        ]
-        
-        opts = []
-        for label, val in common_tzs:
-            opts.append(discord.SelectOption(label=label, value=val, default=(self.selected_tz == val)))
+        per_page = 20
+        start = self.tz_page * per_page
+        page_tzs = EXTENSIVE_TIMEZONES[start:start + per_page]
 
-        select = ui.Select(placeholder="Choose a timezone...", options=opts, row=0)
+        options = [
+            discord.SelectOption(label="⚙️ Custom / Manual Timezone ID...", value="custom", description="Enter any custom IANA timezone ID manually.", emoji="✏️")
+        ]
+
+        # Add 3 Partition Jump options
+        for page_idx, p_name in enumerate(PARTITION_NAMES):
+            if page_idx != self.tz_page:
+                options.append(discord.SelectOption(
+                    label=f"🌍 Jump: {p_name}",
+                    value=f"jump_{page_idx}",
+                    description=f"Switch to page {page_idx + 1} ({p_name})",
+                    emoji="📑"
+                ))
+
+        # Add 20 Timezone options for the active page
+        for label, tz_val, desc in page_tzs:
+            options.append(discord.SelectOption(
+                label=label[:100],
+                value=tz_val,
+                description=desc[:100],
+                default=(tz_val == self.selected_tz)
+            ))
+
+        select = ui.Select(placeholder=f"Choose a timezone ({PARTITION_NAMES[self.tz_page]})...", options=options, row=0)
         select.callback = self.tz_callback
         self.add_item(select)
 
@@ -1642,16 +1779,26 @@ class BulkTimezoneView(BaseBulkProfileView):
     async def tz_callback(self, interaction: discord.Interaction):
         val = interaction.data['values'][0]
         if val == "custom":
-            await interaction.response.send_modal(BulkTimezoneModal(self))
-        else:
-            self.selected_tz = val
+            await interaction.response.send_modal(CustomTimezoneModal(self))
+            return
+
+        if val.startswith("jump_"):
+            target_page = int(val.split("_")[1])
+            self.tz_page = target_page
             self._build_view()
             await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+            return
+
+        _, canonical = _resolve_zoneinfo(val)
+        self.selected_tz = canonical
+        self._build_view()
+        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
 
     async def apply_action(self, interaction: discord.Interaction):
         await interaction.response.defer()
         if not self.selected_tz or not self.selected_profiles:
-            await interaction.edit_original_response(content="Select a timezone and at least one profile.", view=None); return
+            await interaction.edit_original_response(content="Select a timezone and at least one profile.", view=None)
+            return
 
         updated_count = 0
         index = self.cog.profile_manager._get_user_index(self.user_id)
@@ -1660,12 +1807,11 @@ class BulkTimezoneView(BaseBulkProfileView):
             p = self.cog.profile_manager._get_profile_config(self.user_id, name, is_borrowed)
             if p:
                 p["timezone"] = self.selected_tz
-                p["time_tracking_enabled"] = True # Force always-on
+                p["time_tracking_enabled"] = True
                 self.cog.profile_manager._save_profile_config(self.user_id, name, p, is_borrowed)
                 updated_count += 1
         
         if updated_count > 0:
-            # Flush caches for the user
             keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.user_id]
             for k in keys: 
                 self.cog.channel_models.pop(k, None)

@@ -27,7 +27,9 @@ class ToolsService:
         self.cog = cog
 
     async def _run_critic(self, history: list, char_name: str, guild_id: int) -> Optional[str]:
-        """Uses a reasoning model to find linguistic loops and robotic staleness."""
+        """Uses fast lexical heuristics and a reasoning model to find linguistic loops and robotic staleness."""
+        from ..utils.helpers import _fast_repetition_scan
+
         recent_turns = []
         count = 0
         for turn in reversed(history):
@@ -36,11 +38,20 @@ class ToolsService:
                 if parts:
                     recent_turns.append(" ".join(parts))
                     count += 1
-            if count >= 3: break
+            if count >= 4: break
+
+        if len(recent_turns) < 2: return None
+
+        chronological_turns = list(reversed(recent_turns))
+
+        # 1. Ultra-fast local lexical scan (0ms latency fast-path)
+        is_repetitive, reason = _fast_repetition_scan(chronological_turns)
+        if is_repetitive and reason:
+            return f"DO NOT repeat phrasing or structure. {reason}."
 
         if len(recent_turns) < 3: return None
 
-        transcript = "\n---\n".join(reversed(recent_turns))
+        transcript = "\n---\n".join(chronological_turns)
 
         system_instruction = self.cog.global_prompts.get("ANTI_REPETITION", DEFAULT_ANTI_REPETITION_PROMPT).format(char_name=char_name)
 

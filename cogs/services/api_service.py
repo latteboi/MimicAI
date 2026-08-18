@@ -65,9 +65,19 @@ class OpenRouterModel:
                         except Exception as e:
                             print(f"Error encoding legacy image for OpenRouter: {e}")
                 elif isinstance(p, dict) and 'url' in p:
-                    mime_type = p.get('mime_type', '')
+                    mime_type = p.get('mime_type', 'image/png')
+                    url = p['url']
                     if mime_type.startswith("image/"):
-                        message_parts.append({"type": "image_url", "image_url": {"url": p['url']}})
+                        if url.startswith(('http://', 'https://')) or url.startswith('data:'):
+                            message_parts.append({"type": "image_url", "image_url": {"url": url}})
+                        elif os.path.exists(url):
+                            try:
+                                with open(url, 'rb') as img_f:
+                                    b64_data = base64.b64encode(img_f.read()).decode('utf-8')
+                                data_uri = f"data:{mime_type};base64,{b64_data}"
+                                message_parts.append({"type": "image_url", "image_url": {"url": data_uri}})
+                            except Exception as e:
+                                print(f"Error encoding local image for OpenRouter: {e}")
 
             if message_parts:
                 if len(message_parts) == 1 and message_parts[0]["type"] == "text":
@@ -242,7 +252,7 @@ class OllamaModel:
                         except Exception as e:
                             print(f"Error encoding legacy image for Ollama: {e}")
                 elif isinstance(p, dict) and 'url' in p:
-                    mime_type = p.get('mime_type', '')
+                    mime_type = p.get('mime_type', 'image/png')
                     url = p['url']
                     if mime_type.startswith("image/"):
                         if url.startswith(('http://', 'https://')):
@@ -254,6 +264,13 @@ class OllamaModel:
                                     images.append(b64_data)
                             except Exception as e:
                                 print(f"Ollama failed to fetch and encode remote image {url}: {e}")
+                        elif os.path.exists(url):
+                            try:
+                                with open(url, 'rb') as img_f:
+                                    b64_data = base64.b64encode(img_f.read()).decode('utf-8')
+                                images.append(b64_data)
+                            except Exception as e:
+                                print(f"Ollama failed to read local image {url}: {e}")
                         else:
                             match = re.match(r'data:image/[^;]+;base64,(.+)', url)
                             if match:
@@ -436,6 +453,14 @@ class GoogleGenAIModel:
                                 print(f"Failed to fetch media from URL {url}: {e}")
                                 if 'temp_path' in locals() and os.path.exists(temp_path):
                                     os.remove(temp_path)
+                        elif os.path.exists(url):
+                            try:
+                                # Disk Overloading: Upload local temp file directly to Gemini File API
+                                upload_config = {'mime_type': mime_type or 'image/png'}
+                                uploaded_file = await asyncio.to_thread(self.client.files.upload, file=url, config=upload_config)
+                                parts.append(types.Part.from_uri(file_uri=uploaded_file.uri, mime_type=mime_type or 'image/png'))
+                            except Exception as e:
+                                print(f"Failed to upload local image {url} to Gemini File API: {e}")
                         else:
                             parts.append(types.Part.from_uri(file_uri=url, mime_type=mime_type))
 

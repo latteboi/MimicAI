@@ -254,14 +254,9 @@ class MediaService:
                         if package.get('generated_image_path') and not package.get('failure_reason'):
                             system_note = f"<image_context>You have just generated the following image based on the prompt: '{package['prompt_text']}'. Present it.</image_context>"
 
-                            def _read_img():
-                                with open(package['generated_image_path'], 'rb') as f:
-                                    return f.read()
-                            img_data = await asyncio.to_thread(_read_img)
-
                             final_user_parts = [
                                 system_note,
-                                {"mime_type": "image/jpeg", "data": img_data}
+                                {"mime_type": "image/png", "url": package['generated_image_path']}
                             ]
 
                             user_turn = {'role': 'user', 'parts': final_user_parts}
@@ -347,7 +342,18 @@ class MediaService:
 
                                 sources_text_list = _format_citation_subtext(grounding_sources)
 
-                        model_turn = {'role': 'model', 'parts': [response_text]}; chat.history.extend([user_turn, model_turn])
+                        model_turn = {'role': 'model', 'parts': [response_text]}
+                        # Dehydrate user turn to text marker before appending to persistent chat history
+                        dehydrated_user_parts = []
+                        for p in user_turn.get('parts', []):
+                            if isinstance(p, dict) and 'url' in p:
+                                dehydrated_user_parts.append(f"[Attached Image: generated_image.png]")
+                            elif isinstance(p, dict) and 'data' in p:
+                                dehydrated_user_parts.append(f"[Attached Image: image.png]")
+                            else:
+                                dehydrated_user_parts.append(p)
+                        
+                        chat.history.extend([{'role': 'user', 'parts': dehydrated_user_parts}, model_turn])
 
                         # --- Update Placeholder ---
                         if not was_blocked and not is_child_bot and placeholder_message:

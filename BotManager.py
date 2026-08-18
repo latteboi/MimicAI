@@ -139,17 +139,32 @@ async def main():
             profiles_dir = os.path.join(users_dir, user_id_str, "profiles")
             if not os.path.isdir(profiles_dir): continue
             for pid_folder in os.listdir(profiles_dir):
-                bot_file = os.path.join(profiles_dir, pid_folder, "child_bot.json.gz")
-                if os.path.exists(bot_file):
-                    bot_data = IOManager.read_json_gzip(bot_file, encrypted=False)
-                    if bot_data and "bot_id" in bot_data:
-                        bot_data["owner_id"] = int(user_id_str)
-                        bot_data["pid"] = pid_folder
-                        name_file = os.path.join(profiles_dir, pid_folder, "name.txt")
-                        if os.path.exists(name_file):
-                            with open(name_file, 'r', encoding='utf-8') as nf:
-                                bot_data["profile_name"] = nf.read().strip()
-                        bot.child_bot_config[bot_data["bot_id"]] = bot_data
+                profile_file = os.path.join(profiles_dir, pid_folder, "profile.json.gz")
+                if os.path.exists(profile_file):
+                    profile_data = IOManager.read_json_gzip(profile_file, fernet=fernet, encrypted=True)
+                    if profile_data and profile_data.get("child_bot"):
+                        bot_data = profile_data["child_bot"]
+                        if isinstance(bot_data, dict) and "bot_id" in bot_data:
+                            bot_data["owner_id"] = int(user_id_str)
+                            bot_data["pid"] = pid_folder
+                            bot_data["profile_name"] = profile_data.get("name", pid_folder)
+                            bot.child_bot_config[bot_data["bot_id"]] = bot_data
+                else:
+                    # Fallback for initial pre-cog boot before migration
+                    legacy_bot_file = os.path.join(profiles_dir, pid_folder, "child_bot.json.gz")
+                    if os.path.exists(legacy_bot_file):
+                        bot_data = IOManager.read_json_gzip(legacy_bot_file, encrypted=False)
+                        if bot_data and "bot_id" in bot_data:
+                            bot_data["owner_id"] = int(user_id_str)
+                            bot_data["pid"] = pid_folder
+                            name_file = os.path.join(profiles_dir, pid_folder, "name.txt")
+                            if os.path.exists(name_file):
+                                try:
+                                    with open(name_file, 'r', encoding='utf-8') as nf:
+                                        bot_data["profile_name"] = nf.read().strip()
+                                except Exception:
+                                    pass
+                            bot.child_bot_config[bot_data["bot_id"]] = bot_data
     
     # Attach manager queue to bot object for cog access
     bot.manager_queue = manager_queue

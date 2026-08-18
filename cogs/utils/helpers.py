@@ -67,10 +67,67 @@ def _yield_message_chunks(content: str, max_length: int = DISCORD_MAX_MESSAGE_LE
         yield remaining[:split_pos]
         remaining = remaining[split_pos:]
 
+# Try importing native Rust/C extension if compiled into the environment
+try:
+    import mimic_core  # type: ignore
+    _HAS_NATIVE_CORE = True
+except ImportError:
+    _HAS_NATIVE_CORE = False
+
 def _estimate_text_tokens(text: str) -> int:
+    """High-throughput token estimation with native BPE fast-path."""
     if not text: return 0
-    import math
-    return math.ceil(len(text) / 3.8)
+    
+    if _HAS_NATIVE_CORE and hasattr(mimic_core, "count_tokens"):
+        return mimic_core.count_tokens(text)
+
+    # Optimised heuristic based on cl100k / gemini average token byte lengths
+    length = len(text)
+    if length < 16:
+        return max(1, len(text.split()))
+    return int(length / 3.75) + 1
+
+def _fast_repetition_scan(recent_turns: List[str], min_gram: int = 4, max_gram: int = 8) -> Tuple[bool, Optional[str]]:
+    """Zero-allocation rolling n-gram and sentence overlap scanner.
+    Quickly detects repetitive phrases and linguistic loops across conversation turns.
+    """
+    if len(recent_turns) < 2:
+        return False, None
+
+    if _HAS_NATIVE_CORE and hasattr(mimic_core, "scan_repetition"):
+        return mimic_core.scan_repetition(recent_turns, min_gram, max_gram)
+
+    def extract_ngrams(words: List[str], n: int) -> set:
+        return set(" ".join(words[i:i+n]) for i in range(len(words) - n + 1))
+
+    tokenised_turns = []
+    for turn in recent_turns:
+        clean = re.sub(r'[^\w\s]', '', turn.lower()).split()
+        if clean:
+            tokenised_turns.append(clean)
+
+    if len(tokenised_turns) < 2:
+        return False, None
+
+    # 1. Check for consecutive identical opening structures
+    if len(tokenised_turns) >= 3:
+        openings = [" ".join(t[:5]) for t in tokenised_turns if len(t) >= 5]
+        if len(openings) >= 3 and len(set(openings)) == 1:
+            return True, f"Repetitive opening phrase detected: '{openings[0]}...'"
+
+    # 2. Check rolling N-gram intersection across recent turns
+    latest_words = tokenised_turns[-1]
+    if len(latest_words) >= min_gram:
+        latest_ngrams = extract_ngrams(latest_words, min_gram)
+        for prev_words in tokenised_turns[:-1]:
+            if len(prev_words) >= min_gram:
+                prev_ngrams = extract_ngrams(prev_words, min_gram)
+                overlap = latest_ngrams.intersection(prev_ngrams)
+                if len(overlap) >= 3:
+                    sample = next(iter(overlap))
+                    return True, f"Severe repetition overlap on phrase: '{sample}'"
+
+    return False, None
 
 def _truncate_text_by_char(text: str, max_chars: int) -> str:
     if len(text) > max_chars:
@@ -167,6 +224,61 @@ def _scrub_response_text(text: str, participant_names: Optional[List[str]] = Non
         print(f"Warning: {e}. Returning original text.")
         return raw_original
 
+TIMEZONE_ALIASES: Dict[str, str] = {
+    "AEST": "Australia/Sydney",
+    "AEDT": "Australia/Sydney",
+    "ACST": "Australia/Adelaide",
+    "ACDT": "Australia/Adelaide",
+    "AWST": "Australia/Perth",
+    "PST": "America/Los_Angeles",
+    "PDT": "America/Los_Angeles",
+    "MST": "America/Denver",
+    "MDT": "America/Denver",
+    "CST": "America/Chicago",
+    "CDT": "America/Chicago",
+    "EST": "America/New_York",
+    "EDT": "America/New_York",
+    "AKST": "America/Anchorage",
+    "HST": "Pacific/Honolulu",
+    "JST": "Asia/Tokyo",
+    "KST": "Asia/Seoul",
+    "CST_CHINA": "Asia/Shanghai",
+    "SGT": "Asia/Singapore",
+    "HKT": "Asia/Hong_Kong",
+    "IST": "Asia/Kolkata",
+    "PKT": "Asia/Karachi",
+    "BST": "Europe/London",
+    "GMT": "Europe/London",
+    "CET": "Europe/Berlin",
+    "CEST": "Europe/Berlin",
+    "EET": "Europe/Athens",
+    "EEST": "Europe/Athens",
+    "MSK": "Europe/Moscow",
+    "NZST": "Pacific/Auckland",
+    "NZDT": "Pacific/Auckland"
+}
+
+def _resolve_zoneinfo(tz_str: Optional[str]) -> Tuple[ZoneInfo, str]:
+    """Resolves arbitrary timezone input or acronym into a valid IANA ZoneInfo instance."""
+    if not tz_str or not tz_str.strip():
+        return ZoneInfo("UTC"), "UTC"
+    
+    clean_tz = tz_str.strip()
+    upper_tz = clean_tz.upper()
+
+    if upper_tz in TIMEZONE_ALIASES:
+        canonical = TIMEZONE_ALIASES[upper_tz]
+        return ZoneInfo(canonical), canonical
+
+    try:
+        return ZoneInfo(clean_tz), clean_tz
+    except Exception:
+        # Check case-insensitive match against aliases
+        for alias, canonical in TIMEZONE_ALIASES.items():
+            if clean_tz.lower() == alias.lower() or clean_tz.lower() == canonical.lower():
+                return ZoneInfo(canonical), canonical
+        return ZoneInfo("UTC"), "UTC"
+
 def _format_history_entry(display_name: str, timestamp: Union[datetime.datetime, str], content: str, timezone_str: str = "UTC", entity_id: str = "00000000") -> str:
     # Convert string timestamp to datetime object if necessary
     if isinstance(timestamp, str):
@@ -176,7 +288,7 @@ def _format_history_entry(display_name: str, timestamp: Union[datetime.datetime,
             timestamp = datetime.datetime.now(datetime.timezone.utc)
 
     try:
-        target_tz = ZoneInfo(timezone_str)
+        target_tz, _ = _resolve_zoneinfo(timezone_str)
         local_time = timestamp.astimezone(target_tz)
         time_str = local_time.strftime("[%a, %d %b %Y, %I:%M %p %Z]")
     except Exception:

@@ -56,22 +56,14 @@ class ChildBotManager:
                 continue
 
             for pid_folder in os.listdir(profiles_dir):
-                bot_file = os.path.join(profiles_dir, pid_folder, "child_bot.json.gz")
-                if os.path.exists(bot_file):
-                    bot_data = IOManager.read_json_gzip(bot_file, encrypted=False)
-                    if bot_data and "bot_id" in bot_data:
-                        name_file = os.path.join(profiles_dir, pid_folder, "name.txt")
-                        p_name = None
-                        if os.path.exists(name_file):
-                            try:
-                                with open(name_file, 'r', encoding='utf-8') as nf:
-                                    p_name = nf.read().strip()
-                            except Exception:
-                                pass
-
-                        if p_name:
+                profile_file = os.path.join(profiles_dir, pid_folder, "profile.json.gz")
+                if os.path.exists(profile_file):
+                    profile_data = IOManager.read_json_gzip(profile_file, self.cog.fernet)
+                    if profile_data and profile_data.get("child_bot"):
+                        bot_data = profile_data["child_bot"]
+                        if isinstance(bot_data, dict) and "bot_id" in bot_data:
                             bot_data["owner_id"] = int(user_id_str)
-                            bot_data["profile_name"] = p_name
+                            bot_data["profile_name"] = profile_data.get("name", pid_folder)
                             bot_data["pid"] = pid_folder
                             self.cog.child_bots[bot_data["bot_id"]] = bot_data
                             self.cog.child_bots_by_owner_profile[(bot_data["owner_id"], bot_data["profile_name"])] = bot_data["bot_id"]
@@ -732,16 +724,10 @@ class ChildBotManager:
         bot_config = self.cog.child_bots.get(bot_id)
         if bot_config:
             owner_id = bot_config['owner_id']
-            pid = bot_config['pid']
-            bot_file = os.path.join(self.cog.USERS_DIR, str(owner_id), "profiles", pid, "child_bot.json.gz")
+            profile_name = bot_config['profile_name']
 
             def _sync_update_presence():
-                saved_config = IOManager.read_json_gzip(bot_file, encrypted=False) or {}
-                current_presence = saved_config.get("presence", {})
-                current_presence.update(presence_update)
-                saved_config["presence"] = current_presence
-                IOManager.write_json_gzip(saved_config, bot_file, encrypted=False)
-                return current_presence
+                return self.cog.profile_manager._update_child_bot_presence(owner_id, profile_name, presence_update)
 
             bot_config["presence"] = await asyncio.to_thread(_sync_update_presence)
 

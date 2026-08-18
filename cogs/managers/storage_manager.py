@@ -499,7 +499,6 @@ class StorageManager:
             if not os.path.isdir(profiles_dir): continue
             index = self.cog.profile_manager._get_user_index(int(user_id_str))
             
-            # [FIXED] Correctly resolve valid PIDs from the index (Personal only)
             valid_pids = set()
             personal_entry = index.get("personal", {})
             if isinstance(personal_entry, dict):
@@ -508,11 +507,12 @@ class StorageManager:
                 valid_pids.update(personal_entry)
             
             for pid_folder in os.listdir(profiles_dir):
-                bot_file = os.path.join(profiles_dir, pid_folder, "child_bot.json.gz")
-                if os.path.exists(bot_file):
-                    # Check if the folder itself is valid before deleting its config
-                    if pid_folder not in valid_pids:
-                        _delete_file_shard(bot_file)
+                profile_file = os.path.join(profiles_dir, pid_folder, "profile.json.gz")
+                if os.path.exists(profile_file) and pid_folder not in valid_pids:
+                    profile_data = IOManager.read_json_gzip(profile_file, self.fernet)
+                    if profile_data and profile_data.get("child_bot"):
+                        profile_data["child_bot"] = None
+                        IOManager.write_json_gzip(profile_data, profile_file, self.fernet)
                         cleaned_child_bots += 1
                         child_bots_changed = True
                     

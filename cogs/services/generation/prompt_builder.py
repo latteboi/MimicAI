@@ -75,7 +75,8 @@ class PromptBuilderMixin:
 
         if time_tracking_enabled:
             try:
-                tz = ZoneInfo(timezone_str)
+                from ...utils.helpers import _resolve_zoneinfo
+                tz, _ = _resolve_zoneinfo(timezone_str)
                 now = datetime.datetime.now(tz)
                 time_str = now.strftime("%A, %d %B %Y, %I:%M %p (%Z)")
                 final_instr_parts.append(f"<time_context>\nYour current time is {time_str}.\n</time_context>")

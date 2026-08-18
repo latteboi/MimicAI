@@ -1,4 +1,5 @@
 import time
+import re
 import base64
 import asyncio
 import discord
@@ -130,21 +131,52 @@ class RegenerationMixin:
             last_user_turn = next((t for t in reversed(sliced_unified_log) if t.get("is_user") is True), None)
             trigger_content = last_user_turn.get("content", "") if last_user_turn else ""
 
-            # [NEW] Media Recovery Logic for Regeneration
+            # Media Recovery Logic for Regeneration (Handles both User & Bot Generated Media)
             recovered_media_parts = []
-            if last_user_turn:
+            
+            # 1. Check if the bot message being regenerated has an attached generated image
+            regen_msg = None
+            try:
+                regen_msg = await channel.fetch_message(payload.message_id)
+            except Exception:
+                pass
+
+            is_generated_image_turn = False
+            if regen_msg and regen_msg.attachments:
+                bot_image_attachments = [a for a in regen_msg.attachments if a.content_type and a.content_type.startswith("image/")]
+                if bot_image_attachments:
+                    is_generated_image_turn = True
+                    
+                    # Extract original prompt from user turn
+                    prompt_text = ""
+                    if last_user_turn:
+                        raw_u_content = last_user_turn.get("content", "")
+                        lines = raw_u_content.split('\n')
+                        body_lines = [l for l in lines if not re.match(r'^<.+> \[[^\]]+\]:', l) and not l.startswith("</")]
+                        clean_body = "\n".join(body_lines).strip()
+                        for prefix in ["!image", "!imagine"]:
+                            if clean_body.lower().startswith(prefix):
+                                clean_body = clean_body[len(prefix):].strip()
+                                break
+                        prompt_text = clean_body
+
+                    system_note = f"<image_context>You have just generated the following image based on the prompt: '{prompt_text}'. Present it with a comment.</image_context>"
+                    recovered_media_parts.append(system_note)
+                    for a in bot_image_attachments:
+                        recovered_media_parts.append({"url": a.url, "mime_type": a.content_type})
+
+            # 2. If not a bot image generation, recover standard user attachments & replied-to media
+            if not is_generated_image_turn and last_user_turn:
                 user_msg_ids = last_user_turn.get("message_ids", [])
                 if user_msg_ids:
                     target_msg_id = user_msg_ids[-1]
                     try:
                         target_msg = await channel.fetch_message(target_msg_id)
-                        # Recover standard attachments
                         attachments = [a for a in target_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))]
                         if attachments:
                             for attachment in attachments:
                                 recovered_media_parts.append({"url": attachment.url, "mime_type": attachment.content_type})
 
-                        # Recover replied-to media
                         if target_msg.reference and target_msg.reference.message_id:
                             ref_msg = target_msg.reference.resolved
                             if not ref_msg:

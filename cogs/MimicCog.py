@@ -35,7 +35,7 @@ from .gui.gui_profiles import (
     ProfileParamsModal, ProfileTrainingParamsModal, ProfileThinkingParamsModal,
     ProfileLTMParamsModal, ProfileLTMSummarizationModal, ProfileTypingSettingsModal,
     ProfileImageGenSettingsModal, SingleProfileModelView, ModelApplyView,
-    UnifiedBulkTargetView, BulkTimezoneModal, BulkTimezoneView,
+    UnifiedBulkTargetView, CustomTimezoneModal, BulkTimezoneView, SingleProfileTimezoneView,
     ProfileGenerationVisualModal, BulkResetView, BulkDeleteView, AppearanceModal,
     ProfileNeuroModal, BulkManageView,
 )
@@ -136,6 +136,7 @@ class MimicCog(commands.Cog, EventListeners):
 
         self.storage_manager = StorageManager(self)
         self.profile_manager = ProfileManager(self)
+        self.profile_manager._migrate_all_profiles_to_unified()
         self.session_manager = SessionManager(self)
         self.memory_manager = MemoryManager(self)
         self.server_manager = ServerManager(self)
@@ -548,7 +549,7 @@ class MimicCog(commands.Cog, EventListeners):
         )
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
         
-        embed.add_field(name="Version", value="v0.4.0 Beta", inline=True)
+        embed.add_field(name="Version", value="v0.5.0 Beta", inline=True)
         embed.add_field(name="Global Scope", value=f"{len(self.bot.guilds)} Servers", inline=True)
 
         if is_owner:

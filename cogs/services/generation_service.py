@@ -422,9 +422,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         ]
 
                         if attachments:
+                            att_tags = []
                             for attachment in attachments:
                                 try:
                                     attachment_url = attachment['url'] if is_child_mention else attachment.url
+                                    fname = attachment.get('filename', 'attachment.png') if is_child_mention and isinstance(attachment, dict) else getattr(attachment, 'filename', 'attachment.png')
                                     
                                     ctype = "image/png"
                                     if not is_child_mention and attachment.content_type:
@@ -433,8 +435,14 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                         ctype = attachment.get('content_type', "image/png")
                                     
                                     new_message_parts.append({"url": attachment_url, "mime_type": ctype})
+                                    att_tags.append(f"[Attached Image: {fname}]")
                                 except Exception as e:
                                     print(f"Failed to process media attachment in multi-profile trigger: {e}")
+                            
+                            if att_tags:
+                                content = f"{' '.join(att_tags)}\n{content}".strip()
+                                user_line = _format_history_entry(author_name, created_at, content, author_tz, entity_id=user_hash)
+                                turn_object["content"] = user_line
 
                         # Combine standard attachments with URL-extracted media
                         trigger_media_parts.extend(new_message_parts)
@@ -1276,12 +1284,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             supplementary_parts.extend(all_current_media)
                         
                         if is_image_gen_round:
-                            if generated_image_bytes_for_round:
+                            if generated_image_path_for_round:
                                 system_note = f"<image_context>You have just generated the following image based on the prompt: '{image_gen_prompt}'. Present it with a comment.</image_context>" if is_generator else f"<image_context>'{generator_display_name}' just generated the following image based on the prompt: '{image_gen_prompt}'. Comment on it.</image_context>"
                                 
                                 text_gen_parts = [
                                     system_note, 
-                                    {"mime_type": "image/jpeg", "data": generated_image_bytes_for_round}
+                                    {"mime_type": "image/png", "url": generated_image_path_for_round}
                                 ]
                                 supplementary_parts.extend(text_gen_parts)
                             else:
@@ -1921,7 +1929,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             except asyncio.QueueEmpty: break
                         
                         if batched_triggers:
-                            print(f"[DEBUG-WORKER] Found {len(batched_triggers)} mid-round triggers.")
                             for trigger in batched_triggers:
                                 # [UPDATED] Unpack structured tuples in mid-round batches to ensure all messages are read
                                 if isinstance(trigger, tuple) and len(trigger) > 1 and isinstance(trigger[1], discord.Message):
