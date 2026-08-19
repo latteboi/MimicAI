@@ -1,5 +1,6 @@
 import os
 import gzip
+import threading
 import zstandard as zstd
 import pathlib
 import time
@@ -13,8 +14,36 @@ import orjson as json
 
 from ..utils.constants import SERVERS_DIR
 
-_ZSTD_COMPRESSOR = zstd.ZstdCompressor(level=1)
-_ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
+# zstandard's ZstdCompressor / ZstdDecompressor are NOT thread-safe: each owns a
+# native ZSTD_CCtx / ZSTD_DCtx, and the C backend releases the GIL while working on
+# it. Two threads sharing one instance therefore run libzstd on the same context
+# concurrently and corrupt it.
+#
+# These used to be module-level singletons, and every IOManager read/write reaches
+# them through asyncio.to_thread — so any two concurrent shard operations raced.
+# In production that showed up two ways: bursts of "IOManager Read Error ...
+# ZstdError" on valid files, and a hard SIGSEGV inside
+# backend_c.cpython-311-x86_64-linux-gnu.so when the trampled context dereferenced
+# an unmapped pointer.
+#
+# Thread-local rather than per-call: one context per worker thread, built once and
+# reused, so the hot path keeps its allocation-free property on the e2-micro while
+# no context is ever touched by two threads.
+_ZSTD_LOCAL = threading.local()
+
+
+def _get_compressor() -> "zstd.ZstdCompressor":
+    compressor = getattr(_ZSTD_LOCAL, "compressor", None)
+    if compressor is None:
+        compressor = _ZSTD_LOCAL.compressor = zstd.ZstdCompressor(level=1)
+    return compressor
+
+
+def _get_decompressor() -> "zstd.ZstdDecompressor":
+    decompressor = getattr(_ZSTD_LOCAL, "decompressor", None)
+    if decompressor is None:
+        decompressor = _ZSTD_LOCAL.decompressor = zstd.ZstdDecompressor()
+    return decompressor
 
 
 def _delete_file_shard(file_path: str):
@@ -62,7 +91,7 @@ class IOManager:
                 file_bytes = fernet.decrypt(file_bytes)
 
             try:
-                decompressed_bytes = _ZSTD_DECOMPRESSOR.decompress(file_bytes)
+                decompressed_bytes = _get_decompressor().decompress(file_bytes)
             except zstd.ZstdError:
                 # Automatic fallback for legacy gzip files on disk
                 decompressed_bytes = gzip.decompress(file_bytes)
@@ -78,7 +107,7 @@ class IOManager:
         try:
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             json_bytes = json.dumps(data)
-            compressed_bytes = _ZSTD_COMPRESSOR.compress(json_bytes)
+            compressed_bytes = _get_compressor().compress(json_bytes)
 
             bytes_to_write = compressed_bytes
             if encrypted and fernet:

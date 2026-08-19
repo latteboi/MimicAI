@@ -1019,6 +1019,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     fallback_used = False
                     response_text = ""
                     was_blocked = False
+                    # Assigned from _construct_system_instructions well inside the try below,
+                    # but read by the meta block after the except handler. Anything that
+                    # raises before that point — a missing guild API key is the common one —
+                    # left it unbound, so the recovery path itself died with an
+                    # UnboundLocalError and masked the real error.
+                    fallback_model_name = None
 
                     if not self.cog.profile_manager._check_unrestricted_safety_policy(owner_id, profile_name, channel):
                         error_message = f"[System Notice: '{profile_name}' cannot respond. Profiles with 'Unrestricted 18+' safety are only permitted in age-restricted channels.]"
@@ -1656,7 +1662,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     # [NEW] Meta collection for App Context Menu tracing
                     meta = {
                         "duration": round(duration, 2),
-                        "model": model.model_name.replace("models/", "").replace("OPENROUTER/", "").replace("GOOGLE/", "") if hasattr(model, 'model_name') else fallback_model_name,
+                        "model": model.model_name.replace("models/", "").replace("OPENROUTER/", "").replace("GOOGLE/", "") if hasattr(model, 'model_name') else (fallback_model_name or "Unknown"),
                         "fallback": fallback_used,
                         "input_tokens": getattr(response, 'input_tokens', 0) if response else 0,
                         "output_tokens": getattr(response, 'output_tokens', 0) if response else 0,

@@ -137,7 +137,6 @@ class MimicCog(commands.Cog, EventListeners):
 
         self.storage_manager = StorageManager(self)
         self.profile_manager = ProfileManager(self)
-        self.profile_manager._migrate_all_profiles_to_unified()
         self.session_manager = SessionManager(self)
         self.memory_manager = MemoryManager(self)
         self.server_manager = ServerManager(self)
