@@ -7,7 +7,15 @@ import signal
 import platform
 import os
 import sys
+import faulthandler
 from dotenv import load_dotenv
+
+# Dump a Python traceback to stderr if the interpreter takes a fatal signal
+# (SIGSEGV/SIGBUS/SIGFPE/SIGABRT). A native crash inside a C extension otherwise
+# leaves nothing in the journal but "code=dumped, status=11/SEGV", which does not
+# say which call was in flight. Costs nothing at runtime; stderr is captured by
+# systemd, so the traceback lands in `journalctl -u mimicai`.
+faulthandler.enable()
 
 # Load variables from .env file if it exists
 load_dotenv()

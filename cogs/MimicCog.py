@@ -68,6 +68,7 @@ import uuid
 from typing import List, Dict, Tuple, Set, Literal, Any, Optional, get_args
 import traceback
 import time
+import platform
 from collections import OrderedDict
 import re
 import pathlib
@@ -109,6 +110,7 @@ class MimicCog(commands.Cog, EventListeners):
             self.refresh_lock_task.start()
         else:
             print(f"MimicCog {self.cog_id} DID NOT acquire lock. Will run in INACTIVE mode.")
+            self.reacquire_lock_task.start()
 
         print(f"MimicCog Init. Models: Primary='{PRIMARY_MODEL_NAME}', Fallback='{FALLBACK_MODEL_NAME}'.")
 
@@ -1859,31 +1861,73 @@ class MimicCog(commands.Cog, EventListeners):
         view = ModStatsView(self, interaction)
         await view.update_display()
 
+    def _write_lock_file(self):
+        """Stamps the lock with our own PID alongside the heartbeat time."""
+        with open(COG_LOCK_FILE_PATH, "w") as f:
+            f.write(f"{time.time()} {os.getpid()}")
+
+    @staticmethod
+    def _lock_holder_is_alive(pid):
+        """True if the PID recorded in the lock file is still a running process.
+
+        A crash (SEGV, OOM kill, SIGKILL) leaves the lock file on disk with a
+        heartbeat only seconds old, so the staleness window alone cannot tell a
+        crashed holder from a healthy one. Asking the OS can.
+
+        Unknown PID, or Windows where a signal-0 probe is not meaningful, falls
+        back to True so the caller uses the timestamp heuristic instead — that is
+        the old behaviour, never worse than it.
+        """
+        if pid is None or pid <= 0:
+            return True
+        if platform.system() == "Windows":
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return True
+        return True
+
     def _try_acquire_lock(self):
         try:
             if not os.path.exists(COG_LOCK_FILE_PATH):
-                with open(COG_LOCK_FILE_PATH, "w") as f:
-                    f.write(str(time.time()))
+                self._write_lock_file()
+                self.has_lock = True
+                return
+
+            with open(COG_LOCK_FILE_PATH, "r") as f:
+                lock_contents = f.read().strip()
+            if not lock_contents:
+                self._write_lock_file()
+                self.has_lock = True
+                return
+
+            # Legacy lock files hold a bare timestamp; current ones append the PID.
+            fields = lock_contents.split()
+            lock_time = float(fields[0])
+            lock_pid = int(fields[1]) if len(fields) > 1 else None
+
+            is_own_pid = lock_pid is not None and lock_pid == os.getpid()
+            holder_died = lock_pid is not None and not self._lock_holder_is_alive(lock_pid)
+            is_stale = (time.time() - lock_time) > LOCK_STALE_THRESHOLD_SECONDS
+
+            if is_own_pid or holder_died or is_stale:
+                if holder_died and not is_stale:
+                    # The common case after a crash: systemd restarts in 10 s but the
+                    # heartbeat is under the 60 s threshold, so without this the new
+                    # process would boot INACTIVE and stay that way.
+                    print(f"Lock held by dead PID {lock_pid}. Reclaiming.")
+                self._write_lock_file()
                 self.has_lock = True
             else:
-                with open(COG_LOCK_FILE_PATH, "r") as f:
-                    lock_time_str = f.read().strip()
-                if not lock_time_str: 
-                    with open(COG_LOCK_FILE_PATH, "w") as f:
-                        f.write(str(time.time()))
-                    self.has_lock = True
-                    return
-
-                lock_time = float(lock_time_str)
-                if (time.time() - lock_time) > LOCK_STALE_THRESHOLD_SECONDS:
-                    with open(COG_LOCK_FILE_PATH, "w") as f:
-                        f.write(str(time.time()))
-                    self.has_lock = True
-                else:
-                    self.has_lock = False 
-        except (IOError, ValueError) as e: 
+                self.has_lock = False
+        except (IOError, ValueError, IndexError) as e:
             print(f"Error during lock acquisition: {e}. Assuming no lock.")
-            self.has_lock = False 
+            self.has_lock = False
         except Exception as e:
             print(f"Unexpected error during lock acquisition: {e}. Assuming no lock.")
             self.has_lock = False
@@ -1891,17 +1935,32 @@ class MimicCog(commands.Cog, EventListeners):
     @tasks.loop(seconds=LOCK_REFRESH_INTERVAL_SECONDS)
     async def refresh_lock_task(self):
         if self.has_lock:
-            def _sync_refresh():
-                with open(COG_LOCK_FILE_PATH, "w") as f:
-                    f.write(str(time.time()))
             try:
-                await asyncio.to_thread(_sync_refresh)
+                await asyncio.to_thread(self._write_lock_file)
             except IOError as e:
                 print(f"IOError refreshing lock file: {e}. Potential lock loss.")
                 self.has_lock = False
             except Exception as e:
                 print(f"Unexpected error refreshing lock file: {e}. Potential lock loss.")
                 self.has_lock = False
+
+    @tasks.loop(seconds=LOCK_REFRESH_INTERVAL_SECONDS)
+    async def reacquire_lock_task(self):
+        """Self-heals an INACTIVE cog.
+
+        Nothing used to retry after the single attempt in __init__, so a cog that
+        lost the race once stayed half-dead until someone restarted it by hand —
+        listeners and lock-guarded commands silently returning early while the
+        unguarded ones kept working. Retrying costs one stat() every 30 s.
+        """
+        if self.has_lock:
+            return
+        await asyncio.to_thread(self._try_acquire_lock)
+        if self.has_lock:
+            print(f"MimicCog {self.cog_id} acquired lock on retry and is now ACTIVE.")
+            if not self.refresh_lock_task.is_running():
+                self.refresh_lock_task.start()
+            self.reacquire_lock_task.cancel()
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(MimicCog(bot))
