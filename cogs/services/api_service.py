@@ -1,22 +1,18 @@
 import os
+import time
 import asyncio
 import base64
 import datetime
-import threading
 import httpx
 import orjson as json
 from collections import OrderedDict
 from typing import get_args, Any, List, Optional, Tuple
 from discord.ext import tasks
 
-from google import genai
-from google.genai import types
-
 from ..utils.constants import (
     OLLAMA_LOCAL_URL, MODELS_DATA_DIR, PRICING_CACHE_FILE, IMAGE_MODELS, AUDIO_MODELS,
     ALLOWED_MODELS, defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
-    HarmBlockThreshold, HarmCategory,
-    USE_GOOGLE_REST_ADAPTER,
+    HarmBlockThreshold, HarmCategory, HARM_CATEGORIES,
 )
 
 
@@ -377,61 +373,16 @@ class OllamaModel:
             except asyncio.CancelledError:
                 raise
 
-# --- Shared google-genai client cache -----------------------------------------
-#
-# Constructing a genai.Client builds three separate SSL contexts (httpx, aiohttp,
-# websockets), each loading the full CA bundle: ~44 ms of CPU and ~2.4 MB of RSS
-# that is never returned to the OS. On the e2-micro that cost is unaffordable on a
-# per-turn path, and it was previously paid per model, per embedding and per TTS
-# segment. Clients are stateless with respect to requests, so one per
-# (api_key, api_version) is sufficient.
-#
-# Bounded to _GENAI_CLIENT_CACHE_MAX entries, evicted least-recently-used, because
-# the key space is per-guild API keys and must not grow without limit. The lock
-# guards the move_to_end/popitem sequence: the sync client is also touched from
-# worker threads via asyncio.to_thread (see files.upload below).
-
-_GENAI_CLIENT_CACHE_MAX = 8
-_genai_client_cache: "OrderedDict[Tuple[str, str], genai.Client]" = OrderedDict()
-_genai_client_lock = threading.Lock()
-
-
-def get_genai_client(api_key: str, api_version: str = 'v1beta') -> genai.Client:
-    """Returns a shared genai.Client for this (api_key, api_version) pair.
-
-    Always prefer this over constructing genai.Client directly.
-    """
-    key = (api_key, api_version)
-    with _genai_client_lock:
-        client = _genai_client_cache.get(key)
-        if client is not None:
-            _genai_client_cache.move_to_end(key)
-            return client
-
-    # Built outside the lock: construction is slow and two concurrent misses
-    # racing is harmless — the loser's client is simply discarded.
-    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(api_version=api_version))
-
-    with _genai_client_lock:
-        existing = _genai_client_cache.get(key)
-        if existing is not None:
-            _genai_client_cache.move_to_end(key)
-            return existing
-        _genai_client_cache[key] = client
-        while len(_genai_client_cache) > _GENAI_CLIENT_CACHE_MAX:
-            _genai_client_cache.popitem(last=False)
-    return client
-
 
 # --- Google REST adapter -------------------------------------------------------
 #
-# Migration 2. google-genai is already REST over httpx — there is no gRPC and no
-# protocol change here. What it buys is 70 MB of import baseline never returned to
-# the OS, and dropping aiohttp/websockets/requests/pydantic from the dependency
-# tree; on a 1 GB e2-micro that is 7% of RAM before a message is handled.
+# Migration 2, complete. google-genai was already REST over httpx — there was no gRPC
+# and this changed no wire format. What it bought is 70 MB of import baseline never
+# returned to the OS, and dropping aiohttp/websockets/requests/pydantic from the
+# dependency tree; on a 1 GB e2-micro that is 7% of RAM before a message is handled.
 #
-# Selected by USE_GOOGLE_REST_ADAPTER (see constants.py). GoogleSDKModel below stays
-# live alongside it until the flag is flipped for good.
+# This is now the only Google adapter. GoogleSDKModel and the genai.Client cache are
+# gone; the migration's GOOGLE_REST_ADAPTER flag is gone with them.
 
 _GOOGLE_API_BASE = "https://generativelanguage.googleapis.com"
 
@@ -457,6 +408,111 @@ async def close_google_rest_client():
     if _google_rest_client is not None and not _google_rest_client.is_closed:
         await _google_rest_client.aclose()
     _google_rest_client = None
+
+
+# Migration 2 step 2. One function, three call sites (memory_manager LTM/training
+# recall, help_service's two RAG builders) — all three already share this exact
+# payload shape, so the flag is applied here rather than at each site, same as
+# GoogleGenAIModel above.
+async def get_embedding_vector(
+    api_key: str,
+    text: str,
+    task_type: str = "RETRIEVAL_QUERY",
+    output_dimensionality: int = 256,
+    timeout: float = 5.0,
+) -> Optional[List[float]]:
+    """Returns the embedding for `text`, or None on any failure."""
+    if not text or not text.strip():
+        return None
+
+    payload = {
+        "model": "models/gemini-embedding-001",
+        "content": {"parts": [{"text": text}]},
+        "taskType": task_type,
+        "outputDimensionality": output_dimensionality,
+    }
+    try:
+        client = get_google_rest_client()
+        response = await asyncio.wait_for(
+            client.post(
+                "/v1beta/models/gemini-embedding-001:embedContent",
+                content=json.dumps(payload),
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            ),
+            timeout=timeout,
+        )
+        if response.status_code != 200:
+            print(f"Embedding err for '{text[:30]}...': Google API Error {response.status_code}: {response.text}")
+            return None
+        body = json.loads(response.content)
+        return body.get("embedding", {}).get("values")
+    except Exception as e:
+        print(f"Embedding err for '{text[:30]}...': {e}")
+        return None
+
+
+def _read_file_bytes(path: str) -> bytes:
+    """Sync full-file read, run via asyncio.to_thread so the resumable upload's
+    disk I/O never blocks the event loop."""
+    with open(path, "rb") as f:
+        return f.read()
+
+
+# --- Gemini File API URI cache -------------------------------------------------
+#
+# _build_parts resolves every {'url': ...} part by downloading the bytes and
+# uploading them to the File API, and it runs once per participant per round. A
+# four-profile round therefore downloaded and re-uploaded the same attachment four
+# times, and each upload buffers the whole file — which is exactly the "memory grows
+# with participant count" behaviour on the e2-micro. The bytes are identical every
+# time, so resolve once and share the URI for the rest of the round.
+#
+# Bounded and TTL'd. File API entries expire server-side after 48 h, so a cached URI
+# must never outlive that; 30 minutes is far inside it and comfortably longer than
+# any single round.
+
+_FILE_URI_CACHE_MAX = 32
+_FILE_URI_CACHE_TTL = 1800.0
+_file_uri_cache: "OrderedDict[Any, Tuple[float, str]]" = OrderedDict()
+
+# Single-flight: participants in a round are sequential, but two channels can be
+# mid-round on the same image at once. Waiters share one upload instead of racing.
+_file_uri_inflight: dict = {}
+
+
+def _file_cache_key(source: str, mime_type: str):
+    """Cache key for one media source.
+
+    Local paths key on a content stamp as well as the name: these are mkstemp temp
+    files that are deleted at end of round, and the name can be handed out again
+    afterwards. A stale hit on a reused name would attach the wrong image to a turn.
+    """
+    if source.startswith(("http://", "https://")):
+        return (source, mime_type)
+    try:
+        st = os.stat(source)
+        return (source, st.st_size, st.st_mtime_ns, mime_type)
+    except OSError:
+        return (source, mime_type)
+
+
+def _file_uri_cache_get(key) -> Optional[str]:
+    entry = _file_uri_cache.get(key)
+    if entry is None:
+        return None
+    stamped_at, uri = entry
+    if time.monotonic() - stamped_at > _FILE_URI_CACHE_TTL:
+        _file_uri_cache.pop(key, None)
+        return None
+    _file_uri_cache.move_to_end(key)
+    return uri
+
+
+def _file_uri_cache_put(key, uri: str):
+    _file_uri_cache[key] = (time.monotonic(), uri)
+    _file_uri_cache.move_to_end(key)
+    while len(_file_uri_cache) > _FILE_URI_CACHE_MAX:
+        _file_uri_cache.popitem(last=False)
 
 
 def _to_camel(snake: str) -> str:
@@ -585,16 +641,69 @@ class GoogleRESTModel:
     # -- media ------------------------------------------------------------------
 
     async def _upload_file(self, path: str, mime_type: str) -> Optional[str]:
-        """Uploads a file already on disk and returns its file URI.
+        """Uploads a file already on disk via the resumable upload protocol and
+        returns its file URI.
 
-        Still routed through the SDK's resumable upload while google-genai is
-        present. This is the single seam that Migration 2 step 4 replaces with the
-        hand-rolled resumable protocol; keeping it isolated means the media path —
-        the least-exercised one in the bot — changes in exactly one place.
+        Two requests: a "start" that returns an upload URL in the
+        X-Goog-Upload-URL response header, then an "upload, finalize" carrying
+        the bytes. Reads the whole file into memory for that second request
+        rather than chunk-streaming it from disk — the caller already staged it
+        there specifically to avoid buffering the *download*, but Discord
+        attachment sizes cap this in the low tens of megabytes, the buffer is
+        freed the moment the POST returns, and a hand-rolled chunked upload
+        against an under-documented third-party protocol is not a risk worth
+        taking on the bot's least-exercised path. Polls the file resource's
+        `state` only if the API reports PROCESSING; small image/audio files
+        finalize as ACTIVE immediately and skip the poll entirely.
         """
-        client = get_genai_client(self.api_key, 'v1beta')
-        uploaded = await asyncio.to_thread(client.files.upload, file=path, config={'mime_type': mime_type})
-        return getattr(uploaded, 'uri', None)
+        file_size = os.path.getsize(path)
+        client = get_google_rest_client()
+
+        start_resp = await client.post(
+            "/upload/v1beta/files",
+            headers={
+                "x-goog-api-key": self.api_key,
+                "X-Goog-Upload-Protocol": "resumable",
+                "X-Goog-Upload-Command": "start",
+                "X-Goog-Upload-Header-Content-Length": str(file_size),
+                "X-Goog-Upload-Header-Content-Type": mime_type,
+                "Content-Type": "application/json",
+            },
+            content=json.dumps({"file": {"display_name": os.path.basename(path)}}),
+        )
+        if start_resp.status_code != 200:
+            raise Exception(f"Google API Error {start_resp.status_code}: {start_resp.text}")
+
+        upload_url = start_resp.headers.get("x-goog-upload-url")
+        if not upload_url:
+            raise Exception("Google API Error: resumable upload start returned no upload URL")
+
+        file_bytes = await asyncio.to_thread(_read_file_bytes, path)
+
+        upload_resp = await client.post(
+            upload_url,
+            headers={
+                "Content-Length": str(file_size),
+                "X-Goog-Upload-Offset": "0",
+                "X-Goog-Upload-Command": "upload, finalize",
+            },
+            content=file_bytes,
+        )
+        if upload_resp.status_code != 200:
+            raise Exception(f"Google API Error {upload_resp.status_code}: {upload_resp.text}")
+
+        file_resource = json.loads(upload_resp.content).get("file", {}) or {}
+
+        poll_attempts = 0
+        while file_resource.get("state") == "PROCESSING" and file_resource.get("name") and poll_attempts < 10:
+            await asyncio.sleep(1.0)
+            poll_resp = await client.get(f"/v1beta/{file_resource['name']}", headers={"x-goog-api-key": self.api_key})
+            if poll_resp.status_code != 200:
+                break
+            file_resource = json.loads(poll_resp.content)
+            poll_attempts += 1
+
+        return file_resource.get("uri")
 
     async def _build_parts(self, raw_parts) -> List[dict]:
         parts = []
@@ -611,39 +720,82 @@ class GoogleRESTModel:
             elif isinstance(p, dict) and 'url' in p:
                 url = p['url']
                 mime_type = p.get('mime_type', '')
-                if url.startswith(('http://', 'https://')):
-                    temp_path = None
-                    try:
-                        import tempfile
-
-                        # Streamed to disk rather than buffered, so a large attachment
-                        # never sits in RAM in full.
-                        fd, temp_path = tempfile.mkstemp(suffix=".tmp")
-                        client_http = get_google_rest_client()
-                        async with client_http.stream("GET", url, follow_redirects=True, timeout=15.0) as resp:
-                            resp.raise_for_status()
-                            with os.fdopen(fd, 'wb') as f:
-                                async for chunk in resp.aiter_bytes(chunk_size=8192):
-                                    f.write(chunk)
-
-                        file_uri = await self._upload_file(temp_path, mime_type or 'image/jpeg')
-                        if file_uri:
-                            parts.append({"fileData": {"fileUri": file_uri, "mimeType": mime_type or 'image/jpeg'}})
-                    except Exception as e:
-                        print(f"Failed to fetch media from URL {url}: {e}")
-                    finally:
-                        if temp_path and os.path.exists(temp_path):
-                            os.remove(temp_path)
-                elif os.path.exists(url):
-                    try:
-                        file_uri = await self._upload_file(url, mime_type or 'image/png')
-                        if file_uri:
-                            parts.append({"fileData": {"fileUri": file_uri, "mimeType": mime_type or 'image/png'}})
-                    except Exception as e:
-                        print(f"Failed to upload local image {url} to Gemini File API: {e}")
+                is_remote = url.startswith(('http://', 'https://'))
+                if is_remote or os.path.exists(url):
+                    resolved_mime = mime_type or ('image/jpeg' if is_remote else 'image/png')
+                    file_uri = await self._resolve_media_uri(url, resolved_mime, is_remote)
+                    if file_uri:
+                        parts.append({"fileData": {"fileUri": file_uri, "mimeType": resolved_mime}})
                 else:
                     parts.append({"fileData": {"fileUri": url, "mimeType": mime_type}})
         return parts
+
+    async def _resolve_media_uri(self, url: str, mime_type: str, is_remote: bool) -> Optional[str]:
+        """Returns a File API URI for `url`, reusing a cached one when the same
+        bytes were already uploaded. Returns None on failure rather than raising —
+        a media part that cannot be resolved is dropped, as it was before.
+        """
+        key = _file_cache_key(url, mime_type)
+
+        cached = _file_uri_cache_get(key)
+        if cached:
+            return cached
+
+        inflight = _file_uri_inflight.get(key)
+        if inflight is not None:
+            # Another round is already uploading these exact bytes. Shielded so a
+            # cancelled waiter does not kill the upload the others are waiting on.
+            try:
+                return await asyncio.shield(inflight)
+            except Exception:
+                return None
+
+        future = asyncio.get_running_loop().create_future()
+        _file_uri_inflight[key] = future
+        uri = None
+        try:
+            if is_remote:
+                uri = await self._download_and_upload(url, mime_type)
+            else:
+                uri = await self._upload_file(url, mime_type)
+            if uri:
+                _file_uri_cache_put(key, uri)
+        except Exception as e:
+            # An unresolvable media part is dropped, never fatal to the turn — the
+            # per-URL try/except this replaced behaved the same way. CancelledError
+            # is a BaseException and still propagates, as it must.
+            print(f"Failed to resolve media {url} for the Gemini File API: {e}")
+            uri = None
+        finally:
+            _file_uri_inflight.pop(key, None)
+            if not future.done():
+                # Resolved rather than raised: waiters take the same None-means-drop
+                # path, and nothing is left as an unretrieved exception.
+                future.set_result(uri)
+        return uri
+
+    async def _download_and_upload(self, url: str, mime_type: str) -> Optional[str]:
+        temp_path = None
+        try:
+            import tempfile
+
+            # Streamed to disk rather than buffered, so a large attachment
+            # never sits in RAM in full.
+            fd, temp_path = tempfile.mkstemp(suffix=".tmp")
+            client_http = get_google_rest_client()
+            async with client_http.stream("GET", url, follow_redirects=True, timeout=15.0) as resp:
+                resp.raise_for_status()
+                with os.fdopen(fd, 'wb') as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=8192):
+                        f.write(chunk)
+
+            return await self._upload_file(temp_path, mime_type)
+        except Exception as e:
+            print(f"Failed to fetch media from URL {url}: {e}")
+            return None
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
 
     # -- request ----------------------------------------------------------------
 
@@ -790,8 +942,8 @@ class GoogleRESTModel:
 class GoogleRESTResponse:
     """Normalises a parsed generateContent body into the shared adapter interface.
 
-    The same shape GoogleSDKModel's ThoughtResponse produces — only the input
-    changes, from an SDK object to a _RestView over the JSON.
+    Presents the same attribute surface the SDK adapter's ThoughtResponse did, so
+    the call sites that reach past the shared interface into .raw keep working.
     """
 
     def __init__(self, body: dict):
@@ -818,201 +970,68 @@ class GoogleRESTResponse:
         return bool(self.candidates)
 
 
-class GoogleSDKModel:
-    def __init__(self, api_key, model_name, system_instruction=None, safety_settings=None, thinking_params=None, tools=None):
-        # Force v1beta for stable "Thinking" part delivery
-        self.client = get_genai_client(api_key, 'v1beta')
-        self.model_name = model_name.replace("OPENROUTER/", "").replace("GOOGLE/", "")
-        self.system_instruction = system_instruction
-        self.safety_settings = safety_settings
-        self.thinking_params = thinking_params or {}
-        self.tools = tools
 
-    async def generate_content_async(self, contents, generation_config=None, stream_state=None):
-        formatted_contents = []
-        for item in contents:
-            if isinstance(item, str):
-                formatted_contents.append(item)
-            elif isinstance(item, dict):
-                role = item.get('role', 'user')
-                parts = []
-                for p in item.get('parts', []):
-                    if isinstance(p, str):
-                        parts.append(types.Part.from_text(text=p))
-                    elif isinstance(p, dict) and 'mime_type' in p and 'data' in p:
-                        parts.append(types.Part.from_bytes(data=p['data'], mime_type=p['mime_type']))
-                    elif isinstance(p, dict) and 'url' in p:
-                        url = p['url']
-                        mime_type = p.get('mime_type', '')
-                        if url.startswith(('http://', 'https://')):
-                            try:
-                                import tempfile
+# Migration 2 step 3. TTS calls generateContent directly with a response_modalities /
+# speechConfig shape that no other caller needs, so it stays outside the shared
+# generate_content_async interface rather than widening it for one consumer. Same
+# endpoint, same routing switch as GoogleGenAIModel and get_embedding_vector above.
+async def generate_google_tts_audio(
+    api_key: str,
+    model_id: str,
+    text: str,
+    voice_name: str = "Aoede",
+    temperature: float = 1.0,
+) -> Optional[bytes]:
+    """Returns raw PCM audio bytes for `text`, or None if the response carried none.
 
-                                # 1. Stream directly to disk to prevent RAM spikes
-                                fd, temp_path = tempfile.mkstemp(suffix=".tmp")
-                                async with httpx.AsyncClient() as client_http:
-                                    async with client_http.stream("GET", url, follow_redirects=True, timeout=15.0) as resp:
-                                        resp.raise_for_status()
-                                        with os.fdopen(fd, 'wb') as f:
-                                            async for chunk in resp.aiter_bytes(chunk_size=8192):
-                                                f.write(chunk)
+    Raises on network/API failure — same contract as generate_content_async — so
+    media_service's existing try/except keeps handling errors uniformly.
+    """
+    if model_id.upper().startswith("GOOGLE/"):
+        model_id = model_id[7:]
 
-                                # 2. Upload via File API (Disk Overloading)
-                                # Using asyncio.to_thread to prevent blocking the event loop with the sync upload
-                                upload_config = {'mime_type': mime_type or 'image/jpeg'}
-                                uploaded_file = await asyncio.to_thread(self.client.files.upload, file=temp_path, config=upload_config)
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": text}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "temperature": temperature,
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": voice_name}
+                }
+            },
+        },
+    }
+    model_path = model_id if model_id.startswith("models/") else f"models/{model_id}"
 
-                                # 3. Pass the URI reference instead of raw bytes
-                                parts.append(types.Part.from_uri(file_uri=uploaded_file.uri, mime_type=mime_type or 'image/jpeg'))
-
-                                # 4. Cleanup temp file
-                                os.remove(temp_path)
-
-                            except Exception as e:
-                                print(f"Failed to fetch media from URL {url}: {e}")
-                                if 'temp_path' in locals() and os.path.exists(temp_path):
-                                    os.remove(temp_path)
-                        elif os.path.exists(url):
-                            try:
-                                # Disk Overloading: Upload local temp file directly to Gemini File API
-                                upload_config = {'mime_type': mime_type or 'image/png'}
-                                uploaded_file = await asyncio.to_thread(self.client.files.upload, file=url, config=upload_config)
-                                parts.append(types.Part.from_uri(file_uri=uploaded_file.uri, mime_type=mime_type or 'image/png'))
-                            except Exception as e:
-                                print(f"Failed to upload local image {url} to Gemini File API: {e}")
-                        else:
-                            parts.append(types.Part.from_uri(file_uri=url, mime_type=mime_type))
-
-                formatted_contents.append(types.Content(role=role, parts=parts))
-            elif hasattr(item, 'role') and hasattr(item, 'parts'):
-                # Fallback for legacy objects
-                new_parts = []
-                for p in item.parts:
-                    if hasattr(p, 'text') and p.text:
-                        new_parts.append(types.Part.from_text(text=p.text))
-                    elif hasattr(p, 'inline_data') and p.inline_data:
-                        new_parts.append(types.Part.from_bytes(data=p.inline_data.data, mime_type=p.inline_data.mime_type))
-                formatted_contents.append(types.Content(role=item.role, parts=new_parts))
-            else:
-                formatted_contents.append(item)
-
-        v2_safety = []
-        if self.safety_settings:
-            for cat, thresh in self.safety_settings.items():
-                v2_safety.append(types.SafetySetting(
-                    category=cat.name if hasattr(cat, 'name') else str(cat),
-                    threshold=thresh.name if hasattr(thresh, 'name') else str(thresh)
-                ))
-
-        thinking_cfg = None
-        model_lower = self.model_name.lower()
-
-        # [NEW] Exclude utility models that do not support reasoning tokens/thinking config
-        is_utility_model = any(suffix in model_lower for suffix in ["-image", "-tts", "-embedding"])
-
-        include_thoughts = self.thinking_params.get("thinking_summary_visible") == "on"
-
-        temp = None
-        top_p = None
-        top_k = None
-
-        if isinstance(generation_config, dict):
-            temp = generation_config.get("temperature")
-            top_p = generation_config.get("top_p")
-            top_k = generation_config.get("top_k")
-            if generation_config.get("thinking_config"):
-                include_thoughts = generation_config["thinking_config"].get("include_thoughts", include_thoughts)
-        else:
-            temp = generation_config.temperature if generation_config else None
-            top_p = generation_config.top_p if generation_config else None
-            top_k = generation_config.top_k if generation_config else None
-            if generation_config and hasattr(generation_config, 'thinking_config') and generation_config.thinking_config:
-                include_thoughts = generation_config.thinking_config.include_thoughts
-
-        if not is_utility_model:
-            if "gemini-3" in model_lower:
-                lvl = self.thinking_params.get("thinking_level", "high").lower()
-                is_pro = "pro" in model_lower
-                if is_pro:
-                    mapped_lvl = "LOW" if lvl in ["low", "minimal", "none"] else "HIGH"
-                else:
-                    mapped_lvl = {
-                        "xhigh": "HIGH", "high": "HIGH", "medium": "MEDIUM",
-                        "low": "LOW", "minimal": "MINIMAL", "none": "MINIMAL"
-                    }.get(lvl, "HIGH")
-
-                thinking_cfg = types.ThinkingConfig(
-                    include_thoughts=include_thoughts,
-                    thinking_level=mapped_lvl
-                )
-            elif "gemini-2.5" in model_lower:
-                budget = int(self.thinking_params.get("thinking_budget", -1))
-                if "lite" not in model_lower:
-                    if "pro" in model_lower and 0 <= budget < 128:
-                        budget = 128
-                    thinking_cfg = types.ThinkingConfig(
-                        include_thoughts=include_thoughts,
-                        thinking_budget=budget
-                    )
-
-        config = types.GenerateContentConfig(
-            system_instruction=self.system_instruction,
-            temperature=temp,
-            top_p=top_p,
-            top_k=top_k,
-            safety_settings=v2_safety if v2_safety else None,
-            thinking_config=thinking_cfg,
-            tools=self.tools
+    try:
+        client = get_google_rest_client()
+        response = await client.post(
+            f"/v1beta/{model_path}:generateContent",
+            content=json.dumps(payload),
+            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
         )
+    except httpx.RequestError as e:
+        raise Exception(f"Google API Network Error: {str(e)}")
 
-        response = await self.client.aio.models.generate_content(
-            model=self.model_name,
-            contents=formatted_contents,
-            config=config
-        )
+    if response.status_code != 200:
+        raise Exception(f"Google API Error {response.status_code}: {response.text}")
 
-        formatted_contents.clear()
-        del formatted_contents
-
-        class ThoughtResponse:
-            def __init__(self, raw_resp):
-                self.raw = raw_resp
-                self.text = ""
-                self.thought = ""
-                self.candidates = raw_resp.candidates
-                self.prompt_feedback = getattr(raw_resp, 'prompt_feedback', None)
-                self.usage_metadata = getattr(raw_resp, 'usage_metadata', None)
-
-                self.input_tokens = getattr(self.usage_metadata, 'prompt_token_count', 0) if self.usage_metadata else 0
-                self.output_tokens = getattr(self.usage_metadata, 'candidates_token_count', 0) if self.usage_metadata else 0
-
-                if raw_resp.candidates and raw_resp.candidates[0].content and raw_resp.candidates[0].content.parts:
-                    for part in raw_resp.candidates[0].content.parts:
-                        is_thought = getattr(part, 'thought', False)
-                        if is_thought:
-                            self.thought += part.text or ""
-                        elif part.text:
-                            self.text += part.text
-
-                self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
-
-            def __bool__(self): return bool(self.candidates)
-
-        return ThoughtResponse(response)
+    parsed = GoogleRESTResponse(json.loads(response.content))
+    if parsed.candidates and parsed.candidates[0].content and parsed.candidates[0].content.parts:
+        for part in parsed.candidates[0].content.parts:
+            if getattr(part, 'inline_data', None) and part.inline_data.data:
+                return part.inline_data.data
+    return None
 
 
 # --- Google adapter routing ----------------------------------------------------
 #
-# Every Google construction site in the bot imports this name, so the flag is applied
-# here rather than at ten call sites. A function, not a class, because the two
-# adapters share no implementation — only an interface.
-#
-# MimicCog's cost-recording branch matches on __class__.__name__, so it tests for
-# both concrete names; nothing else in the codebase inspects the adapter's type.
-def GoogleGenAIModel(*args, **kwargs):
-    """Constructs the Google adapter selected by USE_GOOGLE_REST_ADAPTER."""
-    cls = GoogleRESTModel if USE_GOOGLE_REST_ADAPTER else GoogleSDKModel
-    return cls(*args, **kwargs)
+# Retained as an alias because ten construction sites across six files import this
+# name. Migration 2 is complete and GoogleRESTModel is the only Google adapter, so
+# there is nothing left to route — but renaming those ten sites is a separate diff
+# from deleting the SDK, and this file is the one that had to change.
+GoogleGenAIModel = GoogleRESTModel
 
 
 class APIService:
@@ -1229,7 +1248,7 @@ class APIService:
         safety_level_str = profile_data.get("safety_level", "low")
         safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
         threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
-        safety_settings = { cat: threshold for cat in get_args(HarmCategory) }
+        safety_settings = { cat: threshold for cat in HARM_CATEGORIES }
 
         try:
             t_params = {
@@ -1265,32 +1284,36 @@ class APIService:
         
 
     async def _validate_api_keys(self, gemini_key: str, openrouter_key: str) -> Tuple[bool, str, str]:
-        """Validates API keys using the new Google Gen AI SDK. Returns (is_valid, error_message, tier)."""
+        """Validates API keys against the REST API. Returns (is_valid, error_message, tier).
+
+        The tier describes whether the **user's Google key has billing enabled** —
+        image models are rejected on unbilled keys. It is not a user tier.
+
+        Kept on v1alpha, as it was under the SDK.
+        """
         detected_tier = "free"
-        
+
         if gemini_key:
-            try:
-                # Initialize new SDK client
-                test_client = get_genai_client(gemini_key, 'v1alpha')
-                
-                # Step 1: Authentication Check (Is the key valid?)
-                await test_client.aio.models.generate_content(
-                    model='gemini-flash-lite-latest', 
-                    contents="ping",
-                    config=types.GenerateContentConfig(max_output_tokens=1)
+            async def _ping(model_name: str):
+                client = get_google_rest_client()
+                return await client.post(
+                    f"/v1alpha/models/{model_name}:generateContent",
+                    content=json.dumps({
+                        "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                        "generationConfig": {"maxOutputTokens": 1},
+                    }),
+                    headers={"x-goog-api-key": gemini_key, "Content-Type": "application/json"},
                 )
 
-                # Step 2: Tier Detection (Does it have access to premium-only models?)
-                try:
-                    await test_client.aio.models.generate_content(
-                        model='gemini-3.1-flash-image', 
-                        contents="ping",
-                        config=types.GenerateContentConfig(max_output_tokens=1)
-                    )
-                    detected_tier = "paid"
-                except Exception:
-                    # Key is valid, but rejected by a restricted model
-                    detected_tier = "free"
+            try:
+                # Step 1: Authentication Check (Is the key valid?)
+                auth_resp = await _ping('gemini-flash-lite-latest')
+                if auth_resp.status_code != 200:
+                    return False, f"Google Gemini API validation failed: {auth_resp.status_code}: {auth_resp.text}", "none"
+
+                # Step 2: Billing Detection (Does it have access to image models?)
+                billing_resp = await _ping('gemini-3.1-flash-image')
+                detected_tier = "paid" if billing_resp.status_code == 200 else "free"
 
             except Exception as e:
                 return False, f"Google Gemini API validation failed: {str(e)}", "none"

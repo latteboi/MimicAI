@@ -2,11 +2,9 @@ import os
 import asyncio
 from typing import Optional
 
-from google.genai import types
-
 from ..utils.constants import defaultConfig, DOCS_DIR, DEFAULT_HELP_MODE_INJECTION
 from ..managers.memory_manager import encode_embedding_b64, decode_embedding_b64
-from .api_service import get_genai_client
+from .api_service import get_embedding_vector
 
 
 class HelpService:
@@ -40,17 +38,12 @@ class HelpService:
                     for page, text in pages.items():
                         chunks.append(f"[{cat} - {page}]\n{text}")
             
-            client = get_genai_client(api_key)
             self.cog.guide_vectors = []
             for chunk in chunks:
                 try:
-                    result = await asyncio.wait_for(
-                        client.aio.models.embed_content(
-                            model='gemini-embedding-001',
-                            contents=chunk,
-                            config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT", output_dimensionality=256)
-                        ), timeout=5.0)
-                    emb = result.embeddings[0].values
+                    emb = await get_embedding_vector(api_key, chunk, task_type="RETRIEVAL_DOCUMENT", output_dimensionality=256, timeout=5.0)
+                    if emb is None:
+                        continue
                     self.cog.guide_vectors.append({"text": chunk, "emb": emb})
                 except Exception as e:
                     print(f"Guide embedding failed: {e}")
@@ -97,8 +90,6 @@ class HelpService:
             print("Warning: No Bot Owner Google API Key found. Skipping documentation vector generation.")
             return
 
-        client = get_genai_client(api_key)
-
         def _sync_walk_docs():
             chunks = []
             for root, dirs, files in os.walk(DOCS_DIR):
@@ -124,13 +115,9 @@ class HelpService:
         cache_to_save = []
         for chunk in chunks:
             try:
-                result = await asyncio.wait_for(
-                    client.aio.models.embed_content(
-                        model='gemini-embedding-001',
-                        contents=chunk,
-                        config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT", output_dimensionality=256)
-                    ), timeout=5.0)
-                emb = result.embeddings[0].values
+                emb = await get_embedding_vector(api_key, chunk, task_type="RETRIEVAL_DOCUMENT", output_dimensionality=256, timeout=5.0)
+                if emb is None:
+                    continue
                 b64_emb = encode_embedding_b64(emb)
                 self.cog.doc_vectors.append({"text": chunk, "emb": emb, "emb_b64": b64_emb})
                 cache_to_save.append({"text": chunk, "emb_b64": b64_emb})

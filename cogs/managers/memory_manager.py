@@ -9,7 +9,6 @@ from typing import Dict, List, Any, Optional, Union, Tuple
 import numpy as np
 import discord
 
-from google.genai import types
 
 from ..utils.constants import (
     defaultConfig, FALLBACK_MODEL_NAME, DEFAULT_SAFETY_SETTINGS,
@@ -18,7 +17,7 @@ from ..utils.constants import (
 )
 from ..utils.helpers import Timeout, _format_api_error, _get_sanitized_history_and_author
 from .storage_manager import IOManager
-from ..services.api_service import get_genai_client
+from ..services.api_service import get_embedding_vector
 
 
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
@@ -401,24 +400,7 @@ class MemoryManager:
         if not api_key:
             return None
 
-        client = get_genai_client(api_key)
-
-        try:
-            result = await asyncio.wait_for(
-                client.aio.models.embed_content(
-                    model='gemini-embedding-001',
-                    contents=text,
-                    config=types.EmbedContentConfig(
-                        task_type=task_type,
-                        output_dimensionality=256
-                    )
-                ),
-                timeout=5.0
-            )
-            return result.embeddings[0].values
-        except Exception as e:
-            print(f"Embedding err for '{text[:30]}...': {e}")
-            return None
+        return await get_embedding_vector(api_key, text, task_type=task_type, output_dimensionality=256, timeout=5.0)
 
     async def _generate_ltm_data_from_history(self, hist:list, user_dn:str, gen_config_params: Dict[str, Any], model_name_to_use: str, guild_id: Optional[int], bot_dn: str = "Bot", profile_owner_id: int = None, profile_name: str = None, warning_channel: Optional[discord.abc.Messageable] = None) -> Optional[str]:
         if not hist or len(hist) < MIN_HISTORY_FOR_LTM_CREATION: return None

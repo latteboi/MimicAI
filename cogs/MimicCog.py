@@ -1493,7 +1493,7 @@ class MimicCog(commands.Cog, EventListeners):
             safety_level_str = p_config.get('safety_level', 'low')
             safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
             threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
-            d_safe = { cat: threshold for cat in get_args(HarmCategory) }
+            d_safe = { cat: threshold for cat in HARM_CATEGORIES }
             
             primary_model = p_config.get("primary_model", "GOOGLE/gemini-2.5-flash-lite")
             fallback_model_name = p_config.get("fallback_model", "GOOGLE/gemini-2.5-flash-lite")
@@ -1684,7 +1684,7 @@ class MimicCog(commands.Cog, EventListeners):
                     model_name_str = f"OLLAMA/{model_used.model_name}"
                 elif class_name == "OpenRouterModel":
                     model_name_str = f"OPENROUTER/{model_used.model_name}"
-                elif class_name in ("GoogleSDKModel", "GoogleRESTModel"):
+                elif class_name == "GoogleRESTModel":
                     model_name_str = f"GOOGLE/{model_used.model_name}"
                     is_google = True
                 elif hasattr(model_used, "model_name"):

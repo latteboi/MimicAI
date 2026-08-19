@@ -1,9 +1,7 @@
 import re
 from typing import Dict
 
-from google.genai.types import HarmBlockThreshold, HarmCategory
-from typing import get_args
-
+from ...utils.constants import HarmBlockThreshold, HarmCategory, HARM_CATEGORIES
 from ...utils.helpers import _scrub_response_text
 
 
@@ -22,4 +20,4 @@ def _resolve_safety_settings(safety_level_str: str) -> Dict[HarmCategory, HarmBl
         "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
     }
     threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
-    return { cat: threshold for cat in get_args(HarmCategory) }
+    return { cat: threshold for cat in HARM_CATEGORIES }

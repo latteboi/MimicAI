@@ -5,7 +5,7 @@ import uuid
 import base64
 import asyncio
 import traceback
-from typing import Dict, Any, Optional, Tuple, List, get_args
+from typing import Dict, Any, Optional, Tuple, List
 import aiohttp
 from PIL import Image
 
@@ -13,7 +13,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..utils.constants import PLACEHOLDER_EMOJI, HarmBlockThreshold, HarmCategory, IMAGE_QUEUE_PRIORITY
+from ..utils.constants import PLACEHOLDER_EMOJI, HarmBlockThreshold, HARM_CATEGORIES, IMAGE_QUEUE_PRIORITY
 from ..utils.helpers import _split_into_sentences_with_abbreviations
 from .storage_manager import IOManager
 
@@ -803,7 +803,7 @@ class ChildBotManager:
             safety_level_str = profile_data.get("safety_level", "low")
             safety_map = {"unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE}
             threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
-            dynamic_safety_settings = {cat: threshold for cat in get_args(HarmCategory)}
+            dynamic_safety_settings = {cat: threshold for cat in HARM_CATEGORIES}
 
             source_owner_id = owner_id
             source_profile_name = profile_name

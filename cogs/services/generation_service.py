@@ -164,7 +164,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 is_image_gen_round = False
                 image_gen_prompt = ""
                 image_gen_anchor_message = None
-                generated_image_bytes_for_round = None
                 generated_image_path_for_round = None
                 # [UPDATED] Store tuples of (base_text, url_context_text, media_parts) 
                 new_round_turn_data = [] 
@@ -616,10 +615,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         ))
 
                 was_blocked = False
-                generated_image_bytes_for_round = None
                 generator_profile_key = None
                 generator_display_name = "A participant"
                 image_gen_error_msg = None
+                image_gen_placeholder_id = None
 
                 if is_image_gen_round:
                     if starting_profile_override:
@@ -787,6 +786,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     gen_cfg = self.cog.profile_manager._get_profile_config(gen_owner_id, gen_profile_name, gen_is_b) or {}
                     
                     if gen_cfg.get("image_generation_enabled", False):
+                        # Hoisted out of the try so the finally below can still read it when
+                        # generation raises: _generate_with_heartbeat mutates the container it
+                        # is handed, so a placeholder it created is recorded there even on the
+                        # error path.
+                        image_state_container = None
                         try:
                             api_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id)
                             if not api_key: raise ValueError("Server API key not configured.")
@@ -889,14 +893,21 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 else:
                                     img_bytes = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
                                     if img_bytes:
-                                        generated_image_bytes_for_round = img_bytes
-                                        def _write_img():
+                                        def _write_img(data=img_bytes):
                                             import tempfile
                                             fd, path = tempfile.mkstemp(suffix=".png")
                                             with os.fdopen(fd, 'wb') as f:
-                                                f.write(img_bytes)
+                                                f.write(data)
                                             return path
                                         generated_image_path_for_round = await asyncio.to_thread(_write_img)
+                                        # From here the temp file is the only carrier the round
+                                        # needs — the media part, the discord.File, and the
+                                        # re-read on the send path all go through the path. Drop
+                                        # the in-RAM copies now rather than at end of round:
+                                        # these are multi-megabyte and would otherwise stay
+                                        # resident through every participant's turn.
+                                        img_bytes = None
+                                        _write_img = None
                                     else:
                                         image_gen_error_msg = "no image data returned"
                                         
@@ -905,6 +916,23 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         except Exception as e:
                             image_gen_error_msg = _format_api_error(e)
                             print(f"Error generating image in multi-profile round: {e}")
+                        finally:
+                            # The heartbeat spawns its own placeholder when the generator is a
+                            # child bot that sends none of its own — in that case feedback_task
+                            # is None, so this id exists nowhere else and the participant loop
+                            # below would never delete it, leaving a stranded "Still
+                            # generating..." message in the channel.
+                            if image_state_container:
+                                image_gen_placeholder_id = image_state_container.get('msg_a_id')
+
+                            # The image response body carries the base64 payload (~1.33x the
+                            # image) and _RestView's memoised decode of it (~1x). Nothing needs
+                            # either once the bytes are on disk, but both are reachable from
+                            # this frame's locals and would otherwise stay resident for the
+                            # entire participant loop.
+                            response = None
+                            candidate = None
+                            image_state_container = None
 
                 for i, participant in enumerate(profile_order):
                     turn_warnings = []
@@ -1070,6 +1098,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         feedback_task_i = None
                         if i == 0:
                             feedback_task_i = feedback_task
+                            # Adopt any placeholder the image-gen heartbeat created. It was sent
+                            # by profile_order[0]'s bot, which is this participant, so the
+                            # appearance already matches and the normal end-of-turn deletion
+                            # path picks it up once it is in state_container.
+                            if image_gen_placeholder_id:
+                                msg_a_id = image_gen_placeholder_id
                         elif i > 0:
                             if participant.get('method') == 'child_bot':
                                 if p_settings.get("child_bot_placeholder", False):
@@ -2050,7 +2084,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         try: os.remove(generated_image_path_for_round)
                         except OSError: pass
                     generated_image_path_for_round = None
-                generated_image_bytes_for_round = None
 
                 guild_id = self.cog.bot.get_channel(channel_id).guild.id
                 

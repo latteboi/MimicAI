@@ -6,16 +6,14 @@ import asyncio
 import traceback
 import discord
 import httpx
-from typing import List, Any, Optional, get_args
-
-from google.genai import types
+from typing import List, Any, Optional
 
 from ..utils.constants import (
     PLACEHOLDER_EMOJI, WARN_IMAGE_GEN_FAILED, ERR_GENERAL_ERROR, ERR_SAFETY_BLOCK,
-    WARN_MAIN_MODEL_FAILED, ERR_REASON_EMPTY_RESPONSE, HarmBlockThreshold, HarmCategory,
+    WARN_MAIN_MODEL_FAILED, ERR_REASON_EMPTY_RESPONSE, HarmBlockThreshold, HARM_CATEGORIES,
     defaultConfig, IMAGE_QUEUE_PRIORITY,
 )
-from .api_service import GoogleGenAIModel, get_genai_client
+from .api_service import GoogleGenAIModel, generate_google_tts_audio
 from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _scrub_response_text
 
 
@@ -38,45 +36,17 @@ class MediaService:
             return None
 
         try:
-            if model_id.upper().startswith("GOOGLE/"): model_id = model_id[7:]
+            raw_audio_bytes = await generate_google_tts_audio(api_key, model_id, text, voice_name=voice_name, temperature=temperature)
 
-            client = get_genai_client(api_key, 'v1beta')
-
-            # Utilise specific voice identities for single-speaker contextual priming
-            speech_cfg = types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
-                )
-            )
-
-            config = types.GenerateContentConfig(
-                response_modalities=['AUDIO'],
-                temperature=temperature,
-                speech_config=speech_cfg
-            )
-
-            response = await client.aio.models.generate_content(
-                model=model_id,
-                contents=text,
-                config=config
-            )
-
-            if response.candidates and response.candidates[0].content.parts:
-                raw_audio_bytes = None
-                for part in response.candidates[0].content.parts:
-                    if getattr(part, 'inline_data', None) and part.inline_data.data:
-                        raw_audio_bytes = part.inline_data.data
-                        break
-
-                if raw_audio_bytes:
-                    wav_io = io.BytesIO()
-                    with wave.open(wav_io, 'wb') as wav_file:
-                        wav_file.setnchannels(1)      # Mono
-                        wav_file.setsampwidth(2)      # 16-bit
-                        wav_file.setframerate(24000)  # 24kHz
-                        wav_file.writeframes(raw_audio_bytes)
-                    wav_io.seek(0)
-                    return wav_io
+            if raw_audio_bytes:
+                wav_io = io.BytesIO()
+                with wave.open(wav_io, 'wb') as wav_file:
+                    wav_file.setnchannels(1)      # Mono
+                    wav_file.setsampwidth(2)      # 16-bit
+                    wav_file.setframerate(24000)  # 24kHz
+                    wav_file.writeframes(raw_audio_bytes)
+                wav_io.seek(0)
+                return wav_io
             return None
         except Exception as e:
             err_msg = _format_api_error(e)
@@ -670,7 +640,7 @@ class MediaService:
             
             safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
             threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
-            dynamic_safety_settings = { cat: threshold for cat in get_args(HarmCategory) }
+            dynamic_safety_settings = { cat: threshold for cat in HARM_CATEGORIES }
 
             # Get appearance text
             source_owner_id = effective_profile_owner_id

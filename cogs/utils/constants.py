@@ -1,7 +1,6 @@
 import os
 import re
 from typing import Literal
-from google.genai.types import HarmCategory, HarmBlockThreshold
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 import discord
@@ -31,18 +30,6 @@ def get_config_value(key_name: str, default: str = None) -> str | None:
                 return response.payload.data.decode("UTF-8")
             except (NotFound, GoogleAPICallError): continue
     return default
-
-# --- Migration 2 feature flag --------------------------------------------------
-#
-# Routes every Google adapter construction between the google-genai SDK
-# (GoogleSDKModel) and the hand-rolled REST adapter (GoogleRESTModel). Both live at
-# once so the migration is revertible without a test suite: set GOOGLE_REST_ADAPTER=1
-# in .env to opt in, unset it to fall straight back.
-#
-# Read once at import. Flipping it needs a restart, which is what we want — the two
-# adapters must not be mixed within a single run.
-USE_GOOGLE_REST_ADAPTER = os.getenv("GOOGLE_REST_ADAPTER", "0").strip().lower() in ("1", "true", "yes", "on")
-
 
 class DefaultConfigNamespace:
     def __init__(self):
@@ -296,6 +283,42 @@ DEFAULT_NEURO_INSTRUCTION = (
     "<neuro_update>D:XX|C:XX|O:XX|A:XX</neuro_update>\n"
     "This will NOT be shown to anyone.\n"
     "</neuro_endocrine_engine>"
+)
+
+# Migration 2 retired google-genai, and with it the HarmCategory / HarmBlockThreshold
+# enums these dicts were keyed on. The REST API takes the bare strings the enums
+# wrapped, so these namespaces hold exactly the same values without the 70 MB import.
+# Kept as attribute holders rather than plain module constants so every existing
+# `HarmBlockThreshold.BLOCK_NONE` call site reads unchanged.
+class HarmBlockThreshold:
+    BLOCK_NONE = "BLOCK_NONE"
+    BLOCK_ONLY_HIGH = "BLOCK_ONLY_HIGH"
+    BLOCK_MEDIUM_AND_ABOVE = "BLOCK_MEDIUM_AND_ABOVE"
+    BLOCK_LOW_AND_ABOVE = "BLOCK_LOW_AND_ABOVE"
+    OFF = "OFF"
+
+
+class HarmCategory:
+    HARM_CATEGORY_HARASSMENT = "HARM_CATEGORY_HARASSMENT"
+    HARM_CATEGORY_HATE_SPEECH = "HARM_CATEGORY_HATE_SPEECH"
+    HARM_CATEGORY_SEXUALLY_EXPLICIT = "HARM_CATEGORY_SEXUALLY_EXPLICIT"
+    HARM_CATEGORY_DANGEROUS_CONTENT = "HARM_CATEGORY_DANGEROUS_CONTENT"
+
+
+# The four categories the API actually accepts, for call sites that want to apply one
+# threshold across all of them.
+#
+# The five dynamic-safety call sites used to spell this as `get_args(HarmCategory)`,
+# which returns () for an enum and still returns () for this plain class — so those
+# dicts were empty and the per-profile safety level never reached the API. Fixed
+# 2026-08-19 to use this tuple instead. See CLAUDE.md for the sites and the
+# consequence: unrestricted profiles now actually send BLOCK_NONE instead of silently
+# inheriting the API default.
+HARM_CATEGORIES = (
+    HarmCategory.HARM_CATEGORY_HARASSMENT,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
 )
 
 DEFAULT_SAFETY_SETTINGS = {
