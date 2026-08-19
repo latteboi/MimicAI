@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from ..MimicCog import MimicCog
     from .gui_profiles import ProfileManageView
 
-from .base_components import BaseBulkProfileView, build_confirm_view, compute_window_slice
+from .base_components import BaseBulkProfileView, PageJumpModal, build_confirm_view, compute_window_slice
 
 class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
     summary_field = ui.TextInput(label="Memory Summary", style=discord.TextStyle.paragraph, required=True, max_length=2000)
@@ -181,29 +181,6 @@ class SearchDataModal(ui.Modal, title="Search Data"):
         self.parent_view.search_term = search_term if search_term else None
         self.parent_view.current_page = 1
         await self.parent_view._update_view(interaction)
-
-class DataPageJumpModal(ui.Modal, title="Jump to Page"):
-    def __init__(self, parent_view: 'DataManageView'):
-        super().__init__()
-        self.parent_view = parent_view
-        self.page_input = ui.TextInput(
-            label="Page Number",
-            placeholder=f"Enter a number between 1 and {parent_view.max_pages}",
-            required=True,
-            min_length=1,
-            max_length=5
-        )
-        self.add_item(self.page_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            page_num = int(self.page_input.value.strip())
-            if page_num < 1 or page_num > self.parent_view.max_pages:
-                raise ValueError("Out of range")
-            self.parent_view.current_page = page_num
-            await self.parent_view._update_view(interaction)
-        except ValueError:
-            await interaction.response.send_message(f"❌ Please enter a valid number between 1 and {self.parent_view.max_pages}.", ephemeral=True)
 
 class DataManageView(ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str, is_borrowed: bool, mode: Optional[Literal['training', 'ltm']] = None, parent_manage_view: Optional['ProfileManageView'] = None):
@@ -506,7 +483,11 @@ class DataManageView(ui.View):
         await self._update_view(interaction)
 
     async def page_button_callback(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(DataPageJumpModal(self))
+        async def _jump(i: discord.Interaction, page: int):
+            self.current_page = page
+            await self._update_view(i)
+
+        await interaction.response.send_modal(PageJumpModal(self.max_pages, _jump))
 
     async def prev_page_callback(self, interaction: discord.Interaction):
         if self.current_page > 1:

@@ -335,13 +335,65 @@ class ProfileManager:
 
         return index
 
-    def _repair_all_user_indices(self):
-        """Scans the USERS_DIR for user folders and runs self-repair on each user's index.json."""
+    def _index_is_consistent(self, user_id_str: str) -> bool:
+        """Cheap pre-check for _repair_all_user_indices.
+
+        A repair opens, Fernet-decrypts and zstd-decompresses every profile shard the
+        user owns. That is the right cost when the index is actually wrong, and pure
+        waste when it is not -- and this runs on every boot AND hourly, so the common
+        case is "nothing has changed since the last one".
+
+        Everything checked here is a directory listing plus one small file, so the
+        check is orders of magnitude cheaper than the repair it avoids. It compares:
+          - the index parses and has the expected shape
+          - it names exactly as many profiles as there are shards on disk
+          - its has_personal_key flag still matches the key file
+
+        Deliberately conservative: anything unexpected returns False and the full
+        repair runs, so a false negative only costs the work we do today.
+        """
+        try:
+            index = IOManager.read_json(os.path.join(USERS_DIR, user_id_str, "index.json"))
+            if not index or not isinstance(index.get("personal"), dict) or not isinstance(index.get("borrowed"), dict):
+                return False
+
+            profiles_dir = os.path.join(USERS_DIR, user_id_str, "profiles")
+            shards_on_disk = 0
+            if os.path.isdir(profiles_dir):
+                for pid_folder in os.listdir(profiles_dir):
+                    if os.path.exists(os.path.join(profiles_dir, pid_folder, "profile.json.gz")):
+                        shards_on_disk += 1
+
+            named_in_index = (len(index.get("personal", {}))
+                              + len(index.get("borrowed", {}))
+                              + len(index.get("system", {})))
+            if named_in_index != shards_on_disk:
+                return False
+
+            # Nothing clears has_personal_key when a key is deleted -- only a repair
+            # does -- so it has to be verified here or a stale True would survive.
+            keys_path = os.path.join(USERS_DIR, user_id_str, "keys.json.gz")
+            has_key = False
+            if os.path.exists(keys_path):
+                keys_data = IOManager.read_json_gzip(keys_path, self.cog.fernet)
+                has_key = bool(keys_data and (keys_data.get("key") or keys_data.get("slots")))
+            return bool(index.get("has_personal_key")) == has_key
+        except Exception:
+            return False
+
+    def _repair_all_user_indices(self, force: bool = False):
+        """Scans the USERS_DIR for user folders and runs self-repair on each user's index.json.
+
+        Skips users whose index already checks out (see _index_is_consistent) unless
+        force=True, because this runs on every boot and then hourly thereafter.
+        """
         if not os.path.isdir(USERS_DIR):
             return
         for user_id_str in os.listdir(USERS_DIR):
             if user_id_str.isdigit():
                 try:
+                    if not force and self._index_is_consistent(user_id_str):
+                        continue
                     user_id = int(user_id_str)
                     self._repair_user_index(user_id)
                 except Exception as e:

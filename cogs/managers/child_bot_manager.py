@@ -32,6 +32,9 @@ class ChildBotManager:
         self.typing_tasks: Dict[Tuple[str, int], asyncio.Task] = {}
         self.pending_toggles: Dict[str, Dict[str, Any]] = {}
         self.queue_worker_task: Optional[asyncio.Task] = None
+        # Signature of the profile shards the last _load_child_bots() scan was built
+        # from. See _profiles_scan_signature for why this is safe to trust.
+        self._child_bot_scan_signature: Optional[Tuple] = None
 
     def _find_borrowed_name_for_owner(self, author_id: int, original_owner_id: int, original_profile_name: str) -> Optional[str]:
         """Finds the name under which author_id has borrowed original_owner_id's original_profile_name profile, if any."""
@@ -42,34 +45,76 @@ class ChildBotManager:
                 return b_name
         return None
 
-    def _load_child_bots(self):
-        self.cog.child_bots = {}
-        self.cog.child_bots_by_owner_profile = {}
-        if not os.path.isdir(self.cog.USERS_DIR):
-            return
+    def _profiles_scan_signature(self) -> Tuple:
+        """A cheap fingerprint of every profile shard on disk.
 
-        for user_id_str in os.listdir(self.cog.USERS_DIR):
+        _load_child_bots has to open, Fernet-decrypt, zstd-decompress and parse every
+        profile.json.gz just to find the handful that carry a child_bot key. Boot calls
+        it three times within milliseconds (cog __init__, on_ready, then
+        start_all_child_bots), and every child-bot create/delete calls it again.
+
+        stat() is orders of magnitude cheaper than that pipeline, and writes go through
+        IOManager's atomic temp-file + os.replace, which always moves mtime. So if the
+        (path, mtime_ns, size) tuple of every shard is unchanged, the parsed result is
+        unchanged too, and the scan can be skipped outright.
+
+        Unlike an index file this holds no state of its own and cannot drift: a shard
+        that changes always changes the signature.
+        """
+        entries = []
+        users_dir = self.cog.USERS_DIR
+        if not os.path.isdir(users_dir):
+            return ()
+        for user_id_str in sorted(os.listdir(users_dir)):
             if not user_id_str.isdigit():
                 continue
-            profiles_dir = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles")
+            profiles_dir = os.path.join(users_dir, user_id_str, "profiles")
             if not os.path.isdir(profiles_dir):
                 continue
-
-            for pid_folder in os.listdir(profiles_dir):
+            for pid_folder in sorted(os.listdir(profiles_dir)):
                 profile_file = os.path.join(profiles_dir, pid_folder, "profile.json.gz")
-                if os.path.exists(profile_file):
-                    profile_data = IOManager.read_json_gzip(profile_file, self.cog.fernet)
-                    if profile_data and profile_data.get("child_bot"):
-                        bot_data = profile_data["child_bot"]
-                        if isinstance(bot_data, dict) and "bot_id" in bot_data:
-                            bot_data["owner_id"] = int(user_id_str)
-                            bot_data["profile_name"] = profile_data.get("name", pid_folder)
-                            bot_data["pid"] = pid_folder
-                            self.cog.child_bots[bot_data["bot_id"]] = bot_data
-                            self.cog.child_bots_by_owner_profile[(bot_data["owner_id"], bot_data["profile_name"])] = bot_data["bot_id"]
+                try:
+                    st = os.stat(profile_file)
+                except OSError:
+                    continue
+                entries.append((profile_file, user_id_str, pid_folder,
+                                st.st_mtime_ns, st.st_size))
+        return tuple(entries)
+
+    def _load_child_bots(self, force: bool = False):
+        """Rebuilds cog.child_bots from the profile shards, skipping the work when
+        nothing on disk has changed since the last scan. Pass force=True to rescan
+        regardless.
+        """
+        signature = self._profiles_scan_signature()
+        if not force and signature == self._child_bot_scan_signature:
+            return
+
+        child_bots: Dict[str, Dict[str, Any]] = {}
+        by_owner_profile: Dict[Tuple[int, str], str] = {}
+
+        for path, user_id_str, pid_folder, _mtime, _size in signature:
+            profile_data = IOManager.read_json_gzip(path, self.cog.fernet)
+            if not profile_data or not profile_data.get("child_bot"):
+                continue
+            bot_data = profile_data["child_bot"]
+            if not isinstance(bot_data, dict) or "bot_id" not in bot_data:
+                continue
+            bot_data["owner_id"] = int(user_id_str)
+            bot_data["profile_name"] = profile_data.get("name", pid_folder)
+            bot_data["pid"] = pid_folder
+            child_bots[bot_data["bot_id"]] = bot_data
+            by_owner_profile[(bot_data["owner_id"], bot_data["profile_name"])] = bot_data["bot_id"]
+
+        # Swap in only once the scan has completed, so a failure part-way through
+        # leaves the previous (working) mapping in place rather than a partial one.
+        self.cog.child_bots = child_bots
+        self.cog.child_bots_by_owner_profile = by_owner_profile
+        self._child_bot_scan_signature = signature
 
     async def start_all_child_bots(self):
         """Launches all configured child bots directly into the shared asyncio event loop."""
+        # Cheap now: returns immediately unless a shard changed since the caller's scan.
         self._load_child_bots()
         if not self.queue_worker_task or self.queue_worker_task.done():
             self.queue_worker_task = asyncio.create_task(self._manager_queue_listener())

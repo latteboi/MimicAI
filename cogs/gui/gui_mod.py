@@ -5,7 +5,7 @@ from discord import ui
 import datetime
 from typing import TYPE_CHECKING
 from ..utils.helpers import _sanitise_filename
-from .base_components import build_pagination_controls, build_tab_nav_bar, build_confirm_view
+from .base_components import TimeoutCleanupMixin, build_pagination_controls, build_tab_nav_bar, build_confirm_view
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 from .gui_profiles import ProfileManageView
 
-class ModBaseView(ui.View):
+class ModBaseView(TimeoutCleanupMixin, ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, current_tab: str):
         super().__init__(timeout=600)
         self.cog = cog

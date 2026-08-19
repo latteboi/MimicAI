@@ -8,7 +8,7 @@ import time
 import asyncio
 from typing import TYPE_CHECKING, List, Dict, Any, Optional
 from ..utils.helpers import _estimate_text_tokens
-from .base_components import build_pagination_controls
+from .base_components import PageJumpModal, build_pagination_controls
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -1627,7 +1627,7 @@ class SessionAuditView(ui.View):
                         self._build_view()
                         await i.response.edit_message(embed=self._build_embed(), view=self)
                     elif val == "jump_page":
-                        await i.response.send_modal(AuditPageJumpModal(self))
+                        await i.response.send_modal(self._page_jump_modal())
                     else:
                         self.selected_turn_id = val
                         self._build_view()
@@ -1670,7 +1670,7 @@ class SessionAuditView(ui.View):
                         self._build_view()
                         await i.response.edit_message(embed=self._build_embed(), view=self)
                     elif val == "jump_page":
-                        await i.response.send_modal(AuditPageJumpModal(self))
+                        await i.response.send_modal(self._page_jump_modal())
                     else:
                         self.simulate_profile_key = val
                         self._build_view()
@@ -1722,7 +1722,7 @@ class SessionAuditView(ui.View):
                         self._build_view()
                         await i.response.edit_message(embed=self._build_embed(), view=self)
                     elif val == "jump_page":
-                        await i.response.send_modal(AuditPageJumpModal(self))
+                        await i.response.send_modal(self._page_jump_modal())
                     else:
                         self.batch_start_id = val
                         self._build_view()
@@ -1742,13 +1742,23 @@ class SessionAuditView(ui.View):
                         self._build_view()
                         await i.response.edit_message(embed=self._build_embed(), view=self)
                     elif val == "jump_page":
-                        await i.response.send_modal(AuditPageJumpModal(self))
+                        await i.response.send_modal(self._page_jump_modal())
                     else:
                         self.batch_end_id = val
                         self._build_view()
                         await i.response.edit_message(embed=self._build_embed(), view=self)
                 sel_end.callback = se_cb
                 self.add_item(sel_end)
+
+    def _page_jump_modal(self) -> PageJumpModal:
+        """Built here rather than at each of the four buttons that send it."""
+        async def _jump(i: discord.Interaction, page: int):
+            self.current_page = page
+            self._build_view()
+            await i.response.defer()
+            await i.edit_original_response(embed=self._build_embed(), view=self)
+
+        return PageJumpModal(self.num_pages, _jump, zero_indexed=True)
 
     def _build_embed(self) -> discord.Embed:
         try:
@@ -1885,27 +1895,3 @@ class SessionAuditView(ui.View):
             err_embed = discord.Embed(title="Audit Error", description=f"An error occurred while building the telemetry report:\n```\n{e}\n```", color=discord.Color.red())
             return err_embed
 
-class AuditPageJumpModal(ui.Modal, title="Jump to Page"):
-    def __init__(self, parent_view: 'SessionAuditView'):
-        super().__init__()
-        self.parent_view = parent_view
-        self.page_input = ui.TextInput(
-            label="Page Number",
-            placeholder=f"Enter a number between 1 and {parent_view.num_pages}",
-            required=True,
-            min_length=1,
-            max_length=5
-        )
-        self.add_item(self.page_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            page_num = int(self.page_input.value.strip())
-            if page_num < 1 or page_num > self.parent_view.num_pages:
-                raise ValueError("Out of range")
-            self.parent_view.current_page = page_num - 1
-            self.parent_view._build_view()
-            await interaction.response.defer()
-            await interaction.edit_original_response(embed=self.parent_view._build_embed(), view=self.parent_view)
-        except ValueError:
-            await interaction.response.send_message(f"Please enter a valid number between 1 and {self.parent_view.num_pages}.", ephemeral=True)

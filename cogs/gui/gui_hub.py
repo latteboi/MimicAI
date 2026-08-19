@@ -7,7 +7,7 @@ import uuid
 import time
 import asyncio
 from typing import TYPE_CHECKING, Optional
-from .base_components import build_pagination_controls, build_tab_nav_bar, compute_window_slice
+from .base_components import PageJumpModal, TimeoutCleanupMixin, build_pagination_controls, build_tab_nav_bar, compute_window_slice
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -104,7 +104,7 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
         
         await interaction.followup.send(message, ephemeral=True)
 
-class HubBaseView(ui.View):
+class HubBaseView(TimeoutCleanupMixin, ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, current_tab: str):
         super().__init__(timeout=600)
         self.cog = cog
@@ -188,32 +188,6 @@ class HubHomeView(HubBaseView):
     async def redeem_callback(self, i: discord.Interaction):
         modal = RedeemCodeModal(self.cog)
         await i.response.send_modal(modal)
-
-class HubPublicLibraryPageJumpModal(ui.Modal, title="Jump to Profile"):
-    def __init__(self, parent_view: 'HubPublicLibraryView'):
-        super().__init__()
-        self.parent_view = parent_view
-        self.max_pages = len(parent_view.filtered_list)
-        self.page_input = ui.TextInput(
-            label="Profile Number",
-            placeholder=f"Enter a number between 1 and {self.max_pages}",
-            required=True,
-            min_length=1,
-            max_length=5
-        )
-        self.add_item(self.page_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            page_num = int(self.page_input.value.strip())
-            if page_num < 1 or page_num > self.max_pages:
-                raise ValueError("Out of range")
-            self.parent_view.current_page = page_num - 1
-            self.parent_view.setup_items()
-            await interaction.response.defer()
-            await self.parent_view.update_display()
-        except ValueError:
-            await interaction.response.send_message(f"❌ Please enter a valid number between 1 and {self.max_pages}.", ephemeral=True)
 
 class HubPublicLibraryView(HubBaseView):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, filtered_list=None):
@@ -380,7 +354,15 @@ class HubPublicLibraryView(HubBaseView):
         await self.update_display()
 
     async def page_jump_cb(self, i: discord.Interaction):
-        await i.response.send_modal(HubPublicLibraryPageJumpModal(self))
+        async def _jump(inner: discord.Interaction, page: int):
+            self.current_page = page
+            self.setup_items()
+            await inner.response.defer()
+            await self.update_display()
+
+        await i.response.send_modal(PageJumpModal(
+            len(self.filtered_list), _jump,
+            title="Jump to Profile", label="Profile Number", zero_indexed=True))
 
     async def borrow_cb(self, i: discord.Interaction):
         if self.current_page >= len(self.filtered_list): return

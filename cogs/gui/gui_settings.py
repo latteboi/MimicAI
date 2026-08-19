@@ -5,7 +5,7 @@ from discord import ui
 import asyncio
 from typing import TYPE_CHECKING, List, Optional
 
-from .base_components import build_tab_nav_bar
+from .base_components import TimeoutCleanupMixin, build_tab_nav_bar
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -138,7 +138,7 @@ class OverrideConfirmView(ui.View):
     async def cancel_override(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.edit_message(content="❌ Assignment update cancelled.", view=None)
 
-class SettingsBaseView(ui.View):
+class SettingsBaseView(TimeoutCleanupMixin, ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, current_tab: str):
         super().__init__(timeout=600)
         self.cog = cog
@@ -698,9 +698,8 @@ class ShutdownConfirmView(ui.View):
         await interaction.response.edit_message(content="Shutting down child bots and main instance...", view=None)
         
         # 1. Close child processes first
-        if hasattr(self.cog.bot, 'child_bot_config'):
-            for bot_id in list(self.cog.bot.child_bot_config.keys()):
-                await self.cog.manager_queue.put({"action": "shutdown_bot", "bot_id": bot_id})
+        for bot_id in list(self.cog.child_bots.keys()):
+            await self.cog.manager_queue.put({"action": "shutdown_bot", "bot_id": bot_id})
         
         await asyncio.sleep(2)
 

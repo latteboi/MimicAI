@@ -1,6 +1,6 @@
 import discord
 from discord import ui
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -40,6 +40,89 @@ def compute_window_slice(center_index: int, total_items: int, window_size: int =
         end = total_items
         start = max(0, end - window_size)
     return start, end
+
+class TimeoutCleanupMixin:
+    """Strips a view's controls when it times out.
+
+    discord.py stops dispatching to a timed-out view but leaves its buttons sitting in
+    the channel, so the user goes on pressing controls that silently do nothing --
+    indistinguishable from the bot having broken. Only two of the GUI's ~64 views
+    handled this; the rest just went quiet.
+
+    Requires self.original_interaction, and edits through it, which is the same call
+    the adopting views already repaint themselves with -- so it is guaranteed to be
+    addressing the message they own rather than some later followup.
+
+    Mix in ahead of ui.View so this on_timeout wins the MRO. A view that defines its
+    own on_timeout still overrides this one.
+    """
+
+    timeout_message: Optional[str] = None
+
+    async def on_timeout(self):
+        interaction = getattr(self, "original_interaction", None)
+        if interaction is None:
+            return
+        payload = {"view": None}
+        if self.timeout_message:
+            payload["content"] = self.timeout_message
+        try:
+            await interaction.edit_original_response(**payload)
+        except Exception:
+            # Ephemeral responses expire and messages get deleted; a view we can no
+            # longer edit is exactly the case this is cleaning up after, so there is
+            # nothing to report.
+            pass
+
+
+class PageJumpModal(ui.Modal):
+    """Jump-to-page prompt for any paginated view.
+
+    Replaces three near-identical copies (session audit, data manager, public library)
+    that differed only in where they read the page count from, whether their page
+    counter was 0- or 1-based, and how they repainted afterwards -- all three now
+    arrive as arguments.
+
+    on_jump is awaited as on_jump(interaction, page), with page already converted to
+    the caller's indexing convention.
+    """
+
+    def __init__(self, max_pages: int, on_jump: Callable[..., Awaitable[None]], *,
+                 title: str = "Jump to Page", label: str = "Page Number",
+                 zero_indexed: bool = False):
+        super().__init__(title=title)
+        self.max_pages = max(1, int(max_pages or 1))
+        self.on_jump = on_jump
+        self.zero_indexed = zero_indexed
+        self.page_input = ui.TextInput(
+            label=label,
+            placeholder=f"Enter a number between 1 and {self.max_pages}",
+            required=True,
+            min_length=1,
+            max_length=5,
+        )
+        self.add_item(self.page_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Parsing is validated separately from running on_jump on purpose. The copies
+        # this replaces wrapped both in one try/except ValueError, so a ValueError
+        # raised anywhere downstream in the repaint was reported to the user as
+        # "please enter a valid number".
+        raw = (self.page_input.value or "").strip()
+        try:
+            page = int(raw)
+        except ValueError:
+            page = None
+
+        if page is None or page < 1 or page > self.max_pages:
+            await interaction.response.send_message(
+                f"❌ Please enter a valid number between 1 and {self.max_pages}.",
+                ephemeral=True,
+            )
+            return
+
+        await self.on_jump(interaction, page - 1 if self.zero_indexed else page)
+
 
 def build_pagination_controls(view: ui.View, current_page: int, num_pages: int, row: int, prev_cb, next_cb, page_cb=None):
     if num_pages <= 1: return
