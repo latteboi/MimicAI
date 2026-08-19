@@ -2,7 +2,7 @@ import re
 import datetime
 import discord
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict, List, Tuple
+from typing import Any, Optional, Dict, List, Tuple
 
 from ...utils.constants import (
     defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
@@ -32,6 +32,8 @@ class PromptBuilderMixin:
 
     def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None) -> Tuple[str, bool, bool, float, float, int, str, str]:
         persona_data: Dict[str, List[str]] = {}
+        # profile_owner_id is Optional, but profile_data is read unconditionally below.
+        profile_data: Dict[str, Any] = {}
         ai_instr_str: str = ""
         grounding_enabled = False
         temperature = defaultConfig.GEMINI_TEMPERATURE

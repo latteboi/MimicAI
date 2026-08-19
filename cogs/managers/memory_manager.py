@@ -9,7 +9,6 @@ from typing import Dict, List, Any, Optional, Union, Tuple
 import numpy as np
 import discord
 
-from google import genai
 from google.genai import types
 
 from ..utils.constants import (
@@ -19,6 +18,7 @@ from ..utils.constants import (
 )
 from ..utils.helpers import Timeout, _format_api_error, _get_sanitized_history_and_author
 from .storage_manager import IOManager
+from ..services.api_service import get_genai_client
 
 
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
@@ -134,8 +134,7 @@ class MemoryManager:
         context_type = "guild"
         ltm_list = ltm_data.get(context_type, [])
 
-        is_premium = self.cog.profile_manager.is_user_premium(ltm_user_id)
-        limit = defaultConfig.LIMIT_LTM_PREMIUM if is_premium else defaultConfig.LIMIT_LTM_FREE
+        limit = defaultConfig.LIMIT_LTM
 
         ltm_list.sort(key=lambda x: x.get('created_ts', x.get('ts')))
 
@@ -157,7 +156,7 @@ class MemoryManager:
 
         # ltm_list is already sorted (line above) and the new entry's timestamp is the newest,
         # so it stays sorted after appending — no need to re-sort before clamping.
-        max_safe_clamp = max(len(ltm_list), defaultConfig.LIMIT_LTM_PREMIUM)
+        max_safe_clamp = max(len(ltm_list), defaultConfig.LIMIT_LTM)
         ltm_data[context_type] = ltm_list[-max_safe_clamp:]
         self._save_ltm_shard(owner_id_str, ltm_profile_name, ltm_data)
 
@@ -242,7 +241,12 @@ class MemoryManager:
 
         owner_id_str = str(ltm_user_id)
         context_type = "guild"
-        ltm_data = self._load_ltm_shard(owner_id_str, ltm_profile_name)
+
+        # Loaded once, in a thread. This shard read is a file open plus Fernet decrypt plus
+        # zstd decompress plus orjson parse; it previously ran here on the event loop and
+        # then a second time inside _thread_search_ltm, with the first result discarded.
+        # The early exit is kept so an empty shard still skips the embedding round trip.
+        ltm_data = await asyncio.to_thread(self._load_ltm_shard, owner_id_str, ltm_profile_name)
         if not ltm_data:
             return None
         all_profile_ltms = ltm_data.get(context_type, [])
@@ -258,12 +262,6 @@ class MemoryManager:
         session_cooldown_history = self.cog.ltm_recall_history.get(session_key, {})
 
         def _thread_search_ltm():
-            owner_id_str = str(ltm_user_id)
-            ltm_data = self._load_ltm_shard(owner_id_str, ltm_profile_name)
-            if not ltm_data: return None
-            all_profile_ltms = ltm_data.get(context_type, [])
-            if not all_profile_ltms: return None
-
             valid_ltms = []
             b64_embs = []
 
@@ -403,7 +401,7 @@ class MemoryManager:
         if not api_key:
             return None
 
-        client = genai.Client(api_key=api_key)
+        client = get_genai_client(api_key)
 
         try:
             result = await asyncio.wait_for(
@@ -599,16 +597,10 @@ class MemoryManager:
         owner_id_str = str(profile_owner_id)
         training_shard = await asyncio.to_thread(self._load_training_shard, owner_id_str, profile_name) or []
 
-        is_premium = self.cog.profile_manager.is_user_premium(profile_owner_id)
-        limit = defaultConfig.LIMIT_TRAINING_PREMIUM if is_premium else defaultConfig.LIMIT_TRAINING_FREE
+        limit = defaultConfig.LIMIT_TRAINING
 
         if len(training_shard) >= limit:
-            msg = f"**Limit Reached.**\n\n"
-            if is_premium:
-                msg += f"You have reached the maximum of **{limit}** training examples."
-            else:
-                msg += f"Free tier is limited to **{limit}** examples per profile. You currently have **{len(training_shard)}**.\nUpgrade to Premium via `/subscription` to increase this to **{defaultConfig.LIMIT_TRAINING_PREMIUM}**."
-            return False, msg
+            return False, f"**Limit Reached.**\n\nYou have reached the maximum of **{limit}** training examples."
 
         emb=await self._get_embedding(usr_in, guild_id, task_type="RETRIEVAL_DOCUMENT")
         if not emb: return False,"Embedding failed. Ensure the server API key is valid."

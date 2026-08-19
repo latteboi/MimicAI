@@ -449,11 +449,7 @@ class SettingsChildBotView(SettingsBaseView):
             self.add_item(select)
 
         # Row 1: Actions
-        is_premium = self.cog.profile_manager.is_user_premium(self.user_id)
-        create_style = discord.ButtonStyle.green if is_premium else discord.ButtonStyle.secondary
-        create_label = "Create New Child Bot" if is_premium else "Create (Premium Only)"
-        
-        btn_create = ui.Button(label=create_label, style=create_style, row=1, disabled=(not is_premium))
+        btn_create = ui.Button(label="Create New Child Bot", style=discord.ButtonStyle.green, row=1)
         btn_create.callback = self.create_bot
         self.add_item(btn_create)
 
@@ -489,10 +485,6 @@ class SettingsChildBotView(SettingsBaseView):
         await self.update_display()
 
     async def create_bot(self, i: discord.Interaction):
-        if not self.cog.profile_manager.is_user_premium(self.user_id):
-            await i.response.send_message("This feature requires a Premium Tier.", ephemeral=True)
-            return
-
         self._build_child_bot_list_ui = lambda x: self.update_rebuild(x) 
         modal = ChildBotCreateModal(self.cog, self)
         await i.response.send_modal(modal)
@@ -713,8 +705,8 @@ class ShutdownConfirmView(ui.View):
         await asyncio.sleep(2)
 
         # 2. Flush all in-memory sessions to disk
-        for session_key, chat_session in self.cog.global_chat_sessions.items():
-            await self.cog.session_manager._save_session_to_disk(session_key, 'global_chat', chat_session)
+        for session_key, session_data in self.cog.global_chat_sessions.items():
+            await self.cog.session_manager._save_session_to_disk(session_key, 'global_chat', session_data)
         
         for ch_id, session_data in self.cog.multi_profile_channels.items():
             if session_data.get("is_hydrated"):

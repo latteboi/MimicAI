@@ -2,11 +2,11 @@ import os
 import asyncio
 from typing import Optional
 
-from google import genai
 from google.genai import types
 
 from ..utils.constants import defaultConfig, DOCS_DIR, DEFAULT_HELP_MODE_INJECTION
 from ..managers.memory_manager import encode_embedding_b64, decode_embedding_b64
+from .api_service import get_genai_client
 
 
 class HelpService:
@@ -40,7 +40,7 @@ class HelpService:
                     for page, text in pages.items():
                         chunks.append(f"[{cat} - {page}]\n{text}")
             
-            client = genai.Client(api_key=api_key)
+            client = get_genai_client(api_key)
             self.cog.guide_vectors = []
             for chunk in chunks:
                 try:
@@ -97,7 +97,7 @@ class HelpService:
             print("Warning: No Bot Owner Google API Key found. Skipping documentation vector generation.")
             return
 
-        client = genai.Client(api_key=api_key)
+        client = get_genai_client(api_key)
 
         def _sync_walk_docs():
             chunks = []

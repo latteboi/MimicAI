@@ -7,7 +7,6 @@ import pathlib
 import time
 import asyncio
 from typing import TYPE_CHECKING, List, Dict, Any, Optional
-from ..services.api_service import GoogleGenAIChatSession
 from ..utils.helpers import _estimate_text_tokens
 from .base_components import build_pagination_controls
 
@@ -150,8 +149,7 @@ class GlobalChatPlayView(ui.View):
         if not session_data:
             session_data = await self.cog.session_manager._load_session_from_disk(self.session_key, 'global_chat')
             if not session_data:
-                chat = GoogleGenAIChatSession(history=[])
-                session_data = {'chat_session': chat, 'unified_log': []}
+                session_data = {'unified_log': []}
             self.cog.global_chat_sessions[self.session_key] = session_data
             
     def _build_view(self):
@@ -245,13 +243,13 @@ class GlobalChatPlayView(ui.View):
             await interaction.response.send_message("Only the session owner can lock or unlock this session.", ephemeral=True)
             return
         
-        session_data = self.cog.global_chat_sessions.setdefault(self.session_key, {'chat_session': GoogleGenAIChatSession(history=[]), 'unified_log': []})
+        session_data = self.cog.global_chat_sessions.setdefault(self.session_key, {'unified_log': []})
         session_data["is_locked"] = not session_data.get("is_locked", True)
         self._build_view()
         await interaction.response.edit_message(view=self)
 
     async def reply_callback(self, interaction: discord.Interaction):
-        session_data = self.cog.global_chat_sessions.setdefault(self.session_key, {'chat_session': GoogleGenAIChatSession(history=[]), 'unified_log': []})
+        session_data = self.cog.global_chat_sessions.setdefault(self.session_key, {'unified_log': []})
         
         if session_data.get("is_locked", True) and interaction.user.id != self.user_id:
             await interaction.response.send_message("This session is currently locked by the host.", ephemeral=True)
@@ -596,12 +594,6 @@ class GlobalChatHistoryView(ui.View):
         session_data['unified_log'] = [t for t in session_data['unified_log'] if t.get('turn_id') not in ids_to_delete]
         
         if len(session_data['unified_log']) < original_len:
-            new_history = []
-            for t in session_data['unified_log']:
-                role = 'model' if t.get('is_user') is False else 'user'
-                new_history.append({'role': role, 'parts': [t.get('content')]})
-            session_data['chat_session'] = GoogleGenAIChatSession(history=new_history)
-            
             await self.cog.session_manager._save_session_to_disk(self.session_key, 'global_chat', session_data)
 
             await self._load_current_session()
@@ -1269,22 +1261,6 @@ class SessionConfigView(ui.View):
                                 if len(self.session['profiles']) >= 200: break
                                 self.session['profiles'].append({"owner_id": self.original_interaction.user.id, "profile_name": val, "method": "webhook", "chance": 100, "wakewords": []})
                 
-                # [NEW] Sync chat_sessions dynamically immediately upon selection
-                existing_keys = set(self.session.get("chat_sessions", {}).keys())
-                new_keys = { (p['owner_id'], p['profile_name']) for p in self.session.get('profiles', []) }
-                
-                for key_to_add in new_keys - existing_keys:
-                    bot_pid = self.cog.profile_manager._get_pid_from_name_any(key_to_add[0], key_to_add[1])
-                    p_index = self.cog.profile_manager._get_user_index(key_to_add[0])
-                    p_is_b = key_to_add[1] in p_index.get("borrowed", [])
-                    p_settings = self.cog.profile_manager._get_profile_config(key_to_add[0], key_to_add[1], p_is_b) or {}
-                    
-                    participant_history = self.cog.session_manager._build_history_for_participant(self.session.get("unified_log", []), bot_pid, p_settings)
-                    self.session.setdefault("chat_sessions", {})[key_to_add] = GoogleGenAIChatSession(history=participant_history)
-
-                for key_to_remove in existing_keys - new_keys:
-                    self.session.get("chat_sessions", {}).pop(key_to_remove, None)
-                    
                 self.cog.session_manager._save_multi_profile_sessions()
                 
                 # [NEW] Dispatch child bot presence updates

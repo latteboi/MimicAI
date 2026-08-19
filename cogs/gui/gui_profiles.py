@@ -422,7 +422,6 @@ class ProfileManageView(ui.View):
         ]
         for k in keys_to_clear:
             self.cog.channel_models.pop(k, None)
-            self.cog.chat_sessions.pop(k, None)
             self.cog.channel_model_last_profile_key.pop(k, None)
 
         new_embed = await self.cog.profile_manager._build_profile_manage_embed(interaction, profile_name)
@@ -466,11 +465,7 @@ class ProfileManageView(ui.View):
                         if p["owner_id"] == self.user_id and p["profile_name"] == old_name:
                             p["profile_name"] = new_name
                     
-                    old_key = (self.user_id, old_name)
-                    new_key = (self.user_id, new_name)
-                    if old_key in session.get("chat_sessions", {}):
-                        session["chat_sessions"][new_key] = session["chat_sessions"].pop(old_key)
-                
+
                 keys_to_clear = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.user_id and k[2] == old_name]
                 for k in keys_to_clear:
                     self.cog.channel_models.pop(k, None)
@@ -496,7 +491,7 @@ class ProfileManageView(ui.View):
             if new_name in user_index.get("personal", []) or new_name in user_index.get("borrowed", []):
                 await self.original_interaction.edit_original_response(content="Duplicate failed: Name already exists.", view=None, embed=None); return
             
-            limit = defaultConfig.LIMIT_PROFILES_PREMIUM if self.cog.profile_manager.is_user_premium(self.user_id) else defaultConfig.LIMIT_PROFILES_FREE
+            limit = defaultConfig.LIMIT_PROFILES
             if len(user_index.get("personal", {})) >= limit:
                 await self.original_interaction.edit_original_response(content="Limit reached.", view=None, embed=None); return
             
@@ -834,7 +829,6 @@ class SingleProfileModelView(ui.View):
 
             for k in keys_to_delete:
                 self.cog.channel_models.pop(k, None)
-                self.cog.chat_sessions.pop(k, None)
                 self.cog.channel_model_last_profile_key.pop(k, None)
 
     def _get_selection_feedback_message(self) -> str:
@@ -1426,7 +1420,6 @@ class ModelApplyView(ui.View):
 
             for k in keys_to_delete:
                 self.cog.channel_models.pop(k, None)
-                self.cog.chat_sessions.pop(k, None)
                 self.cog.channel_model_last_profile_key.pop(k, None)
 
         msg = f"Updated models for {success_count} profiles." if success_count else "No profiles updated."
@@ -1495,7 +1488,6 @@ class UnifiedBulkTargetView(BaseBulkProfileView):
             keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and len(k) >= 2 and k[1] == self.user_id]
             for k in keys:
                 self.cog.channel_models.pop(k, None)
-                self.cog.chat_sessions.pop(k, None)
                 self.cog.channel_model_last_profile_key.pop(k, None)
 
         await interaction.edit_original_response(content=f"Successfully applied settings to {success_count} profile(s).", view=None)
@@ -1691,7 +1683,6 @@ class SingleProfileTimezoneView(ui.View):
         keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.parent_manage_view.user_id]
         for k in keys:
             self.cog.channel_models.pop(k, None)
-            self.cog.chat_sessions.pop(k, None)
 
         new_embed = await self.cog.profile_manager._build_profile_manage_embed(interaction, self.parent_manage_view.profile_name)
         await self.parent_manage_view.original_interaction.edit_original_response(embed=new_embed, view=self.parent_manage_view)
@@ -1716,7 +1707,6 @@ class CustomTimezoneModal(ui.Modal, title="Enter Custom Timezone"):
             keys = [k for k in self.parent_view.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.parent_view.parent_manage_view.user_id]
             for k in keys:
                 self.parent_view.cog.channel_models.pop(k, None)
-                self.parent_view.cog.chat_sessions.pop(k, None)
 
             new_embed = await self.parent_view.cog.profile_manager._build_profile_manage_embed(interaction, self.parent_view.parent_manage_view.profile_name)
             await self.parent_view.parent_manage_view.original_interaction.edit_original_response(embed=new_embed, view=self.parent_view.parent_manage_view)
@@ -1815,7 +1805,6 @@ class BulkTimezoneView(BaseBulkProfileView):
             keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.user_id]
             for k in keys: 
                 self.cog.channel_models.pop(k, None)
-                self.cog.chat_sessions.pop(k, None)
 
         await interaction.edit_original_response(content=f"Timezone set to **{self.selected_tz}** for {updated_count} profiles.", view=None)
 

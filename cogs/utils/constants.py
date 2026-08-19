@@ -32,11 +32,22 @@ def get_config_value(key_name: str, default: str = None) -> str | None:
             except (NotFound, GoogleAPICallError): continue
     return default
 
+# --- Migration 2 feature flag --------------------------------------------------
+#
+# Routes every Google adapter construction between the google-genai SDK
+# (GoogleSDKModel) and the hand-rolled REST adapter (GoogleRESTModel). Both live at
+# once so the migration is revertible without a test suite: set GOOGLE_REST_ADAPTER=1
+# in .env to opt in, unset it to fall straight back.
+#
+# Read once at import. Flipping it needs a restart, which is what we want — the two
+# adapters must not be mixed within a single run.
+USE_GOOGLE_REST_ADAPTER = os.getenv("GOOGLE_REST_ADAPTER", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 class DefaultConfigNamespace:
     def __init__(self):
         self.DISCORD_SDK = get_config_value("DISCORD_SDK")
         self.DISCORD_OWNER_ID = get_config_value("DISCORD_OWNER_ID")
-        self.ALL_USERS_PREMIUM = True
         self.PLACEHOLDER_EMOJI = get_config_value("PLACEHOLDER_EMOJI", "⏳")
         
         raw_key = get_config_value("ENCRYPTION_KEY")
@@ -47,14 +58,10 @@ class DefaultConfigNamespace:
             key_val = raw_key.strip()
             self.ENCRYPTION_KEY = key_val.encode() if isinstance(key_val, str) else key_val
 
-        self.LIMIT_PROFILES_FREE = 5
-        self.LIMIT_PROFILES_PREMIUM = 100
-        self.LIMIT_BORROWED_FREE = 5
-        self.LIMIT_BORROWED_PREMIUM = 100
-        self.LIMIT_LTM_FREE = 50
-        self.LIMIT_LTM_PREMIUM = 5000
-        self.LIMIT_TRAINING_FREE = 10
-        self.LIMIT_TRAINING_PREMIUM = 100
+        self.LIMIT_PROFILES = 100
+        self.LIMIT_BORROWED = 100
+        self.LIMIT_LTM = 5000
+        self.LIMIT_TRAINING = 100
         self.CHATBOT_MEMORY_LENGTH = 20
         self.GEMINI_TEMPERATURE = 1.0
         self.GEMINI_TOP_P = 0.95
@@ -124,7 +131,9 @@ AI_INSTRUCTIONS_PART_MAX_LENGTH = 4000
 PLACEHOLDER_EMOJI = defaultConfig.PLACEHOLDER_EMOJI
 LOCK_STALE_THRESHOLD_SECONDS = 60 
 LOCK_REFRESH_INTERVAL_SECONDS = 30 
-CHAT_SESSION_CACHE_MAX_SIZE = 5 
+# Bound for channel_models / channel_model_last_profile_key, keyed
+# (channel_id, profile_owner_id, profile_name).
+CHANNEL_MODEL_CACHE_MAX_SIZE = 64 
 PROMPT_CACHE_MAX_SIZE = 20
 MAX_USER_PROFILES = 50
 MAX_BORROWED_PROFILES = 50
@@ -132,7 +141,15 @@ MAX_USER_APPEARANCES = 50
 MAX_MULTI_PROFILES = 200
 DROPDOWN_MAX_OPTIONS = 25
 SHARE_CODE_EXPIRATION_SECONDS = 300
+# Single priority band for the image queue. Kept as a named constant so the
+# PriorityQueue ordering stays explicit; ties break on enqueue timestamp (FIFO).
+IMAGE_QUEUE_PRIORITY = 10
 MAX_URL_CONTEXT_CHARACTERS = 16000 # Approx 4000 tokens
+# Hard cap on the raw bytes pulled from a linked page before any scrubbing. A page is
+# read into memory and then rewritten by regex passes, so an uncapped body is the peak
+# RSS of the whole URL path. 512 KB of markup reduces to far more than the 16 KB of text
+# that survives truncation, so this never costs context.
+MAX_URL_FETCH_BYTES = 512 * 1024
 MAX_GROUNDING_SUMMARY_CHARACTERS = 2000 # Approx 500 tokens
 
 REGENERATE_EMOJI = "🔁"
@@ -288,10 +305,6 @@ DEFAULT_SAFETY_SETTINGS = {
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
 }
 
-class GoogleGenAIChatSession:
-    def __init__(self, history=None):
-        self.history = history or []
-
 # --- Standardised Error & Warning Messages ---
 WARN_FALLBACK_USED = "**Fallback Model Used**"
 WARN_MAIN_MODEL_FAILED = "**Main Model Failed** ({reason})"
@@ -397,7 +410,7 @@ DEFAULT_HELP_MODE_INJECTION = (
     "   │    └── Action: Edit Primary Key (Admin only - Server-wide routing key)\n"
     "   └── Tab 3: [Child Bots] (Owner Only - Application Provisioning)\n"
     "        ├── Action: Create New Child Bot (Links PID to custom bot token)\n"
-    "        └── Action: Unlink & Delete (Deletes config & kills subprocess)\n\n"
+    "        └── Action: Unlink & Delete (Deletes config & disconnects the bot)\n\n"
     "3. DASHBOARD: `/session config` (Admin Only)\n"
     "   ├── Tab 1: [Cast] (Configure Cast List)\n"
     "   │    └── Actions: Add/Remove Personal, Borrowed, and Child Bot participants (Max 200)\n"
@@ -434,3 +447,13 @@ PATTERN_TIMESTAMP_HEADER = re.compile(r'(?i)(?:^|\n)(?:<[^>\r\n]+>|[^[\r\n]+)?\s
 PATTERN_METADATA = re.compile(r'\(?\s*(?:Thought Initiated:)?\s*[^|\n\r]*?\|?\s*Duration: \d+\.\d+s\s*\)?', flags=re.IGNORECASE)
 PATTERN_MESSAGE_LINK = re.compile(r'Message\s*#[\w-]+')
 PATTERN_WHITESPACE_CLEANUP = re.compile(r'\n{3,}')
+
+# HTML scrubbing for linked-page context. Compiled once rather than per fetch.
+# The container tags collapse into a single alternation with a backreference so one
+# rewrite handles what used to take three.
+PATTERN_HTML_CONTAINERS = re.compile(
+    r'<(style|script|head|nav|header|footer|svg|form|noscript)\b.*?</\1\s*>',
+    flags=re.DOTALL | re.IGNORECASE,
+)
+PATTERN_HTML_TAGS = re.compile(r'<.*?>', flags=re.DOTALL)
+PATTERN_HTML_BLANKLINES = re.compile(r'\n{3,}')

@@ -518,15 +518,7 @@ class EventListeners:
                                 break
                         
                         if turn_id_to_delete:
-                            original_len = len(session_data['unified_log'])
                             session_data['unified_log'] = [t for t in session_data['unified_log'] if t.get('turn_id') != turn_id_to_delete]
-
-                            if len(session_data['unified_log']) < original_len:
-                                new_history = []
-                                for t in session_data['unified_log']:
-                                    role = 'model' if t.get('is_user') is False else 'user'
-                                    new_history.append({'role': role, 'parts': [t.get('content')]})
-                                session_data['chat_session'] = GoogleGenAIChatSession(history=new_history)
 
                             if not session_data['unified_log']:
                                 self.global_chat_sessions.pop(session_key, None)
@@ -574,9 +566,8 @@ class EventListeners:
                 dummy_session_key = (payload.channel_id, None, None)
                 if is_effectively_empty:
                     await self.session_manager._delete_session_from_disk(dummy_session_key, session_type)
-                    for p_key in session.get("chat_sessions", {}).keys():
-                        owner_id, profile_name = p_key
-                        full_session_key = (payload.channel_id, owner_id, profile_name)
+                    for p in session.get("profiles", []):
+                        full_session_key = (payload.channel_id, p['owner_id'], p['profile_name'])
                         self.ltm_recall_history.pop(full_session_key, None)
                 else:
                     await self.session_manager._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
@@ -696,6 +687,13 @@ class EventListeners:
                 print(f"Unexpected error releasing lock file: {e}")
 
         await self.child_bot_manager.shutdown_all()
+
+        from ..services.tools_service import close_url_fetch_client
+        await close_url_fetch_client()
+
+        from ..services.api_service import close_google_rest_client
+        await close_google_rest_client()
+
         self.bot.tree.remove_command(self.trace_ctx_menu.name, type=self.trace_ctx_menu.type)
         
         self.refresh_lock_task.cancel()
@@ -714,8 +712,8 @@ class EventListeners:
                 self.session_manager._safe_cancel_task(session_data['worker_task'])
                 session_data['worker_task'] = None
         
-        for session_key, chat_session in self.global_chat_sessions.items():
-            await self.session_manager._save_session_to_disk(session_key, 'global_chat', chat_session)
+        for session_key, session_data in self.global_chat_sessions.items():
+            await self.session_manager._save_session_to_disk(session_key, 'global_chat', session_data)
         for ch_id, session_data in self.multi_profile_channels.items():
             if session_data.get("is_hydrated"): # Only save sessions that are loaded in memory
                 session_type = session_data.get("type", "multi")

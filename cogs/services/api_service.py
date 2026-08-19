@@ -2,8 +2,10 @@ import os
 import asyncio
 import base64
 import datetime
+import threading
 import httpx
 import orjson as json
+from collections import OrderedDict
 from typing import get_args, Any, List, Optional, Tuple
 from discord.ext import tasks
 
@@ -14,12 +16,9 @@ from ..utils.constants import (
     OLLAMA_LOCAL_URL, MODELS_DATA_DIR, PRICING_CACHE_FILE, IMAGE_MODELS, AUDIO_MODELS,
     ALLOWED_MODELS, defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
     HarmBlockThreshold, HarmCategory,
+    USE_GOOGLE_REST_ADAPTER,
 )
 
-class OpenRouterChatSession:
-    def __init__(self, model, history=None):
-        self.model = model
-        self.history = history or []
 
 class OpenRouterModel:
     def __init__(self, model_name, api_key, system_instruction=None, thinking_params=None, **kwargs):
@@ -27,9 +26,6 @@ class OpenRouterModel:
         self.api_key = api_key
         self.system_instruction = system_instruction
         self.thinking_params = thinking_params or {} # [NEW]
-
-    def start_chat(self, history=None):
-        return OpenRouterChatSession(self, history=history)
 
     async def generate_content_async(self, contents, generation_config=None, safety_settings=None, stream_state=None):
         messages = []
@@ -176,11 +172,6 @@ class OpenRouterModel:
 
 _ollama_global_lock = asyncio.Lock()
 
-class OllamaChatSession:
-    def __init__(self, model, history=None):
-        self.model = model
-        self.history = history or []
-
 class OllamaResponse:
     def __init__(self, message_dict, finish_reason):
         self.text = message_dict.get('content', '') or ''
@@ -214,9 +205,6 @@ class OllamaModel:
         self.api_url = api_url.rstrip("/")
         self.system_instruction = system_instruction
         self.thinking_params = thinking_params or {}
-
-    def start_chat(self, history=None):
-        return OllamaChatSession(self, history=history)
 
     async def generate_content_async(self, contents, generation_config=None, safety_settings=None, stream_state=None):
         import re
@@ -389,25 +377,456 @@ class OllamaModel:
             except asyncio.CancelledError:
                 raise
 
-class GoogleGenAIChatSession:
-    def __init__(self, history=None):
-        self.history = history or []
+# --- Shared google-genai client cache -----------------------------------------
+#
+# Constructing a genai.Client builds three separate SSL contexts (httpx, aiohttp,
+# websockets), each loading the full CA bundle: ~44 ms of CPU and ~2.4 MB of RSS
+# that is never returned to the OS. On the e2-micro that cost is unaffordable on a
+# per-turn path, and it was previously paid per model, per embedding and per TTS
+# segment. Clients are stateless with respect to requests, so one per
+# (api_key, api_version) is sufficient.
+#
+# Bounded to _GENAI_CLIENT_CACHE_MAX entries, evicted least-recently-used, because
+# the key space is per-guild API keys and must not grow without limit. The lock
+# guards the move_to_end/popitem sequence: the sync client is also touched from
+# worker threads via asyncio.to_thread (see files.upload below).
 
-class GoogleGenAIModel:
-    def __init__(self, api_key, model_name, system_instruction=None, safety_settings=None, thinking_params=None, tools=None):
-        # Force v1beta for stable "Thinking" part delivery
-        self.client = genai.Client(
-            api_key=api_key,
-            http_options=types.HttpOptions(api_version='v1beta')
+_GENAI_CLIENT_CACHE_MAX = 8
+_genai_client_cache: "OrderedDict[Tuple[str, str], genai.Client]" = OrderedDict()
+_genai_client_lock = threading.Lock()
+
+
+def get_genai_client(api_key: str, api_version: str = 'v1beta') -> genai.Client:
+    """Returns a shared genai.Client for this (api_key, api_version) pair.
+
+    Always prefer this over constructing genai.Client directly.
+    """
+    key = (api_key, api_version)
+    with _genai_client_lock:
+        client = _genai_client_cache.get(key)
+        if client is not None:
+            _genai_client_cache.move_to_end(key)
+            return client
+
+    # Built outside the lock: construction is slow and two concurrent misses
+    # racing is harmless — the loser's client is simply discarded.
+    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(api_version=api_version))
+
+    with _genai_client_lock:
+        existing = _genai_client_cache.get(key)
+        if existing is not None:
+            _genai_client_cache.move_to_end(key)
+            return existing
+        _genai_client_cache[key] = client
+        while len(_genai_client_cache) > _GENAI_CLIENT_CACHE_MAX:
+            _genai_client_cache.popitem(last=False)
+    return client
+
+
+# --- Google REST adapter -------------------------------------------------------
+#
+# Migration 2. google-genai is already REST over httpx — there is no gRPC and no
+# protocol change here. What it buys is 70 MB of import baseline never returned to
+# the OS, and dropping aiohttp/websockets/requests/pydantic from the dependency
+# tree; on a 1 GB e2-micro that is 7% of RAM before a message is handled.
+#
+# Selected by USE_GOOGLE_REST_ADAPTER (see constants.py). GoogleSDKModel below stays
+# live alongside it until the flag is flipped for good.
+
+_GOOGLE_API_BASE = "https://generativelanguage.googleapis.com"
+
+# One client for every Google REST call rather than one per request: building an
+# httpx.AsyncClient costs ~14 ms and ~0.8 MB, and nothing here varies per call — the
+# API key travels as a per-request header, not in the client. Created lazily so it
+# binds to the running event loop, and closed from MimicCog.cog_unload.
+_google_rest_client: Optional[httpx.AsyncClient] = None
+
+
+def get_google_rest_client() -> httpx.AsyncClient:
+    global _google_rest_client
+    if _google_rest_client is None or _google_rest_client.is_closed:
+        _google_rest_client = httpx.AsyncClient(
+            base_url=_GOOGLE_API_BASE,
+            timeout=httpx.Timeout(120.0, connect=10.0),
         )
+    return _google_rest_client
+
+
+async def close_google_rest_client():
+    global _google_rest_client
+    if _google_rest_client is not None and not _google_rest_client.is_closed:
+        await _google_rest_client.aclose()
+    _google_rest_client = None
+
+
+def _to_camel(snake: str) -> str:
+    """snake_case attribute name -> camelCase JSON key."""
+    head, _, tail = snake.partition("_")
+    if not tail:
+        return snake
+    return head + "".join(w[:1].upper() + w[1:] for w in tail.split("_"))
+
+
+class _EnumStr(str):
+    """A REST enum value.
+
+    The SDK delivers these as enum objects and the call sites read `.name`
+    (`finish_reason.name`, `block_reason.name`). REST delivers a bare string.
+    Subclassing str keeps both spellings working, so `x.name == 'STOP'` and
+    `x == 'STOP'` are both true.
+    """
+    __slots__ = ()
+
+    @property
+    def name(self) -> str:
+        return str(self)
+
+
+# Attribute names whose values are enums in the SDK and plain strings over REST.
+_ENUM_ATTRS = frozenset({"finish_reason", "block_reason"})
+
+
+class _RestView:
+    """Attribute view over one parsed REST JSON object.
+
+    The SDK hands call sites objects with snake_case attributes; the wire format is
+    camelCase JSON. Rather than hand-translate each response shape, this maps
+    attribute reads onto the JSON keys and returns None for anything absent — which
+    is exactly what the `hasattr(...)` / `... is not None` guards at the call sites
+    already expect of the SDK objects.
+
+    The consumed surface, verified by grep across cogs/ — a wrapper that quietly
+    misses one of these looks like a model that "doesn't support images":
+
+        candidates[0].content.parts[].text / .thought
+        candidates[0].content.parts[].inline_data.data / .mime_type
+        candidates[0].finish_reason.name
+        candidates[0].grounding_metadata.grounding_chunks[].web.uri / .title
+        candidates[0].grounding_metadata.grounding_supports[].segment.end_index
+        candidates[0].grounding_metadata.grounding_supports[].grounding_chunk_indices
+        candidates[0].url_context_metadata.url_metadata[].retrieved_url
+        prompt_feedback.block_reason.name
+        usage_metadata.prompt_token_count / .candidates_token_count
+
+    Wrapped values are memoised. Call sites read the same attribute more than once
+    (media_service tests `part.inline_data.data` for truthiness before binding it),
+    and inline_data.data base64-decodes to a multi-megabyte blob — decoding it twice
+    is a transient the e2-micro cannot spare.
+    """
+
+    __slots__ = ("_data", "_memo")
+
+    def __init__(self, data: dict):
+        self._data = data
+        self._memo = {}
+
+    def __getattr__(self, name):
+        # Guard dunder lookups so copy/pickle protocols do not resolve to None.
+        if name.startswith("__"):
+            raise AttributeError(name)
+
+        data = object.__getattribute__(self, "_data")
+        memo = object.__getattribute__(self, "_memo")
+        if name in memo:
+            return memo[name]
+
+        if name in data:
+            value = data[name]
+        else:
+            camel = _to_camel(name)
+            if camel not in data:
+                memo[name] = None
+                return None
+            value = data[camel]
+
+        wrapped = _wrap_rest(name, value)
+        memo[name] = wrapped
+        return wrapped
+
+    def __bool__(self):
+        return bool(object.__getattribute__(self, "_data"))
+
+    def __repr__(self):
+        return f"_RestView({object.__getattribute__(self, '_data')!r})"
+
+
+def _wrap_rest(name: str, value):
+    if isinstance(value, dict):
+        return _RestView(value)
+    if isinstance(value, list):
+        return [_wrap_rest(name, v) for v in value]
+    if isinstance(value, str):
+        if name in _ENUM_ATTRS:
+            return _EnumStr(value)
+        if name == "data":
+            # inline_data.data is base64 on the wire; the SDK hands call sites bytes.
+            try:
+                return base64.b64decode(value)
+            except Exception:
+                return value
+    return value
+
+
+class GoogleRESTModel:
+    """Google Gemini over raw REST, satisfying the same adapter interface as
+    OpenRouterModel and OllamaModel: generate_content_async(contents,
+    generation_config, ...) returning an object with .text, .thought, .candidates,
+    .prompt_feedback and token counts.
+    """
+
+    def __init__(self, api_key, model_name, system_instruction=None, safety_settings=None, thinking_params=None, tools=None):
+        self.api_key = api_key
         self.model_name = model_name.replace("OPENROUTER/", "").replace("GOOGLE/", "")
         self.system_instruction = system_instruction
         self.safety_settings = safety_settings
         self.thinking_params = thinking_params or {}
         self.tools = tools
 
-    def start_chat(self, history=None):
-        return GoogleGenAIChatSession(history=history)
+    # -- media ------------------------------------------------------------------
+
+    async def _upload_file(self, path: str, mime_type: str) -> Optional[str]:
+        """Uploads a file already on disk and returns its file URI.
+
+        Still routed through the SDK's resumable upload while google-genai is
+        present. This is the single seam that Migration 2 step 4 replaces with the
+        hand-rolled resumable protocol; keeping it isolated means the media path —
+        the least-exercised one in the bot — changes in exactly one place.
+        """
+        client = get_genai_client(self.api_key, 'v1beta')
+        uploaded = await asyncio.to_thread(client.files.upload, file=path, config={'mime_type': mime_type})
+        return getattr(uploaded, 'uri', None)
+
+    async def _build_parts(self, raw_parts) -> List[dict]:
+        parts = []
+        for p in raw_parts:
+            if isinstance(p, str):
+                parts.append({"text": p})
+            elif isinstance(p, dict) and 'mime_type' in p and 'data' in p:
+                parts.append({
+                    "inlineData": {
+                        "mimeType": p['mime_type'],
+                        "data": base64.b64encode(p['data']).decode('ascii'),
+                    }
+                })
+            elif isinstance(p, dict) and 'url' in p:
+                url = p['url']
+                mime_type = p.get('mime_type', '')
+                if url.startswith(('http://', 'https://')):
+                    temp_path = None
+                    try:
+                        import tempfile
+
+                        # Streamed to disk rather than buffered, so a large attachment
+                        # never sits in RAM in full.
+                        fd, temp_path = tempfile.mkstemp(suffix=".tmp")
+                        client_http = get_google_rest_client()
+                        async with client_http.stream("GET", url, follow_redirects=True, timeout=15.0) as resp:
+                            resp.raise_for_status()
+                            with os.fdopen(fd, 'wb') as f:
+                                async for chunk in resp.aiter_bytes(chunk_size=8192):
+                                    f.write(chunk)
+
+                        file_uri = await self._upload_file(temp_path, mime_type or 'image/jpeg')
+                        if file_uri:
+                            parts.append({"fileData": {"fileUri": file_uri, "mimeType": mime_type or 'image/jpeg'}})
+                    except Exception as e:
+                        print(f"Failed to fetch media from URL {url}: {e}")
+                    finally:
+                        if temp_path and os.path.exists(temp_path):
+                            os.remove(temp_path)
+                elif os.path.exists(url):
+                    try:
+                        file_uri = await self._upload_file(url, mime_type or 'image/png')
+                        if file_uri:
+                            parts.append({"fileData": {"fileUri": file_uri, "mimeType": mime_type or 'image/png'}})
+                    except Exception as e:
+                        print(f"Failed to upload local image {url} to Gemini File API: {e}")
+                else:
+                    parts.append({"fileData": {"fileUri": url, "mimeType": mime_type}})
+        return parts
+
+    # -- request ----------------------------------------------------------------
+
+    async def _build_contents(self, contents) -> List[dict]:
+        formatted = []
+        for item in contents:
+            if isinstance(item, str):
+                formatted.append({"role": "user", "parts": [{"text": item}]})
+            elif isinstance(item, dict):
+                parts = await self._build_parts(item.get('parts', []))
+                formatted.append({"role": item.get('role', 'user'), "parts": parts})
+            elif hasattr(item, 'role') and hasattr(item, 'parts'):
+                # Fallback for legacy SDK objects still reaching the adapter.
+                new_parts = []
+                for p in item.parts:
+                    if getattr(p, 'text', None):
+                        new_parts.append({"text": p.text})
+                    elif getattr(p, 'inline_data', None):
+                        new_parts.append({
+                            "inlineData": {
+                                "mimeType": p.inline_data.mime_type,
+                                "data": base64.b64encode(p.inline_data.data).decode('ascii'),
+                            }
+                        })
+                formatted.append({"role": item.role, "parts": new_parts})
+        return formatted
+
+    def _build_generation_config(self, generation_config) -> dict:
+        model_lower = self.model_name.lower()
+
+        # Utility models do not accept a thinking config at all.
+        is_utility_model = any(suffix in model_lower for suffix in ["-image", "-tts", "-embedding"])
+        include_thoughts = self.thinking_params.get("thinking_summary_visible") == "on"
+
+        if isinstance(generation_config, dict):
+            temp = generation_config.get("temperature")
+            top_p = generation_config.get("top_p")
+            top_k = generation_config.get("top_k")
+            if generation_config.get("thinking_config"):
+                include_thoughts = generation_config["thinking_config"].get("include_thoughts", include_thoughts)
+        else:
+            temp = generation_config.temperature if generation_config else None
+            top_p = generation_config.top_p if generation_config else None
+            top_k = generation_config.top_k if generation_config else None
+            if generation_config and getattr(generation_config, 'thinking_config', None):
+                include_thoughts = generation_config.thinking_config.include_thoughts
+
+        cfg = {}
+        if temp is not None:
+            cfg["temperature"] = temp
+        if top_p is not None:
+            cfg["topP"] = top_p
+        if top_k is not None:
+            cfg["topK"] = top_k
+
+        if not is_utility_model:
+            if "gemini-3" in model_lower:
+                lvl = self.thinking_params.get("thinking_level", "high").lower()
+                if "pro" in model_lower:
+                    mapped_lvl = "LOW" if lvl in ["low", "minimal", "none"] else "HIGH"
+                else:
+                    mapped_lvl = {
+                        "xhigh": "HIGH", "high": "HIGH", "medium": "MEDIUM",
+                        "low": "LOW", "minimal": "MINIMAL", "none": "MINIMAL"
+                    }.get(lvl, "HIGH")
+                cfg["thinkingConfig"] = {"includeThoughts": include_thoughts, "thinkingLevel": mapped_lvl}
+            elif "gemini-2.5" in model_lower:
+                budget = int(self.thinking_params.get("thinking_budget", -1))
+                if "lite" not in model_lower:
+                    if "pro" in model_lower and 0 <= budget < 128:
+                        budget = 128
+                    cfg["thinkingConfig"] = {"includeThoughts": include_thoughts, "thinkingBudget": budget}
+
+        return cfg
+
+    def _build_safety_settings(self) -> List[dict]:
+        out = []
+        if self.safety_settings:
+            for cat, thresh in self.safety_settings.items():
+                out.append({
+                    "category": cat.name if hasattr(cat, 'name') else str(cat),
+                    "threshold": thresh.name if hasattr(thresh, 'name') else str(thresh),
+                })
+        return out
+
+    def _build_tools(self) -> Optional[List[dict]]:
+        """Tool declarations arrive as snake_case dicts ({"google_search": {}}),
+        which the SDK converted for us. REST wants camelCase keys.
+        """
+        if not self.tools:
+            return None
+        out = []
+        for tool in self.tools:
+            if isinstance(tool, dict):
+                out.append({_to_camel(k): v for k, v in tool.items()})
+            else:
+                out.append(tool)
+        return out or None
+
+    async def generate_content_async(self, contents, generation_config=None, stream_state=None):
+        payload = {"contents": await self._build_contents(contents)}
+
+        if self.system_instruction:
+            # role is what the SDK sends here; the API ignores it, but matching keeps
+            # the two adapters' wire payloads diffable while both are live.
+            payload["systemInstruction"] = {"role": "user", "parts": [{"text": self.system_instruction}]}
+
+        safety = self._build_safety_settings()
+        if safety:
+            payload["safetySettings"] = safety
+
+        tools = self._build_tools()
+        if tools:
+            payload["tools"] = tools
+
+        gen_cfg = self._build_generation_config(generation_config)
+        if gen_cfg:
+            payload["generationConfig"] = gen_cfg
+
+        model_path = self.model_name if self.model_name.startswith("models/") else f"models/{self.model_name}"
+
+        try:
+            client = get_google_rest_client()
+            response = await client.post(
+                f"/v1beta/{model_path}:generateContent",
+                content=json.dumps(payload),
+                headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
+            )
+        except httpx.RequestError as e:
+            raise Exception(f"Google API Network Error: {str(e)}")
+        except asyncio.CancelledError:
+            raise
+        finally:
+            payload.clear()
+
+        if response.status_code != 200:
+            # The body carries the status name ("RESOURCE_EXHAUSTED") that
+            # helpers._get_friendly_api_error matches on, so pass it through intact.
+            raise Exception(f"Google API Error {response.status_code}: {response.text}")
+
+        return GoogleRESTResponse(json.loads(response.content))
+
+
+class GoogleRESTResponse:
+    """Normalises a parsed generateContent body into the shared adapter interface.
+
+    The same shape GoogleSDKModel's ThoughtResponse produces — only the input
+    changes, from an SDK object to a _RestView over the JSON.
+    """
+
+    def __init__(self, body: dict):
+        self.raw = _RestView(body)
+        self.text = ""
+        self.thought = ""
+        self.candidates = self.raw.candidates or []
+        self.prompt_feedback = self.raw.prompt_feedback
+        self.usage_metadata = self.raw.usage_metadata
+
+        self.input_tokens = (self.usage_metadata.prompt_token_count or 0) if self.usage_metadata else 0
+        self.output_tokens = (self.usage_metadata.candidates_token_count or 0) if self.usage_metadata else 0
+
+        if self.candidates and self.candidates[0].content and self.candidates[0].content.parts:
+            for part in self.candidates[0].content.parts:
+                if part.thought:
+                    self.thought += part.text or ""
+                elif part.text:
+                    self.text += part.text
+
+        self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
+
+    def __bool__(self):
+        return bool(self.candidates)
+
+
+class GoogleSDKModel:
+    def __init__(self, api_key, model_name, system_instruction=None, safety_settings=None, thinking_params=None, tools=None):
+        # Force v1beta for stable "Thinking" part delivery
+        self.client = get_genai_client(api_key, 'v1beta')
+        self.model_name = model_name.replace("OPENROUTER/", "").replace("GOOGLE/", "")
+        self.system_instruction = system_instruction
+        self.safety_settings = safety_settings
+        self.thinking_params = thinking_params or {}
+        self.tools = tools
 
     async def generate_content_async(self, contents, generation_config=None, stream_state=None):
         formatted_contents = []
@@ -580,6 +999,20 @@ class GoogleGenAIModel:
             def __bool__(self): return bool(self.candidates)
 
         return ThoughtResponse(response)
+
+
+# --- Google adapter routing ----------------------------------------------------
+#
+# Every Google construction site in the bot imports this name, so the flag is applied
+# here rather than at ten call sites. A function, not a class, because the two
+# adapters share no implementation — only an interface.
+#
+# MimicCog's cost-recording branch matches on __class__.__name__, so it tests for
+# both concrete names; nothing else in the codebase inspects the adapter's type.
+def GoogleGenAIModel(*args, **kwargs):
+    """Constructs the Google adapter selected by USE_GOOGLE_REST_ADAPTER."""
+    cls = GoogleRESTModel if USE_GOOGLE_REST_ADAPTER else GoogleSDKModel
+    return cls(*args, **kwargs)
 
 
 class APIService:
@@ -838,10 +1271,7 @@ class APIService:
         if gemini_key:
             try:
                 # Initialize new SDK client
-                test_client = genai.Client(
-                    api_key=gemini_key, 
-                    http_options=types.HttpOptions(api_version='v1alpha')
-                )
+                test_client = get_genai_client(gemini_key, 'v1alpha')
                 
                 # Step 1: Authentication Check (Is the key valid?)
                 await test_client.aio.models.generate_content(

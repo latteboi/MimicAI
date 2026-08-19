@@ -55,6 +55,13 @@ class DeliveryMixin:
             owner_id_str = str(effective_owner_id)
             appearance_data = self.cog.profile_manager._get_user_appearance(effective_owner_id, effective_profile_name)
 
+            # Seeded before the branch below reads it. The `or custom_display_name_to_use`
+            # fallback on the custom_display_name line is only reached when the profile has
+            # a custom avatar but no custom display name, and the name was unbound there —
+            # an UnboundLocalError on that one combination. The profile name is the same
+            # fallback the elif branch uses.
+            custom_display_name_to_use = profile_name_for_appearance
+
             if appearance_data and (appearance_data.get("custom_display_name") or appearance_data.get("custom_avatar_url")):
                 use_webhook = True
                 custom_display_name_to_use = appearance_data.get("custom_display_name") or custom_display_name_to_use

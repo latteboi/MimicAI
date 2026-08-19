@@ -93,10 +93,6 @@ class SpeakAsMixin:
 
         turn_object = None
         if session:
-            participant_key = (user_id, profile_name)
-            model_content_obj = {'role': 'model', 'parts': [history_line]}
-            user_content_obj = {'role': 'user', 'parts': [history_line]}
-
             turn_id = str(uuid.uuid4())
             turn_object = {
                 "turn_id": turn_id,
@@ -108,12 +104,6 @@ class SpeakAsMixin:
                 "content": history_line
             }
             session.setdefault("unified_log", []).append(turn_object)
-
-            for key, chat_session in session["chat_sessions"].items():
-                if key == participant_key:
-                    chat_session.history.append(model_content_obj)
-                else:
-                    chat_session.history.append(user_content_obj)
 
             session_type = session.get("type", "multi")
             self.cog.session_last_accessed[channel.id] = time.time()

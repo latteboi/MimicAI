@@ -1,7 +1,6 @@
 import io
 import os
 import re
-import gc
 import time
 import uuid
 import random
@@ -20,7 +19,7 @@ from ..utils.constants import (
 )
 from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt, _format_history_entry, _get_user_hash, _scrub_response_text, _split_into_sentences_with_abbreviations
 from ..managers.memory_manager import encode_embedding_b64
-from .api_service import GoogleGenAIModel, GoogleGenAIChatSession, OllamaModel, OpenRouterModel
+from .api_service import GoogleGenAIModel, OllamaModel, OpenRouterModel
 
 from .generation._shared import _resolve_safety_settings, _strip_neuro_update_and_scrub
 from .generation.heartbeat import HeartbeatMixin
@@ -583,6 +582,39 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         if trigger is not None: session['task_queue'].task_done()
                     continue
 
+                # --- Synchronised Feedback Step ---
+                # Hoisted to here, directly after the channel and API-key guards. The three
+                # things a placeholder needs — a resolved channel, a valid key, and
+                # profile_order[0] for the webhook name and avatar — are all settled by this
+                # point, and nothing between here and generation can decide not to respond.
+                # It previously sat below the anchor-message resolution, so the user waited on
+                # a channel.fetch_message round trip before seeing any feedback at all.
+                first_participant = profile_order[0] if profile_order else None
+                first_placeholder_message = None
+                feedback_task = None
+
+                if first_participant:
+                    if first_participant.get('method') == 'child_bot':
+                        p_index = self.cog.profile_manager._get_user_index(first_participant['owner_id'])
+                        p_is_b = first_participant['profile_name'] in p_index.get("borrowed", [])
+                        fp_settings = self.cog.profile_manager._get_profile_config(first_participant['owner_id'], first_participant['profile_name'], p_is_b) or {}
+
+                        if fp_settings.get("child_bot_placeholder", False):
+                            custom_emoji = fp_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+                            feedback_task = asyncio.create_task(self._send_child_bot_placeholder(first_participant['bot_id'], channel_id, custom_emoji))
+                        else:
+                            await self.cog.manager_queue.put({
+                                "action": "send_to_child", "bot_id": first_participant['bot_id'],
+                                "payload": {"action": "start_typing", "channel_id": channel_id}
+                            })
+                    else: # Webhook
+                        feedback_task = asyncio.create_task(self._send_channel_message(
+                            channel, f"{PLACEHOLDER_EMOJI}",
+                            profile_owner_id_for_appearance=first_participant['owner_id'],
+                            profile_name_for_appearance=first_participant['profile_name'],
+                            bypass_typing=True
+                        ))
+
                 was_blocked = False
                 generated_image_bytes_for_round = None
                 generator_profile_key = None
@@ -625,33 +657,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         if last_mid: anchor_message = await channel.fetch_message(last_mid)
                     except: pass
 
-                # --- Synchronised Feedback Step ---
-                first_participant = profile_order[0] if profile_order else None
-                first_placeholder_message = None
-                feedback_task = None
-                
-                if first_participant:
-                    if first_participant.get('method') == 'child_bot':
-                        p_index = self.cog.profile_manager._get_user_index(first_participant['owner_id'])
-                        p_is_b = first_participant['profile_name'] in p_index.get("borrowed", [])
-                        fp_settings = self.cog.profile_manager._get_profile_config(first_participant['owner_id'], first_participant['profile_name'], p_is_b) or {}
-                        
-                        if fp_settings.get("child_bot_placeholder", False):
-                            custom_emoji = fp_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
-                            feedback_task = asyncio.create_task(self._send_child_bot_placeholder(first_participant['bot_id'], channel_id, custom_emoji))
-                        else:
-                            await self.cog.manager_queue.put({
-                                "action": "send_to_child", "bot_id": first_participant['bot_id'],
-                                "payload": {"action": "start_typing", "channel_id": channel_id}
-                            })
-                    else: # Webhook
-                        feedback_task = asyncio.create_task(self._send_channel_message(
-                            channel, f"{PLACEHOLDER_EMOJI}",
-                            profile_owner_id_for_appearance=first_participant['owner_id'], 
-                            profile_name_for_appearance=first_participant['profile_name'],
-                            bypass_typing=True
-                        ))
-
                 grounding_context, grounding_sources = None, []
                 grounding_profile_key = None
                 grounding_mode_for_citator = "off"
@@ -675,12 +680,15 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     grounding_task = None
                     if grounding_mode == "rag":
                         g_participant_key = (g_owner_id, g_profile_name)
-                        g_chat_session = session['chat_sessions'].get(g_participant_key)
+                        # Derived from unified_log rather than the shadow chat_sessions copy.
+                        g_stm_length = int(g_profile_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
+                        g_stm_capped = min(10, g_stm_length)
                         history_for_grounding = []
-                        if g_chat_session:
-                            g_stm_length = int(g_profile_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
-                            g_stm_capped = min(10, g_stm_length)
-                            history_for_grounding = g_chat_session.history[-(g_stm_capped * 2):] if g_stm_capped > 0 else []
+                        if g_stm_capped > 0:
+                            g_bot_pid = self.cog.profile_manager._get_pid_from_name_any(g_owner_id, g_profile_name)
+                            history_for_grounding = self.cog.session_manager._build_history_for_participant(
+                                session.get("unified_log", []), g_bot_pid, g_profile_settings, len(profile_order) or 1
+                            )[-(g_stm_capped * 2):]
 
                         # Safety Logic for Grounding
                         g_safety_level = g_profile_settings.get('safety_level', 'low')
@@ -826,7 +834,47 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             )
                             
                             status = "api_error"
-                            response = await image_model.generate_content_async([{'role': 'user', 'parts': parts}])
+
+                            # Image generation is the slowest call in the system (tens of
+                            # seconds) and was the one path with no heartbeat: the placeholder
+                            # created above just sat as a static emoji until the image landed.
+                            # Resolve the placeholder id first so _generate_with_heartbeat has
+                            # something to edit. Awaiting feedback_task here is safe — it is an
+                            # asyncio.Task, so the later await in the participant loop returns
+                            # the same cached result rather than re-running it.
+                            img_msg_a_id = None
+                            if feedback_task is not None:
+                                try:
+                                    fb_result = await feedback_task
+                                    if fb_result:
+                                        if first_participant and first_participant.get('method') == 'child_bot':
+                                            img_msg_a_id = fb_result
+                                        else:
+                                            img_msg_a_id = fb_result[0].id
+                                except Exception as e:
+                                    print(f"Image-gen feedback task error: {e}")
+
+                            gen_app_name, gen_app_avatar = self._resolve_appearance_data(gen_owner_id, gen_profile_name)
+                            image_state_container = {
+                                'msg_a_id': img_msg_a_id,
+                                'msg_b_id': None,
+                                'app_name': gen_app_name,
+                                'app_avatar': gen_app_avatar,
+                                'message_type': "text",
+                                'custom_emoji': gen_cfg.get("placeholder_emoji") or PLACEHOLDER_EMOJI,
+                            }
+
+                            response, image_state_container = await self._generate_with_heartbeat(
+                                image_model,
+                                [{'role': 'user', 'parts': parts}],
+                                None,
+                                channel,
+                                first_participant,
+                                img_msg_a_id,
+                                app_name=gen_app_name,
+                                app_avatar=gen_app_avatar,
+                                existing_state=image_state_container,
+                            )
                             status = "blocked_by_safety" if not response.candidates else "success"
                             
                             if not response.candidates:
@@ -919,50 +967,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     self.cog.session_last_accessed[channel_id] = time.time()
                     participant_key = (participant['owner_id'], participant['profile_name'])
                     
-                    # [FIX] Dynamically inject missing ChatSession for ephemeral participants
-                    if participant_key not in session['chat_sessions'] or session['chat_sessions'][participant_key] is None:
-                        bot_pid = self.cog.profile_manager._get_pid_from_name_any(participant['owner_id'], participant['profile_name'])
-                        p_index = self.cog.profile_manager._get_user_index(participant['owner_id'])
-                        p_is_b = participant['profile_name'] in p_index.get("borrowed", [])
-                        p_settings_ephemeral = self.cog.profile_manager._get_profile_config(participant['owner_id'], participant['profile_name'], p_is_b) or {}
-                        
-                        p_history = self.cog.session_manager._build_history_for_participant(session.get("unified_log", []), bot_pid, p_settings_ephemeral)
-                        session['chat_sessions'][participant_key] = GoogleGenAIChatSession(history=p_history)
-
-                    chat_session = session['chat_sessions'].get(participant_key)
-
-                    # Safety Check: If session state is corrupted (contains list instead of ChatSession), force re-hydration
-                    if isinstance(chat_session, list) or chat_session is None:
-                        print(f"Detected corrupted session state for {participant_key} in {channel_id}. Attempting repair.")
-                        session['is_hydrated'] = False
-                        session = await self.cog.session_manager._ensure_session_hydrated(channel_id, session.get("type", "multi"))
-                        if session:
-                            chat_session = session['chat_sessions'].get(participant_key)
-                        
-                        if not chat_session or isinstance(chat_session, list):
-                            print(f"Critical: Could not repair session for {participant_key}. Skipping turn.")
-                            continue
-
-                    if session.get("type") == "freewill" and participant_key not in session.get("initial_turn_taken", set()):
-                        initial_history_data = session.get("initial_channel_history", [])
-                        initial_history_content = []
-                        
-                        participant_user_id = None
-                        if participant.get('method') == 'child_bot':
-                            participant_user_id = int(participant['bot_id'])
-                        else: # webhook
-                            participant_user_id = self.cog.bot.user.id
-
-                        for author_id, author_name, timestamp, content in initial_history_data:
-                            role = 'model' if author_id == participant_user_id else 'user'
-                            e_id = _get_user_hash(author_id)
-                            formatted_line = _format_history_entry(author_name, timestamp, content, entity_id=e_id)
-                            content_obj = {'role': role, 'parts': [formatted_line]}
-                            initial_history_content.append(content_obj)
-
-                        chat_session.history = initial_history_content + chat_session.history
-                        session.setdefault("initial_turn_taken", set()).add(participant_key)
-
                     if participant.get('method') == 'child_bot':
                         p_owner_id_typing = participant['owner_id']
                         p_name_typing = participant['profile_name']
@@ -994,12 +998,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # Send the message immediately, bypassing placeholders/typing for this turn
                         await self._send_channel_message(channel, error_message)
 
-                        # Log this system notice in everyone's history
-                        history_line = _format_history_entry("System", datetime.datetime.now(datetime.timezone.utc), error_message)
-                        error_content_obj = {'role': 'user', 'parts': [history_line]}
-                        for other_chat in session['chat_sessions'].values():
-                            if other_chat is not None:
-                                other_chat.history.append(error_content_obj)
                         continue
 
                     user_index = self.cog.profile_manager._get_user_index(owner_id)
@@ -1047,7 +1045,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                         dynamic_context_for_turn = image_gen_prompt
 
-                        ltm_recall_text = await self.cog.memory_manager._get_relevant_ltm_for_prompt(session_key, chat_session.history, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id)
+                        # _get_relevant_ltm_for_prompt uses this only as len(history) for the recall
+                        # cooldown, so unified_log is the direct and more accurate equivalent.
+                        ltm_recall_text = await self.cog.memory_manager._get_relevant_ltm_for_prompt(session_key, session.get("unified_log", []), owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id)
 
                         # [NEW] Check Image Gen intent vs Profile Toggle
                         turn_is_image_gen = False
@@ -1160,7 +1160,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 cache["rounds"] -= 1
                             else:
                                 # Generate fresh constraints
-                                critic_constraints = await self.cog.tools_service._run_critic(chat_session.history, speaker_display_name, channel.guild.id)
+                                # _run_critic scans recent role=='model' turns; contents_for_api_call is
+                                # already the unified_log-derived history for this participant.
+                                critic_constraints = await self.cog.tools_service._run_critic(contents_for_api_call, speaker_display_name, channel.guild.id)
                                 if critic_constraints:
                                     # Store constraints and set to 1 round (current + 1 future)
                                     session["critic_cache"][participant_key] = {"text": critic_constraints, "rounds": 1}
@@ -1570,9 +1572,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         traceback.print_exc()
                         response_text = f"{custom_main}\n\n-# Blocked due to: **Unknown**."
 
-                    # Resolve the chat session for this specific participant to handle persistence
                     participant_key = (participant['owner_id'], participant['profile_name'])
-                    chat_session = session['chat_sessions'].get(participant_key)
 
                     # Inside the participant loop, after response extraction:
                     
@@ -1890,11 +1890,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         
                     await self._dispatch_warnings(channel, participant.get('method', 'webhook'), participant.get('bot_id'), turn_warnings, owner_id, profile_name, session, turn_object)
                     
-                    user_content_obj = {'role': 'user', 'parts': [history_line]}
-                    for key, other_chat_session in session['chat_sessions'].items():
-                        if key != participant_key and other_chat_session is not None:
-                            other_chat_session.history.append(user_content_obj)
-                    
                     # [FIXED] Turn cleanup: release turn-specific buffers without purging the round's generated image
                     if 'contents_for_api_call' in locals():
                         contents_for_api_call.clear()
@@ -1989,24 +1984,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                         except Exception as e:
                                             print(f"Failed to process batched media attachment {attachment.filename}: {e}")
 
-                                    # [NEW] Conditional Injection into Chat Sessions
-                                    for p_key, inner_chat_session in session['chat_sessions'].items():
-                                        if inner_chat_session is None: continue
-                                        p_owner_id_b, p_name_b = p_key
-                                        p_index_b = self.cog.profile_manager._get_user_index(p_owner_id_b)
-                                        p_is_b_b = p_name_b in p_index_b.get("borrowed", [])
-                                        p_settings_b = self.cog.profile_manager._get_profile_config(p_owner_id_b, p_name_b, p_is_b_b) or {}
-                                        
-                                        final_parts = [user_line]
-                                        if url_text_batch and p_settings_b.get("url_fetching_enabled", False):
-                                            final_parts.append(f"\n<document_context>\n{url_text_batch}\n</document_context>")
-                                        
-                                        final_parts.extend(url_media_batch)
-                                        final_parts.extend(batch_msg_media)
-                                        
-                                        new_content_obj = {'role': 'user', 'parts': final_parts}
-                                        inner_chat_session.history.append(new_content_obj)
-
                                     if trigger.author.id in self.cog.debug_users:
                                         try:
                                             user_to_dm = self.cog.bot.get_user(trigger.author.id)
@@ -2037,9 +2014,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                             all_triggers_for_round.extend(batched_triggers)
                     
-                    # Force garbage collection to clear image buffers from this turn.
-                    # Offloaded to a thread so the collection pass doesn't stall the event loop.
-                    await asyncio.to_thread(gc.collect)
+                    # No forced gc.collect() here. It ran once per participant per round and
+                    # cost ~11 ms of pure GIL-held CPU on a warm heap (worse on the e2-micro),
+                    # stalling Discord heartbeats; asyncio.to_thread does not avoid that, since
+                    # a collection holds the GIL regardless of which thread calls it. Image
+                    # buffers are freed by refcounting the moment the last reference drops, so
+                    # the pass only ever reclaimed reference cycles the automatic collector
+                    # would have caught anyway.
 
                 await self.cog.session_manager._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
 
@@ -2091,11 +2072,28 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         context_size = p_settings.get("ltm_summarization_context", 10)
               
                         if participant['ltm_counter'] >= interval:
-                            history_source_obj = next(iter(session['chat_sessions'].values()), None)
-                            if history_source_obj and len(history_source_obj.history) >= 2:
+                            # Derived per participant from unified_log. This previously read
+                            # next(iter(session['chat_sessions'].values())) — whichever participant
+                            # happened to be first in dict order — so in a multi-profile session
+                            # every profile's long-term memory was written from another profile's
+                            # view of the conversation, private turns included.
+                            #
+                            # The STM floor keeps the summarisation window governed by
+                            # ltm_summarization_context rather than by this profile's STM length,
+                            # which is what the old unbounded shadow history effectively did.
+                            ltm_p_settings = dict(p_settings)
+                            ltm_p_settings["stm_length"] = max(
+                                int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)),
+                                context_size * 2,
+                            )
+                            ltm_bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
+                            ltm_history = self.cog.session_manager._build_history_for_participant(
+                                session.get("unified_log", []), ltm_bot_pid, ltm_p_settings, len(profile_order) or 1
+                            )
+                            if len(ltm_history) >= 2:
                                 # Turn history is consolidated
                                 events_for_summary = []
-                                for turn in history_source_obj.history[-context_size:]:
+                                for turn in ltm_history[-context_size:]:
                                     parts = turn.get('parts', [])
                                     if parts:
                                         text_val = "\n".join(p if isinstance(p, str) else p.get('text', '') for p in parts)
@@ -2138,23 +2136,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 # Ensures the transcript is saved immediately after the last participant speaks.
                 dummy_session_key = (channel_id, None, None)
                 await self.cog.session_manager._save_session_to_disk(dummy_session_key, session_type, session.get("unified_log", []))
-
-                # Rebuild all participant histories from the trimmed unified log to ensure consistency.
-                trimmed_unified_log = session.get("unified_log", [])
-
-                for p_data in session["profiles"]:
-                    p_key = (p_data['owner_id'], p_data['profile_name'])
-                    bot_pid = self.cog.profile_manager._get_pid_from_name_any(p_data['owner_id'], p_data['profile_name'])
-                    
-                    p_index = self.cog.profile_manager._get_user_index(p_data['owner_id'])
-                    p_is_borrowed = p_data['profile_name'] in p_index.get("borrowed",[])
-                    p_profile_settings = self.cog.profile_manager._get_profile_config(p_data['owner_id'], p_data['profile_name'], p_is_borrowed) or {}
-                    stm_length = int(p_profile_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
-
-                    history_slice = trimmed_unified_log[-stm_length:] if stm_length > 0 else []
-                    
-                    participant_history = self.cog.session_manager._build_history_for_participant(history_slice, bot_pid, p_profile_settings)
-                    session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 
             except asyncio.CancelledError:
                 break

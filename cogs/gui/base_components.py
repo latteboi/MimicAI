@@ -93,7 +93,6 @@ class ConfigModal(ui.Modal):
                 keys_to_clear = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and len(k) == 3 and k[1] == uid and k[2] == self.profile_name]
                 for k in keys_to_clear:
                     self.cog.channel_models.pop(k, None)
-                    self.cog.chat_sessions.pop(k, None)
                     self.cog.channel_model_last_profile_key.pop(k, None)
 
         if prompt_updates and not self.is_borrowed:

@@ -40,10 +40,14 @@ class WhisperMixin:
         if not session.get("is_hydrated"):
             session = await self.cog.session_manager._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi"))
 
-        chat_session = session.get("chat_sessions", {}).get(participant_key)
-        if not chat_session:
-            await interaction.followup.send("An error occurred: Could not find the chat session for that participant.", ephemeral=True)
+        participant_keys = {(p['owner_id'], p['profile_name']) for p in session.get("profiles", [])}
+        if participant_key not in participant_keys:
+            await interaction.followup.send("An error occurred: Could not find that participant in this session.", ephemeral=True)
             return
+
+        user_index = self.cog.profile_manager._get_user_index(owner_id)
+        is_borrowed = profile_name in user_index.get("borrowed", [])
+        p_settings = self.cog.profile_manager._get_profile_config(owner_id, profile_name, is_borrowed) or {}
 
         # Get model and settings for the target profile
         model, _, temp, top_p, top_k, _, fallback_model_name = await self.cog.api_service._get_or_create_model_for_channel(
@@ -60,8 +64,14 @@ class WhisperMixin:
 
         api_whisper_prompt = self.cog.global_prompts.get("WHISPER_INJECTION", DEFAULT_WHISPER_INJECTION).format(whisper_content=whisper_content.strip())
 
-        import copy
-        contents_for_api_call = copy.deepcopy(chat_session.history)
+        # Derived from unified_log, the single source of truth, rather than a shadow copy
+        # maintained by incremental appends. _build_history_for_participant already rewrites
+        # this participant's own whispers and private responses into their XML tags, and
+        # hides other participants' — so the privacy boundary is enforced in one place.
+        bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
+        contents_for_api_call = self.cog.session_manager._build_history_for_participant(
+            session.get("unified_log", []), bot_pid, p_settings
+        )
 
         # Ensure alternating roles by appending to the last user turn if present
         if contents_for_api_call and contents_for_api_call[-1].get('role', 'user') == 'user':
@@ -81,9 +91,6 @@ class WhisperMixin:
         # Resolve appearance and identity for placeholder
         effective_owner_id, effective_profile_name = self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)
 
-        user_index = self.cog.profile_manager._get_user_index(owner_id)
-        is_borrowed = profile_name in user_index.get("borrowed", [])
-        p_settings = self.cog.profile_manager._get_profile_config(owner_id, profile_name, is_borrowed) or {}
         custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
 
         display_name = effective_profile_name
@@ -209,15 +216,9 @@ class WhisperMixin:
 
         session.setdefault("unified_log", []).append(resp_log)
 
-        # [FIXED] Add to the target's in-memory history WRAPPED in XML tags so the AI knows it is private
-        header_w, body_w = whisper_content.split('\n', 1)
-        wrapped_whisper = f"{header_w}\n<private_whisper>\n{body_w.strip()}\n</private_whisper>\n"
-        chat_session.history.append({'role': 'user', 'parts': [wrapped_whisper]})
-
-        header_r, body_r = response_content.split('\n', 1)
-        wrapped_response = f"{header_r}\n<private_response>\n{body_r.strip()}\n</private_response>\n"
-        model_obj = {'role': 'model', 'parts': [wrapped_response]}
-        chat_session.history.append(model_obj)
+        # Both turns are already in unified_log above; _build_history_for_participant
+        # wraps them in <private_whisper> / <private_response> when it derives this
+        # participant's history, so there is no second copy to maintain here.
 
         # Add to pending whispers to be injected into the next public turn
         session.setdefault("pending_whispers", {}).setdefault(participant_key, []).append(whisper_content)

@@ -1,6 +1,5 @@
 from .utils.constants import *
-from google import genai
-from .services.api_service import OpenRouterModel, OllamaModel, GoogleGenAIModel, GoogleGenAIChatSession
+from .services.api_service import OpenRouterModel, OllamaModel, GoogleGenAIModel
 from .listeners.event_listeners import EventListeners
 from .gui.base_components import (
     build_pagination_controls, ConfigModal, ActionTextInputModal,
@@ -179,10 +178,12 @@ class MimicCog(commands.Cog, EventListeners):
         self.child_bots_by_owner_profile: Dict[Tuple[int, str], str] = {}
         self.child_bot_manager._load_child_bots()
 
-        self.channel_models: Dict[Any, Tuple[genai.GenerativeModel, bool, str]] = {} 
-        self.channel_model_last_profile_key: Dict[Any, Tuple[Optional[int], str]] = {} 
+        # LRU rather than plain dicts: keyed by (channel_id, owner_id, profile_name), these
+        # otherwise grow for the life of the process. The two are written together and read
+        # together; if they fall out of step the worst case is a miss, which rebuilds.
+        self.channel_models: LRUCache = LRUCache(max_size=CHANNEL_MODEL_CACHE_MAX_SIZE)
+        self.channel_model_last_profile_key: LRUCache = LRUCache(max_size=CHANNEL_MODEL_CACHE_MAX_SIZE)
 
-        self.chat_sessions: LRUCache = LRUCache(max_size=CHAT_SESSION_CACHE_MAX_SIZE)
         self.max_history_items = defaultConfig.CHATBOT_MEMORY_LENGTH
         
         self.model_override_warnings_sent: Set[Tuple[int, int, str]] = set()
@@ -275,17 +276,11 @@ class MimicCog(commands.Cog, EventListeners):
             return
 
         current_count = len(index.get("personal", []))
-        is_premium = self.profile_manager.is_user_premium(interaction.user.id)
-        limit = defaultConfig.LIMIT_PROFILES_PREMIUM if is_premium else defaultConfig.LIMIT_PROFILES_FREE
-        
+        limit = defaultConfig.LIMIT_PROFILES
+
         if current_count >= limit:
-            msg = f"**Limit Reached.**\n\n"
-            if is_premium:
-                msg += f"You have reached the maximum of **{limit}** profiles allowed for Premium users."
-            else:
-                msg += f"Free tier is limited to **{limit}** personal profiles. You currently have **{current_count}**.\nUpgrade to Premium via `/subscription` to increase this limit to **{defaultConfig.LIMIT_PROFILES_PREMIUM}**."
-            
-            await interaction.followup.send(msg, ephemeral=True)
+            await interaction.followup.send(
+                f"**Limit Reached.**\n\nYou have reached the maximum of **{limit}** profiles.", ephemeral=True)
             return
 
         new_profile = self.profile_manager._get_or_create_user_profile(interaction.user.id, profile_name)
@@ -320,12 +315,10 @@ class MimicCog(commands.Cog, EventListeners):
             await interaction.followup.send(f"A profile with the name '{profile_name}' already exists.", ephemeral=True)
             return
 
-        is_premium = self.profile_manager.is_user_premium(interaction.user.id)
-        limit = defaultConfig.LIMIT_PROFILES_PREMIUM if is_premium else defaultConfig.LIMIT_PROFILES_FREE
-        
+        limit = defaultConfig.LIMIT_PROFILES
+
         if len(index.get("personal", [])) >= limit:
-            tier_name = "Premium" if is_premium else "Free"
-            await interaction.followup.send(f"You have reached the maximum of {limit} personal profiles ({tier_name} tier).", ephemeral=True)
+            await interaction.followup.send(f"You have reached the maximum of {limit} personal profiles.", ephemeral=True)
             return
 
         api_key = self.storage_manager._get_api_key_for_user(interaction.user.id)
@@ -609,7 +602,7 @@ class MimicCog(commands.Cog, EventListeners):
                 # Wake it up as a dehydrated shell
                 session = {
                     "type": "multi", "profiles": session_config.get("profiles", []),
-                    "chat_sessions": {}, "unified_log": [], "is_hydrated": False,
+                    "unified_log": [], "is_hydrated": False,
                     "owner_id": session_config.get("owner_id", interaction.user.id),
                     "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
                     "session_prompt": session_config.get("session_prompt"),
@@ -621,7 +614,7 @@ class MimicCog(commands.Cog, EventListeners):
                 # Blank session
                 session = {
                     "type": "multi", "profiles": [],
-                    "chat_sessions": {}, "unified_log": [], "is_hydrated": False,
+                    "unified_log": [], "is_hydrated": False,
                     "owner_id": interaction.user.id,
                     "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
                     "session_prompt": None, "session_mode": "sequential",
@@ -687,7 +680,6 @@ class MimicCog(commands.Cog, EventListeners):
                 return
             
             removed_participant = session["profiles"].pop(slot - 1)
-            session["chat_sessions"].pop((removed_participant['owner_id'], removed_participant['profile_name']), None)
             
             # If removing a child bot, send update
             if removed_participant.get('method') == 'child_bot':
@@ -753,9 +745,8 @@ class MimicCog(commands.Cog, EventListeners):
 
             # Create new session if none exists
             if not session:
-                chat_sessions = {(interaction.user.id, profile_name): None}
                 session = {
-                    "type": "multi", "profiles": [new_participant], "chat_sessions": chat_sessions,
+                    "type": "multi", "profiles": [new_participant],
                     "unified_log": [], "is_hydrated": False, "last_bot_message_id": None,
                     "owner_id": interaction.user.id, "is_running": False,
                     "task_queue": asyncio.Queue(),
@@ -763,9 +754,6 @@ class MimicCog(commands.Cog, EventListeners):
                     "session_mode": "sequential", "pending_image_gen_data": None, "pending_whispers": {}
                 }
                 self.multi_profile_channels[interaction.channel_id] = session
-                
-                # Hydrate immediately for the single participant logic below
-                session["chat_sessions"][(interaction.user.id, profile_name)] = GoogleGenAIChatSession(history=[])
                 session["is_hydrated"] = True
                 
                 if method == "child_bot":
@@ -819,9 +807,6 @@ class MimicCog(commands.Cog, EventListeners):
 
             # Handle Child Bot Updates (Remove Old)
             if old_participant_to_remove:
-                # Remove old chat session from memory
-                session["chat_sessions"].pop((old_participant_to_remove['owner_id'], old_participant_to_remove['profile_name']), None)
-                
                 if old_participant_to_remove.get('method') == 'child_bot':
                     old_bot_id = old_participant_to_remove.get('bot_id')
                     if old_bot_id:
@@ -833,19 +818,6 @@ class MimicCog(commands.Cog, EventListeners):
                             "action": "send_to_child", "bot_id": old_bot_id,
                             "payload": {"action": "stop_typing", "channel_id": interaction.channel_id}
                         })
-
-            # Initialize chat session for new participant
-            new_participant_key = (new_participant['owner_id'], new_participant['profile_name'])
-            
-            # Rebuild history from unified log for the new participant
-            participant_history = []
-            if session.get("is_hydrated"):
-                for turn in session.get("unified_log", []):
-                    speaker_key = tuple(turn.get("speaker_key", []))
-                    role = 'model' if speaker_key == new_participant_key else 'user'
-                    participant_history.append({'role': role, 'parts': [turn.get("content")]})
-            
-            session["chat_sessions"][new_participant_key] = GoogleGenAIChatSession(history=participant_history)
 
             self.session_manager._save_multi_profile_sessions()
             await interaction.followup.send(action_description, ephemeral=True)
@@ -980,9 +952,6 @@ class MimicCog(commands.Cog, EventListeners):
         dummy_session_key = (ch_id, None, None)
         await self.session_manager._delete_session_from_disk(dummy_session_key, session_type)
 
-        for p_key in session["chat_sessions"].keys():
-            session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=[])
-        
         # [NEW] Reset counters for all participants
         for p in session.get('profiles', []):
             p['ltm_counter'] = 0
@@ -991,9 +960,8 @@ class MimicCog(commands.Cog, EventListeners):
             self.message_counters_for_ltm.pop(ltm_counter_key, None)
         
         # [NEW] Reset LTM recall history (penalty system) for this channel
-        for p_key in session.get("chat_sessions", {}).keys():
-            owner_id, profile_name = p_key
-            full_session_key = (ch_id, owner_id, profile_name)
+        for p in session.get("profiles", []):
+            full_session_key = (ch_id, p['owner_id'], p['profile_name'])
             self.ltm_recall_history.pop(full_session_key, None)
 
         session['is_hydrated'] = True
@@ -1193,9 +1161,8 @@ class MimicCog(commands.Cog, EventListeners):
                         dummy_session_key = (interaction.channel_id, None, None)
                         if is_effectively_empty:
                             await self.session_manager._delete_session_from_disk(dummy_session_key, session_type)
-                            for p_key in session.get("chat_sessions", {}).keys():
-                                owner_id, profile_name = p_key
-                                full_session_key = (interaction.channel_id, owner_id, profile_name)
+                            for p in session.get("profiles", []):
+                                full_session_key = (interaction.channel_id, p['owner_id'], p['profile_name'])
                                 self.ltm_recall_history.pop(full_session_key, None)
                         else:
                             await self.session_manager._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
@@ -1366,8 +1333,7 @@ class MimicCog(commands.Cog, EventListeners):
         if not session_data:
             session_data = await self.session_manager._load_session_from_disk(model_cache_key, 'global_chat')
             if not session_data:
-                chat = GoogleGenAIChatSession(history=[])
-                session_data = {'chat_session': chat, 'unified_log': []}
+                session_data = {'unified_log': []}
             self.global_chat_sessions[model_cache_key] = session_data
 
         view = GlobalChatPlayView(self, interaction, user_id, profile_name_lower)
@@ -1583,9 +1549,8 @@ class MimicCog(commands.Cog, EventListeners):
             }
             
             if not session:
-                chat_sessions = {(owner_id, "mimicguide"): None}
                 session = {
-                    "type": "multi", "profiles": [participant], "chat_sessions": chat_sessions,
+                    "type": "multi", "profiles": [participant],
                     "unified_log": [], "is_hydrated": False, "owner_id": interaction.user.id, "is_running": False,
                     "task_queue": asyncio.Queue(), "worker_task": None, "session_mode": "sequential"
                 }
@@ -1599,8 +1564,7 @@ class MimicCog(commands.Cog, EventListeners):
                         break
                 
                 if participant_index != -1:
-                    removed_p = session['profiles'].pop(participant_index)
-                    session['chat_sessions'].pop((removed_p['owner_id'], removed_p['profile_name']), None)
+                    session['profiles'].pop(participant_index)
                     result_msg = "MimicGuide departed the Chat Session."
                     if not session['profiles']:
                         self.multi_profile_channels.pop(interaction.channel_id, None)
@@ -1609,7 +1573,6 @@ class MimicCog(commands.Cog, EventListeners):
                         await interaction.followup.send("The session is full (200 max).", ephemeral=True)
                         return
                     session['profiles'].append(participant)
-                    session['chat_sessions'][(owner_id, "mimicguide")] = None
                     result_msg = "MimicGuide joined the Chat Session."
             
             self.session_manager._save_multi_profile_sessions()
@@ -1721,7 +1684,7 @@ class MimicCog(commands.Cog, EventListeners):
                     model_name_str = f"OLLAMA/{model_used.model_name}"
                 elif class_name == "OpenRouterModel":
                     model_name_str = f"OPENROUTER/{model_used.model_name}"
-                elif class_name == "GoogleGenAIModel":
+                elif class_name in ("GoogleSDKModel", "GoogleRESTModel"):
                     model_name_str = f"GOOGLE/{model_used.model_name}"
                     is_google = True
                 elif hasattr(model_used, "model_name"):

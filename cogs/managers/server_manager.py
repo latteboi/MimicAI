@@ -21,6 +21,7 @@ class ServerManager:
 
     def __init__(self, cog):
         self.cog = cog
+        self._webhook_from_cache = {}
 
     def _load_global_prompts(self):
         self.cog.global_prompts = {}
@@ -78,6 +79,9 @@ class ServerManager:
 
     def _load_channel_webhooks(self):
         self.cog.channel_webhooks = {}
+        # Webhook objects rebuilt from cached URLs, so from_url runs once per channel
+        # rather than once per message. Reset whenever the URL map is reloaded.
+        self._webhook_from_cache = {}
         servers_dir = self.cog.SERVERS_DIR
         if not os.path.isdir(servers_dir):
             return
@@ -169,23 +173,30 @@ class ServerManager:
             return None
             
         try:
-            # Check cached webhooks first
-            if parent_channel.id in self.cog.channel_webhooks:
-                try:
-                    webhooks = await parent_channel.webhooks()
-                    bot_webhook = next((wh for wh in webhooks if wh.user and wh.user.id == self.cog.bot.user.id), None)
-                    if bot_webhook:
-                        return bot_webhook
-                except Exception:
-                    pass
+            # Rebuild from the cached URL. Both branches used to call parent_channel.webhooks()
+            # — a REST round trip — so the cache never actually saved anything; it stored a URL
+            # nothing read. Webhook.from_url sends no request, which takes that round trip off
+            # the front of every placeholder and every webhook message.
+            cached = self.cog.channel_webhooks.get(parent_channel.id)
+            if cached and cached.get('url'):
+                cached_wh = getattr(self, '_webhook_from_cache', {}).get(parent_channel.id)
+                if cached_wh is None:
+                    try:
+                        cached_wh = discord.Webhook.from_url(cached['url'], client=self.cog.bot)
+                        self._webhook_from_cache.setdefault(parent_channel.id, cached_wh)
+                    except Exception:
+                        cached_wh = None
+                if cached_wh is not None:
+                    return cached_wh
 
-            # If not cached or cached lookup failed, fetch or create a new webhook
+            # No usable cache entry: fetch or create, which does cost a round trip.
             webhooks = await parent_channel.webhooks()
             bot_webhook = next((wh for wh in webhooks if wh.user and wh.user.id == self.cog.bot.user.id), None)
             if not bot_webhook:
                 bot_webhook = await parent_channel.create_webhook(name=f"{self.cog.bot.user.name} Webhook", reason="For custom appearances")
             
             self.cog.channel_webhooks[parent_channel.id] = {'url': bot_webhook.url}
+            self._webhook_from_cache[parent_channel.id] = bot_webhook
             self._save_channel_webhooks()
             return bot_webhook
         except Exception as e:

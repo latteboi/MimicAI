@@ -59,15 +59,13 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
         borrowed_field = index.get("borrowed", {})
         current_borrowed = len(borrowed_field) if isinstance(borrowed_field, dict) else len(borrowed_field)
         
-        is_premium = self.cog.profile_manager.is_user_premium(interaction.user.id)
-        limit = defaultConfig.LIMIT_BORROWED_PREMIUM if is_premium else defaultConfig.LIMIT_BORROWED_FREE
+        limit = defaultConfig.LIMIT_BORROWED
 
         if current_borrowed + len(names_to_borrow) > limit:
-            tier_name = "Premium" if is_premium else "Free"
             await interaction.followup.send(
                 f"**Limit Reached.**\n"
-                f"Redeeming this code would put you at {current_borrowed + len(names_to_borrow)}/{limit} borrowed profiles ({tier_name} Tier).\n"
-                f"Please delete some profiles or upgrade to Premium.", 
+                f"Redeeming this code would put you at {current_borrowed + len(names_to_borrow)}/{limit} borrowed profiles.\n"
+                f"Please delete some profiles first.",
                 ephemeral=True
             )
             return
@@ -530,7 +528,7 @@ class HubIncomingView(HubBaseView):
         sharer_id = self.selected_sharer_id
         shares = [s for s in self.cog.profile_shares.get(str(self.user_id), []) if s['sharer_id'] == sharer_id]
         
-        limit = defaultConfig.LIMIT_BORROWED_PREMIUM if self.cog.profile_manager.is_user_premium(self.user_id) else defaultConfig.LIMIT_BORROWED_FREE
+        limit = defaultConfig.LIMIT_BORROWED
         index = self.cog.profile_manager._get_user_index(self.user_id)
         
         borrowed_field = index.get("borrowed", {})
@@ -806,13 +804,6 @@ class HubShareManagerView(HubBaseView):
         to_publish = target_set - current_public_set
         to_unpublish = current_public_set - target_set
         
-        if to_publish and not self.cog.profile_manager.is_user_premium(self.user_id):
-            self.processing = False
-            self.setup_items()
-            await self.update_display()
-            await i.followup.send("Adding new profiles to the public library is a Premium feature.", ephemeral=True)
-            return
-
         published_list = []
         failed_list = {}
 
@@ -1011,7 +1002,7 @@ class RedeemCloneCodeModal(ui.Modal, title="Redeem Clone Code"):
             await interaction.followup.send("A profile with that name already exists.", ephemeral=True)
             return
 
-        limit = defaultConfig.LIMIT_PROFILES_PREMIUM if self.cog.profile_manager.is_user_premium(interaction.user.id) else defaultConfig.LIMIT_PROFILES_FREE
+        limit = defaultConfig.LIMIT_PROFILES
         if len(index.get("personal", [])) >= limit:
             await interaction.followup.send(f"You have reached your personal profile limit of {limit}.", ephemeral=True)
             return

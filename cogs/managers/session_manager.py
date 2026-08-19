@@ -17,7 +17,7 @@ import orjson as json
 
 from ..utils.constants import (
     USERS_DIR, SERVERS_DIR, SESSIONS_GLOBAL_DIR, defaultConfig,
-    PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, GoogleGenAIChatSession,
+    PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
 )
 from .storage_manager import IOManager, _delete_file_shard
 
@@ -56,7 +56,7 @@ class SessionManager:
         # All other session types use a unified log
         return dir_path / "session_log.json.gz"
 
-    async def _save_session_to_disk(self, session_key: Any, session_type: str, session_data: Union[GoogleGenAIChatSession, List[Dict], Dict]):
+    async def _save_session_to_disk(self, session_key: Any, session_type: str, session_data: Union[List[Dict], Dict]):
         if not session_data:
             await self._delete_session_from_disk(session_key, session_type)
             return
@@ -116,7 +116,7 @@ class SessionManager:
         except Exception as e:
             print(f"Error saving session for key {session_key}: {e}")
 
-    async def _load_session_from_disk(self, session_key: Any, session_type: str) -> Optional[Union[GoogleGenAIChatSession, List[Dict], Dict]]:
+    async def _load_session_from_disk(self, session_key: Any, session_type: str) -> Optional[Union[List[Dict], Dict]]:
         try:
             path = self._get_session_path(session_key, session_type)
             if not path.exists():
@@ -154,21 +154,10 @@ class SessionManager:
                         }
                         unified_log.append(log_item)
 
-                    history = []
-                    for t in unified_log:
-                        obj = {'role': t['role'], 'parts': [t['content']]}
-                        history.append(obj)
-                    chat_session = GoogleGenAIChatSession(history=history)
-
-                    return {'chat_session': chat_session, 'unified_log': unified_log}
+                    return {'unified_log': unified_log}
 
                 elif data and isinstance(data, list) and 'turn_id' in data[0]:
-                    history = []
-                    for t in data:
-                        obj = {'role': t['role'], 'parts': [t['content']]}
-                        history.append(obj)
-                    chat_session = GoogleGenAIChatSession(history=history)
-                    return {'chat_session': chat_session, 'unified_log': data}
+                    return {'unified_log': data}
 
                 return None
 
@@ -265,14 +254,8 @@ class SessionManager:
                     if not owner_id or not profiles_data:
                         continue
 
-                    chat_sessions = {}
-                    for p_data in profiles_data:
-                        p_key = (p_data['owner_id'], p_data['profile_name'])
-                        chat_sessions[p_key] = None
-
                     self.cog.multi_profile_channels[channel_id] = {
                         "profiles": profiles_data,
-                        "chat_sessions": chat_sessions,
                         "is_hydrated": False,
                         "last_bot_message_id": None,
                         "owner_id": owner_id,
@@ -453,11 +436,18 @@ class SessionManager:
             warning_key_to_clear = (user_id, interaction_for_feedback.guild.id, old_profile_name)
             self.cog.model_override_warnings_sent.discard(warning_key_to_clear)
 
-        model_cache_key = (channel_id, user_id)
-
-        if model_cache_key in self.cog.channel_models: del self.cog.channel_models[model_cache_key]
-        if model_cache_key in self.cog.chat_sessions: self.cog.chat_sessions.pop(model_cache_key, None)
-        self.cog.channel_model_last_profile_key.pop(model_cache_key, None)
+        # channel_models is keyed (channel_id, profile_owner_id, profile_name) — see
+        # APIService.get_or_create_model. This used to build a 2-tuple, so all three
+        # evictions silently matched nothing and a profile switch left the previous
+        # profile's model cached. Drop every entry for this (channel, user) pair, which
+        # covers both the old and the new profile name.
+        stale_keys = [
+            k for k in self.cog.channel_models
+            if isinstance(k, tuple) and len(k) == 3 and k[0] == channel_id and k[1] == user_id
+        ]
+        for k in stale_keys:
+            self.cog.channel_models.pop(k, None)
+            self.cog.channel_model_last_profile_key.pop(k, None)
 
         if interaction_for_feedback:
             channel_mention = f"<#{channel_id}>" if interaction_for_feedback.guild else "this DM"
@@ -504,9 +494,6 @@ class SessionManager:
                     valid_profiles.append(p)
                 else:
                     cleaned_any = True
-                    p_key = (p_owner_id, p_name)
-                    if "chat_sessions" in session:
-                        session["chat_sessions"].pop(p_key, None)
                     if p.get("method") == "child_bot" and p.get("bot_id"):
                         await self.cog.manager_queue.put({
                             "action": "send_to_child", "bot_id": p["bot_id"],
@@ -590,19 +577,10 @@ class SessionManager:
         # 3. Synchronise Memory for all current participants
         num_participants = len(session.get("profiles", []))
         session["pending_whispers"] = {}
-        session.setdefault("chat_sessions", {})
 
         for p_data in session["profiles"]:
             p_key = (p_data['owner_id'], p_data['profile_name'])
             bot_pid = self.cog.profile_manager._get_pid_from_name_any(p_data['owner_id'], p_data['profile_name'])
-
-            # [FIX] Fully hydrate the ChatSession object here so speak/whisper don't crash
-            p_index = self.cog.profile_manager._get_user_index(p_data['owner_id'])
-            p_is_b = p_data['profile_name'] in p_index.get("borrowed", [])
-            p_settings = self.cog.profile_manager._get_profile_config(p_data['owner_id'], p_data['profile_name'], p_is_b) or {}
-            
-            participant_history = self._build_history_for_participant(unified_log, bot_pid, p_settings)
-            session["chat_sessions"][p_key] = GoogleGenAIChatSession(history=participant_history)
 
             pending = self._get_pending_whispers_for_participant(unified_log, bot_pid)
             if pending:
@@ -657,9 +635,6 @@ class SessionManager:
                     # Clear the large data structures from the in-memory dictionary.
                     if 'unified_log' in session_to_evict:
                         del session_to_evict['unified_log']
-                    if 'chat_sessions' in session_to_evict:
-                        session_to_evict['chat_sessions'].clear()
-
                     # Clean up LTM recall history for participants in this channel to prevent RAM leak
                     for p in session_to_evict.get("profiles", []):
                         full_key = (key, p.get("owner_id"), p.get("profile_name"))
@@ -787,30 +762,12 @@ class SessionManager:
             if not session.get("is_hydrated"):
                 session = await self._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi"))
 
-            existing_keys = set(session.get("chat_sessions", {}).keys())
-            new_keys = { (p['owner_id'], p['profile_name']) for p in participants }
-            
-            for key_to_add in new_keys - existing_keys:
-                bot_pid = self.cog.profile_manager._get_pid_from_name_any(key_to_add[0], key_to_add[1])
-                p_index = self.cog.profile_manager._get_user_index(key_to_add[0])
-                p_is_b = key_to_add[1] in p_index.get("borrowed", [])
-                p_settings = self.cog.profile_manager._get_profile_config(key_to_add[0], key_to_add[1], p_is_b) or {}
-                
-                participant_history = self._build_history_for_participant(session.get("unified_log", []), bot_pid, p_settings)
-                session["chat_sessions"][key_to_add] = GoogleGenAIChatSession(history=participant_history)
-
-            for key_to_remove in existing_keys - new_keys:
-                session["chat_sessions"].pop(key_to_remove, None)
         else:
-            # [FIX] Initialize with empty ChatSessions instead of None
-            chat_sessions = {}
             for p in participants:
                 p['ltm_counter'] = 0
-                chat_sessions[(p['owner_id'], p['profile_name'])] = GoogleGenAIChatSession(history=[])
 
             session = {
                 "type": "multi",
-                "chat_sessions": chat_sessions,
                 "unified_log": [],
                 "is_hydrated": False,
                 "last_bot_message_id": None,

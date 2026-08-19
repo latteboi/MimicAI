@@ -35,7 +35,7 @@ class ProfileManager:
     """Owns profile CRUD, personal/borrowed inheritance resolution, share codes, and cloning logic.
 
     Holds a back-reference to the parent cog for state/logic not yet migrated
-    (fernet, is_user_premium, the generic shard system, and shared instance caches),
+    (fernet, the generic shard system, and shared instance caches),
     per the transitional Dependency Injection pattern in CLAUDE.md.
     """
 
@@ -319,8 +319,7 @@ class ProfileManager:
 
     def _duplicate_profile(self, user_id: int, source_name: str, target_name: str) -> Tuple[bool, str]:
         user_index = self._get_user_index(user_id)
-        limit = defaultConfig.LIMIT_PROFILES_PREMIUM if self.is_user_premium(user_id) else defaultConfig.LIMIT_PROFILES_FREE
-        if len(user_index.get("personal", {})) >= limit:
+        if len(user_index.get("personal", {})) >= defaultConfig.LIMIT_PROFILES:
             return False, "Limit reached."
 
         source_pid = self._get_pid_from_name_any(user_id, source_name)
@@ -520,10 +519,7 @@ class ProfileManager:
         index = self._get_user_index(user_id)
 
         if profile_name not in index.get("personal", []):
-            is_premium = self.is_user_premium(user_id)
-            limit = defaultConfig.LIMIT_PROFILES_PREMIUM if is_premium else defaultConfig.LIMIT_PROFILES_FREE
-
-            if len(index.get("personal", [])) >= limit:
+            if len(index.get("personal", [])) >= defaultConfig.LIMIT_PROFILES:
                 return None
 
             if isinstance(index.get("personal"), dict):
@@ -1168,17 +1164,6 @@ class ProfileManager:
 
         await interaction.followup.send("Account Deleted. All your profiles, memories, and settings have been permanently erased from this instance.", ephemeral=True)
 
-    def is_user_premium(self, user_id: int) -> bool:
-        """
-        Determines if a user has premium privileges.
-        In self-hosted mode, the instance owner is always premium.
-        The ALL_USERS_PREMIUM flag can be used to unlock features for everyone.
-        """
-        is_owner = user_id == int(defaultConfig.DISCORD_OWNER_ID)
-        allow_all = getattr(defaultConfig, "ALL_USERS_PREMIUM", True)
-        return is_owner or allow_all
-    
-
     def _generate_unique_local_name(self, user_id: int, original_name: str, sharer_name: str) -> str:
         index = self._get_user_index(user_id)
         all_profile_names = set(index.get("personal", [])) | set(index.get("borrowed", []))
@@ -1504,7 +1489,6 @@ class ProfileManager:
 
     def _invalidate_channel_model_cache(self, key: Tuple[int, int]):
         if key in self.cog.channel_models: del self.cog.channel_models[key]
-        if key in self.cog.chat_sessions: self.cog.chat_sessions.pop(key, None)
         self.cog.channel_model_last_profile_key.pop(key, None)
 
     async def update_profile_advanced_params(self, user_id: int, profile_name: str, params: Dict[str, Any], channel_id_context: int, is_borrowed: bool) -> bool:
@@ -1681,11 +1665,9 @@ class ProfileManager:
             return
         current_name, owner_profile_data, index, current_borrowed = prep
 
-        limit = defaultConfig.LIMIT_BORROWED_PREMIUM if self.is_user_premium(interaction.user.id) else defaultConfig.LIMIT_BORROWED_FREE
-
+        limit = defaultConfig.LIMIT_BORROWED
         if current_borrowed >= limit:
-            tier_name = "Premium" if self.is_user_premium(interaction.user.id) else "Free"
-            await interaction.followup.send(f"Limit Reached. You have {current_borrowed}/{limit} borrowed profiles ({tier_name} Tier).", ephemeral=True)
+            await interaction.followup.send(f"Limit Reached. You have {current_borrowed}/{limit} borrowed profiles.", ephemeral=True)
             return
 
         def _sync_save():
@@ -1800,8 +1782,7 @@ class ProfileManager:
                 return False, "Source profile data no longer exists."
 
             index = self._get_user_index(recipient_id)
-            limit = defaultConfig.LIMIT_PROFILES_PREMIUM if self.is_user_premium(recipient_id) else defaultConfig.LIMIT_PROFILES_FREE
-            if len(index.get("personal", [])) >= limit:
+            if len(index.get("personal", [])) >= defaultConfig.LIMIT_PROFILES:
                 return False, "You have reached your personal profile limit."
 
             new_pid = f"A{uuid.uuid4().hex[:15].upper()}"

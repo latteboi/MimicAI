@@ -16,7 +16,7 @@ from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_history_entry,
     _get_user_hash, _scrub_response_text,
 )
-from ..api_service import GoogleGenAIModel, GoogleGenAIChatSession, OllamaModel, OpenRouterModel
+from ..api_service import GoogleGenAIModel, OllamaModel, OpenRouterModel
 from ._shared import _resolve_safety_settings, _strip_neuro_update_and_scrub
 
 
@@ -81,23 +81,15 @@ class GlobalChatMixin:
                 session_data = await self.cog.session_manager._load_session_from_disk(model_cache_key, 'global_chat')
 
             if not session_data:
-                chat = GoogleGenAIChatSession(history=[])
-                session_data = {'chat_session': chat, 'unified_log': []}
+                session_data = {'unified_log': []}
 
             self.cog.global_chat_sessions[model_cache_key] = session_data
 
-            # FIX: Reconstruct Chat Session if missing from ram cache
-            chat = session_data.get('chat_session')
-            if not chat:
-                rebuilt_history = []
-                for t in session_data.get('unified_log', []):
-                    role = 'model' if t.get('is_user') is False else 'user'
-                    rebuilt_history.append({'role': role, 'parts': [t.get('content')]})
-                chat = GoogleGenAIChatSession(history=rebuilt_history)
-                session_data['chat_session'] = chat
-
             self.cog.session_last_accessed[model_cache_key] = time.time()
 
+            # Derived from unified_log on every turn. This used to be written onto a
+            # GoogleGenAIChatSession held on session_data, which was then overwritten from
+            # the same log a few lines below — the object never carried state between turns.
             rebuilt_history = []
             for t in session_data.get('unified_log', []):
                 t_role = t.get('role')
@@ -112,10 +104,8 @@ class GlobalChatMixin:
                 content_obj = {'role': t_role, 'parts': parts}
                 rebuilt_history.append(content_obj)
 
-            chat.history = rebuilt_history
-
-            if len(chat.history) > STM_LIMIT_MAX * 2:
-                chat.history = chat.history[-(STM_LIMIT_MAX * 2):]
+            if len(rebuilt_history) > STM_LIMIT_MAX * 2:
+                rebuilt_history = rebuilt_history[-(STM_LIMIT_MAX * 2):]
             session_data['unified_log'] = session_data['unified_log'][-(STM_LIMIT_MAX * 2):]
 
             combined_prompt_text = "\n\n".join([f"{t['display_name']}: {t['content']}" for t in queued_turns])
@@ -155,7 +145,7 @@ class GlobalChatMixin:
                 stm_length = int(profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
                 g_stm_capped = min(10, stm_length)
                 if g_stm_capped > 0:
-                    g_hist = chat.history[-(g_stm_capped * 2):]
+                    g_hist = rebuilt_history[-(g_stm_capped * 2):]
 
                 d_safe = _resolve_safety_settings(safety_level)
 
@@ -176,7 +166,7 @@ class GlobalChatMixin:
 
             stm_length = int(profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
             if stm_length > 0:
-                history_slice = chat.history[-stm_length:]
+                history_slice = rebuilt_history[-stm_length:]
                 contents_for_api_call.extend(history_slice)
 
             if contents_for_api_call and contents_for_api_call[-1].get('role') == 'user':
@@ -406,12 +396,6 @@ class GlobalChatMixin:
                 if sources_text_list:
                     response_text += "\n\n" + "\n".join(sources_text_list)
 
-            model_content_obj_for_turn = {'role': 'model', 'parts': [response_text]}
-            chat.history.extend([user_content_obj_for_turn, model_content_obj_for_turn])
-
-            if len(chat.history) > STM_LIMIT_MAX * 2:
-                chat.history = chat.history[-(STM_LIMIT_MAX * 2):]
-
             current_log = session_data.get('unified_log', [])
             if len(current_log) > STM_LIMIT_MAX * 2:
                 session_data['unified_log'] = current_log[-(STM_LIMIT_MAX * 2):]
@@ -450,22 +434,11 @@ class GlobalChatMixin:
             if state_container and state_container.get('sending_task'):
                 state_container['sending_task'].cancel()
 
-            response_message = await placeholder_msg.edit(embed=embed)
+            await placeholder_msg.edit(embed=embed)
             await self._dispatch_warnings(interaction.channel, 'webhook', None, turn_warnings, host_user_id, profile_name)
 
             t2_end_mono = time.monotonic()
             duration = t2_end_mono - t1_start_mono
-
-            timezone_str = profile_data.get("timezone", "UTC")
-            profile_id = self.cog.profile_manager._get_profile_id(source_owner_id, source_profile_name)
-            main_history_line = _format_history_entry(app_name, response_message.created_at, response_text, timezone_str, entity_id=profile_id)
-
-            bot_response_formatted = main_history_line
-
-            if chat.history and chat.history[-1].get('role', 'user') == 'model':
-                old_turn = chat.history[-1]
-                new_turn = {'role': 'model', 'parts': [bot_response_formatted]}
-                chat.history[-1] = new_turn
 
             await self.cog.session_manager._save_session_to_disk(model_cache_key, 'global_chat', session_data)
 

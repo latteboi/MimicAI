@@ -8,15 +8,14 @@ import discord
 import httpx
 from typing import List, Any, Optional, get_args
 
-from google import genai
 from google.genai import types
 
 from ..utils.constants import (
     PLACEHOLDER_EMOJI, WARN_IMAGE_GEN_FAILED, ERR_GENERAL_ERROR, ERR_SAFETY_BLOCK,
     WARN_MAIN_MODEL_FAILED, ERR_REASON_EMPTY_RESPONSE, HarmBlockThreshold, HarmCategory,
-    defaultConfig,
+    defaultConfig, IMAGE_QUEUE_PRIORITY,
 )
-from .api_service import GoogleGenAIModel, GoogleGenAIChatSession
+from .api_service import GoogleGenAIModel, get_genai_client
 from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _scrub_response_text
 
 
@@ -41,10 +40,7 @@ class MediaService:
         try:
             if model_id.upper().startswith("GOOGLE/"): model_id = model_id[7:]
 
-            client = genai.Client(
-                api_key=api_key,
-                http_options=types.HttpOptions(api_version='v1beta')
-            )
+            client = get_genai_client(api_key, 'v1beta')
 
             # Utilise specific voice identities for single-speaker contextual priming
             speech_cfg = types.SpeechConfig(
@@ -244,10 +240,17 @@ class MediaService:
 
                         text_model, _, temp, top_p, top_k, _, _ = await self.cog.api_service._get_or_create_model_for_channel(package['channel_id'], package['author_id'], package['guild_id'], profile_owner_override=package['effective_profile_owner_id'], profile_name_override=package['effective_profile_name'])
 
-                        model_cache_key = (package['channel_id'], package['effective_profile_owner_id'], package['effective_profile_name'])
-                        chat = self.cog.chat_sessions.get(model_cache_key)
-                        if not chat: chat = GoogleGenAIChatSession(history=[])
-                        self.cog.chat_sessions[model_cache_key] = chat; contents_for_api_call = list(chat.history)
+                        # Derived from the channel's unified_log. This previously read
+                        # cog.chat_sessions, a cache that only this worker ever wrote to, so
+                        # the image-presentation turn saw prior image-generation turns and
+                        # nothing else of the conversation it was replying to.
+                        img_session = self.cog.multi_profile_channels.get(package['channel_id']) or {}
+                        img_bot_pid = self.cog.profile_manager._get_pid_from_name_any(
+                            package['effective_profile_owner_id'], package['effective_profile_name']
+                        )
+                        contents_for_api_call = self.cog.session_manager._build_history_for_participant(
+                            img_session.get("unified_log", []), img_bot_pid, profile_settings
+                        )
 
                         turn_id = str(uuid.uuid4())
 
@@ -343,17 +346,6 @@ class MediaService:
                                 sources_text_list = _format_citation_subtext(grounding_sources)
 
                         model_turn = {'role': 'model', 'parts': [response_text]}
-                        # Dehydrate user turn to text marker before appending to persistent chat history
-                        dehydrated_user_parts = []
-                        for p in user_turn.get('parts', []):
-                            if isinstance(p, dict) and 'url' in p:
-                                dehydrated_user_parts.append(f"[Attached Image: generated_image.png]")
-                            elif isinstance(p, dict) and 'data' in p:
-                                dehydrated_user_parts.append(f"[Attached Image: image.png]")
-                            else:
-                                dehydrated_user_parts.append(p)
-                        
-                        chat.history.extend([{'role': 'user', 'parts': dehydrated_user_parts}, model_turn])
 
                         # --- Update Placeholder ---
                         if not was_blocked and not is_child_bot and placeholder_message:
@@ -743,13 +735,18 @@ class MediaService:
 
             if grounding_mode in ["on", "on+"]:
                 session_key = (channel_id, owner_id, profile_name)
-                chat = self.cog.chat_sessions.get(session_key)
-                
+                img_session = self.cog.multi_profile_channels.get(channel_id) or {}
+
                 stm_len = int(profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
                 grounding_stm = min(10, stm_len)
-                history_for_grounding = chat.history[-grounding_stm:] if chat and grounding_stm > 0 else []
-                
-                mapping_key = self.cog.session_manager._get_mapping_key_for_session(session_key, 'single')
+                history_for_grounding = []
+                if grounding_stm > 0:
+                    g_bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
+                    history_for_grounding = self.cog.session_manager._build_history_for_participant(
+                        img_session.get("unified_log", []), g_bot_pid, profile_data
+                    )[-grounding_stm:]
+
+                mapping_key = self.cog.session_manager._get_mapping_key_for_session(session_key, 'multi')
                 grounding_result = await self.cog.tools_service._get_hybrid_grounding_context(prompt_text, guild_id, history_for_grounding, mapping_key, safety_settings=dynamic_safety_settings, is_for_image=True, warning_channel=message.channel)
                 if grounding_result:
                     grounding_context, sources, *_ = grounding_result
@@ -767,12 +764,7 @@ class MediaService:
                 "image_generation_model": profile_data.get("image_generation_model", "gemini-2.5-flash-image")
             }
             
-            # [NEW] Priority Logic
-            # Lower number = Higher priority
-            is_premium = self.cog.profile_manager.is_user_premium(effective_profile_owner_id)
-            priority = 10 if is_premium else 20
-            
-            await self.cog.image_request_queue.put((priority, time.time(), request_data))
+            await self.cog.image_request_queue.put((IMAGE_QUEUE_PRIORITY, time.time(), request_data))
 
         except Exception as e:
             await message.reply(f"An error occurred while queueing your request: {e}", delete_after=10)

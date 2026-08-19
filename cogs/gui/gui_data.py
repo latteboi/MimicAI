@@ -75,15 +75,12 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
         ltm_shard = self.cog.memory_manager._load_ltm_shard(user_id_str, self.profile_name)
         current_count = len(ltm_shard.get("guild", [])) if ltm_shard else 0
         
-        is_premium = self.cog.profile_manager.is_user_premium(self.profile_owner_id)
-        limit = defaultConfig.LIMIT_LTM_PREMIUM if is_premium else defaultConfig.LIMIT_LTM_FREE
-        
+        limit = defaultConfig.LIMIT_LTM
+
         if current_count >= limit:
             msg = f"**Limit Reached.**\n"
             msg += f"You have **{current_count}** memories (Limit: {limit}).\n"
             msg += "You cannot manually add more memories while at or above the limit. Please delete old memories first."
-            if not is_premium:
-                msg += f"\nOr upgrade to Premium via `/subscription` to increase your limit to {defaultConfig.LIMIT_LTM_PREMIUM}."
             await i.followup.send(msg, ephemeral=True)
             return
 
@@ -102,7 +99,7 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
         # Fetch new count for feedback
         ltm_shard = self.cog.memory_manager._load_ltm_shard(str(self.profile_owner_id), self.profile_name)
         count = len(ltm_shard.get("guild", [])) if ltm_shard else 0
-        limit = defaultConfig.LIMIT_LTM_PREMIUM if self.cog.profile_manager.is_user_premium(self.profile_owner_id) else defaultConfig.LIMIT_LTM_FREE
+        limit = defaultConfig.LIMIT_LTM
         
         msg = f"LTM entry added for '{self.profile_name}'."
         if count >= limit:
@@ -133,15 +130,12 @@ class AddTrainingExampleModal(ui.Modal, title="Add Profile Training Example"):
         training_shard = self.cog.memory_manager._load_training_shard(user_id_str, self.profile_name) or []
         current_count = len(training_shard)
         
-        is_premium = self.cog.profile_manager.is_user_premium(self.profile_owner_id)
-        limit = defaultConfig.LIMIT_TRAINING_PREMIUM if is_premium else defaultConfig.LIMIT_TRAINING_FREE
-        
+        limit = defaultConfig.LIMIT_TRAINING
+
         if current_count >= limit:
             msg = f"**Limit Reached.**\n"
             msg += f"You have **{current_count}** training examples (Limit: {limit}).\n"
             msg += "You cannot add more examples. Please delete existing ones first."
-            if not is_premium:
-                msg += f"\nOr upgrade to Premium via `/subscription` to increase your limit to {defaultConfig.LIMIT_TRAINING_PREMIUM}."
             await i.followup.send(msg, ephemeral=True)
             return
 
