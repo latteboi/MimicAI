@@ -171,6 +171,15 @@ After=network.target
 Type=simple
 User={username}
 WorkingDirectory={current_dir}
+# glibc allocator tuning. BotManager applies the same settings via mallopt() at
+# startup, but these apply from process start — before the interpreter has
+# allocated anything — so they are strictly better where systemd is in play.
+# MALLOC_MMAP_THRESHOLD_ pinned at 128 KB disables glibc's dynamic threshold
+# growth, which otherwise strands a multi-megabyte image buffer in the heap for
+# the life of the process. MALLOC_ARENA_MAX=2 suits a 0.25 vCPU baseline.
+Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_MMAP_THRESHOLD_=131072
+Environment=MALLOC_TRIM_THRESHOLD_=131072
 ExecStart={venv_python_abs} BotManager.py
 Restart=always
 RestartSec=10

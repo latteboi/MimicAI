@@ -1,3 +1,7 @@
+# Deferred annotation evaluation, so the two `-> np.ndarray` return annotations
+# below never touch the lazy proxy at definition time.
+from __future__ import annotations
+
 import os
 import re
 import uuid
@@ -6,8 +10,30 @@ import asyncio
 import datetime
 import traceback
 from typing import Dict, List, Any, Optional, Union, Tuple
-import numpy as np
 import discord
+
+
+class _LazyNumpy:
+    """Imports numpy on first use and gets out of the way.
+
+    numpy costs ~12 MB of resident memory at import, and nothing needs it until
+    the bot does memory work -- an LTM/training retrieval, or encoding an
+    embedding to store. An instance that boots and sits idle should not be
+    carrying it. On the first attribute access this rebinds the module-level
+    `np`, so every call site below is unchanged and only the very first one pays
+    the indirection.
+    """
+
+    __slots__ = ()
+
+    def __getattr__(self, name):
+        import numpy
+
+        globals()["np"] = numpy
+        return getattr(numpy, name)
+
+
+np = _LazyNumpy()
 
 
 from ..utils.constants import (

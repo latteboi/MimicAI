@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional, Union
 from ..utils.content import OLLAMA_GUIDE_TEXT
 from ..utils.helpers import _pf, _pi, _ps, _pb
+from ..utils.http_client import get_shared_client
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -956,13 +957,11 @@ class SingleProfileModelView(ui.View):
         data = self._get_current_profile_data()
         host_url = data.get("ollama_host_url") or OLLAMA_LOCAL_URL
         try:
-            import httpx
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(f"{host_url.rstrip('/')}/api/tags", timeout=2.0)
-                self.ollama_working = (resp.status_code == 200)
-                if self.ollama_working:
-                    data = resp.json()
-                    self.cached_ollama_models = [m['name'] for m in data.get('models', [])]
+            resp = await get_shared_client().get(f"{host_url.rstrip('/')}/api/tags", timeout=2.0)
+            self.ollama_working = (resp.status_code == 200)
+            if self.ollama_working:
+                data = resp.json()
+                self.cached_ollama_models = [m['name'] for m in data.get('models', [])]
         except Exception:
             self.ollama_working = False
             self.cached_ollama_models = []
@@ -1366,13 +1365,11 @@ class ModelApplyView(ui.View):
     async def _update_ollama_status(self):
         host_url = self.models_state.get("ollama_host_url") or OLLAMA_LOCAL_URL
         try:
-            import httpx
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(f"{host_url.rstrip('/')}/api/tags", timeout=2.0)
-                self.ollama_working = (resp.status_code == 200)
-                if self.ollama_working:
-                    data = resp.json()
-                    self.cached_ollama_models = [m['name'] for m in data.get('models', [])]
+            resp = await get_shared_client().get(f"{host_url.rstrip('/')}/api/tags", timeout=2.0)
+            self.ollama_working = (resp.status_code == 200)
+            if self.ollama_working:
+                data = resp.json()
+                self.cached_ollama_models = [m['name'] for m in data.get('models', [])]
         except Exception:
             self.ollama_working = False
             self.cached_ollama_models = []

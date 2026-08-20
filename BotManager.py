@@ -1,3 +1,12 @@
+# Allocator tuning runs before anything else is imported: M_ARENA_MAX only governs
+# arenas that do not exist yet, and pinning M_MMAP_THRESHOLD early keeps every
+# large buffer the bot ever allocates on the mmap path, where freeing it actually
+# returns the pages. See cogs/utils/memory_tuning.py for why this is needed at all.
+# No-op off glibc.
+from cogs.utils.memory_tuning import tune_allocator
+
+tune_allocator()
+
 import asyncio
 import discord
 from discord.ext import commands
@@ -147,6 +156,19 @@ async def main():
     # The legacy child_bot.json.gz fallback went with it. _load_child_bots never
     # honoured that format, so a legacy child bot could be listed here but never
     # launched -- dropping it removes a scan, not a capability.
+
+    # Cap the executor that backs every asyncio.to_thread call. The default is
+    # min(32, cpu_count + 4), which is 5 here and buys nothing on a 0.25 vCPU
+    # baseline -- the work sent there is IOManager's Fernet+zstd pipeline, which
+    # is GIL-bound anyway. Each worker thread costs an 8 MB stack reservation, its
+    # own glibc arena (so its own fragmentation high-water mark), and its own
+    # thread-local ZstdCompressor/ZstdDecompressor pair, which are never released.
+    # Two is enough to keep a read overlapping a write.
+    from concurrent.futures import ThreadPoolExecutor
+
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=2, thread_name_prefix="mimic-io")
+    )
 
     # Attach manager queue to bot object for cog access
     bot.manager_queue = manager_queue

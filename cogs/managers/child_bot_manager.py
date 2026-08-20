@@ -6,8 +6,6 @@ import base64
 import asyncio
 import traceback
 from typing import Dict, Any, Optional, Tuple, List
-import aiohttp
-from PIL import Image
 
 import discord
 from discord import app_commands
@@ -18,6 +16,7 @@ from ..utils.constants import (
     DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING,
 )
 from ..utils.helpers import _split_into_sentences_with_abbreviations
+from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
 
 MAX_AVATAR_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -449,9 +448,26 @@ class ChildBotManager:
 
         file_to_send = None
         if attachment_data:
+            # Three accepted shapes, cheapest first. `path` and `data` exist because
+            # the producer and this consumer are the *same process* -- child bots run
+            # as asyncio tasks in the main event loop, and manager_queue is a plain
+            # in-process asyncio.Queue -- so base64 was never buying transport safety,
+            # only a 4/3 blow-up and three simultaneous copies of the payload.
+            #
+            #   path -- discord.File opens it and aiohttp streams from the handle, so
+            #           a generated image is never resident in Python at all.
+            #   data -- raw bytes, for payloads already in memory (audio, thoughts).
+            #   data_base64 -- legacy shape, still honoured.
+            filename = attachment_data.get('filename', 'attachment.png')
             try:
-                image_bytes = base64.b64decode(attachment_data['data_base64'])
-                file_to_send = discord.File(io.BytesIO(image_bytes), filename=attachment_data.get('filename', 'attachment.png'))
+                if attachment_data.get('path'):
+                    file_to_send = discord.File(attachment_data['path'], filename=filename)
+                elif attachment_data.get('data') is not None:
+                    file_to_send = discord.File(io.BytesIO(attachment_data['data']), filename=filename)
+                else:
+                    file_to_send = discord.File(
+                        io.BytesIO(base64.b64decode(attachment_data['data_base64'])), filename=filename
+                    )
             except Exception as e:
                 print(f"[ChildBotManager] Bot {bot_id} attachment decode error: {e}")
 
@@ -619,21 +635,27 @@ class ChildBotManager:
             elif action == "update_avatar":
                 url = payload.get("avatar_url")
                 if url:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(url) as resp:
-                            if resp.status == 200:
-                                data = await resp.read()
-                                if len(data) < MAX_AVATAR_SIZE_BYTES:
-                                    try:
-                                        with Image.open(io.BytesIO(data)) as img:
-                                            if img.mode != 'RGBA':
-                                                img = img.convert('RGBA')
-                                            with io.BytesIO() as out_buffer:
-                                                img.save(out_buffer, format='PNG')
-                                                png_data = out_buffer.getvalue()
-                                        await bot.user.edit(avatar=png_data)
-                                    except Exception:
-                                        await bot.user.edit(avatar=data)
+                    # Was a per-call aiohttp.ClientSession, which built its own SSL
+                    # context and connector for one GET. Shares the pool now.
+                    resp = await get_shared_client().get(url, follow_redirects=True, timeout=15.0)
+                    if resp.status_code == 200:
+                        data = resp.content
+                        if len(data) < MAX_AVATAR_SIZE_BYTES:
+                            # Imported here rather than at module scope: Pillow
+                            # costs ~6 MB of RSS and this -- a child bot having its
+                            # avatar changed -- is the only path in the process
+                            # that decodes an image.
+                            from PIL import Image
+                            try:
+                                with Image.open(io.BytesIO(data)) as img:
+                                    if img.mode != 'RGBA':
+                                        img = img.convert('RGBA')
+                                    with io.BytesIO() as out_buffer:
+                                        img.save(out_buffer, format='PNG')
+                                        png_data = out_buffer.getvalue()
+                                await bot.user.edit(avatar=png_data)
+                            except Exception:
+                                await bot.user.edit(avatar=data)
                 else:
                     await bot.user.edit(avatar=None)
         except Exception as e:

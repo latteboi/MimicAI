@@ -4,13 +4,11 @@ import re
 import time
 import uuid
 import random
-import base64
 import asyncio
 import discord
 import traceback
 import collections
 import datetime
-import httpx
 from zoneinfo import ZoneInfo
 from ..utils.constants import (
     defaultConfig, OLLAMA_LOCAL_URL, PLACEHOLDER_EMOJI,
@@ -22,6 +20,7 @@ from ..utils.constants import (
     DEFAULT_IMAGE_GROUNDING, DEFAULT_NEGATIVE_CONSTRAINTS, DEFAULT_IMAGE_PRESENT,
     DEFAULT_IMAGE_PRESENT_OTHER, DEFAULT_IMAGE_FAILED,
 )
+from ..utils.http_client import get_shared_client
 from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt, _format_history_entry, _get_user_hash, _scrub_response_text, _split_into_sentences_with_abbreviations
 from ..managers.memory_manager import encode_embedding_b64
 from .api_service import GoogleGenAIModel, OllamaModel, OpenRouterModel
@@ -341,8 +340,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         content = trigger_obj['content'] if is_child_mention else trigger_obj.clean_content
                         
                         raw_att_list = trigger_obj['attachments'] if is_child_mention else trigger_obj.attachments
-                        async with httpx.AsyncClient(timeout=10.0) as text_client:
-                            text_att_content = await self.cog.media_service._process_text_attachments(raw_att_list, text_client)
+                        # Shared client: _process_text_attachments sets its own
+                        # per-request timeout, so nothing is lost by not owning one.
+                        text_att_content = await self.cog.media_service._process_text_attachments(
+                            raw_att_list, get_shared_client()
+                        )
                         
                         if text_att_content:
                             content = f"{content}\n\n{text_att_content}"
@@ -1876,24 +1878,29 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         }
 
                         if file_to_send:
+                            # The child bot lives in this process, so it can open the
+                            # file itself: no read, no base64, nothing resident here.
                             attachment_data = None
                             if is_generator and generated_image_path_for_round:
-                                def _read_b64():
-                                    with open(generated_image_path_for_round, 'rb') as f:
-                                        return base64.b64encode(f.read()).decode('utf-8')
-                                b64_data = await asyncio.to_thread(_read_b64)
                                 attachment_data = {
                                     "filename": "generated_image.png",
-                                    "data_base64": b64_data
+                                    "path": generated_image_path_for_round
                                 }
                             elif audio_file_for_send:
                                 turn_audio_stream.seek(0)
                                 attachment_data = {
                                     "filename": f"voice_{turn_id[:4]}.wav",
-                                    "data_base64": base64.b64encode(turn_audio_stream.read()).decode('utf-8')
+                                    "data": turn_audio_stream.read()
                                 }
                             if attachment_data:
                                 payload["attachment"] = attachment_data
+                            if attachment_data and attachment_data.get("path"):
+                                # file_to_send was opened from this same path for the
+                                # webhook branch and is never sent here -- execute_send
+                                # opens its own handle. Release the descriptor rather
+                                # than leaving it to the round's teardown.
+                                file_to_send.close()
+                                file_to_send = None
 
                         # Direct in-process execution (replaces 45-second queue wait)
                         sent_child_messages = await self.cog.child_bot_manager.execute_send(participant['bot_id'], payload)
@@ -1917,10 +1924,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # Dispatch extra audio attachment directly
                         if extra_audio_file and 'turn_audio_stream' in locals() and turn_audio_stream:
                             turn_audio_stream.seek(0)
-                            audio_b64 = base64.b64encode(turn_audio_stream.read()).decode('utf-8')
                             a_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
                                 "channel_id": channel.id, "content": "", "realistic_typing": False,
-                                "attachment": {"filename": f"voice_{turn_id[:4]}.wav", "data_base64": audio_b64}
+                                "attachment": {"filename": f"voice_{turn_id[:4]}.wav", "data": turn_audio_stream.read()}
                             })
                             if a_msgs:
                                 for sm in a_msgs:
@@ -1928,10 +1934,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                         # Dispatch thinking summary directly
                         if thought_file_to_send and thought_text:
-                            thought_b64 = base64.b64encode(thought_text.encode('utf-8')).decode('utf-8')
                             t_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
                                 "channel_id": channel.id, "content": "", "realistic_typing": False,
-                                "attachment": {"filename": "thinking_summary.txt", "data_base64": thought_b64}
+                                "attachment": {"filename": "thinking_summary.txt", "data": thought_text.encode('utf-8')}
                             })
                             if t_msgs:
                                 for sm in t_msgs:

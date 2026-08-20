@@ -789,6 +789,9 @@ class EventListeners:
         from ..services.api_service import close_google_rest_client
         await close_google_rest_client()
 
+        from ..utils.http_client import close_shared_client
+        await close_shared_client()
+
         self.bot.tree.remove_command(self.trace_ctx_menu.name, type=self.trace_ctx_menu.type)
         
         self.refresh_lock_task.cancel()

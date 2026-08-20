@@ -187,13 +187,26 @@ class MediaService:
                                 if not failure_reason: failure_reason = f"an unexpected error: `{e}`"
 
                             if image_bytes:
-                                def _write_img():
+                                # data= binds the blob as a default argument rather
+                                # than closing over the name, so nulling image_bytes
+                                # below actually drops the last reference.
+                                def _write_img(data=image_bytes):
                                     import tempfile
                                     fd, path = tempfile.mkstemp(suffix=".png")
                                     with os.fdopen(fd, 'wb') as f:
-                                        f.write(image_bytes)
+                                        f.write(data)
                                     return path
                                 package['generated_image_path'] = await asyncio.to_thread(_write_img)
+                                # Same reasoning as the multi-profile round in
+                                # generation_service: from here the temp file is the
+                                # only carrier anything needs. Holding the decoded
+                                # PNG -- and `response`, whose parsed body still has
+                                # the base64 original of it -- across the text
+                                # generation that follows costs several megabytes for
+                                # the length of another API call.
+                                image_bytes = None
+                                _write_img = None
+                                response = None
 
                             package['failure_reason'] = failure_reason
 
@@ -373,12 +386,14 @@ class MediaService:
                             "reply_to_id": reply_id, "ping": should_ping
                         }
                         if image_file_to_send:
-                            def _read_b64():
-                                import base64
-                                with open(package['generated_image_path'], 'rb') as f:
-                                    return base64.b64encode(f.read()).decode('utf-8')
-                            b64_data = await asyncio.to_thread(_read_b64)
-                            payload["attachment"] = { "filename": "generated_image.png", "data_base64": b64_data }
+                            # Hand over the path; execute_send opens it. Encoding a
+                            # multi-megabyte PNG to base64 to move it across an
+                            # in-process asyncio.Queue cost ~4x its size in live
+                            # copies and bought nothing.
+                            payload["attachment"] = {
+                                "filename": "generated_image.png",
+                                "path": package['generated_image_path'],
+                            }
                         await self.cog.manager_queue.put({"action": "send_to_child", "bot_id": package['bot_id'], "payload": payload})
                     else:
                         # [UPDATED] Fix undefined 'i' by resolving anchor_message from package

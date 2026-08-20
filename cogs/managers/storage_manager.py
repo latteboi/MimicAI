@@ -363,6 +363,26 @@ class StorageManager:
         all_bot_member_ids = {str(m.id) for g in self.cog.bot.guilds for m in g.members}
         all_bot_channel_ids = {c.id for g in self.cog.bot.guilds for c in g.channels}
 
+        # `all_bot_member_ids` decides four irreversible things below: deleting a
+        # user's whole directory (profiles, LTM, training, keys), deleting their
+        # session directories, dropping their profile shares, and dropping server
+        # key assignments. It is derived from discord.py's member cache, which is
+        # only populated if the members intent is on AND guild chunking actually
+        # completed. If chunking was disabled, failed, or is still in flight when
+        # the daily task fires, this set is empty or badly short -- and an empty
+        # set means "nobody is a member of anything", which deletes everything.
+        #
+        # A cache miss and a genuinely empty server are indistinguishable here, so
+        # refuse to run rather than guess. Nothing is lost by skipping a day.
+        if self.cog.bot.guilds and not all_bot_member_ids:
+            print(
+                "[Cleanup] Aborted: the member cache is empty across "
+                f"{len(self.cog.bot.guilds)} guild(s). This is a cache problem, not "
+                "an empty server -- refusing to treat every user as departed. Check "
+                "that the members intent is enabled and guild chunking completed."
+            )
+            return
+
         # --- 1. Expired Share Codes ---
         cleaned_codes = 0
         now = time.time()

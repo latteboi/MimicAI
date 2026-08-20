@@ -14,6 +14,8 @@ from ..utils.constants import (
     ALLOWED_MODELS, defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
     HarmBlockThreshold, HarmCategory, HARM_CATEGORIES,
 )
+from ..utils.http_client import get_shared_client
+from ..utils.memory_tuning import maybe_trim_malloc
 
 
 class OpenRouterModel:
@@ -123,44 +125,44 @@ class OpenRouterModel:
         }
 
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=120.0)
-                if response.status_code != 200:
-                    raise Exception(f"OpenRouter API Error {response.status_code}: {response.text}")
+            client = get_shared_client()
+            response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=120.0)
+            if response.status_code != 200:
+                raise Exception(f"OpenRouter API Error {response.status_code}: {response.text}")
 
-                data = response.json()
-                if 'error' in data:
-                     raise Exception(f"OpenRouter API Error: {data['error']}")
+            data = response.json()
+            if 'error' in data:
+                 raise Exception(f"OpenRouter API Error: {data['error']}")
 
-                choice = data['choices'][0]
-                msg_obj = choice['message']
-                usage_obj = data.get('usage', {})
+            choice = data['choices'][0]
+            msg_obj = choice['message']
+            usage_obj = data.get('usage', {})
 
-                class OpenRouterThoughtResponse:
-                    def __init__(self, content, reasoning, finish_reason, input_toks, output_toks):
-                        self.text = content
-                        self.thought = reasoning or ""
-                        self.input_tokens = input_toks
-                        self.output_tokens = output_toks
-                        self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
+            class OpenRouterThoughtResponse:
+                def __init__(self, content, reasoning, finish_reason, input_toks, output_toks):
+                    self.text = content
+                    self.thought = reasoning or ""
+                    self.input_tokens = input_toks
+                    self.output_tokens = output_toks
+                    self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
 
-                        mock_part = type('obj', (object,), {'text': content})
-                        mock_content = type('obj', (object,), {'parts': [mock_part]})
+                    mock_part = type('obj', (object,), {'text': content})
+                    mock_content = type('obj', (object,), {'parts': [mock_part]})
 
-                        self.candidates = [type('obj', (object,), {
-                            'content': mock_content,
-                            'finish_reason': type('obj', (object,), {'name': finish_reason})
-                        })]
+                    self.candidates = [type('obj', (object,), {
+                        'content': mock_content,
+                        'finish_reason': type('obj', (object,), {'name': finish_reason})
+                    })]
 
-                    def __bool__(self): return True
+                def __bool__(self): return True
 
-                return OpenRouterThoughtResponse(
-                    msg_obj.get('content', ''),
-                    msg_obj.get('reasoning', ''),
-                    (choice.get('finish_reason') or 'STOP').upper(),
-                    usage_obj.get('prompt_tokens', 0),
-                    usage_obj.get('completion_tokens', 0)
-                )
+            return OpenRouterThoughtResponse(
+                msg_obj.get('content', ''),
+                msg_obj.get('reasoning', ''),
+                (choice.get('finish_reason') or 'STOP').upper(),
+                usage_obj.get('prompt_tokens', 0),
+                usage_obj.get('completion_tokens', 0)
+            )
         except httpx.RequestError as e:
             raise Exception(f"OpenRouter Network Error: {str(e)}")
         except asyncio.CancelledError:
@@ -241,11 +243,10 @@ class OllamaModel:
                     if mime_type.startswith("image/"):
                         if url.startswith(('http://', 'https://')):
                             try:
-                                async with httpx.AsyncClient() as client:
-                                    resp = await client.get(url, follow_redirects=True, timeout=15.0)
-                                    resp.raise_for_status()
-                                    b64_data = base64.b64encode(resp.content).decode('utf-8')
-                                    images.append(b64_data)
+                                resp = await get_shared_client().get(url, follow_redirects=True, timeout=15.0)
+                                resp.raise_for_status()
+                                b64_data = base64.b64encode(resp.content).decode('utf-8')
+                                images.append(b64_data)
                             except Exception as e:
                                 print(f"Ollama failed to fetch and encode remote image {url}: {e}")
                         elif os.path.exists(url):
@@ -301,73 +302,73 @@ class OllamaModel:
         global _ollama_global_lock
         async with _ollama_global_lock:
             try:
-                async with httpx.AsyncClient() as client:
-                    full_content = ""
-                    reasoning_content = ""
-                    finish_reason = "STOP"
+                client = get_shared_client()
+                full_content = ""
+                reasoning_content = ""
+                finish_reason = "STOP"
 
-                    async with client.stream("POST", f"{self.api_url}/api/chat", json=payload, headers=headers, timeout=120.0) as response:
-                        if response.status_code != 200:
-                            err_text = await response.aread()
-                            raise Exception(f"Ollama API Error {response.status_code}: {err_text.decode('utf-8', errors='ignore')}")
+                async with client.stream("POST", f"{self.api_url}/api/chat", json=payload, headers=headers, timeout=120.0) as response:
+                    if response.status_code != 200:
+                        err_text = await response.aread()
+                        raise Exception(f"Ollama API Error {response.status_code}: {err_text.decode('utf-8', errors='ignore')}")
 
-                        async for line in response.aiter_lines():
-                            if not line.strip(): continue
-                            try:
-                                chunk = json.loads(line)
-                                msg = chunk.get("message", {})
+                    async for line in response.aiter_lines():
+                        if not line.strip(): continue
+                        try:
+                            chunk = json.loads(line)
+                            msg = chunk.get("message", {})
 
-                                if "content" in msg and msg["content"]:
-                                    full_content += msg["content"]
-                                if "thinking" in msg and msg["thinking"]:
-                                    reasoning_content += msg["thinking"]
+                            if "content" in msg and msg["content"]:
+                                full_content += msg["content"]
+                            if "thinking" in msg and msg["thinking"]:
+                                reasoning_content += msg["thinking"]
 
-                                if chunk.get("done"):
-                                    done_reason = chunk.get("done_reason")
-                                    if done_reason:
-                                        finish_reason = done_reason
-                            except Exception:
-                                pass
+                            if chunk.get("done"):
+                                done_reason = chunk.get("done_reason")
+                                if done_reason:
+                                    finish_reason = done_reason
+                        except Exception:
+                            pass
 
-                    msg_obj = {"content": full_content, "reasoning": reasoning_content}
+                msg_obj = {"content": full_content, "reasoning": reasoning_content}
 
-                    class OllamaResponseWrapper:
-                        def __init__(self, m_obj, f_reason, p_eval, e_count):
-                            self.text = m_obj.get('content', '') or ''
-                            self.thought = m_obj.get('reasoning', '') or ''
-                            self.input_tokens = p_eval
-                            self.output_tokens = e_count
-                            self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
+                class OllamaResponseWrapper:
+                    def __init__(self, m_obj, f_reason, p_eval, e_count):
+                        self.text = m_obj.get('content', '') or ''
+                        self.thought = m_obj.get('reasoning', '') or ''
+                        self.input_tokens = p_eval
+                        self.output_tokens = e_count
+                        self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
 
-                            if not self.thought and "<think>" in self.text.lower():
-                                text_lower = self.text.lower()
-                                think_start = text_lower.find("<think>")
-                                think_end = text_lower.find("</think>")
+                        if not self.thought and "<think>" in self.text.lower():
+                            text_lower = self.text.lower()
+                            think_start = text_lower.find("<think>")
+                            think_end = text_lower.find("</think>")
 
-                                if think_start != -1:
-                                    if think_end != -1:
-                                        self.thought = self.text[think_start+7:think_end].strip()
-                                        self.text = (self.text[:think_start] + self.text[think_end+8:]).strip()
-                                        self.reasoning_tokens = int(len(self.thought) / 3.8)
-                                    else:
-                                        self.thought = self.text[think_start+7:].strip()
-                                        self.text = self.text[:think_start].strip()
-                                        self.reasoning_tokens = int(len(self.thought) / 3.8)
+                            if think_start != -1:
+                                if think_end != -1:
+                                    self.thought = self.text[think_start+7:think_end].strip()
+                                    self.text = (self.text[:think_start] + self.text[think_end+8:]).strip()
+                                    self.reasoning_tokens = int(len(self.thought) / 3.8)
+                                else:
+                                    self.thought = self.text[think_start+7:].strip()
+                                    self.text = self.text[:think_start].strip()
+                                    self.reasoning_tokens = int(len(self.thought) / 3.8)
 
-                            mock_part = type('obj', (object,), {'text': self.text})
-                            mock_content = type('obj', (object,), {'parts': [mock_part]})
-                            self.candidates = [type('obj', (object,), {
-                                'content': mock_content,
-                                'finish_reason': type('obj', (object,), {'name': f_reason})
-                            })]
+                        mock_part = type('obj', (object,), {'text': self.text})
+                        mock_content = type('obj', (object,), {'parts': [mock_part]})
+                        self.candidates = [type('obj', (object,), {
+                            'content': mock_content,
+                            'finish_reason': type('obj', (object,), {'name': f_reason})
+                        })]
 
-                        def __bool__(self): return True
+                    def __bool__(self): return True
 
-                    # Ollama streaming returns eval counts on the final chunk
-                    p_eval_count = chunk.get("prompt_eval_count", 0) if 'chunk' in locals() else 0
-                    eval_count = chunk.get("eval_count", 0) if 'chunk' in locals() else 0
+                # Ollama streaming returns eval counts on the final chunk
+                p_eval_count = chunk.get("prompt_eval_count", 0) if 'chunk' in locals() else 0
+                eval_count = chunk.get("eval_count", 0) if 'chunk' in locals() else 0
 
-                    return OllamaResponseWrapper(msg_obj, (finish_reason or 'STOP').upper(), p_eval_count, eval_count)
+                return OllamaResponseWrapper(msg_obj, (finish_reason or 'STOP').upper(), p_eval_count, eval_count)
             except httpx.RequestError as e:
                 raise Exception(f"Ollama Network Error: {str(e)}")
             except asyncio.CancelledError:
@@ -451,11 +452,34 @@ async def get_embedding_vector(
         return None
 
 
-def _read_file_bytes(path: str) -> bytes:
-    """Sync full-file read, run via asyncio.to_thread so the resumable upload's
-    disk I/O never blocks the event loop."""
+# 256 KB per read. Large enough that a 6 MB attachment costs ~24 reads rather
+# than ~750, small enough that each one stays well under the ~10 ms event-loop
+# budget — a read of this size from the page cache (and the file was written
+# moments earlier, so it is hot) costs tens of microseconds.
+_UPLOAD_CHUNK_BYTES = 256 * 1024
+
+# Download chunk for the streaming fetch. 8 KB meant ~750 allocation/append
+# cycles for a single phone photo; 64 KB cuts that by a factor of eight without
+# meaningfully raising the peak.
+_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+
+
+async def _aiter_file_bytes(path: str, chunk_size: int = _UPLOAD_CHUNK_BYTES):
+    """Yields `path` in chunks for use as an httpx request body.
+
+    Must be an *async* generator: httpx refuses a sync iterable body on an
+    AsyncClient. httpx would normally pair an async body with
+    `Transfer-Encoding: chunked`, but `Request._prepare` skips that default when
+    Content-Length is already set explicitly — which the caller does, from
+    `os.path.getsize`. So the request goes out byte-identical to the buffered
+    version it replaces, and the resumable protocol sees no difference.
+    """
     with open(path, "rb") as f:
-        return f.read()
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
 
 
 # --- Gemini File API URI cache -------------------------------------------------
@@ -587,16 +611,24 @@ class _RestView:
             return memo[name]
 
         if name in data:
-            value = data[name]
+            key = name
         else:
-            camel = _to_camel(name)
-            if camel not in data:
+            key = _to_camel(name)
+            if key not in data:
                 memo[name] = None
                 return None
-            value = data[camel]
+        value = data[key]
 
         wrapped = _wrap_rest(name, value)
         memo[name] = wrapped
+
+        if name == "data" and isinstance(wrapped, bytes):
+            # `value` is the base64 text of the blob just decoded -- about 1.33x
+            # its size -- and the memo means nothing will read it again. An image
+            # response otherwise carries the payload twice over, in two forms, for
+            # as long as the caller holds the response. Drop the encoded original.
+            data.pop(key, None)
+
         return wrapped
 
     def __bool__(self):
@@ -641,20 +673,48 @@ class GoogleRESTModel:
     # -- media ------------------------------------------------------------------
 
     async def _upload_file(self, path: str, mime_type: str) -> Optional[str]:
+        """Uploads a file already on disk, retrying once on a transport failure.
+
+        The retry exists because the body streams from a generator (see
+        `_upload_file_once`). httpcore will transparently re-issue a request whose
+        body is a plain `bytes` when the pooled connection turns out to be dead,
+        but it cannot replay a consumed async generator — so a connection that
+        went away between the start request and the finalize surfaces as a
+        `TransportError` here instead of being retried underneath us. Redoing the
+        whole two-request sequence gets a fresh upload session, so there is no
+        ambiguity about how much of the previous body the server accepted.
+        """
+        last_exc = None
+        for attempt in range(2):
+            try:
+                return await self._upload_file_once(path, mime_type)
+            except (httpx.TransportError, httpx.RemoteProtocolError) as e:
+                last_exc = e
+                if attempt == 0:
+                    print(
+                        f"File API upload of {os.path.basename(path)} hit "
+                        f"{type(e).__name__}({e or 'no detail'}); retrying once."
+                    )
+                    continue
+                raise
+        raise last_exc  # unreachable; keeps the type checker honest
+
+    async def _upload_file_once(self, path: str, mime_type: str) -> Optional[str]:
         """Uploads a file already on disk via the resumable upload protocol and
         returns its file URI.
 
         Two requests: a "start" that returns an upload URL in the
         X-Goog-Upload-URL response header, then an "upload, finalize" carrying
-        the bytes. Reads the whole file into memory for that second request
-        rather than chunk-streaming it from disk — the caller already staged it
-        there specifically to avoid buffering the *download*, but Discord
-        attachment sizes cap this in the low tens of megabytes, the buffer is
-        freed the moment the POST returns, and a hand-rolled chunked upload
-        against an under-documented third-party protocol is not a risk worth
-        taking on the bot's least-exercised path. Polls the file resource's
-        `state` only if the API reports PROCESSING; small image/audio files
-        finalize as ACTIVE immediately and skip the poll entirely.
+        the bytes. The body streams off disk in `_UPLOAD_CHUNK_BYTES` pieces
+        rather than being read into one buffer: the caller staged the file
+        precisely so the *download* never sat in RAM in full, and buffering it
+        back for the upload gave that right back. This is not the hand-rolled
+        chunked protocol the previous comment here warned against — the
+        Content-Length header below keeps httpx off `Transfer-Encoding: chunked`,
+        so the request on the wire is identical to the buffered version. Polls
+        the file resource's `state` only if the API reports PROCESSING; small
+        image/audio files finalize as ACTIVE immediately and skip the poll
+        entirely.
         """
         file_size = os.path.getsize(path)
         client = get_google_rest_client()
@@ -678,16 +738,16 @@ class GoogleRESTModel:
         if not upload_url:
             raise Exception("Google API Error: resumable upload start returned no upload URL")
 
-        file_bytes = await asyncio.to_thread(_read_file_bytes, path)
-
         upload_resp = await client.post(
             upload_url,
             headers={
+                # Explicit, and load-bearing: it suppresses httpx's chunked
+                # transfer-encoding default for a streamed body.
                 "Content-Length": str(file_size),
                 "X-Goog-Upload-Offset": "0",
                 "X-Goog-Upload-Command": "upload, finalize",
             },
-            content=file_bytes,
+            content=_aiter_file_bytes(path),
         )
         if upload_resp.status_code != 200:
             raise Exception(f"Google API Error {upload_resp.status_code}: {upload_resp.text}")
@@ -764,9 +824,19 @@ class GoogleRESTModel:
             # An unresolvable media part is dropped, never fatal to the turn — the
             # per-URL try/except this replaced behaved the same way. CancelledError
             # is a BaseException and still propagates, as it must.
-            print(f"Failed to resolve media {url} for the Gemini File API: {e}")
+            print(
+                f"Failed to resolve media {url} for the Gemini File API: "
+                f"{type(e).__name__}({e or 'no detail'})"
+            )
             uri = None
         finally:
+            # Media transfers churn the allocator harder than anything else the
+            # bot does. Hand the freed pages back rather than letting them sit at
+            # the top of an arena until the process exits. Placed here rather than
+            # in _download_and_upload so the local-file branch -- which is how a
+            # *generated* image reaches the model -- is covered too. Rate-limited,
+            # so a multi-participant round pays for this once.
+            maybe_trim_malloc()
             _file_uri_inflight.pop(key, None)
             if not future.done():
                 # Resolved rather than raised: waiters take the same None-means-drop
@@ -776,6 +846,10 @@ class GoogleRESTModel:
 
     async def _download_and_upload(self, url: str, mime_type: str) -> Optional[str]:
         temp_path = None
+        # Which half failed matters: a bad Discord CDN URL and a failed File API
+        # upload need completely different investigation, and this used to report
+        # both as "Failed to fetch media from URL".
+        stage = "download"
         try:
             import tempfile
 
@@ -786,12 +860,23 @@ class GoogleRESTModel:
             async with client_http.stream("GET", url, follow_redirects=True, timeout=15.0) as resp:
                 resp.raise_for_status()
                 with os.fdopen(fd, 'wb') as f:
-                    async for chunk in resp.aiter_bytes(chunk_size=8192):
+                    async for chunk in resp.aiter_bytes(chunk_size=_DOWNLOAD_CHUNK_BYTES):
                         f.write(chunk)
 
+            stage = "upload"
             return await self._upload_file(temp_path, mime_type)
         except Exception as e:
-            print(f"Failed to fetch media from URL {url}: {e}")
+            # Transport errors out of httpx/anyio frequently carry an empty
+            # message -- a bare `{e}` then prints nothing at all and the log line
+            # is useless. The type is always worth having.
+            detail = str(e) or "no detail"
+            size = ""
+            if stage == "upload" and temp_path:
+                try:
+                    size = f", {os.path.getsize(temp_path)} bytes staged"
+                except OSError:
+                    pass
+            print(f"Media {stage} failed for {url}{size}: {type(e).__name__}({detail})")
             return None
         finally:
             if temp_path and os.path.exists(temp_path):
@@ -1320,16 +1405,18 @@ class APIService:
 
         if openrouter_key:
             try:
-                async with httpx.AsyncClient() as client:
-                    headers = {"Authorization": f"Bearer {openrouter_key}"}
-                    response = await client.get("https://openrouter.ai/api/v1/auth/key", headers=headers)
-                    
-                    if response.status_code == 401:
-                        return False, "The OpenRouter API key provided is invalid or has been revoked.", "none"
-                    elif response.status_code != 200:
-                        return False, f"OpenRouter validation failed with status code: {response.status_code}", "none"
-                    
-                    detected_tier = "paid" 
+                client = get_shared_client()
+                headers = {"Authorization": f"Bearer {openrouter_key}"}
+                # 5s explicitly: this used to ride on httpx.AsyncClient's own
+                # default, which the shared client raises to 30s.
+                response = await client.get("https://openrouter.ai/api/v1/auth/key", headers=headers, timeout=5.0)
+                
+                if response.status_code == 401:
+                    return False, "The OpenRouter API key provided is invalid or has been revoked.", "none"
+                elif response.status_code != 200:
+                    return False, f"OpenRouter validation failed with status code: {response.status_code}", "none"
+                
+                detected_tier = "paid" 
 
             except httpx.RequestError as e:
                 return False, f"Could not validate the OpenRouter key due to a network error: {e}", "none"
@@ -1361,22 +1448,21 @@ class APIService:
             }
 
             try:
-                async with httpx.AsyncClient() as client:
-                    resp = await client.get("https://openrouter.ai/api/v1/models", timeout=15.0)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        for model in data.get("data", []):
-                            m_id = model.get("id")
-                            pricing = model.get("pricing", {})
-                            try:
-                                prompt_rate = float(pricing.get("prompt", 0.0)) * 1000000
-                                completion_rate = float(pricing.get("completion", 0.0)) * 1000000
-                                rates[f"OPENROUTER/{m_id}"] = {
-                                    "input_1m": prompt_rate,
-                                    "output_1m": completion_rate
-                                }
-                            except (ValueError, TypeError):
-                                pass
+                resp = await get_shared_client().get("https://openrouter.ai/api/v1/models", timeout=15.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for model in data.get("data", []):
+                        m_id = model.get("id")
+                        pricing = model.get("pricing", {})
+                        try:
+                            prompt_rate = float(pricing.get("prompt", 0.0)) * 1000000
+                            completion_rate = float(pricing.get("completion", 0.0)) * 1000000
+                            rates[f"OPENROUTER/{m_id}"] = {
+                                "input_1m": prompt_rate,
+                                "output_1m": completion_rate
+                            }
+                        except (ValueError, TypeError):
+                            pass
             except Exception as e:
                 print(f"Warning: Failed to fetch OpenRouter pricing: {e}")
 

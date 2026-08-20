@@ -22,6 +22,7 @@ from ..utils.constants import (
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS,
     DEFAULT_AUTO_MODERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS,
 )
+from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
 
@@ -732,12 +733,13 @@ class ProfileManager:
         
         if avatar_url:
             try:
+                # The spoofed User-Agent rides on the request, not the client, so
+                # this can share the process-wide pool with everything else.
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(avatar_url, follow_redirects=True, timeout=10.0, headers=headers)
-                    response.raise_for_status()
-                    image_data = await response.aread()
-                    content_type = response.headers.get("Content-Type", "image/png")
+                response = await get_shared_client().get(avatar_url, follow_redirects=True, timeout=10.0, headers=headers)
+                response.raise_for_status()
+                image_data = response.content
+                content_type = response.headers.get("Content-Type", "image/png")
             except httpx.RequestError as e:
                 return False, f"Could not download the avatar image from the provided URL: {e}"
             except Exception as e:
