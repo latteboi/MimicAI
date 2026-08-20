@@ -12,7 +12,7 @@ import discord
 
 from ..utils.constants import (
     defaultConfig, FALLBACK_MODEL_NAME, DEFAULT_SAFETY_SETTINGS,
-    DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS, MIN_HISTORY_FOR_LTM_CREATION,
+    MIN_HISTORY_FOR_LTM_CREATION,
     DEFAULT_TRAINING_ANALYST_PROMPT,
 )
 from ..utils.helpers import Timeout, _format_api_error, _get_sanitized_history_and_author
@@ -461,7 +461,7 @@ class MemoryManager:
         if len(convo) > 3000: # Slightly higher limit for formatted text
             convo = convo[-3000:]
 
-        instructions = DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS
+        instructions = self.cog.profile_manager._default_ltm_summarization_instructions()
         if profile_owner_id and profile_name:
             user_index = self.cog.profile_manager._get_user_index(profile_owner_id)
             is_borrowed = profile_name in user_index.get("borrowed", [])
@@ -470,8 +470,11 @@ class MemoryManager:
             source_owner_id, source_profile_name = self.cog.profile_manager._resolve_effective_profile(profile_owner_id, profile_name)
             prompts = self.cog.profile_manager._get_profile_prompts(source_owner_id, source_profile_name) or {}
 
-            encrypted_instructions = prompts.get("ltm_summarization_instructions", self.cog.storage_manager._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS))
-            instructions = self.cog.storage_manager._decrypt_data(encrypted_instructions)
+            encrypted_instructions = prompts.get("ltm_summarization_instructions")
+            if encrypted_instructions:
+                # A stored-but-blank value used to yield blank instructions.
+                instructions = (self.cog.storage_manager._decrypt_data(encrypted_instructions).strip()
+                                or self.cog.profile_manager._default_ltm_summarization_instructions())
 
         cfg = {"temperature": 0.2}
 

@@ -190,7 +190,7 @@ class MimicCog(commands.Cog, EventListeners):
         self.model_override_warnings_sent: Set[Tuple[int, int, str]] = set()
         self.debug_users: Set[int] = set()
         self.global_chat_sessions: LRUCache = LRUCache(max_size=10)
-        self.purged_message_ids: Set[int] = set()
+        self.purged_message_ids: LRUCache = LRUCache(PURGED_MESSAGE_ID_CACHE_MAX_SIZE)
         self.pending_child_confirmations: LRUCache = LRUCache(max_size=200)
         self.global_blacklist: Set[int] = set()
         self.server_manager._load_blacklist()
@@ -1101,21 +1101,34 @@ class MimicCog(commands.Cog, EventListeners):
             return
 
         def check_and_track(m):
-            self.purged_message_ids.add(m.id)
+            self.purged_message_ids[m.id] = True
             return True
 
         session_lock = self.multi_profile_channels.get(interaction.channel_id)
-        if session_lock:
-            # Re-hydrate immediately before executing the Discord API purge
-            session_type = session_lock.get("type", "multi")
-            if not session_lock.get("is_hydrated"):
-                session_lock = await self.session_manager._ensure_session_hydrated(interaction.channel_id, session_type)
-                
-            session_lock['is_purging'] = True
-            while session_lock.get('is_running') or session_lock.get('is_regenerating'):
-                await asyncio.sleep(0.5)
 
         try:
+            if session_lock:
+                # Re-hydrate immediately before executing the Discord API purge
+                session_type = session_lock.get("type", "multi")
+                if not session_lock.get("is_hydrated"):
+                    session_lock = await self.session_manager._ensure_session_hydrated(interaction.channel_id, session_type)
+
+                session_lock['is_purging'] = True
+                # This wait is bounded, and it sits inside the try so the finally below
+                # always clears is_purging. generation_service and both reaction
+                # listeners spin on is_purging, so leaking it True wedges every future
+                # turn in the channel for the life of the process -- and a worker that
+                # died with is_running still set is exactly what produces that.
+                wait_deadline = time.monotonic() + PURGE_BUSY_WAIT_TIMEOUT_SECONDS
+                while (session_lock.get('is_running') or session_lock.get('is_regenerating')
+                       or session_lock.get('is_whispering')):
+                    if time.monotonic() > wait_deadline:
+                        await interaction.followup.send(
+                            f"The session is still generating after {int(PURGE_BUSY_WAIT_TIMEOUT_SECONDS)}s. "
+                            "Nothing was deleted \u2014 try again in a moment.", ephemeral=True)
+                        return
+                    await asyncio.sleep(0.5)
+
             messages_to_delete = await interaction.channel.purge(limit=amount, check=check_and_track, before=interaction.created_at, reason=f"Purge by {interaction.user}")
             
             progress_message = await interaction.followup.send(f"Deleted {len(messages_to_delete)} message(s). Now cleaning them from my memory...", ephemeral=True)
@@ -1127,31 +1140,42 @@ class MimicCog(commands.Cog, EventListeners):
                 session_type = session.get("type", "multi")
                 
                 deleted_msg_ids = {m.id for m in messages_to_delete}
-                turn_ids_to_delete = set()
+                unified_log = session.get("unified_log", [])
 
-                # Find which turns contain the deleted message IDs
-                for turn in session.get("unified_log", []):
-                    turn_msg_ids = turn.get("message_ids", [])
-                    if any(mid in deleted_msg_ids for mid in turn_msg_ids):
-                        turn_ids_to_delete.add(turn.get("turn_id"))
+                # One pass, keeping the turn objects rather than only their ids. The
+                # counter decrement below used to re-scan the whole log once per deleted
+                # turn to find each object again -- O(deleted x log) for something the
+                # first pass already had in hand.
+                turns_to_delete = [
+                    turn for turn in unified_log
+                    if any(mid in deleted_msg_ids for mid in turn.get("message_ids", []))
+                ]
 
-                if turn_ids_to_delete:
-                    cleaned_turns_count = len(turn_ids_to_delete)
-                    
-                    # Decrement Individual Counters
-                    for t_id in turn_ids_to_delete:
-                        turn_obj = next((turn for turn in session.get("unified_log", []) if turn.get("turn_id") == t_id), None)
-                        if turn_obj and turn_obj.get("is_user") is False:
-                            bot_pid = turn_obj.get("speaker_pid")
-                            for p in session.get('profiles', []):
-                                if self.profile_manager._get_pid_from_name_any(p['owner_id'], p['profile_name']) == bot_pid:
-                                    p['ltm_counter'] = max(0, p.get('ltm_counter', 0) - 1)
-                                    break
+                if turns_to_delete:
+                    cleaned_turns_count = len(turns_to_delete)
 
-                    original_log_len = len(session.get("unified_log", []))
+                    # speaker_pid -> participant, resolved once. This was previously a
+                    # linear scan of the participant list, with a name->pid lookup per
+                    # candidate, repeated for every deleted turn.
+                    pid_to_profile = {}
+                    for p in session.get('profiles', []):
+                        pid = self.profile_manager._get_pid_from_name_any(p['owner_id'], p['profile_name'])
+                        pid_to_profile.setdefault(pid, p)
+
+                    for turn_obj in turns_to_delete:
+                        if turn_obj.get("is_user") is False:
+                            p = pid_to_profile.get(turn_obj.get("speaker_pid"))
+                            if p:
+                                p['ltm_counter'] = max(0, p.get('ltm_counter', 0) - 1)
+
+                    # Filter by object identity, not by turn_id. A turn carrying no
+                    # turn_id contributed None to the old id set, and every *other*
+                    # turn without a turn_id then matched `not in` and was dropped with
+                    # it -- silently deleting history the purge never touched.
+                    doomed = {id(turn) for turn in turns_to_delete}
+                    original_log_len = len(unified_log)
                     session["unified_log"] = [
-                        turn for turn in session.get("unified_log", [])
-                        if turn.get("turn_id") not in turn_ids_to_delete
+                        turn for turn in unified_log if id(turn) not in doomed
                     ]
 
                     if len(session["unified_log"]) < original_log_len:
@@ -1168,9 +1192,10 @@ class MimicCog(commands.Cog, EventListeners):
                         else:
                             await self.session_manager._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
 
-                        # Now that the correct state is on disk, force a re-read and rebuild
-                        session["is_hydrated"] = False
-                        await self.session_manager._ensure_session_hydrated(interaction.channel_id, session_type)
+                        # Deleting turns can strand or reveal a pending whisper, which is
+                        # the only state a rebuild derives -- so recompute that directly
+                        # rather than re-reading the log we just wrote.
+                        self.session_manager._recompute_pending_whispers(session)
 
                     self.session_last_accessed[interaction.channel_id] = time.time()
 

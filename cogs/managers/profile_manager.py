@@ -533,7 +533,7 @@ class ProfileManager:
 
             prompts = {
                 "persona": {}, "ai_instructions": ["", "", "", ""], "image_generation_prompt": None,
-                "ltm_summarization_instructions": self.cog.storage_manager._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
+                "ltm_summarization_instructions": self.cog.storage_manager._encrypt_data(self._default_ltm_summarization_instructions())
             }
 
             unified_profile = {
@@ -588,7 +588,7 @@ class ProfileManager:
                 },
                 "ai_instructions": [self.cog.storage_manager._encrypt_data("Answer questions concisely using the provided documentation. If you do not know the answer, state that you do not know."), "", "", ""],
                 "image_generation_prompt": None,
-                "ltm_summarization_instructions": self.cog.storage_manager._encrypt_data(DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
+                "ltm_summarization_instructions": self.cog.storage_manager._encrypt_data(self._default_ltm_summarization_instructions())
             }
 
             unified_profile = {
@@ -1464,6 +1464,19 @@ class ProfileManager:
 
         return embed
     
+
+    def _default_ltm_summarization_instructions(self) -> str:
+        """The LTM summariser prompt a profile gets when it has none of its own.
+
+        /mod's "LTM Summarization" entry writes global_prompts, which nothing read
+        before -- summarisation resolves the prompt per-profile. This makes the
+        global the source of that per-profile default, so it governs newly created
+        profiles, the GUI's reset-to-default, and any profile whose stored value is
+        blank. A profile that already has its own text keeps it; changing the global
+        does not rewrite existing profiles.
+        """
+        return self.cog.global_prompts.get(
+            "LTM_SUMMARIZATION_INSTRUCTIONS", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
 
     async def _build_profile_manage_embed(self, interaction: discord.Interaction, profile_name: str, target_user_id: Optional[int] = None) -> discord.Embed:
         return await self._build_profile_embed(target_user_id or interaction.user.id, profile_name, interaction.channel_id)

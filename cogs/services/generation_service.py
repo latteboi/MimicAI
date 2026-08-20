@@ -15,7 +15,12 @@ from zoneinfo import ZoneInfo
 from ..utils.constants import (
     defaultConfig, OLLAMA_LOCAL_URL, PLACEHOLDER_EMOJI,
     ERR_GENERAL_ERROR, ERR_REASON_EMPTY_RESPONSE, ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK,
+    WHISPER_BUSY_WAIT_TIMEOUT_SECONDS,
     WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED, WARN_VOICE_SYNTHESIS_FAILED,
+    DEFAULT_KICKSTART_START, DEFAULT_KICKSTART_CONTINUE, DEFAULT_KICKSTART_IDLE,
+    DEFAULT_WHISPER_RECAP, DEFAULT_DIRECTOR_USER_PROMPT, DEFAULT_IMAGE_APPEARANCE,
+    DEFAULT_IMAGE_GROUNDING, DEFAULT_NEGATIVE_CONSTRAINTS, DEFAULT_IMAGE_PRESENT,
+    DEFAULT_IMAGE_PRESENT_OTHER, DEFAULT_IMAGE_FAILED,
 )
 from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt, _format_history_entry, _get_user_hash, _scrub_response_text, _split_into_sentences_with_abbreviations
 from ..managers.memory_manager import encode_embedding_b64
@@ -73,7 +78,19 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     
                     while session.get('is_purging') or session.get('is_regenerating'):
                         await asyncio.sleep(0.5)
-                        
+
+                    # Yield to a whisper that is already queued for this channel. Without
+                    # this the whisper polls for an idle instant that a busy channel never
+                    # offers -- the worker re-arms is_running within the same event-loop
+                    # tick that the previous round cleared it, and the whisper's 0.5 s poll
+                    # loses every time. Waiting on the counter rather than on is_whispering
+                    # is what closes that gap: it is set before the whisper starts waiting.
+                    # This cannot deadlock -- a whisper never waits on this counter, and it
+                    # drops the counter at the instant it claims is_whispering.
+                    if session.get('whisper_waiting'):
+                        await self.cog.session_manager._wait_for_session_flags(
+                            session, ('whisper_waiting',), WHISPER_BUSY_WAIT_TIMEOUT_SECONDS)
+
                     session['is_running'] = True
 
                 except asyncio.CancelledError:
@@ -96,6 +113,21 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     valid_triggers.append(t)
                 
                 all_triggers_for_round = valid_triggers
+
+                # This drain is the only consumer of cancelled_reaction_triggers, so a
+                # key that survives it is stale: it cancelled a trigger that was never
+                # queued, or one an earlier round already ran. Leaving them made this an
+                # unbounded set keyed by message id -- and worse, a stale
+                # (message_id, emoji) silently swallowed the *next* identical reaction on
+                # that message. It is reachable whenever msg.clear_reaction fails, which
+                # needs Manage Messages -- a permission the bot often lacks, as /purge
+                # checking for it explicitly implies -- because the user then removes the
+                # emoji by hand and strands a key every single time. There is no await
+                # between the filter above and this clear, so nothing can be recorded in
+                # the gap.
+                cancelled_keys = session.get('cancelled_reaction_triggers')
+                if cancelled_keys:
+                    cancelled_keys.clear()
 
                 # [NEW] Record the start of this batch for Hybrid STM
                 batch_start_index = len(session.get("unified_log", []))
@@ -123,7 +155,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                         hist_text = ""
                                         for ht in session.get("unified_log", [])[-10:]:
                                             hist_text += f"{ht.get('content', '')}\n"
-                                        resp = await m.generate_content_async([f"Recent History:\n{hist_text}\n\nGenerate your Director's prompt."])
+                                        director_template = self.cog.global_prompts.get("DIRECTOR_USER_PROMPT", DEFAULT_DIRECTOR_USER_PROMPT)
+                                        resp = await m.generate_content_async([director_template.format(history=hist_text)])
                                         if resp and resp.text: director_prompt = f"<internal_note>Director's Note: {resp.text.strip()}</internal_note>"
                                 except Exception as e: print(f"AI Director failed: {e}")
                         all_triggers_for_round[i] = director_prompt
@@ -614,6 +647,28 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             bypass_typing=True
                         ))
 
+                # --- Whisper barrier ---
+                # A whisper claims the channel and everything else queues behind it. The
+                # wait sits *here*, deliberately: the placeholder and typing indicator above
+                # have already been dispatched, so the profile that is up next shows its
+                # feedback immediately and does the waiting silently, exactly as if it were
+                # composing a long reply. Putting it earlier -- with the other flag waits at
+                # the top of the loop -- would leave the channel showing nothing at all for
+                # the length of the whisper.
+                #
+                # It also has to be before the prompt is built rather than only before the
+                # model call: the whisper appends its turns to unified_log when it lands, and
+                # a round that had already derived its history would answer a conversation
+                # missing them.
+                #
+                # Bounded, and proceeds anyway on timeout -- a leaked is_whispering must
+                # degrade to "the round runs late", never to a channel that stops answering.
+                if session.get('is_whispering'):
+                    if not await self.cog.session_manager._wait_for_session_flags(
+                        session, ('is_whispering',), WHISPER_BUSY_WAIT_TIMEOUT_SECONDS
+                    ):
+                        print(f"Whisper barrier timed out in channel {channel_id}; proceeding with the round.")
+
                 was_blocked = False
                 generator_profile_key = None
                 generator_display_name = "A participant"
@@ -733,7 +788,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     
                     if g_context:
                         if is_image_gen_round:
-                            image_gen_prompt = f"{image_gen_prompt}\n\nUse this information to help generate the image:\n{g_context}"
+                            grounding_template = self.cog.global_prompts.get("IMAGE_GROUNDING", DEFAULT_IMAGE_GROUNDING)
+                            image_gen_prompt = grounding_template.format(prompt=image_gen_prompt, grounding=g_context)
                         else:
                             grounding_context = g_context
                             # [NEW] Sticky Grounding: Purge previous search results from history
@@ -814,7 +870,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 if any(pronoun in prompt_lower.split() for pronoun in second_person_pronouns) or \
                                    generator_display_name.lower() in prompt_lower or \
                                    gen_profile_name.lower() in prompt_lower:
-                                    final_prompt_text = f"Your appearance:\n{appearance_text.strip()}\n\nUser's prompt:\n{image_gen_prompt}"
+                                    appearance_template = self.cog.global_prompts.get("IMAGE_APPEARANCE", DEFAULT_IMAGE_APPEARANCE)
+                                    final_prompt_text = appearance_template.format(appearance=appearance_text.strip(), prompt=image_gen_prompt)
                             
                             ref_images = []
                             for _, _, turn_media in new_round_turn_data:
@@ -1075,7 +1132,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             contents_for_api_call.append({'role': 'user', 'parts': [url_instr]})
 
                         if not contents_for_api_call:
-                            contents_for_api_call.append({'role': 'user', 'parts':["<internal_note>Start the conversation.</internal_note>"]})
+                            contents_for_api_call.append({'role': 'user', 'parts':[self.cog.global_prompts.get("KICKSTART_START", DEFAULT_KICKSTART_START)]})
 
                         dynamic_context_for_turn = image_gen_prompt
 
@@ -1143,7 +1200,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             contents_for_api_call.append({'role': 'user', 'parts': [url_instr]})
 
                         if not contents_for_api_call:
-                            contents_for_api_call.append({'role': 'user', 'parts':["<internal_note>Start the conversation.</internal_note>"]})
+                            contents_for_api_call.append({'role': 'user', 'parts':[self.cog.global_prompts.get("KICKSTART_START", DEFAULT_KICKSTART_START)]})
 
                         # [NEW] Hybrid STM: Rebuild history dynamically from unified_log
                         bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
@@ -1208,7 +1265,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     session["critic_cache"][participant_key] = {"text": critic_constraints, "rounds": 1}
 
                         if critic_constraints:
-                            full_system_instruction += f"\n\nNEGATIVE CONSTRAINTS (STRICT ADHERENCE REQUIRED):\n{critic_constraints}"
+                            constraints_block = self.cog.global_prompts.get("NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS)
+                            full_system_instruction += "\n\n" + constraints_block.format(constraints=critic_constraints)
 
                         safety_level_str = p_settings.get('safety_level', 'low')
 
@@ -1289,9 +1347,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         if contents_for_api_call and contents_for_api_call[-1].get('role', contents_for_api_call[-1].get('role', 'user')) == 'model':
                             last_model_text = "".join(p if isinstance(p, str) else p.get('text', '') for p in contents_for_api_call[-1].get('parts', []))
                             if "<private_response>" in last_model_text:
-                                pseudo_user_turn = {'role': 'user', 'parts': ["<internal_note>Continue the public conversation.</internal_note>"]}
+                                pseudo_user_turn = {'role': 'user', 'parts': [self.cog.global_prompts.get("KICKSTART_CONTINUE", DEFAULT_KICKSTART_CONTINUE)]}
                             else:
-                                pseudo_user_turn = {'role': 'user', 'parts': ["<internal_note>No response from anyone OR no user is present.</internal_note>"]}
+                                pseudo_user_turn = {'role': 'user', 'parts': [self.cog.global_prompts.get("KICKSTART_IDLE", DEFAULT_KICKSTART_IDLE)]}
                             contents_for_api_call.append(pseudo_user_turn)
 
                         # Collect all supplementary context to inject into the final user turn
@@ -1300,9 +1358,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # [UPDATED] Standardised XML injection for pending whispers
                         pending_whispers = session.get("pending_whispers", {}).pop(participant_key, None)
                         if pending_whispers:
-                            whisper_context = "<whisper_context>\n"
-                            whisper_context += "SYSTEM NOTE: You previously received and replied to these private whispers. Keep them in mind for context, but behave how you would treat whispers.\n"
-                            whisper_context += "\n---\n" + "\n---\n".join(pending_whispers) + "\n</whisper_context>"
+                            recap_template = self.cog.global_prompts.get("WHISPER_RECAP", DEFAULT_WHISPER_RECAP)
+                            whisper_context = recap_template.format(whispers="\n---\n".join(pending_whispers))
                             supplementary_parts.append(whisper_context)
 
                         if grounding_context and p_settings.get("grounding_mode", "off") != "off":
@@ -1327,7 +1384,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         
                         if is_image_gen_round:
                             if generated_image_path_for_round:
-                                system_note = f"<image_context>You have just generated the following image based on the prompt: '{image_gen_prompt}'. Present it with a comment.</image_context>" if is_generator else f"<image_context>'{generator_display_name}' just generated the following image based on the prompt: '{image_gen_prompt}'. Comment on it.</image_context>"
+                                if is_generator:
+                                    present_template = self.cog.global_prompts.get("IMAGE_PRESENT", DEFAULT_IMAGE_PRESENT)
+                                    system_note = present_template.format(prompt=image_gen_prompt)
+                                else:
+                                    other_template = self.cog.global_prompts.get("IMAGE_PRESENT_OTHER", DEFAULT_IMAGE_PRESENT_OTHER)
+                                    system_note = other_template.format(name=generator_display_name, prompt=image_gen_prompt)
                                 
                                 text_gen_parts = [
                                     system_note, 
@@ -1337,11 +1399,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             else:
                                 if is_generator:
                                     fail_reason = image_gen_error_msg or "Safety Filter / Unknown"
-                                    system_note = f"<image_context>Your attempt to generate an image based on the prompt '{image_gen_prompt}' failed due to: {fail_reason}. Comment on this failure in character.</image_context>"
+                                    failed_template = self.cog.global_prompts.get("IMAGE_FAILED", DEFAULT_IMAGE_FAILED)
+                                    system_note = failed_template.format(prompt=image_gen_prompt, reason=fail_reason)
                                     supplementary_parts.append(system_note)
 
                         if not contents_for_api_call:
-                            contents_for_api_call.append({'role': 'user', 'parts': ["<internal_note>Begin conversation.</internal_note>"]})
+                            contents_for_api_call.append({'role': 'user', 'parts': [self.cog.global_prompts.get("KICKSTART_START", DEFAULT_KICKSTART_START)]})
 
                         # Inject supplementary parts into the final user turn to ensure alternating roles
                         if supplementary_parts:

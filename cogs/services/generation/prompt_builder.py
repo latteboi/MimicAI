@@ -7,7 +7,7 @@ from typing import Any, Optional, Dict, List, Tuple
 from ...utils.constants import (
     defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
     DEFAULT_SYSTEM_INSTRUCTION, DEFAULT_CONTEXT_RULES, DEFAULT_NEURO_INSTRUCTION,
-    DEFAULT_TRAINING_DATA_INJECTION,
+    DEFAULT_TRAINING_DATA_INJECTION, DEFAULT_TIME_CONTEXT, DEFAULT_NEGATIVE_CONSTRAINTS,
 )
 from ...utils.helpers import Timeout
 
@@ -76,17 +76,18 @@ class PromptBuilderMixin:
             final_instr_parts.append(neuro_block)
 
         if time_tracking_enabled:
+            time_template = self.cog.global_prompts.get("TIME_CONTEXT", DEFAULT_TIME_CONTEXT)
             try:
                 from ...utils.helpers import _resolve_zoneinfo
                 tz, _ = _resolve_zoneinfo(timezone_str)
                 now = datetime.datetime.now(tz)
                 time_str = now.strftime("%A, %d %B %Y, %I:%M %p (%Z)")
-                final_instr_parts.append(f"<time_context>\nYour current time is {time_str}.\n</time_context>")
+                final_instr_parts.append(time_template.format(time_str=time_str))
             except Exception as e:
                 print(f"Error processing timezone '{timezone_str}': {e}. Defaulting to UTC.")
                 now_utc = datetime.datetime.now(datetime.timezone.utc)
                 time_str_utc = now_utc.strftime("%A, %d %B %Y, %I:%M %p (UTC)")
-                final_instr_parts.append(f"<time_context>\nYour current time is {time_str_utc}.\n</time_context>")
+                final_instr_parts.append(time_template.format(time_str=time_str_utc))
 
         if persona_data and any(persona_data.values()):
             persona_blocks = []
@@ -131,7 +132,8 @@ class PromptBuilderMixin:
             current_instructions_str += f"\n\n{recalled_ltm}"
 
         if critic_constraints:
-            current_instructions_str += f"\n\n<negative_constraints>\nSTRICT ADHERENCE REQUIRED:\n{critic_constraints}\n</negative_constraints>"
+            constraints_block = self.cog.global_prompts.get("NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS)
+            current_instructions_str += "\n\n" + constraints_block.format(constraints=critic_constraints)
 
         rule_block = self.cog.global_prompts.get("CONTEXT_RULES", DEFAULT_CONTEXT_RULES)
 

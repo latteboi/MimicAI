@@ -575,19 +575,72 @@ class SessionManager:
         session["unified_log"] = unified_log
 
         # 3. Synchronise Memory for all current participants
-        num_participants = len(session.get("profiles", []))
-        session["pending_whispers"] = {}
+        self._recompute_pending_whispers(session, force=True)
 
-        for p_data in session["profiles"]:
+        session["is_hydrated"] = True
+        return session
+
+    def _recompute_pending_whispers(self, session: Dict, force: bool = False) -> None:
+        """Re-derives session['pending_whispers'] from unified_log, in place.
+
+        This is the *only* state a session rebuild derives. Everything else in
+        _ensure_session_hydrated is either unconditional (the participant
+        validation above the is_hydrated check) or dead for an engaged session
+        (the server-index branch, gated on an empty profile list). So the paths
+        that mutate unified_log and then flush it call this directly, instead of
+        forcing an is_hydrated=False + rehydrate round-trip. That round-trip
+        re-read, decrypted, decompressed and re-parsed the whole session log to
+        arrive back at the log it already held correctly in memory -- measured at
+        2.4 ms and ~15 MB of immediately-discarded allocation for a 1000-turn log,
+        GIL-held inside orjson -- and its "no disk log, but a memory log" branch
+        re-wrote session files the caller had just deleted.
+
+        No-op while a round is in flight, on purpose. _multi_profile_worker pops a
+        participant's whispers when it builds that participant's prompt, but the
+        bot's own turn -- which this derivation reads as the signal that a whisper
+        has been answered -- does not reach unified_log until the response lands.
+        Recomputing inside that window marks consumed whispers pending again and
+        re-injects them on the participant's next turn. Deferring is safe, and is
+        also what recovers them: a round cancelled mid-flight never writes its
+        turn, so the whispers stay derivable from the log and come back on the
+        next rebuild. Hydration passes force=True -- it is establishing initial
+        state, and at that point nothing has been popped.
+        """
+        if not force and (session.get('is_running') or session.get('is_regenerating')):
+            return
+
+        unified_log = session.get("unified_log", [])
+        pending_map = {}
+
+        for p_data in session.get("profiles", []):
             p_key = (p_data['owner_id'], p_data['profile_name'])
             bot_pid = self.cog.profile_manager._get_pid_from_name_any(p_data['owner_id'], p_data['profile_name'])
 
             pending = self._get_pending_whispers_for_participant(unified_log, bot_pid)
             if pending:
-                session["pending_whispers"][p_key] = pending
+                pending_map[p_key] = pending
 
-        session["is_hydrated"] = True
-        return session
+        session["pending_whispers"] = pending_map
+
+    async def _wait_for_session_flags(self, session: Dict, flags: Tuple[str, ...], timeout: float) -> bool:
+        """Spin until none of `flags` is set on the session. True if it cleared, False on timeout.
+
+        Bounded on purpose. Every one of these flags is cleared in a finally, but a worker
+        that dies in the wrong place still leaks one, and an unbounded spin then blocks the
+        channel for the life of the process -- which is exactly what /purge's wait used to
+        do (see PURGE_BUSY_WAIT_TIMEOUT_SECONDS). A caller that times out must decide for
+        itself whether to proceed or abandon; this only reports which happened.
+
+        A caller claiming the channel must assign its own flag *synchronously* on the True
+        return, with no await in between. The event loop is single-threaded and this returns
+        without yielding, so check-then-set is atomic only for as long as that holds.
+        """
+        deadline = time.monotonic() + timeout
+        while any(session.get(flag) for flag in flags):
+            if time.monotonic() > deadline:
+                return False
+            await asyncio.sleep(0.5)
+        return True
 
     def _mark_session_accessed(self, key):
         ts = time.time()
@@ -608,7 +661,13 @@ class SessionManager:
             if self.cog.session_last_accessed.get(key) == ts:
                 if isinstance(key, int):
                     session = self.cog.multi_profile_channels.get(key)
-                    if session and (session.get('is_running') or session.get('is_regenerating') or session.get('is_purging')):
+                    # whisper_waiting counts as busy as well: a queued whisper holds a
+                    # reference to this session dict and reads its unified_log the moment it
+                    # claims the channel, and dehydrating underneath it would have the
+                    # profile answer with no history at all.
+                    if session and (session.get('is_running') or session.get('is_regenerating')
+                                    or session.get('is_purging') or session.get('is_whispering')
+                                    or session.get('whisper_waiting')):
                         continue
                 keys_to_evict.add(key)
 
@@ -635,6 +694,12 @@ class SessionManager:
                     # Clear the large data structures from the in-memory dictionary.
                     if 'unified_log' in session_to_evict:
                         del session_to_evict['unified_log']
+                    # Both are re-derived on the next hydration (pending_whispers from
+                    # the log, cancellations only matter for a queued trigger), and
+                    # dropping the cancellation set is what bounds it for a session
+                    # that is abandoned before its worker next drains the queue.
+                    session_to_evict.pop('cancelled_reaction_triggers', None)
+                    session_to_evict.pop('pending_whispers', None)
                     # Clean up LTM recall history for participants in this channel to prevent RAM leak
                     for p in session_to_evict.get("profiles", []):
                         full_key = (key, p.get("owner_id"), p.get("profile_name"))
@@ -827,6 +892,7 @@ class SessionManager:
             session['is_running'] = False
             session['is_regenerating'] = False
             session['is_purging'] = False
+            session['is_whispering'] = False
 
             # Drain task queue completely
             q = session.get('task_queue')

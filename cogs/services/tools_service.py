@@ -9,7 +9,7 @@ from ..utils.constants import (
     FALLBACK_MODEL_NAME, MAX_URL_CONTEXT_CHARACTERS, MAX_URL_FETCH_BYTES, WARN_URL_FETCHING_FAILED,
     WARN_GROUNDING_FAILED, DEFAULT_ANTI_REPETITION_PROMPT, DEFAULT_WEB_GROUNDING_VISUAL,
     DEFAULT_WEB_GROUNDING_TEXT, PATTERN_HTML_CONTAINERS, PATTERN_HTML_TAGS,
-    PATTERN_HTML_BLANKLINES,
+    PATTERN_HTML_BLANKLINES, DEFAULT_GROUNDING_RAG_PAYLOAD,
 )
 from ..utils.helpers import _add_inline_citations, _format_api_error, _truncate_text_by_char
 from .api_service import GoogleGenAIModel
@@ -257,10 +257,8 @@ class ToolsService:
                 system_instruction = self.cog.global_prompts.get("WEB_GROUNDING_TEXT", DEFAULT_WEB_GROUNDING_TEXT)
 
             # [FIXED] Use XML structure for the data payload
-            user_prompt = (
-                f"<conversation_transcript>\n{history_transcript}\n</conversation_transcript>\n\n"
-                f"<user_query>\n{user_query}\n</user_query>"
-            )
+            payload_template = self.cog.global_prompts.get("GROUNDING_RAG_PAYLOAD", DEFAULT_GROUNDING_RAG_PAYLOAD)
+            user_prompt = payload_template.format(transcript=history_transcript, query=user_query)
 
             # [FIXED] Use universal dict configuration for Google GenAI v2 Tools
             grounding_tool = {"google_search": {}}

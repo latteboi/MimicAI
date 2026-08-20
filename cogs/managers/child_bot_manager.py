@@ -13,7 +13,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..utils.constants import PLACEHOLDER_EMOJI, HarmBlockThreshold, HARM_CATEGORIES, IMAGE_QUEUE_PRIORITY
+from ..utils.constants import (
+    PLACEHOLDER_EMOJI, HarmBlockThreshold, HARM_CATEGORIES, IMAGE_QUEUE_PRIORITY,
+    DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING,
+)
 from ..utils.helpers import _split_into_sentences_with_abbreviations
 from .storage_manager import IOManager
 
@@ -872,7 +875,8 @@ class ChildBotManager:
                 if any(pronoun in prompt_lower.split() for pronoun in second_person_pronouns) or \
                    bot_display_name.lower() in prompt_lower or \
                    profile_name.lower() in prompt_lower:
-                    final_prompt_text = f"Your appearance:\n{appearance_text.strip()}\n\nUser's prompt:\n{prompt_text}"
+                    appearance_template = self.cog.global_prompts.get("IMAGE_APPEARANCE", DEFAULT_IMAGE_APPEARANCE)
+                    final_prompt_text = appearance_template.format(appearance=appearance_text.strip(), prompt=prompt_text)
 
             system_instruction = self.cog.media_service._get_image_gen_system_instruction(owner_id, profile_name)
 
@@ -908,7 +912,8 @@ class ChildBotManager:
                 if grounding_result:
                     grounding_context, sources, *_ = grounding_result
                     if grounding_context:
-                        final_prompt_text = f"{prompt_text}\n\nUse this information to help generate the image:\n{grounding_context}"
+                        grounding_template = self.cog.global_prompts.get("IMAGE_GROUNDING", DEFAULT_IMAGE_GROUNDING)
+                        final_prompt_text = grounding_template.format(prompt=prompt_text, grounding=grounding_context)
                         grounding_sources = sources
 
             request_data = {

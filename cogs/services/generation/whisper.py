@@ -7,7 +7,10 @@ import discord
 import datetime
 from typing import Dict, Optional
 
-from ...utils.constants import defaultConfig, PLACEHOLDER_EMOJI, DEFAULT_WHISPER_INJECTION
+from ...utils.constants import (
+    defaultConfig, PLACEHOLDER_EMOJI, DEFAULT_WHISPER_INJECTION,
+    SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS, WHISPER_WAITING_NOTICE,
+)
 from ...utils.helpers import (
     _add_inline_citations, _format_citation_subtext, _format_history_entry,
     _get_user_hash, _scrub_response_text,
@@ -22,6 +25,20 @@ class WhisperMixin:
     """
 
     async def _execute_whisper(self, interaction: discord.Interaction, target_participant: Dict, whisper_message: str):
+        """Gate, claim, run, release.
+
+        A whisper is a blocking private turn. It never generates on top of a live round --
+        it would be answering a conversation that is still changing underneath it, and its
+        own turns would land in unified_log in the middle of one. So it waits for the
+        channel to go idle, claims it with is_whispering, and everything else queues behind
+        it until it lands: _multi_profile_worker holds before its model call (after posting
+        the placeholder, so the queued profile still shows feedback and waits silently), and
+        the regeneration reaction already queues on the same flags.
+
+        The claim is released in a finally. is_whispering is read by the worker, /purge, the
+        regeneration reaction and the eviction sweep, so leaking it True blocks all four for
+        the life of the process.
+        """
         session = self.cog.multi_profile_channels.get(interaction.channel_id)
 
         # [NEW] Force hydration if session exists or might exist on disk
@@ -44,6 +61,51 @@ class WhisperMixin:
         if participant_key not in participant_keys:
             await interaction.followup.send("An error occurred: Could not find that participant in this session.", ephemeral=True)
             return
+
+        # Announce the intent before waiting for the channel. The worker checks this
+        # counter before it claims a round, so a whisper cannot be starved by a channel
+        # that never goes quiet -- polling for an idle instant at 2 Hz would lose that race
+        # every time against a worker that re-arms is_running the moment its queue refills.
+        session['whisper_waiting'] = session.get('whisper_waiting', 0) + 1
+        waiting_msg = None
+        try:
+            # Tell the user *before* the wait, not after it -- an ephemeral that sits on
+            # "thinking" for a whole round is indistinguishable from a dead command. The
+            # notice is then edited into the placeholder rather than replaced, so this costs
+            # no extra message when the channel was busy and none at all when it was not.
+            if any(session.get(flag) for flag in SESSION_BUSY_FLAGS):
+                waiting_msg = await interaction.followup.send(WHISPER_WAITING_NOTICE, ephemeral=True, wait=True)
+
+            if not await self.cog.session_manager._wait_for_session_flags(
+                session, SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS
+            ):
+                timed_out = (f"The session is still busy after {int(WHISPER_BUSY_WAIT_TIMEOUT_SECONDS)}s. "
+                             "Your whisper was not sent \u2014 try again in a moment.")
+                if waiting_msg:
+                    await waiting_msg.edit(content=timed_out)
+                else:
+                    await interaction.followup.send(timed_out, ephemeral=True)
+                return
+
+            # No await between the clear return above and this claim, which is what makes
+            # check-then-set atomic on a single-threaded loop.
+            session['is_whispering'] = True
+        finally:
+            # Released on the claim, not on completion -- from here the channel is held by
+            # is_whispering, and a worker still parked on this counter would deadlock.
+            session['whisper_waiting'] = max(0, session.get('whisper_waiting', 1) - 1)
+
+        try:
+            await self._run_whisper_turn(interaction, session, target_participant, whisper_message, waiting_msg)
+        finally:
+            session['is_whispering'] = False
+
+    async def _run_whisper_turn(self, interaction: discord.Interaction, session: Dict, target_participant: Dict, whisper_message: str, waiting_msg: Optional[discord.Message] = None):
+        """The whisper turn proper. Only called with the channel already claimed by
+        _execute_whisper -- never call this directly."""
+        owner_id = target_participant['owner_id']
+        profile_name = target_participant['profile_name']
+        participant_key = (owner_id, profile_name)
 
         user_index = self.cog.profile_manager._get_user_index(owner_id)
         is_borrowed = profile_name in user_index.get("borrowed", [])
@@ -104,7 +166,10 @@ class WhisperMixin:
         placeholder_embed = discord.Embed(description=f"{custom_emoji}", color=discord.Color.dark_grey())
         placeholder_embed.set_author(name=display_name, icon_url=avatar_url)
         placeholder_embed.set_footer(text=f"{whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
-        placeholder_msg = await interaction.followup.send(embed=placeholder_embed, ephemeral=True, wait=True)
+        if waiting_msg is not None:
+            placeholder_msg = await waiting_msg.edit(content=None, embed=placeholder_embed)
+        else:
+            placeholder_msg = await interaction.followup.send(embed=placeholder_embed, ephemeral=True, wait=True)
 
         try:
             if not model:
@@ -232,7 +297,11 @@ class WhisperMixin:
         embed.set_author(name=display_name, icon_url=avatar_url)
         embed.set_footer(text=f"{whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
 
-        view = WhisperActionView(self, interaction, whisper_turn_id, response_turn_id, target_participant, whisper_message)
+        # self.cog, not self. WhisperActionView reaches for cog.multi_profile_channels and
+        # cog.generation_service; handed the GenerationService instead, every button press
+        # raised AttributeError inside the callback and surfaced as "This interaction
+        # failed" -- which is why Delete and Regenerate did nothing at all.
+        view = WhisperActionView(self.cog, interaction, whisper_turn_id, response_turn_id, target_participant, whisper_message)
         resp_msg = await placeholder_msg.edit(embed=embed, view=view)
 
         # Inject the message ID back into the log turn
@@ -241,6 +310,12 @@ class WhisperMixin:
             await self.cog.session_manager._save_session_to_disk((interaction.channel_id, None, None), session_type, session["unified_log"])
 
     async def _execute_whisper_regeneration(self, interaction: discord.Interaction, whisper_turn_id: str, response_turn_id: str, target_participant: Dict, whisper_message: str):
+        """Gate, claim, run, release -- the same contract as _execute_whisper.
+
+        This is a component interaction, so the 3-second response deadline is what decides
+        the shape: the waiting notice has to *be* the response, and the placeholder then
+        edits it, rather than the other way round.
+        """
         session = self.cog.multi_profile_channels.get(interaction.channel_id)
 
         # [NEW] Force hydration if session exists or might exist on disk
@@ -251,12 +326,38 @@ class WhisperMixin:
             await interaction.response.send_message("Session not found.", ephemeral=True)
             return
 
+        session['whisper_waiting'] = session.get('whisper_waiting', 0) + 1
+        answered = False
+        try:
+            if any(session.get(flag) for flag in SESSION_BUSY_FLAGS):
+                await interaction.response.edit_message(content=WHISPER_WAITING_NOTICE, embed=None, view=None)
+                answered = True
+
+            if not await self.cog.session_manager._wait_for_session_flags(
+                session, SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS
+            ):
+                timed_out = (f"The session is still busy after {int(WHISPER_BUSY_WAIT_TIMEOUT_SECONDS)}s. "
+                             "Nothing was regenerated \u2014 try again in a moment.")
+                if answered:
+                    await interaction.edit_original_response(content=timed_out, embed=None, view=None)
+                else:
+                    await interaction.response.send_message(timed_out, ephemeral=True)
+                return
+
+            session['is_whispering'] = True
+        finally:
+            session['whisper_waiting'] = max(0, session.get('whisper_waiting', 1) - 1)
+
+        try:
+            await self._run_whisper_regeneration(interaction, session, whisper_turn_id, response_turn_id, target_participant, whisper_message, answered)
+        finally:
+            session['is_whispering'] = False
+
+    async def _run_whisper_regeneration(self, interaction: discord.Interaction, session: Dict, whisper_turn_id: str, response_turn_id: str, target_participant: Dict, whisper_message: str, answered: bool = False):
+        """Only called with the channel already claimed by _execute_whisper_regeneration."""
         owner_id = target_participant['owner_id']
         profile_name = target_participant['profile_name']
         participant_key = (owner_id, profile_name)
-
-        if not session.get("is_hydrated"):
-            session = await self.cog.session_manager._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi"))
 
         model, _, temp, top_p, top_k, _, fallback_model_name = await self.cog.api_service._get_or_create_model_for_channel(
             interaction.channel_id, interaction.user.id, interaction.guild.id,
@@ -283,7 +384,11 @@ class WhisperMixin:
         placeholder_embed.set_author(name=display_name, icon_url=avatar_url)
         placeholder_embed.set_footer(text=f"{whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
 
-        await interaction.response.edit_message(embed=placeholder_embed, view=None)
+        if answered:
+            # The waiting notice already consumed the interaction response.
+            await interaction.edit_original_response(content=None, embed=placeholder_embed, view=None)
+        else:
+            await interaction.response.edit_message(embed=placeholder_embed, view=None)
         placeholder_msg = await interaction.original_response()
 
         # Reconstruct context for AI
@@ -363,12 +468,15 @@ class WhisperMixin:
                 break
 
         await self.cog.session_manager._save_session_to_disk((interaction.channel_id, None, None), session.get("type", "multi"), log)
-        session["is_hydrated"] = False
+        # No is_hydrated=False here: this rewrites one turn's content, which nothing
+        # derives from, and clearing the flag without rehydrating left the session
+        # holding a full unified_log that _evict_inactive_sessions then skipped --
+        # its entire body is gated on is_hydrated, so the log never got released.
 
         # Final Embed Update
         final_embed = placeholder_embed.copy()
         final_embed.description = response_text
-        view = WhisperActionView(self, interaction, whisper_turn_id, response_turn_id, target_participant, whisper_message)
+        view = WhisperActionView(self.cog, interaction, whisper_turn_id, response_turn_id, target_participant, whisper_message)
         await interaction.edit_original_response(embed=final_embed, view=view)
 
     async def _resolve_reply_context(self, message: discord.Message) -> Optional[str]:

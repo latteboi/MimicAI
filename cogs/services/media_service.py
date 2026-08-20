@@ -12,6 +12,7 @@ from ..utils.constants import (
     PLACEHOLDER_EMOJI, WARN_IMAGE_GEN_FAILED, ERR_GENERAL_ERROR, ERR_SAFETY_BLOCK,
     WARN_MAIN_MODEL_FAILED, ERR_REASON_EMPTY_RESPONSE, HarmBlockThreshold, HARM_CATEGORIES,
     defaultConfig, IMAGE_QUEUE_PRIORITY,
+    DEFAULT_IMAGE_PRESENT, DEFAULT_IMAGE_FAILED, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING,
 )
 from .api_service import GoogleGenAIModel, generate_google_tts_audio
 from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _scrub_response_text
@@ -225,7 +226,8 @@ class MediaService:
                         turn_id = str(uuid.uuid4())
 
                         if package.get('generated_image_path') and not package.get('failure_reason'):
-                            system_note = f"<image_context>You have just generated the following image based on the prompt: '{package['prompt_text']}'. Present it.</image_context>"
+                            present_template = self.cog.global_prompts.get("IMAGE_PRESENT", DEFAULT_IMAGE_PRESENT)
+                            system_note = present_template.format(prompt=package['prompt_text'])
 
                             final_user_parts = [
                                 system_note,
@@ -235,7 +237,8 @@ class MediaService:
                             user_turn = {'role': 'user', 'parts': final_user_parts}
                         else:
                             if package.get('failure_reason'):
-                                system_note = f"<image_context>Your attempt to generate an image based on the prompt '{package['prompt_text']}' failed due to: {package['failure_reason']}. Comment on this failure in character.</image_context>"
+                                failed_template = self.cog.global_prompts.get("IMAGE_FAILED", DEFAULT_IMAGE_FAILED)
+                                system_note = failed_template.format(prompt=package['prompt_text'], reason=package['failure_reason'])
                                 user_turn = {'role': 'user', 'parts': [system_note]}
                             else:
                                 user_turn = {'role': 'user', 'parts': [package['prompt_text']]}
@@ -667,7 +670,8 @@ class MediaService:
                 if any(pronoun in prompt_lower.split() for pronoun in second_person_pronouns) or \
                    bot_display_name.lower() in prompt_lower or \
                    effective_profile_name.lower() in prompt_lower:
-                    final_prompt_text = f"Your appearance:\n{appearance_text.strip()}\n\nUser's prompt:\n{prompt_text}"
+                    appearance_template = self.cog.global_prompts.get("IMAGE_APPEARANCE", DEFAULT_IMAGE_APPEARANCE)
+                    final_prompt_text = appearance_template.format(appearance=appearance_text.strip(), prompt=prompt_text)
 
             system_instruction = self._get_image_gen_system_instruction(effective_profile_owner_id, effective_profile_name)
             appearance_data = self.cog.user_appearances.get(str(effective_profile_owner_id), {}).get(effective_profile_name, {})
@@ -721,7 +725,8 @@ class MediaService:
                 if grounding_result:
                     grounding_context, sources, *_ = grounding_result
                     if grounding_context:
-                        final_prompt_text = f"{prompt_text}\n\nUse this information to help generate the image:\n{grounding_context}"
+                        grounding_template = self.cog.global_prompts.get("IMAGE_GROUNDING", DEFAULT_IMAGE_GROUNDING)
+                        final_prompt_text = grounding_template.format(prompt=prompt_text, grounding=grounding_context)
                         grounding_sources = sources
 
             request_data = {

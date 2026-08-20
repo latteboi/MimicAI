@@ -3,7 +3,8 @@ from ..utils.constants import *
 import discord
 from discord import ui
 import datetime
-from typing import TYPE_CHECKING
+from string import Formatter
+from typing import TYPE_CHECKING, Dict, List, Set, Tuple, Optional
 from ..utils.helpers import _sanitise_filename
 from .base_components import TimeoutCleanupMixin, build_pagination_controls, build_tab_nav_bar, build_confirm_view
 
@@ -14,49 +15,38 @@ if TYPE_CHECKING:
 from .gui_profiles import ProfileManageView
 
 class ModBaseView(TimeoutCleanupMixin, ui.View):
-    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, current_tab: str):
+    """Base for every /mod tab.
+
+    target_user_id is the moderated user, and every tab carries it so a trip out
+    to Stats or Docs and back to Profiles does not lose it. Nothing but the
+    Profiles tab reads it; the rest exist only to ferry it.
+    """
+
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, current_tab: str,
+                 target_user_id: Optional[int] = None):
         super().__init__(timeout=600)
         self.cog = cog
         self.original_interaction = interaction
         self.current_tab = current_tab
+        self.target_user_id = target_user_id
         self._add_nav_buttons()
 
     def _add_nav_buttons(self):
-        build_tab_nav_bar(self, self.current_tab, [
-            ("Stats", "stats", self.nav_stats),
-            ("Profiles", "profiles", self.nav_profiles),
-            ("Prompts", "prompts", self.nav_prompts),
-            ("Docs", "docs", self.nav_docs),
-            ("Blacklist", "blacklist", self.nav_blacklist),
-        ])
+        ModBaseView.add_nav_to_other_view(
+            self, self.cog, self.original_interaction, self.current_tab, self.target_user_id)
 
-    async def nav_stats(self, i: discord.Interaction):
-        await i.response.defer(); view = ModStatsView(self.cog, self.original_interaction); await view.update_display()
-
-    async def nav_profiles(self, i: discord.Interaction):
-        await i.response.defer(); view = ModProfilesView(self.cog, self.original_interaction); await view.update_display()
-
-    async def nav_prompts(self, i: discord.Interaction):
-        await i.response.defer(); view = ModPromptsView(self.cog, self.original_interaction); await view.update_display()
-        
-    async def nav_docs(self, i: discord.Interaction):
-        await i.response.defer(); view = ModDocsView(self.cog, self.original_interaction); await view.update_display()
-        
-    async def nav_blacklist(self, i: discord.Interaction):
-        await i.response.defer(); view = ModBlacklistView(self.cog, self.original_interaction); await view.update_display()
-        
     @staticmethod
-    def add_nav_to_other_view(target_view, cog, interaction, current_tab):
+    def add_nav_to_other_view(target_view, cog, interaction, current_tab, target_user_id: Optional[int] = None):
         async def nav_stats(i: discord.Interaction):
-            await i.response.defer(); view = ModStatsView(cog, interaction); await view.update_display()
+            await i.response.defer(); view = ModStatsView(cog, interaction, target_user_id=target_user_id); await view.update_display()
         async def nav_profiles(i: discord.Interaction):
-            await i.response.defer(); view = ModProfilesView(cog, interaction); await view.update_display()
+            await i.response.defer(); view = ModProfilesView(cog, interaction, target_user_id=target_user_id); await view.update_display()
         async def nav_prompts(i: discord.Interaction):
-            await i.response.defer(); view = ModPromptsView(cog, interaction); await view.update_display()
+            await i.response.defer(); view = ModPromptsView(cog, interaction, target_user_id=target_user_id); await view.update_display()
         async def nav_docs(i: discord.Interaction):
-            await i.response.defer(); view = ModDocsView(cog, interaction); await view.update_display()
+            await i.response.defer(); view = ModDocsView(cog, interaction, target_user_id=target_user_id); await view.update_display()
         async def nav_blacklist(i: discord.Interaction):
-            await i.response.defer(); view = ModBlacklistView(cog, interaction); await view.update_display()
+            await i.response.defer(); view = ModBlacklistView(cog, interaction, target_user_id=target_user_id); await view.update_display()
 
         build_tab_nav_bar(target_view, current_tab, [
             ("Stats", "stats", nav_stats),
@@ -120,8 +110,8 @@ class ModDocsEditModal(ui.Modal, title="Edit Document"):
         await self.parent_view.update_display()
 
 class ModDocsView(ModBaseView):
-    def __init__(self, cog, interaction):
-        super().__init__(cog, interaction, "docs")
+    def __init__(self, cog, interaction, target_user_id: Optional[int] = None):
+        super().__init__(cog, interaction, "docs", target_user_id=target_user_id)
         self.selected_category = None
         self.selected_file = None
         self.current_page = 0
@@ -295,8 +285,8 @@ class ModBlacklistModal(ui.Modal, title="Enter User ID"):
         await i.response.edit_message(embed=self.parent_view._get_embed(), view=self.parent_view)
 
 class ModBlacklistView(ModBaseView):
-    def __init__(self, cog, interaction):
-        super().__init__(cog, interaction, "blacklist")
+    def __init__(self, cog, interaction, target_user_id: Optional[int] = None):
+        super().__init__(cog, interaction, "blacklist", target_user_id=target_user_id)
         self.selected_user_id = None
         self.current_page = 0
         self._build_view()
@@ -374,8 +364,8 @@ class ModBlacklistView(ModBaseView):
         await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
 
 class ModStatsView(ModBaseView):
-    def __init__(self, cog, interaction):
-        super().__init__(cog, interaction, "stats")
+    def __init__(self, cog, interaction, target_user_id: Optional[int] = None):
+        super().__init__(cog, interaction, "stats", target_user_id=target_user_id)
         self.selected_category = "Servers"
         self.current_page = 0
         self.content_dict = {}
@@ -470,18 +460,33 @@ class ModProfilesModal(ui.Modal, title="Enter User ID"):
     async def on_submit(self, i: discord.Interaction):
         uid_str = self.user_id_input.value.strip()
         if not uid_str.isdigit():
-            await i.response.send_message("Invalid ID.", ephemeral=True)
+            await i.response.send_message("Invalid ID. Must be numeric.", ephemeral=True)
             return
         self.parent_view.target_user_id = int(uid_str)
+        # Reset the page, or switching from a user with four pages of profiles to one
+        # with a single page lands on an empty window.
+        self.parent_view.current_page = 0
         self.parent_view._build_view()
         await i.response.edit_message(embed=self.parent_view._get_embed(), view=self.parent_view)
 
 class ModProfilesView(ModBaseView):
-    def __init__(self, cog, interaction):
-        super().__init__(cog, interaction, "profiles")
-        self.target_user_id = None
+    def __init__(self, cog, interaction, target_user_id: Optional[int] = None):
+        super().__init__(cog, interaction, "profiles", target_user_id=target_user_id)
         self.current_page = 0
         self._build_view()
+
+    def _resolve_profiles(self) -> List[str]:
+        """Every profile name the moderated user can be managed through, sorted.
+
+        System (class X) profiles are included: they live in the bot owner's own
+        index, so this only ever yields any when the moderated user is the owner,
+        but leaving them out made them unreachable from /mod entirely.
+        """
+        if not self.target_user_id:
+            return []
+        index = self.cog.profile_manager._get_user_index(self.target_user_id)
+        names = set(index.get("personal", [])) | set(index.get("borrowed", [])) | set(index.get("system", []))
+        return sorted(names)
 
     def _build_view(self):
         self.clear_items()
@@ -494,8 +499,7 @@ class ModProfilesView(ModBaseView):
         
         if self.target_user_id:
             index = self.cog.profile_manager._get_user_index(self.target_user_id)
-            profiles = list(index.get("personal", [])) + list(index.get("borrowed", []))
-            profiles.sort()
+            profiles = self._resolve_profiles()
             
             if profiles:
                 num_pages = (len(profiles) - 1) // DROPDOWN_MAX_OPTIONS + 1
@@ -534,80 +538,329 @@ class ModProfilesView(ModBaseView):
 
     def _get_embed(self):
         embed = discord.Embed(title="Moderator Profile Dashboard", color=discord.Color.red())
-        if self.target_user_id:
-            user = self.cog.bot.get_user(self.target_user_id)
-            uname = user.name if user else "Unknown"
-            embed.description = f"Managing User: **{uname}** (`{self.target_user_id}`)\nSelect a profile below."
-        else:
+        if not self.target_user_id:
             embed.description = "Click the button below to enter a User ID to manage."
+            return embed
+
+        user = self.cog.bot.get_user(self.target_user_id)
+        uname = user.name if user else "Unknown"
+        profiles = self._resolve_profiles()
+        if profiles:
+            embed.description = (f"Managing User: **{uname}** (`{self.target_user_id}`)\n"
+                                 f"**{len(profiles)}** profile(s). Select one below.")
+        else:
+            embed.description = (f"Managing User: **{uname}** (`{self.target_user_id}`)\n"
+                                 "This user has no profiles — check the ID, or they have not "
+                                 "created any yet.")
         return embed
 
     async def update_display(self):
         await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
+
+# --- Global prompt metadata -------------------------------------------------
+#
+# Every entry is (label, key, default_text). The placeholder table below records
+# how each prompt is consumed downstream, which the edit modal validates against
+# before saving -- see _validate_prompt_placeholders.
+
+# Prompts are grouped because there are more of them than a single Discord select
+# can hold (25 options), and the list is still growing.
+MOD_PROMPT_CATEGORIES = [
+    ("Core Instructions", [
+        ("Context Rules", "CONTEXT_RULES", DEFAULT_CONTEXT_RULES),
+        ("Time Context", "TIME_CONTEXT", DEFAULT_TIME_CONTEXT),
+        ("Negative Constraints", "NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS),
+        ("Training Data Injection", "TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION),
+        ("Neuro-Endocrine Engine", "NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION),
+    ]),
+    ("Turn Flow", [
+        ("Whisper Injection", "WHISPER_INJECTION", DEFAULT_WHISPER_INJECTION),
+        ("Whisper Recap", "WHISPER_RECAP", DEFAULT_WHISPER_RECAP),
+        ("Kickstart: Start", "KICKSTART_START", DEFAULT_KICKSTART_START),
+        ("Kickstart: Continue", "KICKSTART_CONTINUE", DEFAULT_KICKSTART_CONTINUE),
+        ("Kickstart: Idle", "KICKSTART_IDLE", DEFAULT_KICKSTART_IDLE),
+        ("AI Director Prompt", "DIRECTOR_USER_PROMPT", DEFAULT_DIRECTOR_USER_PROMPT),
+    ]),
+    ("Image Generation", [
+        ("Image: Present (own)", "IMAGE_PRESENT", DEFAULT_IMAGE_PRESENT),
+        ("Image: Present (other's)", "IMAGE_PRESENT_OTHER", DEFAULT_IMAGE_PRESENT_OTHER),
+        ("Image: Failed", "IMAGE_FAILED", DEFAULT_IMAGE_FAILED),
+        ("Image: Appearance Preamble", "IMAGE_APPEARANCE", DEFAULT_IMAGE_APPEARANCE),
+        ("Image: Grounding Preamble", "IMAGE_GROUNDING", DEFAULT_IMAGE_GROUNDING),
+    ]),
+    ("Grounding & Critics", [
+        ("Web Grounding (Text)", "WEB_GROUNDING_TEXT", DEFAULT_WEB_GROUNDING_TEXT),
+        ("Web Grounding (Visual)", "WEB_GROUNDING_VISUAL", DEFAULT_WEB_GROUNDING_VISUAL),
+        ("Grounding RAG Payload", "GROUNDING_RAG_PAYLOAD", DEFAULT_GROUNDING_RAG_PAYLOAD),
+        ("Anti-Repetition Critic", "ANTI_REPETITION", DEFAULT_ANTI_REPETITION_PROMPT),
+        ("Auto-Moderator Critic", "AUTO_MODERATOR", DEFAULT_AUTO_MODERATOR_PROMPT),
+    ]),
+    ("Memory & Training", [
+        ("LTM Summarization", "LTM_SUMMARIZATION_INSTRUCTIONS", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS),
+        ("Training Analyst", "TRAINING_ANALYST", DEFAULT_TRAINING_ANALYST_PROMPT),
+    ]),
+    ("Bot Utilities", [
+        ("Profile Generator", "PROFILE_GENERATOR", DEFAULT_PROFILE_GENERATOR_PROMPT),
+        ("Help Mode Protocol", "HELP_MODE_INJECTION", DEFAULT_HELP_MODE_INJECTION),
+    ]),
+]
+
+# Flattened (label, key, default), in category order.
+MOD_PROMPT_DEFINITIONS = [entry for _cat, entries in MOD_PROMPT_CATEGORIES for entry in entries]
+
+# key -> (required placeholder names, substitution mode).
+#
+# "format" prompts are passed through str.format() at generation time, so an
+# unknown field name or an unbalanced brace in a moderator's custom text raises
+# KeyError/ValueError deep inside the turn path -- for CONTEXT_RULES that is
+# every turn of every profile. "replace" prompts go through str.replace() and so
+# tolerate stray braces; only the presence of the placeholder matters.
+# Keys absent from this table are consumed verbatim and need no validation.
+MOD_PROMPT_PLACEHOLDERS: Dict[str, Tuple[Set[str], str]] = {
+    "CONTEXT_RULES": ({"profile_id_placeholder"}, "format"),
+    "TIME_CONTEXT": ({"time_str"}, "format"),
+    "NEGATIVE_CONSTRAINTS": ({"constraints"}, "format"),
+    "TRAINING_DATA_INJECTION": ({"examples_block"}, "format"),
+    "NEURO_ENGINE": ({"d", "c", "o", "a"}, "format"),
+    "WHISPER_INJECTION": ({"whisper_content"}, "format"),
+    "WHISPER_RECAP": ({"whispers"}, "format"),
+    "DIRECTOR_USER_PROMPT": ({"history"}, "format"),
+    "IMAGE_PRESENT": ({"prompt"}, "format"),
+    "IMAGE_PRESENT_OTHER": ({"name", "prompt"}, "format"),
+    "IMAGE_FAILED": ({"prompt", "reason"}, "format"),
+    "IMAGE_APPEARANCE": ({"appearance", "prompt"}, "format"),
+    "IMAGE_GROUNDING": ({"prompt", "grounding"}, "format"),
+    "GROUNDING_RAG_PAYLOAD": ({"transcript", "query"}, "format"),
+    "ANTI_REPETITION": ({"char_name"}, "format"),
+    "TRAINING_ANALYST": ({"verbosity", "examples_block"}, "format"),
+    "PROFILE_GENERATOR": ({"prompt"}, "format"),
+    "HELP_MODE_INJECTION": ({"docs"}, "replace"),
+}
+
+# Discord's own ceilings: a text input holds 4000 characters and a modal holds
+# five components.
+MODAL_TEXT_INPUT_MAX = 4000
+MODAL_MAX_TEXT_INPUTS = 5
+MODAL_PROMPT_CAPACITY = MODAL_TEXT_INPUT_MAX * MODAL_MAX_TEXT_INPUTS
+
+
+def _split_prompt_for_modal(text: str, max_len: int = MODAL_TEXT_INPUT_MAX,
+                            max_parts: int = MODAL_MAX_TEXT_INPUTS) -> Tuple[List[str], List[str]]:
+    """Splits text into at most max_parts chunks of at most max_len characters.
+
+    Prompts outgrew the single 4000-character text input this modal used to be:
+    DEFAULT_HELP_MODE_INJECTION is 4703 characters, and Discord rejects a modal
+    whose default value exceeds the field's max_length, so that entry could not
+    be opened at all.
+
+    Cuts are preferred at line boundaries. Returns (chunks, joiners), where
+    joiners[i] is the text consumed between chunks[i] and chunks[i + 1] -- a
+    newline for a line-boundary cut, empty for a hard cut inside an over-long
+    line -- so interleaving the two reproduces the input exactly.
+    """
+    if len(text) <= max_len:
+        return [text], []
+
+    chunks: List[str] = []
+    joiners: List[str] = []
+    remaining = text
+
+    while len(remaining) > max_len and len(chunks) < max_parts - 1:
+        # +1 so a newline sitting exactly on the boundary is still a clean cut.
+        cut = remaining[:max_len + 1].rfind("\n")
+        if cut <= 0:
+            chunks.append(remaining[:max_len])
+            joiners.append("")
+            remaining = remaining[max_len:]
+        else:
+            chunks.append(remaining[:cut])
+            joiners.append("\n")
+            remaining = remaining[cut + 1:]
+
+    chunks.append(remaining)
+    return chunks, joiners
+
+
+def _join_prompt_parts(chunks: List[str], joiners: List[str]) -> str:
+    """Inverse of _split_prompt_for_modal."""
+    out = []
+    for i, chunk in enumerate(chunks):
+        out.append(chunk)
+        if i < len(joiners):
+            out.append(joiners[i])
+    return "".join(out)
+
+
+def _validate_prompt_placeholders(key: str, text: str) -> Optional[str]:
+    """Returns an error message if text would break its consumer, else None."""
+    spec = MOD_PROMPT_PLACEHOLDERS.get(key)
+    if not spec:
+        return None
+    required, mode = spec
+
+    if mode == "replace":
+        missing = sorted(f"{{{name}}}" for name in required if f"{{{name}}}" not in text)
+        if missing:
+            return f"This prompt must still contain {', '.join(f'`{m}`' for m in missing)}."
+        return None
+
+    try:
+        found = {field for _, field, _, _ in Formatter().parse(text) if field is not None}
+    except ValueError as e:
+        return (f"Unbalanced or malformed braces: {e}. "
+                "Write `{{` and `}}` for a literal brace.")
+
+    unknown = sorted(f for f in found if f not in required)
+    if unknown:
+        allowed = ", ".join(f"`{{{name}}}`" for name in sorted(required))
+        bad = ", ".join(f"`{{{f}}}`" for f in unknown)
+        return (f"Unknown placeholder(s) {bad}. This prompt only accepts {allowed}. "
+                "Write `{{` and `}}` for a literal brace.")
+
+    missing = sorted(f"{{{name}}}" for name in required if name not in found)
+    if missing:
+        return f"This prompt must still contain {', '.join(f'`{m}`' for m in missing)}."
+    return None
+
 
 class ModPromptModal(ui.Modal, title="Edit Global Prompt"):
     def __init__(self, view, key, default_text):
         super().__init__()
         self.parent_view = view
         self.key = key
-        
+
         curr_val = self.parent_view.cog.global_prompts.get(key, default_text)
-        self.prompt_input = ui.TextInput(
-            label="Prompt (Blank to reset to default)", 
-            style=discord.TextStyle.paragraph, 
-            default=curr_val, 
-            required=False,
-            max_length=4000
-        )
-        self.add_item(self.prompt_input)
+        chunks, self.joiners = _split_prompt_for_modal(curr_val)
+
+        self.prompt_inputs: List[ui.TextInput] = []
+        total = len(chunks)
+        for idx, chunk in enumerate(chunks, start=1):
+            label = "Prompt (blank to reset to default)" if total == 1 else f"Prompt — part {idx} of {total}"
+            field = ui.TextInput(
+                label=label[:45],
+                style=discord.TextStyle.paragraph,
+                default=chunk,
+                required=False,
+                max_length=MODAL_TEXT_INPUT_MAX,
+            )
+            self.prompt_inputs.append(field)
+            self.add_item(field)
 
     async def on_submit(self, i: discord.Interaction):
-        val = self.prompt_input.value.strip()
+        val = _join_prompt_parts([f.value for f in self.prompt_inputs], self.joiners).strip()
+
         if val:
+            error = _validate_prompt_placeholders(self.key, val)
+            if error:
+                await i.response.send_message(
+                    f"❌ `{self.key}` was **not** saved.\n{error}", ephemeral=True)
+                return
             self.parent_view.cog.global_prompts[self.key] = val
         else:
             self.parent_view.cog.global_prompts.pop(self.key, None)
-        
+
         self.parent_view.cog.server_manager._save_global_prompts()
-        await i.response.send_message(f"Updated `{self.key}` successfully.", ephemeral=True)
+        action = "Updated" if val else "Reset to default"
+        await i.response.send_message(f"{action} `{self.key}` successfully.", ephemeral=True)
+
+        # Repaint the dashboard so the customised/default markers reflect the save.
+        self.parent_view._build_view()
+        await self.parent_view.update_display()
 
 class ModPromptsView(ModBaseView):
-    def __init__(self, cog, interaction):
-        super().__init__(cog, interaction, "prompts")
+    def __init__(self, cog, interaction, target_user_id: Optional[int] = None):
+        super().__init__(cog, interaction, "prompts", target_user_id=target_user_id)
+        self.selected_category = MOD_PROMPT_CATEGORIES[0][0]
         self._build_view()
+
+    def _entries_for_category(self):
+        return next((entries for cat, entries in MOD_PROMPT_CATEGORIES if cat == self.selected_category),
+                    MOD_PROMPT_CATEGORIES[0][1])
 
     def _build_view(self):
         self.clear_items()
-        
-        prompt_keys =[
-            ("LTM Summarization", "LTM_SUMMARIZATION_INSTRUCTIONS", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS),
-            ("Context Rules", "CONTEXT_RULES", DEFAULT_CONTEXT_RULES),
-            ("Training Data Injection", "TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION),
-            ("Auto-Moderator Critic", "AUTO_MODERATOR", DEFAULT_AUTO_MODERATOR_PROMPT),
-            ("Anti-Repetition Critic", "ANTI_REPETITION", DEFAULT_ANTI_REPETITION_PROMPT),
-            ("Web Grounding (Text)", "WEB_GROUNDING_TEXT", DEFAULT_WEB_GROUNDING_TEXT),
-            ("Web Grounding (Visual)", "WEB_GROUNDING_VISUAL", DEFAULT_WEB_GROUNDING_VISUAL),
-            ("Profile Generator", "PROFILE_GENERATOR", DEFAULT_PROFILE_GENERATOR_PROMPT),
-            ("Training Analyst", "TRAINING_ANALYST", DEFAULT_TRAINING_ANALYST_PROMPT),
-            ("Whisper Injection", "WHISPER_INJECTION", DEFAULT_WHISPER_INJECTION),
-            ("Neuro-Endocrine Engine", "NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION),
-            ("Help Mode Protocol", "HELP_MODE_INJECTION", DEFAULT_HELP_MODE_INJECTION)
-        ]
-        
-        options = [discord.SelectOption(label=lbl, value=key) for lbl, key, _ in prompt_keys]
-        sel = ui.Select(placeholder="Select a prompt to edit...", options=options, row=0)
-        
+
+        # Category select (row 0). There are more prompts than one Discord select
+        # can hold, so the list is grouped rather than paginated -- a prompt keeps
+        # a stable home instead of drifting between pages as entries are added.
+        cat_opts = []
+        for cat, entries in MOD_PROMPT_CATEGORIES:
+            n_custom = sum(1 for _l, k, _d in entries if k in self.cog.global_prompts)
+            cat_opts.append(discord.SelectOption(
+                label=cat,
+                value=cat,
+                description=f"{len(entries)} prompt(s), {n_custom} customised",
+                default=(cat == self.selected_category),
+            ))
+        cat_sel = ui.Select(placeholder="Select a category...", options=cat_opts, row=0)
+
+        async def cat_cb(i: discord.Interaction):
+            self.selected_category = i.data['values'][0]
+            self._build_view()
+            await i.response.edit_message(embed=self._get_embed(), view=self)
+
+        cat_sel.callback = cat_cb
+        self.add_item(cat_sel)
+
+        # Prompt select (row 1)
+        entries = self._entries_for_category()
+        options = []
+        for lbl, key, _default in entries:
+            is_overridden = key in self.cog.global_prompts
+            options.append(discord.SelectOption(
+                label=lbl[:100],
+                value=key,
+                description="Customised" if is_overridden else "Default",
+                emoji="✏️" if is_overridden else None,
+            ))
+
+        sel = ui.Select(placeholder="Select a prompt to edit...", options=options, row=1)
+
         async def sel_cb(i: discord.Interaction):
             key = i.data['values'][0]
-            default_text = next(d for l, k, d in prompt_keys if k == key)
+            default_text = next(d for _l, k, d in MOD_PROMPT_DEFINITIONS if k == key)
+            current = self.cog.global_prompts.get(key, default_text)
+
+            # A stored prompt longer than the modal can hold could only arrive by
+            # hand-editing system_prompts.json; opening it anyway would silently
+            # truncate the tail on save.
+            if len(current) > MODAL_PROMPT_CAPACITY:
+                await i.response.send_message(
+                    f"❌ `{key}` is {len(current):,} characters, which exceeds the "
+                    f"{MODAL_PROMPT_CAPACITY:,}-character limit a Discord modal can hold. "
+                    "Shorten it in `mod/system_prompts.json` before editing it here.",
+                    ephemeral=True)
+                return
+
             await i.response.send_modal(ModPromptModal(self, key, default_text))
-            
+
         sel.callback = sel_cb
         self.add_item(sel)
         self._add_nav_buttons()
 
     def _get_embed(self):
-        embed = discord.Embed(title="Global System Prompts", description="Modify the internal hardcoded instructions. Leave a prompt completely blank to revert to its default value.", color=discord.Color.purple())
+        overridden = [lbl for lbl, key, _ in MOD_PROMPT_DEFINITIONS if key in self.cog.global_prompts]
+        embed = discord.Embed(
+            title="Global System Prompts",
+            description=("Modify the internal hardcoded instructions. Leave a prompt completely "
+                         "blank to revert to its default value."),
+            color=discord.Color.purple(),
+        )
+
+        entries = self._entries_for_category()
+        lines = []
+        for lbl, key, default in entries:
+            current = self.cog.global_prompts.get(key)
+            mark = "✏️" if current is not None else "▫️"
+            lines.append(f"{mark} **{lbl}** — {len(current if current is not None else default):,} chars")
+        embed.add_field(name=self.selected_category, value="\n".join(lines), inline=False)
+
+        embed.add_field(
+            name=f"Customised overall ({len(overridden)}/{len(MOD_PROMPT_DEFINITIONS)})",
+            value=(", ".join(overridden) if overridden
+                   else "None — every prompt is running its built-in default."),
+            inline=False,
+        )
         return embed
 
     async def update_display(self):

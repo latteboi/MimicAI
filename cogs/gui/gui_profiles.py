@@ -21,7 +21,7 @@ from .gui_hub import HubShareManagerView
 from .gui_sessions import CustomModelModal
 from .gui_settings import OllamaHostModal
 
-def ProfileAdvancedParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+def ProfileAdvancedParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
     def gv(k):
         v = current_params.get(k)
         return str(v) if v is not None else ""
@@ -42,7 +42,7 @@ def ProfileAdvancedParamsModal(cog, profile_name: str, current_params: Dict[str,
             else:
                 c[k] = None
         return {"config": c}
-    return ConfigModal(cog, profile_name, is_borrowed, "Advanced Parameters (OpenRouter)", fields, parser, callback)
+    return ConfigModal(cog, profile_name, is_borrowed, "Advanced Parameters (OpenRouter)", fields, parser, callback, target_user_id)
 
 def ProfileDirectorDeskModal(cog, profile_name: str, current_params: Dict[str, Any], callback=None, target_user_id: Optional[int] = None):
     fields = [
@@ -56,7 +56,8 @@ def ProfileDirectorDeskModal(cog, profile_name: str, current_params: Dict[str, A
         return {"config": {k: _ps(v[k]) or "" for k in ["speech_archetype", "speech_accent", "speech_dynamics", "speech_style", "speech_pacing"]}}
     return ConfigModal(cog, profile_name, False, "Director's Desk: TTS Instructions", fields, parser, callback, target_user_id)
 
-def ProfileSpeechSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+
+def ProfileSpeechSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
     fields = [
         {"label": "Enable TTS (on/off)", "custom_id": "speech_tts_enabled", "default": "on" if current_params.get("speech_tts_enabled", False) else "off", "required": True, "max_length": 10},
         {"label": "Voice Name", "custom_id": "speech_voice", "default": str(current_params.get("speech_voice", "Aoede")), "required": False, "max_length": 40},
@@ -71,7 +72,7 @@ def ProfileSpeechSettingsModal(cog, profile_name: str, current_params: Dict[str,
             if not (0.0 <= t <= 2.0): raise ValueError("Temperature out of range")
             c["speech_temperature"] = t
         return {"config": c}
-    return ConfigModal(cog, profile_name, is_borrowed, "Speech & Voice Settings", fields, parser, callback)
+    return ConfigModal(cog, profile_name, is_borrowed, "Speech & Voice Settings", fields, parser, callback, target_user_id)
 
 class ProfileManageView(ui.View):
     def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction, profile_name: str, is_borrowed: bool, target_user_id: Optional[int] = None, is_mod_view: bool = False):
@@ -93,6 +94,9 @@ class ProfileManageView(ui.View):
         self.profile_name = profile_name
         self.is_borrowed = is_borrowed
         self.is_mod_view = is_mod_view
+        # Whose profile list the mod-mode Back button returns to. Kept separate from
+        # self.user_id because a system profile rewrites that to the bot owner's id.
+        self.mod_return_user_id = target_user_id
         self.current_tab = "home"
         self.is_read_only = self.is_system and original_interaction.user.id != owner_id
         
@@ -108,13 +112,17 @@ class ProfileManageView(ui.View):
 
         is_mod = getattr(self, 'is_mod_view', False)
 
+        # Params/Tools/Memory used to be hidden from the mod view because their
+        # handlers resolved the profile owner from interaction.user.id -- a moderator
+        # would have edited their own profile of the same name. Every one of them now
+        # takes target_user_id, so the tabs are available to both.
         def tab_has_options(tab: str) -> bool:
             if tab == "home":
                 return True
-            elif tab == "persona":
+            if tab == "persona":
                 return not self.is_borrowed
-            elif tab in ["params", "tools", "memory"]:
-                return not is_mod
+            if tab in ("params", "tools", "memory"):
+                return True
             return False
 
         valid_tabs = [t for t in ["home", "persona", "params", "tools", "memory"] if tab_has_options(t)]
@@ -122,31 +130,38 @@ class ProfileManageView(ui.View):
             self.current_tab = valid_tabs[0]
             
         if not valid_tabs:
-            if is_mod: ModBaseView.add_nav_to_other_view(self, self.cog, self.original_interaction, "profiles")
+            if is_mod:
+                self._add_mod_back_button()
+                ModBaseView.add_nav_to_other_view(
+                    self, self.cog, self.original_interaction, "profiles", self.mod_return_user_id)
             return
 
         # --- 1. Category Dropdown (Row 0) ---
         options = []
         
         if self.current_tab == "home":
-            if not is_mod:
-                options.append(discord.SelectOption(label="Rename Profile", value="rename", description="Change the local name of this profile."))
-                
-                if not self.is_borrowed:
-                    options.append(discord.SelectOption(label="Duplicate Profile", value="duplicate", description="Create a new profile from a copy of this one."))
-                    options.append(discord.SelectOption(label="Share Profile", value="share", description="Share this profile with others or publish it."))
-                    options.append(discord.SelectOption(label="Custom Error Message", value="error_response", description="Set the message shown when generation fails."))
-                    options.append(discord.SelectOption(label="Generation Visual", value="generation_visual", description="Set custom placeholder emoji and child bot behavior."))
-                    
-                    owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-                    if self.original_interaction.user.id == owner_id:
-                        if self.is_system:
-                            options.append(discord.SelectOption(label="Copy to Personal Profile", value="convert_to_personal", description="Create a Personal Profile copy from this System Profile."))
-                        else:
-                            options.append(discord.SelectOption(label="Copy to System Profile", value="convert_to_system", description="Create a global System Profile copy from this profile."))
+            options.append(discord.SelectOption(label="Rename Profile", value="rename", description="Change the local name of this profile."))
 
-                options.append(discord.SelectOption(label="Cycle Content Safety Level", value="safety_level", description="Cycle: Low -> Medium -> High -> Unrestricted 18+."))
-            
+            if not self.is_borrowed:
+                options.append(discord.SelectOption(label="Duplicate Profile", value="duplicate", description="Create a new profile from a copy of this one."))
+                # Share and Copy-to-System act on behalf of the profile's owner --
+                # _handle_share opens the invoker's own share manager and
+                # _handle_convert_copy reads i.user.id -- so both stay owner-only
+                # rather than being silently wrong under /mod.
+                if not is_mod:
+                    options.append(discord.SelectOption(label="Share Profile", value="share", description="Share this profile with others or publish it."))
+                options.append(discord.SelectOption(label="Custom Error Message", value="error_response", description="Set the message shown when generation fails."))
+                options.append(discord.SelectOption(label="Generation Visual", value="generation_visual", description="Set custom placeholder emoji and child bot behavior."))
+
+                owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+                if not is_mod and self.original_interaction.user.id == owner_id:
+                    if self.is_system:
+                        options.append(discord.SelectOption(label="Copy to Personal Profile", value="convert_to_personal", description="Create a Personal Profile copy from this System Profile."))
+                    else:
+                        options.append(discord.SelectOption(label="Copy to System Profile", value="convert_to_system", description="Create a global System Profile copy from this profile."))
+
+            options.append(discord.SelectOption(label="Cycle Content Safety Level", value="safety_level", description="Cycle: Low -> Medium -> High -> Unrestricted 18+."))
+
             label = "Remove Borrowed Profile" if self.is_borrowed else "Delete Profile"
             options.append(discord.SelectOption(label=label, value="delete", description="Permanently remove this profile and its data."))
 
@@ -154,17 +169,17 @@ class ProfileManageView(ui.View):
             options.append(discord.SelectOption(label="Edit Persona", value="edit_persona", description="Edit backstory, traits, likes, dislikes, and appearance."))
             options.append(discord.SelectOption(label="Edit Instructions", value="edit_instructions", description="Edit specific AI behavioral instructions."))
             options.append(discord.SelectOption(label="TTS Instructions", value="tts_instructions", description="Configure the 'Director's Desk' for vocal performance."))
-            if not is_mod and not self.is_borrowed:
+            if not self.is_borrowed:
                 options.append(discord.SelectOption(label="Edit Appearance", value="edit_appearance", description="Edit the custom Webhook name and avatar."))
 
-        elif self.current_tab == "params" and not is_mod:
+        elif self.current_tab == "params":
             options.append(discord.SelectOption(label="Set Models", value="models", description="Choose Primary and Fallback AI models."))
             options.append(discord.SelectOption(label="Set Generation Parameters & STM", value="gen_params", description="Set Temp, Top P, Top K, and STM Length."))
             options.append(discord.SelectOption(label="Set Advanced Parameters (OPENROUTER)", value="adv_params", description="Set penalties, Min P, and Top A."))
             options.append(discord.SelectOption(label="Set Thinking Parameters", value="thinking_params", description="Set thinking persistence, level, and budget."))
             options.append(discord.SelectOption(label="Set Speech & Voice Settings", value="speech_settings", description="Set TTS voice, model, and temperature."))
 
-        elif self.current_tab == "tools" and not is_mod:
+        elif self.current_tab == "tools":
             options.append(discord.SelectOption(label="Toggle Image Generation", value="image_toggle", description="Allow this profile to generate images via !image/!imagine."))
             options.append(discord.SelectOption(label="Toggle Grounding (Web Search)", value="grounding", description="Cycle Grounding: OFF -> NATIVE -> RAG."))
             options.append(discord.SelectOption(label="Toggle URL Context Fetching", value="url_toggle", description="Cycle URL Context: OFF -> NATIVE -> RAG."))
@@ -175,7 +190,7 @@ class ProfileManageView(ui.View):
             options.append(discord.SelectOption(label="Toggle Neuro-Endocrine Engine", value="neuro", description="Simulate hormonal states for dynamic emotions."))
             options.append(discord.SelectOption(label="Toggle Help Mode (Guide RAG)", value="help_mode", description="Allow profile to answer technical bot questions."))
 
-        elif self.current_tab == "memory" and not is_mod:
+        elif self.current_tab == "memory":
             options.append(discord.SelectOption(label="Manage Long-Term Memories", value="manage_ltm", description="Add, list, edit, or delete memories."))
             if not self.is_borrowed:
                 options.append(discord.SelectOption(label="Manage Training Examples", value="manage_training", description="Add, list, edit, or delete training examples."))
@@ -202,7 +217,30 @@ class ProfileManageView(ui.View):
             self.add_item(btn)
 
         if is_mod:
-            ModBaseView.add_nav_to_other_view(self, self.cog, self.original_interaction, "profiles")
+            self._add_mod_back_button()
+            ModBaseView.add_nav_to_other_view(
+                self, self.cog, self.original_interaction, "profiles", self.mod_return_user_id)
+
+    def _add_mod_back_button(self):
+        """Back to the moderated user's profile list.
+
+        The mod nav bar's own "Profiles" button is disabled here -- build_tab_nav_bar
+        disables the button for the current tab -- so without this there is no way
+        back to the list at all, and going out via another tab dropped the target
+        user id.
+        """
+        from .gui_mod import ModProfilesView
+
+        btn = ui.Button(label="← Back to Profile List", style=discord.ButtonStyle.secondary, row=2)
+
+        async def back_cb(interaction: discord.Interaction):
+            await interaction.response.defer()
+            view = ModProfilesView(self.cog, self.original_interaction,
+                                   target_user_id=self.mod_return_user_id)
+            await view.update_display()
+
+        btn.callback = back_cb
+        self.add_item(btn)
 
     def create_nav_callback(self, tab_name):
         async def callback(interaction: discord.Interaction):
@@ -237,7 +275,7 @@ class ProfileManageView(ui.View):
             await self._handle_safety_cycle(interaction, profile)
         elif choice == "error_response":
             is_b = getattr(self, "is_borrowed", False)
-            target_profile = self.cog.profile_manager._get_profile_config(interaction.user.id, self.profile_name, is_b)
+            target_profile = self.cog.profile_manager._get_profile_config(self.user_id, self.profile_name, is_b)
 
             if not target_profile:
                 await interaction.response.send_message("❌ Error: Profile not found.", ephemeral=True)
@@ -247,11 +285,11 @@ class ProfileManageView(ui.View):
                 await modal_interaction.response.defer(ephemeral=True)
                 val_to_save = new_val.strip() or "An error has occurred."
                 
-                target = self.cog.profile_manager._get_profile_config(modal_interaction.user.id, self.profile_name, is_b)
+                target = self.cog.profile_manager._get_profile_config(self.user_id, self.profile_name, is_b)
                 
                 if target:
                     target["error_response"] = val_to_save
-                    self.cog.profile_manager._save_profile_config(modal_interaction.user.id, self.profile_name, target, is_b)
+                    self.cog.profile_manager._save_profile_config(self.user_id, self.profile_name, target, is_b)
                     await modal_interaction.followup.send(f"✅ Custom error message updated for '{self.profile_name}'.", ephemeral=True)
                 else:
                     await modal_interaction.followup.send("❌ Error: Profile not found.", ephemeral=True)
@@ -268,9 +306,9 @@ class ProfileManageView(ui.View):
 
         elif choice == "generation_visual":
             async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, self.profile_name)
+                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, self.profile_name, target_user_id=self.user_id)
                 await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileGenerationVisualModal(self.cog, self.profile_name, profile, self.is_borrowed, callback=refresh_cb)
+            modal = ProfileGenerationVisualModal(self.cog, self.profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
             await interaction.response.send_modal(modal)
 
         # --- Persona Tab Logic ---
@@ -298,34 +336,34 @@ class ProfileManageView(ui.View):
         elif choice == "gen_params":
             # Callback logic updated to edit the view on the original message, but not try to defer again
             async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name)
+                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name, target_user_id=self.user_id)
                 # Edit the MAIN message (the dashboard)
                 await self.original_interaction.edit_original_response(embed=new_embed, view=self)
                 
-            modal = ProfileParamsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb)
+            modal = ProfileParamsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
             await interaction.response.send_modal(modal)
         elif choice == "adv_params":
             async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name)
+                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name, target_user_id=self.user_id)
                 await self.original_interaction.edit_original_response(embed=new_embed, view=self)
                 
-            modal = ProfileAdvancedParamsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb)
+            modal = ProfileAdvancedParamsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
             await interaction.response.send_modal(modal)
         elif choice == "thinking_params":
             async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name)
+                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name, target_user_id=self.user_id)
                 await self.original_interaction.edit_original_response(embed=new_embed, view=self)
             
             # [UPDATED] Pass self.is_borrowed to the modal
-            modal = ProfileThinkingParamsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb)
+            modal = ProfileThinkingParamsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
             await interaction.response.send_modal(modal)
 
         elif choice == "speech_settings":
             async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name)
+                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name, target_user_id=self.user_id)
                 await self.original_interaction.edit_original_response(embed=new_embed, view=self)
             
-            modal = ProfileSpeechSettingsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb)
+            modal = ProfileSpeechSettingsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
             await interaction.response.send_modal(modal)
 
         # --- Tools Tab Logic ---
@@ -341,15 +379,15 @@ class ProfileManageView(ui.View):
                 profile["image_generation_prompt"] = prompts.get("image_generation_prompt")
                 
             async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name)
+                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name, target_user_id=self.user_id)
                 await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileImageGenSettingsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb)
+            modal = ProfileImageGenSettingsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
             await interaction.response.send_modal(modal)
         elif choice == "typing":
             async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name)
+                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name, target_user_id=self.user_id)
                 await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileTypingSettingsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb)
+            modal = ProfileTypingSettingsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
             await interaction.response.send_modal(modal)
         elif choice == "grounding":
             current_mode = profile.get("grounding_mode", "off")
@@ -376,17 +414,17 @@ class ProfileManageView(ui.View):
             await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice == "neuro":
             async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, self.profile_name)
+                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, self.profile_name, target_user_id=self.user_id)
                 await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileNeuroModal(self.cog, self.profile_name, profile, self.is_borrowed, callback=refresh_cb)
+            modal = ProfileNeuroModal(self.cog, self.profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
             await interaction.response.send_modal(modal)
 
         # --- Memory Tab Logic ---
         elif choice == "manage_ltm":
-            view = DataManageView(self.cog, interaction, profile_name, self.is_borrowed, mode='ltm', parent_manage_view=self)
+            view = DataManageView(self.cog, interaction, profile_name, self.is_borrowed, mode='ltm', parent_manage_view=self, target_user_id=self.user_id)
             await view.start()
         elif choice == "manage_training":
-            view = DataManageView(self.cog, interaction, profile_name, self.is_borrowed, mode='training', parent_manage_view=self)
+            view = DataManageView(self.cog, interaction, profile_name, self.is_borrowed, mode='training', parent_manage_view=self, target_user_id=self.user_id)
             await view.start()
             await interaction.response.defer()
         elif choice == "ltm_creation":
@@ -394,19 +432,19 @@ class ProfileManageView(ui.View):
             await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
         elif choice == "ltm_params":
             async def refresh_cb(i):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(i, profile_name)
+                new_embed = await self.cog.profile_manager._build_profile_manage_embed(i, profile_name, target_user_id=self.user_id)
                 await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileLTMParamsModal(self.cog, profile_name, profile, callback=refresh_cb)
+            modal = ProfileLTMParamsModal(self.cog, profile_name, profile, callback=refresh_cb, target_user_id=self.user_id)
             await interaction.response.send_modal(modal)
         elif choice == "train_params":
             async def refresh_cb(i):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(i, profile_name)
+                new_embed = await self.cog.profile_manager._build_profile_manage_embed(i, profile_name, target_user_id=self.user_id)
                 await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileTrainingParamsModal(self.cog, profile_name, profile, callback=refresh_cb)
+            modal = ProfileTrainingParamsModal(self.cog, profile_name, profile, callback=refresh_cb, target_user_id=self.user_id)
             await interaction.response.send_modal(modal)
         elif choice == "ltm_summarization":
-            instr = profile.get("ltm_summarization_instructions", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
-            modal = ProfileLTMSummarizationModal(self.cog, profile_name, instr)
+            instr = profile.get("ltm_summarization_instructions") or self.cog.profile_manager._default_ltm_summarization_instructions()
+            modal = ProfileLTMSummarizationModal(self.cog, profile_name, instr, target_user_id=self.user_id)
             await interaction.response.send_modal(modal)
 
     # --- Internal Helpers for UI Flow ---
@@ -424,7 +462,7 @@ class ProfileManageView(ui.View):
             self.cog.channel_models.pop(k, None)
             self.cog.channel_model_last_profile_key.pop(k, None)
 
-        new_embed = await self.cog.profile_manager._build_profile_manage_embed(interaction, profile_name)
+        new_embed = await self.cog.profile_manager._build_profile_manage_embed(interaction, profile_name, target_user_id=self.user_id)
         await interaction.response.edit_message(embed=new_embed, view=self)
 
     async def _handle_safety_cycle(self, interaction, profile):
@@ -436,7 +474,7 @@ class ProfileManageView(ui.View):
         await self._save_and_refresh(interaction, profile, self.profile_name, self.is_borrowed)
 
     async def _handle_appearance(self, interaction):
-        modal = AppearanceModal(self.cog, self.original_interaction, self.profile_name)
+        modal = AppearanceModal(self.cog, self.original_interaction, self.profile_name, target_user_id=self.user_id)
         await interaction.response.send_modal(modal)
 
     async def _handle_rename(self, interaction):
@@ -648,7 +686,7 @@ class EditUserProfileAIInstructionsModal(ui.Modal):
         await i.followup.send(message,ephemeral=True)
     async def on_error(self, i:discord.Interaction,e:Exception): print(f"EditUserProfileAIInstrModal err: {e}"); traceback.print_exc(); await i.followup.send('Form error.',ephemeral=True)
 
-def ProfileParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+def ProfileParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
     fields = [
         {"label": "Temperature (0.0-2.0)", "custom_id": "temperature", "default": str(current_params.get("temperature", defaultConfig.GEMINI_TEMPERATURE)), "required": False},
         {"label": "Top P (0.0-1.0)", "custom_id": "top_p", "default": str(current_params.get("top_p", defaultConfig.GEMINI_TOP_P)), "required": False},
@@ -671,9 +709,9 @@ def ProfileParamsModal(cog, profile_name: str, current_params: Dict[str, Any], i
             if not (0 <= s <= STM_LIMIT_MAX): raise ValueError(f"STM Length out of range (0-{STM_LIMIT_MAX})")
             c["stm_length"] = s
         return {"config": c}
-    return ConfigModal(cog, profile_name, is_borrowed, "Set Profile Generation Parameters", fields, parser, callback)
+    return ConfigModal(cog, profile_name, is_borrowed, "Set Profile Generation Parameters", fields, parser, callback, target_user_id)
 
-def ProfileTrainingParamsModal(cog, profile_name: str, current_params: Dict[str, Any], callback=None):
+def ProfileTrainingParamsModal(cog, profile_name: str, current_params: Dict[str, Any], callback=None, target_user_id: Optional[int] = None):
     fields = [
         {"label": "Context Size (0-10)", "custom_id": "training_context_size", "default": str(current_params.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE)), "required": False},
         {"label": "Relevance Threshold (0.0-1.0)", "custom_id": "training_relevance_threshold", "default": str(current_params.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD)), "required": False}
@@ -688,9 +726,9 @@ def ProfileTrainingParamsModal(cog, profile_name: str, current_params: Dict[str,
             if not (0.0 <= rt <= 1.0): raise ValueError("Relevance Threshold out of range")
             c["training_relevance_threshold"] = rt
         return {"config": c}
-    return ConfigModal(cog, profile_name, False, "Set Profile Training Parameters", fields, parser, callback)
+    return ConfigModal(cog, profile_name, False, "Set Profile Training Parameters", fields, parser, callback, target_user_id)
 
-def ProfileThinkingParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+def ProfileThinkingParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
     fields = [
         {"label": "Thinking Summary (on/off)", "custom_id": "thinking_summary_visible", "default": current_params.get("thinking_summary_visible", "off"), "required": False, "placeholder": "Display reasoning tokens below your message."},
         {"label": "Reasoning Effort / Level", "custom_id": "thinking_level", "default": current_params.get("thinking_level", "low"), "required": False, "placeholder": "xhigh, high, medium, low, minimal, none"},
@@ -708,9 +746,9 @@ def ProfileThinkingParamsModal(cog, profile_name: str, current_params: Dict[str,
         c["thinking_budget"] = min(bv if bv is not None and bv >= -1 else -1, 32768)
         
         return {"config": c}
-    return ConfigModal(cog, profile_name, is_borrowed, "Thinking & Reasoning Parameters", fields, parser, callback)
+    return ConfigModal(cog, profile_name, is_borrowed, "Thinking & Reasoning Parameters", fields, parser, callback, target_user_id)
 
-def ProfileLTMParamsModal(cog, profile_name: str, current_params: Dict[str, Any], callback=None):
+def ProfileLTMParamsModal(cog, profile_name: str, current_params: Dict[str, Any], callback=None, target_user_id: Optional[int] = None):
     fields = [
         {"label": "Creation Interval (5-100 msgs)", "custom_id": "ltm_creation_interval", "default": str(current_params.get("ltm_creation_interval", 10)), "required": False, "placeholder": "Default: 10"},
         {"label": "Summarization Context (5-50 msgs)", "custom_id": "ltm_summarization_context", "default": str(current_params.get("ltm_summarization_context", 10)), "required": False, "placeholder": "Default: 10"},
@@ -734,9 +772,9 @@ def ProfileLTMParamsModal(cog, profile_name: str, current_params: Dict[str, Any]
             if not (0.0 <= rt <= 1.0): raise ValueError("Relevance Threshold out of range")
             c["ltm_relevance_threshold"] = rt
         return {"config": c}
-    return ConfigModal(cog, profile_name, False, "LTM Parameters", fields, parser, callback)
+    return ConfigModal(cog, profile_name, False, "LTM Parameters", fields, parser, callback, target_user_id)
 
-def ProfileLTMSummarizationModal(cog, profile_name: str, current_instructions: str, callback=None):
+def ProfileLTMSummarizationModal(cog, profile_name: str, current_instructions: str, callback=None, target_user_id: Optional[int] = None):
     decrypted = cog.storage_manager._decrypt_data(current_instructions)
     fields = [{
         "label": "AI Instructions for Summarization",
@@ -748,11 +786,11 @@ def ProfileLTMSummarizationModal(cog, profile_name: str, current_instructions: s
         "placeholder": "The system will automatically append the conversation excerpt to these instructions."
     }]
     def parser(v):
-        ins = _ps(v["ltm_summarization_instructions"]) or DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS
+        ins = _ps(v["ltm_summarization_instructions"]) or cog.profile_manager._default_ltm_summarization_instructions()
         return {"prompts": {"ltm_summarization_instructions": cog.storage_manager._encrypt_data(ins)}}
-    return ConfigModal(cog, profile_name, False, "Set LTM Summarization Instructions", fields, parser, callback)
+    return ConfigModal(cog, profile_name, False, "Set LTM Summarization Instructions", fields, parser, callback, target_user_id)
 
-def ProfileTypingSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+def ProfileTypingSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
     fields = [
         {"label": "Enable Realistic Typing (on/off)", "custom_id": "realistic_typing_enabled", "default": "on" if current_params.get("realistic_typing_enabled") else "off", "required": True},
         {"label": "Mode (sentence/line)", "custom_id": "typing_mode", "default": current_params.get("typing_mode", "sentence"), "required": False, "placeholder": "Default: sentence"},
@@ -768,9 +806,9 @@ def ProfileTypingSettingsModal(cog, profile_name: str, current_params: Dict[str,
         md = _pf(v["typing_max_delay"])
         if md is not None: c["typing_max_delay"] = md
         return {"config": c}
-    return ConfigModal(cog, profile_name, is_borrowed, "Realistic Typing Settings", fields, parser, callback)
+    return ConfigModal(cog, profile_name, is_borrowed, "Realistic Typing Settings", fields, parser, callback, target_user_id)
 
-def ProfileImageGenSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+def ProfileImageGenSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
     fields = [
         {"label": "Enable Image Gen (on/off)", "custom_id": "image_generation_enabled", "default": "on" if current_params.get("image_generation_enabled") else "off", "required": True}
     ]
@@ -786,7 +824,7 @@ def ProfileImageGenSettingsModal(cog, profile_name: str, current_params: Dict[st
             pr = _ps(v["image_generation_prompt"])
             p["image_generation_prompt"] = cog.storage_manager._encrypt_data(pr) if pr else None
         return {"config": c, "prompts": p}
-    return ConfigModal(cog, profile_name, is_borrowed, "Image Generation Settings", fields, parser, callback)
+    return ConfigModal(cog, profile_name, is_borrowed, "Image Generation Settings", fields, parser, callback, target_user_id)
 
 class SingleProfileModelView(ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str, is_borrowed: Optional[bool] = None, user_id: Optional[int] = None):
@@ -1684,7 +1722,7 @@ class SingleProfileTimezoneView(ui.View):
         for k in keys:
             self.cog.channel_models.pop(k, None)
 
-        new_embed = await self.cog.profile_manager._build_profile_manage_embed(interaction, self.parent_manage_view.profile_name)
+        new_embed = await self.cog.profile_manager._build_profile_manage_embed(interaction, self.parent_manage_view.profile_name, target_user_id=self.parent_manage_view.user_id)
         await self.parent_manage_view.original_interaction.edit_original_response(embed=new_embed, view=self.parent_manage_view)
         await interaction.response.edit_message(content=f"✅ Timezone set to **{canonical_tz}**.", view=None)
 
@@ -1708,7 +1746,7 @@ class CustomTimezoneModal(ui.Modal, title="Enter Custom Timezone"):
             for k in keys:
                 self.parent_view.cog.channel_models.pop(k, None)
 
-            new_embed = await self.parent_view.cog.profile_manager._build_profile_manage_embed(interaction, self.parent_view.parent_manage_view.profile_name)
+            new_embed = await self.parent_view.cog.profile_manager._build_profile_manage_embed(interaction, self.parent_view.parent_manage_view.profile_name, target_user_id=self.parent_view.parent_manage_view.user_id)
             await self.parent_view.parent_manage_view.original_interaction.edit_original_response(embed=new_embed, view=self.parent_view.parent_manage_view)
             await interaction.response.edit_message(content=f"✅ Timezone set to **{canonical_tz}**.", view=None)
         else:
@@ -1808,7 +1846,7 @@ class BulkTimezoneView(BaseBulkProfileView):
 
         await interaction.edit_original_response(content=f"Timezone set to **{self.selected_tz}** for {updated_count} profiles.", view=None)
 
-def ProfileGenerationVisualModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+def ProfileGenerationVisualModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
     raw = current_params.get("placeholder_emoji") or ""
     name_val, id_val = "", ""
     if raw.startswith("<") and raw.endswith(">"):
@@ -1839,7 +1877,7 @@ def ProfileGenerationVisualModal(cog, profile_name: str, current_params: Dict[st
         c["placeholder_emoji"] = p_emoji if p_emoji else None
         c["child_bot_placeholder"] = _pb(v["child_bot_placeholder"])
         return {"config": c}
-    return ConfigModal(cog, profile_name, is_borrowed, "Generation Visual", fields, parser, callback)
+    return ConfigModal(cog, profile_name, is_borrowed, "Generation Visual", fields, parser, callback, target_user_id)
 
 class BulkResetView(BaseBulkProfileView):
     def __init__(self, cog: 'MimicCog', user_id: int):
@@ -1943,13 +1981,15 @@ class BulkDeleteView(BaseBulkProfileView):
         await interaction.edit_original_response(content=f"Successfully deleted {deleted_count} profiles.", view=None)
 
 class AppearanceModal(ui.Modal):
-    def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction, profile_name: str):
+    def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction, profile_name: str,
+                 target_user_id: Optional[int] = None):
         super().__init__(title=f"Appearance: '{profile_name[:20]}'")
         self.cog = cog
         self.original_interaction = original_interaction
         self.profile_name = profile_name
-        
-        user_id_str = str(original_interaction.user.id)
+        self.owner_id = target_user_id or original_interaction.user.id
+
+        user_id_str = str(self.owner_id)
         current_data = self.cog.user_appearances.get(user_id_str, {}).get(self.profile_name, {})
         
         self.display_name_input = ui.TextInput(label="Custom Display Name (Blank to reset)", required=False, max_length=20, default=current_data.get("custom_display_name"))
@@ -1961,7 +2001,8 @@ class AppearanceModal(ui.Modal):
         await interaction.response.defer()
         new_display_name = self.display_name_input.value.strip() or None
         new_avatar_url = self.avatar_url_input.value.strip() or None
-        user_id_str = str(interaction.user.id)
+        owner_id = self.owner_id
+        user_id_str = str(owner_id)
 
         if new_display_name:
             if len(new_display_name) > 32:
@@ -1971,14 +2012,14 @@ class AppearanceModal(ui.Modal):
                 await interaction.followup.send("❌ **Invalid Display Name:** Contains a reserved keyword or mention.", ephemeral=True)
                 return
 
-        is_public = self.cog.profile_manager._is_profile_public(interaction.user.id, self.profile_name)
+        is_public = self.cog.profile_manager._is_profile_public(owner_id, self.profile_name)
         if is_public and (new_display_name or new_avatar_url):
-            is_safe, reason = await self.cog.profile_manager._is_profile_content_safe(interaction.user.id, self.profile_name, new_display_name or self.profile_name, new_avatar_url)
+            is_safe, reason = await self.cog.profile_manager._is_profile_content_safe(owner_id, self.profile_name, new_display_name or self.profile_name, new_avatar_url)
             if not is_safe:
                 await interaction.followup.send(f"**Safety Block:** {reason}", ephemeral=True)
                 return
 
-        config = self.cog.profile_manager._get_profile_config(interaction.user.id, self.profile_name, False)
+        config = self.cog.profile_manager._get_profile_config(owner_id, self.profile_name, False)
         if config:
             if new_display_name: config["custom_display_name"] = new_display_name
             else: config.pop("custom_display_name", None)
@@ -1986,7 +2027,7 @@ class AppearanceModal(ui.Modal):
             if new_avatar_url: config["custom_avatar_url"] = new_avatar_url
             else: config.pop("custom_avatar_url", None)
             
-            self.cog.profile_manager._save_profile_config(interaction.user.id, self.profile_name, config, False)
+            self.cog.profile_manager._save_profile_config(owner_id, self.profile_name, config, False)
             
             if new_display_name or new_avatar_url:
                 self.cog.user_appearances.setdefault(user_id_str, {})[self.profile_name] = {
@@ -2014,11 +2055,11 @@ class AppearanceModal(ui.Modal):
                 valid_timestamps.append(now)
                 self.cog.child_bot_edit_cooldowns[linked_bot_id] = valid_timestamps
 
-        new_embed = await self.cog.profile_manager._build_profile_manage_embed(self.original_interaction, self.profile_name)
+        new_embed = await self.cog.profile_manager._build_profile_manage_embed(self.original_interaction, self.profile_name, target_user_id=owner_id)
         await self.original_interaction.edit_original_response(embed=new_embed)
         await interaction.followup.send("Appearance updated.", ephemeral=True)
 
-def ProfileNeuroModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None):
+def ProfileNeuroModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
     state = current_params.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
     fields = [
         {"label": "Engine Status (on/off)", "custom_id": "neuro_engine_enabled", "default": "on" if current_params.get("neuro_engine_enabled") else "off", "required": False, "placeholder": "Enable or disable the engine."},
@@ -2040,7 +2081,7 @@ def ProfileNeuroModal(cog, profile_name: str, current_params: Dict[str, Any], is
                 nstate[k] = val
         if nstate: c["neuro_state"] = nstate
         return {"config": c}
-    return ConfigModal(cog, profile_name, is_borrowed, "Neuro-Endocrine Engine Configuration", fields, parser, callback)
+    return ConfigModal(cog, profile_name, is_borrowed, "Neuro-Endocrine Engine Configuration", fields, parser, callback, target_user_id)
 
 class BulkManageView(ui.View):
     def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction):
@@ -2125,7 +2166,7 @@ class BulkManageView(ui.View):
             async def modal_callback(i: discord.Interaction, params: Dict):
                 view = UnifiedBulkTargetView(self.cog, self.user_id, "update_prompts", params.get("prompts", {}), include_borrowed=False)
                 await i.followup.send(content="Prompt received. Now select the profiles to apply it to:", view=view, ephemeral=True)
-            modal = ProfileLTMSummarizationModal(self.cog, "BULK_APPLY", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS, callback=modal_callback)
+            modal = ProfileLTMSummarizationModal(self.cog, "BULK_APPLY", self.cog.profile_manager._default_ltm_summarization_instructions(), callback=modal_callback)
             await interaction.response.send_modal(modal)
 
         elif choice == "models":

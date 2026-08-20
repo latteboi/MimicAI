@@ -275,8 +275,9 @@ class EventListeners:
                 asyncio.create_task(_ack_mute())
 
                 await self.session_manager._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
-                session["is_hydrated"] = False
-                await self.session_manager._ensure_session_hydrated(channel_id, session_type)
+                # Hidden turns are skipped by the whisper derivation, so muting a turn
+                # can resurrect or drop a pending whisper.
+                self.session_manager._recompute_pending_whispers(session)
                 return
 
             if turn_object.get("is_user") is True:
@@ -292,7 +293,7 @@ class EventListeners:
             
             if reacted_to_participant:
                 if is_regen:
-                    is_busy = session.get('is_running') or session.get('is_regenerating') or session.get('is_purging')
+                    is_busy = any(session.get(flag) for flag in SESSION_BUSY_FLAGS)
                     
                     async def _ack_regen_reaction(busy: bool):
                         try:
@@ -309,9 +310,18 @@ class EventListeners:
 
                     async def queue_regeneration():
                         was_busy = is_busy
-                        while session.get('is_running') or session.get('is_regenerating') or session.get('is_purging'):
-                            await asyncio.sleep(0.5)
-                        
+                        # Now bounded. This spun unbounded at 2 Hz on flags it does not own,
+                        # and it waits on is_whispering as well now, so a leaked flag would
+                        # have stranded the task for the life of the process. On timeout the
+                        # regeneration is dropped rather than run against a live round --
+                        # the same outcome as the user pulling the reaction back off.
+                        if not await self.session_manager._wait_for_session_flags(
+                            session, SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS
+                        ):
+                            session.get('regen_tasks', {}).pop(payload.message_id, None)
+                            print(f"Regeneration for message {payload.message_id} timed out waiting for the channel; dropped.")
+                            return
+
                         session.get('regen_tasks', {}).pop(payload.message_id, None)
                         
                         if was_busy:
@@ -377,7 +387,7 @@ class EventListeners:
                             except ValueError:
                                 pass
 
-                        is_busy = session.get('is_running') or session.get('is_regenerating') or session.get('is_purging')
+                        is_busy = any(session.get(flag) for flag in SESSION_BUSY_FLAGS)
                         
                         async def _ack_nav_reaction(busy: bool):
                             try:
@@ -458,8 +468,8 @@ class EventListeners:
             elif is_mute:
                 turn_object["is_hidden"] = False
                 await self.session_manager._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
-                session["is_hydrated"] = False
-                await self.session_manager._ensure_session_hydrated(channel_id, session_type)
+                # Same derivation as the mute path above, in reverse.
+                self.session_manager._recompute_pending_whispers(session)
                 try:
                     channel = self.bot.get_channel(payload.channel_id)
                     msg = await channel.fetch_message(payload.message_id)
@@ -487,7 +497,7 @@ class EventListeners:
 
         deleted_message_id = payload.message_id
         if deleted_message_id in self.purged_message_ids:
-            self.purged_message_ids.discard(deleted_message_id)
+            self.purged_message_ids.pop(deleted_message_id, None)
             return
         
         # 1. Check Global Chat Sessions
@@ -572,11 +582,94 @@ class EventListeners:
                 else:
                     await self.session_manager._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
 
-                # Now that the correct state is on disk, force a re-read and rebuild
-                session["is_hydrated"] = False
-                await self.session_manager._ensure_session_hydrated(payload.channel_id, session_type)
+                # See the note on _recompute_pending_whispers: this is what the
+                # rebuild used to derive, and all it derived.
+                self.session_manager._recompute_pending_whispers(session)
 
             self.session_last_accessed[payload.channel_id] = time.time()
+
+    @commands.Cog.listener()
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent):
+        """Handles MESSAGE_DELETE_BULK, which on_raw_message_delete never receives.
+
+        Discord fires MESSAGE_DELETE for one deletion and MESSAGE_DELETE_BULK for two or
+        more, and discord.py's purge() switches endpoints at exactly that boundary
+        (delete_messages: "if the number of messages is 1 then single message delete is
+        done. If it's more than two, then bulk delete is used."). With no listener here,
+        /purge 1 and /purge 2+ behaved differently: single deletes were reconciled, bulk
+        deletes were not seen at all. Two consequences, both fixed by this method --
+        purged ids were never cleared from purged_message_ids, and a bulk delete
+        performed by anything *else* (a moderation bot, a manual sweep) left its turns
+        in unified_log permanently.
+
+        Batched on purpose: one pass over the log and at most one disk write for the
+        whole payload, rather than running the single-delete path once per message.
+
+        No global-chat branch, unlike on_raw_message_delete -- Discord's bulk delete is
+        a guild-channel endpoint and never fires for DMs.
+        """
+        if not self.has_lock:
+            return
+
+        message_ids = set(payload.message_ids)
+
+        # Ids we deleted ourselves were already reconciled by /purge itself. Drop them
+        # and act only on the remainder.
+        ours = {mid for mid in message_ids if mid in self.purged_message_ids}
+        for mid in ours:
+            self.purged_message_ids.pop(mid, None)
+        message_ids -= ours
+        if not message_ids:
+            return
+
+        session = self.multi_profile_channels.get(payload.channel_id)
+        if not session:
+            return
+
+        session_type = session.get("type", "multi")
+        if not session.get("is_hydrated"):
+            session = await self.session_manager._ensure_session_hydrated(payload.channel_id, session_type)
+        if not session:
+            return
+
+        unified_log = session.get("unified_log", [])
+        turns_to_delete = [
+            turn for turn in unified_log
+            if any(mid in message_ids for mid in turn.get("message_ids", []))
+        ]
+        if not turns_to_delete:
+            return
+
+        pid_to_profile = {}
+        for p in session.get('profiles', []):
+            pid = self.profile_manager._get_pid_from_name_any(p['owner_id'], p['profile_name'])
+            pid_to_profile.setdefault(pid, p)
+
+        for turn_obj in turns_to_delete:
+            if turn_obj.get("is_user") is False:
+                p = pid_to_profile.get(turn_obj.get("speaker_pid"))
+                if p:
+                    p['ltm_counter'] = max(0, p.get('ltm_counter', 0) - 1)
+
+        # Identity, not turn_id -- see the note on /purge in CLAUDE.md.
+        doomed = {id(turn) for turn in turns_to_delete}
+        session["unified_log"] = [t for t in unified_log if id(t) not in doomed]
+
+        is_effectively_empty = not session.get("unified_log") or all(
+            turn.get("type") in ["whisper", "private_response"] for turn in session.get("unified_log", [])
+        )
+
+        dummy_session_key = (payload.channel_id, None, None)
+        if is_effectively_empty:
+            await self.session_manager._delete_session_from_disk(dummy_session_key, session_type)
+            for p in session.get("profiles", []):
+                full_session_key = (payload.channel_id, p['owner_id'], p['profile_name'])
+                self.ltm_recall_history.pop(full_session_key, None)
+        else:
+            await self.session_manager._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
+
+        self.session_manager._recompute_pending_whispers(session)
+        self.session_last_accessed[payload.channel_id] = time.time()
 
     @commands.Cog.listener()
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
@@ -637,9 +730,11 @@ class EventListeners:
             dummy_session_key = (channel_id, None, None)
             await self.session_manager._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
             
-            # Force Re-hydration so all participant histories get the updated log context instantly
-            session["is_hydrated"] = False
-            await self.session_manager._ensure_session_hydrated(channel_id, session_type)
+            # No rebuild here. "Re-hydrate so all participant histories get the updated
+            # log context" predates Migration 1 -- there are no per-participant history
+            # objects left to refresh, every reader derives from unified_log, and the
+            # edit above is already in it. The whisper derivation reads type/target_pid/
+            # speaker_pid/is_hidden and never content, so it cannot change either.
             self.session_last_accessed[channel_id] = time.time()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:

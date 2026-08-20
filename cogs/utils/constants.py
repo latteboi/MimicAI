@@ -121,6 +121,27 @@ LOCK_REFRESH_INTERVAL_SECONDS = 30
 # Bound for channel_models / channel_model_last_profile_key, keyed
 # (channel_id, profile_owner_id, profile_name).
 CHANNEL_MODEL_CACHE_MAX_SIZE = 64 
+# /purge records the ids it deleted so the on_message_delete listener can tell its own
+# deletions from a user's. Entries are removed when that event arrives -- but the event
+# is not guaranteed (gateway gaps, a restart mid-purge), so unmatched ids used to
+# accumulate in a plain set for the life of the process. Bounded at several purges' worth
+# of pending events; /purge itself caps at 100 messages per invocation.
+PURGED_MESSAGE_ID_CACHE_MAX_SIZE = 512
+# How long /purge will wait for an in-flight generation before giving up. Must be
+# bounded: generation_service and the reaction listeners all spin on is_purging, so an
+# unbounded wait here wedges the entire channel for the life of the process.
+PURGE_BUSY_WAIT_TIMEOUT_SECONDS = 30.0
+# A whisper is a blocking private turn. /whisper does not generate on top of a live round
+# -- it waits for the channel to go idle, then claims it, and everything else queues behind
+# it. Both directions of that wait are bounded for the reason directly above: a flag that
+# leaks True wedges the channel for the life of the process. Generous, because a legitimate
+# multi-profile round runs several 240 s participant turns back to back, and it still sits
+# well inside Discord's 15-minute interaction token lifetime.
+WHISPER_BUSY_WAIT_TIMEOUT_SECONDS = 300.0
+# Every flag that means "this channel is mid-operation". A whisper claims the channel only
+# once all of them are clear; the check and the claim must be in the same synchronous step.
+SESSION_BUSY_FLAGS = ('is_running', 'is_regenerating', 'is_purging', 'is_whispering')
+WHISPER_WAITING_NOTICE = "\u23f3 Waiting for turns to finish..."
 PROMPT_CACHE_MAX_SIZE = 20
 MAX_USER_PROFILES = 50
 MAX_BORROWED_PROFILES = 50
@@ -319,6 +340,76 @@ HARM_CATEGORIES = (
     HarmCategory.HARM_CATEGORY_HATE_SPEECH,
     HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+)
+
+# --- Prompts promoted out of the code so /mod can edit them -------------------
+#
+# Each of these was a string literal inlined at the point of use, and most were
+# duplicated across two or three call sites with wording that had already
+# drifted apart (the turn-kickstart note said "Start the conversation." in
+# generation_service and "Begin conversation." in regeneration; the image
+# presentation note said "Present it." in media_service and "Present it with a
+# comment." in regeneration). One definition each now, registered for editing in
+# MOD_PROMPT_DEFINITIONS in cogs/gui/gui_mod.py.
+#
+# Placeholders are substituted with str.format(), so a brace in a *value* -- a
+# user's image prompt, a whisper body -- is safe; only the template is scanned.
+# MOD_PROMPT_PLACEHOLDERS records the required field names, and the /mod editor
+# refuses to save a custom prompt that would break the .format() call.
+
+DEFAULT_TIME_CONTEXT = (
+    "<time_context>\n"
+    "Your current time is {time_str}.\n"
+    "</time_context>"
+)
+
+DEFAULT_NEGATIVE_CONSTRAINTS = (
+    "<negative_constraints>\n"
+    "STRICT ADHERENCE REQUIRED:\n"
+    "{constraints}\n"
+    "</negative_constraints>"
+)
+
+DEFAULT_WHISPER_RECAP = (
+    "<whisper_context>\n"
+    "SYSTEM NOTE: You previously received and replied to these private whispers. "
+    "Keep them in mind for context, but behave how you would treat whispers.\n"
+    "\n---\n"
+    "{whispers}\n"
+    "</whisper_context>"
+)
+
+# Injected as a pseudo-user turn so a participant's history never ends on a
+# 'model' role. No placeholders -- used verbatim.
+DEFAULT_KICKSTART_START = "<internal_note>Start the conversation.</internal_note>"
+DEFAULT_KICKSTART_CONTINUE = "<internal_note>Continue the public conversation.</internal_note>"
+DEFAULT_KICKSTART_IDLE = "<internal_note>No response from anyone OR no user is present.</internal_note>"
+
+DEFAULT_DIRECTOR_USER_PROMPT = "Recent History:\n{history}\n\nGenerate your Director's prompt."
+
+DEFAULT_IMAGE_PRESENT = (
+    "<image_context>You have just generated the following image based on the prompt: "
+    "'{prompt}'. Present it with a comment.</image_context>"
+)
+
+# What a *bystander* profile is told about an image another profile generated.
+DEFAULT_IMAGE_PRESENT_OTHER = (
+    "<image_context>'{name}' just generated the following image based on the prompt: "
+    "'{prompt}'. Comment on it.</image_context>"
+)
+
+DEFAULT_IMAGE_FAILED = (
+    "<image_context>Your attempt to generate an image based on the prompt '{prompt}' "
+    "failed due to: {reason}. Comment on this failure in character.</image_context>"
+)
+
+DEFAULT_IMAGE_APPEARANCE = "Your appearance:\n{appearance}\n\nUser's prompt:\n{prompt}"
+
+DEFAULT_IMAGE_GROUNDING = "{prompt}\n\nUse this information to help generate the image:\n{grounding}"
+
+DEFAULT_GROUNDING_RAG_PAYLOAD = (
+    "<conversation_transcript>\n{transcript}\n</conversation_transcript>\n\n"
+    "<user_query>\n{query}\n</user_query>"
 )
 
 DEFAULT_SAFETY_SETTINGS = {

@@ -10,6 +10,7 @@ from ...utils.constants import (
     defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, PLACEHOLDER_EMOJI,
     ERR_GENERAL_ERROR, ERR_RATE_LIMIT, ERR_REASON_EMPTY_RESPONSE, ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK,
     WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED,
+    DEFAULT_KICKSTART_START, DEFAULT_KICKSTART_IDLE, DEFAULT_IMAGE_PRESENT, DEFAULT_WHISPER_RECAP,
 )
 from ...utils.helpers import _add_inline_citations, _format_api_error, _format_history_entry, _scrub_response_text
 from ._shared import _resolve_safety_settings, _strip_neuro_update_and_scrub
@@ -87,7 +88,7 @@ class RegenerationMixin:
                     is_sources = "Sources:" in msg.content
                     has_image = any(a.content_type and a.content_type.startswith("image/") for a in msg.attachments)
                     if not is_sources and not has_image:
-                        self.cog.purged_message_ids.add(msg_id)
+                        self.cog.purged_message_ids[msg_id] = True
                         await msg.delete()
                 except Exception: pass
 
@@ -117,9 +118,9 @@ class RegenerationMixin:
 
             # Pseudo-turn injection to ensure history ends with a 'user' role
             if participant_history and participant_history[-1].get('role', 'user') == 'model':
-                participant_history.append({'role': 'user', 'parts': ["<internal_note>No response from anyone OR no user is present.</internal_note>"]})
+                participant_history.append({'role': 'user', 'parts': [self.cog.global_prompts.get("KICKSTART_IDLE", DEFAULT_KICKSTART_IDLE)]})
             elif not participant_history:
-                participant_history.append({'role': 'user', 'parts': ["<internal_note>Begin conversation.</internal_note>"]})
+                participant_history.append({'role': 'user', 'parts': [self.cog.global_prompts.get("KICKSTART_START", DEFAULT_KICKSTART_START)]})
 
             # 4. Re-run Generation
             model, _, temp, top_p, top_k, _, fallback_model_name = await self.cog.api_service._get_or_create_model_for_channel(
@@ -160,7 +161,8 @@ class RegenerationMixin:
                                 break
                         prompt_text = clean_body
 
-                    system_note = f"<image_context>You have just generated the following image based on the prompt: '{prompt_text}'. Present it with a comment.</image_context>"
+                    present_template = self.cog.global_prompts.get("IMAGE_PRESENT", DEFAULT_IMAGE_PRESENT)
+                    system_note = present_template.format(prompt=prompt_text)
                     recovered_media_parts.append(system_note)
                     for a in bot_image_attachments:
                         recovered_media_parts.append({"url": a.url, "mime_type": a.content_type})
@@ -198,9 +200,8 @@ class RegenerationMixin:
 
             # Inject pending whispers if any
             if pending_whispers_for_regen and participant_history:
-                whisper_context = "<whisper_context>\n"
-                whisper_context += "SYSTEM NOTE: You previously received and replied to these private whispers. Keep them in mind for context, but behave how you would treat whispers.\n"
-                whisper_context += "\n---\n" + "\n---\n".join(pending_whispers_for_regen) + "\n</whisper_context>"
+                recap_template = self.cog.global_prompts.get("WHISPER_RECAP", DEFAULT_WHISPER_RECAP)
+                whisper_context = recap_template.format(whispers="\n---\n".join(pending_whispers_for_regen))
 
                 for h_turn in reversed(participant_history):
                     if h_turn.get('role') == 'user':
@@ -479,9 +480,8 @@ class RegenerationMixin:
             # Re-sync memory and save final state
             await self.cog.session_manager._save_session_to_disk(dummy_key, session_type, session["unified_log"])
 
-            # Re-hydrate histories for all participants to reflect the edit
-            session["is_hydrated"] = False
-            await self.cog.session_manager._ensure_session_hydrated(channel.id, session_type)
+            # No rebuild: a regenerated turn only changes its own content, which no
+            # derived session state reads. See _recompute_pending_whispers.
 
         except Exception as e:
             print(f"Regeneration failed: {e}")

@@ -811,7 +811,9 @@ class WhisperActionView(ui.View):
         if len(session["unified_log"]) < original_log_len and target_pid:
             session_type = session.get("type", "multi")
             await self.cog.session_manager._save_session_to_disk((self.channel_id, None, None), session_type, session["unified_log"])
-            session["is_hydrated"] = False
+            # Deleting the whisper turns themselves -- recompute rather than clearing
+            # is_hydrated, which stranded the in-memory log past eviction.
+            self.cog.session_manager._recompute_pending_whispers(session)
 
         await interaction.response.edit_message(content="Whisper has been deleted from the profile's memory.", view=None, embed=None)
 

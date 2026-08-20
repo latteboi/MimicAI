@@ -183,11 +183,13 @@ class SearchDataModal(ui.Modal, title="Search Data"):
         await self.parent_view._update_view(interaction)
 
 class DataManageView(ui.View):
-    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str, is_borrowed: bool, mode: Optional[Literal['training', 'ltm']] = None, parent_manage_view: Optional['ProfileManageView'] = None):
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str, is_borrowed: bool, mode: Optional[Literal['training', 'ltm']] = None, parent_manage_view: Optional['ProfileManageView'] = None, target_user_id: Optional[int] = None):
         super().__init__(timeout=600)
         self.cog = cog
         self.original_interaction = interaction
-        self.user_id = interaction.user.id
+        # The profile's owner, which is not the invoker when /mod drives this view.
+        # Only the LTM author stamp (in AddLtmModal) still uses the invoker's id.
+        self.user_id = target_user_id or interaction.user.id
         self.guild_id = interaction.guild_id
         self.profile_name = profile_name
         self.is_borrowed = is_borrowed
