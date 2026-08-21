@@ -203,7 +203,11 @@ class ToolsService:
 
         status = "api_error"
         warning_str = None
-        model_name = 'gemini-2.5-flash-lite' # Use a single, tool-capable model
+        # Provisional, for the finally-block log if we fail before resolving the user's
+        # configured grounding model. Reassigned to the model actually used below --
+        # this used to stay hardcoded, so anyone who changed grounding_rag_model had
+        # every grounding call attributed to flash-lite in their usage stats.
+        model_name = FALLBACK_MODEL_NAME
         try:
             history_for_decision = conversation_history
 
@@ -294,6 +298,10 @@ class ToolsService:
                 # OpenRouter doesn't support the Google Search Tool natively yet in our adapter
                 # We will fall back to Google for the RAG phase if they attempt to route grounding to OpenRouter
                 actual_model_name = FALLBACK_MODEL_NAME
+
+            # Set after the OpenRouter fallback above, so the log names the model the
+            # call is actually made against rather than the one that was requested.
+            model_name = actual_model_name
 
             model = GoogleGenAIModel(
                 api_key=api_key,

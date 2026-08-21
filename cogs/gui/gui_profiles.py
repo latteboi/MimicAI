@@ -9,7 +9,7 @@ import time
 from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional, Union
 from ..utils.content import OLLAMA_GUIDE_TEXT
-from ..utils.helpers import _pf, _pi, _ps, _pb
+from ..utils.helpers import _coerce_safety_level, _pf, _pi, _ps, _pb
 from ..utils.http_client import get_shared_client
 
 if TYPE_CHECKING:
@@ -75,6 +75,210 @@ def ProfileSpeechSettingsModal(cog, profile_name: str, current_params: Dict[str,
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Speech & Voice Settings", fields, parser, callback, target_user_id)
 
+#: Tab order for ProfileManageView's nav bar. "persona" is hidden for borrowed profiles.
+PROFILE_TABS = ("home", "persona", "params", "tools", "memory")
+
+
+class _Action:
+    """One row of ProfileManageView's dropdown.
+
+    Label, description, visibility and handler used to live ~200 lines apart: the
+    SelectOption was built in a 135-line `_build_view`, and its behaviour sat in a
+    51-branch `elif` chain in `dropdown_callback`. Adding an action meant editing both,
+    and reordering one silently desynchronised them. Here a row is one declaration.
+
+    `gate` is an optional predicate on the view; a row with no gate is always shown.
+    `label` may be a callable for the one row whose wording depends on the profile.
+    """
+
+    __slots__ = ("value", "tab", "label", "description", "gate", "run")
+
+    def __init__(self, value, tab, label, description, run, gate=None):
+        self.value = value
+        self.tab = tab
+        self.label = label
+        self.description = description
+        self.run = run
+        self.gate = gate
+
+    def visible(self, view) -> bool:
+        return self.gate is None or self.gate(view)
+
+    def option(self, view) -> discord.SelectOption:
+        label = self.label(view) if callable(self.label) else self.label
+        return discord.SelectOption(label=label, value=self.value, description=self.description)
+
+
+def _modal(factory_name: str, *, pass_borrowed: bool = True):
+    """Handler for the dominant shape: open a settings modal, refresh the dashboard.
+
+    The modal factories all take (cog, profile_name, current_params[, is_borrowed],
+    callback, target_user_id); the two that predate `is_borrowed` opt out.
+
+    Named rather than passed by reference because the table is defined above the
+    factories it points at, so the lookup has to happen at click time.
+    """
+    async def run(view, interaction, profile):
+        args = [view.cog, view.profile_name, profile]
+        if pass_borrowed:
+            args.append(view.is_borrowed)
+        await interaction.response.send_modal(
+            globals()[factory_name](*args, callback=view._refresh_dashboard,
+                                    target_user_id=view.user_id))
+    return run
+
+
+def _toggle(key: str):
+    """Handler for a plain boolean flag on the profile config."""
+    async def run(view, interaction, profile):
+        profile[key] = not profile.get(key, False)
+        await view._save_and_refresh(interaction, profile, view.profile_name, view.is_borrowed)
+    return run
+
+
+def _cycle(key: str, order: tuple, default=None):
+    """Handler for a setting that advances through a fixed sequence."""
+    async def run(view, interaction, profile):
+        current = profile.get(key, default if default is not None else order[0])
+        index = order.index(current) + 1 if current in order else 0
+        profile[key] = order[index % len(order)]
+        await view._save_and_refresh(interaction, profile, view.profile_name, view.is_borrowed)
+    return run
+
+
+def _method(name: str, *args, wants_profile: bool = False, wants_borrowed: bool = False):
+    """Handler that defers to one of the view's own `_handle_*` / `_act_*` methods.
+
+    `wants_profile` / `wants_borrowed` append the view state those older handlers take
+    positionally, ahead of any literal `args` declared in the table.
+    """
+    async def run(view, interaction, profile):
+        extra = []
+        if wants_profile:
+            extra.append(profile)
+        if wants_borrowed:
+            extra.append(view.is_borrowed)
+        await getattr(view, name)(interaction, *extra, *args)
+    return run
+
+
+# Gates. Named rather than inlined as lambdas so the table below reads as data.
+def _own(view):        return not view.is_borrowed
+def _own_not_mod(view): return not view.is_borrowed and not view.is_mod_view
+def _to_system(view):
+    return (not view.is_borrowed and not view.is_mod_view
+            and view.original_interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)
+            and not view.is_system)
+def _to_personal(view):
+    return (not view.is_borrowed and not view.is_mod_view
+            and view.original_interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)
+            and view.is_system)
+
+
+def _can_mark_adult(view):
+    """The 18+ toggle is hidden for borrowed and published profiles.
+
+    A borrower does not own the content, and the public index only accepts
+    Restricted profiles. Under the old four-tier cycle both cases were handled by
+    offering a reduced Low -> Medium -> High cycle; with two values there is
+    nothing left to cycle through, so the row is withheld rather than shown dead.
+
+    Both checks are in-memory for a non-borrowed profile -- _is_profile_public
+    reads the cached user index and cog.public_profiles -- so this is safe to
+    evaluate on every render of the Home tab.
+    """
+    return (not view.is_borrowed
+            and not view.cog.profile_manager._is_profile_public(view.user_id, view.profile_name))
+
+
+#: The dropdown, in render order, grouped by tab. Order within a tab is the order the
+#: user sees, so rows must not be resorted.
+PROFILE_ACTIONS = (
+    # --- Home ---
+    _Action("rename", "home", "Rename Profile", "Change the local name of this profile.",
+            _method("_handle_rename")),
+    _Action("duplicate", "home", "Duplicate Profile", "Create a new profile from a copy of this one.",
+            _method("_handle_duplicate"), _own),
+    # Share and Copy-to-System act on behalf of the profile's owner -- _handle_share
+    # opens the invoker's own share manager and _handle_convert_copy reads i.user.id --
+    # so both stay owner-only rather than being silently wrong under /mod.
+    _Action("share", "home", "Share Profile", "Share this profile with others or publish it.",
+            _method("_handle_share"), _own_not_mod),
+    _Action("error_response", "home", "Custom Error Message", "Set the message shown when generation fails.",
+            _method("_act_error_response", wants_profile=True), _own),
+    _Action("generation_visual", "home", "Generation Visual", "Set custom placeholder emoji and child bot behavior.",
+            _modal("ProfileGenerationVisualModal"), _own),
+    _Action("convert_to_system", "home", "Copy to System Profile", "Create a global System Profile copy from this profile.",
+            _method("_handle_convert_copy", True), _to_system),
+    _Action("convert_to_personal", "home", "Copy to Personal Profile", "Create a Personal Profile copy from this System Profile.",
+            _method("_handle_convert_copy", False), _to_personal),
+    _Action("safety_level", "home", "Toggle Content Safety Level", "Switch between Restricted and Unrestricted 18+.",
+            _method("_handle_safety_toggle", wants_profile=True), _can_mark_adult),
+    _Action("delete", "home",
+            lambda v: "Remove Borrowed Profile" if v.is_borrowed else "Delete Profile",
+            "Permanently remove this profile and its data.",
+            _method("_handle_delete")),
+
+    # --- Persona (tab hidden entirely for borrowed profiles) ---
+    _Action("edit_persona", "persona", "Edit Persona", "Edit backstory, traits, likes, dislikes, and appearance.",
+            _method("_act_edit_persona", wants_profile=True)),
+    _Action("edit_instructions", "persona", "Edit Instructions", "Edit specific AI behavioral instructions.",
+            _method("_act_edit_instructions", wants_profile=True)),
+    _Action("tts_instructions", "persona", "TTS Instructions", "Configure the 'Director's Desk' for vocal performance.",
+            _modal("ProfileDirectorDeskModal", pass_borrowed=False)),
+    _Action("edit_appearance", "persona", "Edit Appearance", "Edit the custom Webhook name and avatar.",
+            _method("_handle_appearance"), _own),
+
+    # --- Params ---
+    _Action("models", "params", "Set Models", "Choose Primary and Fallback AI models.",
+            _method("_act_models", wants_profile=True)),
+    _Action("gen_params", "params", "Set Generation Parameters & STM", "Set Temp, Top P, Top K, and STM Length.",
+            _modal("ProfileParamsModal")),
+    _Action("adv_params", "params", "Set Advanced Parameters (OPENROUTER)", "Set penalties, Min P, and Top A.",
+            _modal("ProfileAdvancedParamsModal")),
+    _Action("thinking_params", "params", "Set Thinking Parameters", "Set thinking persistence, level, and budget.",
+            _modal("ProfileThinkingParamsModal")),
+    _Action("speech_settings", "params", "Set Speech & Voice Settings", "Set TTS voice, model, and temperature.",
+            _modal("ProfileSpeechSettingsModal")),
+
+    # --- Tools ---
+    _Action("image_toggle", "tools", "Toggle Image Generation", "Allow this profile to generate images via !image/!imagine.",
+            _method("_act_image_toggle", wants_profile=True)),
+    _Action("grounding", "tools", "Toggle Grounding (Web Search)", "Cycle Grounding: OFF -> NATIVE -> RAG.",
+            _method("_act_grounding", wants_profile=True)),
+    _Action("url_toggle", "tools", "Toggle URL Context Fetching", "Cycle URL Context: OFF -> NATIVE -> RAG.",
+            _method("_act_url_toggle", wants_profile=True)),
+    _Action("cycle_response", "tools", "Cycle Response Mode", "Cycle: Regular -> Mention -> Reply -> Mention Reply.",
+            _cycle("response_mode", ("regular", "mention", "reply", "mention_reply"))),
+    _Action("time", "tools", "Set Time & Timezone", "Enable time awareness and set the profile's timezone.",
+            _method("_handle_timezone", wants_profile=True, wants_borrowed=True)),
+    _Action("typing", "tools", "Toggle Realistic Typing", "Enable a human-like delay when the bot sends messages.",
+            _modal("ProfileTypingSettingsModal")),
+    _Action("critic", "tools", "Toggle Anti-Repetition Critic", "Enable semantic repetition analysis (Adds latency).",
+            _toggle("critic_enabled")),
+    _Action("neuro", "tools", "Toggle Neuro-Endocrine Engine", "Simulate hormonal states for dynamic emotions.",
+            _modal("ProfileNeuroModal")),
+    _Action("help_mode", "tools", "Toggle Help Mode (Guide RAG)", "Allow profile to answer technical bot questions.",
+            _toggle("help_mode_enabled")),
+
+    # --- Memory ---
+    _Action("manage_ltm", "memory", "Manage Long-Term Memories", "Add, list, edit, or delete memories.",
+            _method("_act_manage_ltm", wants_profile=True)),
+    _Action("manage_training", "memory", "Manage Training Examples", "Add, list, edit, or delete training examples.",
+            _method("_act_manage_training", wants_profile=True), _own),
+    _Action("train_params", "memory", "Set Training Parameters", "Set training context size and relevance threshold.",
+            _modal("ProfileTrainingParamsModal", pass_borrowed=False), _own),
+    _Action("ltm_creation", "memory", "Toggle LTM Auto-Creation", "Automatically create memories from conversations.",
+            _toggle("ltm_creation_enabled")),
+    _Action("ltm_params", "memory", "Set LTM Parameters", "Set frequency, context, and recall settings.",
+            _modal("ProfileLTMParamsModal", pass_borrowed=False)),
+    _Action("ltm_summarization", "memory", "Set LTM Summarization Prompt", "Customize how the AI creates memories.",
+            _method("_act_ltm_summarization", wants_profile=True), _own),
+)
+
+PROFILE_ACTIONS_BY_VALUE = {a.value: a for a in PROFILE_ACTIONS}
+
+
 class ProfileManageView(ui.View):
     def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction, profile_name: str, is_borrowed: bool, target_user_id: Optional[int] = None, is_mod_view: bool = False):
         super().__init__(timeout=600)
@@ -113,93 +317,13 @@ class ProfileManageView(ui.View):
 
         is_mod = getattr(self, 'is_mod_view', False)
 
-        # Params/Tools/Memory used to be hidden from the mod view because their
-        # handlers resolved the profile owner from interaction.user.id -- a moderator
-        # would have edited their own profile of the same name. Every one of them now
-        # takes target_user_id, so the tabs are available to both.
-        def tab_has_options(tab: str) -> bool:
-            if tab == "home":
-                return True
-            if tab == "persona":
-                return not self.is_borrowed
-            if tab in ("params", "tools", "memory"):
-                return True
-            return False
-
-        valid_tabs = [t for t in ["home", "persona", "params", "tools", "memory"] if tab_has_options(t)]
+        valid_tabs = [t for t in PROFILE_TABS if t == "home" or t != "persona" or not self.is_borrowed]
         if self.current_tab not in valid_tabs and valid_tabs:
             self.current_tab = valid_tabs[0]
-            
-        if not valid_tabs:
-            if is_mod:
-                self._add_mod_back_button()
-                ModBaseView.add_nav_to_other_view(
-                    self, self.cog, self.original_interaction, "profiles", self.mod_return_user_id)
-            return
 
         # --- 1. Category Dropdown (Row 0) ---
-        options = []
-        
-        if self.current_tab == "home":
-            options.append(discord.SelectOption(label="Rename Profile", value="rename", description="Change the local name of this profile."))
-
-            if not self.is_borrowed:
-                options.append(discord.SelectOption(label="Duplicate Profile", value="duplicate", description="Create a new profile from a copy of this one."))
-                # Share and Copy-to-System act on behalf of the profile's owner --
-                # _handle_share opens the invoker's own share manager and
-                # _handle_convert_copy reads i.user.id -- so both stay owner-only
-                # rather than being silently wrong under /mod.
-                if not is_mod:
-                    options.append(discord.SelectOption(label="Share Profile", value="share", description="Share this profile with others or publish it."))
-                options.append(discord.SelectOption(label="Custom Error Message", value="error_response", description="Set the message shown when generation fails."))
-                options.append(discord.SelectOption(label="Generation Visual", value="generation_visual", description="Set custom placeholder emoji and child bot behavior."))
-
-                owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-                if not is_mod and self.original_interaction.user.id == owner_id:
-                    if self.is_system:
-                        options.append(discord.SelectOption(label="Copy to Personal Profile", value="convert_to_personal", description="Create a Personal Profile copy from this System Profile."))
-                    else:
-                        options.append(discord.SelectOption(label="Copy to System Profile", value="convert_to_system", description="Create a global System Profile copy from this profile."))
-
-            options.append(discord.SelectOption(label="Cycle Content Safety Level", value="safety_level", description="Cycle: Low -> Medium -> High -> Unrestricted 18+."))
-
-            label = "Remove Borrowed Profile" if self.is_borrowed else "Delete Profile"
-            options.append(discord.SelectOption(label=label, value="delete", description="Permanently remove this profile and its data."))
-
-        elif self.current_tab == "persona":
-            options.append(discord.SelectOption(label="Edit Persona", value="edit_persona", description="Edit backstory, traits, likes, dislikes, and appearance."))
-            options.append(discord.SelectOption(label="Edit Instructions", value="edit_instructions", description="Edit specific AI behavioral instructions."))
-            options.append(discord.SelectOption(label="TTS Instructions", value="tts_instructions", description="Configure the 'Director's Desk' for vocal performance."))
-            if not self.is_borrowed:
-                options.append(discord.SelectOption(label="Edit Appearance", value="edit_appearance", description="Edit the custom Webhook name and avatar."))
-
-        elif self.current_tab == "params":
-            options.append(discord.SelectOption(label="Set Models", value="models", description="Choose Primary and Fallback AI models."))
-            options.append(discord.SelectOption(label="Set Generation Parameters & STM", value="gen_params", description="Set Temp, Top P, Top K, and STM Length."))
-            options.append(discord.SelectOption(label="Set Advanced Parameters (OPENROUTER)", value="adv_params", description="Set penalties, Min P, and Top A."))
-            options.append(discord.SelectOption(label="Set Thinking Parameters", value="thinking_params", description="Set thinking persistence, level, and budget."))
-            options.append(discord.SelectOption(label="Set Speech & Voice Settings", value="speech_settings", description="Set TTS voice, model, and temperature."))
-
-        elif self.current_tab == "tools":
-            options.append(discord.SelectOption(label="Toggle Image Generation", value="image_toggle", description="Allow this profile to generate images via !image/!imagine."))
-            options.append(discord.SelectOption(label="Toggle Grounding (Web Search)", value="grounding", description="Cycle Grounding: OFF -> NATIVE -> RAG."))
-            options.append(discord.SelectOption(label="Toggle URL Context Fetching", value="url_toggle", description="Cycle URL Context: OFF -> NATIVE -> RAG."))
-            options.append(discord.SelectOption(label="Cycle Response Mode", value="cycle_response", description="Cycle: Regular -> Mention -> Reply -> Mention Reply."))
-            options.append(discord.SelectOption(label="Set Time & Timezone", value="time", description="Enable time awareness and set the profile's timezone."))
-            options.append(discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable a human-like delay when the bot sends messages."))
-            options.append(discord.SelectOption(label="Toggle Anti-Repetition Critic", value="critic", description="Enable semantic repetition analysis (Adds latency)."))
-            options.append(discord.SelectOption(label="Toggle Neuro-Endocrine Engine", value="neuro", description="Simulate hormonal states for dynamic emotions."))
-            options.append(discord.SelectOption(label="Toggle Help Mode (Guide RAG)", value="help_mode", description="Allow profile to answer technical bot questions."))
-
-        elif self.current_tab == "memory":
-            options.append(discord.SelectOption(label="Manage Long-Term Memories", value="manage_ltm", description="Add, list, edit, or delete memories."))
-            if not self.is_borrowed:
-                options.append(discord.SelectOption(label="Manage Training Examples", value="manage_training", description="Add, list, edit, or delete training examples."))
-                options.append(discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training context size and relevance threshold."))
-            options.append(discord.SelectOption(label="Toggle LTM Auto-Creation", value="ltm_creation", description="Automatically create memories from conversations."))
-            options.append(discord.SelectOption(label="Set LTM Parameters", value="ltm_params", description="Set frequency, context, and recall settings."))
-            if not self.is_borrowed:
-                options.append(discord.SelectOption(label="Set LTM Summarization Prompt", value="ltm_summarization", description="Customize how the AI creates memories."))
+        options = [a.option(self) for a in PROFILE_ACTIONS
+                   if a.tab == self.current_tab and a.visible(self)]
 
         if options:
             select = ui.Select(placeholder=f"Select an action for {self.current_tab.title()}...", options=options, row=0)
@@ -250,203 +374,127 @@ class ProfileManageView(ui.View):
             await interaction.response.edit_message(view=self)
         return callback
 
+    async def _refresh_dashboard(self, interaction: discord.Interaction):
+        """Repaint the dashboard embed on the message the view owns.
+
+        Every settings modal hands this back as its completion callback. It used to be
+        redefined as an identical four-line `refresh_cb` closure inside eleven separate
+        dropdown branches.
+        """
+        new_embed = await self.cog.profile_manager._build_profile_manage_embed(
+            interaction, self.profile_name, target_user_id=self.user_id)
+        await self.original_interaction.edit_original_response(embed=new_embed, view=self)
+
     async def dropdown_callback(self, interaction: discord.Interaction):
         choice = interaction.data['values'][0]
-        user_id = self.user_id
-        profile_name = self.profile_name
-        profile = self.cog.profile_manager._get_profile_config(user_id, profile_name, self.is_borrowed)
-        
+        profile = self.cog.profile_manager._get_profile_config(
+            self.user_id, self.profile_name, self.is_borrowed)
+
         if not profile:
             await interaction.response.send_message("Profile data not found.", ephemeral=True); return
 
-        # --- Home Tab Logic ---
-        if choice == "rename":
-            await self._handle_rename(interaction)
-        elif choice == "duplicate":
-            await self._handle_duplicate(interaction)
-        elif choice == "share":
-            await self._handle_share(interaction)
-        elif choice == "convert_to_system":
-            await self._handle_convert_copy(interaction, to_system=True)
-        elif choice == "convert_to_personal":
-            await self._handle_convert_copy(interaction, to_system=False)
-        elif choice == "delete":
-            await self._handle_delete(interaction)
-        elif choice == "safety_level":
-            await self._handle_safety_cycle(interaction, profile)
-        elif choice == "error_response":
-            is_b = getattr(self, "is_borrowed", False)
-            target_profile = self.cog.profile_manager._get_profile_config(self.user_id, self.profile_name, is_b)
+        action = PROFILE_ACTIONS_BY_VALUE.get(choice)
+        if action is None:
+            return
+        await action.run(self, interaction, profile)
 
-            if not target_profile:
-                await interaction.response.send_message("❌ Error: Profile not found.", ephemeral=True)
-                return
+    # --- Bespoke dropdown handlers ---
+    #
+    # Everything the action table cannot express as "open this modal", "flip this flag"
+    # or "advance this cycle" lives here as a named method, so the table stays a table.
 
-            async def modal_callback(modal_interaction: discord.Interaction, new_val: str):
-                await modal_interaction.response.defer(ephemeral=True)
-                val_to_save = new_val.strip() or "An error has occurred."
-                
-                target = self.cog.profile_manager._get_profile_config(self.user_id, self.profile_name, is_b)
-                
-                if target:
-                    target["error_response"] = val_to_save
-                    self.cog.profile_manager._save_profile_config(self.user_id, self.profile_name, target, is_b)
-                    await modal_interaction.followup.send(f"✅ Custom error message updated for '{self.profile_name}'.", ephemeral=True)
-                else:
-                    await modal_interaction.followup.send("❌ Error: Profile not found.", ephemeral=True)
+    async def _act_error_response(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        is_b = getattr(self, "is_borrowed", False)
+        target_profile = self.cog.profile_manager._get_profile_config(self.user_id, self.profile_name, is_b)
 
-            modal = ActionTextInputModal(
-                title="Set Custom Error Message",
-                label="Error Message",
-                placeholder="Enter the message to show on API/Safety errors...",
-                default=target_profile.get("error_response", "An error has occurred."),
-                required=False,
-                on_submit_callback=modal_callback
-            )
-            await interaction.response.send_modal(modal)
+        if not target_profile:
+            await interaction.response.send_message("❌ Error: Profile not found.", ephemeral=True)
+            return
 
-        elif choice == "generation_visual":
-            async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, self.profile_name, target_user_id=self.user_id)
-                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileGenerationVisualModal(self.cog, self.profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
-            await interaction.response.send_modal(modal)
+        async def modal_callback(modal_interaction: discord.Interaction, new_val: str):
+            await modal_interaction.response.defer(ephemeral=True)
+            val_to_save = new_val.strip() or "An error has occurred."
 
-        # --- Persona Tab Logic ---
-        elif choice == "edit_persona":
-            prompts = self.cog.profile_manager._get_profile_prompts(user_id, profile_name) or {}
-            modal = EditUserProfilePersonaModal(self.cog, profile_name, prompts.get("persona", {}), user_id)
-            await interaction.response.send_modal(modal)
-        elif choice == "edit_instructions":
-            prompts = self.cog.profile_manager._get_profile_prompts(user_id, profile_name) or {}
-            modal = EditUserProfileAIInstructionsModal(self.cog, profile_name, prompts.get("ai_instructions", ""), user_id)
-            await interaction.response.send_modal(modal)
-        elif choice == "tts_instructions":
-            async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name, target_user_id=self.user_id)
-                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileDirectorDeskModal(self.cog, profile_name, profile, callback=refresh_cb, target_user_id=self.user_id)
-            await interaction.response.send_modal(modal)
-        elif choice == "edit_appearance":
-            await self._handle_appearance(interaction)
+            target = self.cog.profile_manager._get_profile_config(self.user_id, self.profile_name, is_b)
 
-        # --- Params Tab Logic ---
-        elif choice == "models":
-            view = SingleProfileModelView(self.cog, self.original_interaction, profile_name, is_borrowed=self.is_borrowed, user_id=self.user_id)
-            await interaction.response.send_message(view._get_selection_feedback_message(), view=view, ephemeral=True)
-        elif choice == "gen_params":
-            # Callback logic updated to edit the view on the original message, but not try to defer again
-            async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name, target_user_id=self.user_id)
-                # Edit the MAIN message (the dashboard)
-                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-                
-            modal = ProfileParamsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
-            await interaction.response.send_modal(modal)
-        elif choice == "adv_params":
-            async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name, target_user_id=self.user_id)
-                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-                
-            modal = ProfileAdvancedParamsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
-            await interaction.response.send_modal(modal)
-        elif choice == "thinking_params":
-            async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name, target_user_id=self.user_id)
-                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            
-            # [UPDATED] Pass self.is_borrowed to the modal
-            modal = ProfileThinkingParamsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
-            await interaction.response.send_modal(modal)
+            if target:
+                target["error_response"] = val_to_save
+                self.cog.profile_manager._save_profile_config(self.user_id, self.profile_name, target, is_b)
+                await modal_interaction.followup.send(f"✅ Custom error message updated for '{self.profile_name}'.", ephemeral=True)
+            else:
+                await modal_interaction.followup.send("❌ Error: Profile not found.", ephemeral=True)
 
-        elif choice == "speech_settings":
-            async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name, target_user_id=self.user_id)
-                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            
-            modal = ProfileSpeechSettingsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
-            await interaction.response.send_modal(modal)
+        modal = ActionTextInputModal(
+            title="Set Custom Error Message",
+            label="Error Message",
+            placeholder="Enter the message to show on API/Safety errors...",
+            default=target_profile.get("error_response", "An error has occurred."),
+            required=False,
+            on_submit_callback=modal_callback
+        )
+        await interaction.response.send_modal(modal)
 
-        # --- Tools Tab Logic ---
-        elif choice == "cycle_response":
-            modes = ["regular", "mention", "reply", "mention_reply"]
-            curr = profile.get("response_mode", "regular")
-            profile["response_mode"] = modes[(modes.index(curr) + 1) % len(modes)]
-            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
-        elif choice == "image_toggle":
-            # Inject prompt into current_params to avoid breaking the modal signature
-            if not self.is_borrowed:
-                prompts = self.cog.profile_manager._get_profile_prompts(self.user_id, profile_name) or {}
-                profile["image_generation_prompt"] = prompts.get("image_generation_prompt")
-                
-            async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name, target_user_id=self.user_id)
-                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileImageGenSettingsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
-            await interaction.response.send_modal(modal)
-        elif choice == "typing":
-            async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, profile_name, target_user_id=self.user_id)
-                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileTypingSettingsModal(self.cog, profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
-            await interaction.response.send_modal(modal)
-        elif choice == "grounding":
-            current_mode = profile.get("grounding_mode", "off")
-            if isinstance(current_mode, bool): current_mode = "rag" if current_mode else "off"
-            elif current_mode == "on" or current_mode == "on+": current_mode = "rag" # Legacy migration
-            cycle_map = {"off": "native", "native": "rag", "rag": "off"}
-            profile["grounding_mode"] = cycle_map.get(current_mode, "off")
-            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
-        elif choice == "url_toggle":
-            current_mode = profile.get("url_mode", "off")
-            if "url_mode" not in profile:
-                current_mode = "rag" if profile.get("url_fetching_enabled", False) else "off"
-            cycle_map = {"off": "native", "native": "rag", "rag": "off"}
-            profile["url_mode"] = cycle_map.get(current_mode, "off")
-            profile["url_fetching_enabled"] = (profile["url_mode"] == "rag") # Legacy support
-            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
-        elif choice == "time":
-            await self._handle_timezone(interaction, profile, self.is_borrowed)
-        elif choice == "critic":
-            profile["critic_enabled"] = not profile.get("critic_enabled", False)
-            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
-        elif choice == "help_mode":
-            profile["help_mode_enabled"] = not profile.get("help_mode_enabled", False)
-            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
-        elif choice == "neuro":
-            async def refresh_cb(modal_interaction: discord.Interaction):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(modal_interaction, self.profile_name, target_user_id=self.user_id)
-                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileNeuroModal(self.cog, self.profile_name, profile, self.is_borrowed, callback=refresh_cb, target_user_id=self.user_id)
-            await interaction.response.send_modal(modal)
+    async def _act_edit_persona(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        prompts = self.cog.profile_manager._get_profile_prompts(self.user_id, self.profile_name) or {}
+        modal = EditUserProfilePersonaModal(self.cog, self.profile_name, prompts.get("persona", {}), self.user_id)
+        await interaction.response.send_modal(modal)
 
-        # --- Memory Tab Logic ---
-        elif choice == "manage_ltm":
-            view = DataManageView(self.cog, interaction, profile_name, self.is_borrowed, mode='ltm', parent_manage_view=self, target_user_id=self.user_id)
-            await view.start()
-        elif choice == "manage_training":
-            view = DataManageView(self.cog, interaction, profile_name, self.is_borrowed, mode='training', parent_manage_view=self, target_user_id=self.user_id)
-            await view.start()
-            await interaction.response.defer()
-        elif choice == "ltm_creation":
-            profile["ltm_creation_enabled"] = not profile.get("ltm_creation_enabled", False)
-            await self._save_and_refresh(interaction, profile, profile_name, self.is_borrowed)
-        elif choice == "ltm_params":
-            async def refresh_cb(i):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(i, profile_name, target_user_id=self.user_id)
-                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileLTMParamsModal(self.cog, profile_name, profile, callback=refresh_cb, target_user_id=self.user_id)
-            await interaction.response.send_modal(modal)
-        elif choice == "train_params":
-            async def refresh_cb(i):
-                new_embed = await self.cog.profile_manager._build_profile_manage_embed(i, profile_name, target_user_id=self.user_id)
-                await self.original_interaction.edit_original_response(embed=new_embed, view=self)
-            modal = ProfileTrainingParamsModal(self.cog, profile_name, profile, callback=refresh_cb, target_user_id=self.user_id)
-            await interaction.response.send_modal(modal)
-        elif choice == "ltm_summarization":
-            instr = profile.get("ltm_summarization_instructions") or self.cog.profile_manager._default_ltm_summarization_instructions()
-            modal = ProfileLTMSummarizationModal(self.cog, profile_name, instr, target_user_id=self.user_id)
-            await interaction.response.send_modal(modal)
+    async def _act_edit_instructions(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        prompts = self.cog.profile_manager._get_profile_prompts(self.user_id, self.profile_name) or {}
+        modal = EditUserProfileAIInstructionsModal(self.cog, self.profile_name, prompts.get("ai_instructions", ""), self.user_id)
+        await interaction.response.send_modal(modal)
+
+    async def _act_models(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        view = SingleProfileModelView(self.cog, self.original_interaction, self.profile_name,
+                                      is_borrowed=self.is_borrowed, user_id=self.user_id)
+        await interaction.response.send_message(view._get_selection_feedback_message(), view=view, ephemeral=True)
+
+    async def _act_image_toggle(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        # Inject prompt into current_params to avoid breaking the modal signature
+        if not self.is_borrowed:
+            prompts = self.cog.profile_manager._get_profile_prompts(self.user_id, self.profile_name) or {}
+            profile["image_generation_prompt"] = prompts.get("image_generation_prompt")
+
+        modal = ProfileImageGenSettingsModal(self.cog, self.profile_name, profile, self.is_borrowed,
+                                             callback=self._refresh_dashboard, target_user_id=self.user_id)
+        await interaction.response.send_modal(modal)
+
+    async def _act_grounding(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        current_mode = profile.get("grounding_mode", "off")
+        if isinstance(current_mode, bool): current_mode = "rag" if current_mode else "off"
+        elif current_mode == "on" or current_mode == "on+": current_mode = "rag" # Legacy migration
+        cycle_map = {"off": "native", "native": "rag", "rag": "off"}
+        profile["grounding_mode"] = cycle_map.get(current_mode, "off")
+        await self._save_and_refresh(interaction, profile, self.profile_name, self.is_borrowed)
+
+    async def _act_url_toggle(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        current_mode = profile.get("url_mode", "off")
+        if "url_mode" not in profile:
+            current_mode = "rag" if profile.get("url_fetching_enabled", False) else "off"
+        cycle_map = {"off": "native", "native": "rag", "rag": "off"}
+        profile["url_mode"] = cycle_map.get(current_mode, "off")
+        profile["url_fetching_enabled"] = (profile["url_mode"] == "rag") # Legacy support
+        await self._save_and_refresh(interaction, profile, self.profile_name, self.is_borrowed)
+
+    async def _act_manage_ltm(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        view = DataManageView(self.cog, interaction, self.profile_name, self.is_borrowed,
+                              mode='ltm', parent_manage_view=self, target_user_id=self.user_id)
+        await view.start()
+
+    async def _act_manage_training(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        view = DataManageView(self.cog, interaction, self.profile_name, self.is_borrowed,
+                              mode='training', parent_manage_view=self, target_user_id=self.user_id)
+        await view.start()
+        # NOTE: this defer runs *after* start() has already responded, so it raises
+        # InteractionResponded and is swallowed by discord.py's handler. Preserved
+        # verbatim from the pre-refactor branch rather than silently fixed -- see the
+        # note accompanying this refactor.
+        await interaction.response.defer()
+
+    async def _act_ltm_summarization(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        instr = profile.get("ltm_summarization_instructions") or self.cog.profile_manager._default_ltm_summarization_instructions()
+        modal = ProfileLTMSummarizationModal(self.cog, self.profile_name, instr, target_user_id=self.user_id)
+        await interaction.response.send_modal(modal)
 
     # --- Internal Helpers for UI Flow ---
 
@@ -466,12 +514,20 @@ class ProfileManageView(ui.View):
         new_embed = await self.cog.profile_manager._build_profile_manage_embed(interaction, profile_name, target_user_id=self.user_id)
         await interaction.response.edit_message(embed=new_embed, view=self)
 
-    async def _handle_safety_cycle(self, interaction, profile):
-        is_public = self.cog.profile_manager._is_profile_public(self.user_id, self.profile_name)
-        cycle_full = {'low': 'medium', 'medium': 'high', 'high': 'unrestricted', 'unrestricted': 'low'}
-        cycle_rest = {'low': 'medium', 'medium': 'high', 'high': 'low'}
-        curr = profile.get('safety_level', 'low')
-        profile['safety_level'] = (cycle_rest if (self.is_borrowed or is_public) else cycle_full).get(curr, 'low')
+    async def _handle_safety_toggle(self, interaction, profile):
+        """Flips the profile between the two safety levels.
+
+        _can_mark_adult already withholds this row from borrowed and published
+        profiles, but the ownership check is repeated here because a profile can
+        be published from another view while this one is still open on screen.
+        """
+        if not _can_mark_adult(self):
+            profile['safety_level'] = "restricted"
+            await self._save_and_refresh(interaction, profile, self.profile_name, self.is_borrowed)
+            return
+
+        current = _coerce_safety_level(profile.get('safety_level'))
+        profile['safety_level'] = "restricted" if current == "unrestricted" else "unrestricted"
         await self._save_and_refresh(interaction, profile, self.profile_name, self.is_borrowed)
 
     async def _handle_appearance(self, interaction):
@@ -827,7 +883,148 @@ def ProfileImageGenSettingsModal(cog, profile_name: str, current_params: Dict[st
         return {"config": c, "prompts": p}
     return ConfigModal(cog, profile_name, is_borrowed, "Image Generation Settings", fields, parser, callback, target_user_id)
 
-class SingleProfileModelView(ui.View):
+class ModelPickerMixin:
+    """The model-selection machinery shared by the single-profile and bulk pickers.
+
+    SingleProfileModelView and ModelApplyView present the same picker over different
+    targets -- one profile versus a selected set -- and had drifted into two copies of
+    the option builder, the Ollama probe, the select class and the 48-line API/category
+    button row. The copies differed only in where they read the Ollama host from, and in
+    one missing truncation (see `_create_model_options`).
+
+    Adopters must provide `view_mode`, `category`, `ollama_working`, `_build_view`,
+    `_get_selection_feedback_message`, and `_ollama_host_url`.
+    """
+
+    def _get_top_models(self, provider: str, target_config_key: str) -> List[str]:
+        return self.cog.api_service.get_top_models(provider, target_config_key)
+
+    def _ollama_host_url(self) -> str:
+        """Where this view reads the configured Ollama host from."""
+        raise NotImplementedError
+
+    class GenericModelSelect(ui.Select):
+        def __init__(self, placeholder: str, options: list, row: int, target_config_key: str):
+            super().__init__(placeholder=placeholder, options=options, row=row)
+            self.target_config_key = target_config_key
+
+        async def callback(self, interaction: discord.Interaction):
+            view = self.view
+            if self.values[0] == "ollama_offline":
+                await interaction.response.send_message("Ollama is offline or has no models downloaded.", ephemeral=True)
+                return
+            if self.values[0] == "custom_option":
+                await interaction.response.send_modal(CustomModelModal(view, self.target_config_key))
+            else: 
+                view._save_changes(self.target_config_key, self.values[0])
+                view._build_view()
+                await interaction.response.edit_message(content=view._get_selection_feedback_message(), view=view)
+
+    def _create_model_options(self, current_val: str, target_config_key: str) -> List[discord.SelectOption]:
+        top_models = self._get_top_models(self.view_mode, target_config_key)
+        opts = [discord.SelectOption(label="Custom Model...", value="custom_option", description="Enter manually via modal")]
+        
+        if current_val:
+            # The [:100] truncation was present only in the single-profile copy. Discord
+            # rejects an option label over 100 characters, so the bulk picker would raise
+            # on a long custom model id; sharing this version fixes that.
+            opts.append(discord.SelectOption(label=f"Current: {current_val}"[:100], value=current_val, default=True))
+        
+        prefix = "GOOGLE/"
+        if self.view_mode == 'openrouter': prefix = "OPENROUTER/"
+        elif self.view_mode == 'ollama': prefix = "OLLAMA/"
+        
+        if target_config_key in ['image_generation_model', 'speech_model']:
+            prefix = "GOOGLE/"
+            
+        added = len(opts)
+        for m in top_models:
+            if added >= 25: break
+            val = f"{prefix}{m}"
+            if current_val != val:
+                opts.append(discord.SelectOption(label=m[:100], value=val))
+                added += 1
+                
+        if self.view_mode == 'ollama' and not top_models:
+            opts.append(discord.SelectOption(label="⚠️ Ollama Offline / No Models", value="ollama_offline", description=f"Check {OLLAMA_LOCAL_URL}"))
+            
+        return opts
+
+    async def _update_ollama_status(self):
+        host_url = self._ollama_host_url() or OLLAMA_LOCAL_URL
+        try:
+            resp = await get_shared_client().get(f"{host_url.rstrip('/')}/api/tags", timeout=2.0)
+            self.ollama_working = (resp.status_code == 200)
+            if self.ollama_working:
+                data = resp.json()
+                self.cached_ollama_models = [m['name'] for m in data.get('models', [])]
+        except Exception:
+            self.ollama_working = False
+            self.cached_ollama_models = []
+
+    def _add_api_and_category_buttons(self, *, row: int = 2):
+        """The API-mode / Ollama-host / category button row, identical in both pickers."""
+        api_modes = ['google', 'openrouter', 'ollama']
+        api_labels = {'google': 'API: Google', 'openrouter': 'API: OpenRouter', 'ollama': 'API: Ollama (Local)'}
+        
+        btn_api = ui.Button(label=api_labels[self.view_mode], style=discord.ButtonStyle.primary, row=row, disabled=(self.category == 'media'))
+        async def api_cb(i: discord.Interaction):
+            next_idx = (api_modes.index(self.view_mode) + 1) % len(api_modes)
+            self.view_mode = api_modes[next_idx]
+            if self.view_mode == 'ollama':
+                await i.response.defer()
+                self.ollama_working = "processing"
+                await self._update_ollama_status()
+                self._build_view()
+                await i.edit_original_response(content=self._get_selection_feedback_message(), view=self)
+            else:
+                self._build_view()
+                await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+        btn_api.callback = api_cb
+        self.add_item(btn_api)
+        
+        if self.view_mode == 'ollama':
+            host_style = discord.ButtonStyle.secondary
+            if getattr(self, 'ollama_working', None) == "processing":
+                host_style = discord.ButtonStyle.blurple
+            elif getattr(self, 'ollama_working', None) is True:
+                host_style = discord.ButtonStyle.success
+            elif getattr(self, 'ollama_working', None) is False:
+                host_style = discord.ButtonStyle.danger
+                
+            btn_host = ui.Button(label="Set Host URL", style=host_style, row=row)
+            async def host_cb(i: discord.Interaction):
+                await i.response.send_modal(OllamaHostModal(self))
+            btn_host.callback = host_cb
+            self.add_item(btn_host)
+            
+            btn_guide = ui.Button(label="Guide", style=discord.ButtonStyle.secondary, row=row)
+            async def guide_cb(i: discord.Interaction):
+                await i.response.send_message(OLLAMA_GUIDE_TEXT, ephemeral=True)
+            btn_guide.callback = guide_cb
+            self.add_item(btn_guide)
+
+        categories = ['response', 'media', 'tools', 'ltm']
+        cat_labels = {'response': 'Response', 'media': 'Media', 'tools': 'Tools', 'ltm': 'LTM'}
+        btn_cat = ui.Button(label=f"Category: {cat_labels[self.category]}", style=discord.ButtonStyle.blurple, row=row)
+        async def cat_cb(i: discord.Interaction):
+            next_idx = (categories.index(self.category) + 1) % len(categories)
+            self.category = categories[next_idx]
+            self._build_view()
+            await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+        btn_cat.callback = cat_cb
+        self.add_item(btn_cat)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: ui.Item):
+        print(f"Error in {type(self).__name__}: {error}")
+        traceback.print_exc()
+        if not interaction.response.is_done():
+            await interaction.response.send_message("An unexpected error occurred with this view.", ephemeral=True)
+        else:
+            await interaction.followup.send("An unexpected error occurred with this view.", ephemeral=True)
+
+
+class SingleProfileModelView(ModelPickerMixin, ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str, is_borrowed: Optional[bool] = None, user_id: Optional[int] = None):
         super().__init__(timeout=300)
         self.cog = cog
@@ -847,6 +1044,9 @@ class SingleProfileModelView(ui.View):
 
     def _get_current_profile_data(self) -> Dict[str, Any]:
         return self.cog.profile_manager._get_profile_config(self.user_id, self.profile_name, self.is_borrowed) or {}
+
+    def _ollama_host_url(self) -> str:
+        return self._get_current_profile_data().get("ollama_host_url")
 
     def _save_changes(self, key: str, value: Any):
         target_dict = self._get_current_profile_data()
@@ -906,66 +1106,6 @@ class SingleProfileModelView(ui.View):
             
         return msg
 
-    def _get_top_models(self, provider: str, target_config_key: str) -> List[str]:
-        return self.cog.api_service.get_top_models(provider, target_config_key)
-
-    class GenericModelSelect(ui.Select):
-        def __init__(self, placeholder: str, options: list, row: int, target_config_key: str):
-            super().__init__(placeholder=placeholder, options=options, row=row)
-            self.target_config_key = target_config_key
-
-        async def callback(self, interaction: discord.Interaction):
-            view = self.view
-            if self.values[0] == "ollama_offline":
-                await interaction.response.send_message("Ollama is offline or has no models downloaded.", ephemeral=True)
-                return
-            if self.values[0] == "custom_option":
-                await interaction.response.send_modal(CustomModelModal(view, self.target_config_key))
-            else: 
-                view._save_changes(self.target_config_key, self.values[0])
-                view._build_view()
-                await interaction.response.edit_message(content=view._get_selection_feedback_message(), view=view)
-
-    def _create_model_options(self, current_val: str, target_config_key: str) -> List[discord.SelectOption]:
-        top_models = self._get_top_models(self.view_mode, target_config_key)
-        opts = [discord.SelectOption(label="Custom Model...", value="custom_option", description="Enter manually via modal")]
-        
-        if current_val:
-            opts.append(discord.SelectOption(label=f"Current: {current_val}"[:100], value=current_val, default=True))
-        
-        prefix = "GOOGLE/"
-        if self.view_mode == 'openrouter': prefix = "OPENROUTER/"
-        elif self.view_mode == 'ollama': prefix = "OLLAMA/"
-        
-        if target_config_key in ['image_generation_model', 'speech_model']:
-            prefix = "GOOGLE/"
-            
-        added = len(opts)
-        for m in top_models:
-            if added >= 25: break
-            val = f"{prefix}{m}"
-            if current_val != val:
-                opts.append(discord.SelectOption(label=m[:100], value=val))
-                added += 1
-                
-        if self.view_mode == 'ollama' and not top_models:
-            opts.append(discord.SelectOption(label="⚠️ Ollama Offline / No Models", value="ollama_offline", description=f"Check {OLLAMA_LOCAL_URL}"))
-            
-        return opts
-
-    async def _update_ollama_status(self):
-        data = self._get_current_profile_data()
-        host_url = data.get("ollama_host_url") or OLLAMA_LOCAL_URL
-        try:
-            resp = await get_shared_client().get(f"{host_url.rstrip('/')}/api/tags", timeout=2.0)
-            self.ollama_working = (resp.status_code == 200)
-            if self.ollama_working:
-                data = resp.json()
-                self.cached_ollama_models = [m['name'] for m in data.get('models', [])]
-        except Exception:
-            self.ollama_working = False
-            self.cached_ollama_models = []
-
     def _build_view(self):
         self.clear_items()
         data = self._get_current_profile_data()
@@ -998,56 +1138,7 @@ class SingleProfileModelView(ui.View):
             self.add_item(self.GenericModelSelect("Select LTM Summariser Model...", self._create_model_options(l_val, "ltm_model"), 0, "ltm_model"))
 
         # --- Row 2 Actions ---
-        api_modes = ['google', 'openrouter', 'ollama']
-        api_labels = {'google': 'API: Google', 'openrouter': 'API: OpenRouter', 'ollama': 'API: Ollama (Local)'}
-        
-        btn_api = ui.Button(label=api_labels[self.view_mode], style=discord.ButtonStyle.primary, row=2, disabled=(self.category == 'media'))
-        async def api_cb(i: discord.Interaction):
-            next_idx = (api_modes.index(self.view_mode) + 1) % len(api_modes)
-            self.view_mode = api_modes[next_idx]
-            if self.view_mode == 'ollama':
-                await i.response.defer()
-                self.ollama_working = "processing"
-                await self._update_ollama_status()
-                self._build_view()
-                await i.edit_original_response(content=self._get_selection_feedback_message(), view=self)
-            else:
-                self._build_view()
-                await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-        btn_api.callback = api_cb
-        self.add_item(btn_api)
-        
-        if self.view_mode == 'ollama':
-            host_style = discord.ButtonStyle.secondary
-            if getattr(self, 'ollama_working', None) == "processing":
-                host_style = discord.ButtonStyle.blurple
-            elif getattr(self, 'ollama_working', None) is True:
-                host_style = discord.ButtonStyle.success
-            elif getattr(self, 'ollama_working', None) is False:
-                host_style = discord.ButtonStyle.danger
-                
-            btn_host = ui.Button(label="Set Host URL", style=host_style, row=2)
-            async def host_cb(i: discord.Interaction):
-                await i.response.send_modal(OllamaHostModal(self))
-            btn_host.callback = host_cb
-            self.add_item(btn_host)
-            
-            btn_guide = ui.Button(label="Guide", style=discord.ButtonStyle.secondary, row=2)
-            async def guide_cb(i: discord.Interaction):
-                await i.response.send_message(OLLAMA_GUIDE_TEXT, ephemeral=True)
-            btn_guide.callback = guide_cb
-            self.add_item(btn_guide)
-
-        categories = ['response', 'media', 'tools', 'ltm']
-        cat_labels = {'response': 'Response', 'media': 'Media', 'tools': 'Tools', 'ltm': 'LTM'}
-        btn_cat = ui.Button(label=f"Category: {cat_labels[self.category]}", style=discord.ButtonStyle.blurple, row=2)
-        async def cat_cb(i: discord.Interaction):
-            next_idx = (categories.index(self.category) + 1) % len(categories)
-            self.category = categories[next_idx]
-            self._build_view()
-            await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-        btn_cat.callback = cat_cb
-        self.add_item(btn_cat)
+        self._add_api_and_category_buttons()
 
         if self.category == 'response':
             show_fb = data.get("show_fallback_indicator", True)
@@ -1086,15 +1177,7 @@ class SingleProfileModelView(ui.View):
             btn.callback = make_nav_cb(val)
             self.add_item(btn)
 
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item: ui.Item):
-        print(f"Error in SingleProfileModelView: {error}")
-        traceback.print_exc()
-        if not interaction.response.is_done():
-            await interaction.response.send_message("An unexpected error occurred with this view.", ephemeral=True)
-        else:
-            await interaction.followup.send("An unexpected error occurred with this view.", ephemeral=True)
-
-class ModelApplyView(ui.View):
+class ModelApplyView(ModelPickerMixin, ui.View):
     def __init__(self, cog: 'MimicCog', user_id: int, interaction: discord.Interaction):
         super().__init__(timeout=300)
         self.cog = cog
@@ -1120,6 +1203,12 @@ class ModelApplyView(ui.View):
 
         self._load_lists()
         self._build_view()
+
+    #: The bulk picker refers to the shared select under its historical name.
+    GenericBulkModelSelect = ModelPickerMixin.GenericModelSelect
+
+    def _ollama_host_url(self) -> str:
+        return self.models_state.get("ollama_host_url")
 
     def _load_lists(self):
         index = self.cog.profile_manager._get_user_index(self.user_id)
@@ -1180,53 +1269,6 @@ class ModelApplyView(ui.View):
             msg += f"\n...and {count - 10} more."
         return msg
 
-    def _get_top_models(self, provider: str, target_config_key: str) -> List[str]:
-        return self.cog.api_service.get_top_models(provider, target_config_key)
-    
-    class GenericBulkModelSelect(ui.Select):
-        def __init__(self, placeholder: str, options: list, row: int, target_config_key: str):
-            super().__init__(placeholder=placeholder, options=options, row=row)
-            self.target_config_key = target_config_key
-
-        async def callback(self, interaction: discord.Interaction):
-            view = self.view
-            if self.values[0] == "ollama_offline":
-                await interaction.response.send_message("Ollama is offline or has no models downloaded.", ephemeral=True)
-                return
-            if self.values[0] == "custom_option":
-                await interaction.response.send_modal(CustomModelModal(view, self.target_config_key))
-            else: 
-                view._save_changes(self.target_config_key, self.values[0])
-                view._build_view()
-                await interaction.response.edit_message(content=view._get_selection_feedback_message(), view=view)
-
-    def _create_model_options(self, current_val: str, target_config_key: str) -> List[discord.SelectOption]:
-        top_models = self._get_top_models(self.view_mode, target_config_key)
-        opts = [discord.SelectOption(label="Custom Model...", value="custom_option", description="Enter manually via modal")]
-        
-        if current_val:
-            opts.append(discord.SelectOption(label=f"Current: {current_val}", value=current_val, default=True))
-        
-        prefix = "GOOGLE/"
-        if self.view_mode == 'openrouter': prefix = "OPENROUTER/"
-        elif self.view_mode == 'ollama': prefix = "OLLAMA/"
-        
-        if target_config_key in ['image_generation_model', 'speech_model']:
-            prefix = "GOOGLE/"
-            
-        added = len(opts)
-        for m in top_models:
-            if added >= 25: break
-            val = f"{prefix}{m}"
-            if current_val != val:
-                opts.append(discord.SelectOption(label=m[:100], value=val))
-                added += 1
-                
-        if self.view_mode == 'ollama' and not top_models:
-            opts.append(discord.SelectOption(label="⚠️ Ollama Offline / No Models", value="ollama_offline", description=f"Check {OLLAMA_LOCAL_URL}"))
-            
-        return opts
-
     def _build_view(self):
         self.clear_items()
         
@@ -1263,56 +1305,7 @@ class ModelApplyView(ui.View):
         start = self.current_page * per_page
         page_profiles = active_list[start : start + per_page]
 
-        api_modes = ['google', 'openrouter', 'ollama']
-        api_labels = {'google': 'API: Google', 'openrouter': 'API: OpenRouter', 'ollama': 'API: Ollama (Local)'}
-        
-        btn_api = ui.Button(label=api_labels[self.view_mode], style=discord.ButtonStyle.primary, row=2, disabled=(self.category == 'media'))
-        async def api_cb(i: discord.Interaction):
-            next_idx = (api_modes.index(self.view_mode) + 1) % len(api_modes)
-            self.view_mode = api_modes[next_idx]
-            if self.view_mode == 'ollama':
-                await i.response.defer()
-                self.ollama_working = "processing"
-                await self._update_ollama_status()
-                self._build_view()
-                await i.edit_original_response(content=self._get_selection_feedback_message(), view=self)
-            else:
-                self._build_view()
-                await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-        btn_api.callback = api_cb
-        self.add_item(btn_api)
-
-        if self.view_mode == 'ollama':
-            host_style = discord.ButtonStyle.secondary
-            if getattr(self, 'ollama_working', None) == "processing":
-                host_style = discord.ButtonStyle.blurple
-            elif getattr(self, 'ollama_working', None) is True:
-                host_style = discord.ButtonStyle.success
-            elif getattr(self, 'ollama_working', None) is False:
-                host_style = discord.ButtonStyle.danger
-                
-            btn_host = ui.Button(label="Set Host URL", style=host_style, row=2)
-            async def host_cb(i: discord.Interaction):
-                await i.response.send_modal(OllamaHostModal(self))
-            btn_host.callback = host_cb
-            self.add_item(btn_host)
-            
-            btn_guide = ui.Button(label="Guide", style=discord.ButtonStyle.secondary, row=2)
-            async def guide_cb(i: discord.Interaction):
-                await i.response.send_message(OLLAMA_GUIDE_TEXT, ephemeral=True)
-            btn_guide.callback = guide_cb
-            self.add_item(btn_guide)
-
-        categories = ['response', 'media', 'tools', 'ltm']
-        cat_labels = {'response': 'Response', 'media': 'Media', 'tools': 'Tools', 'ltm': 'LTM'}
-        btn_cat = ui.Button(label=f"Category: {cat_labels[self.category]}", style=discord.ButtonStyle.blurple, row=2)
-        async def cat_cb(i: discord.Interaction):
-            next_idx = (categories.index(self.category) + 1) % len(categories)
-            self.category = categories[next_idx]
-            self._build_view()
-            await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-        btn_cat.callback = cat_cb
-        self.add_item(btn_cat)
+        self._add_api_and_category_buttons()
 
         if self.category == 'response':
             fb_label = "Fallback Indicator: Unchanged" if self.show_fallback_indicator is None else ("Fallback Indicator: ON" if self.show_fallback_indicator else "Fallback Indicator: OFF")
@@ -1361,18 +1354,6 @@ class ModelApplyView(ui.View):
         apply_btn = ui.Button(label="Apply", style=discord.ButtonStyle.success, row=4)
         apply_btn.callback = self.apply_settings
         self.add_item(apply_btn)
-
-    async def _update_ollama_status(self):
-        host_url = self.models_state.get("ollama_host_url") or OLLAMA_LOCAL_URL
-        try:
-            resp = await get_shared_client().get(f"{host_url.rstrip('/')}/api/tags", timeout=2.0)
-            self.ollama_working = (resp.status_code == 200)
-            if self.ollama_working:
-                data = resp.json()
-                self.cached_ollama_models = [m['name'] for m in data.get('models', [])]
-        except Exception:
-            self.ollama_working = False
-            self.cached_ollama_models = []
 
     async def toggle_source_callback(self, interaction: discord.Interaction):
         self.view_source = 'borrowed' if self.view_source == 'personal' else 'personal'
@@ -1459,14 +1440,6 @@ class ModelApplyView(ui.View):
 
         msg = f"Updated models for {success_count} profiles." if success_count else "No profiles updated."
         await interaction.edit_original_response(content=msg, view=None)
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item: ui.Item):
-        print(f"Error in ModelApplyView: {error}")
-        traceback.print_exc()
-        if not interaction.response.is_done():
-            await interaction.response.send_message("An unexpected error occurred with this view.", ephemeral=True)
-        else:
-            await interaction.followup.send("An unexpected error occurred with this view.", ephemeral=True)
 
 class UnifiedBulkTargetView(BaseBulkProfileView):
     def __init__(self, cog: 'MimicCog', user_id: int, action_key: str, payload: Any, include_borrowed: bool = True):
@@ -2102,7 +2075,7 @@ class BulkManageView(ui.View):
             discord.SelectOption(label="Toggle Neuro-Endocrine Engine", value="neuro", description="Enable or disable hormonal simulation for multiple profiles."),
             discord.SelectOption(label="Toggle Help Mode (Guide RAG)", value="help_mode", description="Allow profiles to answer technical bot questions."),
             discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable or disable realistic typing for multiple profiles."),
-            discord.SelectOption(label="Set Safety Level", value="safety_level", description="Apply a content safety level to multiple profiles."),
+            discord.SelectOption(label="Set Safety Level", value="safety_level", description="Apply Restricted or Unrestricted 18+ to multiple profiles."),
             discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training settings to multiple personal profiles."),
             discord.SelectOption(label="Set LTM Parameters", value="ltm_params", description="Apply LTM settings to multiple personal profiles."),
             discord.SelectOption(label="Set LTM Summarization Prompt", value="ltm_summarization", description="Apply a custom LTM summarization prompt."),
@@ -2247,8 +2220,11 @@ class BulkManageView(ui.View):
             await interaction.response.send_message(content="Select action and profiles:", view=view, ephemeral=True)
             
         elif choice == "safety_level":
-            opts = [discord.SelectOption(label=l, value=v) for l,v in [("Unrestricted", "unrestricted"), ("Low", "low"), ("Medium", "medium"), ("High", "high")]]
-            view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("safety_level", None), include_borrowed=True)
+            opts = [discord.SelectOption(label=SAFETY_LEVEL_LABELS[v], value=v) for v in ("restricted", "unrestricted")]
+            # Borrowed profiles are excluded: their level is now resolved from the
+            # source profile by _check_unrestricted_safety_policy, so writing the
+            # borrower's local copy would change the label without changing the gate.
+            view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("safety_level", None), include_borrowed=False)
             sel = ui.Select(placeholder="Select safety level...", options=opts, row=0)
             async def sel_cb(inter): view.payload = ("safety_level", sel.values[0]); await inter.response.defer()
             sel.callback = sel_cb

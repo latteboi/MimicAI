@@ -8,6 +8,7 @@ from ...utils.constants import (
     defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
     DEFAULT_SYSTEM_INSTRUCTION, DEFAULT_CONTEXT_RULES, DEFAULT_NEURO_INSTRUCTION,
     DEFAULT_TRAINING_DATA_INJECTION, DEFAULT_TIME_CONTEXT, DEFAULT_NEGATIVE_CONSTRAINTS,
+    DEFAULT_CONTENT_POLICY,
 )
 from ...utils.helpers import Timeout
 
@@ -22,6 +23,23 @@ class PromptBuilderMixin:
         display_name = app.get("custom_display_name") or profile_name
         avatar_url = app.get("custom_avatar_url") or (self.cog.bot.user.display_avatar.url if self.cog.bot.user else "")
         return display_name, avatar_url
+
+    def _channel_allows_adult_content(self, channel_id: int) -> bool:
+        """True only when the destination channel is flagged age-restricted.
+
+        DMs, group channels and anything the gateway cache cannot resolve count as
+        not age-restricted -- the same direction _check_unrestricted_safety_policy
+        already fails in, so the two agree on every channel type.
+
+        get_channel is an in-memory cache hit, so this is safe on the turn path.
+        """
+        channel = self.cog.bot.get_channel(channel_id)
+        if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
+            return False
+        try:
+            return channel.is_nsfw()
+        except Exception:
+            return False
 
     async def _send_session_warning(self, channel: discord.abc.Messageable, message: str):
         if not channel: return
@@ -142,6 +160,17 @@ class PromptBuilderMixin:
         rule_block = rule_block.format(profile_id_placeholder=profile_id_val)
 
         current_instructions_str += "\n\n" + rule_block.strip()
+
+        # Channel-level content shaping, gated on the destination rather than the
+        # profile: an 'unrestricted' profile is already confined to age-restricted
+        # channels by _check_unrestricted_safety_policy, so anything that reaches a
+        # general channel should be written for one. Appended last for recency, and
+        # it is the only content control that has any effect on OpenRouter and
+        # Ollama, which ignore safety_settings entirely.
+        if not self._channel_allows_adult_content(channel_id):
+            policy_block = self.cog.global_prompts.get("CONTENT_POLICY", DEFAULT_CONTENT_POLICY).strip()
+            if policy_block:
+                current_instructions_str += "\n\n" + policy_block
 
         final_system_instruction = current_instructions_str if current_instructions_str.strip() else DEFAULT_SYSTEM_INSTRUCTION
         return final_system_instruction, False, grounding_enabled, temperature, top_p, top_k, primary_model, fallback_model

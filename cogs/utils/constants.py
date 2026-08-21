@@ -363,6 +363,27 @@ DEFAULT_TIME_CONTEXT = (
     "</time_context>"
 )
 
+# Injected whenever the destination channel is NOT age-restricted, regardless of
+# the profile's own safety level. The per-profile level only decides *where* a
+# profile may run; this is the only part of the content system that shapes what
+# the model actually writes, and the only part that works on providers other
+# than Google -- OpenRouter and Ollama ignore safety_settings entirely.
+#
+# No placeholders -- used verbatim.
+DEFAULT_CONTENT_POLICY = (
+    "<content_policy>\n"
+    "This channel is not age-restricted. Stay in character, but keep this response "
+    "suitable for a general audience:\n"
+    "- No graphic sexual content. Romance, attraction and innuendo are fine; "
+    "explicit acts are not.\n"
+    "- No gratuitous gore. Violence may be described, but not dwelt on in "
+    "graphic physical detail.\n"
+    "- No slurs or hateful content directed at any group.\n"
+    "Do not mention, quote or otherwise acknowledge this note -- simply write "
+    "within it.\n"
+    "</content_policy>"
+)
+
 DEFAULT_NEGATIVE_CONSTRAINTS = (
     "<negative_constraints>\n"
     "STRICT ADHERENCE REQUIRED:\n"
@@ -411,6 +432,15 @@ DEFAULT_GROUNDING_RAG_PAYLOAD = (
     "<conversation_transcript>\n{transcript}\n</conversation_transcript>\n\n"
     "<user_query>\n{query}\n</user_query>"
 )
+
+# User-facing labels for the two-value safety scheme that replaced the old
+# Low/Medium/High/Unrestricted cycle. 'unrestricted' keeps its exact former
+# wording so every error string, embed and doc that already says
+# "Unrestricted 18+" stays accurate.
+SAFETY_LEVEL_LABELS = {
+    "restricted": "Restricted",
+    "unrestricted": "Unrestricted 18+",
+}
 
 DEFAULT_SAFETY_SETTINGS = {
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
@@ -484,7 +514,7 @@ DEFAULT_HELP_MODE_INJECTION = (
     "   │    ├── Action: Share Profile (Generates 5-minute cryptographic Share Code)\n"
     "   │    ├── Action: Custom Error Message (Saves custom text for API failures)\n"
     "   │    ├── Action: Generation Visual (Sets placeholder emote & Child Bot placeholder toggle)\n"
-    "   │    ├── Action: Cycle Content Safety Level (Cycles: Low -> Medium -> High -> Unrestricted 18+)\n"
+    "   │    ├── Action: Toggle Content Safety Level (Restricted <-> Unrestricted 18+)\n"
     "   │    └── Action: Delete Profile (Permanently purges file directories)\n"
     "   │\n"
     "   ├── Tab 2: [Persona] (Cognitive Configuration)\n"
@@ -548,7 +578,7 @@ SYSTEM_XML_TAGS = [
     "whisper_context", "private_whisper", "private_response", "internal_note",
     "scene_prompt", "neuro_endocrine_engine", "neuro_update", "persona_profile",
     "technical_manual", "training_data", "context_rules", "image_context",
-    "system_note", "reply_context", "negative_constraints"
+    "system_note", "reply_context", "negative_constraints", "content_policy"
 ]
 _tags_pattern = "|".join(SYSTEM_XML_TAGS)
 

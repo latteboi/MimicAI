@@ -17,7 +17,8 @@ from ...utils.helpers import (
     _get_user_hash, _scrub_response_text,
 )
 from ..api_service import GoogleGenAIModel, OllamaModel, OpenRouterModel
-from ._shared import _resolve_safety_settings, _strip_neuro_update_and_scrub
+from ._shared import _strip_neuro_update_and_scrub
+from ...utils.helpers import _coerce_safety_level, _resolve_safety_settings
 
 
 class GlobalChatMixin:
@@ -45,9 +46,8 @@ class GlobalChatMixin:
             await interaction.followup.send(f"The source for '{profile_name}' could not be found.", ephemeral=True)
             return
 
-        safety_level = profile_data.get("safety_level", "low")
-        if safety_level == "unrestricted":
-            await interaction.followup.send("For safety reasons, profiles with an 'Unrestricted 18+' safety level cannot be used with `/profile global_chat`. Please set the safety level to 'Low', 'Medium', or 'High'.", ephemeral=True)
+        if _coerce_safety_level(profile_data.get("safety_level")) == "unrestricted":
+            await interaction.followup.send("For safety reasons, profiles with an 'Unrestricted 18+' safety level cannot be used with `/profile global_chat`. Set the profile back to 'Restricted' first.", ephemeral=True)
             return
 
         user_api_key = self.cog.storage_manager._get_api_key_for_user(host_user_id, "gemini")
@@ -239,7 +239,7 @@ class GlobalChatMixin:
                             source_name_f = bd.get("original_profile_name", profile_name)
 
                         p_data_f = self.cog.profile_manager._get_profile_config(source_id_f, source_name_f, False) or {}
-                        safe_lvl = p_data_f.get("safety_level", "low")
+                        safe_lvl = p_data_f.get("safety_level")
 
                         d_safe = _resolve_safety_settings(safe_lvl)
 

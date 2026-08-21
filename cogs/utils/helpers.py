@@ -9,11 +9,47 @@ from typing import List, Dict, Tuple, Any, Optional, Union
 import orjson as json
 from .constants import (
     DISCORD_MAX_MESSAGE_LENGTH, API_ERROR_MAPPINGS,
+    HARM_CATEGORIES, HarmBlockThreshold, HarmCategory,
     PATTERN_SYSTEM_XML_BLOCKS, PATTERN_SYSTEM_XML_ORPHANS,
     PATTERN_REASONING_BLOCKS, PATTERN_REASONING_ORPHANS, PATTERN_SYSTEM_HEADER,
     PATTERN_TIMESTAMP_HEADER, PATTERN_METADATA, PATTERN_MESSAGE_LINK,
     PATTERN_WHITESPACE_CLEANUP,
 )
+
+
+def _coerce_safety_level(raw: Any) -> str:
+    """Normalises a stored safety_level onto the two-value scheme.
+
+    Profiles written before the four-tier collapse still carry 'low', 'medium'
+    or 'high' on disk. Rather than migrate them, every read funnels through
+    here: only the literal 'unrestricted' survives, and everything else --
+    including a missing, None, or malformed value -- reads as 'restricted'.
+    Old files are rewritten naturally the next time something saves them, so
+    there is no boot sweep and no rewrite pass.
+    """
+    return "unrestricted" if str(raw).strip().lower() == "unrestricted" else "restricted"
+
+
+def _resolve_safety_settings(safety_level: Any) -> Dict[HarmCategory, HarmBlockThreshold]:
+    """Maps a profile's safety level onto the provider harm thresholds.
+
+    'unrestricted' profiles are already confined to age-restricted channels by
+    ProfileManager._check_unrestricted_safety_policy, so a provider filter would
+    only re-litigate a check that has already passed -- they get BLOCK_NONE.
+    Everything else keeps BLOCK_ONLY_HIGH, which is what the old 'low' default
+    resolved to, so no existing profile changes behaviour on this path.
+
+    This lived in six copy-pasted dicts (MimicCog, child_bot_manager,
+    media_service, api_service twice, generation/_shared) that had to be edited
+    in lockstep. It is defined once here, in utils, because two of those callers
+    sit outside services/generation and could not import the old location.
+    """
+    threshold = (
+        HarmBlockThreshold.BLOCK_NONE
+        if _coerce_safety_level(safety_level) == "unrestricted"
+        else HarmBlockThreshold.BLOCK_ONLY_HIGH
+    )
+    return {cat: threshold for cat in HARM_CATEGORIES}
 
 
 def _split_into_sentences_with_abbreviations(text: str) -> List[str]:

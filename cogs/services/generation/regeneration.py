@@ -13,7 +13,8 @@ from ...utils.constants import (
     DEFAULT_KICKSTART_START, DEFAULT_KICKSTART_IDLE, DEFAULT_IMAGE_PRESENT, DEFAULT_WHISPER_RECAP,
 )
 from ...utils.helpers import _add_inline_citations, _format_api_error, _format_history_entry, _scrub_response_text
-from ._shared import _resolve_safety_settings, _strip_neuro_update_and_scrub
+from ._shared import _strip_neuro_update_and_scrub
+from ...utils.helpers import _resolve_safety_settings
 
 
 class RegenerationMixin:
@@ -238,7 +239,7 @@ class RegenerationMixin:
             primary_model = p_profile.get("primary_model", PRIMARY_MODEL_NAME)
             fallback_model_name = p_profile.get("fallback_model", FALLBACK_MODEL_NAME)
 
-            safety_level_str = p_profile.get('safety_level', 'low')
+            safety_level_str = p_profile.get('safety_level')
             dynamic_safety_settings = _resolve_safety_settings(safety_level_str)
 
             t_params_worker = {

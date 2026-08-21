@@ -1553,14 +1553,10 @@ class SessionAuditView(ui.View):
     def _extract_turn_preview(self, turn: dict) -> str:
         content = turn.get("content", "")
         import re
-        system_tags = [
-            "archive_context", "external_context", "document_context", "time_context",
-            "whisper_context", "private_whisper", "private_response", "internal_note",
-            "scene_prompt", "neuro_endocrine_engine", "neuro_update", "persona_profile",
-            "technical_manual", "training_data", "context_rules", "image_context",
-            "system_note", "reply_context", "negative_constraints"
-        ]
-        tags_pattern = "|".join(system_tags)
+        # Was a hand-copied duplicate of SYSTEM_XML_TAGS that had to be edited in
+        # lockstep with constants.py; a tag added there but missed here leaked into
+        # this preview. Use the one list.
+        tags_pattern = "|".join(SYSTEM_XML_TAGS)
         clean_text = re.sub(rf'<({tags_pattern})>.*?</\1>', '', content, flags=re.DOTALL | re.IGNORECASE)
         clean_text = re.sub(rf'</?({tags_pattern})>', '', clean_text, flags=re.IGNORECASE)
         clean_text = re.sub(r'<[^>]+>\s*\[ID:[^\]]+\]\s*\[[^\]]+\]:\s*', '', clean_text)
@@ -1594,164 +1590,94 @@ class SessionAuditView(ui.View):
         # Contextual Dropdowns
         if self.mode == "inspector":
             self.all_turns = self.session.get("unified_log", []) or []
-            self.num_pages = max(1, (len(self.all_turns) - 1) // 20 + 1)
-            self.current_page = max(0, min(self.current_page, self.num_pages - 1))
-            
-            start = self.current_page * 20
-            page_turns = self.all_turns[start : start + 20]
-            
-            opts = []
-            if self.current_page > 0:
-                opts.append(discord.SelectOption(label="◀ Previous Page", value="prev_page", description="Navigate to previous page of turns"))
-            
-            opts.append(discord.SelectOption(label=f"📄 Page {self.current_page + 1}/{self.num_pages} (Jump)", value="jump_page", description="Click to jump to a page number"))
-            
-            if self.current_page < self.num_pages - 1:
-                opts.append(discord.SelectOption(label="▶ Next Page", value="next_page", description="Navigate to next page of turns"))
-            
-            for idx, t in enumerate(page_turns):
-                abs_turn_num = start + idx + 1
-                display = self._resolve_turn_speaker_name(t)
-                preview = self._extract_turn_preview(t)
-                label = f"Turn #{abs_turn_num} - {display} ({preview})"
-                opts.append(discord.SelectOption(label=label[:100], value=t.get("turn_id"), default=(t.get("turn_id") == self.selected_turn_id)))
-            
-            if opts:
-                sel = ui.Select(placeholder="Select a turn to inspect...", options=opts, row=1)
-                async def sel_cb(i: discord.Interaction):
-                    val = i.data['values'][0]
-                    if val == "prev_page":
-                        self.current_page -= 1
-                        self._build_view()
-                        await i.response.edit_message(embed=self._build_embed(), view=self)
-                    elif val == "next_page":
-                        self.current_page += 1
-                        self._build_view()
-                        await i.response.edit_message(embed=self._build_embed(), view=self)
-                    elif val == "jump_page":
-                        await i.response.send_modal(self._page_jump_modal())
-                    else:
-                        self.selected_turn_id = val
-                        self._build_view()
-                        await i.response.edit_message(embed=self._build_embed(), view=self)
-                sel.callback = sel_cb
-                self.add_item(sel)
+            self._add_paged_select(
+                self.all_turns, "Select a turn to inspect...", "selected_turn_id",
+                self._turn_option, nav_suffix=" of turns", always_show_jump=True)
 
         elif self.mode == "simulator":
-            profiles = self.session.get("profiles", []) or []
-            self.num_pages = max(1, (len(profiles) - 1) // 20 + 1)
-            self.current_page = max(0, min(self.current_page, self.num_pages - 1))
-            
-            start = self.current_page * 20
-            page_profiles = profiles[start : start + 20]
-            
-            opts = []
-            if self.current_page > 0:
-                opts.append(discord.SelectOption(label="◀ Previous Page", value="prev_page", description="Navigate to previous page of profiles"))
-            
-            if self.num_pages > 1:
-                opts.append(discord.SelectOption(label=f"📄 Page {self.current_page + 1}/{self.num_pages} (Jump)", value="jump_page", description="Click to jump to a page number"))
-            
-            if self.current_page < self.num_pages - 1:
-                opts.append(discord.SelectOption(label="▶ Next Page", value="next_page", description="Navigate to next page of profiles"))
-            
-            for p in page_profiles:
-                val = f"{p['owner_id']}:{p['profile_name']}"
-                opts.append(discord.SelectOption(label=p['profile_name'][:100], value=val, default=(val == self.simulate_profile_key)))
-                
-            if opts:
-                sel = ui.Select(placeholder="Select a profile to simulate next turn...", options=opts, row=1)
-                async def sel_cb(i: discord.Interaction):
-                    val = i.data['values'][0]
-                    if val == "prev_page":
-                        self.current_page -= 1
-                        self._build_view()
-                        await i.response.edit_message(embed=self._build_embed(), view=self)
-                    elif val == "next_page":
-                        self.current_page += 1
-                        self._build_view()
-                        await i.response.edit_message(embed=self._build_embed(), view=self)
-                    elif val == "jump_page":
-                        await i.response.send_modal(self._page_jump_modal())
-                    else:
-                        self.simulate_profile_key = val
-                        self._build_view()
-                        await i.response.edit_message(embed=self._build_embed(), view=self)
-                sel.callback = sel_cb
-                self.add_item(sel)
+            self._add_paged_select(
+                self.session.get("profiles", []) or [],
+                "Select a profile to simulate next turn...", "simulate_profile_key",
+                lambda p, _idx, current: discord.SelectOption(
+                    label=p['profile_name'][:100],
+                    value=f"{p['owner_id']}:{p['profile_name']}",
+                    default=(f"{p['owner_id']}:{p['profile_name']}" == current)),
+                nav_suffix=" of profiles")
 
         elif self.mode == "batch":
             self.all_turns = self.session.get("unified_log", []) or []
-            self.num_pages = max(1, (len(self.all_turns) - 1) // 20 + 1)
-            self.current_page = max(0, min(self.current_page, self.num_pages - 1))
-            
-            start = self.current_page * 20
-            page_turns = self.all_turns[start : start + 20]
-            
-            opts_start = []
-            opts_end = []
-            
-            if self.current_page > 0:
-                opts_start.append(discord.SelectOption(label="◀ Previous Page", value="prev_page", description="Navigate to previous page"))
-                opts_end.append(discord.SelectOption(label="◀ Previous Page", value="prev_page", description="Navigate to previous page"))
-            
-            if self.num_pages > 1:
-                opts_start.append(discord.SelectOption(label=f"📄 Page {self.current_page + 1}/{self.num_pages} (Jump)", value="jump_page", description="Click to jump to a page number"))
-                opts_end.append(discord.SelectOption(label=f"📄 Page {self.current_page + 1}/{self.num_pages} (Jump)", value="jump_page", description="Click to jump to a page number"))
-            
-            if self.current_page < self.num_pages - 1:
-                opts_start.append(discord.SelectOption(label="▶ Next Page", value="next_page", description="Navigate to next page"))
-                opts_end.append(discord.SelectOption(label="▶ Next Page", value="next_page", description="Navigate to next page"))
+            # Two selects over one shared page cursor: turning the page on either moves
+            # both, which is why they are built from the same item list and page state.
+            self._add_paged_select(self.all_turns, "Select Start Turn...", "batch_start_id",
+                                   self._turn_option, row=1)
+            self._add_paged_select(self.all_turns, "Select End Turn...", "batch_end_id",
+                                   self._turn_option, row=2)
 
-            for idx, t in enumerate(page_turns):
-                abs_turn_num = start + idx + 1
-                display = self._resolve_turn_speaker_name(t)
-                preview = self._extract_turn_preview(t)
-                label = f"Turn #{abs_turn_num} - {display} ({preview})"
-                opts_start.append(discord.SelectOption(label=label[:100], value=t.get("turn_id"), default=(t.get("turn_id") == self.batch_start_id)))
-                opts_end.append(discord.SelectOption(label=label[:100], value=t.get("turn_id"), default=(t.get("turn_id") == self.batch_end_id)))
-            
-            if opts_start:
-                sel_start = ui.Select(placeholder="Select Start Turn...", options=opts_start, row=1)
-                async def ss_cb(i: discord.Interaction):
-                    val = i.data['values'][0]
-                    if val == "prev_page":
-                        self.current_page -= 1
-                        self._build_view()
-                        await i.response.edit_message(embed=self._build_embed(), view=self)
-                    elif val == "next_page":
-                        self.current_page += 1
-                        self._build_view()
-                        await i.response.edit_message(embed=self._build_embed(), view=self)
-                    elif val == "jump_page":
-                        await i.response.send_modal(self._page_jump_modal())
-                    else:
-                        self.batch_start_id = val
-                        self._build_view()
-                        await i.response.edit_message(embed=self._build_embed(), view=self)
-                sel_start.callback = ss_cb
-                self.add_item(sel_start)
-                
-                sel_end = ui.Select(placeholder="Select End Turn...", options=opts_end, row=2)
-                async def se_cb(i: discord.Interaction):
-                    val = i.data['values'][0]
-                    if val == "prev_page":
-                        self.current_page -= 1
-                        self._build_view()
-                        await i.response.edit_message(embed=self._build_embed(), view=self)
-                    elif val == "next_page":
-                        self.current_page += 1
-                        self._build_view()
-                        await i.response.edit_message(embed=self._build_embed(), view=self)
-                    elif val == "jump_page":
-                        await i.response.send_modal(self._page_jump_modal())
-                    else:
-                        self.batch_end_id = val
-                        self._build_view()
-                        await i.response.edit_message(embed=self._build_embed(), view=self)
-                sel_end.callback = se_cb
-                self.add_item(sel_end)
+    def _turn_option(self, t: dict, abs_index: int, current) -> discord.SelectOption:
+        display = self._resolve_turn_speaker_name(t)
+        preview = self._extract_turn_preview(t)
+        label = f"Turn #{abs_index + 1} - {display} ({preview})"
+        return discord.SelectOption(label=label[:100], value=t.get("turn_id"),
+                                    default=(t.get("turn_id") == current))
 
+    def _add_paged_select(self, items, placeholder, attr, option_for, *, row=1,
+                          per_page=20, nav_suffix="", always_show_jump=False):
+        """Attach one paginated dropdown, page controls included.
+
+        Written once and called four times. Each of the four used to carry its own copy
+        of the page-option construction and a 16-line prev/next/jump/select callback,
+        differing only in the item list, the attribute the choice lands in, and the
+        wording of the nav descriptions.
+
+        `attr` is the name of the view attribute the selection is stored on; page state
+        is shared across every select on the view, so the two batch dropdowns turn
+        together exactly as they did before.
+
+        `always_show_jump` preserves an inconsistency in the original: the inspector
+        offered the jump row even with a single page, while the other three hid it.
+        """
+        self.num_pages = max(1, (len(items) - 1) // per_page + 1)
+        self.current_page = max(0, min(self.current_page, self.num_pages - 1))
+
+        start = self.current_page * per_page
+        page_items = items[start : start + per_page]
+
+        opts = []
+        if self.current_page > 0:
+            opts.append(discord.SelectOption(label="◀ Previous Page", value="prev_page",
+                                             description=f"Navigate to previous page{nav_suffix}"))
+        if always_show_jump or self.num_pages > 1:
+            opts.append(discord.SelectOption(label=f"📄 Page {self.current_page + 1}/{self.num_pages} (Jump)",
+                                             value="jump_page", description="Click to jump to a page number"))
+        if self.current_page < self.num_pages - 1:
+            opts.append(discord.SelectOption(label="▶ Next Page", value="next_page",
+                                             description=f"Navigate to next page{nav_suffix}"))
+
+        current = getattr(self, attr)
+        for idx, item in enumerate(page_items):
+            opts.append(option_for(item, start + idx, current))
+
+        if not opts:
+            return
+
+        sel = ui.Select(placeholder=placeholder, options=opts, row=row)
+
+        async def sel_cb(i: discord.Interaction):
+            val = i.data['values'][0]
+            if val == "jump_page":
+                await i.response.send_modal(self._page_jump_modal())
+                return
+            if val == "prev_page":
+                self.current_page -= 1
+            elif val == "next_page":
+                self.current_page += 1
+            else:
+                setattr(self, attr, val)
+            self._build_view()
+            await i.response.edit_message(embed=self._build_embed(), view=self)
+
+        sel.callback = sel_cb
+        self.add_item(sel)
     def _page_jump_modal(self) -> PageJumpModal:
         """Built here rather than at each of the four buttons that send it."""
         async def _jump(i: discord.Interaction, page: int):

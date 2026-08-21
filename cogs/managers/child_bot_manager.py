@@ -12,10 +12,10 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..utils.constants import (
-    PLACEHOLDER_EMOJI, HarmBlockThreshold, HARM_CATEGORIES, IMAGE_QUEUE_PRIORITY,
+    PLACEHOLDER_EMOJI, IMAGE_QUEUE_PRIORITY,
     DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING,
 )
-from ..utils.helpers import _split_into_sentences_with_abbreviations
+from ..utils.helpers import _resolve_safety_settings, _split_into_sentences_with_abbreviations
 from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
 
@@ -870,10 +870,7 @@ class ChildBotManager:
             if not profile_data.get("image_generation_enabled", False):
                 return
 
-            safety_level_str = profile_data.get("safety_level", "low")
-            safety_map = {"unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE}
-            threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
-            dynamic_safety_settings = {cat: threshold for cat in HARM_CATEGORIES}
+            dynamic_safety_settings = _resolve_safety_settings(profile_data.get("safety_level"))
 
             source_owner_id = owner_id
             source_profile_name = profile_name

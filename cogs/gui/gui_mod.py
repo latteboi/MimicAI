@@ -31,6 +31,30 @@ class ModBaseView(TimeoutCleanupMixin, ui.View):
         self.target_user_id = target_user_id
         self._add_nav_buttons()
 
+    def _add_page_controls(self, num_pages: int, row: int, *, repaint: bool = True):
+        """Attach prev/next page buttons.
+
+        Four tabs each carried their own pair of near-identical `p_cb`/`n_cb` closures.
+        `repaint=True` edits the message in place off the click; `repaint=False` defers
+        and repaints through `update_display`, which is what the Docs tab did.
+        """
+        async def p_cb(i: discord.Interaction):
+            await self._turn_page(i, -1, repaint)
+
+        async def n_cb(i: discord.Interaction):
+            await self._turn_page(i, 1, repaint)
+
+        build_pagination_controls(self, self.current_page, num_pages, row, p_cb, n_cb)
+
+    async def _turn_page(self, i: discord.Interaction, delta: int, repaint: bool):
+        self.current_page += delta
+        self._build_view()
+        if repaint:
+            await i.response.edit_message(embed=self._get_embed(), view=self)
+        else:
+            await i.response.defer()
+            await self.update_display()
+
     def _add_nav_buttons(self):
         ModBaseView.add_nav_to_other_view(
             self, self.cog, self.original_interaction, self.current_tab, self.target_user_id)
@@ -179,18 +203,7 @@ class ModDocsView(ModBaseView):
             self.add_item(file_select)
 
             if num_pages > 1:
-                async def p_cb(i: discord.Interaction):
-                    self.current_page -= 1
-                    self._build_view()
-                    await i.response.defer()
-                    await self.update_display()
-                async def n_cb(i: discord.Interaction):
-                    self.current_page += 1
-                    self._build_view()
-                    await i.response.defer()
-                    await self.update_display()
-                    
-                build_pagination_controls(self, self.current_page, num_pages, 2, p_cb, n_cb)
+                self._add_page_controls(num_pages, 2, repaint=False)
 
         # 5. Build Action Buttons
         action_row = 3 if len(files) > DROPDOWN_MAX_OPTIONS else 2
@@ -337,16 +350,7 @@ class ModBlacklistView(ModBaseView):
             self.add_item(sel)
 
             if num_pages > 1:
-                async def p_cb(i: discord.Interaction):
-                    self.current_page -= 1
-                    self._build_view()
-                    await i.response.edit_message(embed=self._get_embed(), view=self)
-                async def n_cb(i: discord.Interaction):
-                    self.current_page += 1
-                    self._build_view()
-                    await i.response.edit_message(embed=self._get_embed(), view=self)
-                    
-                build_pagination_controls(self, self.current_page, num_pages, 2, p_cb, n_cb)
+                self._add_page_controls(num_pages, 2)
 
         self._add_nav_buttons()
 
@@ -431,16 +435,7 @@ class ModStatsView(ModBaseView):
         num_pages = len(pages)
         if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
 
-        async def p_cb(i: discord.Interaction):
-            self.current_page -= 1
-            self._build_view()
-            await i.response.edit_message(embed=self._get_embed(), view=self)
-        async def n_cb(i: discord.Interaction):
-            self.current_page += 1
-            self._build_view()
-            await i.response.edit_message(embed=self._get_embed(), view=self)
-
-        build_pagination_controls(self, self.current_page, num_pages, 1, p_cb, n_cb)
+        self._add_page_controls(num_pages, 1)
         self._add_nav_buttons()
 
     def _get_embed(self):
@@ -523,16 +518,7 @@ class ModProfilesView(ModBaseView):
                 self.add_item(sel)
 
                 if num_pages > 1:
-                    async def p_cb(i: discord.Interaction):
-                        self.current_page -= 1
-                        self._build_view()
-                        await i.response.edit_message(embed=self._get_embed(), view=self)
-                    async def n_cb(i: discord.Interaction):
-                        self.current_page += 1
-                        self._build_view()
-                        await i.response.edit_message(embed=self._get_embed(), view=self)
-                        
-                    build_pagination_controls(self, self.current_page, num_pages, 2, p_cb, n_cb)
+                    self._add_page_controls(num_pages, 2)
 
         self._add_nav_buttons()
 
@@ -572,6 +558,7 @@ MOD_PROMPT_CATEGORIES = [
         ("Negative Constraints", "NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS),
         ("Training Data Injection", "TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION),
         ("Neuro-Endocrine Engine", "NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION),
+        ("Content Policy (non-18+ channels)", "CONTENT_POLICY", DEFAULT_CONTENT_POLICY),
     ]),
     ("Turn Flow", [
         ("Whisper Injection", "WHISPER_INJECTION", DEFAULT_WHISPER_INJECTION),

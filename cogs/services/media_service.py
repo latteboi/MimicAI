@@ -10,12 +10,12 @@ from typing import List, Any, Optional
 
 from ..utils.constants import (
     PLACEHOLDER_EMOJI, WARN_IMAGE_GEN_FAILED, ERR_GENERAL_ERROR, ERR_SAFETY_BLOCK,
-    WARN_MAIN_MODEL_FAILED, ERR_REASON_EMPTY_RESPONSE, HarmBlockThreshold, HARM_CATEGORIES,
+    WARN_MAIN_MODEL_FAILED, ERR_REASON_EMPTY_RESPONSE,
     defaultConfig, IMAGE_QUEUE_PRIORITY,
     DEFAULT_IMAGE_PRESENT, DEFAULT_IMAGE_FAILED, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING,
 )
 from .api_service import GoogleGenAIModel, generate_google_tts_audio
-from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _scrub_response_text
+from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text
 
 
 class MediaService:
@@ -654,11 +654,7 @@ class MediaService:
             index = self.cog.profile_manager._get_user_index(effective_profile_owner_id)
             is_borrowed = effective_profile_name in index.get("borrowed", [])
             profile_data = self.cog.profile_manager._get_profile_config(effective_profile_owner_id, effective_profile_name, is_borrowed) or {}
-            safety_level_str = profile_data.get("safety_level", "low")
-            
-            safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
-            threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
-            dynamic_safety_settings = { cat: threshold for cat in HARM_CATEGORIES }
+            dynamic_safety_settings = _resolve_safety_settings(profile_data.get("safety_level"))
 
             # Get appearance text
             source_owner_id = effective_profile_owner_id

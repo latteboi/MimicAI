@@ -20,8 +20,9 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from ..utils.constants import (
     USERS_DIR, PUBLIC_PROFILES_DIR, defaultConfig,
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS,
-    DEFAULT_AUTO_MODERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS,
+    DEFAULT_AUTO_MODERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS, SAFETY_LEVEL_LABELS,
 )
+from ..utils.helpers import _coerce_safety_level
 from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
@@ -519,7 +520,7 @@ class ProfileManager:
                 "top_k": defaultConfig.GEMINI_TOP_K, "training_context_size": defaultConfig.TRAINING_CONTEXT_SIZE,
                 "training_relevance_threshold": defaultConfig.TRAINING_RELEVANCE_THRESHOLD,
                 "ltm_context_size": 3, "ltm_relevance_threshold": 0.75, "ltm_creation_interval": 10,
-                "ltm_summarization_context": 10, "ltm_scope": "server", "safety_level": "low",
+                "ltm_summarization_context": 10, "ltm_scope": "server", "safety_level": "restricted",
                 "primary_model": PRIMARY_MODEL_NAME, "fallback_model": FALLBACK_MODEL_NAME,
                 "time_tracking_enabled": True, "timezone": "UTC",
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
@@ -567,7 +568,7 @@ class ProfileManager:
                 "top_k": 40, "training_context_size": 0,
                 "training_relevance_threshold": 0.0,
                 "ltm_context_size": 0, "ltm_relevance_threshold": 1.0, "ltm_creation_interval": 100,
-                "ltm_summarization_context": 10, "ltm_scope": "server", "safety_level": "low",
+                "ltm_summarization_context": 10, "ltm_scope": "server", "safety_level": "restricted",
                 "primary_model": "GOOGLE/gemini-2.5-flash-lite", "fallback_model": "GOOGLE/gemini-2.5-flash-lite",
                 "time_tracking_enabled": True, "timezone": "UTC", "generation_metadata_enabled": False,
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
@@ -607,7 +608,19 @@ class ProfileManager:
         is_borrowed = profile_name in index.get("borrowed", [])
         config = self._get_profile_config(profile_owner_id, profile_name, is_borrowed) or {}
 
-        safety_level = config.get("safety_level", "low")
+        safety_level = _coerce_safety_level(config.get("safety_level"))
+
+        # A borrowed profile carries its own local copy of the config, so reading
+        # only that copy let a borrower downgrade an owner's 18+ profile to
+        # Restricted and run it in a general channel -- the local value is
+        # writable by the borrower via the bulk editor. Consult the source as
+        # well and take whichever is stricter, so the level can only ever be
+        # escalated by the person holding the copy, never relaxed.
+        if is_borrowed and safety_level != "unrestricted":
+            src_owner, src_name = self._resolve_effective_profile(profile_owner_id, profile_name)
+            if (src_owner, src_name) != (profile_owner_id, profile_name):
+                src_config = self._get_profile_config(src_owner, src_name, False) or {}
+                safety_level = _coerce_safety_level(src_config.get("safety_level"))
 
         if safety_level == "unrestricted":
             if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
@@ -1197,7 +1210,7 @@ class ProfileManager:
         stm_length = profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
         ltm_ctx = profile_data.get("ltm_context_size", 3)
         ltm_rel = profile_data.get("ltm_relevance_threshold", 0.75)
-        safety_level = profile_data.get("safety_level", "low").title()
+        safety_level = SAFETY_LEVEL_LABELS[_coerce_safety_level(profile_data.get("safety_level"))]
         ltm_creation_status = "**`ON`**" if profile_data.get("ltm_creation_enabled", False) else "`OFF`"
 
         created_str = profile_data.get('created_at')
@@ -1299,7 +1312,7 @@ class ProfileManager:
         
         appearance_data = self._get_user_appearance(effective_owner_id, effective_profile_name)
         display_name = appearance_data.get("custom_display_name") or effective_profile_name
-        safety_level = config.get("safety_level", "low").title()
+        safety_level = SAFETY_LEVEL_LABELS[_coerce_safety_level(config.get("safety_level"))]
 
         embed.add_field(name="Profile Type", value=f"`{profile_type}`", inline=True)
         embed.add_field(name="Created", value=created_display, inline=True)

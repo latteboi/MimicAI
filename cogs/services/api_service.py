@@ -12,8 +12,8 @@ from discord.ext import tasks
 from ..utils.constants import (
     OLLAMA_LOCAL_URL, MODELS_DATA_DIR, PRICING_CACHE_FILE, IMAGE_MODELS, AUDIO_MODELS,
     ALLOWED_MODELS, defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
-    HarmBlockThreshold, HarmCategory, HARM_CATEGORIES,
 )
+from ..utils.helpers import _resolve_safety_settings
 from ..utils.http_client import get_shared_client
 from ..utils.memory_tuning import maybe_trim_malloc
 
@@ -415,6 +415,55 @@ async def close_google_rest_client():
 # recall, help_service's two RAG builders) — all three already share this exact
 # payload shape, so the flag is applied here rather than at each site, same as
 # GoogleGenAIModel above.
+# --- Query embedding cache -----------------------------------------------------
+#
+# A single turn asks for the *same* embedding three times: LTM recall, training-example
+# recall and help-mode RAG all embed `dynamic_context_for_turn` at the same task type
+# and the same 256 dimensions, and generation_service gathers them concurrently -- so a
+# plain read-through cache misses on all three. Hence single-flight: the first caller
+# issues the request, the other two await its future.
+#
+# Only RETRIEVAL_QUERY is cached. RETRIEVAL_DOCUMENT is by construction unique per call
+# (a newly written memory summary, a new training example), so caching those could only
+# ever burn memory and evict live query entries during a bulk import.
+#
+# Embeddings are deterministic for a given (text, task, dims), so entries need no TTL --
+# the LRU bound is the whole eviction story. Values are held as float32 ndarrays rather
+# than Python lists: 1 KB against roughly 8 KB for 256 boxed floats, and every caller
+# converts straight back to numpy anyway. `.tolist()` costs ~4 us and hands out a fresh
+# list each time, so the stored array can never be mutated by a caller.
+
+_EMBED_CACHE_MAX = 256
+_embed_cache: "OrderedDict[Any, Any]" = OrderedDict()
+_embed_inflight: dict = {}
+
+
+def _embed_cache_key(text: str, task_type: str, output_dimensionality: int):
+    """Hash the text rather than keying on it: a round context runs to several KB, and
+    holding those strings alive as dict keys is the bulk of what the cache would cost."""
+    import hashlib
+
+    digest = hashlib.blake2b(text.encode("utf-8"), digest_size=16).digest()
+    return (digest, task_type, output_dimensionality)
+
+
+def _embed_cache_get(key) -> Optional[List[float]]:
+    hit = _embed_cache.get(key)
+    if hit is None:
+        return None
+    _embed_cache.move_to_end(key)
+    return hit.tolist()
+
+
+def _embed_cache_put(key, values: List[float]):
+    import numpy as np
+
+    _embed_cache[key] = np.asarray(values, dtype=np.float32)
+    _embed_cache.move_to_end(key)
+    while len(_embed_cache) > _EMBED_CACHE_MAX:
+        _embed_cache.popitem(last=False)
+
+
 async def get_embedding_vector(
     api_key: str,
     text: str,
@@ -426,6 +475,55 @@ async def get_embedding_vector(
     if not text or not text.strip():
         return None
 
+    cache_key = None
+    if task_type == "RETRIEVAL_QUERY":
+        cache_key = _embed_cache_key(text, task_type, output_dimensionality)
+
+        cached = _embed_cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        inflight = _embed_inflight.get(cache_key)
+        if inflight is not None:
+            # A sibling retrieval in this same turn is already fetching this exact
+            # vector. Shielded so a cancelled waiter does not kill the request the
+            # others are waiting on.
+            try:
+                result = await asyncio.shield(inflight)
+            except Exception:
+                return None
+            return list(result) if result is not None else None
+
+    future = None
+    if cache_key is not None:
+        future = asyncio.get_running_loop().create_future()
+        _embed_inflight[cache_key] = future
+
+    values: Optional[List[float]] = None
+    try:
+        values = await _fetch_embedding_vector(
+            api_key, text, task_type, output_dimensionality, timeout
+        )
+        if cache_key is not None and values is not None:
+            _embed_cache_put(cache_key, values)
+        return values
+    finally:
+        if cache_key is not None:
+            _embed_inflight.pop(cache_key, None)
+            if future is not None and not future.done():
+                # Resolved rather than raised: waiters take the same None-means-skip
+                # path the uncached call always had, and nothing is left as an
+                # unretrieved exception. `values` stays None if the fetch raised.
+                future.set_result(values)
+
+
+async def _fetch_embedding_vector(
+    api_key: str,
+    text: str,
+    task_type: str,
+    output_dimensionality: int,
+    timeout: float,
+) -> Optional[List[float]]:
     payload = {
         "model": "models/gemini-embedding-001",
         "content": {"parts": [{"text": text}]},
@@ -1245,24 +1343,8 @@ class APIService:
 
         model_instance, model_init_error = None, True
         
-        safety_level_str = "low" 
         profile_data_for_safety = self.cog.profile_manager._get_profile_config(profile_owner_id_for_instructions, profile_name_for_instructions, is_borrowed) or {}
-        safety_level_str = profile_data_for_safety.get("safety_level", "low")
-
-        safety_map = {
-            "unrestricted": HarmBlockThreshold.BLOCK_NONE,
-            "low": HarmBlockThreshold.BLOCK_ONLY_HIGH,
-            "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-            "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
-        }
-        threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
-        
-        dynamic_safety_settings = {
-            HarmCategory.HARM_CATEGORY_HARASSMENT: threshold,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: threshold,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: threshold,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: threshold,
-        }
+        dynamic_safety_settings = _resolve_safety_settings(profile_data_for_safety.get("safety_level"))
 
         model_to_create = primary_model
         
@@ -1330,10 +1412,7 @@ class APIService:
         if not user_api_key and not or_key and not primary_model.upper().startswith("OLLAMA/"):
             return None, 0.0, 0.0, 0, "This feature requires a personal API key. Use `/settings` to add one.", None
         
-        safety_level_str = profile_data.get("safety_level", "low")
-        safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
-        threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
-        safety_settings = { cat: threshold for cat in HARM_CATEGORIES }
+        safety_settings = _resolve_safety_settings(profile_data.get("safety_level"))
 
         try:
             t_params = {

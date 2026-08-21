@@ -5,7 +5,7 @@ import uuid
 import random
 import asyncio
 import traceback
-from typing import List
+from typing import Any, Dict, List, Tuple
 
 import discord
 from discord import app_commands
@@ -13,6 +13,7 @@ from discord.ext import commands
 
 from ..utils.constants import *
 from ..utils.helpers import _format_history_entry
+from ..utils.fuzzy import rank_keyed
 
 
 class EventListeners:
@@ -854,8 +855,6 @@ class EventListeners:
             return [c for c in choices if current.lower() in c.name.lower()]
 
         choices = []
-        current_lower = current.lower()
-        
         def format_choice_name(display_name, internal_name, pid, creator_name, is_system=False):
             suffix = " ┃ [System Profile]" if is_system else f" ┃ By {creator_name}"
             base_str = f" ┃ [{pid}]{suffix}"
@@ -870,37 +869,57 @@ class EventListeners:
                     name_str = name_str[:max(1, rem_len-3)] + "..."
             return f"{name_str}{base_str}"
 
+        # Two phases, deliberately. Phase one collects (value, matchable text) pairs and
+        # ranks them; phase two formats only the survivors. Matching used to be a plain
+        # substring test -- which returned nothing at all for a typo, and returned an
+        # arbitrary 25 in insertion order when a user had many profiles, so an exact
+        # match could be truncated away. Formatting also ran for every match rather than
+        # the 25 that survive, and each one costs an appearance lookup that can reach
+        # disk for a borrowed profile.
+        pending: List[Tuple[str, str]] = []
+        meta: Dict[str, Any] = {}
+
         if cmd_name in ["speak", "whisper"]:
             server_id_str = str(interaction.guild_id) if interaction.guild_id else "dm"
             server_index = self.server_manager._get_server_index(server_id_str)
             channel_str = str(interaction.channel_id)
             session_data = server_index.get("active_sessions", {}).get("regular", {}).get(channel_str)
             if not session_data: return []
-            
+
             for p in session_data.get("profiles", []):
                 o_id = p.get("owner_id")
                 p_name = p.get("profile_name")
-                
+
                 if cmd_name == "speak" and o_id != interaction.user.id and interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
                     if o_id != int(defaultConfig.DISCORD_OWNER_ID):
                         continue
-                
+
                 eff_owner, eff_name = self.profile_manager._resolve_effective_profile(o_id, p_name)
                 app = self.profile_manager._get_user_appearance(eff_owner, eff_name)
                 disp_name = app.get("custom_display_name") or eff_name
-                pid = self.profile_manager._get_pid_from_name_any(o_id, p_name)
-                
-                creator_name = "Unknown"
-                is_sys = pid.startswith("X")
-                if not is_sys:
-                    creator = self.bot.get_user(eff_owner)
-                    creator_name = creator.name if creator else str(eff_owner)
-                    
-                formatted_name = format_choice_name(disp_name, p_name, pid, creator_name, is_sys)
+
                 val = f"{o_id}:{p_name}"
-                if current_lower in p_name.lower() or current_lower in disp_name.lower():
-                    choices.append(app_commands.Choice(name=formatted_name, value=val))
-        
+                # Participants are capped at MAX_MULTI_PROFILES, so resolving appearance
+                # up front here is bounded and lets the display name be matched on too --
+                # which the old code did for these commands and only these.
+                pending.append((val, p_name))
+                pending.append((val, disp_name))
+                meta[val] = {"owner": o_id, "name": p_name, "eff_owner": eff_owner, "disp": disp_name}
+
+            ranked = rank_keyed(current, pending, limit=25)
+            for val, _ in ranked:
+                m = meta[val]
+                pid = self.profile_manager._get_pid_from_name_any(m["owner"], m["name"])
+                is_sys = pid.startswith("X")
+                creator_name = "Unknown"
+                if not is_sys:
+                    creator = self.bot.get_user(m["eff_owner"])
+                    creator_name = creator.name if creator else str(m["eff_owner"])
+                choices.append(app_commands.Choice(
+                    name=format_choice_name(m["disp"], m["name"], pid, creator_name, is_sys),
+                    value=val))
+            return choices
+
         elif cmd_name == "global_chat":
             user_id = interaction.user.id
             index = self.profile_manager._get_user_index(user_id)
@@ -912,61 +931,75 @@ class EventListeners:
                     oid = str(p_info.get("owner_id"))
                     opid = p_info.get("original_pid")
                     if oid and opid: public_pointers.add(f"{oid}:{opid}")
-            
+
             for p_name in index.get("personal", []):
                 pid = self.profile_manager._get_pid_from_name_any(user_id, p_name)
-                if f"{user_id}:{pid}" in public_pointers and current_lower in p_name.lower():
-                    app = self.profile_manager._get_user_appearance(user_id, p_name)
-                    disp_name = app.get("custom_display_name") or p_name
-                    formatted = format_choice_name(disp_name, p_name, pid, interaction.user.name, False)
-                    choices.append(app_commands.Choice(name=formatted, value=p_name))
-                    
+                if f"{user_id}:{pid}" in public_pointers:
+                    pending.append((p_name, p_name))
+                    meta[p_name] = {"kind": "personal", "pid": pid}
+
             for b_name in index.get("borrowed", []):
                 b_cfg = self.profile_manager._get_profile_config(user_id, b_name, True)
                 if not b_cfg: continue
                 orig_oid = str(b_cfg.get("original_owner_id"))
                 orig_pid = b_cfg.get("original_pid") or b_cfg.get("original_profile_id")
-                if f"{orig_oid}:{orig_pid}" in public_pointers and current_lower in b_name.lower():
-                    eff_owner, eff_name = self.profile_manager._resolve_effective_profile(user_id, b_name)
-                    app = self.profile_manager._get_user_appearance(eff_owner, eff_name)
-                    disp_name = app.get("custom_display_name") or eff_name
-                    creator = self.bot.get_user(int(orig_oid))
-                    c_name = creator.name if creator else orig_oid
-                    formatted = format_choice_name(disp_name, b_name, orig_pid, c_name, str(orig_pid).startswith("X"))
-                    choices.append(app_commands.Choice(name=formatted, value=b_name))
-        
+                if f"{orig_oid}:{orig_pid}" in public_pointers:
+                    pending.append((b_name, b_name))
+                    meta[b_name] = {"kind": "borrowed", "pid": orig_pid, "orig_oid": orig_oid}
+
         else:
             user_id = interaction.user.id
             index = self.profile_manager._get_user_index(user_id)
+
             for p_name in index.get("personal", []):
-                if current_lower in p_name.lower():
-                    pid = self.profile_manager._get_pid_from_name_any(user_id, p_name)
-                    app = self.profile_manager._get_user_appearance(user_id, p_name)
-                    disp_name = app.get("custom_display_name") or p_name
-                    formatted = format_choice_name(disp_name, p_name, pid, interaction.user.name, False)
-                    choices.append(app_commands.Choice(name=formatted, value=p_name))
-                    
+                pending.append((p_name, p_name))
+                meta[p_name] = {"kind": "personal", "pid": None}
+
             for b_name in index.get("borrowed", []):
-                if current_lower in b_name.lower():
-                    b_cfg = self.profile_manager._get_profile_config(user_id, b_name, True) or {}
-                    orig_oid = b_cfg.get("original_owner_id", user_id)
-                    orig_pid = b_cfg.get("original_pid") or b_cfg.get("original_profile_id", "Unknown")
-                    eff_owner, eff_name = self.profile_manager._resolve_effective_profile(user_id, b_name)
-                    app = self.profile_manager._get_user_appearance(eff_owner, eff_name)
-                    disp_name = app.get("custom_display_name") or eff_name
-                    creator = self.bot.get_user(int(orig_oid))
-                    c_name = creator.name if creator else str(orig_oid)
-                    formatted = format_choice_name(disp_name, b_name, orig_pid, c_name, str(orig_pid).startswith("X"))
-                    choices.append(app_commands.Choice(name=formatted, value=b_name))
-                    
+                pending.append((b_name, b_name))
+                meta[b_name] = {"kind": "borrowed", "pid": None}
+
             if user_id == int(defaultConfig.DISCORD_OWNER_ID):
                 owner_idx = self.profile_manager._get_user_index(user_id)
                 for s_name in owner_idx.get("system", {}):
-                    if current_lower in s_name.lower():
-                        pid = owner_idx["system"][s_name]
-                        app = self.profile_manager._get_user_appearance(user_id, s_name)
-                        disp_name = app.get("custom_display_name") or s_name
-                        formatted = format_choice_name(disp_name, s_name, pid, "System", True)
-                        choices.append(app_commands.Choice(name=formatted, value=s_name))
-                        
-        return choices[:25]
+                    pending.append((s_name, s_name))
+                    meta[s_name] = {"kind": "system", "pid": owner_idx["system"][s_name]}
+
+        # Shared formatting for the two owned-profile branches. Only the ranked
+        # survivors reach here, so the per-candidate config reads below are bounded at
+        # 25 no matter how many profiles the account holds.
+        user_id = interaction.user.id
+        for name, _ in rank_keyed(current, pending, limit=25):
+            m = meta[name]
+            kind = m["kind"]
+
+            if kind == "system":
+                app = self.profile_manager._get_user_appearance(user_id, name)
+                disp_name = app.get("custom_display_name") or name
+                choices.append(app_commands.Choice(
+                    name=format_choice_name(disp_name, name, m["pid"], "System", True),
+                    value=name))
+                continue
+
+            if kind == "personal":
+                pid = m["pid"] or self.profile_manager._get_pid_from_name_any(user_id, name)
+                app = self.profile_manager._get_user_appearance(user_id, name)
+                disp_name = app.get("custom_display_name") or name
+                choices.append(app_commands.Choice(
+                    name=format_choice_name(disp_name, name, pid, interaction.user.name, False),
+                    value=name))
+                continue
+
+            b_cfg = self.profile_manager._get_profile_config(user_id, name, True) or {}
+            orig_oid = m.get("orig_oid") or b_cfg.get("original_owner_id", user_id)
+            orig_pid = m["pid"] or b_cfg.get("original_pid") or b_cfg.get("original_profile_id", "Unknown")
+            eff_owner, eff_name = self.profile_manager._resolve_effective_profile(user_id, name)
+            app = self.profile_manager._get_user_appearance(eff_owner, eff_name)
+            disp_name = app.get("custom_display_name") or eff_name
+            creator = self.bot.get_user(int(orig_oid))
+            c_name = creator.name if creator else str(orig_oid)
+            choices.append(app_commands.Choice(
+                name=format_choice_name(disp_name, name, orig_pid, c_name, str(orig_pid).startswith("X")),
+                value=name))
+
+        return choices

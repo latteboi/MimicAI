@@ -38,6 +38,10 @@ from .gui.gui_profiles import (
     ProfileGenerationVisualModal, BulkResetView, BulkDeleteView, AppearanceModal,
     ProfileNeuroModal, BulkManageView,
 )
+from .gui.gui_resolve import (
+    autocorrect_profile, gather_owned_candidates, gather_participant_candidates,
+    suggest_profile,
+)
 from .gui.gui_mod import (
     ModBaseView, ModDocsCreateModal, ModDocsEditModal, ModDocsView, ModBlacklistModal,
     ModBlacklistView, ModStatsView, ModProfilesModal, ModProfilesView, ModPromptModal,
@@ -72,7 +76,7 @@ import platform
 from collections import OrderedDict
 import re
 import pathlib
-from .utils.helpers import _scrub_response_text
+from .utils.helpers import _resolve_safety_settings, _scrub_response_text
 
 class LRUCache(OrderedDict):
     def __init__(self, max_size, *args, **kwargs):
@@ -102,6 +106,9 @@ class MimicCog(commands.Cog, EventListeners):
         # Client placeholder for session-specific usage
         self.client = None
         self.guide_vectors = []
+        # Pre-normalised (N, dims) float32 matrix over doc_vectors, built by
+        # HelpService._rebuild_doc_matrix whenever the documentation is (re)loaded.
+        self.doc_matrix = None
         
         self._try_acquire_lock()
 
@@ -407,24 +414,50 @@ class MimicCog(commands.Cog, EventListeners):
     async def manage_profile_slash(self, interaction: discord.Interaction, profile_name: str):
         await interaction.response.defer(ephemeral=True)
 
-        index = self.profile_manager._get_user_index(interaction.user.id)
-        is_personal = profile_name in index.get("personal", [])
-        is_borrowed = profile_name in index.get("borrowed", [])
-        
-        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-        owner_idx = self.profile_manager._get_user_index(owner_id)
-        is_system = profile_name in owner_idx.get("system", {})
+        if not self._owns_profile_name(interaction.user.id, profile_name):
+            candidates = gather_owned_candidates(self, interaction.user.id)
 
-        if not is_personal and not is_borrowed and not is_system:
-            await interaction.followup.send(f"Profile '{profile_name}' not found.", ephemeral=True)
+            # Names are stored lowercase, so "Alice" is not a typo -- it is the same
+            # profile typed with a capital. Resolve that silently rather than prompting.
+            corrected = autocorrect_profile(profile_name, candidates)
+            if corrected is not None:
+                await self._open_profile_manage(interaction, corrected)
+                return
+
+            async def on_pick(pick_interaction: discord.Interaction, picked: str):
+                await self._open_profile_manage(pick_interaction, picked, repaint=True)
+
+            await suggest_profile(self, interaction, profile_name, candidates, on_pick)
             return
-            
-        is_view_borrowed = is_borrowed
-        
+
+        await self._open_profile_manage(interaction, profile_name)
+
+    def _owns_profile_name(self, user_id: int, profile_name: str) -> bool:
+        """Whether `user_id` can address `profile_name` at all (personal, borrowed, or system)."""
+        index = self.profile_manager._get_user_index(user_id)
+        if profile_name in index.get("personal", []) or profile_name in index.get("borrowed", []):
+            return True
+        owner_idx = self.profile_manager._get_user_index(int(defaultConfig.DISCORD_OWNER_ID))
+        return profile_name in owner_idx.get("system", {})
+
+    async def _open_profile_manage(self, interaction: discord.Interaction, profile_name: str,
+                                   *, repaint: bool = False):
+        """Render the profile dashboard.
+
+        `repaint` edits the interaction's existing message instead of sending a new one,
+        which is how a "Did you mean?" prompt turns into the dashboard in place rather
+        than leaving a spent suggestion card above it.
+        """
+        index = self.profile_manager._get_user_index(interaction.user.id)
+        is_view_borrowed = profile_name in index.get("borrowed", [])
+
         embed = await self.profile_manager._build_profile_manage_embed(interaction, profile_name)
         view = ProfileManageView(self, interaction, profile_name, is_view_borrowed)
 
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        if repaint:
+            await interaction.edit_original_response(content=None, embed=embed, view=view)
+        else:
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     bulk_group = app_commands.Group(name="bulk", description="Perform actions on multiple profiles at once.", parent=profile_group)
 
@@ -640,6 +673,17 @@ class MimicCog(commands.Cog, EventListeners):
     )
     async def swap_session_slash(self, interaction: discord.Interaction, profile_name: Optional[str] = None, use_child_bot: Optional[bool] = None, slot: Optional[app_commands.Range[int, 1, 200]] = None):
         await interaction.response.defer(ephemeral=True)
+        await self._swap_session_impl(interaction, profile_name, use_child_bot, slot)
+
+    async def _swap_session_impl(self, interaction: discord.Interaction, profile_name: Optional[str],
+                                 use_child_bot: Optional[bool], slot: Optional[int]):
+        """The body of /session swap, minus the opening defer.
+
+        Split from the command so a "Did you mean?" correction can re-enter it: the
+        component interaction that carries the correction has already been deferred, and
+        deferring twice raises. Everything below responds through `followup`, which is
+        valid for either interaction.
+        """
         session = self.multi_profile_channels.get(interaction.channel_id)
 
         if not profile_name and not slot:
@@ -709,7 +753,17 @@ class MimicCog(commands.Cog, EventListeners):
             is_system = profile_name in owner_idx.get("system", {})
             
             if not is_personal and not is_borrowed and not is_system:
-                await interaction.followup.send(f"You do not have a profile named '{profile_name}'.", ephemeral=True)
+                candidates = gather_owned_candidates(self, interaction.user.id)
+
+                corrected = autocorrect_profile(profile_name, candidates)
+                if corrected is not None:
+                    await self._swap_session_impl(interaction, corrected, use_child_bot, slot)
+                    return
+
+                async def on_pick(pick_interaction: discord.Interaction, picked: str):
+                    await self._swap_session_impl(pick_interaction, picked, use_child_bot, slot)
+
+                await suggest_profile(self, interaction, profile_name, candidates, on_pick)
                 return
 
             # Resolve Method (Child Bot vs Webhook)
@@ -1344,7 +1398,26 @@ class MimicCog(commands.Cog, EventListeners):
         is_personal = profile_name_lower in index.get("personal", [])
         is_borrowed = profile_name_lower in index.get("borrowed", [])
         if not is_personal and not is_borrowed:
-            await interaction.response.send_message(f"Profile '{profile_name_lower}' not found.", ephemeral=True)
+            # Only published profiles can be used here, and an unpublished suggestion
+            # would just walk the user into the next rejection, so they are filtered out
+            # of the prompt. This is a typo-recovery path, not a per-message one, so the
+            # publicity check per candidate is affordable.
+            candidates = gather_owned_candidates(
+                self, user_id, include_system=False,
+                only=lambda name, kind: self.profile_manager._is_profile_public(user_id, name),
+            )
+
+            async def on_pick(pick_interaction: discord.Interaction, picked: str):
+                await self.global_chat_slash.callback(
+                    self, pick_interaction, profile_name=picked,
+                    refresh=refresh, suspend=suspend)
+
+            await suggest_profile(
+                self, interaction, profile_name_lower, candidates, on_pick,
+                # /global_chat answers publicly, so its continuation has to own the
+                # first response and choose ephemeral=False for itself.
+                defer_on_pick=False,
+            )
             return
 
         is_public = self.profile_manager._is_profile_public(user_id, profile_name_lower)
@@ -1516,10 +1589,7 @@ class MimicCog(commands.Cog, EventListeners):
                 "thinking_budget": p_config.get("thinking_budget", -1)
             }
             
-            safety_level_str = p_config.get('safety_level', 'low')
-            safety_map = { "unrestricted": HarmBlockThreshold.BLOCK_NONE, "low": HarmBlockThreshold.BLOCK_ONLY_HIGH, "medium": HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE, "high": HarmBlockThreshold.BLOCK_LOW_AND_ABOVE }
-            threshold = safety_map.get(safety_level_str, HarmBlockThreshold.BLOCK_ONLY_HIGH)
-            d_safe = { cat: threshold for cat in HARM_CATEGORIES }
+            d_safe = _resolve_safety_settings(p_config.get('safety_level'))
             
             primary_model = p_config.get("primary_model", "GOOGLE/gemini-2.5-flash-lite")
             fallback_model_name = p_config.get("fallback_model", "GOOGLE/gemini-2.5-flash-lite")
@@ -1756,7 +1826,30 @@ class MimicCog(commands.Cog, EventListeners):
 
         participant = next((p for p in session.get("profiles", []) if p.get("profile_name") == p_name and p.get("owner_id") == p_owner_id), None)
         if not participant:
-            await interaction.response.send_message(f"The profile '{p_name}' is not active in this session. It must be added first.", ephemeral=True)
+            # Mirrors the permission filter master_autocomplete applies, so the prompt
+            # never offers a participant the invoker would then be refused.
+            bot_owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+
+            def speakable(p: dict) -> bool:
+                owner = p.get("owner_id")
+                return (owner == interaction.user.id
+                        or interaction.user.id == bot_owner_id
+                        or owner == bot_owner_id)
+
+            async def on_pick(pick_interaction: discord.Interaction, picked: str):
+                await self.speak_slash.callback(
+                    self, pick_interaction, profile_name=picked,
+                    method=method, message=message)
+
+            await suggest_profile(
+                self, interaction, p_name,
+                gather_participant_candidates(session, only=speakable),
+                on_pick,
+                noun="participant",
+                # Without a message, the continuation opens a modal, and a modal can
+                # only answer an interaction that has not been responded to.
+                defer_on_pick=False,
+            )
             return
 
         if p_owner_id != interaction.user.id and interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
@@ -1819,7 +1912,18 @@ class MimicCog(commands.Cog, EventListeners):
             target_participant = next((p for p in session.get("profiles", []) if p.get("profile_name") == p_name and (p_owner_id is None or p.get("owner_id") == p_owner_id)), None)
 
             if not target_participant:
-                await interaction.response.send_message(f"The profile '{p_name}' is not an active participant in this session.", ephemeral=True)
+                async def on_pick(pick_interaction: discord.Interaction, picked: str):
+                    await self.whisper_slash.callback(
+                        self, pick_interaction, profile=picked, message=message)
+
+                await suggest_profile(
+                    self, interaction, p_name,
+                    gather_participant_candidates(session),
+                    on_pick,
+                    noun="participant",
+                    # Without a message, the continuation opens a modal.
+                    defer_on_pick=False,
+                )
                 return
 
         if profile and message:

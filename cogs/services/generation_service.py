@@ -25,7 +25,8 @@ from ..utils.helpers import _add_inline_citations, _format_api_error, _format_ci
 from ..managers.memory_manager import encode_embedding_b64
 from .api_service import GoogleGenAIModel, OllamaModel, OpenRouterModel
 
-from .generation._shared import _resolve_safety_settings, _strip_neuro_update_and_scrub
+from .generation._shared import _strip_neuro_update_and_scrub
+from ..utils.helpers import _resolve_safety_settings
 from .generation.heartbeat import HeartbeatMixin
 from .generation.prompt_builder import PromptBuilderMixin
 from .generation.delivery import DeliveryMixin
@@ -747,7 +748,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             )[-(g_stm_capped * 2):]
 
                         # Safety Logic for Grounding
-                        g_safety_level = g_profile_settings.get('safety_level', 'low')
+                        g_safety_level = g_profile_settings.get('safety_level')
                         g_dynamic_safety_settings = _resolve_safety_settings(g_safety_level)
 
                         is_for_image_flag = is_image_gen_round
@@ -886,7 +887,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 parts.append({"url": ref["url"], "mime_type": ref.get("mime_type", "image/png")})
 
                             # Determine safety
-                            safety_level_str = gen_cfg.get("safety_level", "low")
+                            safety_level_str = gen_cfg.get("safety_level")
                             dynamic_safety_settings = _resolve_safety_settings(safety_level_str)
 
                             image_model = GoogleGenAIModel(
@@ -1270,7 +1271,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             constraints_block = self.cog.global_prompts.get("NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS)
                             full_system_instruction += "\n\n" + constraints_block.format(constraints=critic_constraints)
 
-                        safety_level_str = p_settings.get('safety_level', 'low')
+                        safety_level_str = p_settings.get('safety_level')
 
                         dynamic_safety_settings = _resolve_safety_settings(safety_level_str)
 
@@ -1365,8 +1366,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             supplementary_parts.append(whisper_context)
 
                         if grounding_context and p_settings.get("grounding_mode", "off") != "off":
-                            g_instr = f"<external_context>\n{grounding_context}\n</external_context>"
-                            supplementary_parts.append(g_instr)
+                            # Already wrapped by _get_hybrid_grounding_context, which returns
+                            # the summary inside <external_context> along with the footnote
+                            # instruction. Re-wrapping here nested the tag inside itself for
+                            # every grounded participant.
+                            supplementary_parts.append(grounding_context)
 
                         if p_settings.get("url_fetching_enabled", False) and round_url_text_contexts:
                             url_instr = "<document_context>\n" + "\n".join(round_url_text_contexts) + "\n</document_context>"
@@ -1765,19 +1769,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     session_type = session.get("type", "multi")
                     await self.cog.session_manager._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
 
-                    is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
-
-                    if is_realistic_typing:
-                        if state_container and state_container.get('sending_task'):
-                            state_container['sending_task'].cancel()
-                        msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
-                        msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
-                        await self._safe_delete_placeholder(channel, msg_a_to_delete)
-                        await self._safe_delete_placeholder(channel, msg_b_to_delete)
-                        if state_container:
-                            state_container['msg_a_id'] = None
-                            state_container['msg_b_id'] = None
-
                     # [NEW] Unified Synthesis Logic
                     audio_file_for_send = None
                     
@@ -1845,6 +1836,25 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         file_to_send = audio_file_for_send
 
                     is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
+
+                    # Realistic typing streams its own first chunk instead of editing the
+                    # placeholder, so the placeholder has to come down before the send --
+                    # but not a moment earlier. This teardown used to sit above the speech
+                    # synthesis block, which meant that with realistic typing *and* audio
+                    # enabled the placeholder vanished and the channel then showed nothing
+                    # at all for the whole duration of the TTS round-trip. Deferring it to
+                    # here keeps the placeholder (and its "Sending..." heartbeat) up until
+                    # the turn is genuinely ready to be delivered.
+                    if is_realistic_typing:
+                        if state_container and state_container.get('sending_task'):
+                            state_container['sending_task'].cancel()
+                        msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
+                        msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
+                        await self._safe_delete_placeholder(channel, msg_a_to_delete)
+                        await self._safe_delete_placeholder(channel, msg_b_to_delete)
+                        if state_container:
+                            state_container['msg_a_id'] = None
+                            state_container['msg_b_id'] = None
 
                     if participant.get('method') == 'child_bot':
                         # Stop any pending sending heartbeat task immediately
@@ -1941,6 +1951,16 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             if t_msgs:
                                 for sm in t_msgs:
                                     turn_object.setdefault("message_ids", []).append(sm.id)
+
+                        # The webhook branch persists its message_ids the moment they are
+                        # known; this branch used to leave them to whichever save came next
+                        # -- the following participant's, or the round-level one. A crash in
+                        # that window left the turn on disk with an empty message_ids list,
+                        # which is what regenerate, delete and the audit view key off, so the
+                        # messages stayed in the channel with nothing able to address them.
+                        if turn_object.get("message_ids"):
+                            session_type = session.get("type", "multi")
+                            await self.cog.session_manager._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
 
                     else: # Webhook logic
                         sent_messages = await self._send_channel_message(

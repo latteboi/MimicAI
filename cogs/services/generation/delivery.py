@@ -37,6 +37,20 @@ class DeliveryMixin:
 
         is_placeholder = (content == f"{PLACEHOLDER_EMOJI}")
 
+        # Seeded before the appearance block, which is the only place they were bound.
+        # A caller that passes no profile -- the unrestricted-in-general-channel refusal
+        # notice in _multi_profile_worker is the one such call site -- skipped that block
+        # entirely and then hit `if is_realistic_typing` and `if use_webhook`, raising
+        # UnboundLocalError while trying to deliver the very message explaining the
+        # refusal. Defaults describe a plain bot-authored message with no typing
+        # simulation, which is what a system notice should be.
+        use_webhook = False
+        is_realistic_typing = False
+        typing_cps = 30.0
+        typing_max_delay = 2.5
+        custom_display_name_to_use = None
+        custom_avatar_url_to_use = None
+
         if profile_owner_id_for_appearance is not None and profile_name_for_appearance:
             index = self.cog.profile_manager._get_user_index(profile_owner_id_for_appearance)
             is_borrowed = profile_name_for_appearance in index.get("borrowed", [])

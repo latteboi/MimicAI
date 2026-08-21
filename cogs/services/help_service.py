@@ -60,6 +60,44 @@ class HelpService:
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write(content.strip())
 
+    def _rebuild_doc_matrix(self):
+        """Collapses `doc_vectors` into one pre-normalised (N, dims) float32 matrix.
+
+        The search path used to rebuild this on *every query*: np.array over a list of
+        lists, plus a norm per row, for a corpus that is static between reloads -- and
+        it did so inline on the event loop, not in a thread.
+
+        Rows are stored unit length so a query is a bare dot product. Once the matrix
+        exists the per-document `emb` is dropped: 256 boxed Python floats is roughly
+        8 KB against 1 KB for the same row of the matrix, and nothing reads it again.
+        """
+        import numpy as np
+
+        self.cog.doc_matrix = None
+        vectors = getattr(self.cog, "doc_vectors", None)
+        if not vectors:
+            return
+
+        try:
+            matrix = np.array([doc["emb"] for doc in vectors], dtype=np.float32)
+            if matrix.ndim != 2 or matrix.shape[0] != len(vectors):
+                raise ValueError(f"ragged document embeddings: {matrix.shape}")
+        except Exception as e:
+            # A cache written at a different dimensionality would land here. Better to
+            # disable help RAG with a warning than to raise inside /help at query time,
+            # which is where this would previously have surfaced.
+            print(f"Failed to build documentation matrix ({e}); help RAG disabled until reload.")
+            self.cog.doc_vectors = []
+            return
+
+        norms = np.linalg.norm(matrix, axis=1)
+        # A zero row stays zero and so scores 0.0, matching the old 1e-10 guard.
+        matrix /= np.where(norms == 0.0, 1.0, norms)[:, None]
+        self.cog.doc_matrix = matrix
+
+        for doc in vectors:
+            doc.pop("emb", None)
+
     async def _load_and_embed_docs(self):
         """Reads all .txt shards, tags them semantically, and builds the vector database."""
         cache_path = os.path.join(DOCS_DIR, "embedded_docs_cache.json.gz")
@@ -80,6 +118,7 @@ class HelpService:
         cached_data = await asyncio.to_thread(_sync_ensure_and_load_cache)
         if cached_data is not None:
             self.cog.doc_vectors = cached_data
+            self._rebuild_doc_matrix()
             print(f"Loaded {len(self.cog.doc_vectors)} embedded documentation shards from local cache.")
             return
 
@@ -130,6 +169,7 @@ class HelpService:
             except Exception as e:
                 print(f"Failed to save documentation embedding cache: {e}")
 
+        self._rebuild_doc_matrix()
         print(f"Loaded and embedded {len(self.cog.doc_vectors)} documentation shards.")
 
     async def _get_relevant_help_context(self, query: str, guild_id: Optional[int], force_always_respond: bool = False) -> Optional[str]:
@@ -150,19 +190,24 @@ class HelpService:
             return None
             
         import numpy as np
-        
-        # Vectorized Cosine Similarity for Help Docs
-        doc_embs = np.array([doc["emb"] for doc in self.cog.doc_vectors], dtype=np.float32)
+
+        doc_matrix = getattr(self.cog, "doc_matrix", None)
+        if doc_matrix is None:
+            # doc_vectors exists but the matrix does not, so this instance loaded its
+            # documents before the matrix was introduced (or a rebuild failed). Build
+            # it now rather than falling back to the old per-query path.
+            self._rebuild_doc_matrix()
+            doc_matrix = getattr(self.cog, "doc_matrix", None)
+            if doc_matrix is None:
+                return None
+
         prompt_vec = np.array(emb, dtype=np.float32)
-        
-        emb_norms = np.linalg.norm(doc_embs, axis=1)
         prompt_norm = np.linalg.norm(prompt_vec)
-        
-        emb_norms[emb_norms == 0] = 1e-10
-        prompt_norm = prompt_norm if prompt_norm != 0 else 1e-10
-        
-        similarities = np.dot(doc_embs, prompt_vec) / (emb_norms * prompt_norm)
-        
+        prompt_unit = prompt_vec / (prompt_norm if prompt_norm != 0 else 1e-10)
+
+        # Rows are already unit length, so cosine is a bare dot product.
+        similarities = doc_matrix @ prompt_unit
+
         sims = [{"text": doc["text"], "sim": float(similarities[i])} for i, doc in enumerate(self.cog.doc_vectors)]
         sims.sort(key=lambda x: x["sim"], reverse=True)
         
@@ -202,7 +247,7 @@ DEFAULT_HELP_DOCS = {
     ),
     "profiles/public_hub_publishing.txt": (
         "Concept: Publishing to the global Public Library (`/profile hub`) allows any user to borrow your profile.\n"
-        "Mechanism: Before hitting the public index, an automated safety validation (`AUTO_MODERATOR`) evaluates the profile text, name, and avatar. Explicit, graphic, or Unrestricted 18+ profiles are completely blocked from global publishing."
+        "Mechanism: Before hitting the public index, an automated safety validation (`AUTO_MODERATOR`) evaluates the profile name, display name, and avatar. Explicit or graphic profiles, and any profile set to 'Unrestricted 18+', are blocked from global publishing -- only 'Restricted' profiles can be published."
     ),
     "profiles/child_bot_sync.txt": (
         "Concept: Override options allow you to customise Webhook appearances. If linked to a Child Bot, the system synchronises this identity by updating the actual bot application.\n"
@@ -210,10 +255,14 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'Child bot appearance changed too frequently.' Fix: Discord strictly limits application avatar updates (2 changes per 10 minutes). The system enforces cooldowns to prevent API bans. Wait 10 minutes before trying again."
     ),
     "profiles/safety_and_nsfw.txt": (
-        "Concept: Profiles have four safety floors: Low, Medium, High, and Unrestricted 18+.\n"
-        "NSFW Gating: If a profile is set to 'Unrestricted', the system performs an `is_nsfw()` check on the channel before sending the prompt.\n"
+        "Concept: Profiles have two safety levels: 'Restricted' (the default, usable in any channel) and 'Unrestricted 18+' (usable only in age-restricted channels). The older Low/Medium/High tiers were removed; any profile still carrying one of them is read as 'Restricted'.\n"
+        "NSFW Gating: If a profile is set to 'Unrestricted 18+', the system performs an `is_nsfw()` check on the channel before sending the prompt. For a borrowed profile the level is taken from the original owner's profile, so a borrower cannot downgrade it.\n"
+        "Channel Content Policy: In any channel that is NOT age-restricted, the system appends a `<content_policy>` note to the system instruction asking the model to keep the response suitable for a general audience. This applies to every provider, including OpenRouter and Ollama, and is editable by the bot operator via `/mod` as the CONTENT_POLICY prompt.\n"
+        "Provider Filters: On Google models, 'Restricted' sends BLOCK_ONLY_HIGH harm thresholds and 'Unrestricted 18+' sends BLOCK_NONE. Non-Google providers ignore these thresholds entirely, which is why the content policy note exists.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'Unrestricted profile is silent or throwing errors.' Fix: Unrestricted profiles are strictly blocked in standard channels. You MUST set the channel to Age-Restricted (NSFW) in your Discord settings to use them."
+        "- Symptom: 'Unrestricted profile is silent or throwing errors.' Fix: Unrestricted profiles are strictly blocked in standard channels. You MUST set the channel to Age-Restricted (NSFW) in your Discord settings to use them.\n"
+        "- Symptom: 'The Toggle Content Safety Level action is missing from the dropdown.' Fix: The toggle is hidden for borrowed profiles and for profiles published to the Public Library. Unpublish the profile first, or edit the original if it is borrowed.\n"
+        "- Symptom: 'My profile still says Low/Medium/High somewhere.' Fix: Stored values are not migrated on disk; they are read as 'Restricted' and rewritten the next time the profile is saved."
     ),
 
     # APIS CATEGORY

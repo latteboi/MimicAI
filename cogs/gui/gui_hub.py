@@ -7,6 +7,7 @@ import uuid
 import time
 import asyncio
 from typing import TYPE_CHECKING, Optional
+from ..utils.helpers import _coerce_safety_level
 from .base_components import PageJumpModal, TimeoutCleanupMixin, build_pagination_controls, build_tab_nav_bar, compute_window_slice
 
 if TYPE_CHECKING:
@@ -112,6 +113,27 @@ class HubBaseView(TimeoutCleanupMixin, ui.View):
         self.user_id = interaction.user.id
         self.current_tab = current_tab
         self._add_nav_buttons()
+
+    async def _turn_page(self, i: discord.Interaction, delta: int):
+        """Move the page cursor and repaint.
+
+        Four of this class's subclasses each carried a byte-identical copy of this pair,
+        differing only in the method names their buttons happened to be wired to.
+        """
+        self.current_page += delta
+        self.setup_items()
+        await i.response.defer()
+        await self.update_display()
+
+    async def prev_page(self, i: discord.Interaction):
+        await self._turn_page(i, -1)
+
+    async def next_page(self, i: discord.Interaction):
+        await self._turn_page(i, 1)
+
+    # HubPublicLibraryView wires its buttons to the *_cb spelling.
+    prev_page_cb = prev_page
+    next_page_cb = next_page
 
     def _add_nav_buttons(self):
         build_tab_nav_bar(self, self.current_tab, [
@@ -341,17 +363,6 @@ class HubPublicLibraryView(HubBaseView):
         await i.response.defer()
         await self.update_display()
 
-    async def prev_page_cb(self, i: discord.Interaction):
-        self.current_page -= 1
-        self.setup_items()
-        await i.response.defer()
-        await self.update_display()
-
-    async def next_page_cb(self, i: discord.Interaction):
-        self.current_page += 1
-        self.setup_items()
-        await i.response.defer()
-        await self.update_display()
 
     async def page_jump_cb(self, i: discord.Interaction):
         async def _jump(inner: discord.Interaction, page: int):
@@ -483,17 +494,6 @@ class HubIncomingView(HubBaseView):
         await i.response.defer()
         await self.update_display()
 
-    async def prev_page(self, i: discord.Interaction):
-        self.current_page -= 1
-        self.setup_items()
-        await i.response.defer()
-        await self.update_display()
-
-    async def next_page(self, i: discord.Interaction):
-        self.current_page += 1
-        self.setup_items()
-        await i.response.defer()
-        await self.update_display()
 
     async def clear_selection(self, i: discord.Interaction):
         self.selected_sharer_id = None
@@ -684,17 +684,6 @@ class HubShareManagerView(HubBaseView):
         await i.response.defer()
         await self.update_display()
 
-    async def prev_page(self, i: discord.Interaction):
-        self.current_page -= 1
-        self.setup_items()
-        await i.response.defer()
-        await self.update_display()
-
-    async def next_page(self, i: discord.Interaction):
-        self.current_page += 1
-        self.setup_items()
-        await i.response.defer()
-        await self.update_display()
 
     async def select_users(self, i: discord.Interaction):
         self.selected_users = i.data['values'] 
@@ -800,8 +789,8 @@ class HubShareManagerView(HubBaseView):
                 ava = appearance_data.get("custom_avatar_url")
                 
                 p_data = self.cog.profile_manager._get_profile_config(self.user_id, name, False) or {}
-                if p_data.get("safety_level") == "unrestricted":
-                    return name, False, "Safety Level is 'Unrestricted 18+'. Only 'Low', 'Medium', or 'High' can be published."
+                if _coerce_safety_level(p_data.get("safety_level")) == "unrestricted":
+                    return name, False, "Safety Level is 'Unrestricted 18+'. Only 'Restricted' profiles can be published."
 
                 try:
                     is_safe, reason = await self.cog.profile_manager._is_profile_content_safe(self.user_id, name, disp, ava)
@@ -913,17 +902,6 @@ class HubCloningView(HubBaseView):
         await i.response.defer()
         await self.update_display()
 
-    async def prev_page(self, i: discord.Interaction):
-        self.current_page -= 1
-        self.setup_items()
-        await i.response.defer()
-        await self.update_display()
-
-    async def next_page(self, i: discord.Interaction):
-        self.current_page += 1
-        self.setup_items()
-        await i.response.defer()
-        await self.update_display()
 
     async def generate_clone_code_cb(self, i: discord.Interaction):
         if not self.selected_profile: return

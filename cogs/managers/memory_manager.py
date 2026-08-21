@@ -9,6 +9,7 @@ import base64
 import asyncio
 import datetime
 import traceback
+from collections import OrderedDict
 from typing import Dict, List, Any, Optional, Union, Tuple
 import discord
 
@@ -82,6 +83,109 @@ def calculate_similarities(prompt_emb: List[float], b64_embs: List[str]) -> np.n
     prompt_norm = prompt_norm if prompt_norm != 0 else 1e-10
 
     return np.dot(matrix, prompt_vec) / (emb_norms * prompt_norm)
+
+
+# --- LTM shard vector cache ----------------------------------------------------
+#
+# Retrieval used to rebuild everything numeric about a shard on every single call:
+# base64-decode each stored embedding, stack, upcast to float32, compute row norms,
+# and parse every `created_ts` with datetime.fromisoformat. At the LIMIT_LTM cap of
+# 5000 that measured ~10.8 ms per retrieval, of which ~7.8 ms is Python-level looping
+# that holds the GIL -- so running it under asyncio.to_thread bought nothing and it
+# stalled heartbeats anyway, per the hot-path rule in CLAUDE.md. It ran once per
+# participant per turn over a shard that had not changed.
+#
+# Everything cached here is a pure function of the file on disk, so the stat stamp is
+# a complete invalidation signal: _save_shard writes atomically via os.replace, which
+# moves both mtime_ns and size.
+#
+# Rows are stored *pre-normalised*, which is what makes a query a single BLAS
+# `matrix @ unit_prompt` with no norms at query time. This is an in-memory
+# representation only -- the on-disk float16 base64 format is untouched.
+#
+# Bounded by total rows rather than entry count, because entries differ in size by
+# three orders of magnitude: 20000 rows at 256 float32 dims is ~20 MB, which is the
+# ceiling this is allowed to occupy on the 1 GB target.
+
+_LTM_VEC_CACHE_MAX_ROWS = 20000
+_ltm_vec_cache: "OrderedDict[Any, Any]" = OrderedDict()
+
+
+class _LTMVectors:
+    """Numeric view of one LTM shard, valid for as long as the file is unchanged.
+
+    `rows` are the indices into the caller's `all_profile_ltms` list that carry an
+    embedding, so a mask computed here maps straight back onto the original records.
+    """
+
+    __slots__ = ("rows", "ids", "id_to_row", "context_ids", "unit", "ts_epoch", "n")
+
+    def __init__(self, rows, ids, id_to_row, context_ids, unit, ts_epoch):
+        self.rows = rows
+        self.ids = ids
+        self.id_to_row = id_to_row
+        self.context_ids = context_ids
+        self.unit = unit
+        self.ts_epoch = ts_epoch
+        self.n = len(rows)
+
+
+def _parse_ts_epoch(ts_str):
+    """Epoch seconds for a stored timestamp, or NaN when it must not decay.
+
+    The loop this replaces did `now_utc - fromisoformat(ts)` inside a try/except, so a
+    missing, malformed, or *naive* timestamp raised and silently skipped decay. NaN
+    reproduces that exactly: the vectorised decay leaves those rows at factor 1.0.
+    """
+    if not ts_str:
+        return float("nan")
+    try:
+        parsed = datetime.datetime.fromisoformat(ts_str)
+    except Exception:
+        return float("nan")
+    if parsed.tzinfo is None:
+        return float("nan")
+    return parsed.timestamp()
+
+
+def _build_ltm_vectors(all_profile_ltms) -> Optional["_LTMVectors"]:
+    rows, ids, b64_embs, context_ids, ts_epoch = [], [], [], [], []
+    for i, ltm in enumerate(all_profile_ltms):
+        if "s_emb_b64" not in ltm:
+            continue
+        rows.append(i)
+        ids.append(ltm.get("id"))
+        b64_embs.append(ltm["s_emb_b64"])
+        context_ids.append(str(ltm.get("context_id")))
+        ts_epoch.append(_parse_ts_epoch(ltm.get("created_ts") or ltm.get("ts")))
+
+    if not rows:
+        return None
+
+    raw_bytes = b"".join(base64.b64decode(s) for s in b64_embs)
+    matrix = np.frombuffer(raw_bytes, dtype=np.float16).reshape(len(b64_embs), -1).astype(np.float32)
+
+    norms = np.linalg.norm(matrix, axis=1)
+    # A zero row divided by 1.0 stays zero, so its similarity is 0 -- the same answer
+    # the old `norms[norms == 0] = 1e-10` produced, without manufacturing a huge vector.
+    safe = np.where(norms == 0.0, 1.0, norms)
+    unit = matrix / safe[:, None]
+
+    return _LTMVectors(
+        rows=rows,
+        ids=ids,
+        id_to_row={ltm_id: idx for idx, ltm_id in enumerate(ids) if ltm_id is not None},
+        context_ids=np.array(context_ids, dtype=object),
+        unit=unit,
+        ts_epoch=np.array(ts_epoch, dtype=np.float64),
+    )
+
+
+def _ltm_vec_cache_evict():
+    total = sum(v.n for v in _ltm_vec_cache.values())
+    while total > _LTM_VEC_CACHE_MAX_ROWS and _ltm_vec_cache:
+        _, dropped = _ltm_vec_cache.popitem(last=False)
+        total -= dropped.n
 
 
 class MemoryManager:
@@ -286,50 +390,70 @@ class MemoryManager:
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         session_cooldown_history = self.cog.ltm_recall_history.get(session_key, {})
 
+        ltm_shard_path = self.cog.storage_manager._get_shard_path("ltm", owner_id_str, ltm_profile_name)
+        try:
+            st = os.stat(ltm_shard_path)
+            ltm_cache_key = (owner_id_str, ltm_profile_name, st.st_mtime_ns, st.st_size)
+        except OSError:
+            # No file to stamp (an in-memory or just-deleted shard). Skip the cache
+            # rather than risk serving vectors for content that is no longer on disk.
+            ltm_cache_key = None
+
+        now_epoch = now_utc.timestamp()
+        guild_id_str = str(guild_id)
+
         def _thread_search_ltm():
-            valid_ltms = []
-            b64_embs = []
+            vectors = _ltm_vec_cache.get(ltm_cache_key) if ltm_cache_key is not None else None
+            if vectors is None:
+                vectors = _build_ltm_vectors(all_profile_ltms)
+                if vectors is None:
+                    return None
+                if ltm_cache_key is not None:
+                    _ltm_vec_cache[ltm_cache_key] = vectors
+                    _ltm_vec_cache.move_to_end(ltm_cache_key)
+                    _ltm_vec_cache_evict()
+            else:
+                _ltm_vec_cache.move_to_end(ltm_cache_key)
 
-            for ltm in all_profile_ltms:
-                ltm_id = ltm.get('id')
-                if ltm_id in session_cooldown_history:
-                    last_turn, last_sim = session_cooldown_history[ltm_id]
-                    if current_turn - last_turn < (5 + (1 - last_sim) * 25): continue
+            # Both filters that used to run as a Python loop *before* the maths now run
+            # as a mask *after* it. The dot product over the whole shard is microseconds
+            # of BLAS; it was never the expensive half.
+            mask = vectors.context_ids == guild_id_str
+            if not mask.any():
+                return None
 
-                if str(ltm.get('context_id')) != str(guild_id): continue
+            # Cooldown is keyed off session state rather than the file, so it cannot be
+            # cached -- but it is only ever as large as the set of memories this session
+            # has already recalled, so it is walked directly instead of scanned for.
+            for ltm_id, (last_turn, last_sim) in session_cooldown_history.items():
+                row = vectors.id_to_row.get(ltm_id)
+                if row is not None and current_turn - last_turn < (5 + (1 - last_sim) * 25):
+                    mask[row] = False
 
-                if "s_emb_b64" in ltm:
-                    valid_ltms.append(ltm)
-                    b64_embs.append(ltm["s_emb_b64"])
+            if not mask.any():
+                return None
 
-            if not valid_ltms: return None
-
-            raw_bytes = b"".join(base64.b64decode(s) for s in b64_embs)
-            emb_matrix = np.frombuffer(raw_bytes, dtype=np.float16).reshape(len(b64_embs), -1).astype(np.float32)
             prompt_vec = np.array(prompt_embedding, dtype=np.float32)
-
-            matrix_norms = np.linalg.norm(emb_matrix, axis=1)
             prompt_norm = np.linalg.norm(prompt_vec)
-            matrix_norms[matrix_norms == 0] = 1e-10
-            prompt_norm = prompt_norm if prompt_norm != 0 else 1e-10
+            prompt_unit = prompt_vec / (prompt_norm if prompt_norm != 0 else 1e-10)
 
-            raw_similarities = np.dot(emb_matrix, prompt_vec) / (matrix_norms * prompt_norm)
-            candidate_indices = []
+            # Rows are already unit length, so cosine is a bare dot product.
+            raw_similarities = vectors.unit @ prompt_unit
 
-            for i, ltm in enumerate(valid_ltms):
-                sim = float(raw_similarities[i])
-                ts_str = ltm.get('created_ts') or ltm.get('ts')
-                if ts_str:
-                    try:
-                        days_old = (now_utc - datetime.datetime.fromisoformat(ts_str)).total_seconds() / 86400.0
-                        sim *= (0.995 ** days_old)
-                    except Exception:
-                        pass
+            # Recency decay, vectorised. NaN marks a row whose timestamp was missing,
+            # malformed or naive; those rows kept factor 1.0 in the loop this replaces.
+            days_old = (now_epoch - vectors.ts_epoch) / 86400.0
+            decay = np.power(0.995, days_old)
+            decayed = raw_similarities * np.where(np.isnan(decay), 1.0, decay)
 
-                if sim >= ltm_relevance_threshold:
-                    candidate_indices.append((i, sim, float(raw_similarities[i])))
+            eligible = mask & (decayed >= ltm_relevance_threshold)
+            cand_rows = np.flatnonzero(eligible)
+            if cand_rows.size == 0:
+                return None
 
-            if not candidate_indices: return None
+            candidate_indices = [
+                (int(r), float(decayed[r]), float(raw_similarities[r])) for r in cand_rows
+            ]
             candidate_indices.sort(key=lambda x: x[1], reverse=True)
 
             # High-throughput vectorised MMR diversification (Zero Base64 re-decoding)
@@ -338,18 +462,20 @@ class MemoryManager:
 
             while len(final_memories) < ltm_context_size and current_candidates:
                 best_idx, best_sim, orig_sim = current_candidates.pop(0)
-                final_memories.append({"ltm": valid_ltms[best_idx], "sim": best_sim, "original_sim": orig_sim})
+                final_memories.append({
+                    "ltm": all_profile_ltms[vectors.rows[best_idx]],
+                    "sim": best_sim,
+                    "original_sim": orig_sim,
+                })
                 if not current_candidates: break
 
-                best_vec = emb_matrix[best_idx]
-                best_norm_val = matrix_norms[best_idx]
+                best_vec = vectors.unit[best_idx]
 
                 rem_idxs = [c[0] for c in current_candidates]
-                rem_matrix = emb_matrix[rem_idxs]
-                rem_norms = matrix_norms[rem_idxs]
+                rem_matrix = vectors.unit[rem_idxs]
 
                 # Instantaneous BLAS batch projection across remaining candidates
-                inter_sims = np.dot(rem_matrix, best_vec) / (rem_norms * best_norm_val)
+                inter_sims = rem_matrix @ best_vec
 
                 updated = []
                 for j, (c_idx, c_sim, o_sim) in enumerate(current_candidates):
@@ -390,16 +516,23 @@ class MemoryManager:
         if training_context_size == 0:
             return []
 
-        owner_id_str = str(profile_owner_id)
         effective_owner_id_for_training, effective_profile_name_for_training = self.cog.profile_manager._resolve_effective_profile(profile_owner_id, profile_name)
+
+        # Shard first, embedding second. _get_relevant_ltm_for_prompt already orders it
+        # this way on purpose -- an empty shard has nothing to rank, so paying for the
+        # query embedding before finding that out is a round trip bought for nothing.
+        # This path had kept the opposite order, so every profile with training enabled
+        # but no examples yet was billed an embedding on every single turn.
+        profile_examples = await asyncio.to_thread(
+            self._load_training_shard, str(effective_owner_id_for_training), effective_profile_name_for_training
+        )
+        if not profile_examples:
+            return []
 
         msg_emb = await self._get_embedding(msg_content, guild_id, task_type="RETRIEVAL_QUERY")
         if not msg_emb: return []
 
         def _thread_search_training():
-            profile_examples = self._load_training_shard(str(effective_owner_id_for_training), effective_profile_name_for_training)
-            if not profile_examples: return []
-
             valid_ex = []
             b64_embs = []
             for ex in profile_examples:
