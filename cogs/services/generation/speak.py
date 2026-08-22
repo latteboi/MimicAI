@@ -37,7 +37,7 @@ class SpeakAsMixin:
             profile_data_source = self.cog.profile_manager._get_profile_config(user_id, profile_name, False) or {}
 
         if not self.cog.profile_manager._check_unrestricted_safety_policy(effective_owner_id, effective_profile_name, channel):
-            await interaction_to_respond.followup.send("This profile has an 'Unrestricted 18+' safety level and cannot speak in this channel because it is not marked as Age-Restricted.", ephemeral=True)
+            await interaction_to_respond.followup.send("This profile is rated 'Adult 18+' and cannot speak in this channel because it is not marked as Age-Restricted.", ephemeral=True)
             return
 
         delivery_method = 'webhook'

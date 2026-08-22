@@ -1,6 +1,5 @@
 import time
 import uuid
-import base64
 import asyncio
 import discord
 import traceback
@@ -8,17 +7,15 @@ import datetime
 from typing import Dict, List
 
 from ...utils.constants import (
-    defaultConfig, PRIMARY_MODEL_NAME, OLLAMA_LOCAL_URL, STM_LIMIT_MAX, PLACEHOLDER_EMOJI,
+    defaultConfig, PRIMARY_MODEL_NAME, STM_LIMIT_MAX, PLACEHOLDER_EMOJI,
     ERR_GENERAL_ERROR, ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK,
     WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED,
 )
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_history_entry,
-    _get_user_hash, _scrub_response_text,
+    _get_user_hash, _resolve_safety_settings, _scrub_response_text,
 )
-from ..api_service import GoogleGenAIModel, OllamaModel, OpenRouterModel
 from ._shared import _strip_neuro_update_and_scrub
-from ...utils.helpers import _coerce_safety_level, _resolve_safety_settings
 
 
 class GlobalChatMixin:
@@ -46,8 +43,11 @@ class GlobalChatMixin:
             await interaction.followup.send(f"The source for '{profile_name}' could not be found.", ephemeral=True)
             return
 
-        if _coerce_safety_level(profile_data.get("safety_level")) == "unrestricted":
-            await interaction.followup.send("For safety reasons, profiles with an 'Unrestricted 18+' safety level cannot be used with `/profile global_chat`. Set the profile back to 'Restricted' first.", ephemeral=True)
+        # A DM can never be marked age-restricted, so an adult-rated profile has
+        # nowhere compliant to run here. Read through the resolver rather than off
+        # the config, so a borrowed profile is judged by its source's rating.
+        if self.cog.profile_manager._resolve_enforced_safety_level(host_user_id, profile_name) == "unrestricted":
+            await interaction.followup.send("For safety reasons, profiles rated 'Adult 18+' cannot be used with `/profile global_chat`, since a DM cannot be marked age-restricted.", ephemeral=True)
             return
 
         user_api_key = self.cog.storage_manager._get_api_key_for_user(host_user_id, "gemini")
@@ -147,7 +147,10 @@ class GlobalChatMixin:
                 if g_stm_capped > 0:
                     g_hist = rebuilt_history[-(g_stm_capped * 2):]
 
-                d_safe = _resolve_safety_settings(safety_level)
+                # Always a DM: not age-restricted, so BLOCK_ONLY_HIGH. (`safety_level`
+                # was never defined in this scope -- this line raised NameError for
+                # any global-chat profile with RAG grounding enabled.)
+                d_safe = _resolve_safety_settings(None, profile_data)
 
                 g_res = await self.cog.tools_service._get_hybrid_grounding_context(combined_prompt_text, 0, g_hist, ('global_chat', host_user_id), safety_settings=d_safe)
                 if g_res:
@@ -239,83 +242,58 @@ class GlobalChatMixin:
                             source_name_f = bd.get("original_profile_name", profile_name)
 
                         p_data_f = self.cog.profile_manager._get_profile_config(source_id_f, source_name_f, False) or {}
-                        safe_lvl = p_data_f.get("safety_level")
 
-                        d_safe = _resolve_safety_settings(safe_lvl)
+                        d_safe = _resolve_safety_settings(None, p_data_f)
 
+                        t_params_f = {
+                            "thinking_summary_visible": p_data_f.get("thinking_summary_visible", "off"),
+                            "thinking_level": p_data_f.get("thinking_level", "high"),
+                            "thinking_budget": p_data_f.get("thinking_budget", -1)
+                        }
+
+                        grounding_mode_native = p_data_f.get("grounding_mode", "off")
+                        if isinstance(grounding_mode_native, bool): grounding_mode_native = "rag" if grounding_mode_native else "off"
+                        elif grounding_mode_native in ["on", "on+"]: grounding_mode_native = "rag"
+
+                        url_mode_native = p_data_f.get("url_mode", "off")
+                        if "url_mode" not in p_data_f:
+                            url_mode_native = "rag" if p_data_f.get("url_fetching_enabled", False) else "off"
+
+                        model_tools_list = []
+                        if grounding_mode_native == "native":
+                            model_tools_list.append({"google_search": {}})
+                        if url_mode_native == "native":
+                            model_tools_list.append({"url_context": {}})
+
+                        model_tools = model_tools_list if model_tools_list else None
+
+                        # One factory call in place of three hand-rolled provider branches.
+                        # Those branches also left the generation call below nested inside the
+                        # Google branch, so an OpenRouter or Ollama fallback model was built and
+                        # then never used: the fallback silently did nothing and the turn
+                        # reported that both models had failed. Collapsing the branches puts
+                        # the call back on the single path every provider reaches.
                         fb_name = fallback_model_name
-                        fb_is_or = False
-                        fb_is_ollama = False
+                        fallback_instance = self.cog.api_service._instantiate_model(
+                            fb_name, None, host_user_id,
+                            sys_instr, d_safe, t_params_f, model_tools, p_data_f,
+                            openrouter_key_error="No OR key for fallback",
+                            google_key_error="No Google key for fallback",
+                        )
 
-                        if fb_name.startswith("OPENROUTER/"):
-                            fb_name = fb_name[11:]
-                            fb_is_or = True
-                        elif fb_name.startswith("GOOGLE/"):
-                            fb_name = fb_name[7:]
-                        elif fb_name.startswith("OLLAMA/"):
-                            fb_name = fb_name[7:]
-                            fb_is_ollama = True
-                        elif "/" in fb_name:
-                            fb_is_or = True
+                        response, state_container = await self._generate_with_heartbeat(
+                            fallback_instance, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type="embed"
+                        )
+                        status = "blocked_by_safety" if not response or not response.candidates else "success"
+                        if status == "success":
+                            fb_raw_check = getattr(response, 'text', "").strip()
+                            temp_scrubbed = _strip_neuro_update_and_scrub(fb_raw_check, [app_name])
 
-                        if fb_is_or:
-                            or_key = self.cog.storage_manager._get_api_key_for_user(host_user_id, provider="openrouter")
-                            if or_key:
-                                fallback_instance = OpenRouterModel(fb_name, api_key=or_key, system_instruction=sys_instr, thinking_params={})
-                            else:
-                                raise ValueError("No OR key for fallback")
-                        elif fb_is_ollama:
-                            ollama_host = p_data_f.get("ollama_host_url", OLLAMA_LOCAL_URL)
-                            fallback_instance = OllamaModel(fb_name, api_url=ollama_host, system_instruction=sys_instr, thinking_params={})
-                        else:
-                            user_key = self.cog.storage_manager._get_api_key_for_user(host_user_id)
-                            if user_key:
-                                t_params_f = {
-                                    "thinking_summary_visible": p_data_f.get("thinking_summary_visible", "off"),
-                                    "thinking_level": p_data_f.get("thinking_level", "high"),
-                                    "thinking_budget": p_data_f.get("thinking_budget", -1)
-                                }
+                            if not temp_scrubbed:
+                                raise ValueError("Empty Response (AI produced no text content)")
 
-                                grounding_mode_native = p_data_f.get("grounding_mode", "off")
-                                if isinstance(grounding_mode_native, bool): grounding_mode_native = "rag" if grounding_mode_native else "off"
-                                elif grounding_mode_native in ["on", "on+"]: grounding_mode_native = "rag"
-
-                                url_mode_native = p_data_f.get("url_mode", "off")
-                                if "url_mode" not in p_data_f:
-                                    url_mode_native = "rag" if p_data_f.get("url_fetching_enabled", False) else "off"
-
-                                model_tools_list = []
-                                if grounding_mode_native == "native":
-                                    model_tools_list.append({"google_search": {}})
-                                if url_mode_native == "native":
-                                    model_tools_list.append({"url_context": {}})
-
-                                model_tools = model_tools_list if model_tools_list else None
-
-                                fallback_instance = GoogleGenAIModel(
-                                    api_key=user_key,
-                                    model_name=fb_name,
-                                    system_instruction=sys_instr,
-                                    safety_settings=d_safe,
-                                    thinking_params=t_params_f,
-                                    tools=model_tools
-                                )
-                            else:
-                                raise ValueError("No Google key for fallback")
-
-                            response, state_container = await self._generate_with_heartbeat(
-                                fallback_instance, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type="embed"
-                            )
-                            status = "blocked_by_safety" if not response or not response.candidates else "success"
-                            if status == "success":
-                                fb_raw_check = getattr(response, 'text', "").strip()
-                                temp_scrubbed = _strip_neuro_update_and_scrub(fb_raw_check, [app_name])
-
-                                if not temp_scrubbed:
-                                    raise ValueError("Empty Response (AI produced no text content)")
-
-                                fallback_used = True
-                                self.cog._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat_fallback", model_used=fb_name, status="success")
+                            fallback_used = True
+                            self.cog._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat_fallback", model_used=fb_name, status="success")
                     except asyncio.CancelledError:
                         return
                     except Exception as retry_e:

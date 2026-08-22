@@ -16,6 +16,7 @@ from ..utils.constants import (
 )
 from .api_service import GoogleGenAIModel, generate_google_tts_audio
 from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text
+from ..utils.memory_tuning import maybe_trim_malloc
 
 
 class MediaService:
@@ -207,6 +208,10 @@ class MediaService:
                                 image_bytes = None
                                 _write_img = None
                                 response = None
+                                # Returns the freed pages to the OS rather than
+                                # leaving them at the top of a glibc arena for the
+                                # text generation that follows to sit on top of.
+                                maybe_trim_malloc()
 
                             package['failure_reason'] = failure_reason
 
@@ -524,6 +529,15 @@ class MediaService:
                             f.write(image_bytes)
                         return path
                     request_data['generated_image_path'] = await asyncio.to_thread(_write_img)
+                    # image_bytes is only rebound when the *next* request arrives, so
+                    # without this the decoded PNG stays resident for the whole idle
+                    # period between generations -- the worker spends most of its life
+                    # blocked on the queue below. The temp file is the only carrier the
+                    # text stage needs.
+                    image_bytes = None
+                    _write_img = None
+                    response = None
+                    maybe_trim_malloc()
 
                 request_data['failure_reason'] = failure_reason
 
@@ -654,7 +668,7 @@ class MediaService:
             index = self.cog.profile_manager._get_user_index(effective_profile_owner_id)
             is_borrowed = effective_profile_name in index.get("borrowed", [])
             profile_data = self.cog.profile_manager._get_profile_config(effective_profile_owner_id, effective_profile_name, is_borrowed) or {}
-            dynamic_safety_settings = _resolve_safety_settings(profile_data.get("safety_level"))
+            dynamic_safety_settings = _resolve_safety_settings(message.channel, profile_data)
 
             # Get appearance text
             source_owner_id = effective_profile_owner_id

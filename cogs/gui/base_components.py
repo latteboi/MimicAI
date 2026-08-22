@@ -258,15 +258,30 @@ class InviteView(ui.View):
         self.add_item(btn)
 
 class BaseBulkProfileView(ui.View):
-    def __init__(self, cog, user_id, include_borrowed=True, timeout=300):
+    def __init__(self, cog, user_id, include_borrowed=True, timeout=300, exclude_public=False):
         super().__init__(timeout=timeout)
         self.cog = cog
         self.user_id = user_id
         self.include_borrowed = include_borrowed
+        self.exclude_public = exclude_public
         self.selected_profiles = set()
         
         index = self.cog.profile_manager._get_user_index(self.user_id)
         self.personal_profiles = sorted(list(index.get("personal", [])))
+
+        # Profiles held in the Public Library are withheld from settings that would
+        # invalidate their listing -- the 18+ declaration being the one that does. A
+        # bulk sweep over "all my profiles" silently flipped published profiles to
+        # 18+, which the publish gate rejects, so they had to be found and reverted
+        # one at a time. Resolved in a single pass over the public index rather than
+        # a _is_profile_public call per profile.
+        self.excluded_public = []
+        if exclude_public:
+            published = {d["profile_name"]
+                         for d in self.cog.profile_manager._iter_public_entries(self.user_id)}
+            self.excluded_public = [n for n in self.personal_profiles if n in published]
+            self.personal_profiles = [n for n in self.personal_profiles if n not in published]
+
         self.borrowed_profiles = sorted(list(index.get("borrowed", []))) if include_borrowed else []
         
         # Pre-compute options once to save massive UI overhead

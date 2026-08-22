@@ -1,14 +1,37 @@
-discord.py
-google-genai
-google-generativeai
-websockets
-orjson
-cryptography
-aiohttp
-httpx
-numpy
-dotenv
-fernet
-Pillow
-google-cloud-secret-manager
-zstandard
+# MimicAI runtime dependencies. Requires Python 3.10+.
+#
+# setup.py installs from this file when it is present, so it is the single source
+# of truth for a fresh install. Keep it in sync with the fallback list in setup.py.
+
+# Discord gateway + slash commands. Pulls aiohttp in transitively; nothing here
+# imports aiohttp directly any more.
+discord.py>=2.4
+
+# Encoding and persistence. Every .json.gz on disk is Fernet-encrypted zstd
+# (the extension is historical), serialised with orjson.
+orjson>=3.9
+cryptography>=42.0
+zstandard>=0.22
+
+# HTTP. api_service.py talks to Google, OpenRouter and Ollama over a hand-rolled
+# REST adapter on one shared httpx.AsyncClient -- no vendor SDKs.
+httpx>=0.27
+
+# Embedding maths: cosine/MMR retrieval over stacked float16 matrices.
+numpy>=1.24
+
+# Image handling for avatars and generated media.
+Pillow>=10.0
+
+# .env configuration loading. NOTE: the package is python-dotenv; the PyPI
+# package literally named "dotenv" is something else entirely.
+python-dotenv>=1.0
+
+# IANA timezone database for zoneinfo (per-profile time awareness). Required on
+# Windows and on slim Linux images that ship no system tzdata.
+tzdata
+
+# --- Optional ---
+# Only imported when GCP_PROJECT_ID is set, to read secrets from Google Secret
+# Manager instead of the environment. Uncomment if you deploy that way.
+# google-cloud-secret-manager

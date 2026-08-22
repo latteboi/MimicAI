@@ -1,14 +1,5 @@
-import time
-import uuid
-import asyncio
-import discord
-from typing import Optional
-
-from ...utils.constants import PLACEHOLDER_EMOJI
-
 
 import time
-import uuid
 import asyncio
 import discord
 from typing import Optional

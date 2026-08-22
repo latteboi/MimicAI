@@ -535,7 +535,7 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
         owner_id = interaction.user.id
 
         if not (pid.startswith("A") or pid.startswith("X")):
-            await interaction.followup.send("Error: Child bots can only be linked to Personal Profiles (PIDs starting with 'A') or System Profiles (PIDs starting with 'X').", ephemeral=True)
+            await interaction.followup.send("Error: Child bots can only be linked to Personal Profiles (PIDs starting with 'A') or System Profiles (PIDs starting with 'X'). Borrowed profiles (PIDs starting with 'B' or 'C') cannot be linked -- duplicate one first to get your own Personal Profile.", ephemeral=True)
             return
 
         index = self.cog.profile_manager._get_user_index(owner_id)

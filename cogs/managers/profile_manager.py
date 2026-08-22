@@ -1,5 +1,7 @@
 import os
 import io
+import time
+import hashlib
 import re
 import uuid
 import shutil
@@ -20,9 +22,12 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from ..utils.constants import (
     USERS_DIR, PUBLIC_PROFILES_DIR, defaultConfig,
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS,
-    DEFAULT_AUTO_MODERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS, SAFETY_LEVEL_LABELS,
+    DEFAULT_AUTO_MODERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS,
+    CONTENT_RATING_LABELS, CHANNEL_ACCESS_LABELS,
+    CONTENT_RATING_REASON_LABELS, CONTENT_RATING_REASON_FALLBACK,
+    DEFAULT_CONTENT_CLASSIFIER_PROMPT,
 )
-from ..utils.helpers import _coerce_safety_level
+from ..utils.helpers import _legacy_declared_adult
 from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
@@ -44,12 +49,25 @@ class ProfileManager:
     def __init__(self, cog):
         self.cog = cog
 
+    # Name resolution across the profile classes checks the user's OWN profiles
+    # before the global System ones. It used to be the other way around, which meant
+    # a user who created a personal profile sharing a name with any System profile
+    # -- 'mimicguide' being one that ships -- had their own profile shadowed
+    # everywhere a name was resolved: edits landed on it, but generation, prompts and
+    # appearance all read the System profile instead. No creation path checks the
+    # System index for collisions, so the name was accepted and the profile then
+    # quietly did not exist. System stays the fallback, so a name with no personal
+    # profile behind it still resolves to it exactly as before.
+
     def _get_pid_from_name(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> str:
         index = self._get_user_index(user_id)
         if not is_borrowed:
+            personal = index.get("personal", {})
+            if isinstance(personal, dict) and profile_name in personal:
+                return personal[profile_name]
             if isinstance(index.get("system"), dict) and profile_name in index.get("system", {}):
                 return index["system"][profile_name]
-            mapping = index.get("personal", {})
+            mapping = personal
         else:
             mapping = index.get("borrowed", {})
         if isinstance(mapping, dict):
@@ -58,20 +76,29 @@ class ProfileManager:
 
     def _get_pid_from_name_any(self, user_id: int, profile_name: str) -> str:
         index = self._get_user_index(user_id)
-        if isinstance(index.get("system"), dict) and profile_name in index["system"]:
-            return index["system"][profile_name]
         if isinstance(index.get("personal"), dict) and profile_name in index["personal"]:
             return index["personal"][profile_name]
         if isinstance(index.get("borrowed"), dict) and profile_name in index["borrowed"]:
             return index["borrowed"][profile_name]
+        if isinstance(index.get("system"), dict) and profile_name in index["system"]:
+            return index["system"][profile_name]
         return profile_name
 
     def _get_name_from_pid(self, user_id: int, target_pid: str) -> Optional[str]:
+        """The local name a PID maps to, across the classes the owner can share.
+
+        System profiles are included because _accept_share_request resolves the
+        shared profile's current name through here: searching only 'personal' meant
+        a shared System profile fell through to the requester's cached name, which
+        is stale the moment the bot owner renames it. Borrowed profiles are
+        deliberately excluded -- a borrow is not the borrower's to re-share.
+        """
         index = self._get_user_index(user_id)
-        personal = index.get("personal", {})
-        if isinstance(personal, dict):
-            for name, pid in personal.items():
-                if pid == target_pid: return name
+        for category in ("personal", "system"):
+            mapping = index.get(category, {})
+            if isinstance(mapping, dict):
+                for name, pid in mapping.items():
+                    if pid == target_pid: return name
         return None
 
     def _is_valid_profile_name(self, name: str) -> tuple[bool, str]:
@@ -131,6 +158,126 @@ class ProfileManager:
         else:
             self.cog.storage_manager._save_shard("profile_shares", recipient_id_str, data)
 
+    def _describe_public_entry(self, entry_id: str, p_info: Any) -> Optional[Dict[str, Any]]:
+        """Normalises one public-index entry into a single shape.
+
+        The index holds two formats. Publishing writes a plain "owner_id:pid"
+        string; older entries are a dict carrying the display name and timestamp.
+        Four separate readers branched on the type themselves, and every string
+        branch looked the profile name up in a `profiles/<pid>/name.txt` that
+        nothing in the codebase has ever written -- so a string entry always
+        rendered as "Unknown" and, worse, silently vanished from the
+        already-published set that apply_public diffs against. The name is
+        resolved from the owner's index here, which is where it actually lives.
+
+        Returns None for a malformed entry so callers can skip it.
+        """
+        name = None
+        published_at = 0
+        status = "active"
+
+        if isinstance(p_info, str) and ":" in p_info:
+            owner_str, pid = p_info.split(":", 1)
+        elif isinstance(p_info, dict):
+            owner_str = str(p_info.get("owner_id"))
+            pid = p_info.get("original_pid") or p_info.get("original_profile_id")
+            name = p_info.get("original_profile_name")
+            published_at = p_info.get("published_at") or 0
+            status = p_info.get("status", "active")
+        else:
+            return None
+
+        if not pid or not owner_str:
+            return None
+        try:
+            owner_id = int(owner_str)
+        except (TypeError, ValueError):
+            return None
+
+        # The owner's index is the authority on whether the profile still exists.
+        # A pid that is not in it was deleted, unpublished by hand, or belonged to a
+        # user whose data was wiped -- the entry is a tombstone. It used to render
+        # as the literal string "Unknown" and sit in the hub forever.
+        resolved = self._get_name_from_pid(owner_id, pid)
+        orphaned = resolved is None
+        if not name or name == "Unknown":
+            name = resolved
+
+        if not published_at:
+            # Sorting fallback for entries that predate published_at. The profile
+            # file is the one artefact guaranteed to exist for a live entry.
+            try:
+                published_at = os.path.getmtime(
+                    os.path.join(USERS_DIR, str(owner_id), "profiles", pid, "profile.json.gz"))
+            except OSError:
+                published_at = 0
+
+        return {
+            "id": entry_id,
+            "owner_id": owner_id,
+            "original_pid": pid,
+            "profile_name": name or "Unknown",
+            "published_at": published_at,
+            "status": status,
+            "orphaned": orphaned,
+        }
+
+    def _iter_public_entries(self, owner_id: Optional[int] = None, include_orphaned: bool = False):
+        """Yields normalised public entries, optionally filtered to one owner.
+
+        Orphans are withheld by default so a tombstone can never be listed,
+        borrowed, or counted, even between prunes.
+        """
+        for entry_id, p_info in list(self.cog.public_profiles.items()):
+            desc = self._describe_public_entry(entry_id, p_info)
+            if not desc:
+                continue
+            if desc["orphaned"] and not include_orphaned:
+                continue
+            if owner_id is None or desc["owner_id"] == int(owner_id):
+                yield desc
+
+    def _prune_public_index(self) -> List[Dict[str, Any]]:
+        """Drops public entries whose source profile no longer exists.
+
+        Two independent checks, because either can fail on its own: the pid must
+        still be in the owner's personal index, and the profile file must still be
+        on disk. Deletion normally cascades through
+        _cascade_delete_borrowed_profiles, so anything reaching here survived a
+        crash, a manual edit, or a delete path that predates that cascade.
+
+        Returns the removed entries so a caller can report them.
+        """
+        removed = []
+        for entry_id, p_info in list(self.cog.public_profiles.items()):
+            desc = self._describe_public_entry(entry_id, p_info)
+
+            if desc is None:
+                # Unparseable entry -- neither a pointer string nor a dict.
+                removed.append({"id": entry_id, "profile_name": "<malformed>", "owner_id": None})
+                self.cog.public_profiles.pop(entry_id, None)
+                continue
+
+            if not desc["orphaned"]:
+                profile_path = os.path.join(
+                    USERS_DIR, str(desc["owner_id"]), "profiles", desc["original_pid"], "profile.json.gz")
+                if os.path.exists(profile_path):
+                    continue
+
+            removed.append(desc)
+            self.cog.public_profiles.pop(entry_id, None)
+
+        if removed:
+            self._save_public_index()
+        return removed
+
+    def _find_public_entry_id(self, owner_id: int, pid: str) -> Optional[str]:
+        """The public-index key for a given owner/pid, or None if not published."""
+        for desc in self._iter_public_entries(owner_id):
+            if desc["original_pid"] == pid:
+                return desc["id"]
+        return None
+
     def _is_profile_public(self, user_id: int, profile_name: str) -> bool:
         index = self._get_user_index(user_id)
         is_borrowed = profile_name in index.get("borrowed", [])
@@ -155,28 +302,40 @@ class ProfileManager:
         return False
 
     def _resolve_borrowed_pointer(self, pointer: str) -> Optional[Tuple[int, str]]:
+        """A borrow's pointer resolved to (owner_id, pid), or None if it is broken.
+
+        A pointer has one of two shapes: "<owner_id>:<pid>" for a private share-code
+        borrow, or a key into the public index for a Public Library borrow. The
+        public form used to be recognised by an allowlist of leading characters --
+        "pub_" or "A" -- which was the source profile's own PID class showing
+        through, since publishing keys the index by the profile's PID. Any other
+        class fell through both branches and resolved to None, orphaning the borrow,
+        and the list would have needed a new case for every class added since.
+
+        The colon is what actually separates the two shapes, so that is what is
+        tested. No PID class is named here and none needs to be.
+        """
         if not pointer:
             return None
-        if pointer.startswith("pub_") or pointer.startswith("A"):
+
+        if ":" not in pointer:
             if not self.cog.public_profiles:
                 self._load_public_profiles()
             target = self.cog.public_profiles.get(pointer)
-            if target:
-                if isinstance(target, str) and ":" in target:
-                    pointer = target
-                elif isinstance(target, dict):
-                    owner_id = target.get("owner_id")
-                    pid = target.get("original_pid") or target.get("original_profile_id")
-                    if owner_id and pid:
-                        return int(owner_id), pid
+            if isinstance(target, dict):
+                owner_id = target.get("owner_id")
+                pid = target.get("original_pid") or target.get("original_profile_id")
+                return (int(owner_id), pid) if owner_id and pid else None
+            if not isinstance(target, str):
+                return None
+            # Indirection into the "<owner_id>:<pid>" form, resolved below.
+            pointer = target
 
-        if ":" in pointer:
-            try:
-                owner_id_str, pid = pointer.split(":", 1)
-                return int(owner_id_str), pid
-            except ValueError:
-                pass
-        return None
+        try:
+            owner_id_str, pid = pointer.split(":", 1)
+            return int(owner_id_str), pid
+        except ValueError:
+            return None
 
     def _get_profile(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> Optional[Dict[str, Any]]:
         if not profile_name:
@@ -247,6 +406,13 @@ class ProfileManager:
         if p_data:
             p_data["name"] = new_name
             self._save_profile_by_pid(user_id, pid, p_data)
+
+        # The name is part of the classified surface, and the cache is keyed by it,
+        # so both entries must go -- the stale key would otherwise linger until the
+        # LRU evicted it.
+        self._invalidate_content_rating(user_id, old_name)
+        if not is_borrowed:
+            self.schedule_content_classification(user_id, new_name)
         return True
 
     def _duplicate_profile(self, user_id: int, source_name: str, target_name: str) -> Tuple[bool, str]:
@@ -266,7 +432,12 @@ class ProfileManager:
             "prompts": source_data.get("prompts", {}).copy(),
             "child_bot": None
         }
-        new_data["config"]["profile_id"] = str(uuid.uuid4().hex[:8].upper())
+        # The PID assigned above, not a fresh id. This used to mint an unrelated
+        # 8-character value, so a duplicated profile's config disagreed with its own
+        # folder name -- and every other write site (import, clone, convert) sets
+        # config["profile_id"] to the PID. See _get_profile_config for what the
+        # mismatch broke.
+        new_data["config"]["profile_id"] = new_pid
         new_data["config"]["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         self._save_profile_by_pid(user_id, new_pid, new_data)
@@ -424,12 +595,71 @@ class ProfileManager:
         p_data = self._get_profile(user_id, profile_name, is_borrowed)
         if p_data is not None:
             config = p_data.get("config", {})
-            if not is_borrowed and "profile_id" not in config:
-                config["profile_id"] = str(uuid.uuid4().hex[:8].upper())
-                p_data["config"] = config
-                self._save_profile(user_id, profile_name, p_data, is_borrowed)
+            if not is_borrowed:
+                # config["profile_id"] is meant to equal the PID the profile is
+                # stored under, and import, clone and convert all set it that way.
+                # Two paths did not: a missing value was filled with a fresh
+                # 8-character id, and _duplicate_profile minted one that matched
+                # nothing at all. Either way the config claimed an identity the rest
+                # of the system could not resolve -- _accept_share_request falls back
+                # to this field when it has no PID to work from and stores it as the
+                # borrow's original_pid, so _find_public_entry_id could not link a
+                # public borrow to its listing and _is_profile_public reported every
+                # such borrow as unpublished.
+                #
+                # Reconciled rather than only backfilled, so profiles already
+                # carrying a stray id are repaired on their next read. The write
+                # happens once per affected profile; afterwards the values agree and
+                # this is a string comparison.
+                pid = self._get_pid_from_name(user_id, profile_name, is_borrowed)
+                # A name that does not map -- mid-repair, or one that never mapped --
+                # comes back as the name itself. Leave the field alone in that case
+                # rather than writing an id that would outlive the confusion.
+                if pid and pid != profile_name and config.get("profile_id") != pid:
+                    config["profile_id"] = pid
+                    p_data["config"] = config
+                    self._save_profile(user_id, profile_name, p_data, is_borrowed)
+            if "safety_level" in config:
+                self._migrate_legacy_safety_level(config)
             return config
         return None
+
+    def _migrate_legacy_safety_level(self, config: Dict[str, Any]) -> None:
+        """Folds the retired safety_level field into content_rating, in place.
+
+        Runs on read rather than as a boot sweep, the same way the four-tier
+        collapse was retired: the mutated dict is what every caller works from,
+        and the next save of the profile persists it. Nothing has to migrate
+        before the bot is usable.
+
+        The direction matters more than the mechanism. Simply dropping the field
+        would release every existing 18+ profile into general channels on the
+        first restart after the merge, so an owner who had declared 'Unrestricted
+        18+' keeps that declaration as an owner_declared adult verdict. Under the
+        old scheme the declaration and the classifier verdict were merged by
+        taking whichever was stricter, so a declaration also outranks a stored
+        'general' -- only an existing 'adult' or 'exempt' is left alone, since
+        neither can be made stricter by this.
+        """
+        declared = config.pop("safety_level", None)
+        if not _legacy_declared_adult(declared):
+            return
+
+        rating = config.get("content_rating") or {}
+        if rating.get("verdict") in ("adult", "exempt"):
+            return
+
+        config["content_rating"] = {
+            "verdict": "adult",
+            # No hash: the declaration was about the profile, not about a
+            # specific revision of its text. set_owner_adult_declaration stamps
+            # one for declarations made after the merge.
+            "hash": None,
+            "model": None,
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "reason": "Declared 18+ by the owner before the safety-level merge",
+            "source": "owner_declared",
+        }
 
     def _save_profile_config(self, user_id: int, profile_name: str, data: Dict[str, Any], is_borrowed: bool = False):
         p_data = self._get_profile(user_id, profile_name, is_borrowed)
@@ -446,18 +676,26 @@ class ProfileManager:
         self._save_profile(user_id, profile_name, p_data, is_borrowed)
 
     def _resolve_effective_profile(self, user_id: int, profile_name: str) -> Tuple[int, str]:
+        index = self._get_user_index(user_id)
+
+        # Own profiles first, System as the fallback -- see the note above
+        # _get_pid_from_name. The System branch used to run before this one, so a
+        # user's personal profile sharing a name with a System profile resolved to
+        # the System profile and never ran.
+        if profile_name in index.get("borrowed", []):
+            b_config = self._get_profile_config(user_id, profile_name, True) or {}
+            eff_owner = int(b_config.get("original_owner_id", user_id))
+            eff_name = b_config.get("original_profile_name", profile_name)
+            return eff_owner, eff_name
+        if profile_name in index.get("personal", []):
+            return user_id, profile_name
+
         owner_id = int(defaultConfig.DISCORD_OWNER_ID)
         if user_id != owner_id:
             owner_idx = self._get_user_index(owner_id)
             if profile_name in owner_idx.get("system", {}):
                 return owner_id, profile_name
 
-        index = self._get_user_index(user_id)
-        if profile_name in index.get("borrowed", []):
-            b_config = self._get_profile_config(user_id, profile_name, True) or {}
-            eff_owner = int(b_config.get("original_owner_id", user_id))
-            eff_name = b_config.get("original_profile_name", profile_name)
-            return eff_owner, eff_name
         return user_id, profile_name
 
     def _get_user_appearance(self, owner_id: int, profile_name: str) -> Dict[str, Optional[str]]:
@@ -483,6 +721,12 @@ class ProfileManager:
         return None
 
     def _save_profile_prompts(self, user_id: int, profile_name: str, data: Dict[str, Any]):
+        """Persists prompts and requeues content classification.
+
+        Every persona, instruction and image-prompt write funnels through here and
+        none of them are on the turn path, which is what makes this a safe hook --
+        unlike _save_profile_config, which the neuro engine rewrites every turn.
+        """
         pid = self._get_pid_from_name_any(user_id, profile_name)
         if not pid: return
         p_data = self._get_profile_by_pid(user_id, pid)
@@ -496,6 +740,7 @@ class ProfileManager:
         else:
             p_data["prompts"] = data
         self._save_profile_by_pid(user_id, pid, p_data)
+        self.schedule_content_classification(user_id, profile_name)
 
     def _get_or_create_user_profile(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
         profile_name = profile_name.lower().strip()
@@ -520,7 +765,7 @@ class ProfileManager:
                 "top_k": defaultConfig.GEMINI_TOP_K, "training_context_size": defaultConfig.TRAINING_CONTEXT_SIZE,
                 "training_relevance_threshold": defaultConfig.TRAINING_RELEVANCE_THRESHOLD,
                 "ltm_context_size": 3, "ltm_relevance_threshold": 0.75, "ltm_creation_interval": 10,
-                "ltm_summarization_context": 10, "ltm_scope": "server", "safety_level": "restricted",
+                "ltm_summarization_context": 10, "ltm_scope": "server",
                 "primary_model": PRIMARY_MODEL_NAME, "fallback_model": FALLBACK_MODEL_NAME,
                 "time_tracking_enabled": True, "timezone": "UTC",
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
@@ -568,7 +813,7 @@ class ProfileManager:
                 "top_k": 40, "training_context_size": 0,
                 "training_relevance_threshold": 0.0,
                 "ltm_context_size": 0, "ltm_relevance_threshold": 1.0, "ltm_creation_interval": 100,
-                "ltm_summarization_context": 10, "ltm_scope": "server", "safety_level": "restricted",
+                "ltm_summarization_context": 10, "ltm_scope": "server",
                 "primary_model": "GOOGLE/gemini-2.5-flash-lite", "fallback_model": "GOOGLE/gemini-2.5-flash-lite",
                 "time_tracking_enabled": True, "timezone": "UTC", "generation_metadata_enabled": False,
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
@@ -603,26 +848,176 @@ class ProfileManager:
 
         return {"config": self._get_profile_config(user_id, profile_name), "prompts": self._get_profile_prompts(user_id, profile_name)}
 
-    def _check_unrestricted_safety_policy(self, profile_owner_id: int, profile_name: str, channel: discord.abc.Messageable) -> bool:
+    # ------------------------------------------------------------------
+    # Content classification (Phase 3)
+    #
+    # config["content_rating"] is the single input deciding where a profile may
+    # run. It carries a verdict and the source that set it:
+    #   classifier      -- what the classifier found
+    #   owner_declared  -- the owner volunteering that the profile is 18+
+    #   owner_override  -- a moderator clearing a classifier 'adult' for this content
+    #   owner_exempt    -- the bot owner exempting the profile from classification
+    #
+    # This absorbed a second field, config["safety_level"], which held the owner's
+    # declaration separately and was merged with the verdict by taking whichever
+    # was stricter. Two fields for one decision meant two writers, and the
+    # provider harm thresholds read the wrong one of them -- see
+    # _resolve_safety_settings in utils/helpers. _migrate_legacy_safety_level
+    # folds the old field in on read.
+    #
+    # The classifier can only ever escalate: it may force a profile to adult;
+    # nothing it returns can walk an owner's own declaration back to general.
+    # That keeps the writers order-independent -- a save racing a classification
+    # cannot produce a more permissive result than either would alone.
+    # ------------------------------------------------------------------
+
+    def _moderated_surface(self, owner_id: int, profile_name: str) -> str:
+        """The profile text the classifier judges, and the text the hash covers.
+
+        Built from the same decrypted fields prompt_builder assembles, so the
+        verdict is about what the model will actually be told to be. Deliberately
+        excludes LTM, session logs and training examples: the first two are
+        conversation-derived, and training examples -- though the strongest signal
+        of what a profile really outputs -- change often enough that hashing them
+        would invalidate the verdict constantly. Revisit them with their own hash
+        and a debounce.
+        """
+        eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
+        prompts = self._get_profile_prompts(eff_owner, eff_name) or {}
+        config = self._get_profile_config(eff_owner, eff_name, False) or {}
+
+        parts = [f"name: {eff_name}"]
+
+        display = config.get("custom_display_name")
+        if display:
+            parts.append(f"display_name: {display}")
+        avatar = config.get("custom_avatar_url")
+        if avatar:
+            parts.append(f"avatar_url: {avatar}")
+
+        persona = prompts.get("persona", {}) or {}
+        for key in self.cog.persona_modal_sections_order:
+            lines = persona.get(key) or []
+            decrypted = [self.cog.storage_manager._decrypt_data(l).strip()
+                         for l in lines if isinstance(l, str) and l.strip()]
+            body = "\n".join(d for d in decrypted if d)
+            if body:
+                parts.append(f"{key}:\n{body}")
+
+        instr = prompts.get("ai_instructions", "")
+        instr_list = instr if isinstance(instr, list) else [instr]
+        decrypted_instr = [self.cog.storage_manager._decrypt_data(i).strip()
+                           for i in instr_list if isinstance(i, str) and i.strip()]
+        body = "\n\n".join(d for d in decrypted_instr if d)
+        if body:
+            parts.append(f"instructions:\n{body}")
+
+        img_prompt = prompts.get("image_generation_prompt")
+        if isinstance(img_prompt, str) and img_prompt.strip():
+            parts.append(f"image_prompt:\n{self.cog.storage_manager._decrypt_data(img_prompt).strip()}")
+
+        return "\n\n".join(parts)
+
+    def _surface_hash(self, surface: str) -> str:
+        return hashlib.sha256(surface.encode("utf-8", "replace")).hexdigest()[:16]
+
+    def _effective_safety_level(self, config: Dict[str, Any]) -> str:
+        """Where this profile may run, derived from its content rating alone."""
+        rating = config.get("content_rating") or {}
+        verdict = rating.get("verdict")
+
+        if verdict == "adult":
+            return "unrestricted"
+        if verdict == "exempt":
+            # Bot-owner exemption: behaves as 'general' -- it runs in any channel,
+            # global chat included -- and is never subject to fail-closed, since the
+            # whole point is that it bypasses the check. Checked ahead of the legacy
+            # field below so a retired 18+ declaration left on an exempted profile
+            # cannot override the exemption that was granted after it.
+            return "restricted"
+
+        # Belt and braces for a config that reached here without passing through
+        # _get_profile_config -- a raw dict held by a view, an import, a restored
+        # backup. The migration is the normal path; this only stops an unmigrated
+        # 18+ declaration from reading as General in the gap, and it deliberately
+        # ranks below a real verdict rather than above it.
+        if _legacy_declared_adult(config.get("safety_level")):
+            return "unrestricted"
+
+        if verdict in (None, "unclassified") and defaultConfig.CONTENT_CLASSIFY_FAIL_CLOSED:
+            return "unrestricted"
+        return "restricted"
+
+    def _content_rating_state(self, owner_id: int, profile_name: str) -> Tuple[str, Optional[str]]:
+        """(verdict, reason) as last recorded, for display and for the UI gates.
+
+        Deliberately does NOT recompute the surface hash. This runs on every render
+        of the profile Home tab, and hashing means decrypting the whole persona;
+        staleness is detected instead by verify_content_rating, which is async and
+        runs on dashboard open and session setup. The consequence is conservative in
+        the right direction: a stale 'adult' verdict keeps the toggle locked until
+        the recheck lands, rather than briefly unlocking it.
+        """
+        eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
+        config = self._get_profile_config(eff_owner, eff_name, False) or {}
+        rating = config.get("content_rating") or {}
+        return rating.get("verdict", "unclassified"), rating.get("reason")
+
+    def _resolve_enforced_safety_level(self, profile_owner_id: int, profile_name: str) -> str:
+        """The level the gate enforces for this profile, cached per (owner, name).
+
+        The uncached path reads, decrypts and decompresses up to two profile files
+        and hashes the persona. The gate runs on the turn path, so the result is
+        memoised and invalidated by _invalidate_content_rating from every edit,
+        classification and bulk write.
+        """
+        cache_key = (int(profile_owner_id), profile_name)
+        cached = self.cog.content_rating_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         index = self._get_user_index(profile_owner_id)
         is_borrowed = profile_name in index.get("borrowed", [])
         config = self._get_profile_config(profile_owner_id, profile_name, is_borrowed) or {}
 
-        safety_level = _coerce_safety_level(config.get("safety_level"))
+        level = self._effective_safety_level(config)
 
-        # A borrowed profile carries its own local copy of the config, so reading
-        # only that copy let a borrower downgrade an owner's 18+ profile to
-        # Restricted and run it in a general channel -- the local value is
-        # writable by the borrower via the bulk editor. Consult the source as
-        # well and take whichever is stricter, so the level can only ever be
-        # escalated by the person holding the copy, never relaxed.
-        if is_borrowed and safety_level != "unrestricted":
+        # A borrowed profile carries its own local copy of the config, and
+        # _store_content_rating refuses to write one -- the authoritative rating
+        # only ever exists at the source, where the persona the verdict was formed
+        # from actually lives. The local copy can still hold a stale rating, or a
+        # legacy 18+ declaration frozen in at borrow time, so take whichever of the
+        # two is stricter: the borrow can only ever escalate, never relax.
+        if is_borrowed and level != "unrestricted":
             src_owner, src_name = self._resolve_effective_profile(profile_owner_id, profile_name)
             if (src_owner, src_name) != (profile_owner_id, profile_name):
                 src_config = self._get_profile_config(src_owner, src_name, False) or {}
-                safety_level = _coerce_safety_level(src_config.get("safety_level"))
+                level = self._effective_safety_level(src_config)
 
-        if safety_level == "unrestricted":
+        self.cog.content_rating_cache[cache_key] = level
+        return level
+
+    def _invalidate_content_rating(self, owner_id: int, profile_name: str):
+        """Drops the cached level for a profile and for every borrow of it.
+
+        A borrowed entry is keyed by the borrower's local name, so a change at the
+        source cannot be located by key -- the borrow map is scanned instead. It is
+        small (one entry per live borrow in the cache) and this runs on edits, not
+        on the turn path.
+        """
+        self.cog.content_rating_cache.pop((int(owner_id), profile_name), None)
+        for key in [k for k in list(self.cog.content_rating_cache.keys())
+                    if k != (int(owner_id), profile_name)]:
+            k_owner, k_name = key
+            try:
+                src = self._resolve_effective_profile(k_owner, k_name)
+            except Exception:
+                continue
+            if src == (int(owner_id), profile_name):
+                self.cog.content_rating_cache.pop(key, None)
+
+    def _check_unrestricted_safety_policy(self, profile_owner_id: int, profile_name: str, channel: discord.abc.Messageable) -> bool:
+        if self._resolve_enforced_safety_level(profile_owner_id, profile_name) == "unrestricted":
             if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
                 return False
             return channel.is_nsfw()
@@ -642,17 +1037,29 @@ class ProfileManager:
 
         # Group by owner to minimize I/O
         profiles_by_owner = {}
+        ids_to_remove = []
         for local_name in borrowed:
             b_config = self._get_profile_config(user_id, local_name, True)
-            if b_config:
-                o_id = b_config.get("original_owner_id")
-                o_pid = b_config.get("original_pid")
-                o_name = b_config.get("original_profile_name")
-                if o_id and (o_pid or o_name):
-                    profiles_by_owner.setdefault(str(o_id),[]).append((local_name, o_pid, o_name))
+            if not b_config:
+                # Index entry with no readable profile behind it -- the directory was
+                # removed, the file is corrupt, or a save was interrupted. This used
+                # to be skipped silently, so the dead name stayed in the index
+                # forever and kept passing the session-hydration existence check,
+                # which only looks the name up in the index.
+                ids_to_remove.append(local_name)
+                continue
+
+            o_id = b_config.get("original_owner_id")
+            o_pid = b_config.get("original_pid")
+            o_name = b_config.get("original_profile_name")
+            if o_id and (o_pid or o_name):
+                profiles_by_owner.setdefault(str(o_id),[]).append((local_name, o_pid, o_name))
+            else:
+                # A borrowed profile with no pointer back to a source cannot be
+                # resolved or refreshed; nothing can ever validate it again.
+                ids_to_remove.append(local_name)
 
         removed_count = 0
-        ids_to_remove =[]
 
         for owner_id_str, items in profiles_by_owner.items():
             owner_index = self._get_user_index(int(owner_id_str))
@@ -851,6 +1258,394 @@ class ProfileManager:
             traceback.print_exc()
             return False, "An error occurred during the moderation check."
         
+
+    def _classifier_api_key(self, owner_id: int, provider: str) -> Optional[str]:
+        """Personal -> instance-owner key for the classifier.
+
+        The auto-moderator only ever tried the personal key, which was fine while
+        the only caller was publishing. Classification runs for every profile, so a
+        user with no key of their own would otherwise never get a verdict. Guild
+        keys are deliberately not used: a profile is not owned by a guild, and
+        billing someone's server for another member's profile edit is surprising.
+        """
+        key = self.cog.storage_manager._get_api_key_for_user(owner_id, provider)
+        if key:
+            return key
+        bot_owner = int(defaultConfig.DISCORD_OWNER_ID)
+        if int(owner_id) != bot_owner:
+            return self.cog.storage_manager._get_api_key_for_user(bot_owner, provider)
+        return None
+
+    async def _classify_profile_content(self, owner_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
+        """Runs the classifier over one profile and returns a content_rating record.
+
+        Returns None when no verdict could be reached -- no key, or every provider
+        failed -- so the caller can leave the profile unclassified and retry rather
+        than recording a wrong verdict.
+        """
+        surface = await asyncio.to_thread(self._moderated_surface, owner_id, profile_name)
+        surface_hash = self._surface_hash(surface)
+
+        max_chars = defaultConfig.CONTENT_CLASSIFY_MAX_CHARS
+        truncated = surface[:max_chars]
+        if len(surface) > max_chars:
+            truncated += "\n[...truncated]"
+
+        prompt_text = self.cog.global_prompts.get(
+            "CONTENT_CLASSIFIER", DEFAULT_CONTENT_CLASSIFIER_PROMPT)
+        payload = [{"role": "user", "parts": [f"<target_profile>\n{truncated}\n</target_profile>"]}]
+        gen_cfg = {"temperature": 0.0, "top_k": 1, "top_p": 0.9}
+
+        attempts = [
+            ("openrouter", "amazon/nova-lite-v1", OpenRouterModel),
+            ("gemini", "gemini-2.5-flash-lite", GoogleGenAIModel),
+        ]
+
+        raw = None
+        used_model = None
+        status = None
+        model_name = None
+        failures = []
+        for provider, model_name, model_cls in attempts:
+            key = self._classifier_api_key(owner_id, provider)
+            if not key:
+                # _get_api_key_for_user returns None both when no key is assigned for
+                # this provider AND when the assigned key is inside its rate-limit
+                # cooldown window. Both used to `continue` in silence, so a run that
+                # never reached a provider looked identical to one that failed at it.
+                failures.append(f"{provider}: no usable key (unassigned or rate-limit cooldown)")
+                continue
+            status = "api_error"
+            try:
+                kwargs = {"api_key": key, "model_name": model_name, "system_instruction": prompt_text}
+                if model_cls is GoogleGenAIModel:
+                    kwargs["safety_settings"] = DEFAULT_SAFETY_SETTINGS
+                model = model_cls(**kwargs)
+                response = await model.generate_content_async(payload, generation_config=gen_cfg)
+                if response and response.candidates:
+                    candidate = response.candidates[0]
+                    if candidate.content and candidate.content.parts:
+                        raw = "".join(p.text for p in candidate.content.parts
+                                      if hasattr(p, "text")).strip()
+                        status = "success"
+                else:
+                    status = "blocked_by_safety"
+            except Exception as e:
+                failures.append(f"{provider}: {e}")
+            finally:
+                self.cog._log_api_call(user_id=0, guild_id=None, context="content_classification",
+                                       model_used=model_name, status=status)
+            if raw:
+                used_model = model_name
+                break
+
+        if not raw:
+            if status == "blocked_by_safety" and not failures:
+                failures.append(f"{model_name}: provider returned no candidates")
+            self._last_classify_failure = "; ".join(failures) or "unknown"
+            # No provider was even reachable because none had a usable key. Retrying
+            # cannot help within the backoff window -- a key is not going to appear
+            # in fifteen seconds -- so tell the caller not to bother.
+            self._last_classify_retryable = not all("no usable key" in f for f in failures) if failures else True
+            return None
+
+        head, _, tail = raw.partition(":")
+        verdict = "adult" if head.strip().upper().startswith("ADULT") else "general"
+
+        # Only a recognised category code survives. The prompt asks for one, but a
+        # model that answers in prose anyway must not have that prose stored and
+        # shown back to the owner -- it would be describing their persona to them,
+        # in the classifier's words. An unusable reason is dropped, and the embed
+        # renders the generic label in its place.
+        code = "".join(tail.split()).upper().strip(".")
+        reason = code if code in CONTENT_RATING_REASON_LABELS else None
+
+        return {
+            "verdict": verdict,
+            "hash": surface_hash,
+            "model": used_model,
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "reason": reason,
+            "source": "classifier",
+        }
+
+    def _store_content_rating(self, owner_id: int, profile_name: str, rating: Dict[str, Any]) -> bool:
+        """Persists a verdict, unless a moderator override is pinned for this content."""
+        index = self._get_user_index(owner_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
+        if is_borrowed:
+            return False
+
+        config = self._get_profile_config(owner_id, profile_name, False)
+        if config is None:
+            return False
+
+        existing = config.get("content_rating") or {}
+        if (existing.get("source") == "owner_override"
+                and existing.get("hash") == rating.get("hash")):
+            # A moderator cleared this exact content; re-running the classifier over
+            # it must not silently undo that. A later edit changes the hash and the
+            # override lapses with the content it was granted for.
+            return False
+
+        if (existing.get("verdict") == "adult"
+                and existing.get("source") == "owner_declared"
+                and rating.get("verdict") != "adult"):
+            # The owner volunteered 18+. The classifier escalates, it does not
+            # relax, so a 'general' verdict here changes nothing -- but the hash is
+            # stamped anyway, so verify_content_rating stops seeing this content as
+            # unclassified and re-queueing it on every dashboard render. Normally
+            # unreachable: schedule_content_classification skips declared profiles.
+            # This catches a job already in flight when the declaration landed.
+            # Rebuilt rather than mutated: _duplicate_profile shallow-copies the
+            # config, so a duplicate can share this dict with its source.
+            config["content_rating"] = {**existing, "hash": rating.get("hash")}
+            self._save_profile_config(owner_id, profile_name, config, False)
+            self._invalidate_content_rating(owner_id, profile_name)
+            return False
+
+        config["content_rating"] = rating
+        self._save_profile_config(owner_id, profile_name, config, False)
+        self._invalidate_content_rating(owner_id, profile_name)
+        return True
+
+    async def verify_content_rating(self, owner_id: int, profile_name: str):
+        """Reclassifies if the stored verdict no longer matches the profile content.
+
+        The edit paths schedule classification directly; this is the backstop for
+        anything they miss -- an import, a restored backup, a future edit path.
+        Deliberately NOT called from the gate: it decrypts the whole persona to
+        hash it, which has no business running on the turn path. Called instead
+        when the dashboard is opened and when a session is set up.
+        """
+        eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
+        config = self._get_profile_config(eff_owner, eff_name, False) or {}
+        rating = config.get("content_rating") or {}
+
+        # Checked before hashing, not after: this runs on every dashboard render, and
+        # an exempt, declared or recently-failed profile must cost nothing here.
+        # Skipping only at the schedule step still paid for the persona decrypt
+        # every time.
+        if rating.get("verdict") == "exempt":
+            return
+        if rating.get("verdict") == "adult" and rating.get("source") == "owner_declared":
+            # Already at the strictest verdict the classifier could reach, and it
+            # cannot relax one. Reclassifying could only ever confirm it, at the
+            # cost of an API call per edit against the owner's key.
+            return
+        retry_after = rating.get("retry_after")
+        if retry_after and time.time() < retry_after:
+            return
+
+        current = await asyncio.to_thread(
+            lambda: self._surface_hash(self._moderated_surface(eff_owner, eff_name)))
+        if rating.get("hash") == current:
+            return
+        self.schedule_content_classification(eff_owner, eff_name)
+
+    def _record_classification_failure(self, owner_id: int, profile_name: str, reason: str):
+        """Stamps a retry-after on a profile the classifier could not judge."""
+        config = self._get_profile_config(owner_id, profile_name, False)
+        if config is None:
+            return
+        if (config.get("content_rating") or {}).get("verdict") in ("adult", "general", "exempt"):
+            return  # a real verdict already stands; a later failure must not erase it
+        config["content_rating"] = {
+            "verdict": "unclassified",
+            "hash": None,
+            "model": None,
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "reason": reason[:200],
+            "source": "failed",
+            "retry_after": time.time() + defaultConfig.CONTENT_CLASSIFY_RETRY_AFTER,
+        }
+        self._save_profile_config(owner_id, profile_name, config, False)
+        self._invalidate_content_rating(owner_id, profile_name)
+
+    def _classification_on_cooldown(self, owner_id: int, profile_name: str) -> bool:
+        config = self._get_profile_config(owner_id, profile_name, False) or {}
+        rating = config.get("content_rating") or {}
+        retry_after = rating.get("retry_after")
+        return bool(retry_after) and time.time() < retry_after
+
+    def set_classification_exempt(self, owner_id: int, profile_name: str, exempt: bool) -> bool:
+        """Bot-owner switch: exempt a profile from classification entirely.
+
+        An exempt profile is treated as 'general' for placement -- it runs in any
+        channel -- and no classifier job is ever queued for it. It is also the one
+        carve-out in _resolve_safety_settings: an exemption is a standing statement
+        that this profile does not need filtering, so it sends BLOCK_NONE even in a
+        general channel, where every other profile sends BLOCK_ONLY_HIGH. The
+        <content_policy> block is all that shapes it there.
+
+        Unlike a moderator override, the exemption is NOT tied to a content hash:
+        it is a standing decision about the profile, so editing the persona does
+        not revoke it. That is the point of it, and also its risk.
+        """
+        config = self._get_profile_config(owner_id, profile_name, False)
+        if config is None:
+            return False
+        if exempt:
+            config["content_rating"] = {
+                "verdict": "exempt",
+                "hash": None,
+                "model": None,
+                "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "reason": "Exempted from classification by the bot owner",
+                "source": "owner_exempt",
+            }
+        else:
+            config.pop("content_rating", None)
+        self._save_profile_config(owner_id, profile_name, config, False)
+        self._invalidate_content_rating(owner_id, profile_name)
+        if not exempt:
+            self.schedule_content_classification(owner_id, profile_name)
+        return True
+
+    def _is_classification_exempt(self, owner_id: int, profile_name: str) -> bool:
+        eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
+        config = self._get_profile_config(eff_owner, eff_name, False) or {}
+        return (config.get("content_rating") or {}).get("verdict") == "exempt"
+
+    def _is_owner_declared_adult(self, owner_id: int, profile_name: str) -> bool:
+        """True when the adult verdict came from the owner rather than the classifier.
+
+        The two are stored identically and enforced identically; they differ only
+        in who may move them. An owner may take their own declaration back; a
+        classifier verdict is appealed to a moderator via _handle_clear_verdict.
+        """
+        eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
+        config = self._get_profile_config(eff_owner, eff_name, False) or {}
+        rating = config.get("content_rating") or {}
+        return rating.get("verdict") == "adult" and rating.get("source") == "owner_declared"
+
+    def set_owner_adult_declaration(self, owner_id: int, profile_name: str, declared: bool) -> bool:
+        """The owner's own 18+ declaration, recorded as a content_rating verdict.
+
+        This is what the retired safety_level toggle became. Declaring costs no API
+        call and needs no classifier agreement, which is the point: an owner who
+        wants the age-restricted lane should not have to write a persona
+        inflammatory enough to trip a flash-lite model into agreeing with them.
+
+        Refuses rather than silently doing nothing where the verdict is not the
+        owner's to move -- a classifier 'adult' (appealed via /mod), an exemption
+        (the bot owner's), or a borrowed profile (not the borrower's content).
+        Returns True only when the stored rating now matches what was asked for.
+        """
+        index = self._get_user_index(owner_id)
+        if profile_name in index.get("borrowed", []):
+            return False
+
+        config = self._get_profile_config(owner_id, profile_name, False)
+        if config is None:
+            return False
+
+        rating = config.get("content_rating") or {}
+        verdict, source = rating.get("verdict"), rating.get("source")
+
+        if verdict == "exempt":
+            return False
+        if verdict == "adult" and source != "owner_declared":
+            return False
+
+        if declared:
+            if verdict == "adult":
+                return True
+            config["content_rating"] = {
+                "verdict": "adult",
+                # No hash. A declaration is about the profile, not about one
+                # revision of its text, and verify_content_rating returns on the
+                # declaration before it hashes anything -- so a hash would protect
+                # against nothing while costing a full persona decrypt inside a GUI
+                # callback, once per profile in the bulk path.
+                "hash": None,
+                "model": None,
+                "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "reason": "Declared 18+ by the profile owner",
+                "source": "owner_declared",
+            }
+        else:
+            if source != "owner_declared":
+                return False
+            # Dropped rather than rewritten to 'general': the owner withdrawing a
+            # declaration is not a judgement that the content is general, it is a
+            # request for the classifier to make one. Scheduled below.
+            config.pop("content_rating", None)
+
+        self._save_profile_config(owner_id, profile_name, config, False)
+        self._invalidate_content_rating(owner_id, profile_name)
+        if not declared:
+            self.schedule_content_classification(owner_id, profile_name)
+        return True
+
+    def schedule_content_classification(self, owner_id: int, profile_name: str):
+        """Queues a profile for (re)classification after an edit. Never awaited.
+
+        Called from the handful of edit paths that touch the moderated surface --
+        deliberately not from _save_profile_config, which the neuro engine writes to
+        on every turn for neuro-enabled profiles and would turn into a classify storm.
+        """
+        index = self._get_user_index(owner_id)
+        if profile_name in index.get("borrowed", []):
+            return
+        if self._is_classification_exempt(owner_id, profile_name):
+            return
+        if self._is_owner_declared_adult(owner_id, profile_name):
+            # Nothing a verdict could add: adult is already the strictest outcome
+            # and the classifier cannot relax one. Skipping here is what keeps a
+            # declared profile from spending an API call on every persona edit.
+            return
+        if self._classification_on_cooldown(owner_id, profile_name):
+            return
+
+        key = (int(owner_id), profile_name)
+        self._invalidate_content_rating(owner_id, profile_name)
+        if key in self.cog.pending_classifications:
+            return
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Called from a worker thread with no loop. The invalidation above still
+            # stands, and verify_content_rating picks the profile up next time the
+            # dashboard or a session touches it.
+            return
+
+        self.cog.pending_classifications[key] = 0
+        asyncio.create_task(self._run_classification_job(owner_id, profile_name))
+
+    async def _run_classification_job(self, owner_id: int, profile_name: str):
+        key = (int(owner_id), profile_name)
+        try:
+            for attempt in range(defaultConfig.CONTENT_CLASSIFY_MAX_ATTEMPTS):
+                self.cog.pending_classifications[key] = attempt + 1
+                try:
+                    rating = await self._classify_profile_content(owner_id, profile_name)
+                except Exception as e:
+                    print(f"Classification job errored for {owner_id}/{profile_name}: {e}")
+                    rating = None
+
+                if rating:
+                    await asyncio.to_thread(self._store_content_rating, owner_id, profile_name, rating)
+                    return
+
+                if not getattr(self, "_last_classify_retryable", True):
+                    break
+
+                if attempt < defaultConfig.CONTENT_CLASSIFY_MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(5 * (2 ** attempt))
+
+            # Out of attempts. Record why and when, so the next dashboard render or
+            # session setup does not immediately re-queue the same doomed job -- that
+            # loop is what turned one unclassifiable profile into an endless stream of
+            # give-up lines. The profile stays unclassified, which behaves as
+            # Restricted unless the operator set CONTENT_CLASSIFY_FAIL_CLOSED.
+            reason = getattr(self, "_last_classify_failure", None) or "unknown"
+            print(f"Classification gave up for {owner_id}/{profile_name}: {reason}. "
+                  f"Retrying no sooner than {defaultConfig.CONTENT_CLASSIFY_RETRY_AFTER}s from now.")
+            await asyncio.to_thread(self._record_classification_failure, owner_id, profile_name, reason)
+        finally:
+            self.cog.pending_classifications.pop(key, None)
 
     @tasks.loop(hours=1.0)
     async def hourly_self_repair_task(self):
@@ -1210,7 +2005,7 @@ class ProfileManager:
         stm_length = profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
         ltm_ctx = profile_data.get("ltm_context_size", 3)
         ltm_rel = profile_data.get("ltm_relevance_threshold", 0.75)
-        safety_level = SAFETY_LEVEL_LABELS[_coerce_safety_level(profile_data.get("safety_level"))]
+        access_display = CHANNEL_ACCESS_LABELS[self._resolve_enforced_safety_level(owner_id, profile_name)]
         ltm_creation_status = "**`ON`**" if profile_data.get("ltm_creation_enabled", False) else "`OFF`"
 
         created_str = profile_data.get('created_at')
@@ -1234,19 +2029,29 @@ class ProfileManager:
         embed.add_field(name="Created", value=created_display, inline=True)
         embed.add_field(name="Display Name", value=f"`{display_name}`", inline=True)
         
+        # Same column discipline as the profile dashboard: identity on the left,
+        # Public Library in the middle, channel access on the right. Borrowed
+        # profiles carry a second identity field and fill the row on their own.
+        is_public = self._is_profile_public(owner_id, profile_name)
+        library_display = "🌐 `Published`" if is_public else "`Not published`"
+
         if is_borrowed:
             borrowed_config = self._get_profile_config(owner_id, profile_name, True) or {}
-            a_class_pid = borrowed_config.get("original_profile_id", "Unknown")
-            b_class_pid = self._get_pid_from_name_any(owner_id, profile_name)
-            embed.add_field(name="Profile ID (Source)", value=f"`{a_class_pid}`", inline=True)
-            embed.add_field(name="Profile ID (Local)", value=f"`{b_class_pid}`", inline=True)
+            # Not "A class" and "B class": the source of a borrow can be a personal
+            # profile (A) or a System one (X), and the local PID is B or C depending
+            # on whether the borrow came through a share code or the Public Library.
+            source_pid = borrowed_config.get("original_profile_id", "Unknown")
+            local_pid = self._get_pid_from_name_any(owner_id, profile_name)
+            embed.add_field(name="Profile ID (Source)", value=f"`{source_pid}`", inline=True)
+            embed.add_field(name="Profile ID (Local)", value=f"`{local_pid}`", inline=True)
+            embed.add_field(name="\u200b", value="\u200b", inline=True)
+            embed.add_field(name="\u200b", value="\u200b", inline=True)
         else:
             profile_id = self._get_profile_id(effective_owner_id, effective_profile_name)
             embed.add_field(name="Profile ID (PID)", value=f"`{profile_id}`", inline=True)
-            embed.add_field(name="\u200b", value="\u200b", inline=True)
 
-        embed.add_field(name="Safety Level", value=f"`{safety_level}`", inline=True)
-        embed.add_field(name="\u200b", value="\u200b", inline=True) # Spacer for alignment
+        embed.add_field(name="Public Library", value=library_display, inline=True)
+        embed.add_field(name="Channel Access", value=f"`{access_display}`", inline=True)
 
         embed.add_field(name="\u200b", value="**Core Settings**", inline=False)
         embed.add_field(name="Primary Model", value=f"`{prim_model}`", inline=True)
@@ -1312,28 +2117,89 @@ class ProfileManager:
         
         appearance_data = self._get_user_appearance(effective_owner_id, effective_profile_name)
         display_name = appearance_data.get("custom_display_name") or effective_profile_name
-        safety_level = SAFETY_LEVEL_LABELS[_coerce_safety_level(config.get("safety_level"))]
 
         embed.add_field(name="Profile Type", value=f"`{profile_type}`", inline=True)
         embed.add_field(name="Created", value=created_display, inline=True)
         embed.add_field(name="Display Name", value=f"`{display_name}`", inline=True)
         
+        enforced = self._resolve_enforced_safety_level(user_id, profile_name)
+        verdict, verdict_reason = self._content_rating_state(user_id, profile_name)
+        declared = self._is_owner_declared_adult(user_id, profile_name)
+        is_public = self._is_profile_public(user_id, profile_name)
+
+        rating_display = {
+            "general": "✅ `General`",
+            "adult": "🔞 `Adult 18+`",
+            "exempt": "🛡️ `Exempt`",
+            "unclassified": "⏳ `Pending`",
+        }.get(verdict, "⏳ `Pending`")
+        # The padlock marks a verdict the owner cannot move themselves, which is
+        # every adult verdict except their own declaration.
+        if verdict == "adult" and not declared:
+            rating_display += " 🔒"
+
+        # Discord packs inline fields three to a row, so these are emitted as two
+        # deliberate rows rather than in the order they were computed: identity in
+        # the left column, content state in the middle, consequence on the right.
+        # Content Rating and Public Library sharing the middle column is the point --
+        # read downwards, they are the two fields that say where the profile may go.
+        # The zero-width fields are the padding that holds the grid square.
         if is_borrowed:
             borrowed_config = self._get_profile_config(user_id, profile_name, True) or {}
-            a_class_pid = borrowed_config.get("original_profile_id", "Unknown")
-            b_class_pid = self._get_pid_from_name_any(user_id, profile_name)
-            embed.add_field(name="Profile ID (Source)", value=f"`{a_class_pid}`", inline=True)
-            embed.add_field(name="Profile ID (Local)", value=f"`{b_class_pid}`", inline=True)
+            source_pid = borrowed_config.get("original_profile_id", "Unknown")
+            local_pid = self._get_pid_from_name_any(user_id, profile_name)
+            left_column = [("Profile ID (Source)", f"`{source_pid}`"),
+                           ("Profile ID (Local)", f"`{local_pid}`")]
         else:
             profile_id = self._get_profile_id(effective_owner_id, effective_profile_name)
-            embed.add_field(name="Profile ID (PID)", value=f"`{profile_id}`", inline=True)
-            embed.add_field(name="\u200b", value="\u200b", inline=True)
-            
+            left_column = [("Profile ID (PID)", f"`{profile_id}`"),
+                           ("\u200b", "\u200b")]
+
             if profile_id.startswith("X"):
                 embed.description = f"⚠️ **System Profile.** Global settings managed by Bot Admin.\n\n" + (embed.description or "")
                 profile_type = "System"
 
-        embed.add_field(name="Safety Level", value=f"`{safety_level}`", inline=True)
+        embed.add_field(name=left_column[0][0], value=left_column[0][1], inline=True)
+        embed.add_field(name="Content Rating", value=rating_display, inline=True)
+        embed.add_field(name="Channel Access",
+                        value=f"`{CHANNEL_ACCESS_LABELS[enforced]}`", inline=True)
+
+        embed.add_field(name=left_column[1][0], value=left_column[1][1], inline=True)
+        embed.add_field(name="Public Library",
+                        value="🌐 `Published`" if is_public else "`Not published`", inline=True)
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
+
+        if verdict == "unclassified" and verdict_reason:
+            # Surface why a profile is stuck on Pending. A silent Pending was
+            # indistinguishable from one still in flight. This reason describes an
+            # operational failure rather than the persona, so it is shown as stored.
+            embed.description = ((embed.description or "") +
+                                 f"\n⏳ **Classification unavailable:** {verdict_reason}").strip()
+        if verdict == "adult" and declared:
+            embed.description = ((embed.description or "") +
+                                 "\n🔞 **Declared as adult content by you.** This profile is "
+                                 "limited to age-restricted channels and cannot be published. "
+                                 "Withdraw the declaration from the Home tab to have it "
+                                 "classified normally.").strip()
+        elif verdict == "adult":
+            # A category, never the classifier's own words about the persona.
+            embed.description = ((embed.description or "") +
+                                 "\n🔞 **Classified as adult content: "
+                                 + CONTENT_RATING_REASON_LABELS.get(
+                                     verdict_reason, CONTENT_RATING_REASON_FALLBACK) +
+                                 ".** This profile is limited to age-restricted channels. "
+                                 "Editing the persona re-runs the check; contact the bot "
+                                 "operator to dispute the result.").strip()
+
+        # Re-check off the turn path: the edit hooks cover the normal cases, this
+        # catches imports and anything they miss.
+        asyncio.create_task(self.verify_content_rating(user_id, profile_name))
+
+        if is_public:
+            embed.description = ((embed.description or "") +
+                                 "\n🌐 **Published to the Public Library.** The 18+ declaration is "
+                                 "withheld while listed, and bulk rating changes skip this profile. "
+                                 "Unpublish via `/profile hub` to change it.").strip()
 
         embed.add_field(name="\u200b", value="\u200b", inline=False)
 
@@ -1684,7 +2550,10 @@ class ProfileManager:
             target_original_pid = target_pid or owner_profile_data.get("profile_id", "00000000")
             source_pointer = f"{sharer_id}:{target_original_pid}"
             if is_public_borrow:
-                public_key = next((k for k, v in self.cog.public_profiles.items() if v == source_pointer), None)
+                # Was an equality test against the raw value, which only ever matched
+                # the "owner:pid" string form -- a dict entry fell through to the raw
+                # pointer and the borrow lost its link to the public listing.
+                public_key = self._find_public_entry_id(sharer_id, target_original_pid)
                 pointer_value = public_key if public_key else source_pointer
             else:
                 pointer_value = source_pointer
@@ -1701,7 +2570,19 @@ class ProfileManager:
                 "ltm_scope": "server"
             })
 
-            pid = f"B{uuid.uuid4().hex[:15].upper()}"
+            # The class letter records provenance, not current state: 'C' means the
+            # borrow arrived through the Public Library, 'B' through a private share
+            # code. A PID is the on-disk folder name and never changes, so the owner
+            # later unpublishing does not turn a C back into a B -- the pointer above
+            # is what tracks that.
+            #
+            # Nothing branches on the letter, and nothing may start to. Every borrow
+            # created before this existed is a 'B' whatever its origin, so code that
+            # needs to know whether a borrow is public must read `pointer` or ask
+            # _find_public_entry_id. Renaming the old folders to match would mean
+            # moving directories and rewriting index entries for cosmetics, with
+            # orphaned profiles as the failure mode; the mixed population stays.
+            pid = f"{'C' if is_public_borrow else 'B'}{uuid.uuid4().hex[:15].upper()}"
 
             if "borrowed" not in index or not isinstance(index["borrowed"], dict):
                 index["borrowed"] = {}

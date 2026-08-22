@@ -47,7 +47,13 @@ intents.members = True
 intents.guilds = True
 
 # --- Bot Initialization ---
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+# max_messages=None disables discord.py's cache of the last 1000 Message objects.
+# Nothing here reads it: every delete/edit listener uses the on_raw_* variants, which
+# do not consult the cache, and message.reference.resolved is built by discord.py from
+# the gateway payload's `referenced_message` field rather than from the cache. Left on,
+# the deque fills with full Message objects -- author, embeds, attachments, reactions --
+# and never shrinks, which on a 24/7 e2-micro is the one baseline term that grows.
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None, max_messages=None)
 
 # --- Event: Bot Ready ---
 @bot.event

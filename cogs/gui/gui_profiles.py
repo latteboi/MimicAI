@@ -9,7 +9,7 @@ import time
 from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional, Union
 from ..utils.content import OLLAMA_GUIDE_TEXT
-from ..utils.helpers import _coerce_safety_level, _pf, _pi, _ps, _pb
+from ..utils.helpers import _pf, _pi, _ps, _pb
 from ..utils.http_client import get_shared_client
 
 if TYPE_CHECKING:
@@ -88,7 +88,7 @@ class _Action:
     and reordering one silently desynchronised them. Here a row is one declaration.
 
     `gate` is an optional predicate on the view; a row with no gate is always shown.
-    `label` may be a callable for the one row whose wording depends on the profile.
+    `label` may be a callable for the rows whose wording depends on the profile.
     """
 
     __slots__ = ("value", "tab", "label", "description", "gate", "run")
@@ -175,20 +175,51 @@ def _to_personal(view):
             and view.is_system)
 
 
+def _is_bot_owner_view(view):
+    """Bot-owner-only rows. Unlike _can_clear_verdict this does not require a
+    verdict to already stand -- the exemption is set ahead of time."""
+    return (not view.is_borrowed
+            and view.original_interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID))
+
+
+def _can_clear_verdict(view):
+    """Moderator-only: clear a classifier 'adult' verdict for the current content.
+
+    The appeal path. Without one, a false positive from a flash-lite model bricks a
+    profile in every general channel, and the owner's only recourse is to delete and
+    recreate -- which, with the verdict keyed to content, lands on the same result.
+    """
+    if view.is_borrowed or not view.is_mod_view:
+        return False
+    if view.original_interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
+        return False
+    verdict, _ = view.cog.profile_manager._content_rating_state(view.user_id, view.profile_name)
+    return verdict == "adult"
+
+
+
 def _can_mark_adult(view):
-    """The 18+ toggle is hidden for borrowed and published profiles.
+    """The 18+ declaration is hidden for borrowed and published profiles.
 
     A borrower does not own the content, and the public index only accepts
-    Restricted profiles. Under the old four-tier cycle both cases were handled by
-    offering a reduced Low -> Medium -> High cycle; with two values there is
-    nothing left to cycle through, so the row is withheld rather than shown dead.
+    General profiles. The row is withheld rather than shown dead: there is
+    nothing to move in either case.
 
     Both checks are in-memory for a non-borrowed profile -- _is_profile_public
     reads the cached user index and cog.public_profiles -- so this is safe to
     evaluate on every render of the Home tab.
     """
-    return (not view.is_borrowed
-            and not view.cog.profile_manager._is_profile_public(view.user_id, view.profile_name))
+    if view.is_borrowed or view.cog.profile_manager._is_profile_public(view.user_id, view.profile_name):
+        return False
+
+    pm = view.cog.profile_manager
+    verdict, _ = pm._content_rating_state(view.user_id, view.profile_name)
+    # An adult verdict the owner did not set is not theirs to withdraw -- a
+    # classifier result is appealed to a moderator via /mod, and an exemption is
+    # the bot owner's. Their own declaration always stays withdrawable.
+    if verdict == "adult":
+        return pm._is_owner_declared_adult(view.user_id, view.profile_name)
+    return verdict != "exempt"
 
 
 #: The dropdown, in render order, grouped by tab. Order within a tab is the order the
@@ -212,8 +243,20 @@ PROFILE_ACTIONS = (
             _method("_handle_convert_copy", True), _to_system),
     _Action("convert_to_personal", "home", "Copy to Personal Profile", "Create a Personal Profile copy from this System Profile.",
             _method("_handle_convert_copy", False), _to_personal),
-    _Action("safety_level", "home", "Toggle Content Safety Level", "Switch between Restricted and Unrestricted 18+.",
-            _method("_handle_safety_toggle", wants_profile=True), _can_mark_adult),
+    _Action("adult_declaration", "home",
+            lambda v: ("Withdraw Adult 18+ Declaration"
+                       if v.cog.profile_manager._is_owner_declared_adult(v.user_id, v.profile_name)
+                       else "Declare Adult Content 18+"),
+            "Confine this profile to age-restricted channels.",
+            _method("_handle_adult_declaration"), _can_mark_adult),
+    _Action("clear_verdict", "home", "Clear Adult Verdict (Mod)", "Override the classifier for this profile's current content.",
+            _method("_handle_clear_verdict", wants_profile=True), _can_clear_verdict),
+    _Action("classify_exempt", "home",
+            lambda v: ("Remove Classification Exemption (Owner)"
+                       if v.cog.profile_manager._is_classification_exempt(v.user_id, v.profile_name)
+                       else "Exempt From Classification (Owner)"),
+            "Bypass content classification for this profile entirely.",
+            _method("_handle_classify_exempt"), _is_bot_owner_view),
     _Action("delete", "home",
             lambda v: "Remove Borrowed Profile" if v.is_borrowed else "Delete Profile",
             "Permanently remove this profile and its data.",
@@ -514,20 +557,69 @@ class ProfileManageView(ui.View):
         new_embed = await self.cog.profile_manager._build_profile_manage_embed(interaction, profile_name, target_user_id=self.user_id)
         await interaction.response.edit_message(embed=new_embed, view=self)
 
-    async def _handle_safety_toggle(self, interaction, profile):
-        """Flips the profile between the two safety levels.
+    async def _handle_adult_declaration(self, interaction):
+        """Adds or withdraws the owner's own 18+ declaration.
 
         _can_mark_adult already withholds this row from borrowed and published
-        profiles, but the ownership check is repeated here because a profile can
-        be published from another view while this one is still open on screen.
-        """
-        if not _can_mark_adult(self):
-            profile['safety_level'] = "restricted"
-            await self._save_and_refresh(interaction, profile, self.profile_name, self.is_borrowed)
-            return
+        profiles, but the check is repeated here because a profile can be
+        published from another view while this one is still open on screen.
 
-        current = _coerce_safety_level(profile.get('safety_level'))
-        profile['safety_level'] = "restricted" if current == "unrestricted" else "unrestricted"
+        Goes through the manager rather than mutating the config dict this view
+        was built from: the declaration is a content_rating record, and writing it
+        here would race the classifier's own writer. The view is rebuilt from the
+        stored result afterwards, the same way the exemption toggle does it.
+        """
+        pm = self.cog.profile_manager
+        if _can_mark_adult(self):
+            declared = pm._is_owner_declared_adult(self.user_id, self.profile_name)
+            pm.set_owner_adult_declaration(self.user_id, self.profile_name, not declared)
+
+        for k in [k for k in self.cog.channel_models.keys()
+                  if isinstance(k, tuple) and len(k) >= 2 and k[1] == self.user_id]:
+            self.cog.channel_models.pop(k, None)
+            self.cog.channel_model_last_profile_key.pop(k, None)
+
+        self._build_view()
+        new_embed = await pm._build_profile_manage_embed(
+            interaction, self.profile_name, target_user_id=self.user_id)
+        await interaction.response.edit_message(embed=new_embed, view=self)
+
+    async def _handle_classify_exempt(self, interaction):
+        """Toggles the bot-owner exemption. Re-reads the profile after the manager
+        writes it, so the refreshed embed shows the new state rather than the stale
+        dict this view was built from."""
+        pm = self.cog.profile_manager
+        now_exempt = pm._is_classification_exempt(self.user_id, self.profile_name)
+        pm.set_classification_exempt(self.user_id, self.profile_name, not now_exempt)
+
+        for k in [k for k in self.cog.channel_models.keys()
+                  if isinstance(k, tuple) and len(k) >= 2 and k[1] == self.user_id]:
+            self.cog.channel_models.pop(k, None)
+            self.cog.channel_model_last_profile_key.pop(k, None)
+
+        self._build_view()
+        new_embed = await pm._build_profile_manage_embed(
+            interaction, self.profile_name, target_user_id=self.user_id)
+        await interaction.response.edit_message(embed=new_embed, view=self)
+
+    async def _handle_clear_verdict(self, interaction, profile):
+        """Pins a 'general' rating for exactly the content that was flagged.
+
+        Keyed to the current surface hash, so the override lapses the moment the
+        persona changes -- a cleared profile cannot be edited into adult content
+        and keep the clearance.
+        """
+        pm = self.cog.profile_manager
+        surface = pm._moderated_surface(self.user_id, self.profile_name)
+        profile['content_rating'] = {
+            "verdict": "general",
+            "hash": pm._surface_hash(surface),
+            "model": None,
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "reason": f"Cleared by moderator {interaction.user.id}",
+            "source": "owner_override",
+        }
+        pm._invalidate_content_rating(self.user_id, self.profile_name)
         await self._save_and_refresh(interaction, profile, self.profile_name, self.is_borrowed)
 
     async def _handle_appearance(self, interaction):
@@ -1442,8 +1534,8 @@ class ModelApplyView(ModelPickerMixin, ui.View):
         await interaction.edit_original_response(content=msg, view=None)
 
 class UnifiedBulkTargetView(BaseBulkProfileView):
-    def __init__(self, cog: 'MimicCog', user_id: int, action_key: str, payload: Any, include_borrowed: bool = True):
-        super().__init__(cog, user_id, include_borrowed=include_borrowed)
+    def __init__(self, cog: 'MimicCog', user_id: int, action_key: str, payload: Any, include_borrowed: bool = True, exclude_public: bool = False):
+        super().__init__(cog, user_id, include_borrowed=include_borrowed, exclude_public=exclude_public)
         self.action_key = action_key
         self.payload = payload
         self._build_view()
@@ -1467,6 +1559,18 @@ class UnifiedBulkTargetView(BaseBulkProfileView):
         
         for name in targets:
             is_borrowed = name in index.get("borrowed", [])
+
+            if self.action_key == "adult_declaration":
+                # Not a config key this loop can set: the declaration is a
+                # content_rating record with its own writer, its own cache
+                # invalidation, and its own refusals -- a classifier verdict or an
+                # exemption is not the owner's to overwrite in bulk either. The
+                # manager persists it, so this skips the save below.
+                if self.payload is not None and self.cog.profile_manager.set_owner_adult_declaration(
+                        self.user_id, name, bool(self.payload)):
+                    success_count += 1
+                continue
+
             profile = self.cog.profile_manager._get_profile_config(self.user_id, name, is_borrowed)
             
             if profile:
@@ -1998,6 +2102,10 @@ class AppearanceModal(ui.Modal):
             else: config.pop("custom_avatar_url", None)
             
             self.cog.profile_manager._save_profile_config(owner_id, self.profile_name, config, False)
+            # Display name and avatar are part of the classified surface, and they
+            # live in config rather than prompts, so the _save_profile_prompts hook
+            # does not see them.
+            self.cog.profile_manager.schedule_content_classification(owner_id, self.profile_name)
             
             if new_display_name or new_avatar_url:
                 self.cog.user_appearances.setdefault(user_id_str, {})[self.profile_name] = {
@@ -2075,7 +2183,7 @@ class BulkManageView(ui.View):
             discord.SelectOption(label="Toggle Neuro-Endocrine Engine", value="neuro", description="Enable or disable hormonal simulation for multiple profiles."),
             discord.SelectOption(label="Toggle Help Mode (Guide RAG)", value="help_mode", description="Allow profiles to answer technical bot questions."),
             discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable or disable realistic typing for multiple profiles."),
-            discord.SelectOption(label="Set Safety Level", value="safety_level", description="Apply Restricted or Unrestricted 18+ to multiple profiles."),
+            discord.SelectOption(label="Set Adult 18+ Declaration", value="adult_declaration", description="Declare or withdraw 18+ across multiple profiles."),
             discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training settings to multiple personal profiles."),
             discord.SelectOption(label="Set LTM Parameters", value="ltm_params", description="Apply LTM settings to multiple personal profiles."),
             discord.SelectOption(label="Set LTM Summarization Prompt", value="ltm_summarization", description="Apply a custom LTM summarization prompt."),
@@ -2219,17 +2327,33 @@ class BulkManageView(ui.View):
             view.add_item(sel)
             await interaction.response.send_message(content="Select action and profiles:", view=view, ephemeral=True)
             
-        elif choice == "safety_level":
-            opts = [discord.SelectOption(label=SAFETY_LEVEL_LABELS[v], value=v) for v in ("restricted", "unrestricted")]
-            # Borrowed profiles are excluded: their level is now resolved from the
-            # source profile by _check_unrestricted_safety_policy, so writing the
-            # borrower's local copy would change the label without changing the gate.
-            view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("safety_level", None), include_borrowed=False)
-            sel = ui.Select(placeholder="Select safety level...", options=opts, row=0)
-            async def sel_cb(inter): view.payload = ("safety_level", sel.values[0]); await inter.response.defer()
+        elif choice == "adult_declaration":
+            opts = [
+                discord.SelectOption(label="Declare Adult 18+", value="declare",
+                                     description="Confine to age-restricted channels."),
+                discord.SelectOption(label="Withdraw Declaration", value="withdraw",
+                                     description="Hand the profile back to the classifier."),
+            ]
+            # Borrowed profiles are excluded: the rating is resolved from the source
+            # profile, so writing the borrower's local copy would change nothing.
+            view = UnifiedBulkTargetView(self.cog, self.user_id, "adult_declaration", None,
+                                         include_borrowed=False, exclude_public=True)
+            sel = ui.Select(placeholder="Declare or withdraw...", options=opts, row=0)
+            async def sel_cb(inter): view.payload = sel.values[0] == "declare"; await inter.response.defer()
             sel.callback = sel_cb
             view.add_item(sel)
-            await interaction.response.send_message(content="Select safety level and profiles:", view=view, ephemeral=True)
+            # Say what was withheld rather than letting profiles quietly go missing
+            # from the list.
+            msg = "Select an action and the profiles to apply it to:"
+            if view.excluded_public:
+                names = ", ".join(f"`{n}`" for n in view.excluded_public)
+                msg += (f"\n-# Withheld ({len(view.excluded_public)} published to the Public Library, "
+                        f"which only accepts General profiles): {names}")
+            if len(msg) > 2000:
+                msg = (f"Select an action and the profiles to apply it to:\n-# Withheld "
+                       f"{len(view.excluded_public)} profile(s) published to the Public Library, "
+                       "which only accepts General profiles.")
+            await interaction.response.send_message(content=msg, view=view, ephemeral=True)
 
         elif choice == "timezone":
             view = BulkTimezoneView(self.cog, self.user_id)

@@ -152,7 +152,12 @@ class ChildBotManager:
         intents = discord.Intents.none()
         intents.guilds = True
 
-        child = commands.Bot(command_prefix="!", intents=intents)
+        # max_messages=None for the same reason as the parent in BotManager, and it
+        # matters more here: every child bot is another commands.Bot in this same
+        # process, so the default 1000-message deque would be paid once per child.
+        # Intents.none() means they receive no MESSAGE_CREATE to cache anyway -- this
+        # keeps that true if the intents are ever widened.
+        child = commands.Bot(command_prefix="!", intents=intents, max_messages=None)
         self.clients[bot_id] = child
         parent_name = self.cog.bot.user.name if self.cog.bot.user else "MimicAI"
         parent_id = self.cog.bot.user.id if self.cog.bot.user else 0
@@ -870,7 +875,8 @@ class ChildBotManager:
             if not profile_data.get("image_generation_enabled", False):
                 return
 
-            dynamic_safety_settings = _resolve_safety_settings(profile_data.get("safety_level"))
+            dynamic_safety_settings = _resolve_safety_settings(
+                self.cog.bot.get_channel(channel_id), profile_data)
 
             source_owner_id = owner_id
             source_profile_name = profile_name

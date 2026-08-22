@@ -162,11 +162,13 @@ class PromptBuilderMixin:
         current_instructions_str += "\n\n" + rule_block.strip()
 
         # Channel-level content shaping, gated on the destination rather than the
-        # profile: an 'unrestricted' profile is already confined to age-restricted
+        # profile: an Adult-rated profile is already confined to age-restricted
         # channels by _check_unrestricted_safety_policy, so anything that reaches a
-        # general channel should be written for one. Appended last for recency, and
-        # it is the only content control that has any effect on OpenRouter and
-        # Ollama, which ignore safety_settings entirely.
+        # general channel should be written for one. _resolve_safety_settings keys
+        # the provider thresholds off the same channel, so the two content controls
+        # now move together. Appended last for recency, and it is the only one of
+        # them with any effect on OpenRouter and Ollama, which ignore
+        # safety_settings entirely.
         if not self._channel_allows_adult_content(channel_id):
             policy_block = self.cog.global_prompts.get("CONTENT_POLICY", DEFAULT_CONTENT_POLICY).strip()
             if policy_block:

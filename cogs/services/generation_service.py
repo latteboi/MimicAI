@@ -11,22 +11,23 @@ import collections
 import datetime
 from zoneinfo import ZoneInfo
 from ..utils.constants import (
-    defaultConfig, OLLAMA_LOCAL_URL, PLACEHOLDER_EMOJI,
+    defaultConfig, PLACEHOLDER_EMOJI,
     ERR_GENERAL_ERROR, ERR_REASON_EMPTY_RESPONSE, ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK,
     WHISPER_BUSY_WAIT_TIMEOUT_SECONDS,
     WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED, WARN_VOICE_SYNTHESIS_FAILED,
     DEFAULT_KICKSTART_START, DEFAULT_KICKSTART_CONTINUE, DEFAULT_KICKSTART_IDLE,
-    DEFAULT_WHISPER_RECAP, DEFAULT_DIRECTOR_USER_PROMPT, DEFAULT_IMAGE_APPEARANCE,
+    DEFAULT_WHISPER_RECAP, DEFAULT_DIRECTOR_USER_PROMPT,
     DEFAULT_IMAGE_GROUNDING, DEFAULT_NEGATIVE_CONSTRAINTS, DEFAULT_IMAGE_PRESENT,
     DEFAULT_IMAGE_PRESENT_OTHER, DEFAULT_IMAGE_FAILED,
 )
-from ..utils.http_client import get_shared_client
-from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt, _format_history_entry, _get_user_hash, _scrub_response_text, _split_into_sentences_with_abbreviations
+from ..utils.helpers import (
+    _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt,
+    _format_history_entry, _get_user_hash, _resolve_safety_settings, _scrub_response_text,
+    _split_into_sentences_with_abbreviations,
+)
 from ..managers.memory_manager import encode_embedding_b64
-from .api_service import GoogleGenAIModel, OllamaModel, OpenRouterModel
 
 from .generation._shared import _strip_neuro_update_and_scrub
-from ..utils.helpers import _resolve_safety_settings
 from .generation.heartbeat import HeartbeatMixin
 from .generation.prompt_builder import PromptBuilderMixin
 from .generation.delivery import DeliveryMixin
@@ -34,9 +35,13 @@ from .generation.regeneration import RegenerationMixin
 from .generation.speak import SpeakAsMixin
 from .generation.global_chat import GlobalChatMixin
 from .generation.whisper import WhisperMixin
+from .generation.image_round import ImageRoundMixin
+from .generation.triggers import TriggerIntakeMixin
 
 
-class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, RegenerationMixin, SpeakAsMixin, GlobalChatMixin, WhisperMixin):
+class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, RegenerationMixin,
+                        SpeakAsMixin, GlobalChatMixin, WhisperMixin, ImageRoundMixin,
+                        TriggerIntakeMixin):
     """Owns the core generation engine: the multi-participant turn-rotation worker
     (_multi_profile_worker, defined here) plus the heartbeat/prompt-building/delivery/
     regeneration/speak/global-chat/whisper mixins (each in cogs/services/generation/) that
@@ -144,20 +149,22 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             sys_instr = pro.get("director_instructions")
                             if sys_instr:
                                 try:
-                                    is_or = model_raw.upper().startswith("OPENROUTER/")
-                                    model_name = model_raw[11:] if is_or else (model_raw[7:] if model_raw.upper().startswith("GOOGLE/") else model_raw)
                                     channel = self.cog.bot.get_channel(channel_id)
                                     guild_id = channel.guild.id if channel and getattr(channel, 'guild', None) else 0
-                                    api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id, "openrouter" if is_or else "gemini")
-                                    if api_key:
-                                        if is_or: m = OpenRouterModel(model_name, api_key=api_key, system_instruction=sys_instr, thinking_params={})
-                                        else: m = GoogleGenAIModel(api_key=api_key, model_name=model_name, system_instruction=sys_instr)
-                                        hist_text = ""
-                                        for ht in session.get("unified_log", [])[-10:]:
-                                            hist_text += f"{ht.get('content', '')}\n"
-                                        director_template = self.cog.global_prompts.get("DIRECTOR_USER_PROMPT", DEFAULT_DIRECTOR_USER_PROMPT)
-                                        resp = await m.generate_content_async([director_template.format(history=hist_text)])
-                                        if resp and resp.text: director_prompt = f"<internal_note>Director's Note: {resp.text.strip()}</internal_note>"
+                                    # Via the factory rather than a local copy of the prefix parsing.
+                                    # The copy matched prefixes case-insensitively, which the factory
+                                    # deliberately does not: OpenRouter namespaces its models as
+                                    # 'google/gemini-2.5-flash', so an upper()-ed match read that as a
+                                    # GOOGLE/ prefix and sent an OpenRouter model id to Google.
+                                    m = self.cog.api_service._instantiate_model(
+                                        model_raw, guild_id, session.get("owner_id"),
+                                        system_instruction=sys_instr, thinking_params={})
+                                    hist_text = ""
+                                    for ht in session.get("unified_log", [])[-10:]:
+                                        hist_text += f"{ht.get('content', '')}\n"
+                                    director_template = self.cog.global_prompts.get("DIRECTOR_USER_PROMPT", DEFAULT_DIRECTOR_USER_PROMPT)
+                                    resp = await m.generate_content_async([director_template.format(history=hist_text)])
+                                    if resp and resp.text: director_prompt = f"<internal_note>Director's Note: {resp.text.strip()}</internal_note>"
                                 except Exception as e: print(f"AI Director failed: {e}")
                         all_triggers_for_round[i] = director_prompt
 
@@ -244,266 +251,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # [UPDATED] Use new_round_turn_data with tuple format
                         new_round_turn_data.append((director_prompt, None, []))
 
-                for i, trigger in enumerate(all_triggers_for_round):
-                    if not trigger:
-                        continue
-
-                    message_trigger, reaction_trigger, message_payload = None, None, None
-                    
-                    if i == 0:
-                        if isinstance(trigger, tuple):
-                            if trigger[0] == 'reply':
-                                _, message_trigger, starting_profile_override = trigger
-                            elif trigger[0] == 'reaction': 
-                                _, reaction_trigger, starting_profile_override = trigger
-                                try:
-                                    ch = self.cog.bot.get_channel(reaction_trigger.channel_id)
-                                    msg_obj = await ch.fetch_message(reaction_trigger.message_id)
-                                    await msg_obj.clear_reaction(reaction_trigger.emoji)
-                                except: pass
-                            elif trigger[0] == 'reaction_single': 
-                                _, reaction_trigger, starting_profile_override = trigger
-                                try:
-                                    ch = self.cog.bot.get_channel(reaction_trigger.channel_id)
-                                    msg_obj = await ch.fetch_message(reaction_trigger.message_id)
-                                    await msg_obj.clear_reaction(reaction_trigger.emoji)
-                                except: pass
-                            elif trigger[0] == 'child_mention': _, message_payload, starting_profile_override = trigger
-                        elif isinstance(trigger, discord.RawReactionActionEvent): reaction_trigger = trigger
-                        elif isinstance(trigger, str):
-                            # Handle string prompts
-                            content = trigger
-                            turn_id = str(uuid.uuid4())
-                            
-                            # XML-standardised system turn without Name/Timestamp header
-                            system_content = f"<system_note>\n{content}\n</system_note>"
-                            
-                            turn_object = {
-                                "turn_id": turn_id,
-                                "is_user": False,
-                                "speaker_pid": "SYSTEM",
-                                "message_ids": [],
-                                "content": system_content
-                            }
-                            session.setdefault("unified_log", []).append(turn_object)
-                            
-                            new_round_turn_data.append((system_content, None, []))
-                            
-                            message_trigger = None
-                        else: message_trigger = trigger
-                    else:
-                        # [UPDATED] Unpack structured tuples in batches to prevent lost replies/mentions/child bots
-                        if isinstance(trigger, discord.Message):
-                            message_trigger = trigger
-                        elif isinstance(trigger, tuple) and len(trigger) > 1:
-                            if isinstance(trigger[1], discord.Message):
-                                message_trigger = trigger[1]
-                            elif isinstance(trigger[1], dict):
-                                message_payload = trigger[1]
-
-                    # --- Deduplication Check ---
-                    check_id = None
-                    if message_trigger: check_id = message_trigger.id
-                    elif message_payload: check_id = message_payload.get('id')
-                    
-                    if check_id:
-                        if check_id in recent_processed_ids:
-                            continue # Skip duplicate trigger
-                        recent_processed_ids.append(check_id)
-                    # ---------------------------
-
-                    if (message_trigger or message_payload) and not is_image_gen_round:
-                        trigger_content = message_payload['content'] if message_payload else message_trigger.clean_content
-                        content_lower = trigger_content.lower()
-                        
-                        image_prefixes = ("!image", "!imagine")
-                        if any(content_lower.startswith(p) for p in image_prefixes):
-                            # Detection is now prefix-based only
-                            is_image_gen_round = True
-                            used_prefix = next((p for p in image_prefixes if content_lower.startswith(p)), "!image")
-                            image_gen_prompt = trigger_content[len(used_prefix):].strip()
-                            image_gen_anchor_message = message_trigger or message_payload
-
-                    if message_trigger or message_payload:
-                        is_child_mention = message_payload is not None
-                        trigger_obj = message_payload if is_child_mention else message_trigger
-                        
-                        triggering_user_id = trigger_obj['author_id'] if is_child_mention else trigger_obj.author.id
-                        author_name = trigger_obj['author_name'] if is_child_mention else trigger_obj.author.display_name
-                        if round_author_name == "A user": round_author_name = author_name
-                        
-                        reply_context = ""
-                        if is_child_mention and trigger_obj.get('replied_to'):
-                            reply_context = "[Replying to a previous message]"
-                        elif message_trigger:
-                            reply_context = await self._resolve_reply_context(message_trigger)
-
-                        content = trigger_obj['content'] if is_child_mention else trigger_obj.clean_content
-                        
-                        raw_att_list = trigger_obj['attachments'] if is_child_mention else trigger_obj.attachments
-                        # Shared client: _process_text_attachments sets its own
-                        # per-request timeout, so nothing is lost by not owning one.
-                        text_att_content = await self.cog.media_service._process_text_attachments(
-                            raw_att_list, get_shared_client()
-                        )
-                        
-                        if text_att_content:
-                            content = f"{content}\n\n{text_att_content}"
-
-                        content = f"{reply_context}\n{content}" if reply_context else content
-                        
-                        # [NEW] URL Context Logic: Enforce Profile Setting & Separation
-                        any_url_enabled = False
-                        any_url_rag = False
-                        for p in session['profiles']:
-                            p_index = self.cog.profile_manager._get_user_index(p['owner_id'])
-                            p_is_b = p['profile_name'] in p_index.get("borrowed", [])
-                            p_settings = self.cog.profile_manager._get_profile_config(p['owner_id'], p['profile_name'], p_is_b) or {}
-                            
-                            u_mode = p_settings.get("url_mode", "off")
-                            if "url_mode" not in p_settings:
-                                u_mode = "rag" if p_settings.get("url_fetching_enabled", False) else "off"
-                                
-                            if u_mode != "off":
-                                any_url_enabled = True
-                            if u_mode == "rag":
-                                any_url_rag = True
-                        
-                        url_text_content = None
-                        trigger_media_parts = []
-                        
-                        if any_url_enabled and any_url_rag:
-                            # Defer URL fetching until after placeholder is sent
-                            pending_url_fetches.append({
-                                "content": content,
-                                "guild_id": trigger_obj['guild_id'] if is_child_mention else trigger_obj.guild.id,
-                                "turn_data_index": len(new_round_turn_data)
-                            })
-
-                        # [NEW] Localized User Timestamp Logic
-                        u_index_author = self.cog.profile_manager._get_user_index(triggering_user_id)
-                        u_prof_author = self.cog.session_manager._get_active_user_profile_name_for_channel(triggering_user_id, channel_id)
-                        u_is_b_author = u_prof_author in u_index_author.get("borrowed", [])
-                        u_sett_author = self.cog.profile_manager._get_profile_config(triggering_user_id, u_prof_author, u_is_b_author) or {}
-                        author_tz = u_sett_author.get("timezone", "UTC")
-                        user_hash = _get_user_hash(triggering_user_id)
-
-                        created_at = datetime.datetime.now(datetime.timezone.utc) if is_child_mention else trigger_obj.created_at
-                        user_line = _format_history_entry(author_name, created_at, content, author_tz, entity_id=user_hash)
-                        
-                        turn_id = str(uuid.uuid4())
-                        trigger_id = trigger_obj['id'] if is_child_mention else trigger_obj.id
-                        
-                        turn_object = {
-                            "turn_id": turn_id, 
-                            "is_user": True,
-                            "speaker_pid": str(triggering_user_id),
-                            "message_ids": [trigger_id],
-                            "content": user_line
-                        }
-                        if url_text_content:
-                            # Clear any previous URL context from the log to make the new one exclusive
-                            for turn in session.get("unified_log", []):
-                                if "url_context" in turn:
-                                    del turn["url_context"]
-                            turn_object["url_context"] = url_text_content
-                            
-                        session.setdefault("unified_log", []).append(turn_object)
-                        
-                        if pending_url_fetches and pending_url_fetches[-1]["turn_data_index"] == len(new_round_turn_data):
-                            pending_url_fetches[-1]["turn_object"] = turn_object
-
-                        # [NEW] Immediate persistence for user turns
-                        await self.cog.session_manager._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
-                        
-                        # Initialize list for standard message attachments/reply images
-                        new_message_parts = []
-                        
-                        # --- Logic to fetch image from replied-to message ---
-                        msg_for_ref = message_trigger
-                        if not msg_for_ref and message_payload:
-                            try:
-                                # For child bots, we only have payload, so fetch the discord.Message
-                                r_ch = self.cog.bot.get_channel(message_payload['channel_id'])
-                                if r_ch:
-                                    msg_for_ref = await r_ch.fetch_message(message_payload['id'])
-                            except Exception: pass
-
-                        if msg_for_ref and msg_for_ref.reference:
-                            ref_img = None 
-                            try:
-                                ref_msg = msg_for_ref.reference.resolved
-                                if not ref_msg:
-                                    r_ch = self.cog.bot.get_channel(msg_for_ref.reference.channel_id)
-                                    if r_ch:
-                                        ref_msg = await r_ch.fetch_message(msg_for_ref.reference.message_id)
-                                
-                                if ref_msg and ref_msg.attachments:
-                                    # Find the first image/audio/video attachment in the referenced message
-                                    ref_media = next((a for a in ref_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))), None)
-                                    if ref_media:
-                                        new_message_parts.append({"url": ref_media.url, "mime_type": ref_media.content_type})
-                            except Exception as e:
-                                print(f"Error fetching replied media: {e}")
-
-                        attachments = trigger_obj['attachments'] if is_child_mention else [
-                            a for a in trigger_obj.attachments 
-                            if a.content_type and (
-                                a.content_type.startswith("image/") or 
-                                a.content_type.startswith("audio/") or 
-                                a.content_type.startswith("video/")
-                            )
-                        ]
-
-                        if attachments:
-                            att_tags = []
-                            for attachment in attachments:
-                                try:
-                                    attachment_url = attachment['url'] if is_child_mention else attachment.url
-                                    fname = attachment.get('filename', 'attachment.png') if is_child_mention and isinstance(attachment, dict) else getattr(attachment, 'filename', 'attachment.png')
-                                    
-                                    ctype = "image/png"
-                                    if not is_child_mention and attachment.content_type:
-                                        ctype = attachment.content_type
-                                    elif is_child_mention and isinstance(attachment, dict):
-                                        ctype = attachment.get('content_type', "image/png")
-                                    
-                                    new_message_parts.append({"url": attachment_url, "mime_type": ctype})
-                                    att_tags.append(f"[Attached Image: {fname}]")
-                                except Exception as e:
-                                    print(f"Failed to process media attachment in multi-profile trigger: {e}")
-                            
-                            if att_tags:
-                                content = f"{' '.join(att_tags)}\n{content}".strip()
-                                user_line = _format_history_entry(author_name, created_at, content, author_tz, entity_id=user_hash)
-                                turn_object["content"] = user_line
-
-                        # Combine standard attachments with URL-extracted media
-                        trigger_media_parts.extend(new_message_parts)
-                        
-                        # Store raw components for gating logic
-                        new_round_turn_data.append((user_line, url_text_content, trigger_media_parts))
-
-                        if triggering_user_id in self.cog.debug_users:
-                            try:
-                                user_to_dm = self.cog.bot.get_user(triggering_user_id)
-                                if user_to_dm:
-                                    # Create a temporary debug obj
-                                    debug_parts = [user_line]
-                                    if url_text_content: debug_parts.append(url_text_content)
-                                    debug_parts.extend(trigger_media_parts)
-                                    debug_obj = {'role': 'user', 'parts': debug_parts}
-                                    
-                                    debug_message = _format_debug_prompt([debug_obj])
-                                    await user_to_dm.send(debug_message)
-                            except Exception as e:
-                                print(f"Failed to send user turn debug DM to user {triggering_user_id}: {e}")
-
-                    elif reaction_trigger and i == 0:
-                        triggering_user_id = reaction_trigger.user_id
-                        user_obj = self.cog.bot.get_user(triggering_user_id)
-                        if user_obj:
-                            round_author_name = user_obj.display_name
+                (is_image_gen_round, image_gen_prompt, starting_profile_override,
+                 round_author_name, triggering_user_id) = await self._collect_round_triggers(
+                    session, session_type, channel_id, all_triggers_for_round,
+                    new_round_turn_data, pending_url_fetches, recent_processed_ids,
+                    is_image_gen_round, image_gen_prompt, starting_profile_override,
+                    round_author_name, triggering_user_id,
+                )
 
                 for content_obj in new_round_turn_data:
                     pass
@@ -617,11 +371,43 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         if trigger is not None: session['task_queue'].task_done()
                     continue
 
+                # --- Age-restriction gate, applied before any feedback is dispatched ---
+                # The per-participant loop below re-checks this and skips the turn, but the
+                # placeholder and typing indicator are dispatched *here*, so a blocked
+                # profile used to flash its emoji or a "typing..." bubble and then fall
+                # silent. Worse, profile_order[0] could itself be blocked, so the placeholder
+                # wore the name and avatar of a profile that was never going to speak.
+                # Filtering first also collapses the refusal notice to one per profile per
+                # round instead of one per turn.
+                blocked_participants = [
+                    p for p in profile_order
+                    if not self.cog.profile_manager._check_unrestricted_safety_policy(
+                        p['owner_id'], p['profile_name'], channel)
+                ]
+                if blocked_participants:
+                    profile_order = [p for p in profile_order if p not in blocked_participants]
+                    seen_blocked = set()
+                    for p in blocked_participants:
+                        key = (p['owner_id'], p['profile_name'])
+                        if key in seen_blocked:
+                            continue
+                        seen_blocked.add(key)
+                        await self._send_channel_message(
+                            channel,
+                            f"[System Notice: '{p['profile_name']}' cannot respond. Profiles with "
+                            "'Unrestricted 18+' safety are only permitted in age-restricted channels.]")
+
+                if not profile_order:
+                    for trigger in all_triggers_for_round:
+                        if trigger is not None: session['task_queue'].task_done()
+                    continue
+
                 # --- Synchronised Feedback Step ---
                 # Hoisted to here, directly after the channel and API-key guards. The three
                 # things a placeholder needs — a resolved channel, a valid key, and
                 # profile_order[0] for the webhook name and avatar — are all settled by this
-                # point, and nothing between here and generation can decide not to respond.
+                # point, and the age-restriction filter above has already removed every
+                # participant that would decline to respond.
                 # It previously sat below the anchor-message resolution, so the user waited on
                 # a channel.fetch_message round trip before seeing any feedback at all.
                 first_participant = profile_order[0] if profile_order else None
@@ -748,8 +534,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             )[-(g_stm_capped * 2):]
 
                         # Safety Logic for Grounding
-                        g_safety_level = g_profile_settings.get('safety_level')
-                        g_dynamic_safety_settings = _resolve_safety_settings(g_safety_level)
+                        g_dynamic_safety_settings = _resolve_safety_settings(channel, g_profile_settings)
 
                         is_for_image_flag = is_image_gen_round
                         grounding_query = image_gen_prompt if is_image_gen_round else initial_round_context
@@ -839,160 +624,14 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                 # --- NEW IMAGE GENERATION LOGIC ---
                 if is_image_gen_round and generator_profile_key:
-                    gen_owner_id, gen_profile_name = generator_profile_key
-                    gen_idx = self.cog.profile_manager._get_user_index(gen_owner_id)
-                    gen_is_b = gen_profile_name in gen_idx.get("borrowed", [])
-                    gen_cfg = self.cog.profile_manager._get_profile_config(gen_owner_id, gen_profile_name, gen_is_b) or {}
-                    
-                    if gen_cfg.get("image_generation_enabled", False):
-                        # Hoisted out of the try so the finally below can still read it when
-                        # generation raises: _generate_with_heartbeat mutates the container it
-                        # is handed, so a placeholder it created is recorded there even on the
-                        # error path.
-                        image_state_container = None
-                        try:
-                            api_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id)
-                            if not api_key: raise ValueError("Server API key not configured.")
-                            
-                            img_model_name = gen_cfg.get("image_generation_model", "GOOGLE/gemini-2.5-flash-image")
-                            if img_model_name.upper().startswith("GOOGLE/"): img_model_name = img_model_name[7:]
-                            
-                            system_instruction = self.cog.media_service._get_image_gen_system_instruction(gen_owner_id, gen_profile_name)
-                            
-                            # Combine prompt with appearance if needed
-                            appearance_text = ""
-                            source_prompts = self.cog.profile_manager._get_profile_prompts(gen_owner_id, gen_profile_name) or {}
-                            if source_prompts:
-                                appearance_lines = source_prompts.get("persona", {}).get("appearance", [])
-                                appearance_text = "\n".join([self.cog.storage_manager._decrypt_data(line) for line in appearance_lines])
-                            
-                            final_prompt_text = image_gen_prompt
-                            if appearance_text.strip():
-                                prompt_lower = image_gen_prompt.lower()
-                                second_person_pronouns = ["you", "your", "yourself", "u", "ur"]
-                                if any(pronoun in prompt_lower.split() for pronoun in second_person_pronouns) or \
-                                   generator_display_name.lower() in prompt_lower or \
-                                   gen_profile_name.lower() in prompt_lower:
-                                    appearance_template = self.cog.global_prompts.get("IMAGE_APPEARANCE", DEFAULT_IMAGE_APPEARANCE)
-                                    final_prompt_text = appearance_template.format(appearance=appearance_text.strip(), prompt=image_gen_prompt)
-                            
-                            ref_images = []
-                            for _, _, turn_media in new_round_turn_data:
-                                for media in turn_media:
-                                    if media.get("mime_type", "").startswith("image/"):
-                                        ref_images.append(media)
-                            
-                            parts = [final_prompt_text]
-                            for ref in ref_images[:10]:
-                                parts.append({"url": ref["url"], "mime_type": ref.get("mime_type", "image/png")})
-
-                            # Determine safety
-                            safety_level_str = gen_cfg.get("safety_level")
-                            dynamic_safety_settings = _resolve_safety_settings(safety_level_str)
-
-                            image_model = GoogleGenAIModel(
-                                api_key=api_key,
-                                model_name=img_model_name,
-                                system_instruction=system_instruction,
-                                safety_settings=dynamic_safety_settings
-                            )
-                            
-                            status = "api_error"
-
-                            # Image generation is the slowest call in the system (tens of
-                            # seconds) and was the one path with no heartbeat: the placeholder
-                            # created above just sat as a static emoji until the image landed.
-                            # Resolve the placeholder id first so _generate_with_heartbeat has
-                            # something to edit. Awaiting feedback_task here is safe — it is an
-                            # asyncio.Task, so the later await in the participant loop returns
-                            # the same cached result rather than re-running it.
-                            img_msg_a_id = None
-                            if feedback_task is not None:
-                                try:
-                                    fb_result = await feedback_task
-                                    if fb_result:
-                                        if first_participant and first_participant.get('method') == 'child_bot':
-                                            img_msg_a_id = fb_result
-                                        else:
-                                            img_msg_a_id = fb_result[0].id
-                                except Exception as e:
-                                    print(f"Image-gen feedback task error: {e}")
-
-                            gen_app_name, gen_app_avatar = self._resolve_appearance_data(gen_owner_id, gen_profile_name)
-                            image_state_container = {
-                                'msg_a_id': img_msg_a_id,
-                                'msg_b_id': None,
-                                'app_name': gen_app_name,
-                                'app_avatar': gen_app_avatar,
-                                'message_type': "text",
-                                'custom_emoji': gen_cfg.get("placeholder_emoji") or PLACEHOLDER_EMOJI,
-                            }
-
-                            response, image_state_container = await self._generate_with_heartbeat(
-                                image_model,
-                                [{'role': 'user', 'parts': parts}],
-                                None,
-                                channel,
-                                first_participant,
-                                img_msg_a_id,
-                                app_name=gen_app_name,
-                                app_avatar=gen_app_avatar,
-                                existing_state=image_state_container,
-                            )
-                            status = "blocked_by_safety" if not response.candidates else "success"
-                            
-                            if not response.candidates:
-                                reason = "Safety Filter"
-                                if response.prompt_feedback and response.prompt_feedback.block_reason: 
-                                    reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
-                                image_gen_error_msg = f"the safety filter ({reason})"
-                            else:
-                                candidate = response.candidates[0]
-                                if candidate.finish_reason.name != 'STOP':
-                                    image_gen_error_msg = f"process stopped: {candidate.finish_reason.name.replace('_', ' ').title()}"
-                                else:
-                                    img_bytes = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
-                                    if img_bytes:
-                                        def _write_img(data=img_bytes):
-                                            import tempfile
-                                            fd, path = tempfile.mkstemp(suffix=".png")
-                                            with os.fdopen(fd, 'wb') as f:
-                                                f.write(data)
-                                            return path
-                                        generated_image_path_for_round = await asyncio.to_thread(_write_img)
-                                        # From here the temp file is the only carrier the round
-                                        # needs — the media part, the discord.File, and the
-                                        # re-read on the send path all go through the path. Drop
-                                        # the in-RAM copies now rather than at end of round:
-                                        # these are multi-megabyte and would otherwise stay
-                                        # resident through every participant's turn.
-                                        img_bytes = None
-                                        _write_img = None
-                                    else:
-                                        image_gen_error_msg = "no image data returned"
-                                        
-                            self.cog._log_api_call(user_id=session.get('owner_id', 0), guild_id=channel.guild.id, context="image_generation_multi", model_used=image_model, status=status)
-                                
-                        except Exception as e:
-                            image_gen_error_msg = _format_api_error(e)
-                            print(f"Error generating image in multi-profile round: {e}")
-                        finally:
-                            # The heartbeat spawns its own placeholder when the generator is a
-                            # child bot that sends none of its own — in that case feedback_task
-                            # is None, so this id exists nowhere else and the participant loop
-                            # below would never delete it, leaving a stranded "Still
-                            # generating..." message in the channel.
-                            if image_state_container:
-                                image_gen_placeholder_id = image_state_container.get('msg_a_id')
-
-                            # The image response body carries the base64 payload (~1.33x the
-                            # image) and _RestView's memoised decode of it (~1x). Nothing needs
-                            # either once the bytes are on disk, but both are reachable from
-                            # this frame's locals and would otherwise stay resident for the
-                            # entire participant loop.
-                            response = None
-                            candidate = None
-                            image_state_container = None
+                    (generated_image_path_for_round,
+                     image_gen_placeholder_id,
+                     image_gen_error_msg) = await self._run_image_generation_round(
+                        session, channel, generator_profile_key, image_gen_prompt,
+                        generator_display_name, first_participant, feedback_task,
+                        new_round_turn_data, generated_image_path_for_round,
+                        image_gen_placeholder_id, image_gen_error_msg,
+                    )
 
                 for i, participant in enumerate(profile_order):
                     turn_warnings = []
@@ -1086,12 +725,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     # UnboundLocalError and masked the real error.
                     fallback_model_name = None
 
+                    # Backstop only. profile_order was filtered before the feedback step, so
+                    # this fires only if the channel's age-restricted flag is flipped mid-round.
                     if not self.cog.profile_manager._check_unrestricted_safety_policy(owner_id, profile_name, channel):
                         error_message = f"[System Notice: '{profile_name}' cannot respond. Profiles with 'Unrestricted 18+' safety are only permitted in age-restricted channels.]"
-                        
-                        # Send the message immediately, bypassing placeholders/typing for this turn
                         await self._send_channel_message(channel, error_message)
-
                         continue
 
                     user_index = self.cog.profile_manager._get_user_index(owner_id)
@@ -1271,31 +909,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             constraints_block = self.cog.global_prompts.get("NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS)
                             full_system_instruction += "\n\n" + constraints_block.format(constraints=critic_constraints)
 
-                        safety_level_str = p_settings.get('safety_level')
-
-                        dynamic_safety_settings = _resolve_safety_settings(safety_level_str)
-
-                        # Factory Logic
-                        actual_name = primary_model
-                        is_openrouter = False
-                        is_ollama = False
-                        
-                        if primary_model.startswith("OPENROUTER/"):
-                            actual_name = primary_model[11:]
-                            is_openrouter = True
-                        elif primary_model.startswith("OLLAMA/"):
-                            actual_name = primary_model[7:]
-                            is_ollama = True
-                        elif primary_model.startswith("GOOGLE/"):
-                            actual_name = primary_model[7:]
-                        elif "/" in primary_model or "grok" in primary_model.lower():
-                            # Heuristic for OpenRouter models without explicit prefix
-                            is_openrouter = True
+                        dynamic_safety_settings = _resolve_safety_settings(channel, p_settings)
 
                         model = None
                         warning_message = None
 
-                        # [FIXED] Pass thinking parameters to the model instance in the worker
+                        # Pass thinking parameters to the model instance in the worker
                         t_params_worker = {
                             "thinking_persistence": p_settings.get("thinking_persistence", 10),
                             "thinking_summary_visible": p_settings.get("thinking_summary_visible", "off"),
@@ -1320,29 +939,24 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             
                         model_tools = model_tools_list if model_tools_list else None
 
-                        if is_openrouter:
-                            or_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id, provider="openrouter")
-                            if or_key:
-                                # [FIXED] Passing thinking_params to OpenRouter constructor
-                                model = OpenRouterModel(actual_name, api_key=or_key, system_instruction=full_system_instruction, thinking_params=t_params_worker)
-                            else:
-                                warning_message = f"API Configuration Error: OpenRouter API Key missing for this server. Cannot load model '{primary_model}'."
-                        elif is_ollama:
-                            ollama_host = p_settings.get("ollama_host_url", OLLAMA_LOCAL_URL)
-                            model = OllamaModel(actual_name, api_url=ollama_host, system_instruction=full_system_instruction, thinking_params=t_params_worker)
-                        else:
-                            try:
-                                # [NEW] Pass thinking_params and tools here
-                                model = GoogleGenAIModel(
-                                    api_key=api_key, 
-                                    model_name=actual_name, 
-                                    system_instruction=full_system_instruction, 
-                                    safety_settings=dynamic_safety_settings,
-                                    thinking_params=t_params_worker,
-                                    tools=model_tools
-                                )
-                            except Exception as e:
-                                warning_message = f"Model Initialization Error: Failed to instantiate Google model '{actual_name}'. {e}"
+                        # Provider resolution goes through APIService._instantiate_model, the one
+                        # factory. The worker used to inline its own copy of the prefix parsing,
+                        # and the two had already drifted: the factory reads a slash-free name
+                        # containing "anthropic" as OpenRouter, this copy did not. The fallback
+                        # path below already calls the factory, so the same configured model
+                        # resolved to a different provider on the primary and fallback attempts.
+                        try:
+                            model = self.cog.api_service._instantiate_model(
+                                primary_model, channel.guild.id, triggering_user_id,
+                                full_system_instruction, dynamic_safety_settings,
+                                t_params_worker, model_tools, p_settings,
+                                openrouter_key_error=f"API Configuration Error: OpenRouter API Key missing for this server. Cannot load model '{primary_model}'.",
+                                google_key_error=f"API Configuration Error: Google API Key missing for this server. Cannot load model '{primary_model}'.",
+                            )
+                        except ValueError as e:
+                            warning_message = str(e)
+                        except Exception as e:
+                            warning_message = f"Model Initialization Error: Failed to instantiate model '{primary_model}'. {e}"
                         
                         session_key = (channel.id, owner_id, profile_name)
 

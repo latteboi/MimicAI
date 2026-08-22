@@ -1,0 +1,198 @@
+import os
+import asyncio
+
+from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE
+from ...utils.helpers import _format_api_error, _resolve_safety_settings
+from ...utils.memory_tuning import maybe_trim_malloc
+from ..api_service import GoogleGenAIModel
+
+
+class ImageRoundMixin:
+    """The single image generation a multi-profile round may run before its
+    participants speak, so the generated image is available to every turn.
+    """
+
+    async def _run_image_generation_round(
+        self, session, channel, generator_profile_key, image_gen_prompt,
+        generator_display_name, first_participant, feedback_task, new_round_turn_data,
+        generated_image_path_for_round=None, image_gen_placeholder_id=None, image_gen_error_msg=None,
+    ):
+        """Runs the round's one image generation and returns
+        (generated_image_path_for_round, image_gen_placeholder_id, image_gen_error_msg).
+
+        Lifted out of _multi_profile_worker rather than left inline: the response body
+        carries the base64 payload and its memoised decode, and while this ran in the
+        worker frame every one of those buffers stayed reachable for the whole
+        participant loop below it. The explicit teardown in the finally block is kept,
+        but returning from a frame of its own is what actually bounds their lifetime.
+
+        The three values are passed in and returned so a profile with image generation
+        disabled leaves the caller's state exactly as it found it.
+        """
+        gen_owner_id, gen_profile_name = generator_profile_key
+        gen_idx = self.cog.profile_manager._get_user_index(gen_owner_id)
+        gen_is_b = gen_profile_name in gen_idx.get("borrowed", [])
+        gen_cfg = self.cog.profile_manager._get_profile_config(gen_owner_id, gen_profile_name, gen_is_b) or {}
+
+        if not gen_cfg.get("image_generation_enabled", False):
+            return generated_image_path_for_round, image_gen_placeholder_id, image_gen_error_msg
+
+        # Hoisted out of the try so the finally below can still read it when
+        # generation raises: _generate_with_heartbeat mutates the container it
+        # is handed, so a placeholder it created is recorded there even on the
+        # error path.
+        image_state_container = None
+        try:
+            api_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id)
+            if not api_key: raise ValueError("Server API key not configured.")
+
+            img_model_name = gen_cfg.get("image_generation_model", "GOOGLE/gemini-2.5-flash-image")
+            if img_model_name.upper().startswith("GOOGLE/"): img_model_name = img_model_name[7:]
+
+            system_instruction = self.cog.media_service._get_image_gen_system_instruction(gen_owner_id, gen_profile_name)
+
+            # Combine prompt with appearance if needed
+            appearance_text = ""
+            source_prompts = self.cog.profile_manager._get_profile_prompts(gen_owner_id, gen_profile_name) or {}
+            if source_prompts:
+                appearance_lines = source_prompts.get("persona", {}).get("appearance", [])
+                appearance_text = "\n".join([self.cog.storage_manager._decrypt_data(line) for line in appearance_lines])
+
+            final_prompt_text = image_gen_prompt
+            if appearance_text.strip():
+                prompt_lower = image_gen_prompt.lower()
+                second_person_pronouns = ["you", "your", "yourself", "u", "ur"]
+                if any(pronoun in prompt_lower.split() for pronoun in second_person_pronouns) or \
+                   generator_display_name.lower() in prompt_lower or \
+                   gen_profile_name.lower() in prompt_lower:
+                    appearance_template = self.cog.global_prompts.get("IMAGE_APPEARANCE", DEFAULT_IMAGE_APPEARANCE)
+                    final_prompt_text = appearance_template.format(appearance=appearance_text.strip(), prompt=image_gen_prompt)
+
+            ref_images = []
+            for _, _, turn_media in new_round_turn_data:
+                for media in turn_media:
+                    if media.get("mime_type", "").startswith("image/"):
+                        ref_images.append(media)
+
+            parts = [final_prompt_text]
+            for ref in ref_images[:10]:
+                parts.append({"url": ref["url"], "mime_type": ref.get("mime_type", "image/png")})
+
+            # Determine safety
+            dynamic_safety_settings = _resolve_safety_settings(channel, gen_cfg)
+
+            image_model = GoogleGenAIModel(
+                api_key=api_key,
+                model_name=img_model_name,
+                system_instruction=system_instruction,
+                safety_settings=dynamic_safety_settings
+            )
+
+            status = "api_error"
+
+            # Image generation is the slowest call in the system (tens of
+            # seconds) and was the one path with no heartbeat: the placeholder
+            # created above just sat as a static emoji until the image landed.
+            # Resolve the placeholder id first so _generate_with_heartbeat has
+            # something to edit. Awaiting feedback_task here is safe — it is an
+            # asyncio.Task, so the later await in the participant loop returns
+            # the same cached result rather than re-running it.
+            img_msg_a_id = None
+            if feedback_task is not None:
+                try:
+                    fb_result = await feedback_task
+                    if fb_result:
+                        if first_participant and first_participant.get('method') == 'child_bot':
+                            img_msg_a_id = fb_result
+                        else:
+                            img_msg_a_id = fb_result[0].id
+                except Exception as e:
+                    print(f"Image-gen feedback task error: {e}")
+
+            gen_app_name, gen_app_avatar = self._resolve_appearance_data(gen_owner_id, gen_profile_name)
+            image_state_container = {
+                'msg_a_id': img_msg_a_id,
+                'msg_b_id': None,
+                'app_name': gen_app_name,
+                'app_avatar': gen_app_avatar,
+                'message_type': "text",
+                'custom_emoji': gen_cfg.get("placeholder_emoji") or PLACEHOLDER_EMOJI,
+            }
+
+            response, image_state_container = await self._generate_with_heartbeat(
+                image_model,
+                [{'role': 'user', 'parts': parts}],
+                None,
+                channel,
+                first_participant,
+                img_msg_a_id,
+                app_name=gen_app_name,
+                app_avatar=gen_app_avatar,
+                existing_state=image_state_container,
+            )
+            status = "blocked_by_safety" if not response.candidates else "success"
+
+            if not response.candidates:
+                reason = "Safety Filter"
+                if response.prompt_feedback and response.prompt_feedback.block_reason: 
+                    reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
+                image_gen_error_msg = f"the safety filter ({reason})"
+            else:
+                candidate = response.candidates[0]
+                if candidate.finish_reason.name != 'STOP':
+                    image_gen_error_msg = f"process stopped: {candidate.finish_reason.name.replace('_', ' ').title()}"
+                else:
+                    img_bytes = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
+                    if img_bytes:
+                        def _write_img(data=img_bytes):
+                            import tempfile
+                            fd, path = tempfile.mkstemp(suffix=".png")
+                            with os.fdopen(fd, 'wb') as f:
+                                f.write(data)
+                            return path
+                        generated_image_path_for_round = await asyncio.to_thread(_write_img)
+                        # From here the temp file is the only carrier the round
+                        # needs — the media part, the discord.File, and the
+                        # re-read on the send path all go through the path. Drop
+                        # the in-RAM copies now rather than at end of round:
+                        # these are multi-megabyte and would otherwise stay
+                        # resident through every participant's turn.
+                        img_bytes = None
+                        _write_img = None
+                    else:
+                        image_gen_error_msg = "no image data returned"
+
+            self.cog._log_api_call(user_id=session.get('owner_id', 0), guild_id=channel.guild.id, context="image_generation_multi", model_used=image_model, status=status)
+
+        except Exception as e:
+            image_gen_error_msg = _format_api_error(e)
+            print(f"Error generating image in multi-profile round: {e}")
+        finally:
+            # The heartbeat spawns its own placeholder when the generator is a
+            # child bot that sends none of its own — in that case feedback_task
+            # is None, so this id exists nowhere else and the participant loop
+            # below would never delete it, leaving a stranded "Still
+            # generating..." message in the channel.
+            if image_state_container:
+                image_gen_placeholder_id = image_state_container.get('msg_a_id')
+
+            # The image response body carries the base64 payload (~1.33x the
+            # image) and _RestView's memoised decode of it (~1x). Nothing needs
+            # either once the bytes are on disk, but both are reachable from
+            # this frame's locals and would otherwise stay resident for the
+            # entire participant loop.
+            response = None
+            candidate = None
+            image_state_container = None
+
+            # Those three, plus the wire body and the parsed base64 that
+            # GoogleRESTResponse dropped on the way here, are the largest run of
+            # frees the bot ever performs -- roughly 3.6x the generated image,
+            # measured. Freeing them only returns the pages to glibc's arenas;
+            # without this they sit there until some later call happens to reach
+            # the trim inside APIService._resolve_media_uri, which for a generated
+            # image is a whole round away. Rate-limited, so a round that also
+            # moves media through the File API still trims once, not twice.
+            maybe_trim_malloc()
+
+        return generated_image_path_for_round, image_gen_placeholder_id, image_gen_error_msg

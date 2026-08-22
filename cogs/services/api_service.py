@@ -1344,7 +1344,7 @@ class APIService:
         model_instance, model_init_error = None, True
         
         profile_data_for_safety = self.cog.profile_manager._get_profile_config(profile_owner_id_for_instructions, profile_name_for_instructions, is_borrowed) or {}
-        dynamic_safety_settings = _resolve_safety_settings(profile_data_for_safety.get("safety_level"))
+        dynamic_safety_settings = _resolve_safety_settings(channel, profile_data_for_safety)
 
         model_to_create = primary_model
         
@@ -1412,7 +1412,11 @@ class APIService:
         if not user_api_key and not or_key and not primary_model.upper().startswith("OLLAMA/"):
             return None, 0.0, 0.0, 0, "This feature requires a personal API key. Use `/settings` to add one.", None
         
-        safety_settings = _resolve_safety_settings(profile_data.get("safety_level"))
+        # Global chat runs in a DM, which can never be age-restricted -- and an
+        # adult-rated profile is refused from the feature outright. Passing the
+        # absent channel resolves to BLOCK_ONLY_HIGH, which is what this path
+        # already sent.
+        safety_settings = _resolve_safety_settings(None, profile_data)
 
         try:
             t_params = {

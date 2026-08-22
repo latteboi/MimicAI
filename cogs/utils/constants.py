@@ -55,6 +55,27 @@ class DefaultConfigNamespace:
         self.GEMINI_TOP_K = 0
         self.TRAINING_CONTEXT_SIZE = 5
         self.TRAINING_RELEVANCE_THRESHOLD = 0.1
+
+        # Content classification (Phase 3).
+        # CONTENT_CLASSIFY_FAIL_CLOSED decides what an *unclassified* profile may do
+        # when the classifier could not run -- no API key, provider outage, retries
+        # exhausted. False (default) treats it as Restricted, so the bot stays usable
+        # and the channel content-policy note plus the provider thresholds still
+        # apply. True confines it to age-restricted channels until a verdict lands,
+        # which is the safer posture for a public instance whose operator carries the
+        # liability, at the cost of new profiles going silent during an outage.
+        self.CONTENT_CLASSIFY_FAIL_CLOSED = False
+        # Characters of persona + instructions sent to the classifier. Bounds cost on
+        # a profile with a very long persona; the tail of one is near-always more of
+        # the same register.
+        self.CONTENT_CLASSIFY_MAX_CHARS = 6000
+        self.CONTENT_CLASSIFY_MAX_ATTEMPTS = 3
+        # How long a profile that failed classification is left alone. Without this,
+        # every dashboard render re-queued a profile that could not be classified --
+        # a key on cooldown or none configured -- and burned the whole retry budget
+        # again each time.
+        self.CONTENT_CLASSIFY_RETRY_AFTER = 1800
+
         self.MIMIC_NEWS = ""
 
 defaultConfig = DefaultConfigNamespace()
@@ -197,6 +218,59 @@ DEFAULT_AUTO_MODERATOR_PROMPT = (
     "Analyze all provided content (profile name, display name, and image) together. Respond with ONLY a single word: SAFE or UNSAFE."
 )
 
+# Phase 3 content classifier. Deliberately NOT the same prompt as AUTO_MODERATOR:
+# that one answers "may this appear in a global public directory?", which is a
+# stricter and different question than "does this need an 18+ channel?". Merging
+# them would either over-block ordinary profiles or under-block published ones.
+#
+# The first word of the reply is the verdict, so parsing stays trivial; anything
+# after the colon becomes the reason shown to the profile's owner.
+DEFAULT_CONTENT_CLASSIFIER_PROMPT = (
+    "You classify a roleplay character profile for a Discord bot. Decide whether the "
+    "character, as written, is intended for adult audiences and should therefore be "
+    "confined to age-restricted (18+) channels.\n\n"
+    "Answer ADULT if the profile does any of the following:\n"
+    "- Directs or invites explicit sexual content, or describes sexual acts in graphic detail.\n"
+    "- Is defined primarily around sexual availability, fetish content, or erotic roleplay.\n"
+    "- Directs graphic gore, torture, or sexualised violence.\n"
+    "- Sexualises a character described as a minor, in any framing.\n\n"
+    "Answer GENERAL for everything else, including:\n"
+    "- Romance, flirtation, attraction, innuendo and suggestive humour.\n"
+    "- Dark, violent, horror, morally grey or villainous characters, where the violence "
+    "is narrative rather than gratuitous physical detail.\n"
+    "- Rude, abrasive, profane or unpleasant personalities.\n"
+    "- Suggestive artwork, revealing outfits, or an attractive appearance.\n\n"
+    "Judge what the profile is FOR, not whether individual words are coarse. A blunt or "
+    "crude character is GENERAL; a character written to produce explicit content is ADULT. "
+    "When genuinely balanced, answer GENERAL.\n\n"
+    "Reply with exactly one line and nothing else: the single word GENERAL or ADULT, "
+    "then a colon, then one category code from this list and nothing more.\n"
+    "  SEXUAL_EXPLICIT   -- explicit sexual content or graphic sexual acts\n"
+    "  SEXUAL_FOCUS      -- the persona is built around sexual availability, fetish or erotica\n"
+    "  GRAPHIC_VIOLENCE  -- gore, torture or sexualised violence\n"
+    "  MINOR_SAFETY      -- sexualises a character described as a minor\n"
+    "  NONE              -- use this for GENERAL\n"
+    "Never quote, paraphrase or describe the profile itself. The category code is the "
+    "entire reason; do not add words to it.\n"
+    "Example: ADULT: SEXUAL_EXPLICIT\n"
+    "Example: GENERAL: NONE"
+)
+
+# What a stored content_rating reason renders as. The classifier is constrained to
+# return one of these codes rather than prose, and the code is what gets stored --
+# a free-text reason quoted the persona back at whoever opened the dashboard, which
+# is both needlessly specific about someone's private profile and awkward to read
+# over a moderator's shoulder. Anything unrecognised -- a reason written before this
+# changed, or a model that ignored the format -- falls back to the generic label,
+# so no unvetted model text ever reaches the embed.
+CONTENT_RATING_REASON_LABELS = {
+    "SEXUAL_EXPLICIT": "Explicit sexual content",
+    "SEXUAL_FOCUS": "Sexually-focused persona",
+    "GRAPHIC_VIOLENCE": "Graphic violence",
+    "MINOR_SAFETY": "Minor safety",
+}
+CONTENT_RATING_REASON_FALLBACK = "Adult themes"
+
 DEFAULT_ANTI_REPETITION_PROMPT = (
     "You are a linguistic pattern analyzer for the character '{char_name}'.\n"
     "Your task is to detect repetitive structural and semantic patterns across the provided transcript.\n\n"
@@ -333,8 +407,9 @@ class HarmCategory:
 # which returns () for an enum and still returns () for this plain class — so those
 # dicts were empty and the per-profile safety level never reached the API. Fixed
 # 2026-08-19 to use this tuple instead. See CLAUDE.md for the sites and the
-# consequence: unrestricted profiles now actually send BLOCK_NONE instead of silently
-# inheriting the API default.
+# consequence: the resolved thresholds now actually reach the API instead of
+# silently inheriting the default. (The input has since become the destination
+# channel rather than the profile -- see _resolve_safety_settings.)
 HARM_CATEGORIES = (
     HarmCategory.HARM_CATEGORY_HARASSMENT,
     HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -364,10 +439,10 @@ DEFAULT_TIME_CONTEXT = (
 )
 
 # Injected whenever the destination channel is NOT age-restricted, regardless of
-# the profile's own safety level. The per-profile level only decides *where* a
-# profile may run; this is the only part of the content system that shapes what
-# the model actually writes, and the only part that works on providers other
-# than Google -- OpenRouter and Ollama ignore safety_settings entirely.
+# the profile's content rating. The rating only decides *where* a profile may
+# run; this is the only part of the content system that shapes what the model
+# actually writes, and the only part that works on providers other than Google
+# -- OpenRouter and Ollama ignore safety_settings entirely.
 #
 # No placeholders -- used verbatim.
 DEFAULT_CONTENT_POLICY = (
@@ -433,13 +508,24 @@ DEFAULT_GROUNDING_RAG_PAYLOAD = (
     "<user_query>\n{query}\n</user_query>"
 )
 
-# User-facing labels for the two-value safety scheme that replaced the old
-# Low/Medium/High/Unrestricted cycle. 'unrestricted' keeps its exact former
-# wording so every error string, embed and doc that already says
-# "Unrestricted 18+" stays accurate.
-SAFETY_LEVEL_LABELS = {
-    "restricted": "Restricted",
-    "unrestricted": "Unrestricted 18+",
+# User-facing labels for the content rating, which absorbed the retired
+# safety_level field. A profile now carries exactly one of these verdicts, and
+# everything else -- where it may run, which provider thresholds apply, whether
+# it may be published -- is derived from it.
+CONTENT_RATING_LABELS = {
+    "general": "General",
+    "adult": "Adult 18+",
+    "exempt": "Exempt",
+    "unclassified": "Pending",
+}
+
+# What the rating means for placement, phrased as the consequence rather than as
+# a second setting -- the old "Restricted / Unrestricted 18+" wording read like a
+# level the owner could set independently, which is exactly the confusion the
+# merge removes.
+CHANNEL_ACCESS_LABELS = {
+    "restricted": "Any channel",
+    "unrestricted": "Age-restricted only",
 }
 
 DEFAULT_SAFETY_SETTINGS = {
@@ -511,10 +597,11 @@ DEFAULT_HELP_MODE_INJECTION = (
     "   ├── Tab 1: [Home] (Operational Actions)\n"
     "   │    ├── Action: Rename Profile (Change local database directory mask)\n"
     "   │    ├── Action: Duplicate Profile (Creates independent Class A fork)\n"
+    "   │    │      PID classes: A personal, B share-code borrow, C library borrow, X system\n"
     "   │    ├── Action: Share Profile (Generates 5-minute cryptographic Share Code)\n"
     "   │    ├── Action: Custom Error Message (Saves custom text for API failures)\n"
     "   │    ├── Action: Generation Visual (Sets placeholder emote & Child Bot placeholder toggle)\n"
-    "   │    ├── Action: Toggle Content Safety Level (Restricted <-> Unrestricted 18+)\n"
+    "   │    ├── Action: Declare Adult Content 18+ (Confines the profile to age-restricted channels)\n"
     "   │    └── Action: Delete Profile (Permanently purges file directories)\n"
     "   │\n"
     "   ├── Tab 2: [Persona] (Cognitive Configuration)\n"

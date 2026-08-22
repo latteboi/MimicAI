@@ -7,7 +7,7 @@ import uuid
 import time
 import asyncio
 from typing import TYPE_CHECKING, Optional
-from ..utils.helpers import _coerce_safety_level
+
 from .base_components import PageJumpModal, TimeoutCleanupMixin, build_pagination_controls, build_tab_nav_bar, compute_window_slice
 
 if TYPE_CHECKING:
@@ -176,17 +176,7 @@ class HubHomeView(HubBaseView):
     async def update_display(self):
         total_public = len(self.cog.public_profiles)
         
-        unique_creators = set()
-        for p_info in self.cog.public_profiles.values():
-            if isinstance(p_info, str) and ":" in p_info:
-                try:
-                    owner_id_str, _ = p_info.split(":", 1)
-                    unique_creators.add(int(owner_id_str))
-                except: pass
-            elif isinstance(p_info, dict):
-                owner_id = p_info.get("owner_id")
-                if owner_id:
-                    unique_creators.add(int(owner_id))
+        unique_creators = {d["owner_id"] for d in self.cog.profile_manager._iter_public_entries()}
         unique_creators_count = len(unique_creators)
         
         index = self.cog.profile_manager._get_user_index(self.user_id)
@@ -223,41 +213,7 @@ class HubPublicLibraryView(HubBaseView):
         self.setup_items()
 
     def _load_public_data(self):
-        raw_list = []
-        for p_id, p_info in self.cog.public_profiles.items():
-            if isinstance(p_info, str) and ":" in p_info:
-                try:
-                    owner_id_str, original_pid = p_info.split(":", 1)
-                    owner_id = int(owner_id_str)
-                    
-                    original_profile_name = "Unknown"
-                    published_at = 0
-                    
-                    name_path = os.path.join(self.cog.USERS_DIR, owner_id_str, "profiles", original_pid, "name.txt")
-                    if os.path.exists(name_path):
-                        with open(name_path, "r", encoding="utf-8") as nf:
-                            original_profile_name = nf.read().strip()
-                        # Use file modification time as a lightweight fallback for sorting
-                        published_at = os.path.getmtime(name_path)
-
-                    raw_list.append({
-                        "id": p_id,
-                        "owner_id": owner_id,
-                        "original_pid": original_pid,
-                        "profile_name": original_profile_name,
-                        "published_at": published_at
-                    })
-                except Exception as e:
-                    print(f"Error loading public entry {p_id}: {e}")
-            elif isinstance(p_info, dict):
-                raw_list.append({
-                    "id": p_id,
-                    "owner_id": p_info.get('owner_id'),
-                    "original_pid": p_info.get("original_pid"),
-                    "profile_name": p_info.get('original_profile_name', 'Unknown'),
-                    "published_at": p_info.get("published_at", 0)
-                })
-        
+        raw_list = list(self.cog.profile_manager._iter_public_entries())
         raw_list.sort(key=lambda x: x['published_at'], reverse=True)
         self.all_public = raw_list
 
@@ -572,19 +528,8 @@ class HubShareManagerView(HubBaseView):
 
     def _get_user_public_profiles(self):
         """Scans public_profiles for entries owned by this user, returning (name, is_locked) pairs."""
-        user_id_str = str(self.user_id)
-        result = []
-        for p_info in self.cog.public_profiles.values():
-            if isinstance(p_info, str) and ":" in p_info:
-                try:
-                    owner_id_str, original_pid = p_info.split(":", 1)
-                    if owner_id_str == user_id_str:
-                        p_name = self.cog.profile_manager._get_name_from_pid(self.user_id, original_pid)
-                        if p_name: result.append((p_name, False))
-                except: pass
-            elif isinstance(p_info, dict) and str(p_info.get("owner_id")) == user_id_str:
-                result.append((p_info.get('original_profile_name', 'Unknown'), p_info.get("status", "active") == "locked"))
-        return result
+        return [(d["profile_name"], d["status"] == "locked")
+                for d in self.cog.profile_manager._iter_public_entries(self.user_id)]
 
     def setup_items(self):
         for item in self.children[:]:
@@ -757,19 +702,14 @@ class HubShareManagerView(HubBaseView):
         analysis_message = None
         user_id_str = str(self.user_id)
         
-        current_public_set = set()
-        for p_info in self.cog.public_profiles.values():
-            if isinstance(p_info, str) and ":" in p_info:
-                try:
-                    owner_id_str, original_pid = p_info.split(":", 1)
-                    if owner_id_str == user_id_str:
-                        name_path = os.path.join(self.cog.USERS_DIR, owner_id_str, "profiles", original_pid, "name.txt")
-                        if os.path.exists(name_path):
-                            with open(name_path, "r", encoding="utf-8") as nf:
-                                current_public_set.add(nf.read().strip())
-                except: pass
-            elif isinstance(p_info, dict) and str(p_info.get("owner_id")) == user_id_str:
-                current_public_set.add(p_info['original_profile_name'])
+        # Names of everything this user already has published. Read through the
+        # normaliser: the old inline version resolved string entries via a
+        # name.txt that is never written, so this set came back empty and every
+        # already-public profile landed in `to_publish` -- re-running the paid
+        # moderator on it and, if it had since been set to 18+, reporting a
+        # failure for a profile that was published all along.
+        current_public_set = {d["profile_name"]
+                              for d in self.cog.profile_manager._iter_public_entries(self.user_id)}
         
         target_set = set(self.selected_profiles)
         to_publish = target_set - current_public_set
@@ -788,9 +728,19 @@ class HubShareManagerView(HubBaseView):
                 disp = appearance_data.get("custom_display_name") or name
                 ava = appearance_data.get("custom_avatar_url")
                 
-                p_data = self.cog.profile_manager._get_profile_config(self.user_id, name, False) or {}
-                if _coerce_safety_level(p_data.get("safety_level")) == "unrestricted":
-                    return name, False, "Safety Level is 'Unrestricted 18+'. Only 'Restricted' profiles can be published."
+                verdict, _ = self.cog.profile_manager._content_rating_state(self.user_id, name)
+                if verdict == "adult":
+                    return name, False, "Content Rating is 'Adult 18+'. Only 'General' profiles can be published."
+                if verdict not in ("general", "exempt"):
+                    # Publishing is a deliberate, non-hot-path action, so it is the
+                    # one place that refuses to proceed on an absent verdict rather
+                    # than falling through to CONTENT_CLASSIFY_FAIL_CLOSED. Listing a
+                    # profile the classifier has not judged is exactly what the
+                    # Public Library must not do. Queue the check on the way out so
+                    # retrying actually gets somewhere without a detour through the
+                    # dashboard; it no-ops if one is already pending or on cooldown.
+                    self.cog.profile_manager.schedule_content_classification(eff_owner, eff_name)
+                    return name, False, "This profile has not been classified yet. The check has been queued -- try publishing again shortly."
 
                 try:
                     is_safe, reason = await self.cog.profile_manager._is_profile_content_safe(self.user_id, name, disp, ava)
@@ -1002,4 +952,4 @@ class BorrowNameModal(ui.Modal, title="Name Your Borrowed Profile"):
             return
 
         await self.cog.profile_manager._accept_share_request(interaction, self.sharer_id, self.target_pid, self.fallback_name, desired_name, self.is_public_borrow)
-        await interaction.followup.send(f"✅ Successfully borrowed profile **{self.fallback_name}** and named it **{desired_name}**. You can now use it with `/profile swap`.", ephemeral=True)
+        await interaction.followup.send(f"✅ Successfully borrowed profile **{self.fallback_name}** and named it **{desired_name}**.", ephemeral=True)

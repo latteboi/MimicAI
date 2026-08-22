@@ -74,9 +74,12 @@ def setup_mimic():
     # NOTE: no Google SDK. Migration 2 replaced google-genai with a hand-rolled REST
     # adapter over httpx (see cogs/services/api_service.py), which removed 70 MB of
     # import baseline plus the websockets/requests/pydantic the SDK pulled in for Live
-    # API and Vertex paths this bot never touched. aiohttp stays — child_bot_manager
-    # imports it directly, and discord.py needs it regardless.
-    deps = ["discord.py", "orjson", "cryptography", "aiohttp", "httpx", "numpy", "python-dotenv", "Pillow", "tzdata", "zstandard"]
+    # API and Vertex paths this bot never touched. aiohttp is not listed either -- no
+    # module imports it directly any more; discord.py pulls it in transitively.
+    #
+    # This list is only a fallback for a checkout missing requirements.txt. That file
+    # is the source of truth, so any change here has to be mirrored there.
+    deps = ["discord.py", "orjson", "cryptography", "zstandard", "httpx", "numpy", "Pillow", "python-dotenv", "tzdata"]
     
     if os.path.exists("requirements.txt"):
         run_pip(venv_python, ["-r", "requirements.txt"])

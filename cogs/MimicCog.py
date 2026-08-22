@@ -1,52 +1,28 @@
-from .utils.constants import *
-from .services.api_service import OpenRouterModel, OllamaModel, GoogleGenAIModel
+from .utils.constants import (
+    ALLOWED_MODELS, CHANNEL_MODEL_CACHE_MAX_SIZE, COG_LOCK_FILE_PATH, DATA_DIR,
+    DEFAULT_PROFILE_GENERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS, DEFAULT_SYSTEM_INSTRUCTION,
+    FALLBACK_MODEL_NAME, LOCK_REFRESH_INTERVAL_SECONDS, LOCK_STALE_THRESHOLD_SECONDS,
+    MAX_MULTI_PROFILES, MOD_DATA_DIR, PRIMARY_MODEL_NAME, PUBLIC_PROFILES_DIR,
+    PURGED_MESSAGE_ID_CACHE_MAX_SIZE, PURGE_BUSY_WAIT_TIMEOUT_SECONDS, SERVERS_DIR,
+    SESSIONS_GLOBAL_DIR, USERS_DIR, defaultConfig, is_admin_or_owner_check,
+    is_owner_in_dm_check,
+)
+from .services.api_service import OpenRouterModel, GoogleGenAIModel
 from .listeners.event_listeners import EventListeners
-from .gui.base_components import (
-    build_pagination_controls, ConfigModal, ActionTextInputModal,
-    DropdownContentView, InviteView, BaseBulkProfileView,
-)
-from .gui.gui_data import (
-    EditLtmModal, AddLtmModal, AddTrainingExampleModal, EditTrainingExampleModal,
-    SearchDataModal, DataManageView, AnalyseExamplesModal,
-    PrivacyDashboardView, AccountDeleteModal, ExportPassphraseModal,
-    ImportPassphraseModal, BulkExportView,
-)
-from .gui.gui_hub import (
-    RedeemCodeModal, HubBaseView, HubHomeView,
-    HubPublicLibraryView, HubIncomingView, HubShareManagerView, HubCloningView,
-    RedeemCloneCodeModal, BorrowNameModal,
-)
+from .gui.base_components import ActionTextInputModal, DropdownContentView, InviteView
+from .gui.gui_data import PrivacyDashboardView, ImportPassphraseModal, BulkExportView
+from .gui.gui_hub import HubHomeView
 from .gui.gui_sessions import (
-    GlobalChatInputModal, GlobalChatQueueView, GlobalChatPlayView, CustomModelModal,
-    GlobalChatHistoryView, WhisperHistoryView, WhisperActionView, SessionPromptModal,
-    ReactivitySettingsModal, ProactivitySettingsModal, ResponseLimitModal,
-    SessionSwapListView, SessionView, SessionConfigView, WakewordsModal,
-    SessionAuditView,
+    GlobalChatPlayView, GlobalChatHistoryView, WhisperHistoryView, SessionSwapListView,
+    SessionView, SessionConfigView, SessionAuditView
 )
-from .gui.gui_settings import (
-    OllamaHostModal, SubmitAPIKeyModal, OverrideConfirmView, SettingsBaseView,
-    SettingsHomeView, SettingsAPIView, SettingsChildBotView, ChildBotCreateModal,
-    ParentActivityModal, ParentPresenceView, ShutdownConfirmView,
-)
-from .gui.gui_profiles import (
-    ProfileAdvancedParamsModal, ProfileDirectorDeskModal, ProfileSpeechSettingsModal,
-    ProfileManageView, EditUserProfilePersonaModal, EditUserProfileAIInstructionsModal,
-    ProfileParamsModal, ProfileTrainingParamsModal, ProfileThinkingParamsModal,
-    ProfileLTMParamsModal, ProfileLTMSummarizationModal, ProfileTypingSettingsModal,
-    ProfileImageGenSettingsModal, SingleProfileModelView, ModelApplyView,
-    UnifiedBulkTargetView, CustomTimezoneModal, BulkTimezoneView, SingleProfileTimezoneView,
-    ProfileGenerationVisualModal, BulkResetView, BulkDeleteView, AppearanceModal,
-    ProfileNeuroModal, BulkManageView,
-)
+from .gui.gui_settings import SettingsHomeView, ParentPresenceView, ShutdownConfirmView
+from .gui.gui_profiles import ProfileManageView, BulkManageView
 from .gui.gui_resolve import (
     autocorrect_profile, gather_owned_candidates, gather_participant_candidates,
     suggest_profile,
 )
-from .gui.gui_mod import (
-    ModBaseView, ModDocsCreateModal, ModDocsEditModal, ModDocsView, ModBlacklistModal,
-    ModBlacklistView, ModStatsView, ModProfilesModal, ModProfilesView, ModPromptModal,
-    ModPromptsView,
-)
+from .gui.gui_mod import ModStatsView
 from .managers.storage_manager import StorageManager
 from .managers.profile_manager import ProfileManager
 from .managers.session_manager import SessionManager
@@ -182,9 +158,27 @@ class MimicCog(commands.Cog, EventListeners):
         self.profile_manager._load_profile_shares()
         self.public_profiles: Dict[str, Dict[str, Any]] = {}
         self.profile_manager._load_public_profiles()
+        # Sweep tombstones once at boot. Deletion normally cascades, so a survivor
+        # here came from a crash mid-delete or an older build; left alone it renders
+        # in the hub as an unborrowable "Unknown" entry forever.
+        _pruned = self.profile_manager._prune_public_index()
+        if _pruned:
+            print(f"Public hub: pruned {len(_pruned)} orphaned entr"
+                  f"{'y' if len(_pruned) == 1 else 'ies'} "
+                  f"({', '.join(str(e['profile_name']) for e in _pruned[:10])}"
+                  f"{', ...' if len(_pruned) > 10 else ''})")
         self.child_bots: Dict[str, Dict[str, Any]] = {}
         self.child_bots_by_owner_profile: Dict[Tuple[int, str], str] = {}
         self.child_bot_manager._load_child_bots()
+
+        # Resolved channel access per (owner_id, profile_name), derived from the
+        # profile's content rating. The gate runs on the turn path and the uncached
+        # resolve reads up to two encrypted profile files; invalidated by
+        # ProfileManager._invalidate_content_rating.
+        self.content_rating_cache: LRUCache = LRUCache(max_size=512)
+        # Profiles queued for content classification, so a burst of edits collapses
+        # into one job each and a failed job can be retried with a bounded count.
+        self.pending_classifications: Dict[Tuple[int, str], int] = {}
 
         # LRU rather than plain dicts: keyed by (channel_id, owner_id, profile_name), these
         # otherwise grow for the life of the process. The two are written together and read
@@ -543,7 +537,6 @@ class MimicCog(commands.Cog, EventListeners):
                 return
                 
             if auth_mode == "passphrase":
-                from .gui.gui_data import ImportPassphraseModal
                 await interaction.response.send_modal(ImportPassphraseModal(self, file_bytes))
                 return
         except Exception as e:
@@ -700,7 +693,6 @@ class MimicCog(commands.Cog, EventListeners):
                 await interaction.followup.send("There is no active session in this channel.", ephemeral=True)
                 return
             
-            from .gui.gui_sessions import SessionSwapListView
             view = SessionSwapListView(self, interaction, session_data_idx)
             await interaction.followup.send(embed=view.embed, view=view, ephemeral=True)
             return
@@ -1589,7 +1581,7 @@ class MimicCog(commands.Cog, EventListeners):
                 "thinking_budget": p_config.get("thinking_budget", -1)
             }
             
-            d_safe = _resolve_safety_settings(p_config.get('safety_level'))
+            d_safe = _resolve_safety_settings(interaction.channel, p_config)
             
             primary_model = p_config.get("primary_model", "GOOGLE/gemini-2.5-flash-lite")
             fallback_model_name = p_config.get("fallback_model", "GOOGLE/gemini-2.5-flash-lite")

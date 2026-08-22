@@ -1,6 +1,7 @@
 import re
 import asyncio
 import platform
+import discord
 import signal
 import functools
 import datetime
@@ -17,36 +18,66 @@ from .constants import (
 )
 
 
-def _coerce_safety_level(raw: Any) -> str:
-    """Normalises a stored safety_level onto the two-value scheme.
+def _legacy_declared_adult(raw: Any) -> bool:
+    """True when a profile still carries the retired safety_level 18+ declaration.
 
-    Profiles written before the four-tier collapse still carry 'low', 'medium'
-    or 'high' on disk. Rather than migrate them, every read funnels through
-    here: only the literal 'unrestricted' survives, and everything else --
-    including a missing, None, or malformed value -- reads as 'restricted'.
-    Old files are rewritten naturally the next time something saves them, so
-    there is no boot sweep and no rewrite pass.
+    Migration only. `safety_level` was removed in favour of a single
+    `content_rating`, and profiles written before the merge still carry the old
+    field on disk -- 'unrestricted' from the two-value scheme, or 'low' /
+    'medium' / 'high' from the four-tier one before that. Only the literal
+    'unrestricted' ever meant 18+; every other value, including a missing, None
+    or malformed one, meant Restricted and needs no migration.
+
+    ProfileManager._migrate_legacy_safety_level folds the survivors into a
+    content_rating on read, so there is no boot sweep and no rewrite pass.
     """
-    return "unrestricted" if str(raw).strip().lower() == "unrestricted" else "restricted"
+    return str(raw).strip().lower() == "unrestricted"
 
 
-def _resolve_safety_settings(safety_level: Any) -> Dict[HarmCategory, HarmBlockThreshold]:
-    """Maps a profile's safety level onto the provider harm thresholds.
+def _channel_is_age_restricted(channel: Any) -> bool:
+    """True only when a resolved channel object is flagged age-restricted.
 
-    'unrestricted' profiles are already confined to age-restricted channels by
-    ProfileManager._check_unrestricted_safety_policy, so a provider filter would
-    only re-litigate a check that has already passed -- they get BLOCK_NONE.
-    Everything else keeps BLOCK_ONLY_HIGH, which is what the old 'low' default
-    resolved to, so no existing profile changes behaviour on this path.
-
-    This lived in six copy-pasted dicts (MimicCog, child_bot_manager,
-    media_service, api_service twice, generation/_shared) that had to be edited
-    in lockstep. It is defined once here, in utils, because two of those callers
-    sit outside services/generation and could not import the old location.
+    DMs, group channels, and anything the gateway cache could not resolve count
+    as not age-restricted -- the same direction
+    ProfileManager._check_unrestricted_safety_policy already fails in, so the
+    placement gate and the provider thresholds agree on every channel type.
     """
+    if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
+        return False
+    try:
+        return channel.is_nsfw()
+    except Exception:
+        return False
+
+
+def _resolve_safety_settings(channel: Any, profile_config: Optional[Dict[str, Any]] = None) -> Dict[HarmCategory, HarmBlockThreshold]:
+    """Maps the *destination channel* onto the provider harm thresholds.
+
+    This used to key off the profile's own safety_level, which diverged from the
+    placement gate in the worst possible direction: a profile the classifier
+    ruled 'adult' was confined to an age-restricted channel and *still* sent
+    BLOCK_ONLY_HIGH, so the provider filtered content the channel had already
+    been cleared for -- surfacing as empty candidates and a generic generation
+    failure. Keying off the channel makes the filter agree with the gate by
+    construction, and puts it on the same axis as the <content_policy> block
+    that prompt_builder injects for non-age-restricted channels.
+
+    An age-restricted channel only ever receives profiles the gate has already
+    cleared for it, so BLOCK_NONE re-litigates nothing. Everything else keeps
+    BLOCK_ONLY_HIGH, which is what the old 'low' default resolved to.
+
+    `profile_config` carries the one carve-out: a profile the bot owner marked
+    exempt runs unfiltered wherever it runs. Callers holding a borrowed
+    profile's local copy may not see the exemption, since it is only ever
+    written at the source -- that fails towards the stricter threshold, which is
+    the right direction.
+    """
+    rating = (profile_config or {}).get("content_rating") or {}
+    exempt = rating.get("verdict") == "exempt"
+
     threshold = (
         HarmBlockThreshold.BLOCK_NONE
-        if _coerce_safety_level(safety_level) == "unrestricted"
+        if exempt or _channel_is_age_restricted(channel)
         else HarmBlockThreshold.BLOCK_ONLY_HIGH
     )
     return {cat: threshold for cat in HARM_CATEGORIES}

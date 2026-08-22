@@ -479,12 +479,17 @@ class SessionManager:
         if session and session.get("profiles"):
             cleaned_any = False
             valid_profiles = []
+
+            # Once per distinct owner, not once per participant. This scan reads and
+            # decrypts every borrowed profile the owner has, so a five-participant
+            # session sharing one owner ran that whole sweep five times per
+            # hydration, on the event loop.
+            for owner_id in {p["owner_id"] for p in session["profiles"]}:
+                await self.cog.profile_manager._validate_and_clean_borrowed_profiles(owner_id)
+
             for p in list(session["profiles"]):
                 p_owner_id = p["owner_id"]
                 p_name = p["profile_name"]
-
-                # Proactively scan and clean up this specific owner's borrowed profiles
-                await self.cog.profile_manager._validate_and_clean_borrowed_profiles(p_owner_id)
 
                 # Verify if the profile continues to exist for the owner
                 p_index = self.cog.profile_manager._get_user_index(p_owner_id)
@@ -821,6 +826,15 @@ class SessionManager:
     async def setup_multi_profile_session(self, interaction: discord.Interaction, participants: List[Dict], session_prompt: Optional[str], session_mode: str, as_admin_scope: bool = False, audio_mode: str = "off"):
         user_id = interaction.user.id
         is_update = interaction.channel_id in self.cog.multi_profile_channels
+
+        # Verify each participant's content rating is still current before the
+        # session runs. Session setup is user-initiated and infrequent, which is why
+        # the staleness check lives here and not in the per-turn gate -- it decrypts
+        # the whole persona to hash it. Fire-and-forget: a stale verdict only ever
+        # errs toward the previous, stricter answer while the recheck lands.
+        for _p in {(p["owner_id"], p["profile_name"]) for p in participants}:
+            asyncio.create_task(
+                self.cog.profile_manager.verify_content_rating(_p[0], _p[1]))
 
         if is_update:
             session = self.cog.multi_profile_channels[interaction.channel_id]
