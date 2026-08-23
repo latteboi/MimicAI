@@ -1851,7 +1851,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                             summary_embedding = await self.cog.memory_manager._get_embedding(ltm_d, g_id, task_type="RETRIEVAL_DOCUMENT")
                                             if summary_embedding:
                                                 b64_emb = encode_embedding_b64(summary_embedding)
-                                                self.cog.memory_manager._add_ltm(o_id, p_name, ltm_d, b64_emb, g_id, t_user_id, r_author)
+                                                await self.cog.memory_manager._add_ltm(o_id, p_name, ltm_d, b64_emb, g_id, t_user_id, r_author)
                                                 
                                                 # Link LTM creation to the turn metadata for trace transparency
                                                 bot_pid = self.cog.profile_manager._get_pid_from_name_any(o_id, p_name)

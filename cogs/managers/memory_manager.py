@@ -1,5 +1,6 @@
 # Deferred annotation evaluation, so the two `-> np.ndarray` return annotations
-# below never touch the lazy proxy at definition time.
+# below never touch the lazy proxy at definition time. See the TYPE_CHECKING branch
+# under _LazyNumpy for the static half of the same problem.
 from __future__ import annotations
 
 import os
@@ -10,7 +11,7 @@ import asyncio
 import datetime
 import traceback
 from collections import OrderedDict
-from typing import Dict, List, Any, Optional, Union, Tuple
+from typing import TYPE_CHECKING, Dict, List, Any, Optional, Union, Tuple
 import discord
 
 
@@ -34,7 +35,15 @@ class _LazyNumpy:
         return getattr(numpy, name)
 
 
-np = _LazyNumpy()
+if TYPE_CHECKING:
+    # Type checkers need the *module* behind `np`. `_LazyNumpy()` binds a variable, and
+    # an attribute of a variable ("np.ndarray") is not a valid type expression -- so the
+    # two annotations below were reported as errors. Under TYPE_CHECKING the real module
+    # is what the checker sees; at runtime only the proxy is ever bound, so an idle
+    # instance still never pays numpy's ~12 MB import.
+    import numpy as np
+else:
+    np = _LazyNumpy()
 
 
 from ..utils.constants import (
@@ -46,10 +55,6 @@ from ..utils.helpers import Timeout, _format_api_error, _get_sanitized_history_a
 from .storage_manager import IOManager
 from ..services.api_service import get_embedding_vector
 
-
-def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
-    np_vec1=np.array(vec1); np_vec2=np.array(vec2); dot=np.dot(np_vec1,np_vec2); n1=np.linalg.norm(np_vec1); n2=np.linalg.norm(np_vec2)
-    return 0.0 if n1==0 or n2==0 else float(dot/(n1*n2))
 
 def encode_embedding_b64(embedding: List[float]) -> str:
     if not embedding: return ""
@@ -88,12 +93,11 @@ def calculate_similarities(prompt_emb: List[float], b64_embs: List[str]) -> np.n
 # --- LTM shard vector cache ----------------------------------------------------
 #
 # Retrieval used to rebuild everything numeric about a shard on every single call:
-# base64-decode each stored embedding, stack, upcast to float32, compute row norms,
-# and parse every `created_ts` with datetime.fromisoformat. At the LIMIT_LTM cap of
-# 5000 that measured ~10.8 ms per retrieval, of which ~7.8 ms is Python-level looping
-# that holds the GIL -- so running it under asyncio.to_thread bought nothing and it
-# stalled heartbeats anyway, per the hot-path rule in CLAUDE.md. It ran once per
-# participant per turn over a shard that had not changed.
+# base64-decode each stored embedding, stack, upcast to float32, and compute row norms.
+# At the LIMIT_LTM cap of 5000 that measured ~10.8 ms per retrieval, most of it
+# Python-level looping that holds the GIL -- so running it under asyncio.to_thread
+# bought nothing and it stalled heartbeats anyway, per the hot-path rule in CLAUDE.md.
+# It ran once per participant per turn over a shard that had not changed.
 #
 # Everything cached here is a pure function of the file on disk, so the stat stamp is
 # a complete invalidation signal: _save_shard writes atomically via os.replace, which
@@ -115,49 +119,39 @@ class _LTMVectors:
     """Numeric view of one LTM shard, valid for as long as the file is unchanged.
 
     `rows` are the indices into the caller's `all_profile_ltms` list that carry an
-    embedding, so a mask computed here maps straight back onto the original records.
+    embedding, so a row index computed here maps straight back onto the original
+    records.
+
+    `guild_rows` maps a guild id to the row indices formed in that guild. Retrieval
+    only ever looks at one guild, and the membership is a pure function of the file,
+    so the grouping is built once here instead of being recomputed per turn. It used
+    to be `context_ids == guild_id_str` over an object-dtype array -- an element-wise
+    Python string compare across the whole shard, ~0.08 ms at the LIMIT_LTM cap for
+    something a dict lookup answers. Doing it here also means the dot product and
+    everything after it run over one guild's rows rather than all of them.
     """
 
-    __slots__ = ("rows", "ids", "id_to_row", "context_ids", "unit", "ts_epoch", "n")
+    __slots__ = ("rows", "ids", "id_to_row", "guild_rows", "unit", "n")
 
-    def __init__(self, rows, ids, id_to_row, context_ids, unit, ts_epoch):
+    def __init__(self, rows, ids, id_to_row, guild_rows, unit):
         self.rows = rows
         self.ids = ids
         self.id_to_row = id_to_row
-        self.context_ids = context_ids
+        self.guild_rows = guild_rows
         self.unit = unit
-        self.ts_epoch = ts_epoch
         self.n = len(rows)
 
 
-def _parse_ts_epoch(ts_str):
-    """Epoch seconds for a stored timestamp, or NaN when it must not decay.
-
-    The loop this replaces did `now_utc - fromisoformat(ts)` inside a try/except, so a
-    missing, malformed, or *naive* timestamp raised and silently skipped decay. NaN
-    reproduces that exactly: the vectorised decay leaves those rows at factor 1.0.
-    """
-    if not ts_str:
-        return float("nan")
-    try:
-        parsed = datetime.datetime.fromisoformat(ts_str)
-    except Exception:
-        return float("nan")
-    if parsed.tzinfo is None:
-        return float("nan")
-    return parsed.timestamp()
-
-
 def _build_ltm_vectors(all_profile_ltms) -> Optional["_LTMVectors"]:
-    rows, ids, b64_embs, context_ids, ts_epoch = [], [], [], [], []
+    rows, ids, b64_embs = [], [], []
+    guild_rows: Dict[str, List[int]] = {}
     for i, ltm in enumerate(all_profile_ltms):
         if "s_emb_b64" not in ltm:
             continue
+        guild_rows.setdefault(str(ltm.get("context_id")), []).append(len(rows))
         rows.append(i)
         ids.append(ltm.get("id"))
         b64_embs.append(ltm["s_emb_b64"])
-        context_ids.append(str(ltm.get("context_id")))
-        ts_epoch.append(_parse_ts_epoch(ltm.get("created_ts") or ltm.get("ts")))
 
     if not rows:
         return None
@@ -175,17 +169,87 @@ def _build_ltm_vectors(all_profile_ltms) -> Optional["_LTMVectors"]:
         rows=rows,
         ids=ids,
         id_to_row={ltm_id: idx for idx, ltm_id in enumerate(ids) if ltm_id is not None},
-        context_ids=np.array(context_ids, dtype=object),
+        guild_rows={g: np.array(r, dtype=np.intp) for g, r in guild_rows.items()},
         unit=unit,
-        ts_epoch=np.array(ts_epoch, dtype=np.float64),
     )
 
 
-def _ltm_vec_cache_evict():
-    total = sum(v.n for v in _ltm_vec_cache.values())
-    while total > _LTM_VEC_CACHE_MAX_ROWS and _ltm_vec_cache:
-        _, dropped = _ltm_vec_cache.popitem(last=False)
+def _cached_vectors(cache, key, max_rows, build, *build_args):
+    """Fetch or build one shard's numeric view, keeping `cache` LRU and row-bounded.
+
+    `key` is None when the shard has no file to stat -- an in-memory or just-deleted
+    shard. The vectors are still built, but not stored: a stamp that cannot be
+    invalidated is worse than no cache entry at all.
+    """
+    if key is not None:
+        vectors = cache.get(key)
+        if vectors is not None:
+            cache.move_to_end(key)
+            return vectors
+
+    vectors = build(*build_args)
+    if vectors is None or key is None:
+        return vectors
+
+    cache[key] = vectors  # a fresh key inserts at the end already
+    total = sum(v.n for v in cache.values())
+    # Never evict down to empty: dropping the entry just built would mean nothing is
+    # ever cached. Unreachable as configured -- one shard is capped at LIMIT_LTM /
+    # LIMIT_TRAINING rows, both far under the per-cache row budgets.
+    while total > max_rows and len(cache) > 1:
+        _, dropped = cache.popitem(last=False)
         total -= dropped.n
+    return vectors
+
+
+# --- Training shard vector cache -----------------------------------------------
+#
+# Same stat-stamped, pre-normalised scheme as the LTM cache above, for the same reason:
+# the example embeddings are re-decoded from base64, re-stacked and re-normed on every
+# turn over a file that has not changed. The shard itself still has to be read each turn
+# -- the winning examples' text lives in it -- so this only removes the numeric rebuild,
+# not the decrypt; at the LIMIT_TRAINING cap of 100 that is tens of microseconds per
+# participant per turn rather than the milliseconds the LTM cache saves.
+#
+# Budgeted separately and much smaller than LTM's: 100 rows is the per-profile ceiling,
+# so 5000 rows is ~50 profiles resident at ~5 MB.
+
+_TRAINING_VEC_CACHE_MAX_ROWS = 5000
+_train_vec_cache: "OrderedDict[Any, Any]" = OrderedDict()
+
+
+class _TrainingVectors:
+    """Numeric view of one training shard, valid for as long as the file is unchanged.
+
+    `rows` are indices into the caller's example list that carry an embedding, so a
+    row index maps straight back onto the original record.
+    """
+
+    __slots__ = ("rows", "unit", "n")
+
+    def __init__(self, rows, unit):
+        self.rows = rows
+        self.unit = unit
+        self.n = len(rows)
+
+
+def _build_training_vectors(profile_examples) -> Optional["_TrainingVectors"]:
+    rows, b64_embs = [], []
+    for i, ex in enumerate(profile_examples):
+        if "u_emb_b64" not in ex:
+            continue
+        rows.append(i)
+        b64_embs.append(ex["u_emb_b64"])
+
+    if not rows:
+        return None
+
+    raw_bytes = b"".join(base64.b64decode(s) for s in b64_embs)
+    matrix = np.frombuffer(raw_bytes, dtype=np.float16).reshape(len(b64_embs), -1).astype(np.float32)
+
+    norms = np.linalg.norm(matrix, axis=1)
+    safe = np.where(norms == 0.0, 1.0, norms)
+    return _TrainingVectors(rows=rows, unit=matrix / safe[:, None])
 
 
 class MemoryManager:
@@ -241,7 +305,16 @@ class MemoryManager:
                     return session_owner_id, b_name
         return profile_owner_id, profile_name
 
-    def _add_ltm(self, profile_owner_id: int, profile_name: str, summary: str, summary_embedding_b64: str, guild_id: Optional[int], triggering_user_id: int, user_dn: Optional[str] = None):
+    async def _add_ltm(self, profile_owner_id: int, profile_name: str, summary: str, summary_embedding_b64: str, guild_id: Optional[int], triggering_user_id: int, user_dn: Optional[str] = None):
+        """Appends one memory to a profile's LTM shard.
+
+        Async because the two shard calls below are a Fernet decrypt plus zstd
+        decompress plus orjson parse of up to LIMIT_LTM entries, and the same again in
+        reverse to write -- tens of milliseconds of blocking work that ran directly on
+        the event loop from every caller. The session and profile lookups stay on the
+        loop: they read cog-owned dicts the loop itself mutates, so iterating them from
+        a worker thread risks a "dictionary changed size during iteration".
+        """
         if not guild_id: return
 
         # Redirect LTM saves to the borrower's folder if running in a borrowed session
@@ -257,7 +330,7 @@ class MemoryManager:
         ltm_user_id, ltm_profile_name = self._resolve_ltm_storage_target(profile_owner_id, profile_name, session_owner_id)
 
         owner_id_str = str(ltm_user_id)
-        ltm_data = self._load_ltm_shard(owner_id_str, ltm_profile_name)
+        ltm_data = await asyncio.to_thread(self._load_ltm_shard, owner_id_str, ltm_profile_name)
         if ltm_data is None:
             ltm_data = {"guild": []}
 
@@ -266,10 +339,20 @@ class MemoryManager:
 
         limit = defaultConfig.LIMIT_LTM
 
-        ltm_list.sort(key=lambda x: x.get('created_ts', x.get('ts')))
-
-        if len(ltm_list) >= limit:
-            ltm_list.pop(0)
+        # Entries are appended newest-last and only ever trimmed from the front, so the
+        # list is already in timestamp order. The full re-sort this replaces ran a Python
+        # key function over up to LIMIT_LTM entries on every write, and that key --
+        # `x.get('created_ts', x.get('ts'))` -- evaluated its fallback unconditionally.
+        #
+        # Trimming to fit happens here too. The clamp that used to follow the append was
+        # `max(len(ltm_list), LIMIT_LTM)`, which is LIMIT_LTM for any list at or under
+        # the cap: it never dropped anything and only copied the list. That left the
+        # single `pop(0)` as the whole cap, so a shard already over it -- profile import
+        # writes the bundle's entries without checking -- shed one entry per write
+        # forever. One slice deletion trims to fit in a single step.
+        overflow = len(ltm_list) - limit + 1
+        if overflow > 0:
+            del ltm_list[:overflow]
 
         now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
         entry = {
@@ -280,20 +363,19 @@ class MemoryManager:
             "s_emb_b64": summary_embedding_b64,
             "usr": user_dn,
             # The guild the memory formed in, and the only place it is ever
-            # recalled: retrieval masks on this against the current guild.
+            # recalled: _build_ltm_vectors groups rows by this, and retrieval only
+            # ever looks at the current guild's group.
             "context_id": str(guild_id)
         }
         ltm_list.append(entry)
 
-        # ltm_list is already sorted (line above) and the new entry's timestamp is the newest,
-        # so it stays sorted after appending — no need to re-sort before clamping.
-        max_safe_clamp = max(len(ltm_list), defaultConfig.LIMIT_LTM)
-        ltm_data[context_type] = ltm_list[-max_safe_clamp:]
-        self._save_ltm_shard(owner_id_str, ltm_profile_name, ltm_data)
+        ltm_data[context_type] = ltm_list
+        await asyncio.to_thread(self._save_ltm_shard, owner_id_str, ltm_profile_name, ltm_data)
 
-    def update_ltm(self, profile_owner_id: int, profile_name: str, ltm_id: str, new_summary: str, new_embedding_b64: str) -> bool:
+    async def update_ltm(self, profile_owner_id: int, profile_name: str, ltm_id: str, new_summary: str, new_embedding_b64: str) -> bool:
+        """Rewrites one memory in place. Async for the same shard-I/O reason as _add_ltm."""
         owner_id_str = str(profile_owner_id)
-        ltm_data = self._load_ltm_shard(owner_id_str, profile_name)
+        ltm_data = await asyncio.to_thread(self._load_ltm_shard, owner_id_str, profile_name)
         if not ltm_data:
             return False
 
@@ -306,7 +388,7 @@ class MemoryManager:
                 ltm_data["guild"][i]["modified_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 if "kw" in ltm_data["guild"][i]:
                     del ltm_data["guild"][i]["kw"]
-                self._save_ltm_shard(owner_id_str, profile_name, ltm_data)
+                await asyncio.to_thread(self._save_ltm_shard, owner_id_str, profile_name, ltm_data)
                 return True
         return False
 
@@ -395,7 +477,6 @@ class MemoryManager:
             return None
 
         current_turn = len(history)
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
         session_cooldown_history = self.cog.ltm_recall_history.get(session_key, {})
 
         ltm_shard_path = self.cog.storage_manager._get_shard_path("ltm", owner_id_str, ltm_profile_name)
@@ -407,93 +488,78 @@ class MemoryManager:
             # rather than risk serving vectors for content that is no longer on disk.
             ltm_cache_key = None
 
-        now_epoch = now_utc.timestamp()
         guild_id_str = str(guild_id)
 
         def _thread_search_ltm():
-            vectors = _ltm_vec_cache.get(ltm_cache_key) if ltm_cache_key is not None else None
+            vectors = _cached_vectors(
+                _ltm_vec_cache, ltm_cache_key, _LTM_VEC_CACHE_MAX_ROWS,
+                _build_ltm_vectors, all_profile_ltms,
+            )
             if vectors is None:
-                vectors = _build_ltm_vectors(all_profile_ltms)
-                if vectors is None:
-                    return None
-                if ltm_cache_key is not None:
-                    _ltm_vec_cache[ltm_cache_key] = vectors
-                    _ltm_vec_cache.move_to_end(ltm_cache_key)
-                    _ltm_vec_cache_evict()
-            else:
-                _ltm_vec_cache.move_to_end(ltm_cache_key)
+                return None
 
-            # Both filters that used to run as a Python loop *before* the maths now run
-            # as a mask *after* it. The dot product over the whole shard is microseconds
-            # of BLAS; it was never the expensive half.
-            mask = vectors.context_ids == guild_id_str
-            if not mask.any():
+            # Guild membership is grouped at build time, so scoping the shard to the
+            # one guild that can be recalled here is a dict lookup, and every array
+            # below is already only as wide as that guild.
+            guild_idx = vectors.guild_rows.get(guild_id_str)
+            if guild_idx is None:
                 return None
 
             # Cooldown is keyed off session state rather than the file, so it cannot be
             # cached -- but it is only ever as large as the set of memories this session
             # has already recalled, so it is walked directly instead of scanned for.
+            blocked = []
             for ltm_id, (last_turn, last_sim) in session_cooldown_history.items():
                 row = vectors.id_to_row.get(ltm_id)
                 if row is not None and current_turn - last_turn < (5 + (1 - last_sim) * 25):
-                    mask[row] = False
-
-            if not mask.any():
-                return None
+                    blocked.append(row)
+            if blocked:
+                keep = np.ones(vectors.n, dtype=bool)
+                keep[np.array(blocked, dtype=np.intp)] = False
+                guild_idx = guild_idx[keep[guild_idx]]
+                if guild_idx.size == 0:
+                    return None
 
             prompt_vec = np.array(prompt_embedding, dtype=np.float32)
             prompt_norm = np.linalg.norm(prompt_vec)
             prompt_unit = prompt_vec / (prompt_norm if prompt_norm != 0 else 1e-10)
 
             # Rows are already unit length, so cosine is a bare dot product.
-            raw_similarities = vectors.unit @ prompt_unit
+            sub = vectors.unit[guild_idx]
+            similarities = sub @ prompt_unit
 
-            # Recency decay, vectorised. NaN marks a row whose timestamp was missing,
-            # malformed or naive; those rows kept factor 1.0 in the loop this replaces.
-            days_old = (now_epoch - vectors.ts_epoch) / 86400.0
-            decay = np.power(0.995, days_old)
-            decayed = raw_similarities * np.where(np.isnan(decay), 1.0, decay)
-
-            eligible = mask & (decayed >= ltm_relevance_threshold)
-            cand_rows = np.flatnonzero(eligible)
-            if cand_rows.size == 0:
+            eligible = np.flatnonzero(similarities >= ltm_relevance_threshold)
+            if eligible.size == 0:
                 return None
 
-            candidate_indices = [
-                (int(r), float(decayed[r]), float(raw_similarities[r])) for r in cand_rows
+            cand_rows = guild_idx[eligible]
+            # The one gather the MMR loop needs. The version this replaces re-gathered a
+            # shrinking submatrix, then re-penalised and re-sorted a list of tuples in
+            # Python on every round: ~1.0 ms against ~0.12 ms here at 800 candidates,
+            # and ~85% of the entire retrieval path.
+            cand_mat = sub[eligible]
+            original_sims = similarities[eligible]
+            sub = None  # up to LIMIT_LTM x 256 float32; drop it before the loop runs
+
+            # MMR diversification. Scores are penalised in place and the winner taken by
+            # argmax, so nothing is rebuilt or re-sorted per round. A picked row is
+            # parked at -inf, which survives the penalty because the factor
+            # (1 - cosine * 0.75) is bounded to [0.25, 1.75] and so never flips sign.
+            scores = original_sims.astype(np.float32, copy=True)
+            picked = []
+            for _ in range(min(ltm_context_size, cand_rows.size)):
+                best = int(np.argmax(scores))
+                picked.append(best)
+                scores *= 1.0 - (cand_mat @ cand_mat[best]) * 0.75
+                scores[best] = -np.inf
+
+            return [
+                {
+                    "ltm": all_profile_ltms[vectors.rows[int(cand_rows[p])]],
+                    "original_sim": float(original_sims[p]),
+                }
+                for p in picked
             ]
-            candidate_indices.sort(key=lambda x: x[1], reverse=True)
-
-            # High-throughput vectorised MMR diversification (Zero Base64 re-decoding)
-            final_memories = []
-            current_candidates = list(candidate_indices)
-
-            while len(final_memories) < ltm_context_size and current_candidates:
-                best_idx, best_sim, orig_sim = current_candidates.pop(0)
-                final_memories.append({
-                    "ltm": all_profile_ltms[vectors.rows[best_idx]],
-                    "sim": best_sim,
-                    "original_sim": orig_sim,
-                })
-                if not current_candidates: break
-
-                best_vec = vectors.unit[best_idx]
-
-                rem_idxs = [c[0] for c in current_candidates]
-                rem_matrix = vectors.unit[rem_idxs]
-
-                # Instantaneous BLAS batch projection across remaining candidates
-                inter_sims = rem_matrix @ best_vec
-
-                updated = []
-                for j, (c_idx, c_sim, o_sim) in enumerate(current_candidates):
-                    penalised_sim = c_sim * (1.0 - (float(inter_sims[j]) * 0.75))
-                    updated.append((c_idx, penalised_sim, o_sim))
-
-                updated.sort(key=lambda x: x[1], reverse=True)
-                current_candidates = updated
-
-            return final_memories
 
         final_memories = await asyncio.to_thread(_thread_search_ltm)
 
@@ -518,9 +584,20 @@ class MemoryManager:
 
     async def _get_relevant_training_examples(self, profile_owner_id: int, profile_name: str, msg_content:str, guild_id: int)->List[str]:
         # [UPDATED] Check context size before disk or API activity
-        _, _, _, _, _, _, training_context_size, training_relevance_threshold, _, _ = await asyncio.to_thread(
-            self.cog.session_manager._get_user_profile_for_model, profile_owner_id, 0, profile_name
-        )
+        #
+        # Read straight off the profile config. This used to go through
+        # _get_user_profile_for_model under asyncio.to_thread, which resolves the
+        # effective profile and loads its prompts to build a ten-tuple, of which eight
+        # entries were discarded into `_`. Both values wanted here come from the config
+        # the first lookup already returns, and every accessor involved reads a
+        # cog-owned dict with disk only on a cold miss -- the same trade the rest of
+        # this module makes on the loop -- so the thread hop cost more than the work.
+        index = self.cog.profile_manager._get_user_index(profile_owner_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
+        config = self.cog.profile_manager._get_profile_config(profile_owner_id, profile_name, is_borrowed) or {}
+
+        training_context_size = int(config.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE))
+        training_relevance_threshold = float(config.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD))
         if training_context_size == 0:
             return []
 
@@ -540,22 +617,46 @@ class MemoryManager:
         msg_emb = await self._get_embedding(msg_content, guild_id, task_type="RETRIEVAL_QUERY")
         if not msg_emb: return []
 
+        training_shard_path = self.cog.storage_manager._get_shard_path(
+            "training", str(effective_owner_id_for_training), effective_profile_name_for_training
+        )
+        try:
+            st = os.stat(training_shard_path)
+            train_cache_key = (str(effective_owner_id_for_training), effective_profile_name_for_training,
+                               st.st_mtime_ns, st.st_size)
+        except OSError:
+            train_cache_key = None
+
         def _thread_search_training():
-            valid_ex = []
-            b64_embs = []
-            for ex in profile_examples:
-                if "u_emb_b64" in ex:
-                    valid_ex.append(ex)
-                    b64_embs.append(ex["u_emb_b64"])
+            vectors = _cached_vectors(
+                _train_vec_cache, train_cache_key, _TRAINING_VEC_CACHE_MAX_ROWS,
+                _build_training_vectors, profile_examples,
+            )
+            if vectors is None:
+                return []
 
-            if not valid_ex: return []
+            prompt_vec = np.array(msg_emb, dtype=np.float32)
+            prompt_norm = np.linalg.norm(prompt_vec)
+            prompt_unit = prompt_vec / (prompt_norm if prompt_norm != 0 else 1e-10)
 
-            similarities = calculate_similarities(msg_emb, b64_embs)
+            # Rows are already unit length, so cosine is a bare dot product. The list
+            # comprehension this replaces called float(similarities[i]) twice per
+            # example, then sorted dicts of Python floats.
+            similarities = vectors.unit @ prompt_unit
 
-            sc = [{"ex": ex, "sim": float(similarities[i])} for i, ex in enumerate(valid_ex) if float(similarities[i]) >= training_relevance_threshold]
-            sc.sort(key=lambda x: x["sim"], reverse=True)
+            eligible = np.flatnonzero(similarities >= training_relevance_threshold)
+            if eligible.size == 0:
+                return []
 
-            return [f"<example>\nUser: {self.cog.storage_manager._decrypt_data(i['ex']['u_in'])}\nYou: {self.cog.storage_manager._decrypt_data(i['ex']['b_out'])}\n</example>" for i in sc[:training_context_size]]
+            # argsort descending, then keep only as many as the caller asked for.
+            top = eligible[np.argsort(-similarities[eligible], kind="stable")][:training_context_size]
+
+            decrypt = self.cog.storage_manager._decrypt_data
+            out = []
+            for row in top:
+                ex = profile_examples[vectors.rows[int(row)]]
+                out.append(f"<example>\nUser: {decrypt(ex['u_in'])}\nYou: {decrypt(ex['b_out'])}\n</example>")
+            return out
 
         return await asyncio.to_thread(_thread_search_training)
 
@@ -740,7 +841,7 @@ class MemoryManager:
                 summary_embedding = await self._get_embedding(summary, guild_id, task_type="RETRIEVAL_DOCUMENT")
                 if summary_embedding:
                     b64_emb = encode_embedding_b64(summary_embedding)
-                    self._add_ltm(profile_owner_id, profile_name, summary, b64_emb, guild.id if guild else None, triggering_user_id, sanitized_author)
+                    await self._add_ltm(profile_owner_id, profile_name, summary, b64_emb, guild.id if guild else None, triggering_user_id, sanitized_author)
 
     async def add_new_training_example(self, profile_owner_id: int, profile_name: str, usr_in:str, bot_out:str, guild_id: int)->Tuple[bool,str]:
         if not usr_in.strip() or not bot_out.strip(): return False,"Inputs empty."

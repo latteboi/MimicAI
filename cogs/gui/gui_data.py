@@ -47,7 +47,7 @@ class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
             return
 
         b64_emb = encode_embedding_b64(new_embedding)
-        success = self.cog.memory_manager.update_ltm(self.profile_owner_id, self.profile_name, self.ltm_id, new_summary, b64_emb)
+        success = await self.cog.memory_manager.update_ltm(self.profile_owner_id, self.profile_name, self.ltm_id, new_summary, b64_emb)
         if success:
             await i.followup.send(f"LTM entry `{self.ltm_id}` for profile '{self.profile_name}' has been updated.", ephemeral=True)
         else:
@@ -94,7 +94,7 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
         b64_emb = encode_embedding_b64(embedding)
         
         # The _add_ltm method now handles the rolling window logic automatically.
-        self.cog.memory_manager._add_ltm(self.profile_owner_id, self.profile_name, summary, b64_emb, self.guild_id, i.user.id, i.user.display_name)
+        await self.cog.memory_manager._add_ltm(self.profile_owner_id, self.profile_name, summary, b64_emb, self.guild_id, i.user.id, i.user.display_name)
         
         # Fetch new count for feedback
         ltm_shard = self.cog.memory_manager._load_ltm_shard(str(self.profile_owner_id), self.profile_name)
