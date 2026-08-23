@@ -298,8 +298,13 @@ class HubPublicLibraryView(HubBaseView):
         # Load the heavy config data dynamically ONLY for the profile actively being viewed
         cfg_data = {}
         if original_pid:
-            cfg_path = os.path.join(self.cog.USERS_DIR, str(owner_id), "profiles", original_pid, "config.json.gz")
-            cfg_data = self.cog.storage_manager._load_json_gzip(cfg_path) or {}
+            # profile.json.gz, and the config nested inside it. This read used to name
+            # a `config.json.gz` that has never been written -- the profile file has
+            # been unified since before the hub existed -- so cfg_data was always {},
+            # and every library entry rendered with no avatar and the raw profile name
+            # instead of the creator's chosen display name.
+            profile_data = self.cog.profile_manager._get_profile_by_pid(owner_id, original_pid) or {}
+            cfg_data = profile_data.get("config") or {}
         
         owner = self.cog.bot.get_user(owner_id) or await self.cog.bot.fetch_user(owner_id)
         owner_name = owner.name if owner else "Unknown"
@@ -542,17 +547,46 @@ class HubShareManagerView(HubBaseView):
         toggle_btn.callback = self.toggle_mode
         self.add_item(toggle_btn)
 
-        # Row 1: Paginated Profiles
-        num_pages = (len(self.personal_profiles) - 1) // DROPDOWN_MAX_OPTIONS + 1
+        # Row 0, not beside the action buttons: in private mode row 2 already carries
+        # the three pagination controls plus Send and Get Code, which is Discord's
+        # five-per-row limit exactly. Sitting directly above the select reads as
+        # belonging to it anyway.
+        if self.selected_profiles:
+            clear_btn = ui.Button(label=f"Clear ({len(self.selected_profiles)})",
+                                  style=discord.ButtonStyle.secondary, row=0)
+            clear_btn.callback = self.clear_selection
+            self.add_item(clear_btn)
+
+        # Row 1: Paginated Profiles.
+        #
+        # Page size is SHARE_PAGE_SIZE rather than the full 25, because the two bulk
+        # rows occupy option slots: Discord caps a select at 25 options total, so a
+        # full page plus the sentinels would be rejected outright.
+        num_pages = max(1, (len(self.personal_profiles) - 1) // SHARE_PAGE_SIZE + 1)
         if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
-        
-        start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_profiles = self.personal_profiles[start : start + DROPDOWN_MAX_OPTIONS]
-        
+
+        start = self.current_page * SHARE_PAGE_SIZE
+        page_profiles = self.personal_profiles[start : start + SHARE_PAGE_SIZE]
+
         options = []
-        for p in page_profiles:
-            options.append(discord.SelectOption(label=p, value=p, default=(p in self.selected_profiles)))
-        
+        if page_profiles:
+            page_set = set(page_profiles)
+            page_selected = page_set.issubset(self.selected_profiles)
+            options.append(discord.SelectOption(
+                label="Unselect Page" if page_selected else "Select Page",
+                value="toggle_page", emoji="📄",
+                description="Toggle selection for every profile on this page."))
+
+            all_selected = set(self.personal_profiles).issubset(self.selected_profiles)
+            options.append(discord.SelectOption(
+                label="Unselect All" if all_selected else "Select All",
+                value="toggle_all", emoji="📚",
+                description="Toggle selection for every profile you own."))
+
+            for p in page_profiles:
+                options.append(discord.SelectOption(
+                    label=p, value=p, default=(p in self.selected_profiles)))
+
         if options:
             prof_sel = ui.Select(placeholder="Select profiles...", options=options, min_values=0, max_values=len(options), row=1)
             prof_sel.callback = self.select_profiles
@@ -617,14 +651,38 @@ class HubShareManagerView(HubBaseView):
         await self.update_display()
 
     async def select_profiles(self, i: discord.Interaction):
-        new_page_selections = set(i.data['values'])
-        start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_profiles = set(self.personal_profiles[start : start + DROPDOWN_MAX_OPTIONS])
-        
-        self.selected_profiles = [p for p in self.selected_profiles if p not in page_profiles]
-        self.selected_profiles.extend(list(new_page_selections))
-        self.selected_profiles.sort() # Keep tidy
-        
+        vals = set(i.data.get('values', []))
+        start = self.current_page * SHARE_PAGE_SIZE
+        page_profiles = set(self.personal_profiles[start : start + SHARE_PAGE_SIZE])
+        selected = set(self.selected_profiles)
+
+        # The sentinels are checked before the ordinary values, and short-circuit:
+        # picking "Select All" alongside three names is one gesture with one meaning,
+        # and applying both would leave a selection the user did not ask for.
+        if "toggle_page" in vals:
+            if page_profiles.issubset(selected):
+                selected -= page_profiles
+            else:
+                selected |= page_profiles
+        elif "toggle_all" in vals:
+            everything = set(self.personal_profiles)
+            if everything.issubset(selected):
+                selected -= everything
+            else:
+                selected |= everything
+        else:
+            # Only this page's membership is being restated; selections made on other
+            # pages are not in the payload and must survive.
+            selected -= page_profiles
+            selected |= vals
+
+        self.selected_profiles = sorted(selected)
+        self.setup_items()
+        await i.response.defer()
+        await self.update_display()
+
+    async def clear_selection(self, i: discord.Interaction):
+        self.selected_profiles = []
         self.setup_items()
         await i.response.defer()
         await self.update_display()
@@ -649,6 +707,16 @@ class HubShareManagerView(HubBaseView):
             await self.update_display()
             return
         
+        shareable, refused = self._partition_shareable(self.selected_profiles)
+        if not shareable:
+            self.processing = False
+            self.setup_items()
+            await self.update_display()
+            lines = "\n".join(f"• **{n}** -- {r}" for n, r in refused.items())
+            await i.followup.send(
+                f"None of the selected profiles can be shared yet.\n{lines}", ephemeral=True)
+            return
+
         success_count = 0
         for recipient_id_str in self.selected_users:
             recipient_id = int(recipient_id_str)
@@ -662,7 +730,7 @@ class HubShareManagerView(HubBaseView):
 
             self.cog.profile_shares.setdefault(str(recipient_id), [])
             newly_shared = []
-            for profile_name in self.selected_profiles:
+            for profile_name in shareable:
                 pid = self.cog.profile_manager._get_pid_from_name_any(self.user_id, profile_name)
                 existing = next((s for s in self.cog.profile_shares[str(recipient_id)] if s['sharer_id'] == self.user_id and (s.get('original_pid') == pid or s.get('profile_name') == profile_name)), None)
                 if not existing:
@@ -681,15 +749,50 @@ class HubShareManagerView(HubBaseView):
         self.processing = False
         self.setup_items()
         await self.update_display()
-        await i.followup.send(f"Sent to {success_count} users.", ephemeral=True)
+        report = f"Sent to {success_count} users."
+        if refused:
+            lines = "\n".join(f"• **{n}** -- {r}" for n, r in refused.items())
+            report += f"\n\n**Left out:**\n{lines}"
+        await i.followup.send(report, ephemeral=True)
+
+    def _partition_shareable(self, names):
+        """Splits a selection into (allowed, {name: reason}) for the share gates.
+
+        Sharing is the point at which a profile stops being only its owner's
+        business, so it is gated on the rating exactly as publishing is -- the
+        difference being that Adult may be shared privately and may not be
+        published. Both gates read content_capability so the refusal wording is the
+        same sentence the Content Safety dashboard shows.
+        """
+        allowed, refused = [], {}
+        for name in names:
+            ok, reason = self.cog.profile_manager.content_capability(self.user_id, name, "share")
+            if ok:
+                allowed.append(name)
+            else:
+                refused[name] = reason
+        return allowed, refused
 
     async def generate_code(self, i: discord.Interaction):
         if not self.selected_profiles:
             await i.response.send_message("Select at least one profile.", ephemeral=True); return
+
+        shareable, refused = self._partition_shareable(self.selected_profiles)
+        if not shareable:
+            lines = "\n".join(f"• **{n}** -- {r}" for n, r in refused.items())
+            await i.response.send_message(
+                f"None of the selected profiles can be shared yet.\n{lines}", ephemeral=True)
+            return
+
         code = f"SHR-{uuid.uuid4().hex[:8].upper()}"
-        pids =[self.cog.profile_manager._get_pid_from_name_any(self.user_id, p) for p in self.selected_profiles]
-        self.cog.share_codes[code] = {"owner_id": str(self.user_id), "pids": pids, "profile_names": self.selected_profiles, "expires_at": time.time() + 300}
-        await i.response.send_message(f"Share Code: `{code}`\nExpires in 5 minutes.", ephemeral=True)
+        pids =[self.cog.profile_manager._get_pid_from_name_any(self.user_id, p) for p in shareable]
+        self.cog.share_codes[code] = {"owner_id": str(self.user_id), "pids": pids, "profile_names": shareable, "expires_at": time.time() + 300}
+
+        msg = f"Share Code: `{code}`\nExpires in 5 minutes.\nIncludes: {', '.join(shareable)}"
+        if refused:
+            lines = "\n".join(f"• **{n}** -- {r}" for n, r in refused.items())
+            msg += f"\n\n**Left out:**\n{lines}"
+        await i.response.send_message(msg, ephemeral=True)
 
     async def apply_public(self, i: discord.Interaction):
         if self.processing: return
@@ -699,7 +802,6 @@ class HubShareManagerView(HubBaseView):
             if isinstance(item, ui.Button) and item.label in ["Apply Changes", "Apply Publishing Changes"]: item.disabled = True
         await i.response.edit_message(view=self)
 
-        analysis_message = None
         user_id_str = str(self.user_id)
         
         # Names of everything this user already has published. Read through the
@@ -719,38 +821,22 @@ class HubShareManagerView(HubBaseView):
         failed_list = {}
 
         if to_publish:
-            analysis_message = await i.followup.send("🔍 Analysing profiles for safety...", ephemeral=True)
-            
-            async def evaluate_profile(name: str):
-                eff_owner, eff_name = self.cog.profile_manager._resolve_effective_profile(self.user_id, name)
-                
-                appearance_data = self.cog.user_appearances.get(str(eff_owner), {}).get(eff_name, {})
-                disp = appearance_data.get("custom_display_name") or name
-                ava = appearance_data.get("custom_avatar_url")
-                
-                verdict, _ = self.cog.profile_manager._content_rating_state(self.user_id, name)
-                if verdict == "adult":
-                    return name, False, "Content Rating is 'Adult 18+'. Only 'General' profiles can be published."
-                if verdict not in ("general", "exempt"):
-                    # Publishing is a deliberate, non-hot-path action, so it is the
-                    # one place that refuses to proceed on an absent verdict rather
-                    # than falling through to CONTENT_CLASSIFY_FAIL_CLOSED. Listing a
-                    # profile the classifier has not judged is exactly what the
-                    # Public Library must not do. Queue the check on the way out so
-                    # retrying actually gets somewhere without a detour through the
-                    # dashboard; it no-ops if one is already pending or on cooldown.
-                    self.cog.profile_manager.schedule_content_classification(eff_owner, eff_name)
-                    return name, False, "This profile has not been classified yet. The check has been queued -- try publishing again shortly."
+            # Publishing no longer analyses anything. It reads the rating the owner
+            # already obtained, because that rating *is* the safety analysis -- the
+            # separate auto-moderator pass that used to run here answered an adjacent
+            # question with a second prompt, and the two could disagree on the same
+            # profile with no way for the owner to tell which had objected.
+            #
+            # The consequence is that publishing is now instant and free: no API call,
+            # no avatar download, no "Analysing profiles for safety..." wait. A
+            # profile that has not been rated is refused with the same sentence the
+            # Content Safety dashboard shows, and rating it is a click away there.
+            def evaluate_profile(name: str):
+                allowed, reason = self.cog.profile_manager.content_capability(
+                    self.user_id, name, "publish")
+                return name, allowed, reason
 
-                try:
-                    is_safe, reason = await self.cog.profile_manager._is_profile_content_safe(self.user_id, name, disp, ava)
-                    return name, is_safe, reason
-                except Exception as safe_ex:
-                    return name, False, f"Analysing failed with error: {safe_ex}"
-
-            # Run all evaluations concurrently for speed
-            tasks = [evaluate_profile(name) for name in to_publish]
-            results = await asyncio.gather(*tasks)
+            results = [evaluate_profile(name) for name in to_publish]
 
             for name, is_safe, reason in results:
                 if is_safe:
@@ -795,10 +881,7 @@ class HubShareManagerView(HubBaseView):
             report_embed.color = discord.Color.orange()
         if not (published_list or unpublished_list or failed_list): report_embed.description = "No changes were made."
 
-        if analysis_message:
-            await analysis_message.edit(content=None, embed=report_embed)
-        else:
-            await i.followup.send(embed=report_embed, ephemeral=True)
+        await i.followup.send(embed=report_embed, ephemeral=True)
 
 class HubCloningView(HubBaseView):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):

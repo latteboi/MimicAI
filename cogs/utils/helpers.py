@@ -18,22 +18,6 @@ from .constants import (
 )
 
 
-def _legacy_declared_adult(raw: Any) -> bool:
-    """True when a profile still carries the retired safety_level 18+ declaration.
-
-    Migration only. `safety_level` was removed in favour of a single
-    `content_rating`, and profiles written before the merge still carry the old
-    field on disk -- 'unrestricted' from the two-value scheme, or 'low' /
-    'medium' / 'high' from the four-tier one before that. Only the literal
-    'unrestricted' ever meant 18+; every other value, including a missing, None
-    or malformed one, meant Restricted and needs no migration.
-
-    ProfileManager._migrate_legacy_safety_level folds the survivors into a
-    content_rating on read, so there is no boot sweep and no rewrite pass.
-    """
-    return str(raw).strip().lower() == "unrestricted"
-
-
 def _channel_is_age_restricted(channel: Any) -> bool:
     """True only when a resolved channel object is flagged age-restricted.
 

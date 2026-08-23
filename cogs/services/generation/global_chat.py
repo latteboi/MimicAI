@@ -19,8 +19,13 @@ from ._shared import _strip_neuro_update_and_scrub
 
 
 class GlobalChatMixin:
-    """The `/profile global_chat` DM/cross-server chat session (its own model-caching 
-    and history path, separate from the multi-profile worker).
+    """The `/profile global_chat` session (its own model-caching and history path,
+    separate from the multi-profile worker).
+
+    Not a DM and not a channel of messages: the conversation is one embed, posted
+    wherever the command was run and edited in place by GlobalChatPlayView. History
+    is keyed on (host, profile) rather than on a channel, which is what makes it
+    "global" -- the same conversation continues in any server, or in a DM.
     """
 
     async def _execute_global_chat(self, interaction: discord.Interaction, host_user_id: int, profile_name: str, queued_turns: List[Dict]):
@@ -43,11 +48,15 @@ class GlobalChatMixin:
             await interaction.followup.send(f"The source for '{profile_name}' could not be found.", ephemeral=True)
             return
 
-        # A DM can never be marked age-restricted, so an adult-rated profile has
-        # nowhere compliant to run here. Read through the resolver rather than off
-        # the config, so a borrowed profile is judged by its source's rating.
-        if self.cog.profile_manager._resolve_enforced_safety_level(host_user_id, profile_name) == "unrestricted":
-            await interaction.followup.send("For safety reasons, profiles rated 'Adult 18+' cannot be used with `/profile global_chat`, since a DM cannot be marked age-restricted.", ephemeral=True)
+        # The embed goes wherever the command was run, and nothing constrains that
+        # to an age-restricted channel, so an adult-rated profile has nowhere
+        # compliant to run here. Read through the resolver rather than off the
+        # config, so a borrowed profile is judged by its source's rating.
+        allowed, deny_reason = self.cog.profile_manager.content_capability(
+            host_user_id, profile_name, "global_chat")
+        if not allowed:
+            await interaction.followup.send(
+                f"**'{profile_name}' cannot be used in Global Chat.**\n{deny_reason}", ephemeral=True)
             return
 
         user_api_key = self.cog.storage_manager._get_api_key_for_user(host_user_id, "gemini")

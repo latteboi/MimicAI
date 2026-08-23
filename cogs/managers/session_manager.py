@@ -834,7 +834,7 @@ class SessionManager:
         # errs toward the previous, stricter answer while the recheck lands.
         for _p in {(p["owner_id"], p["profile_name"]) for p in participants}:
             asyncio.create_task(
-                self.cog.profile_manager.verify_content_rating(_p[0], _p[1]))
+                self.cog.profile_manager.resolve_stale_rating(_p[0], _p[1]))
 
         if is_update:
             session = self.cog.multi_profile_channels[interaction.channel_id]

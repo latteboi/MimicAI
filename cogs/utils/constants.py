@@ -56,19 +56,23 @@ class DefaultConfigNamespace:
         self.TRAINING_CONTEXT_SIZE = 5
         self.TRAINING_RELEVANCE_THRESHOLD = 0.1
 
-        # Content classification (Phase 3).
-        # CONTENT_CLASSIFY_FAIL_CLOSED decides what an *unclassified* profile may do
-        # when the classifier could not run -- no API key, provider outage, retries
-        # exhausted. False (default) treats it as Restricted, so the bot stays usable
-        # and the channel content-policy note plus the provider thresholds still
-        # apply. True confines it to age-restricted channels until a verdict lands,
-        # which is the safer posture for a public instance whose operator carries the
-        # liability, at the cost of new profiles going silent during an outage.
-        self.CONTENT_CLASSIFY_FAIL_CLOSED = False
+        # Content classification.
+        #
+        # CONTENT_CLASSIFY_FAIL_CLOSED is gone. It decided what an *unclassified*
+        # profile was allowed to do at runtime, back when a profile could sit
+        # unclassified indefinitely through no act of its owner. An Unrated profile
+        # now has defined behaviour -- it runs exactly as a General one does, and is
+        # barred from sharing, publishing and Global Chat until its owner submits it
+        # -- so there is no undecided runtime case left for the flag to arbitrate.
+        #
         # Characters of persona + instructions sent to the classifier. Bounds cost on
         # a profile with a very long persona; the tail of one is near-always more of
         # the same register.
         self.CONTENT_CLASSIFY_MAX_CHARS = 6000
+        # Bytes of avatar image sent alongside the text. Beyond this the image is
+        # dropped and the text is judged alone -- an avatar is one signal among
+        # several, and a 20 MB PNG is not worth the upload on the deployment target.
+        self.CONTENT_CLASSIFY_MAX_IMAGE_BYTES = 4 * 1024 * 1024
         self.CONTENT_CLASSIFY_MAX_ATTEMPTS = 3
         # How long a profile that failed classification is left alone. Without this,
         # every dashboard render re-queued a profile that could not be classified --
@@ -169,6 +173,10 @@ MAX_BORROWED_PROFILES = 50
 MAX_USER_APPEARANCES = 50
 MAX_MULTI_PROFILES = 200
 DROPDOWN_MAX_OPTIONS = 25
+# Page size for selects that reserve option slots for "Select Page" / "Select All".
+# Discord rejects a select carrying more than DROPDOWN_MAX_OPTIONS options, so the
+# two sentinels have to come out of the page, not be added on top of it.
+SHARE_PAGE_SIZE = DROPDOWN_MAX_OPTIONS - 2
 SHARE_CODE_EXPIRATION_SECONDS = 300
 # Single priority band for the image queue. Kept as a named constant so the
 # PriorityQueue ordering stays explicit; ties break on enqueue timestamp (FIFO).
@@ -204,24 +212,17 @@ DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS = (
     "- If the excerpt contains no new, meaningful information worth remembering, respond ONLY with the text 'NO_SUMMARY'."
 )
 
-DEFAULT_AUTO_MODERATOR_PROMPT = (
-    "You are an expert AI content moderator for a social platform like Discord. Your task is to analyze user-submitted content (text and an optional image for an avatar) and determine if it violates policy. Your primary goal is to distinguish between what is merely 'suggestive' (often SAFE) and what is 'explicit' or 'graphic' (UNSAFE).\n\n"
-    "**Policy Violations (UNSAFE):**\n"
-    "- **Sexually Explicit:** Graphic depictions of sexual acts, genitalia, or pornographic material.\n"
-    "- **Extreme Violence:** Real gore, graphic depictions of severe injury or death.\n"
-    "- **Hate Speech:** Content that promotes violence or hatred against individuals or groups based on protected characteristics.\n\n"
-    "**Acceptable Content (SAFE):**\n"
-    "- **Swimwear/Beachwear:** Photos or art of people in bikinis, swimsuits, etc., are SAFE.\n"
-    "- **Artistic Nudity:** Non-pornographic artistic depictions of nudity are generally SAFE.\n"
-    "- **Suggestive Poses/Themes:** Common anime/fantasy art styles that may be suggestive but are not explicit are SAFE.\n"
-    "- **Cleavage/Musculature:** Depictions of cleavage or muscular bodies are SAFE.\n\n"
-    "Analyze all provided content (profile name, display name, and image) together. Respond with ONLY a single word: SAFE or UNSAFE."
-)
-
-# Phase 3 content classifier. Deliberately NOT the same prompt as AUTO_MODERATOR:
-# that one answers "may this appear in a global public directory?", which is a
-# stricter and different question than "does this need an 18+ channel?". Merging
-# them would either over-block ordinary profiles or under-block published ones.
+# The one content judgement in the system. It absorbed AUTO_MODERATOR, which used to
+# answer the separate question "may this appear in the public directory?" -- separate
+# because publishing was the only gate that existed and it ran on every appearance
+# edit. Now that a rating is a deliberate, once-per-profile submission, one verdict
+# drives every gate: which channels the profile may run in, whether it may be shared,
+# and whether it may be published. Two prompts answering adjacent questions could
+# disagree, and when they did the profile was refused with no way to tell which had
+# objected.
+#
+# The avatar image comes with the text, which is what AUTO_MODERATOR contributed and
+# the classifier never had -- it only ever saw the avatar URL as a string.
 #
 # The first word of the reply is the verdict, so parsing stays trivial; anything
 # after the colon becomes the reason shown to the profile's owner.
@@ -229,6 +230,10 @@ DEFAULT_CONTENT_CLASSIFIER_PROMPT = (
     "You classify a roleplay character profile for a Discord bot. Decide whether the "
     "character, as written, is intended for adult audiences and should therefore be "
     "confined to age-restricted (18+) channels.\n\n"
+    "You may be given the profile's avatar image alongside its text. Judge the two "
+    "together: an explicit image makes the profile ADULT whatever the text says, and "
+    "a suggestive or revealing image on its own does not. If no image is provided, "
+    "judge the text alone and do not treat the absence as suspicious.\n\n"
     "Answer ADULT if the profile does any of the following:\n"
     "- Directs or invites explicit sexual content, or describes sexual acts in graphic detail.\n"
     "- Is defined primarily around sexual availability, fetish content, or erotic roleplay.\n"
@@ -508,15 +513,102 @@ DEFAULT_GROUNDING_RAG_PAYLOAD = (
     "<user_query>\n{query}\n</user_query>"
 )
 
-# User-facing labels for the content rating, which absorbed the retired
-# safety_level field. A profile now carries exactly one of these verdicts, and
-# everything else -- where it may run, which provider thresholds apply, whether
-# it may be published -- is derived from it.
+# The content rating states. A profile carries exactly one, and every gate --
+# which channels it may run in, whether it may be shared, published, or used in
+# global chat -- is derived from it.
+#
+# UNRATED and PENDING are what the old single "unclassified" value became. It had
+# to carry both "never submitted" and "submitted, awaiting a verdict", which was
+# fine while classification was automatic and those were the same instant. Now
+# that submitting is a deliberate act they are different states with different
+# affordances, and the dashboard has to be able to tell them apart.
+CONTENT_RATING_UNRATED = "unrated"
+CONTENT_RATING_PENDING = "pending"
+CONTENT_RATING_GENERAL = "general"
+CONTENT_RATING_ADULT = "adult"
+CONTENT_RATING_EXEMPT = "exempt"
+
 CONTENT_RATING_LABELS = {
-    "general": "General",
-    "adult": "Adult 18+",
-    "exempt": "Exempt",
-    "unclassified": "Pending",
+    CONTENT_RATING_UNRATED: "Unrated",
+    CONTENT_RATING_PENDING: "Pending",
+    CONTENT_RATING_GENERAL: "General",
+    CONTENT_RATING_ADULT: "Adult 18+",
+    CONTENT_RATING_EXEMPT: "Exempt",
+}
+
+CONTENT_RATING_EMOJI = {
+    CONTENT_RATING_UNRATED: "⚪",
+    CONTENT_RATING_PENDING: "⏳",
+    CONTENT_RATING_GENERAL: "✅",
+    CONTENT_RATING_ADULT: "🔞",
+    CONTENT_RATING_EXEMPT: "🛡️",
+}
+
+# One line explaining what the state *is*, for the Content Safety dashboard. The
+# capability list is rendered separately from the matrix below, so these say what
+# the state means rather than enumerating consequences.
+CONTENT_RATING_BLURBS = {
+    CONTENT_RATING_UNRATED: (
+        "This profile has not been submitted for a content rating. It runs normally "
+        "in your own servers, but it cannot be shared, published, or used in Global "
+        "Chat until it has been rated."
+    ),
+    CONTENT_RATING_PENDING: (
+        "This profile has been submitted and is waiting on a verdict. This normally "
+        "takes a few seconds."
+    ),
+    CONTENT_RATING_GENERAL: (
+        "This profile is rated for a general audience. It can run anywhere, be "
+        "shared or published, and be used in Global Chat."
+    ),
+    CONTENT_RATING_ADULT: (
+        "This profile is rated for adult audiences. It runs only in age-restricted "
+        "channels, and can be shared privately but not published to the Public "
+        "Library or used in Global Chat."
+    ),
+    CONTENT_RATING_EXEMPT: (
+        "This profile has been exempted from content classification by the bot "
+        "operator. It runs anywhere with no provider content filtering."
+    ),
+}
+
+# The capability matrix, keyed by verdict. Every gate in the codebase reads this
+# rather than testing verdicts inline, so the rules live in one place and the
+# dashboard can render exactly what it enforces -- the previous scheme spread the
+# same decision across the hub, the global chat command and the turn gate, and
+# they drifted.
+#
+# `age_restricted_only` is the sole runtime gate. Note that UNRATED and GENERAL are
+# deliberately identical at runtime: a rating governs distribution, not execution.
+# The provider harm threshold is NOT here -- it follows the destination channel via
+# _resolve_safety_settings, with an exemption carve-out, and always has.
+CONTENT_RATING_CAPABILITIES = {
+    CONTENT_RATING_UNRATED:  {"age_restricted_only": False, "share": False, "publish": False, "global_chat": False},
+    CONTENT_RATING_PENDING:  {"age_restricted_only": False, "share": False, "publish": False, "global_chat": False},
+    CONTENT_RATING_GENERAL:  {"age_restricted_only": False, "share": True,  "publish": True,  "global_chat": True},
+    CONTENT_RATING_ADULT:    {"age_restricted_only": True,  "share": True,  "publish": False, "global_chat": False},
+    CONTENT_RATING_EXEMPT:   {"age_restricted_only": False, "share": True,  "publish": True,  "global_chat": True},
+}
+
+# Why a capability is unavailable, shown against the failed row on the dashboard
+# and reused verbatim by the command that refused. A user who is told the same
+# sentence in both places does not have to work out whether they hit two different
+# rules.
+CONTENT_CAPABILITY_LABELS = {
+    "share": "Share privately",
+    "publish": "Publish to Public Library",
+    "global_chat": "Use in Global Chat",
+}
+
+CONTENT_CAPABILITY_DENIALS = {
+    ("share", CONTENT_RATING_UNRATED): "Submit this profile for a content rating first.",
+    ("share", CONTENT_RATING_PENDING): "Waiting on the content rating verdict.",
+    ("publish", CONTENT_RATING_UNRATED): "Submit this profile for a content rating first.",
+    ("publish", CONTENT_RATING_PENDING): "Waiting on the content rating verdict.",
+    ("publish", CONTENT_RATING_ADULT): "Only General profiles can be published. Adult profiles can still be shared privately.",
+    ("global_chat", CONTENT_RATING_UNRATED): "Submit this profile for a content rating first.",
+    ("global_chat", CONTENT_RATING_PENDING): "Waiting on the content rating verdict.",
+    ("global_chat", CONTENT_RATING_ADULT): "A Global Chat can be opened in any channel, and none of them is guaranteed age-restricted, so Adult profiles cannot be used here.",
 }
 
 # What the rating means for placement, phrased as the consequence rather than as
@@ -585,78 +677,36 @@ def is_admin_or_owner_check():
         return interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)
     return app_commands.check(predicate)
 
+# The dashboard tree is no longer written out here. It is generated from the live
+# PROFILE_ACTIONS table by cogs/utils/menu_map.py and substituted for {menu_map} at
+# injection time, because the hand-written copy drifted out of step with the UI it
+# described -- see that module's docstring. An operator override saved via /mod that
+# has no {menu_map} placeholder simply keeps whatever it already contains.
 DEFAULT_HELP_MODE_INJECTION = (
     "<technical_manual>\n"
     "{docs}\n"
     "</technical_manual>\n"
     "<system_note>\n"
+    "You are answering a technical question about MimicAI, the Discord bot you run on.\n"
+    "\n"
+    "Answer only from <technical_manual> and the dashboard map below. If neither covers "
+    "the question, say so plainly and suggest the closest dashboard the user could look "
+    "at -- never invent a command, tab, action or setting name.\n"
+    "\n"
+    "When an answer involves changing a setting, state the exact path: the command, then "
+    "the tab, then the action, in that order (for example: `/profile manage` -> Tools -> "
+    "Toggle Grounding (Web Search)). Actions on the `/profile manage` dashboard are "
+    "chosen from the dropdown at the top of the tab, not from separate buttons.\n"
+    "\n"
+    "Stay in character while you do it. Answer at the length the question deserves -- a "
+    "one-line question takes a one-line answer -- and do not restate the map back to the "
+    "user.\n"
+    "\n"
     "=========================================\n"
-    "MIMICAI SYSTEM MENU VISUALISATION MAP\n"
+    "MIMICAI DASHBOARD MAP\n"
     "=========================================\n"
-    "1. DASHBOARD: `/profile manage [profile_name]`\n"
-    "   ├── Tab 1: [Home] (Operational Actions)\n"
-    "   │    ├── Action: Rename Profile (Change local database directory mask)\n"
-    "   │    ├── Action: Duplicate Profile (Creates independent Class A fork)\n"
-    "   │    │      PID classes: A personal, B share-code borrow, C library borrow, X system\n"
-    "   │    ├── Action: Share Profile (Generates 5-minute cryptographic Share Code)\n"
-    "   │    ├── Action: Custom Error Message (Saves custom text for API failures)\n"
-    "   │    ├── Action: Generation Visual (Sets placeholder emote & Child Bot placeholder toggle)\n"
-    "   │    ├── Action: Declare Adult Content 18+ (Confines the profile to age-restricted channels)\n"
-    "   │    └── Action: Delete Profile (Permanently purges file directories)\n"
-    "   │\n"
-    "   ├── Tab 2: [Persona] (Cognitive Configuration)\n"
-    "   │    ├── Action: Edit Persona (Backstory, Traits, Likes, Dislikes, Appearance text)\n"
-    "   │    ├── Action: Edit Instructions (4 distinct sequential prompt segments)\n"
-    "   │    ├── Action: TTS Instructions (Director's Desk: Archetype, Accent, Dynamics, Pacing, Style)\n"
-    "   │    └── Action: Edit Appearance (Webhook Name & Avatar overrides - synchronised to Child Bots)\n"
-    "   │\n"
-    "   ├── Tab 3: [Params] (Model & Heuristics Tuning)\n"
-    "   │    ├── Action: Set Models (Choose Primary Model & Fallback Model. Toggle Fallback Indicator)\n"
-    "   │    ├── Action: Set Generation Parameters & STM (Temperature, Top P, Top K, STM Length 0-50)\n"
-    "   │    ├── Action: Set Advanced Parameters (Frequency, Presence, Repetition Penalties, Min P, Top A)\n"
-    "   │    ├── Action: Set Thinking Parameters (Thinking Summary toggle, Reasoning Level, Token Budget, Signatures)\n"
-    "   │    └── Action: Set Speech & Voice Settings (Speech TTS Toggle, Voice Name, Model, Temperature)\n"
-    "   │\n"
-    "   ├── Tab 4: [Tools] (External Systems)\n"
-    "   │    ├── Action: Toggle Image Generation (Enable/Disable `!image` & `!imagine`)\n"
-    "   │    ├── Action: Toggle Grounding (Cycle: OFF -> NATIVE -> RAG)\n"
-    "   │    ├── Action: Toggle URL Context (Cycle: OFF -> NATIVE -> RAG)\n"
-    "   │    ├── Action: Cycle Response Mode (Cycle: Regular -> Mention -> Reply -> Mention+Reply)\n"
-    "   │    ├── Action: Set Time & Timezone (Enable Time Tracking & set IANA Timezone ID)\n"
-    "   │    ├── Action: Toggle Realistic Typing (Enable realistic typing delays, CPS, chunk modes)\n"
-    "   │    ├── Action: Toggle Anti-Repetition Critic (Enable loop-detection & negative constraints)\n"
-    "   │    ├── Action: Toggle Help Mode (RAG) (Enables/Disables this technical help protocol)\n"
-    "   │    └── Action: Toggle Neuro-Endocrine Engine (Simulates emotional chemical variables)\n"
-    "   │\n"
-    "   └── Tab 5: [Memory] (Data Repositories)\n"
-    "        ├── Action: Manage Long-Term Memories & Training Examples (CRUD interface for vectors and few-shots)\n"
-    "        ├── Action: Set Training Parameters (Few-shot context size & relevance thresholds)\n"
-    "        ├── Action: Toggle LTM Auto-Creation (Enable/Disable automated third-person summaries)\n"
-    "        ├── Action: Set LTM Parameters (LTM creation interval, summarisation context, LTM context size, LTM threshold)\n"
-    "        └── Action: Set LTM Summarisation Prompt (Customises memory compilation instructions)\n\n"
-    "2. DASHBOARD: `/settings` (DM Only)\n"
-    "   ├── Tab 1: [Home] (Integration Summary & Statuses)\n"
-    "   ├── Tab 2: [API Keys] (Provider Credentials)\n"
-    "   │    ├── Action: Edit Personal Key (Gemini & OpenRouter keys for Global Chat)\n"
-    "   │    └── Action: Edit Primary Key (Admin only - Server-wide routing key)\n"
-    "   └── Tab 3: [Child Bots] (Owner Only - Application Provisioning)\n"
-    "        ├── Action: Create New Child Bot (Links PID to custom bot token)\n"
-    "        └── Action: Unlink & Delete (Deletes config & disconnects the bot)\n\n"
-    "3. DASHBOARD: `/session config` (Admin Only)\n"
-    "   ├── Tab 1: [Cast] (Configure Cast List)\n"
-    "   │    └── Actions: Add/Remove Personal, Borrowed, and Child Bot participants (Max 200)\n"
-    "   ├── Tab 2: [Config] (Session Variables)\n"
-    "   │    ├── Action: Toggle Execution (Sequential vs Random turn pacing)\n"
-    "   │    ├── Action: Edit Master Prompt (Sets session scene prompt)\n"
-    "   │    ├── Action: Toggle TTS (Enables Master WAV stitching)\n"
-    "   │    └── Action: Set Response Limit (Max responses per round)\n"
-    "   ├── Tab 3: [Reactivity] (Interjection Probabilities)\n"
-    "   │    └── Action: Edit Chance & Wakewords (Configure random interjection triggers)\n"
-    "   └── Tab 4: [Proactivity] (AI Director)\n"
-    "        ├── Action: Toggle Proactivity (Enable/disable automated timer)\n"
-    "        └── Action: Edit Settings & AI Director (Set chance, cooldown, and Director model)\n"
-    "=========================================\n\n"
-    "When using the visualisation map, directly state the exact Dashboard, Tab, and Action path needed.\"\n"
+    "{menu_map}\n"
+    "=========================================\n"
     "</system_note>"
 )
 

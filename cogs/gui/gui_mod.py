@@ -1,5 +1,6 @@
 from ..utils.constants import *
 
+import asyncio
 import discord
 from discord import ui
 import datetime
@@ -491,6 +492,48 @@ class ModProfilesView(ModBaseView):
             await i.response.send_modal(ModProfilesModal(self))
         btn_enter.callback = enter_cb
         self.add_item(btn_enter)
+
+        # Instance-wide maintenance, deliberately manual. Nothing runs this on boot:
+        # it is a one-off baseline reset the operator performs once, which is why no
+        # rating record carries a schema marker recording whether it has happened.
+        btn_reset = ui.Button(label="Reset All Content Ratings",
+                              style=discord.ButtonStyle.danger, row=0)
+
+        async def reset_cb(i: discord.Interaction):
+            async def confirm(confirm_i: discord.Interaction):
+                await confirm_i.response.edit_message(
+                    content="Resetting every content rating on this instance...",
+                    view=None, embed=None)
+                counts = await asyncio.to_thread(
+                    self.cog.profile_manager.reset_all_content_ratings)
+
+                delisted = counts["delisted"]
+                lines = [
+                    f"**Reset complete.**",
+                    f"• Profiles scanned: `{counts['scanned']}`",
+                    f"• Reset to Unrated: `{counts['reset']}`",
+                    f"• Borrowed profiles skipped: `{counts['skipped_borrowed']}`",
+                    f"• Legacy `safety_level` fields stripped: `{counts['legacy_fields']}`",
+                    f"• Public Library entries delisted: `{len(delisted)}`",
+                ]
+                if counts["errors"]:
+                    lines.append(f"• ⚠️ Errors: `{counts['errors']}` (see the console log)")
+                lines.append("\nEvery profile is now Unrated. Owners re-submit from "
+                             "`/profile manage` -> Home -> Content Safety.")
+                await confirm_i.edit_original_response(content="\n".join(lines), view=None)
+
+            await i.response.send_message(
+                "**Reset every content rating on this instance?**\n"
+                "Every profile becomes **Unrated** — including Adult and Exempt ones — and the "
+                "entire Public Library is delisted, because an Unrated profile cannot be "
+                "published. Existing borrows keep working.\n\n"
+                "Owners re-submit their own profiles afterwards; 18+ declarations and "
+                "exemptions can be re-applied in one click with no API call.\n\n"
+                "This cannot be undone.",
+                view=build_confirm_view("Reset Everything", confirm), ephemeral=True)
+
+        btn_reset.callback = reset_cb
+        self.add_item(btn_reset)
         
         if self.target_user_id:
             index = self.cog.profile_manager._get_user_index(self.target_user_id)
@@ -580,7 +623,6 @@ MOD_PROMPT_CATEGORIES = [
         ("Web Grounding (Visual)", "WEB_GROUNDING_VISUAL", DEFAULT_WEB_GROUNDING_VISUAL),
         ("Grounding RAG Payload", "GROUNDING_RAG_PAYLOAD", DEFAULT_GROUNDING_RAG_PAYLOAD),
         ("Anti-Repetition Critic", "ANTI_REPETITION", DEFAULT_ANTI_REPETITION_PROMPT),
-        ("Auto-Moderator Critic", "AUTO_MODERATOR", DEFAULT_AUTO_MODERATOR_PROMPT),
         ("Content Classifier (18+ gating)", "CONTENT_CLASSIFIER", DEFAULT_CONTENT_CLASSIFIER_PROMPT),
     ]),
     ("Memory & Training", [
@@ -636,10 +678,13 @@ def _split_prompt_for_modal(text: str, max_len: int = MODAL_TEXT_INPUT_MAX,
                             max_parts: int = MODAL_MAX_TEXT_INPUTS) -> Tuple[List[str], List[str]]:
     """Splits text into at most max_parts chunks of at most max_len characters.
 
-    Prompts outgrew the single 4000-character text input this modal used to be:
-    DEFAULT_HELP_MODE_INJECTION is 4703 characters, and Discord rejects a modal
-    whose default value exceeds the field's max_length, so that entry could not
-    be opened at all.
+    Prompts outgrew the single 4000-character text input this modal used to be,
+    and Discord rejects a modal whose default value exceeds the field's
+    max_length -- an over-long entry could not be opened at all. The worst
+    offender was DEFAULT_HELP_MODE_INJECTION, which carried the whole dashboard
+    tree inline; that tree is now generated and substituted at injection time, so
+    the default fits comfortably again. The split stays because an operator
+    override is free to grow past the limit.
 
     Cuts are preferred at line boundaries. Returns (chunks, joiners), where
     joiners[i] is the text consumed between chunks[i] and chunks[i + 1] -- a

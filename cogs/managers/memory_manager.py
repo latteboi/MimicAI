@@ -202,14 +202,15 @@ class MemoryManager:
         self.cog = cog
 
     def _load_ltm_shard(self, user_id: str, profile_name: str) -> Optional[Dict[str, List[Dict]]]:
-        data = self.cog.storage_manager._load_shard("ltm", user_id, profile_name)
-        if data:
-            # Purge legacy non-server memories upon load
-            guild_ltms =[item for item in data.get("guild", []) if item.get("scope") == "server"]
-            data["guild"] = guild_ltms
-            if "dm" in data:
-                del data["dm"]
-        return data
+        """Reads a profile's LTM archive: one "guild" bucket, every entry keyed by
+        the guild it formed in.
+
+        There is exactly one scope -- server -- so nothing is filtered here. This
+        used to rebuild the list on every load to drop memories under retired
+        scopes, which cost a pass over up to LIMIT_LTM entries on the retrieval
+        path to enforce a distinction that no longer has a way to be created.
+        """
+        return self.cog.storage_manager._load_shard("ltm", user_id, profile_name)
 
     def _save_ltm_shard(self, user_id: str, profile_name: str, data: Optional[Dict[str, List[Dict]]]):
         if not data or not data.get("guild"):
@@ -278,7 +279,8 @@ class MemoryManager:
             "sum": summary.strip(),
             "s_emb_b64": summary_embedding_b64,
             "usr": user_dn,
-            "scope": "server",
+            # The guild the memory formed in, and the only place it is ever
+            # recalled: retrieval masks on this against the current guild.
             "context_id": str(guild_id)
         }
         ltm_list.append(entry)
@@ -338,8 +340,14 @@ class MemoryManager:
             owner_profile_id = borrowed_data.get("original_profile_id")
 
             if owner_profile_id:
-                path = os.path.join(self.cog.USERS_DIR, str(owner_id), "profiles", owner_profile_id, "config.json.gz")
-                params_source = IOManager.read_json_gzip(path, self.cog.fernet) or {}
+                # Same dead `config.json.gz` path as the hub carried: the file is
+                # profile.json.gz with the config nested inside. Reading the missing
+                # path yielded {}, and the `if not params_source: return None` below
+                # then returned before retrieval -- so every borrowed profile (each
+                # borrow writes original_profile_id) silently recalled no long-term
+                # memories at all.
+                owner_profile_data = self.cog.profile_manager._get_profile_by_pid(owner_id, owner_profile_id) or {}
+                params_source = owner_profile_data.get("config") or {}
             else:
                 owner_profile_name = borrowed_data.get("original_profile_name", profile_name)
                 params_source = self.cog.profile_manager._get_profile_config(owner_id, owner_profile_name, False) or {}

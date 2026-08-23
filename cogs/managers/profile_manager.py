@@ -22,12 +22,15 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from ..utils.constants import (
     USERS_DIR, PUBLIC_PROFILES_DIR, defaultConfig,
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS,
-    DEFAULT_AUTO_MODERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS,
+    DEFAULT_SAFETY_SETTINGS,
     CONTENT_RATING_LABELS, CHANNEL_ACCESS_LABELS,
     CONTENT_RATING_REASON_LABELS, CONTENT_RATING_REASON_FALLBACK,
     DEFAULT_CONTENT_CLASSIFIER_PROMPT,
+    CONTENT_RATING_UNRATED, CONTENT_RATING_PENDING, CONTENT_RATING_GENERAL,
+    CONTENT_RATING_ADULT, CONTENT_RATING_EXEMPT,
+    CONTENT_RATING_CAPABILITIES, CONTENT_CAPABILITY_DENIALS,
+    CONTENT_RATING_EMOJI,
 )
-from ..utils.helpers import _legacy_declared_adult
 from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
@@ -411,8 +414,6 @@ class ProfileManager:
         # so both entries must go -- the stale key would otherwise linger until the
         # LRU evicted it.
         self._invalidate_content_rating(user_id, old_name)
-        if not is_borrowed:
-            self.schedule_content_classification(user_id, new_name)
         return True
 
     def _duplicate_profile(self, user_id: int, source_name: str, target_name: str) -> Tuple[bool, str]:
@@ -619,48 +620,8 @@ class ProfileManager:
                     config["profile_id"] = pid
                     p_data["config"] = config
                     self._save_profile(user_id, profile_name, p_data, is_borrowed)
-            if "safety_level" in config:
-                self._migrate_legacy_safety_level(config)
             return config
         return None
-
-    def _migrate_legacy_safety_level(self, config: Dict[str, Any]) -> None:
-        """Folds the retired safety_level field into content_rating, in place.
-
-        Runs on read rather than as a boot sweep, the same way the four-tier
-        collapse was retired: the mutated dict is what every caller works from,
-        and the next save of the profile persists it. Nothing has to migrate
-        before the bot is usable.
-
-        The direction matters more than the mechanism. Simply dropping the field
-        would release every existing 18+ profile into general channels on the
-        first restart after the merge, so an owner who had declared 'Unrestricted
-        18+' keeps that declaration as an owner_declared adult verdict. Under the
-        old scheme the declaration and the classifier verdict were merged by
-        taking whichever was stricter, so a declaration also outranks a stored
-        'general' -- only an existing 'adult' or 'exempt' is left alone, since
-        neither can be made stricter by this.
-        """
-        declared = config.pop("safety_level", None)
-        if not _legacy_declared_adult(declared):
-            return
-
-        rating = config.get("content_rating") or {}
-        if rating.get("verdict") in ("adult", "exempt"):
-            return
-
-        config["content_rating"] = {
-            "verdict": "adult",
-            # No hash: the declaration was about the profile, not about a
-            # specific revision of its text. set_owner_adult_declaration stamps
-            # one for declarations made after the merge.
-            "hash": None,
-            "model": None,
-            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "reason": "Declared 18+ by the owner before the safety-level merge",
-            "source": "owner_declared",
-        }
-
     def _save_profile_config(self, user_id: int, profile_name: str, data: Dict[str, Any], is_borrowed: bool = False):
         p_data = self._get_profile(user_id, profile_name, is_borrowed)
         if p_data is None:
@@ -721,11 +682,16 @@ class ProfileManager:
         return None
 
     def _save_profile_prompts(self, user_id: int, profile_name: str, data: Dict[str, Any]):
-        """Persists prompts and requeues content classification.
+        """Persists prompts and invalidates any cached content rating.
 
-        Every persona, instruction and image-prompt write funnels through here and
-        none of them are on the turn path, which is what makes this a safe hook --
-        unlike _save_profile_config, which the neuro engine rewrites every turn.
+        Every persona, instruction and image-prompt write funnels through here.
+
+        Deliberately does NOT classify. This hook used to fire the classifier on
+        every persona and instruction save and was the dominant source of classifier
+        calls -- a profile could be judged dozens of times over its life without its
+        owner ever asking for a verdict. The edit now only invalidates: the caller
+        decides what to do about the rating going stale, interactively where there
+        is a user to ask, and via resolve_stale_rating everywhere else.
         """
         pid = self._get_pid_from_name_any(user_id, profile_name)
         if not pid: return
@@ -740,7 +706,7 @@ class ProfileManager:
         else:
             p_data["prompts"] = data
         self._save_profile_by_pid(user_id, pid, p_data)
-        self.schedule_content_classification(user_id, profile_name)
+        self._invalidate_content_rating(user_id, profile_name)
 
     def _get_or_create_user_profile(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
         profile_name = profile_name.lower().strip()
@@ -765,7 +731,7 @@ class ProfileManager:
                 "top_k": defaultConfig.GEMINI_TOP_K, "training_context_size": defaultConfig.TRAINING_CONTEXT_SIZE,
                 "training_relevance_threshold": defaultConfig.TRAINING_RELEVANCE_THRESHOLD,
                 "ltm_context_size": 3, "ltm_relevance_threshold": 0.75, "ltm_creation_interval": 10,
-                "ltm_summarization_context": 10, "ltm_scope": "server",
+                "ltm_summarization_context": 10,
                 "primary_model": PRIMARY_MODEL_NAME, "fallback_model": FALLBACK_MODEL_NAME,
                 "time_tracking_enabled": True, "timezone": "UTC",
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
@@ -813,7 +779,7 @@ class ProfileManager:
                 "top_k": 40, "training_context_size": 0,
                 "training_relevance_threshold": 0.0,
                 "ltm_context_size": 0, "ltm_relevance_threshold": 1.0, "ltm_creation_interval": 100,
-                "ltm_summarization_context": 10, "ltm_scope": "server",
+                "ltm_summarization_context": 10,
                 "primary_model": "GOOGLE/gemini-2.5-flash-lite", "fallback_model": "GOOGLE/gemini-2.5-flash-lite",
                 "time_tracking_enabled": True, "timezone": "UTC", "generation_metadata_enabled": False,
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
@@ -847,29 +813,6 @@ class ProfileManager:
             self._save_profile_by_pid(user_id, pid, unified_profile)
 
         return {"config": self._get_profile_config(user_id, profile_name), "prompts": self._get_profile_prompts(user_id, profile_name)}
-
-    # ------------------------------------------------------------------
-    # Content classification (Phase 3)
-    #
-    # config["content_rating"] is the single input deciding where a profile may
-    # run. It carries a verdict and the source that set it:
-    #   classifier      -- what the classifier found
-    #   owner_declared  -- the owner volunteering that the profile is 18+
-    #   owner_override  -- a moderator clearing a classifier 'adult' for this content
-    #   owner_exempt    -- the bot owner exempting the profile from classification
-    #
-    # This absorbed a second field, config["safety_level"], which held the owner's
-    # declaration separately and was merged with the verdict by taking whichever
-    # was stricter. Two fields for one decision meant two writers, and the
-    # provider harm thresholds read the wrong one of them -- see
-    # _resolve_safety_settings in utils/helpers. _migrate_legacy_safety_level
-    # folds the old field in on read.
-    #
-    # The classifier can only ever escalate: it may force a profile to adult;
-    # nothing it returns can walk an owner's own declaration back to general.
-    # That keeps the writers order-independent -- a save racing a classification
-    # cannot produce a more permissive result than either would alone.
-    # ------------------------------------------------------------------
 
     def _moderated_surface(self, owner_id: int, profile_name: str) -> str:
         """The profile text the classifier judges, and the text the hash covers.
@@ -921,47 +864,158 @@ class ProfileManager:
     def _surface_hash(self, surface: str) -> str:
         return hashlib.sha256(surface.encode("utf-8", "replace")).hexdigest()[:16]
 
-    def _effective_safety_level(self, config: Dict[str, Any]) -> str:
-        """Where this profile may run, derived from its content rating alone."""
+
+    def reset_all_content_ratings(self) -> Dict[str, Any]:
+        """Operator maintenance: reset every profile on the instance to Unrated.
+
+        A single deliberate action, run once by the operator, rather than a lazy
+        per-read migration or a boot sweep. That is why nothing here is versioned:
+        with no automatic pass to guard against, there is no need to record which
+        profiles have already been through it, and no schema marker to carry
+        forward in every rating record for the rest of the bot's life.
+
+        **Unconditional.** Every profile, including Adult and Exempt ones. The point
+        is a clean baseline: a rating now means "the owner asked for this and got an
+        answer", and no verdict predating that rule qualifies, however it was
+        reached. Sparing Adult profiles would leave verdicts nobody consented to,
+        and sparing Exempt ones would leave grants whose original justification is
+        no longer visible. The operator can re-grant an exemption in one click, and
+        an owner can re-declare 18+ in one click with no API call.
+
+        Also strips the retired `safety_level`, which is the last of the pre-rating
+        fields.
+
+        Borrowed profiles (B/C PIDs) are skipped: their rating resolves through the
+        source profile, so their local snapshot is not the authority and rewriting
+        it would only create a second answer.
+
+        Blocking -- walks and rewrites every profile file. Call it in a thread.
+        """
+        counts = {"scanned": 0, "reset": 0, "skipped_borrowed": 0,
+                  "legacy_fields": 0, "errors": 0, "delisted": []}
+        if not os.path.isdir(USERS_DIR):
+            return counts
+
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        for user_id_str in os.listdir(USERS_DIR):
+            if not user_id_str.isdigit():
+                continue
+            profiles_dir = os.path.join(USERS_DIR, user_id_str, "profiles")
+            if not os.path.isdir(profiles_dir):
+                continue
+
+            for pid in os.listdir(profiles_dir):
+                path = os.path.join(profiles_dir, pid, "profile.json.gz")
+                if not os.path.exists(path):
+                    continue
+                counts["scanned"] += 1
+
+                if pid.startswith(("B", "C")):
+                    counts["skipped_borrowed"] += 1
+                    continue
+
+                try:
+                    p_data = IOManager.read_json_gzip(path, self.cog.fernet)
+                    if not isinstance(p_data, dict):
+                        continue
+                    config = p_data.get("config")
+                    if not isinstance(config, dict):
+                        continue
+
+                    if config.pop("safety_level", None) is not None:
+                        counts["legacy_fields"] += 1
+
+                    config["content_rating"] = {
+                        "verdict": CONTENT_RATING_UNRATED,
+                        "hash": None,
+                        "model": None,
+                        "at": now,
+                        "reason": None,
+                        "source": "reset",
+                    }
+                    p_data["config"] = config
+                    IOManager.write_json_gzip(p_data, path, self.cog.fernet)
+                    counts["reset"] += 1
+                except Exception as e:
+                    counts["errors"] += 1
+                    print(f"Content rating reset failed for {user_id_str}/{pid}: "
+                          f"{type(e).__name__}({e})")
+
+        # Everything is Unrated now, and an Unrated profile may not be published, so
+        # the entire public index is stale by construction. Clearing it is not a side
+        # effect of the reset -- it is the same decision applied to the index.
+        # Existing borrows are untouched: a borrow reads the source profile, never
+        # this index.
+        for entry_id, p_info in list(self.cog.public_profiles.items()):
+            desc = self._describe_public_entry(entry_id, p_info)
+            label = entry_id
+            if desc:
+                label = f"{desc['profile_name']} (owner {desc['owner_id']})"
+            self.cog.public_profiles.pop(entry_id, None)
+            counts["delisted"].append(label)
+        if counts["delisted"]:
+            self._save_public_index()
+
+        self.cog.content_rating_cache.clear()
+        return counts
+
+    def _verdict_of(self, config: Dict[str, Any]) -> str:
+        """The rating verdict for a config, normalised to a known state.
+
+        Anything unrecognised -- an absent record, the retired "unclassified", a
+        value from a build that has since been removed -- reads as Unrated. That is
+        the correct failure direction now: Unrated runs normally but cannot be
+        distributed, so an unreadable rating costs the owner a submission rather
+        than either silencing the profile or letting it out into the library.
+        """
         rating = config.get("content_rating") or {}
         verdict = rating.get("verdict")
+        if verdict in CONTENT_RATING_CAPABILITIES:
+            return verdict
+        return CONTENT_RATING_UNRATED
 
-        if verdict == "adult":
-            return "unrestricted"
-        if verdict == "exempt":
-            # Bot-owner exemption: behaves as 'general' -- it runs in any channel,
-            # global chat included -- and is never subject to fail-closed, since the
-            # whole point is that it bypasses the check. Checked ahead of the legacy
-            # field below so a retired 18+ declaration left on an exempted profile
-            # cannot override the exemption that was granted after it.
-            return "restricted"
+    def _effective_safety_level(self, config: Dict[str, Any]) -> str:
+        """Where this profile may run, derived from its content rating alone.
 
-        # Belt and braces for a config that reached here without passing through
-        # _get_profile_config -- a raw dict held by a view, an import, a restored
-        # backup. The migration is the normal path; this only stops an unmigrated
-        # 18+ declaration from reading as General in the gap, and it deliberately
-        # ranks below a real verdict rather than above it.
-        if _legacy_declared_adult(config.get("safety_level")):
-            return "unrestricted"
-
-        if verdict in (None, "unclassified") and defaultConfig.CONTENT_CLASSIFY_FAIL_CLOSED:
-            return "unrestricted"
-        return "restricted"
+        Only Adult restricts placement. Unrated, Pending and General are identical
+        at runtime -- the rating governs distribution, not execution -- so a profile
+        whose owner has never submitted it is not silenced, it is merely undistributable.
+        """
+        capabilities = CONTENT_RATING_CAPABILITIES[self._verdict_of(config)]
+        return "unrestricted" if capabilities["age_restricted_only"] else "restricted"
 
     def _content_rating_state(self, owner_id: int, profile_name: str) -> Tuple[str, Optional[str]]:
         """(verdict, reason) as last recorded, for display and for the UI gates.
 
         Deliberately does NOT recompute the surface hash. This runs on every render
         of the profile Home tab, and hashing means decrypting the whole persona;
-        staleness is detected instead by verify_content_rating, which is async and
+        staleness is detected instead by rating_is_stale, which is async and
         runs on dashboard open and session setup. The consequence is conservative in
         the right direction: a stale 'adult' verdict keeps the toggle locked until
         the recheck lands, rather than briefly unlocking it.
         """
         eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
         config = self._get_profile_config(eff_owner, eff_name, False) or {}
-        rating = config.get("content_rating") or {}
-        return rating.get("verdict", "unclassified"), rating.get("reason")
+        return self._verdict_of(config), (config.get("content_rating") or {}).get("reason")
+
+    def content_capability(self, owner_id: int, profile_name: str, capability: str) -> Tuple[bool, Optional[str]]:
+        """(allowed, reason_if_not) for one distribution capability.
+
+        Single source of truth for the share, publish and global-chat gates. Each
+        used to test verdicts inline in its own module -- the hub checked one set of
+        values, the global chat command checked publication instead of rating, and
+        the turn gate checked a third thing -- so the same profile could be accepted
+        by one and refused by another with no shared wording to explain it.
+        """
+        verdict, _ = self._content_rating_state(owner_id, profile_name)
+        allowed = CONTENT_RATING_CAPABILITIES[verdict][capability]
+        if allowed:
+            return True, None
+        reason = CONTENT_CAPABILITY_DENIALS.get(
+            (capability, verdict),
+            f"Not available for a profile rated {CONTENT_RATING_LABELS[verdict]}.")
+        return False, reason
 
     def _resolve_enforced_safety_level(self, profile_owner_id: int, profile_name: str) -> str:
         """The level the gate enforces for this profile, cached per (owner, name).
@@ -1145,120 +1199,6 @@ class ProfileManager:
             except Exception as e:
                 print(f"Error in cascade delete for user {user_id_str}: {e}")
 
-    async def _is_profile_content_safe(self, user_id: int, profile_name: str, display_name: str, avatar_url: Optional[str]) -> Tuple[bool, str]:
-        prompt_text = self.cog.global_prompts.get("AUTO_MODERATOR", DEFAULT_AUTO_MODERATOR_PROMPT)
-        
-        image_data = None
-        content_type = "image/png"
-        
-        if avatar_url:
-            try:
-                # The spoofed User-Agent rides on the request, not the client, so
-                # this can share the process-wide pool with everything else.
-                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-                response = await get_shared_client().get(avatar_url, follow_redirects=True, timeout=10.0, headers=headers)
-                response.raise_for_status()
-                image_data = response.content
-                content_type = response.headers.get("Content-Type", "image/png")
-            except httpx.RequestError as e:
-                return False, f"Could not download the avatar image from the provided URL: {e}"
-            except Exception as e:
-                return False, f"An error occurred while processing the avatar URL: {e}"
-
-        try:
-            or_key = self.cog.storage_manager._get_api_key_for_user(user_id, "openrouter")
-            g_key = self.cog.storage_manager._get_api_key_for_user(user_id, "gemini")
-            
-            if not or_key and not g_key:
-                return False, "A Personal API Key (OpenRouter or Google) is required to perform safety analysis for public profiles. Please configure one via the `/settings` command."
-            
-            parts_list = [
-                f"<target_content>\nProfile Name: {profile_name}\nDisplay Name: {display_name}\n</target_content>"
-            ]
-            if image_data:
-                parts_list.append({"mime_type": content_type, "data": image_data})
-
-            eval_payload = [{"role": "user", "parts": parts_list}]
-            gen_cfg = {"temperature": 0.0, "top_k": 1, "top_p": 0.9}
-            
-            response = None
-            status = "api_error"
-            or_error = None
-            g_error = None
-            
-            if or_key:
-                used_model = "amazon/nova-lite-v1"
-                try:
-                    model = OpenRouterModel(
-                        api_key=or_key,
-                        model_name=used_model, 
-                        system_instruction=prompt_text
-                    )
-                    response = await model.generate_content_async(eval_payload, generation_config=gen_cfg)
-                    status = "blocked_by_safety" if not response.candidates else "success"
-                except Exception as e:
-                    or_error = str(e)
-                    print(f"OpenRouter Auto-Mod failed: {e}")
-                    response = None
-                finally:
-                    self.cog._log_api_call(user_id=0, guild_id=None, context="moderation_check", model_used=used_model, status=status)
-
-            if not response and g_key:
-                status = "api_error"
-                used_model = "gemini-2.5-flash-lite"
-                try:
-                    model = GoogleGenAIModel(
-                        api_key=g_key,
-                        model_name=used_model,
-                        system_instruction=prompt_text,
-                        safety_settings=DEFAULT_SAFETY_SETTINGS
-                    )
-                    response = await model.generate_content_async(eval_payload, generation_config=gen_cfg)
-                    status = "blocked_by_safety" if not response.candidates else "success"
-                except Exception as e:
-                    g_error = str(e)
-                    print(f"Google Auto-Mod failed: {e}")
-                    response = None
-                finally:
-                    self.cog._log_api_call(user_id=0, guild_id=None, context="moderation_check_fallback" if or_key else "moderation_check", model_used=used_model, status=status)
-
-            if not response or not response.candidates:
-                reason = "Unknown"
-                if response and hasattr(response, 'prompt_feedback') and response.prompt_feedback and response.prompt_feedback.block_reason:
-                    reason = response.prompt_feedback.block_reason.name
-                
-                print(f"Auto-moderation check failed. OpenRouter Error: {or_error} | Google Error: {g_error} | Block Reason: {reason}")
-                
-                err_msg = "Content was flagged as unsafe or validation failed."
-                if or_error and g_error:
-                    err_msg += f" Primary model failed ({self.cog._format_api_error(Exception(or_error))}). Fallback model failed ({self.cog._format_api_error(Exception(g_error))})."
-                elif or_error:
-                    err_msg += f" Model failed ({self.cog._format_api_error(Exception(or_error))})."
-                elif g_error:
-                    err_msg += f" Model failed ({self.cog._format_api_error(Exception(g_error))})."
-                elif reason != "Unknown":
-                    err_msg += f" Block reason: {reason}."
-                
-                return False, err_msg
-
-            result = ""
-            if response.candidates:
-                candidate = response.candidates[0]
-                if candidate.content and candidate.content.parts:
-                    result = "".join(p.text for p in candidate.content.parts if hasattr(p, 'text')).strip().upper()
-
-            if "SAFE" in result and "UNSAFE" not in result:
-                return True, "Content is safe."
-            elif result == "SAFE":
-                return True, "Content is safe."
-            else:
-                return False, "Content was flagged as unsafe by the AI moderator."
-        except Exception as e:
-            print(f"Auto-moderation check failed: {e}")
-            traceback.print_exc()
-            return False, "An error occurred during the moderation check."
-        
-
     def _classifier_api_key(self, owner_id: int, provider: str) -> Optional[str]:
         """Personal -> instance-owner key for the classifier.
 
@@ -1275,6 +1215,53 @@ class ProfileManager:
         if int(owner_id) != bot_owner:
             return self.cog.storage_manager._get_api_key_for_user(bot_owner, provider)
         return None
+
+    async def _fetch_avatar_part(self, owner_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
+        """The profile's avatar as an inline image part, or None.
+
+        Absorbed from the retired auto-moderator, with one behavioural change that
+        was a standing bug: a download failure is no longer fatal.
+
+        The auto-moderator refused to publish when it could not fetch the avatar,
+        which conflated "this image is unacceptable" with "this host would not serve
+        *us*". Those are not the same, and the difference is visible in production:
+        the webhook path never downloads anything -- it hands the URL to Discord and
+        Discord's servers fetch it -- so an image the bot could not retrieve from a
+        datacentre IP still rendered perfectly in chat, while publishing the same
+        profile failed with a URL error. Now the image is one signal among several:
+        if it cannot be had, the text is judged alone.
+        """
+        eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
+        config = self._get_profile_config(eff_owner, eff_name, False) or {}
+        avatar_url = config.get("custom_avatar_url")
+        if not avatar_url:
+            return None
+
+        try:
+            # The spoofed User-Agent rides on the request, not the client, so this
+            # can share the process-wide pool with everything else.
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                     "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                     "Chrome/120.0.0.0 Safari/537.36"}
+            response = await get_shared_client().get(
+                avatar_url, follow_redirects=True, timeout=10.0, headers=headers)
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Classifier could not fetch the avatar for {eff_owner}/{eff_name} "
+                  f"({type(e).__name__}); judging the text alone.")
+            return None
+
+        data = response.content
+        if not data or len(data) > defaultConfig.CONTENT_CLASSIFY_MAX_IMAGE_BYTES:
+            return None
+
+        content_type = (response.headers.get("Content-Type") or "image/png").split(";")[0].strip()
+        if not content_type.startswith("image/"):
+            # A URL that serves an HTML error page is not an avatar. Sending it as
+            # an image part is a guaranteed provider error.
+            return None
+
+        return {"mime_type": content_type, "data": data}
 
     async def _classify_profile_content(self, owner_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
         """Runs the classifier over one profile and returns a content_rating record.
@@ -1293,7 +1280,13 @@ class ProfileManager:
 
         prompt_text = self.cog.global_prompts.get(
             "CONTENT_CLASSIFIER", DEFAULT_CONTENT_CLASSIFIER_PROMPT)
-        payload = [{"role": "user", "parts": [f"<target_profile>\n{truncated}\n</target_profile>"]}]
+
+        parts = [f"<target_profile>\n{truncated}\n</target_profile>"]
+        avatar_part = await self._fetch_avatar_part(owner_id, profile_name)
+        if avatar_part:
+            parts.append(avatar_part)
+
+        payload = [{"role": "user", "parts": parts}]
         gen_cfg = {"temperature": 0.0, "top_k": 1, "top_p": 0.9}
 
         attempts = [
@@ -1393,7 +1386,7 @@ class ProfileManager:
                 and rating.get("verdict") != "adult"):
             # The owner volunteered 18+. The classifier escalates, it does not
             # relax, so a 'general' verdict here changes nothing -- but the hash is
-            # stamped anyway, so verify_content_rating stops seeing this content as
+            # stamped anyway, so rating_is_stale stops seeing this content as
             # unclassified and re-queueing it on every dashboard render. Normally
             # unreachable: schedule_content_classification skips declared profiles.
             # This catches a job already in flight when the declaration landed.
@@ -1409,49 +1402,83 @@ class ProfileManager:
         self._invalidate_content_rating(owner_id, profile_name)
         return True
 
-    async def verify_content_rating(self, owner_id: int, profile_name: str):
-        """Reclassifies if the stored verdict no longer matches the profile content.
+    async def rating_is_stale(self, owner_id: int, profile_name: str) -> bool:
+        """True when the profile's text has changed since its verdict was recorded.
 
-        The edit paths schedule classification directly; this is the backstop for
-        anything they miss -- an import, a restored backup, a future edit path.
-        Deliberately NOT called from the gate: it decrypts the whole persona to
-        hash it, which has no business running on the turn path. Called instead
-        when the dashboard is opened and when a session is set up.
+        Hashes the moderated surface, which decrypts the whole persona -- so this
+        belongs on deliberate paths only, never on the turn path. States that cannot
+        go stale are answered before the hash is computed rather than after it.
         """
         eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
         config = self._get_profile_config(eff_owner, eff_name, False) or {}
         rating = config.get("content_rating") or {}
+        verdict = self._verdict_of(config)
 
-        # Checked before hashing, not after: this runs on every dashboard render, and
-        # an exempt, declared or recently-failed profile must cost nothing here.
-        # Skipping only at the schedule step still paid for the persona decrypt
-        # every time.
-        if rating.get("verdict") == "exempt":
-            return
-        if rating.get("verdict") == "adult" and rating.get("source") == "owner_declared":
-            # Already at the strictest verdict the classifier could reach, and it
-            # cannot relax one. Reclassifying could only ever confirm it, at the
-            # cost of an API call per edit against the owner's key.
-            return
+        # Unrated has nothing to be stale against; Pending is mid-flight; Exempt is
+        # the operator's standing decision; an owner declaration is about the profile
+        # rather than a revision of its text, and Adult is already the strictest
+        # verdict reachable.
+        if verdict in (CONTENT_RATING_UNRATED, CONTENT_RATING_PENDING, CONTENT_RATING_EXEMPT):
+            return False
+        if verdict == CONTENT_RATING_ADULT and rating.get("source") == "owner_declared":
+            return False
         retry_after = rating.get("retry_after")
         if retry_after and time.time() < retry_after:
-            return
+            return False
+
+        stored = rating.get("hash")
+        if not stored:
+            return False
 
         current = await asyncio.to_thread(
             lambda: self._surface_hash(self._moderated_surface(eff_owner, eff_name)))
-        if rating.get("hash") == current:
-            return
-        self.schedule_content_classification(eff_owner, eff_name)
+        return stored != current
+
+    async def resolve_stale_rating(self, owner_id: int, profile_name: str) -> Optional[str]:
+        """Handles a rating whose profile has been edited since it was judged.
+
+        Returns what happened, for the caller to report, or None if nothing needed
+        doing. This is the backstop for edits that do not go through the interactive
+        prompt -- an import, a bulk apply, a restored backup, a future edit path.
+
+        The rule is the whole point of the redesign:
+
+        * **Undistributed** -- drop to Unrated. Free, no API call. The owner keeps
+          using the profile exactly as before and re-submits when they next want to
+          share it.
+        * **Distributed** -- re-classify. Other people are running this profile on
+          the strength of its verdict, so the verdict has to keep up. This is the
+          only path that spends a call without being asked to, and it is bounded by
+          the number of profiles that are actually shared.
+        """
+        if not await self.rating_is_stale(owner_id, profile_name):
+            return None
+
+        eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
+
+        distributed = await asyncio.to_thread(
+            self.is_profile_distributed, eff_owner, eff_name)
+        if distributed:
+            self.schedule_content_classification(eff_owner, eff_name)
+            return "reclassify"
+
+        await asyncio.to_thread(self.drop_to_unrated, eff_owner, eff_name)
+        return "unrated"
 
     def _record_classification_failure(self, owner_id: int, profile_name: str, reason: str):
         """Stamps a retry-after on a profile the classifier could not judge."""
         config = self._get_profile_config(owner_id, profile_name, False)
         if config is None:
             return
-        if (config.get("content_rating") or {}).get("verdict") in ("adult", "general", "exempt"):
+        if self._verdict_of(config) in (CONTENT_RATING_ADULT, CONTENT_RATING_GENERAL,
+                                       CONTENT_RATING_EXEMPT):
             return  # a real verdict already stands; a later failure must not erase it
         config["content_rating"] = {
-            "verdict": "unclassified",
+            # Stays Pending rather than dropping to Unrated: the owner did ask for a
+            # verdict, and the dashboard shows the stored reason and the retry time
+            # against this state. Dropping to Unrated would silently discard their
+            # submission because a key happened to be missing.
+            "verdict": CONTENT_RATING_PENDING,
             "hash": None,
             "model": None,
             "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -1495,11 +1522,50 @@ class ProfileManager:
                 "source": "owner_exempt",
             }
         else:
-            config.pop("content_rating", None)
+            # Back to Unrated rather than straight to the classifier: removing an
+            # exemption returns the profile to its owner's hands, and submitting is
+            # the owner's call to make.
+            config["content_rating"] = {
+                "verdict": CONTENT_RATING_UNRATED,
+                "hash": None,
+                "model": None,
+                "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "reason": None,
+                "source": "exemption_removed",
+            }
         self._save_profile_config(owner_id, profile_name, config, False)
         self._invalidate_content_rating(owner_id, profile_name)
-        if not exempt:
-            self.schedule_content_classification(owner_id, profile_name)
+        return True
+
+    def clear_adult_verdict(self, owner_id: int, profile_name: str, moderator_id: int) -> bool:
+        """Operator appeal: pins General for exactly the content that was flagged.
+
+        Keyed to the current surface hash, so the override lapses the moment the
+        persona changes -- a cleared profile cannot be edited into adult content and
+        keep its clearance. Lifted out of the dashboard view so the Content Safety
+        page and any future caller share one implementation.
+        """
+        config = self._get_profile_config(owner_id, profile_name, False)
+        if config is None:
+            return False
+        if self._verdict_of(config) != CONTENT_RATING_ADULT:
+            return False
+        if self._is_owner_declared_adult(owner_id, profile_name):
+            # An owner's own declaration is theirs to withdraw, not a moderator's to
+            # overrule -- clearing it would silently un-declare their profile.
+            return False
+
+        surface = self._moderated_surface(owner_id, profile_name)
+        config["content_rating"] = {
+            "verdict": CONTENT_RATING_GENERAL,
+            "hash": self._surface_hash(surface),
+            "model": None,
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "reason": f"Cleared by moderator {moderator_id}",
+            "source": "owner_override",
+        }
+        self._save_profile_config(owner_id, profile_name, config, False)
+        self._invalidate_content_rating(owner_id, profile_name)
         return True
 
     def _is_classification_exempt(self, owner_id: int, profile_name: str) -> bool:
@@ -1554,7 +1620,7 @@ class ProfileManager:
             config["content_rating"] = {
                 "verdict": "adult",
                 # No hash. A declaration is about the profile, not about one
-                # revision of its text, and verify_content_rating returns on the
+                # revision of its text, and rating_is_stale returns on the
                 # declaration before it hashes anything -- so a hash would protect
                 # against nothing while costing a full persona decrypt inside a GUI
                 # callback, once per profile in the bulk path.
@@ -1569,21 +1635,157 @@ class ProfileManager:
                 return False
             # Dropped rather than rewritten to 'general': the owner withdrawing a
             # declaration is not a judgement that the content is general, it is a
-            # request for the classifier to make one. Scheduled below.
-            config.pop("content_rating", None)
+            # Withdrawing a declaration is not a judgement that the content is
+            # general, it is a request to stop asserting otherwise. The profile
+            # returns to Unrated and its owner submits it when they want a verdict.
+            config["content_rating"] = {
+                "verdict": CONTENT_RATING_UNRATED,
+                "hash": None,
+                "model": None,
+                "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "reason": None,
+                "source": "declaration_withdrawn",
+            }
 
         self._save_profile_config(owner_id, profile_name, config, False)
         self._invalidate_content_rating(owner_id, profile_name)
-        if not declared:
-            self.schedule_content_classification(owner_id, profile_name)
+        return True
+
+    def is_profile_distributed(self, owner_id: int, profile_name: str) -> bool:
+        """True when someone other than the owner currently holds this profile.
+
+        Published to the library, or borrowed by at least one user. This is the line
+        the whole scheme turns on: an undistributed profile is nobody else's problem
+        and is never classified without being asked for, while a distributed one has
+        to keep its verdict honest because other people are running it.
+
+        Scans every user's borrow index, so it belongs on deliberate paths -- an
+        edit, a dashboard render -- and never on the turn path.
+        """
+        if self._is_profile_public(owner_id, profile_name):
+            return True
+
+        eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
+        owner_str = str(eff_owner)
+        if not os.path.isdir(USERS_DIR):
+            return False
+
+        for user_id_str in os.listdir(USERS_DIR):
+            if not user_id_str.isdigit() or user_id_str == owner_str:
+                continue
+            try:
+                index = self._get_user_index(int(user_id_str))
+                for b_name in index.get("borrowed", []) or []:
+                    b_config = self._get_profile_config(int(user_id_str), b_name, True)
+                    if not b_config:
+                        continue
+                    if str(b_config.get("original_owner_id")) != owner_str:
+                        continue
+                    if b_config.get("original_profile_name") == eff_name:
+                        return True
+            except Exception:
+                # A single unreadable index must not decide that a shared profile is
+                # private -- that is the direction that skips a needed reclassification.
+                continue
+        return False
+
+    async def submit_for_rating(self, owner_id: int, profile_name: str) -> Tuple[bool, str]:
+        """Owner-initiated: move a profile to Pending and queue the classifier.
+
+        The only path that starts a classification from nothing. Everything else
+        either re-runs an existing verdict for a distributed profile, or drops the
+        profile back to Unrated and waits to be asked again.
+
+        **Async on purpose.** schedule_content_classification needs a running event
+        loop to create its task, and returns silently when there is not one. An
+        earlier version of this was a plain sync method that callers reached through
+        asyncio.to_thread for the file writes -- which meant the schedule call landed
+        on a worker thread every single time, hit that guard, and did nothing. The
+        profile was written Pending, the user was told it had been submitted, and no
+        job existed to ever move it off Pending. The blocking work is threaded
+        individually here so the scheduling stays on the loop.
+        """
+        index = await asyncio.to_thread(self._get_user_index, owner_id)
+        if profile_name in index.get("borrowed", []):
+            return False, "A borrowed profile is rated by its owner, not by you."
+
+        verdict, _ = await asyncio.to_thread(self._content_rating_state, owner_id, profile_name)
+        if verdict == CONTENT_RATING_EXEMPT:
+            return False, "This profile is exempt from classification."
+        if verdict == CONTENT_RATING_PENDING:
+            # A Pending profile is either genuinely in flight or a submission that
+            # failed and stamped a retry-after. Refusing both alike strands the
+            # second kind permanently: the internal retries are exhausted, nothing
+            # re-queues it, and the owner is told to wait for a verdict that will
+            # never arrive. Once the cooldown has passed, let them try again.
+            eff_owner, eff_name = await asyncio.to_thread(
+                self._resolve_effective_profile, owner_id, profile_name)
+            config = await asyncio.to_thread(self._get_profile_config, eff_owner, eff_name, False)
+            rating = (config or {}).get("content_rating") or {}
+            retry_after = rating.get("retry_after")
+            if not retry_after:
+                return False, "This profile is already awaiting a verdict."
+            if time.time() < retry_after:
+                return False, (f"The last attempt failed and it will retry "
+                               f"<t:{int(retry_after)}:R>. This usually means no API key "
+                               f"was available -- check `/settings`.")
+        if verdict == CONTENT_RATING_ADULT and await asyncio.to_thread(
+                self._is_owner_declared_adult, owner_id, profile_name):
+            return False, ("You have declared this profile 18+. Withdraw the declaration "
+                           "first if you want it classified instead.")
+
+        config = await asyncio.to_thread(self._get_profile_config, owner_id, profile_name, False)
+        if config is None:
+            return False, "Profile not found."
+
+        config["content_rating"] = {
+            "verdict": CONTENT_RATING_PENDING,
+            "hash": None,
+            "model": None,
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "reason": None,
+            "source": "submitted",
+        }
+        await asyncio.to_thread(self._save_profile_config, owner_id, profile_name, config, False)
+        self._invalidate_content_rating(owner_id, profile_name)
+
+        # On the loop, not in a thread -- see the note above.
+        self.schedule_content_classification(owner_id, profile_name)
+        return True, "Submitted. The verdict usually lands within a few seconds."
+
+    def drop_to_unrated(self, owner_id: int, profile_name: str) -> bool:
+        """Returns a profile to Unrated without spending a call.
+
+        What an edit to an undistributed profile does. The owner keeps using it
+        exactly as before -- Unrated and General are identical at runtime -- and
+        re-submits whenever they next want to share it.
+        """
+        config = self._get_profile_config(owner_id, profile_name, False)
+        if config is None:
+            return False
+        if self._verdict_of(config) == CONTENT_RATING_EXEMPT:
+            return False
+
+        config["content_rating"] = {
+            "verdict": CONTENT_RATING_UNRATED,
+            "hash": None,
+            "model": None,
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "reason": None,
+            "source": "edited",
+        }
+        self._save_profile_config(owner_id, profile_name, config, False)
+        self._invalidate_content_rating(owner_id, profile_name)
         return True
 
     def schedule_content_classification(self, owner_id: int, profile_name: str):
-        """Queues a profile for (re)classification after an edit. Never awaited.
+        """Queues a profile for classification. Never awaited.
 
-        Called from the handful of edit paths that touch the moderated surface --
-        deliberately not from _save_profile_config, which the neuro engine writes to
-        on every turn for neuro-enabled profiles and would turn into a classify storm.
+        No longer called from the edit paths. Classification now starts in exactly
+        two places: an owner submitting via the Content Safety dashboard, and the
+        re-check of a *distributed* profile whose text has changed underneath its
+        borrowers. Every other edit either drops the profile to Unrated or, for a
+        distributed one, asks the owner which they want.
         """
         index = self._get_user_index(owner_id)
         if profile_name in index.get("borrowed", []):
@@ -1593,7 +1795,7 @@ class ProfileManager:
         if self._is_owner_declared_adult(owner_id, profile_name):
             # Nothing a verdict could add: adult is already the strictest outcome
             # and the classifier cannot relax one. Skipping here is what keeps a
-            # declared profile from spending an API call on every persona edit.
+            # declared profile from ever spending an API call.
             return
         if self._classification_on_cooldown(owner_id, profile_name):
             return
@@ -1606,9 +1808,16 @@ class ProfileManager:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            # Called from a worker thread with no loop. The invalidation above still
-            # stands, and verify_content_rating picks the profile up next time the
-            # dashboard or a session touches it.
+            # Called from a worker thread with no loop, so no task can be created.
+            # Loud, because a silent return here is what left submitted profiles
+            # stuck on Pending forever: the caller had already written the state and
+            # told the user it was in progress, and nothing existed to finish it.
+            # The invalidation above still stands, and resolve_stale_rating picks the
+            # profile up next time the dashboard or a session touches it.
+            print(f"Classification for {owner_id}/{profile_name} was scheduled from a "
+                  f"worker thread with no event loop and has been dropped. Call this "
+                  f"from the loop.")
+            self.cog.pending_classifications.pop(key, None)
             return
 
         self.cog.pending_classifications[key] = 0
@@ -1638,8 +1847,8 @@ class ProfileManager:
             # Out of attempts. Record why and when, so the next dashboard render or
             # session setup does not immediately re-queue the same doomed job -- that
             # loop is what turned one unclassifiable profile into an endless stream of
-            # give-up lines. The profile stays unclassified, which behaves as
-            # Restricted unless the operator set CONTENT_CLASSIFY_FAIL_CLOSED.
+            # give-up lines. The profile stays Pending, which runs normally but
+            # cannot be shared until a verdict is actually reached.
             reason = getattr(self, "_last_classify_failure", None) or "unknown"
             print(f"Classification gave up for {owner_id}/{profile_name}: {reason}. "
                   f"Retrying no sooner than {defaultConfig.CONTENT_CLASSIFY_RETRY_AFTER}s from now.")
@@ -2127,15 +2336,11 @@ class ProfileManager:
         declared = self._is_owner_declared_adult(user_id, profile_name)
         is_public = self._is_profile_public(user_id, profile_name)
 
-        rating_display = {
-            "general": "✅ `General`",
-            "adult": "🔞 `Adult 18+`",
-            "exempt": "🛡️ `Exempt`",
-            "unclassified": "⏳ `Pending`",
-        }.get(verdict, "⏳ `Pending`")
+        rating_display = (f"{CONTENT_RATING_EMOJI[verdict]} "
+                          f"`{CONTENT_RATING_LABELS[verdict]}`")
         # The padlock marks a verdict the owner cannot move themselves, which is
         # every adult verdict except their own declaration.
-        if verdict == "adult" and not declared:
+        if verdict == CONTENT_RATING_ADULT and not declared:
             rating_display += " 🔒"
 
         # Discord packs inline fields three to a row, so these are emitted as two
@@ -2169,7 +2374,7 @@ class ProfileManager:
                         value="🌐 `Published`" if is_public else "`Not published`", inline=True)
         embed.add_field(name="\u200b", value="\u200b", inline=True)
 
-        if verdict == "unclassified" and verdict_reason:
+        if verdict == CONTENT_RATING_PENDING and verdict_reason:
             # Surface why a profile is stuck on Pending. A silent Pending was
             # indistinguishable from one still in flight. This reason describes an
             # operational failure rather than the persona, so it is shown as stored.
@@ -2179,7 +2384,7 @@ class ProfileManager:
             embed.description = ((embed.description or "") +
                                  "\n🔞 **Declared as adult content by you.** This profile is "
                                  "limited to age-restricted channels and cannot be published. "
-                                 "Withdraw the declaration from the Home tab to have it "
+                                 "Withdraw the declaration from Content Safety to have it "
                                  "classified normally.").strip()
         elif verdict == "adult":
             # A category, never the classifier's own words about the persona.
@@ -2188,12 +2393,13 @@ class ProfileManager:
                                  + CONTENT_RATING_REASON_LABELS.get(
                                      verdict_reason, CONTENT_RATING_REASON_FALLBACK) +
                                  ".** This profile is limited to age-restricted channels. "
-                                 "Editing the persona re-runs the check; contact the bot "
-                                 "operator to dispute the result.").strip()
+                                 "Edit the persona and submit it again from Content Safety, "
+                                 "or contact the bot operator to dispute the "
+                                 "result.").strip()
 
         # Re-check off the turn path: the edit hooks cover the normal cases, this
         # catches imports and anything they miss.
-        asyncio.create_task(self.verify_content_rating(user_id, profile_name))
+        asyncio.create_task(self.resolve_stale_rating(user_id, profile_name))
 
         if is_public:
             embed.description = ((embed.description or "") +
@@ -2566,8 +2772,7 @@ class ProfileManager:
                 "original_profile_id": target_original_pid,
                 "pointer": pointer_value,
                 "borrowed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "ltm_creation_enabled": False,
-                "ltm_scope": "server"
+                "ltm_creation_enabled": False
             })
 
             # The class letter records provenance, not current state: 'C' means the

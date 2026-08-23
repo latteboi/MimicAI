@@ -49,9 +49,7 @@ class EventListeners:
             print("Running initial index.json self-repair on boot...")
             await asyncio.to_thread(self.profile_manager._repair_all_user_indices)
             print("Initial index.json self-repair complete.")
-            
-            await asyncio.to_thread(self.storage_manager._migrate_embeddings_to_b64)
-            
+
             if not self.profile_manager.hourly_self_repair_task.is_running():
                 self.profile_manager.hourly_self_repair_task.start()
             
@@ -921,31 +919,27 @@ class EventListeners:
             return choices
 
         elif cmd_name == "global_chat":
+            # Gated on the content rating, which is what the command itself checks.
+            # This used to offer only profiles listed in the Public Library -- the
+            # proxy the command dropped when content_capability became the single
+            # gate -- so a user whose profiles were rated but unpublished got an
+            # empty menu for profiles the command accepts, which is every user who
+            # has never published. Publication is not required to talk to your own
+            # profile privately.
+            #
+            # The rating check reads the profile body (and the source's, for a
+            # borrow), so it runs on the <=25 ranked survivors in the shared loop
+            # below rather than over the whole index on every keystroke.
             user_id = interaction.user.id
             index = self.profile_manager._get_user_index(user_id)
-            public_pointers = set()
-            for p_info in self.public_profiles.values():
-                if isinstance(p_info, str) and ":" in p_info:
-                    public_pointers.add(p_info)
-                elif isinstance(p_info, dict):
-                    oid = str(p_info.get("owner_id"))
-                    opid = p_info.get("original_pid")
-                    if oid and opid: public_pointers.add(f"{oid}:{opid}")
 
             for p_name in index.get("personal", []):
-                pid = self.profile_manager._get_pid_from_name_any(user_id, p_name)
-                if f"{user_id}:{pid}" in public_pointers:
-                    pending.append((p_name, p_name))
-                    meta[p_name] = {"kind": "personal", "pid": pid}
+                pending.append((p_name, p_name))
+                meta[p_name] = {"kind": "personal", "pid": None, "needs_global_chat": True}
 
             for b_name in index.get("borrowed", []):
-                b_cfg = self.profile_manager._get_profile_config(user_id, b_name, True)
-                if not b_cfg: continue
-                orig_oid = str(b_cfg.get("original_owner_id"))
-                orig_pid = b_cfg.get("original_pid") or b_cfg.get("original_profile_id")
-                if f"{orig_oid}:{orig_pid}" in public_pointers:
-                    pending.append((b_name, b_name))
-                    meta[b_name] = {"kind": "borrowed", "pid": orig_pid, "orig_oid": orig_oid}
+                pending.append((b_name, b_name))
+                meta[b_name] = {"kind": "borrowed", "pid": None, "needs_global_chat": True}
 
         else:
             user_id = interaction.user.id
@@ -972,6 +966,10 @@ class EventListeners:
         for name, _ in rank_keyed(current, pending, limit=25):
             m = meta[name]
             kind = m["kind"]
+
+            if m.get("needs_global_chat") and not self.profile_manager.content_capability(
+                    user_id, name, "global_chat")[0]:
+                continue
 
             if kind == "system":
                 app = self.profile_manager._get_user_appearance(user_id, name)

@@ -81,9 +81,9 @@ class MimicCog(commands.Cog, EventListeners):
         
         # Client placeholder for session-specific usage
         self.client = None
-        self.guide_vectors = []
-        # Pre-normalised (N, dims) float32 matrix over doc_vectors, built by
-        # HelpService._rebuild_doc_matrix whenever the documentation is (re)loaded.
+        # Documentation shards for Help Mode, embedded by HelpService, plus the
+        # pre-normalised (N, dims) float32 matrix over them that the search uses.
+        self.doc_vectors = []
         self.doc_matrix = None
         
         self._try_acquire_lock()
@@ -1390,13 +1390,14 @@ class MimicCog(commands.Cog, EventListeners):
         is_personal = profile_name_lower in index.get("personal", [])
         is_borrowed = profile_name_lower in index.get("borrowed", [])
         if not is_personal and not is_borrowed:
-            # Only published profiles can be used here, and an unpublished suggestion
-            # would just walk the user into the next rejection, so they are filtered out
-            # of the prompt. This is a typo-recovery path, not a per-message one, so the
-            # publicity check per candidate is affordable.
+            # Only profiles that may actually be used here are suggested -- proposing
+            # one that would just hit the next rejection wastes the recovery. This is a
+            # typo-recovery path, not a per-message one, so the per-candidate rating
+            # lookup is affordable.
             candidates = gather_owned_candidates(
                 self, user_id, include_system=False,
-                only=lambda name, kind: self.profile_manager._is_profile_public(user_id, name),
+                only=lambda name, kind: self.profile_manager.content_capability(
+                    user_id, name, "global_chat")[0],
             )
 
             async def on_pick(pick_interaction: discord.Interaction, picked: str):
@@ -1412,9 +1413,18 @@ class MimicCog(commands.Cog, EventListeners):
             )
             return
 
-        is_public = self.profile_manager._is_profile_public(user_id, profile_name_lower)
-        if not is_public:
-            await interaction.response.send_message(f"The profile '{profile_name_lower}' is not published to the Public Library. Only published profiles can be used in Global Chat.", ephemeral=True)
+        # Rating, not publication. Requiring a profile to be listed in the Public
+        # Library to talk to it privately was a proxy for "somebody has vetted this",
+        # and a poor one -- it forced users to publish a profile they only wanted for
+        # themselves. The rating is the vetting, so it is what gets checked.
+        allowed, deny_reason = self.profile_manager.content_capability(
+            user_id, profile_name_lower, "global_chat")
+        if not allowed:
+            await interaction.response.send_message(
+                f"**'{profile_name_lower}' cannot be used in Global Chat.**\n{deny_reason}\n\n"
+                f"Open `/profile manage profile_name:{profile_name_lower}` and choose "
+                f"**Content Safety** to rate it.",
+                ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=False)

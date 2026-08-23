@@ -355,6 +355,22 @@ class BaseBulkProfileView(ui.View):
 
         build_pagination_controls(self, self.current_page, num_pages, btn_row, p_cb, n_cb)
 
+        # Only when there is something to clear. "Select All" across both sources is
+        # one click, and undoing it by paging through every page to unselect is not;
+        # the dropdown sentinels only ever toggle the source currently in view.
+        if self.selected_profiles:
+            clear_btn = ui.Button(label="Clear", style=discord.ButtonStyle.secondary,
+                                  custom_id="clear_selection", row=btn_row)
+            clear_btn.callback = self.clear_selection_callback
+            self.add_item(clear_btn)
+
+    async def clear_selection_callback(self, interaction: discord.Interaction):
+        """Drops the whole selection, both sources, every page."""
+        self.selected_profiles.clear()
+        self._build_view()
+        await interaction.response.edit_message(
+            content=self._get_selection_feedback_message(), view=self)
+
     async def toggle_source_callback(self, interaction: discord.Interaction):
         self.view_source = 'borrowed' if self.view_source == 'personal' else 'personal'
         self.current_page = 0

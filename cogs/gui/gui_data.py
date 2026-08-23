@@ -260,11 +260,11 @@ class DataManageView(ui.View):
                 self.displayed_data_list = self.full_data_list
 
 
-        # After scope filtering, apply search term filtering on the result
+        # After server filtering, apply search term filtering on the result
         if self.search_term:
             search_term_lower = self.search_term.lower()
             
-            # Note: We filter the already-scope-filtered 'displayed_data_list'
+            # Note: We filter the already-server-filtered 'displayed_data_list'
             search_filtered_list = []
             for item in self.displayed_data_list:
                 content_to_search = ""
@@ -363,7 +363,7 @@ class DataManageView(ui.View):
 
         # Row 1: LTM Filter
         if self.mode == 'ltm' and ltm_filter_options:
-            ltm_filter_select = ui.Select(placeholder="Filter memories by scope...", options=ltm_filter_options, row=1)
+            ltm_filter_select = ui.Select(placeholder="Filter memories by server...", options=ltm_filter_options, row=1)
             ltm_filter_select.callback = self.ltm_filter_callback
             self.add_item(ltm_filter_select)
 
@@ -557,7 +557,10 @@ class DataManageView(ui.View):
                     self.cog.memory_manager._save_training_shard(user_id_str, self.profile_name, new_list)
                     deleted = True
             else: # ltm
-                context_type: Literal["guild", "dm"] = "guild" if self.guild_id else "dm"
+                # Always the guild bucket: it is the only one there is. Keying this
+                # off self.guild_id sent every deletion opened from a DM at a "dm"
+                # bucket that no longer exists, so it silently found nothing.
+                context_type = "guild"
                 ltm_shard = self.cog.memory_manager._load_ltm_shard(user_id_str, self.profile_name)
                 if ltm_shard:
                     data_list = ltm_shard.get(context_type, [])

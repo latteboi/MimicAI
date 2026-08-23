@@ -1291,6 +1291,48 @@ class SessionConfigView(ui.View):
                 async def n_cb(i): self.current_page += 1; await i.response.defer(); await self.update_display()
                 build_pagination_controls(self, self.current_page, num_pages, 1, p_cb, n_cb)
 
+            # Row 1 holds the source toggle plus at most three pagination controls, so
+            # there is exactly one slot left for this. Only rendered when the cast is
+            # non-empty -- the dropdown sentinels can only clear the source currently
+            # in view, so with a mixed cast there is otherwise no single gesture that
+            # empties it.
+            if self.session.get('profiles'):
+                clear_btn = ui.Button(label=f"Clear Cast ({len(self.session['profiles'])})",
+                                      style=discord.ButtonStyle.secondary, row=1)
+
+                async def clear_cast_cb(i: discord.Interaction):
+                    removed = list(self.session.get('profiles', []))
+                    self.session['profiles'] = []
+                    self.cog.session_manager._save_multi_profile_sessions()
+
+                    # Child bots hold their own per-channel session state, so dropping
+                    # them from the list is not enough -- without this they keep the
+                    # channel registered and go on showing a typing indicator for a
+                    # session they are no longer part of.
+                    for p_data in removed:
+                        if p_data.get('method') != 'child_bot':
+                            continue
+                        bot_id = p_data.get('bot_id')
+                        if not bot_id:
+                            continue
+                        await self.cog.manager_queue.put({
+                            "action": "send_to_child", "bot_id": bot_id,
+                            "payload": {"action": "session_update_remove",
+                                        "channel_id": self.original_interaction.channel_id}
+                        })
+                        await self.cog.manager_queue.put({
+                            "action": "send_to_child", "bot_id": bot_id,
+                            "payload": {"action": "stop_typing",
+                                        "channel_id": self.original_interaction.channel_id}
+                        })
+
+                    self.current_page = 0
+                    await i.response.defer()
+                    await self.update_display()
+
+                clear_btn.callback = clear_cast_cb
+                self.add_item(clear_btn)
+
             profiles = self.session.get('profiles', [])
             total_active = len(profiles)
             

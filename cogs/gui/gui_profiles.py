@@ -89,17 +89,33 @@ class _Action:
 
     `gate` is an optional predicate on the view; a row with no gate is always shown.
     `label` may be a callable for the rows whose wording depends on the profile.
+
+    `menu_label` is the wording used by the documentation menu map, which is rendered
+    from this table with no view to evaluate a callable `label` against. Required only
+    for the rows whose `label` is callable; everywhere else the static label is used.
     """
 
-    __slots__ = ("value", "tab", "label", "description", "gate", "run")
+    __slots__ = ("value", "tab", "label", "description", "gate", "run", "_menu_label")
 
-    def __init__(self, value, tab, label, description, run, gate=None):
+    def __init__(self, value, tab, label, description, run, gate=None, menu_label=None):
         self.value = value
         self.tab = tab
         self.label = label
         self.description = description
         self.run = run
         self.gate = gate
+        self._menu_label = menu_label
+
+    @property
+    def menu_label(self) -> str:
+        """View-independent wording for the generated menu map."""
+        if self._menu_label:
+            return self._menu_label
+        if callable(self.label):
+            # A callable label with no menu_label is a bug in the table, but the map
+            # is documentation -- degrade to the action key rather than raising.
+            return self.value.replace("_", " ").title()
+        return self.label
 
     def visible(self, view) -> bool:
         return self.gate is None or self.gate(view)
@@ -175,53 +191,6 @@ def _to_personal(view):
             and view.is_system)
 
 
-def _is_bot_owner_view(view):
-    """Bot-owner-only rows. Unlike _can_clear_verdict this does not require a
-    verdict to already stand -- the exemption is set ahead of time."""
-    return (not view.is_borrowed
-            and view.original_interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID))
-
-
-def _can_clear_verdict(view):
-    """Moderator-only: clear a classifier 'adult' verdict for the current content.
-
-    The appeal path. Without one, a false positive from a flash-lite model bricks a
-    profile in every general channel, and the owner's only recourse is to delete and
-    recreate -- which, with the verdict keyed to content, lands on the same result.
-    """
-    if view.is_borrowed or not view.is_mod_view:
-        return False
-    if view.original_interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
-        return False
-    verdict, _ = view.cog.profile_manager._content_rating_state(view.user_id, view.profile_name)
-    return verdict == "adult"
-
-
-
-def _can_mark_adult(view):
-    """The 18+ declaration is hidden for borrowed and published profiles.
-
-    A borrower does not own the content, and the public index only accepts
-    General profiles. The row is withheld rather than shown dead: there is
-    nothing to move in either case.
-
-    Both checks are in-memory for a non-borrowed profile -- _is_profile_public
-    reads the cached user index and cog.public_profiles -- so this is safe to
-    evaluate on every render of the Home tab.
-    """
-    if view.is_borrowed or view.cog.profile_manager._is_profile_public(view.user_id, view.profile_name):
-        return False
-
-    pm = view.cog.profile_manager
-    verdict, _ = pm._content_rating_state(view.user_id, view.profile_name)
-    # An adult verdict the owner did not set is not theirs to withdraw -- a
-    # classifier result is appealed to a moderator via /mod, and an exemption is
-    # the bot owner's. Their own declaration always stays withdrawable.
-    if verdict == "adult":
-        return pm._is_owner_declared_adult(view.user_id, view.profile_name)
-    return verdict != "exempt"
-
-
 #: The dropdown, in render order, grouped by tab. Order within a tab is the order the
 #: user sees, so rows must not be resorted.
 PROFILE_ACTIONS = (
@@ -243,24 +212,19 @@ PROFILE_ACTIONS = (
             _method("_handle_convert_copy", True), _to_system),
     _Action("convert_to_personal", "home", "Copy to Personal Profile", "Create a Personal Profile copy from this System Profile.",
             _method("_handle_convert_copy", False), _to_personal),
-    _Action("adult_declaration", "home",
-            lambda v: ("Withdraw Adult 18+ Declaration"
-                       if v.cog.profile_manager._is_owner_declared_adult(v.user_id, v.profile_name)
-                       else "Declare Adult Content 18+"),
-            "Confine this profile to age-restricted channels.",
-            _method("_handle_adult_declaration"), _can_mark_adult),
-    _Action("clear_verdict", "home", "Clear Adult Verdict (Mod)", "Override the classifier for this profile's current content.",
-            _method("_handle_clear_verdict", wants_profile=True), _can_clear_verdict),
-    _Action("classify_exempt", "home",
-            lambda v: ("Remove Classification Exemption (Owner)"
-                       if v.cog.profile_manager._is_classification_exempt(v.user_id, v.profile_name)
-                       else "Exempt From Classification (Owner)"),
-            "Bypass content classification for this profile entirely.",
-            _method("_handle_classify_exempt"), _is_bot_owner_view),
+    # One row where there were three. Declaring 18+, clearing a verdict and granting
+    # an exemption are all answers to "why can this profile not do X", and as bare
+    # dropdown rows none of them said what X was -- a user refused a publish had to
+    # guess which applied to them. They now live inside the Content Safety dashboard,
+    # next to the rating that explains them.
+    _Action("content_safety", "home", "Content Safety",
+            "View this profile's content rating and what it allows.",
+            _method("_handle_content_safety")),
     _Action("delete", "home",
             lambda v: "Remove Borrowed Profile" if v.is_borrowed else "Delete Profile",
             "Permanently remove this profile and its data.",
-            _method("_handle_delete")),
+            _method("_handle_delete"),
+            menu_label="Delete Profile / Remove Borrowed Profile"),
 
     # --- Persona (tab hidden entirely for borrowed profiles) ---
     _Action("edit_persona", "persona", "Edit Persona", "Edit backstory, traits, likes, dislikes, and appearance.",
@@ -557,70 +521,14 @@ class ProfileManageView(ui.View):
         new_embed = await self.cog.profile_manager._build_profile_manage_embed(interaction, profile_name, target_user_id=self.user_id)
         await interaction.response.edit_message(embed=new_embed, view=self)
 
-    async def _handle_adult_declaration(self, interaction):
-        """Adds or withdraws the owner's own 18+ declaration.
-
-        _can_mark_adult already withholds this row from borrowed and published
-        profiles, but the check is repeated here because a profile can be
-        published from another view while this one is still open on screen.
-
-        Goes through the manager rather than mutating the config dict this view
-        was built from: the declaration is a content_rating record, and writing it
-        here would race the classifier's own writer. The view is rebuilt from the
-        stored result afterwards, the same way the exemption toggle does it.
-        """
-        pm = self.cog.profile_manager
-        if _can_mark_adult(self):
-            declared = pm._is_owner_declared_adult(self.user_id, self.profile_name)
-            pm.set_owner_adult_declaration(self.user_id, self.profile_name, not declared)
-
-        for k in [k for k in self.cog.channel_models.keys()
-                  if isinstance(k, tuple) and len(k) >= 2 and k[1] == self.user_id]:
-            self.cog.channel_models.pop(k, None)
-            self.cog.channel_model_last_profile_key.pop(k, None)
-
-        self._build_view()
-        new_embed = await pm._build_profile_manage_embed(
-            interaction, self.profile_name, target_user_id=self.user_id)
-        await interaction.response.edit_message(embed=new_embed, view=self)
-
-    async def _handle_classify_exempt(self, interaction):
-        """Toggles the bot-owner exemption. Re-reads the profile after the manager
-        writes it, so the refreshed embed shows the new state rather than the stale
-        dict this view was built from."""
-        pm = self.cog.profile_manager
-        now_exempt = pm._is_classification_exempt(self.user_id, self.profile_name)
-        pm.set_classification_exempt(self.user_id, self.profile_name, not now_exempt)
-
-        for k in [k for k in self.cog.channel_models.keys()
-                  if isinstance(k, tuple) and len(k) >= 2 and k[1] == self.user_id]:
-            self.cog.channel_models.pop(k, None)
-            self.cog.channel_model_last_profile_key.pop(k, None)
-
-        self._build_view()
-        new_embed = await pm._build_profile_manage_embed(
-            interaction, self.profile_name, target_user_id=self.user_id)
-        await interaction.response.edit_message(embed=new_embed, view=self)
-
-    async def _handle_clear_verdict(self, interaction, profile):
-        """Pins a 'general' rating for exactly the content that was flagged.
-
-        Keyed to the current surface hash, so the override lapses the moment the
-        persona changes -- a cleared profile cannot be edited into adult content
-        and keep the clearance.
-        """
-        pm = self.cog.profile_manager
-        surface = pm._moderated_surface(self.user_id, self.profile_name)
-        profile['content_rating'] = {
-            "verdict": "general",
-            "hash": pm._surface_hash(surface),
-            "model": None,
-            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "reason": f"Cleared by moderator {interaction.user.id}",
-            "source": "owner_override",
-        }
-        pm._invalidate_content_rating(self.user_id, self.profile_name)
-        await self._save_and_refresh(interaction, profile, self.profile_name, self.is_borrowed)
+    async def _handle_content_safety(self, interaction):
+        view = ContentSafetyView(self.cog, self.original_interaction, self.profile_name,
+                                 self.is_borrowed, self.mod_return_user_id, self.is_mod_view)
+        await interaction.response.defer()
+        await view.refresh_state()
+        view._build_view()
+        await self.original_interaction.edit_original_response(
+            content=None, embed=view.get_embed(), view=view)
 
     async def _handle_appearance(self, interaction):
         modal = AppearanceModal(self.cog, self.original_interaction, self.profile_name, target_user_id=self.user_id)
@@ -799,6 +707,9 @@ class EditUserProfilePersonaModal(ui.Modal):
         message = f"Persona sections for {scope} {'updated' if success else 'update failed (max profiles reached or other issue)'}."
 
         await i.followup.send(message, ephemeral=True)
+        if success:
+            await maybe_prompt_rating_after_edit(
+                self.cog_instance, i, self.user_id, self.profile_name)
     async def on_error(self, i:discord.Interaction, e:Exception): print(f"EditUserProfilePersonaModal err: {e}"); traceback.print_exc(); await i.followup.send('Form error.',ephemeral=True)
 
 class EditUserProfileAIInstructionsModal(ui.Modal): 
@@ -833,6 +744,9 @@ class EditUserProfileAIInstructionsModal(ui.Modal):
         message = f"AI Instructions for {scope} {'updated' if success else 'update failed (max profiles reached or other issue)'}."
 
         await i.followup.send(message,ephemeral=True)
+        if success:
+            await maybe_prompt_rating_after_edit(
+                self.cog, i, self.user_id, self.profile_name)
     async def on_error(self, i:discord.Interaction,e:Exception): print(f"EditUserProfileAIInstrModal err: {e}"); traceback.print_exc(); await i.followup.send('Form error.',ephemeral=True)
 
 def ProfileParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
@@ -2086,12 +2000,13 @@ class AppearanceModal(ui.Modal):
                 await interaction.followup.send("❌ **Invalid Display Name:** Contains a reserved keyword or mention.", ephemeral=True)
                 return
 
-        is_public = self.cog.profile_manager._is_profile_public(owner_id, self.profile_name)
-        if is_public and (new_display_name or new_avatar_url):
-            is_safe, reason = await self.cog.profile_manager._is_profile_content_safe(owner_id, self.profile_name, new_display_name or self.profile_name, new_avatar_url)
-            if not is_safe:
-                await interaction.followup.send(f"**Safety Block:** {reason}", ephemeral=True)
-                return
+        # The published-profile safety re-check that used to run here is gone with the
+        # auto-moderator. It downloaded the avatar from this host and refused the edit
+        # if it could not -- which is how a profile whose avatar Discord serves
+        # perfectly well ended up unable to change its own display name. The avatar is
+        # now judged by the classifier, which treats a failed download as "no image"
+        # rather than as a violation, and a published profile whose appearance changes
+        # is picked up as a stale rating like any other edit.
 
         config = self.cog.profile_manager._get_profile_config(owner_id, self.profile_name, False)
         if config:
@@ -2103,9 +2018,10 @@ class AppearanceModal(ui.Modal):
             
             self.cog.profile_manager._save_profile_config(owner_id, self.profile_name, config, False)
             # Display name and avatar are part of the classified surface, and they
-            # live in config rather than prompts, so the _save_profile_prompts hook
-            # does not see them.
-            self.cog.profile_manager.schedule_content_classification(owner_id, self.profile_name)
+            # live in config rather than prompts, so the prompts hook does not see
+            # them. Invalidate only -- the rating going stale is resolved the same
+            # way a persona edit is, rather than spending a call here.
+            self.cog.profile_manager._invalidate_content_rating(owner_id, self.profile_name)
             
             if new_display_name or new_avatar_url:
                 self.cog.user_appearances.setdefault(user_id_str, {})[self.profile_name] = {
@@ -2136,6 +2052,9 @@ class AppearanceModal(ui.Modal):
         new_embed = await self.cog.profile_manager._build_profile_manage_embed(self.original_interaction, self.profile_name, target_user_id=owner_id)
         await self.original_interaction.edit_original_response(embed=new_embed)
         await interaction.followup.send("Appearance updated.", ephemeral=True)
+        # The display name and avatar are part of the classified surface, so an
+        # appearance edit invalidates a rating exactly as a persona edit does.
+        await maybe_prompt_rating_after_edit(self.cog, interaction, owner_id, self.profile_name)
 
 def ProfileNeuroModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
     state = current_params.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
@@ -2366,3 +2285,357 @@ class BulkManageView(ui.View):
         elif choice == "delete_items":
             view = BulkDeleteView(self.cog, self.user_id)
             await interaction.response.send_message(content="Select profiles to delete:", view=view, ephemeral=True)
+
+
+class ContentSafetyView(ui.View):
+    """The Content Safety dashboard for one profile.
+
+    Replaces the profile dashboard rather than opening beside it, because it is not
+    a settings page -- it is the explanation of why the profile can or cannot do
+    things, and it needs the room to say so. The three actions it absorbed
+    (declare 18+, clear verdict, exemption) previously sat as unexplained rows in
+    the Home dropdown, where a user who hit "this profile cannot be published" had
+    no way to find out which of them applied.
+
+    Every gate the bot enforces is rendered here from the same
+    CONTENT_RATING_CAPABILITIES table the gates read, so the page cannot describe a
+    rule the code does not implement.
+    """
+
+    def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction,
+                 profile_name: str, is_borrowed: bool, target_user_id: Optional[int] = None,
+                 is_mod_view: bool = False):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.original_interaction = original_interaction
+        self.profile_name = profile_name
+        self.is_borrowed = is_borrowed
+        self.is_mod_view = is_mod_view
+        self.user_id = target_user_id or original_interaction.user.id
+        self.mod_return_user_id = target_user_id
+        self.is_bot_owner = original_interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)
+        self.stale = False
+        self.distributed = False
+        self._build_view()
+
+    # --- data -----------------------------------------------------------------
+
+    async def refresh_state(self):
+        """Reads the two facts that need I/O, off the interaction path.
+
+        Staleness needs the persona decrypted and hashed, and distribution scans
+        every user's borrow index. Both are far too heavy for a render, so they are
+        resolved once when the view opens and reused until it is rebuilt.
+        """
+        pm = self.cog.profile_manager
+        try:
+            self.stale = await pm.rating_is_stale(self.user_id, self.profile_name)
+            self.distributed = await asyncio.to_thread(
+                pm.is_profile_distributed, self.user_id, self.profile_name)
+        except Exception as e:
+            print(f"Content Safety state read failed for {self.user_id}/{self.profile_name}: {e}")
+
+    def _rating(self):
+        pm = self.cog.profile_manager
+        eff_owner, eff_name = pm._resolve_effective_profile(self.user_id, self.profile_name)
+        config = pm._get_profile_config(eff_owner, eff_name, False) or {}
+        return pm._verdict_of(config), (config.get("content_rating") or {})
+
+    # --- layout ---------------------------------------------------------------
+
+    def _build_view(self):
+        self.clear_items()
+        verdict, rating = self._rating()
+        pm = self.cog.profile_manager
+
+        back = ui.Button(label="← Back to Profile", style=discord.ButtonStyle.secondary, row=2)
+        back.callback = self.back_cb
+        self.add_item(back)
+
+        # A borrowed profile is rated by whoever owns it. Showing the rating is
+        # useful -- it explains the borrower's own gates -- but nothing here is
+        # theirs to change.
+        if self.is_borrowed:
+            return
+
+        # A Pending profile whose retry-after has elapsed is a failed submission, not
+        # one in flight, and offering only "check again" would strand it.
+        stalled = (verdict == CONTENT_RATING_PENDING
+                   and rating.get("retry_after")
+                   and time.time() >= rating["retry_after"])
+
+        if verdict == CONTENT_RATING_UNRATED or stalled or (
+                verdict == CONTENT_RATING_GENERAL and self.stale):
+            submit = ui.Button(label="Try Again" if stalled else "Submit for Rating",
+                               style=discord.ButtonStyle.success, row=0)
+            submit.callback = self.submit_cb
+            self.add_item(submit)
+
+        if verdict == CONTENT_RATING_PENDING and not stalled:
+            recheck = ui.Button(label="Check for a Verdict", style=discord.ButtonStyle.primary, row=0)
+            recheck.callback = self.recheck_cb
+            self.add_item(recheck)
+
+        # The declaration is withheld exactly where it has nothing to move: on a
+        # published profile, while a classifier verdict stands, and on an exemption.
+        declared = pm._is_owner_declared_adult(self.user_id, self.profile_name)
+        can_declare = verdict != CONTENT_RATING_EXEMPT and not pm._is_profile_public(
+            self.user_id, self.profile_name)
+        if verdict == CONTENT_RATING_ADULT and not declared:
+            can_declare = False
+        if can_declare:
+            label = "Withdraw 18+ Declaration" if declared else "Declare Adult 18+"
+            style = discord.ButtonStyle.secondary if declared else discord.ButtonStyle.danger
+            btn = ui.Button(label=label, style=style, row=0)
+            btn.callback = self.declare_cb
+            self.add_item(btn)
+
+        if self.is_mod_view and self.is_bot_owner:
+            exempt = verdict == CONTENT_RATING_EXEMPT
+            ex_btn = ui.Button(
+                label="Remove Exemption" if exempt else "Exempt From Classification",
+                style=discord.ButtonStyle.secondary if exempt else discord.ButtonStyle.primary,
+                row=1)
+            ex_btn.callback = self.exempt_cb
+            self.add_item(ex_btn)
+
+            if verdict == CONTENT_RATING_ADULT and not declared:
+                clear = ui.Button(label="Clear Adult Verdict", style=discord.ButtonStyle.danger, row=1)
+                clear.callback = self.clear_cb
+                self.add_item(clear)
+
+            force = ui.Button(label="Force Re-classify", style=discord.ButtonStyle.secondary, row=1)
+            force.callback = self.force_cb
+            self.add_item(force)
+
+    def get_embed(self) -> discord.Embed:
+        pm = self.cog.profile_manager
+        verdict, rating = self._rating()
+
+        colour = {
+            CONTENT_RATING_UNRATED: discord.Color.light_grey(),
+            CONTENT_RATING_PENDING: discord.Color.gold(),
+            CONTENT_RATING_GENERAL: discord.Color.green(),
+            CONTENT_RATING_ADULT: discord.Color.red(),
+            CONTENT_RATING_EXEMPT: discord.Color.blurple(),
+        }[verdict]
+
+        emoji = CONTENT_RATING_EMOJI[verdict]
+        label = CONTENT_RATING_LABELS[verdict]
+
+        embed = discord.Embed(
+            title=f"{emoji} Content Safety — {self.profile_name}",
+            description=f"**Rating: {label}**\n{CONTENT_RATING_BLURBS[verdict]}",
+            color=colour)
+
+        # Why, when the verdict came from the classifier. A category code, never the
+        # model's own words about somebody's persona.
+        if verdict == CONTENT_RATING_ADULT:
+            if pm._is_owner_declared_adult(self.user_id, self.profile_name):
+                embed.add_field(
+                    name="Set by", value="You declared this profile 18+.", inline=False)
+            else:
+                reason = CONTENT_RATING_REASON_LABELS.get(
+                    rating.get("reason"), CONTENT_RATING_REASON_FALLBACK)
+                embed.add_field(
+                    name="Reason", value=f"{reason}.\nOnly the bot operator can clear this. "
+                                         "Editing the persona lets you submit again.", inline=False)
+
+        # Why a Pending profile is still pending.
+        if verdict == CONTENT_RATING_PENDING:
+            retry_after = rating.get("retry_after")
+            if retry_after and time.time() < retry_after:
+                embed.add_field(
+                    name="Held up",
+                    value=(f"The last attempt failed and it will retry "
+                           f"<t:{int(retry_after)}:R>.\nThis usually means no API key was "
+                           f"available — check `/settings`."),
+                    inline=False)
+
+        # The capability list, rendered from the table the gates actually read.
+        rows = []
+        for cap, cap_label in CONTENT_CAPABILITY_LABELS.items():
+            allowed, reason = pm.content_capability(self.user_id, self.profile_name, cap)
+            mark = "✅" if allowed else "❌"
+            rows.append(f"{mark} **{cap_label}**" + ("" if allowed else f"\n　　*{reason}*"))
+
+        access = "Age-restricted channels only" if CONTENT_RATING_CAPABILITIES[verdict]["age_restricted_only"] \
+            else "Any channel"
+        rows.insert(0, f"💬 **Runs in:** {access}")
+        embed.add_field(name="What this profile can do", value="\n".join(rows), inline=False)
+
+        if self.stale:
+            if self.distributed:
+                note = ("This profile has been edited since it was rated, and other people "
+                        "are using it. It will be re-checked automatically.")
+            else:
+                note = ("This profile has been edited since it was rated, so the rating no "
+                        "longer describes it. Submit it again when you want to share it.")
+            embed.add_field(name="⚠️ Edited since rating", value=note, inline=False)
+
+        if self.is_borrowed:
+            embed.add_field(
+                name="Borrowed profile",
+                value="This profile is rated by its owner. You cannot change its rating.",
+                inline=False)
+
+        embed.add_field(
+            name="What gets checked",
+            value=("The profile name, display name, avatar image, persona and AI "
+                   "instructions.\nNever your long-term memories, training examples, or "
+                   "any conversation."),
+            inline=False)
+
+        if self.is_mod_view and self.is_bot_owner:
+            detail = (f"verdict: `{verdict}`\n"
+                      f"source: `{rating.get('source') or '—'}`\n"
+                      f"model: `{rating.get('model') or '—'}`\n"
+                      f"hash: `{rating.get('hash') or '—'}`\n"
+                      f"at: `{rating.get('at') or '—'}`\n"
+                      f"distributed: `{self.distributed}`")
+            embed.add_field(name="Operator detail", value=detail, inline=False)
+
+        return embed
+
+    async def _refresh(self, i: discord.Interaction):
+        await self.refresh_state()
+        self._build_view()
+        await i.edit_original_response(embed=self.get_embed(), view=self)
+
+    # --- actions --------------------------------------------------------------
+
+    async def back_cb(self, i: discord.Interaction):
+        view = ProfileManageView(self.cog, self.original_interaction, self.profile_name,
+                                 self.is_borrowed, self.mod_return_user_id, self.is_mod_view)
+        await i.response.defer()
+        await view.update_display()
+
+    async def submit_cb(self, i: discord.Interaction):
+        await i.response.defer()
+        ok, msg = await self.cog.profile_manager.submit_for_rating(
+            self.user_id, self.profile_name)
+        await i.followup.send(msg, ephemeral=True)
+        if ok:
+            # The job is fire-and-forget; give it a beat so the common case renders
+            # the finished verdict rather than a Pending the user has to refresh past.
+            await asyncio.sleep(2.5)
+        await self._refresh(i)
+
+    async def recheck_cb(self, i: discord.Interaction):
+        """Refreshes a Pending profile, re-queueing it if nothing is actually running.
+
+        Pending means "a job is working on this", so if no job is in flight the state
+        is a lie and refreshing forever will not fix it. Re-queueing here makes the
+        button self-healing for any profile stranded by an interrupted submission --
+        a restart mid-classification, or a scheduling call that never created a task.
+        """
+        await i.response.defer()
+        pm = self.cog.profile_manager
+        verdict, _ = self._rating()
+        key = (int(self.user_id), self.profile_name)
+        if verdict == CONTENT_RATING_PENDING and key not in self.cog.pending_classifications:
+            pm.schedule_content_classification(self.user_id, self.profile_name)
+            await asyncio.sleep(2.5)
+        await self._refresh(i)
+
+    async def declare_cb(self, i: discord.Interaction):
+        pm = self.cog.profile_manager
+        declared = pm._is_owner_declared_adult(self.user_id, self.profile_name)
+        await i.response.defer()
+        await asyncio.to_thread(
+            pm.set_owner_adult_declaration, self.user_id, self.profile_name, not declared)
+        await self._refresh(i)
+
+    async def exempt_cb(self, i: discord.Interaction):
+        pm = self.cog.profile_manager
+        verdict, _ = self._rating()
+        await i.response.defer()
+        await asyncio.to_thread(
+            pm.set_classification_exempt, self.user_id, self.profile_name,
+            verdict != CONTENT_RATING_EXEMPT)
+        await self._refresh(i)
+
+    async def clear_cb(self, i: discord.Interaction):
+        await i.response.defer()
+        await asyncio.to_thread(
+            self.cog.profile_manager.clear_adult_verdict,
+            self.user_id, self.profile_name, i.user.id)
+        await self._refresh(i)
+
+    async def force_cb(self, i: discord.Interaction):
+        await i.response.defer()
+        self.cog.profile_manager.schedule_content_classification(self.user_id, self.profile_name)
+        await i.followup.send("Re-classification queued.", ephemeral=True)
+        await asyncio.sleep(2.5)
+        await self._refresh(i)
+
+
+class PostEditRatingView(ui.View):
+    """The ephemeral prompt shown after editing a profile that was already rated.
+
+    An edit invalidates the rating, and there are exactly two sensible responses:
+    stop claiming a verdict that no longer describes the profile, or get a new one.
+    Choosing for the user is wrong in both directions -- silently dropping a shared
+    profile to Unrated pulls it out from under its borrowers, and silently
+    re-classifying spends their API quota on an edit they may still be in the middle
+    of. So the choice is theirs, taken at the one moment they have the context to
+    make it.
+
+    Ephemeral and self-timing-out: ignoring it leaves the rating stale, and
+    resolve_stale_rating settles it on the next dashboard open or session start.
+    """
+
+    def __init__(self, cog: 'MimicCog', user_id: int, profile_name: str, distributed: bool):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.user_id = user_id
+        self.profile_name = profile_name
+        self.distributed = distributed
+
+    def get_content(self) -> str:
+        base = (f"**'{self.profile_name}' has been edited since it was rated.**\n"
+                f"Its current rating no longer describes it.")
+        if self.distributed:
+            base += ("\n\nOther people are using this profile, so leaving it rated means "
+                     "leaving them a verdict that is out of date.")
+        return base
+
+    @ui.button(label="Re-check the rating", style=discord.ButtonStyle.success)
+    async def recheck(self, i: discord.Interaction, _: ui.Button):
+        await i.response.defer()
+        self.cog.profile_manager.schedule_content_classification(self.user_id, self.profile_name)
+        await i.edit_original_response(
+            content=f"Re-checking the rating for '{self.profile_name}'.", view=None)
+        self.stop()
+
+    @ui.button(label="Set to Unrated", style=discord.ButtonStyle.secondary)
+    async def unrate(self, i: discord.Interaction, _: ui.Button):
+        await i.response.defer()
+        await asyncio.to_thread(
+            self.cog.profile_manager.drop_to_unrated, self.user_id, self.profile_name)
+        await i.edit_original_response(
+            content=(f"'{self.profile_name}' is now **Unrated**. It works exactly as before, "
+                     f"but cannot be shared or used in Global Chat until you submit it again."),
+            view=None)
+        self.stop()
+
+
+async def maybe_prompt_rating_after_edit(cog, interaction: discord.Interaction,
+                                         user_id: int, profile_name: str):
+    """Offers the post-edit choice, if there is one to make.
+
+    Silent for the overwhelming majority of edits: an Unrated profile has no rating
+    to invalidate, and a declared or exempt one cannot be moved by an edit. Costs a
+    persona hash, so it is only ever called from an interactive edit path.
+    """
+    pm = cog.profile_manager
+    try:
+        if not await pm.rating_is_stale(user_id, profile_name):
+            return
+        distributed = await asyncio.to_thread(pm.is_profile_distributed, user_id, profile_name)
+        view = PostEditRatingView(cog, user_id, profile_name, distributed)
+        await interaction.followup.send(view.get_content(), view=view, ephemeral=True)
+    except Exception as e:
+        # Never cost the user their edit. The rating stays stale and
+        # resolve_stale_rating settles it the next time the profile is opened.
+        print(f"Post-edit rating prompt failed for {user_id}/{profile_name}: {e}")
