@@ -39,7 +39,7 @@ class OllamaHostModal(ui.Modal, title="Set Ollama Host URL"):
         
         await self.parent_view._update_ollama_status()
         self.parent_view._build_view()
-        await interaction.edit_original_response(content=self.parent_view._get_selection_feedback_message(), view=self.parent_view)
+        await interaction.edit_original_response(**self.parent_view._picker_render())
 
 class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
     key_input = ui.TextInput(label="API Key", placeholder="Paste your API key here...", required=True)

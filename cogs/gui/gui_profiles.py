@@ -9,7 +9,7 @@ import time
 from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional, Union
 from ..utils.content import OLLAMA_GUIDE_TEXT
-from ..utils.helpers import _pf, _pi, _ps, _pb
+from ..utils.helpers import _pf, _pi, _ps, _pb, is_real_model, image_model_caps
 from ..utils.http_client import get_shared_client
 
 if TYPE_CHECKING:
@@ -59,24 +59,82 @@ def ProfileDirectorDeskModal(cog, profile_name: str, current_params: Dict[str, A
 
 
 def ProfileSpeechSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
+    # No voice field: it moved to the Choose TTS Voice picker. A text box here accepted
+    # any string, and an unknown voice name comes back as a 400 that _generate_google_tts
+    # turns into silence -- the profile looked configured and simply never spoke.
     fields = [
         {"label": "Enable TTS (on/off)", "custom_id": "speech_tts_enabled", "default": "on" if current_params.get("speech_tts_enabled", False) else "off", "required": True, "max_length": 10},
-        {"label": "Voice Name", "custom_id": "speech_voice", "default": str(current_params.get("speech_voice", "Aoede")), "required": False, "max_length": 40},
         {"label": "Temperature (0.0 - 2.0)", "custom_id": "speech_temperature", "default": str(current_params.get("speech_temperature", 1.0)), "required": False, "max_length": 5}
     ]
     def parser(v):
         c = {}
         c["speech_tts_enabled"] = _pb(v["speech_tts_enabled"])
-        c["speech_voice"] = _ps(v["speech_voice"]) or "Aoede"
         t = _pf(v["speech_temperature"])
         if t is not None:
             if not (0.0 <= t <= 2.0): raise ValueError("Temperature out of range")
             c["speech_temperature"] = t
         return {"config": c}
-    return ConfigModal(cog, profile_name, is_borrowed, "Speech & Voice Settings", fields, parser, callback, target_user_id)
+    return ConfigModal(cog, profile_name, is_borrowed, "Speech Settings", fields, parser, callback, target_user_id)
 
 #: Tab order for ProfileManageView's nav bar. "persona" is hidden for borrowed profiles.
 PROFILE_TABS = ("home", "persona", "params", "tools", "memory")
+
+
+class _Bulk:
+    """How one PROFILE_ACTIONS row behaves in the bulk manager.
+
+    BulkManageView used to carry its own hand-written list of ~20 SelectOptions and a
+    parallel `elif` chain, which is exactly the shape `_Action` was introduced to kill
+    for the single-profile dashboard. The two drifted: Speech & Voice, Custom Error
+    Message, LTM Auto-Creation and the whole Persona tab were reachable for one profile
+    and unreachable for forty. Declaring the bulk behaviour beside the single-profile
+    behaviour means a new setting cannot be added to one and forgotten in the other.
+
+    `scope` is "all" (personal + borrowed) or "personal"; prompts live only on profiles
+    the user owns, so anything writing them must be personal-only or it silently no-ops
+    on the borrowed half of the selection.
+
+    `destructive` carries the row's warning into the review step, which turns red and
+    names the profile count before anything is written. Reserved for the rows that
+    overwrite authored content rather than flipping a setting -- restoring forty
+    personas by hand is not an undo.
+
+    `terminal` marks the two rows that are not settings at all: deleting profiles and
+    wiping LTM or training data. Everything else reduces to merging into a config or
+    prompts dict and can therefore be staged alongside anything else; these two remove
+    files, so they run on their own and refuse to share a pass with staged edits.
+
+    `keys` / `prompt_keys` name what the row writes, which is what makes it copyable
+    from an anchor profile: the inherit step reads exactly these keys off the anchor
+    rather than needing a second table of its own. They are checked against what the
+    row's own handler actually stages, so a modal that grows a field and forgets to
+    declare it fails the suite instead of silently dropping out of every copy. A row
+    with neither is not offered for copying -- the 18+ declaration deliberately so,
+    since a content rating is not a setting to be propagated.
+    """
+
+    __slots__ = ("run", "scope", "destructive", "terminal", "warning", "description",
+                 "label", "keys", "prompt_keys")
+
+    def __init__(self, run, *, scope="all", destructive=False, terminal=False,
+                 warning=None, description=None, label=None, keys=(), prompt_keys=()):
+        self.run = run
+        self.scope = scope
+        self.destructive = destructive
+        self.terminal = terminal
+        self.warning = warning
+        self.description = description
+        self.label = label
+        self.keys = tuple(keys)
+        self.prompt_keys = tuple(prompt_keys)
+
+    @property
+    def copyable(self) -> bool:
+        return bool(self.keys or self.prompt_keys)
+
+    @property
+    def include_borrowed(self) -> bool:
+        return self.scope == "all"
 
 
 class _Action:
@@ -93,11 +151,17 @@ class _Action:
     `menu_label` is the wording used by the documentation menu map, which is rendered
     from this table with no view to evaluate a callable `label` against. Required only
     for the rows whose `label` is callable; everywhere else the static label is used.
+
+    `bulk` is an optional `_Bulk` describing the same setting applied to many profiles
+    at once. Rows with no `bulk` are the ones that cannot mean anything in bulk -- a
+    rename, a duplicate, or an item-by-item data editor.
     """
 
-    __slots__ = ("value", "tab", "label", "description", "gate", "run", "_menu_label")
+    __slots__ = ("value", "tab", "label", "description", "gate", "run", "_menu_label",
+                 "bulk")
 
-    def __init__(self, value, tab, label, description, run, gate=None, menu_label=None):
+    def __init__(self, value, tab, label, description, run, gate=None, menu_label=None,
+                 bulk=None):
         self.value = value
         self.tab = tab
         self.label = label
@@ -105,6 +169,18 @@ class _Action:
         self.run = run
         self.gate = gate
         self._menu_label = menu_label
+        self.bulk = bulk
+
+    def bulk_label(self) -> str:
+        """Wording for the bulk dropdown, which has no view to resolve a callable label."""
+        if self.bulk is not None and self.bulk.label:
+            return self.bulk.label
+        return self.menu_label
+
+    def bulk_description(self) -> str:
+        if self.bulk is not None and self.bulk.description:
+            return self.bulk.description
+        return self.description
 
     @property
     def menu_label(self) -> str:
@@ -178,6 +254,99 @@ def _method(name: str, *args, wants_profile: bool = False, wants_borrowed: bool 
     return run
 
 
+# --- Bulk handlers -------------------------------------------------------------
+#
+# The bulk counterparts of _modal / _toggle / _cycle above. Each returns a coroutine
+# taking (wizard, interaction), and its only job is to collect a value: which profiles
+# receive it was settled two steps earlier, and whether the write needs confirming is
+# settled two steps later. A handler ends by staging into the wizard's changeset, not
+# by writing anything.
+
+def _bulk_modal(factory_name: str, *, action_key: str = "update_config",
+                pass_borrowed: bool = True, seed=None):
+    """Open a settings modal in BULK_APPLY mode, then stage what it parsed.
+
+    The modal factories short-circuit on the sentinel profile name "BULK_APPLY" and
+    hand their parsed payload to `callback` instead of writing it, so the bulk flow
+    reuses the exact fields and validation the single-profile flow uses -- the two
+    cannot drift, because there is only one of them.
+
+    `seed` supplies the third positional argument for the factories that read it as
+    something other than a config dict; ProfileLTMSummarizationModal takes an
+    instruction *string* there and feeds it straight to a TextInput default, so the
+    empty dict every other factory tolerates is not valid for it. Callable so a
+    default can be resolved against the live cog rather than at import time.
+    """
+    async def run(wizard, interaction):
+        # Captured now rather than read back off the wizard on submit: the user can
+        # page around the panel while the modal is open, and the payload belongs to
+        # the row that opened it.
+        action_value = wizard.current_action.value
+
+        async def modal_callback(i: discord.Interaction, params: Dict):
+            if action_key == "update_both":
+                config = params.get("config") or {}
+                prompts = params.get("prompts") or {}
+            elif action_key == "update_prompts":
+                config, prompts = {}, (params.get("prompts") or {})
+            else:
+                config, prompts = (params.get("config") or {}), {}
+            await wizard._stage_from_modal(i, action_value, config, prompts)
+
+        current = seed(wizard.cog) if callable(seed) else ({} if seed is None else seed)
+        args = [wizard.cog, "BULK_APPLY", current]
+        if pass_borrowed:
+            args.append(False)
+        await interaction.response.send_modal(
+            globals()[factory_name](*args, callback=modal_callback))
+    return run
+
+
+def _bulk_choice(placeholder: str, choices, *, to_payload):
+    """A fixed set of options, chosen once and staged for every selected profile.
+
+    `choices` is a sequence of (label, value[, description]); `to_payload` maps the
+    chosen value to the config keys it writes. Rendered as a step of the wizard rather
+    than as a dropdown bolted onto the profile picker, which is where it used to live
+    -- and where every rebuild of that picker deleted it.
+    """
+    async def run(wizard, interaction):
+        action = wizard.current_action
+        opts = []
+        for c in choices:
+            label, value = str(c[0]), str(c[1])
+            desc = str(c[2]) if len(c) > 2 else None
+            opts.append(discord.SelectOption(label=label[:100], value=value,
+                                             description=desc[:100] if desc else None))
+        wizard._open_choice(
+            action.value, placeholder, opts,
+            lambda w, v: w._stage_change(action.value, config=to_payload(v)))
+        await wizard.refresh(interaction)
+    return run
+
+
+def _bulk_sub(view_factory: str):
+    """Bulk rows that need a picker of their own, or that act rather than stage.
+
+    Models and timezone have too many controls to sit inside the action step; delete
+    and data-reset are not settings at all. Both kinds swap onto the wizard's own
+    message and carry a Back button, so the flow never leaves the panel it began in --
+    which is the difference between a step and a dead ephemeral message with a fresh
+    one stacked under it.
+    """
+    async def run(wizard, interaction):
+        sub = globals()[view_factory](wizard)
+        await interaction.response.edit_message(embed=sub.embed(), view=sub)
+    return run
+
+
+def _bulk_method(name: str):
+    """Bulk row that defers to one of BulkManageView's own methods."""
+    async def run(wizard, interaction):
+        await getattr(wizard, name)(interaction)
+    return run
+
+
 # Gates. Named rather than inlined as lambdas so the table below reads as data.
 def _own(view):        return not view.is_borrowed
 def _own_not_mod(view): return not view.is_borrowed and not view.is_mod_view
@@ -205,9 +374,13 @@ PROFILE_ACTIONS = (
     _Action("share", "home", "Share Profile", "Share this profile with others or publish it.",
             _method("_handle_share"), _own_not_mod),
     _Action("error_response", "home", "Custom Error Message", "Set the message shown when generation fails.",
-            _method("_act_error_response", wants_profile=True), _own),
+            _method("_act_error_response", wants_profile=True), _own,
+            bulk=_Bulk(_bulk_method("_bulk_error_response"), scope="all",
+                       keys=("error_response",))),
     _Action("generation_visual", "home", "Generation Visual", "Set custom placeholder emoji and child bot behavior.",
-            _modal("ProfileGenerationVisualModal"), _own),
+            _modal("ProfileGenerationVisualModal"), _own,
+            bulk=_Bulk(_bulk_modal("ProfileGenerationVisualModal"), scope="all",
+                       keys=("placeholder_emoji", "child_bot_placeholder"))),
     _Action("convert_to_system", "home", "Copy to System Profile", "Create a global System Profile copy from this profile.",
             _method("_handle_convert_copy", True), _to_system),
     _Action("convert_to_personal", "home", "Copy to Personal Profile", "Create a Personal Profile copy from this System Profile.",
@@ -219,68 +392,187 @@ PROFILE_ACTIONS = (
     # next to the rating that explains them.
     _Action("content_safety", "home", "Content Safety",
             "View this profile's content rating and what it allows.",
-            _method("_handle_content_safety")),
+            _method("_handle_content_safety"),
+            # The dashboard itself is per-profile, but the one action inside it that
+            # is the owner's to set in bulk -- the 18+ declaration -- is not. A
+            # classifier verdict and an exemption are deliberately excluded.
+            bulk=_Bulk(_bulk_method("_bulk_adult_declaration"), scope="personal",
+                       label="Set Adult 18+ Declaration",
+                       description="Declare or withdraw 18+ across multiple profiles.")),
     _Action("delete", "home",
             lambda v: "Remove Borrowed Profile" if v.is_borrowed else "Delete Profile",
             "Permanently remove this profile and its data.",
             _method("_handle_delete"),
-            menu_label="Delete Profile / Remove Borrowed Profile"),
+            menu_label="Delete Profile / Remove Borrowed Profile",
+            bulk=_Bulk(_bulk_sub("BulkDeleteView"), scope="all", terminal=True,
+                       label="Delete Profiles",
+                       description="Permanently delete the selected profiles.")),
 
     # --- Persona (tab hidden entirely for borrowed profiles) ---
     _Action("edit_persona", "persona", "Edit Persona", "Edit backstory, traits, likes, dislikes, and appearance.",
-            _method("_act_edit_persona", wants_profile=True)),
+            _method("_act_edit_persona", wants_profile=True),
+            bulk=_Bulk(_bulk_method("_bulk_edit_persona"), scope="personal", destructive=True,
+                       prompt_keys=("persona",),
+                       description="Overwrite backstory, traits, likes, dislikes and appearance.",
+                       warning="Every selected profile's **entire persona** is replaced with what you "
+                               "typed. Sections you left blank are cleared, not preserved. The previous "
+                               "text is not recoverable.")),
     _Action("edit_instructions", "persona", "Edit Instructions", "Edit specific AI behavioral instructions.",
-            _method("_act_edit_instructions", wants_profile=True)),
+            _method("_act_edit_instructions", wants_profile=True),
+            bulk=_Bulk(_bulk_method("_bulk_edit_instructions"), scope="personal", destructive=True,
+                       prompt_keys=("ai_instructions",),
+                       description="Overwrite all four AI instruction parts.",
+                       warning="Every selected profile's **AI instructions** are replaced with what you "
+                               "typed, across all four parts. Part 4 is the slot the training analyser "
+                               "writes to, so any generated style guide is overwritten too. The previous "
+                               "text is not recoverable.")),
     _Action("tts_instructions", "persona", "TTS Instructions", "Configure the 'Director's Desk' for vocal performance.",
-            _modal("ProfileDirectorDeskModal", pass_borrowed=False)),
+            _modal("ProfileDirectorDeskModal", pass_borrowed=False),
+            bulk=_Bulk(_bulk_modal("ProfileDirectorDeskModal", pass_borrowed=False),
+                       scope="personal",
+                       keys=("speech_archetype", "speech_accent", "speech_pacing",
+                             "speech_dynamics", "speech_style"))),
     _Action("edit_appearance", "persona", "Edit Appearance", "Edit the custom Webhook name and avatar.",
             _method("_handle_appearance"), _own),
 
     # --- Params ---
     _Action("models", "params", "Set Models", "Choose Primary and Fallback AI models.",
-            _method("_act_models", wants_profile=True)),
+            _method("_act_models", wants_profile=True),
+            bulk=_Bulk(_bulk_sub("ModelApplyView"), scope="all",
+                       description="Stage primary, fallback and utility models.",
+                       keys=("primary_model", "fallback_model", "show_fallback_indicator",
+                             "image_generation_model", "image_generation_fallback_model",
+                             "speech_model", "speech_fallback_model",
+                             "grounding_rag_model", "grounding_rag_fallback_model",
+                             "critic_model", "critic_fallback_model",
+                             "ltm_model", "ltm_fallback_model",
+                             "ollama_host_url"))),
     _Action("gen_params", "params", "Set Generation Parameters & STM", "Set Temp, Top P, Top K, and STM Length.",
-            _modal("ProfileParamsModal")),
+            _modal("ProfileParamsModal"),
+            bulk=_Bulk(_bulk_modal("ProfileParamsModal"), scope="all",
+                       keys=("temperature", "top_p", "top_k", "stm_length"))),
     _Action("adv_params", "params", "Set Advanced Parameters (OPENROUTER)", "Set penalties, Min P, and Top A.",
-            _modal("ProfileAdvancedParamsModal")),
+            _modal("ProfileAdvancedParamsModal"),
+            bulk=_Bulk(_bulk_modal("ProfileAdvancedParamsModal"), scope="all",
+                       keys=("frequency_penalty", "presence_penalty", "repetition_penalty",
+                             "min_p", "top_a"))),
     _Action("thinking_params", "params", "Set Thinking Parameters", "Set thinking persistence, level, and budget.",
-            _modal("ProfileThinkingParamsModal")),
-    _Action("speech_settings", "params", "Set Speech & Voice Settings", "Set TTS voice, model, and temperature.",
-            _modal("ProfileSpeechSettingsModal")),
+            _modal("ProfileThinkingParamsModal"),
+            bulk=_Bulk(_bulk_modal("ProfileThinkingParamsModal"), scope="all",
+                       keys=("thinking_level", "thinking_budget", "thinking_summary_visible"))),
+    _Action("speech_settings", "params", "Set Speech Settings", "Turn TTS on or off and set its temperature.",
+            _modal("ProfileSpeechSettingsModal"),
+            bulk=_Bulk(_bulk_modal("ProfileSpeechSettingsModal"), scope="all",
+                       keys=("speech_tts_enabled", "speech_temperature"))),
+    _Action("voice", "params", "Choose TTS Voice", "Pick from the thirty prebuilt Gemini voices.",
+            _method("_act_voice", wants_profile=True),
+            bulk=_Bulk(_bulk_sub("VoiceApplyView"), scope="all", label="Choose TTS Voice",
+                       description="Stage one of the thirty prebuilt voices.",
+                       keys=("speech_voice",))),
 
     # --- Tools ---
     _Action("image_toggle", "tools", "Toggle Image Generation", "Allow this profile to generate images via !image/!imagine.",
-            _method("_act_image_toggle", wants_profile=True)),
+            _method("_act_image_toggle", wants_profile=True),
+            bulk=_Bulk(_bulk_modal("ProfileImageGenSettingsModal", action_key="update_both"),
+                       scope="all", label="Configure Image Generation",
+                       description="Set up models, prompts, and toggles for multiple profiles.",
+                       keys=("image_generation_enabled",),
+                       prompt_keys=("image_generation_prompt",))),
+    _Action("image_output", "tools", "Set Image Output", "Set aspect ratio, resolution and thinking level.",
+            _method("_act_image_output", wants_profile=True),
+            bulk=_Bulk(_bulk_sub("ImageOutputApplyView"), scope="all", label="Set Image Output",
+                       description="Stage aspect ratio, resolution and thinking level.",
+                       keys=IMAGE_OUTPUT_KEYS)),
     _Action("grounding", "tools", "Toggle Grounding (Web Search)", "Cycle Grounding: OFF -> NATIVE -> RAG.",
-            _method("_act_grounding", wants_profile=True)),
+            _method("_act_grounding", wants_profile=True),
+            bulk=_Bulk(_bulk_choice("Select Grounding Mode...",
+                                    [("Off", "off"), ("Native", "native"), ("RAG", "rag")],
+                                    to_payload=lambda v: {"grounding_mode": v}),
+                       scope="all", label="Set Grounding Mode", keys=("grounding_mode",),
+                       description="Choose Off, Native or RAG for every selected profile.")),
     _Action("url_toggle", "tools", "Toggle URL Context Fetching", "Cycle URL Context: OFF -> NATIVE -> RAG.",
-            _method("_act_url_toggle", wants_profile=True)),
+            _method("_act_url_toggle", wants_profile=True),
+            # url_fetching_enabled is the legacy flag the turn path still reads, so it
+            # has to move with url_mode or a bulk sweep leaves the two disagreeing.
+            bulk=_Bulk(_bulk_choice("Select URL Mode...",
+                                    [("Off", "off"), ("Native", "native"), ("RAG", "rag")],
+                                    to_payload=lambda v: {"url_mode": v,
+                                                          "url_fetching_enabled": v == "rag"}),
+                       scope="all", label="Set URL Context Mode",
+                       keys=("url_mode", "url_fetching_enabled"),
+                       description="Choose Off, Native or RAG for every selected profile.")),
     _Action("cycle_response", "tools", "Cycle Response Mode", "Cycle: Regular -> Mention -> Reply -> Mention Reply.",
-            _cycle("response_mode", ("regular", "mention", "reply", "mention_reply"))),
+            _cycle("response_mode", ("regular", "mention", "reply", "mention_reply")),
+            bulk=_Bulk(_bulk_choice("Select Response Mode...",
+                                    [("Regular", "regular"), ("Mention", "mention"),
+                                     ("Reply", "reply"), ("Mention+Reply", "mention_reply")],
+                                    to_payload=lambda v: {"response_mode": v}),
+                       scope="all", label="Set Response Mode", keys=("response_mode",),
+                       description="Choose Regular, Mention, Reply or Mention+Reply.")),
     _Action("time", "tools", "Set Time & Timezone", "Enable time awareness and set the profile's timezone.",
-            _method("_handle_timezone", wants_profile=True, wants_borrowed=True)),
+            _method("_handle_timezone", wants_profile=True, wants_borrowed=True),
+            bulk=_Bulk(_bulk_sub("BulkTimezoneView"), scope="all",
+                       keys=("timezone", "time_tracking_enabled"))),
     _Action("typing", "tools", "Toggle Realistic Typing", "Enable a human-like delay when the bot sends messages.",
-            _modal("ProfileTypingSettingsModal")),
+            _modal("ProfileTypingSettingsModal"),
+            bulk=_Bulk(_bulk_modal("ProfileTypingSettingsModal"), scope="all",
+                       keys=("realistic_typing_enabled", "typing_mode", "typing_cps",
+                             "typing_max_delay"))),
     _Action("critic", "tools", "Toggle Anti-Repetition Critic", "Enable semantic repetition analysis (Adds latency).",
-            _toggle("critic_enabled")),
+            _toggle("critic_enabled"),
+            bulk=_Bulk(_bulk_choice("Select action...",
+                                    [("Enable Critic", "true"), ("Disable Critic", "false")],
+                                    to_payload=lambda v: {"critic_enabled": v == "true"}),
+                       scope="all", label="Set Anti-Repetition Critic", keys=("critic_enabled",),
+                       description="Turn semantic repetition analysis on or off.")),
     _Action("neuro", "tools", "Toggle Neuro-Endocrine Engine", "Simulate hormonal states for dynamic emotions.",
-            _modal("ProfileNeuroModal")),
+            _modal("ProfileNeuroModal"),
+            bulk=_Bulk(_bulk_modal("ProfileNeuroModal"), scope="all",
+                       keys=("neuro_engine_enabled", "neuro_state"))),
     _Action("help_mode", "tools", "Toggle Help Mode (Guide RAG)", "Allow profile to answer technical bot questions.",
-            _toggle("help_mode_enabled")),
+            _toggle("help_mode_enabled"),
+            bulk=_Bulk(_bulk_choice("Select action...",
+                                    [("Enable Help Mode", "true"), ("Disable Help Mode", "false")],
+                                    to_payload=lambda v: {"help_mode_enabled": v == "true"}),
+                       scope="all", label="Set Help Mode", keys=("help_mode_enabled",),
+                       description="Turn the documentation RAG on or off.")),
 
     # --- Memory ---
     _Action("manage_ltm", "memory", "Manage Long-Term Memories", "Add, list, edit, or delete memories.",
-            _method("_act_manage_ltm", wants_profile=True)),
+            _method("_act_manage_ltm", wants_profile=True),
+            # Editing memories one at a time has no bulk form; wiping them does.
+            bulk=_Bulk(_bulk_sub("BulkResetView"), scope="all", terminal=True,
+                       label="Reset Profile Data",
+                       description="Wipe long-term memories or training examples.")),
     _Action("manage_training", "memory", "Manage Training Examples", "Add, list, edit, or delete training examples.",
             _method("_act_manage_training", wants_profile=True), _own),
     _Action("train_params", "memory", "Set Training Parameters", "Set training context size and relevance threshold.",
-            _modal("ProfileTrainingParamsModal", pass_borrowed=False), _own),
+            _modal("ProfileTrainingParamsModal", pass_borrowed=False), _own,
+            bulk=_Bulk(_bulk_modal("ProfileTrainingParamsModal", pass_borrowed=False),
+                       scope="personal",
+                       keys=("training_context_size", "training_relevance_threshold"))),
     _Action("ltm_creation", "memory", "Toggle LTM Auto-Creation", "Automatically create memories from conversations.",
-            _toggle("ltm_creation_enabled")),
+            _toggle("ltm_creation_enabled"),
+            bulk=_Bulk(_bulk_choice("Select action...",
+                                    [("Enable LTM Auto-Creation", "true"),
+                                     ("Disable LTM Auto-Creation", "false")],
+                                    to_payload=lambda v: {"ltm_creation_enabled": v == "true"}),
+                       scope="all", label="Set LTM Auto-Creation", keys=("ltm_creation_enabled",),
+                       description="Turn automatic memory creation on or off.")),
     _Action("ltm_params", "memory", "Set LTM Parameters", "Set frequency, context, and recall settings.",
-            _modal("ProfileLTMParamsModal", pass_borrowed=False)),
+            _modal("ProfileLTMParamsModal", pass_borrowed=False),
+            bulk=_Bulk(_bulk_modal("ProfileLTMParamsModal", pass_borrowed=False), scope="all",
+                       keys=("ltm_creation_interval", "ltm_summarization_context",
+                             "ltm_context_size", "ltm_relevance_threshold"))),
     _Action("ltm_summarization", "memory", "Set LTM Summarization Prompt", "Customize how the AI creates memories.",
-            _method("_act_ltm_summarization", wants_profile=True), _own),
+            _method("_act_ltm_summarization", wants_profile=True), _own,
+            bulk=_Bulk(_bulk_modal("ProfileLTMSummarizationModal",
+                                   action_key="update_prompts", pass_borrowed=False,
+                                   seed=lambda c: c.profile_manager._default_ltm_summarization_instructions()),
+                       scope="personal", destructive=True,
+                       prompt_keys=("ltm_summarization_instructions",),
+                       warning="Every selected profile's **LTM summarisation prompt** is replaced. "
+                               "Profiles using a customised prompt lose it.")),
 )
 
 PROFILE_ACTIONS_BY_VALUE = {a.value: a for a in PROFILE_ACTIONS}
@@ -465,6 +757,17 @@ class ProfileManageView(ui.View):
         modal = ProfileImageGenSettingsModal(self.cog, self.profile_name, profile, self.is_borrowed,
                                              callback=self._refresh_dashboard, target_user_id=self.user_id)
         await interaction.response.send_modal(modal)
+
+    async def _act_image_output(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        await self._open_media_options(interaction, "image")
+
+    async def _act_voice(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        await self._open_media_options(interaction, "voice")
+
+    async def _open_media_options(self, interaction: discord.Interaction, mode: str):
+        view = SingleProfileMediaOptionsView(self.cog, self.original_interaction, self.profile_name,
+                                             mode, is_borrowed=self.is_borrowed, user_id=self.user_id)
+        await interaction.response.send_message(view._feedback(), view=view, ephemeral=True)
 
     async def _act_grounding(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         current_mode = profile.get("grounding_mode", "off")
@@ -676,14 +979,20 @@ class ProfileManageView(ui.View):
         try: await self.original_interaction.edit_original_response(content="Manager timed out.", view=None)
         except: pass
 
-class EditUserProfilePersonaModal(ui.Modal): 
-    def __init__(self, cog_instance, profile_name: str, current_persona_data: Dict[str, List[str]], user_id: int):
+class EditUserProfilePersonaModal(ui.Modal):
+    def __init__(self, cog_instance, profile_name: str, current_persona_data: Dict[str, List[str]], user_id: int, callback=None):
         self.cog_instance: MimicCog = cog_instance
         self.profile_name = profile_name
         self.user_id = user_id
+        self.callback = callback
         self.persona_sections_order = cog_instance.persona_modal_sections_order
 
-        title = f"Edit Persona for Profile: '{profile_name}'"[:45]; super().__init__(title=title)
+        # Same sentinel ConfigModal uses: in bulk the fields are collected here and
+        # handed to `callback`, so the bulk flow can never present a different set of
+        # persona sections from the single-profile flow.
+        title = ("Set Persona for Multiple Profiles" if profile_name == "BULK_APPLY"
+                 else f"Edit Persona for Profile: '{profile_name}'")[:45]
+        super().__init__(title=title)
 
         for key in self.persona_sections_order:
             decrypted_content = "\n".join(self.cog_instance.storage_manager._decrypt_data(line) for line in current_persona_data.get(key, []))
@@ -698,8 +1007,13 @@ class EditUserProfilePersonaModal(ui.Modal):
         if i.response.is_done():
             return
         await i.response.defer(ephemeral=True,thinking=True)
-        updated_persona_data:Dict[str,List[str]]={c.custom_id.replace("persona_",""): c.value.splitlines() for c in self.children if isinstance(c,ui.TextInput)and c.custom_id} 
-        
+        updated_persona_data:Dict[str,List[str]]={c.custom_id.replace("persona_",""): c.value.splitlines() for c in self.children if isinstance(c,ui.TextInput)and c.custom_id}
+
+        if self.profile_name == "BULK_APPLY":
+            if self.callback:
+                await self.callback(i, updated_persona_data)
+            return
+
         success = await self.cog_instance.profile_manager.update_user_profile_persona(
             self.user_id, self.profile_name, updated_persona_data, i.channel_id
         )
@@ -712,13 +1026,16 @@ class EditUserProfilePersonaModal(ui.Modal):
                 self.cog_instance, i, self.user_id, self.profile_name)
     async def on_error(self, i:discord.Interaction, e:Exception): print(f"EditUserProfilePersonaModal err: {e}"); traceback.print_exc(); await i.followup.send('Form error.',ephemeral=True)
 
-class EditUserProfileAIInstructionsModal(ui.Modal): 
-    def __init__(self, cog_instance, profile_name: str, current_instr:str, user_id: int):
+class EditUserProfileAIInstructionsModal(ui.Modal):
+    def __init__(self, cog_instance, profile_name: str, current_instr:str, user_id: int, callback=None):
         self.cog:MimicCog=cog_instance
         self.profile_name = profile_name
         self.user_id = user_id
-        
-        title=f"Edit AI Instructions for Profile: '{profile_name}'"[:45]; super().__init__(title=title)
+        self.callback = callback
+
+        title = ("Set AI Instructions for Multiple Profiles" if profile_name == "BULK_APPLY"
+                 else f"Edit AI Instructions for Profile: '{profile_name}'")[:45]
+        super().__init__(title=title)
         
         p1, p2, p3, p4 = "", "", "", ""
         if isinstance(current_instr, list):
@@ -735,8 +1052,14 @@ class EditUserProfileAIInstructionsModal(ui.Modal):
     async def on_submit(self, i:discord.Interaction):
         await i.response.defer(ephemeral=True,thinking=True)
         p1=next(c.value for c in self.children if c.custom_id=="ai_p1"); p2=next(c.value for c in self.children if c.custom_id=="ai_p2")
-        p3=next(c.value for c in self.children if c.custom_id=="ai_p3"); p4=next(c.value for c in self.children if c.custom_id=="ai_p4") 
+        p3=next(c.value for c in self.children if c.custom_id=="ai_p3"); p4=next(c.value for c in self.children if c.custom_id=="ai_p4")
         instr_list = [p1, p2, p3, p4]
+
+        if self.profile_name == "BULK_APPLY":
+            if self.callback:
+                await self.callback(i, instr_list)
+            return
+
         success = await self.cog.profile_manager.update_user_profile_ai_instructions(
             self.user_id, self.profile_name, instr_list, i.channel_id
         )
@@ -889,6 +1212,183 @@ def ProfileImageGenSettingsModal(cog, profile_name: str, current_params: Dict[st
         return {"config": c, "prompts": p}
     return ConfigModal(cog, profile_name, is_borrowed, "Image Generation Settings", fields, parser, callback, target_user_id)
 
+class MediaOptionsMixin:
+    """The dropdown machinery shared by the image-output and voice pickers.
+
+    Both settings are fixed enumerations the API validates strictly, and neither
+    survives a text box: "16;9" and "Kore " are accepted by a modal and answered by a
+    400 -- which reaches the user as a missing image, or, for TTS, as silence, because
+    `_generate_google_tts` swallows the failure and returns no stream. A dropdown of the
+    values the model actually carries is the only version of this that cannot be typed
+    wrong.
+
+    Adopters provide `_current_value(key)`, `_apply(key, value)`, `_render()` and
+    `_build_view()`. The single-profile pickers write straight through to the profile;
+    the bulk ones stage into the wizard's changeset, which is the only difference
+    between them.
+    """
+
+    #: The "let the model decide" row. Applied as "" rather than as a sentinel, because
+    #: an absent value is already what MediaService.resolve_image_output_params reads as
+    #: "send no such field" -- storing a marker would only mean stripping it back out.
+    AUTO = "__auto__"
+
+    def _add_choice_select(self, key: str, placeholder: str, values, notes: Dict[str, str],
+                           row: int, auto_label: str = "Model default"):
+        current = self._current_value(key)
+        options = [discord.SelectOption(
+            label=auto_label, value=self.AUTO,
+            description="Send no preference; the model picks.",
+            default=not current)]
+        for value in values:
+            options.append(discord.SelectOption(
+                label=value, value=value,
+                description=(notes.get(value) or None),
+                default=(str(current or "") == value)))
+
+        select = ui.Select(placeholder=placeholder, options=options[:25], row=row)
+
+        async def callback(interaction: discord.Interaction):
+            chosen = select.values[0]
+            self._apply(key, "" if chosen == self.AUTO else chosen)
+            self._build_view()
+            await interaction.response.edit_message(**self._render())
+
+        select.callback = callback
+        self.add_item(select)
+
+    def _add_voice_select(self, key: str, row: int):
+        """The voice list, one gender at a time, with the other reachable from inside.
+
+        Paged through an option rather than a pair of buttons because the select has an
+        option cap but the view has rows to spare, and it keeps the whole control in one
+        component -- the timezone picker settled the same question the same way.
+
+        The gender is Google's own attribute for the voice, published on the Cloud
+        Text-to-Speech side rather than in the Gemini API docs. It is the page break
+        because it is the filter someone casting a character reaches for first; the
+        one-word character narrows it from there.
+        """
+        current = self._current_value(key) or DEFAULT_SPEECH_VOICE
+        gender, chunk = TTS_VOICE_GROUPS[self.voice_page]
+
+        options = []
+        for page_idx, (other_gender, other) in enumerate(TTS_VOICE_GROUPS):
+            if page_idx == self.voice_page:
+                continue
+            options.append(discord.SelectOption(
+                label=f"Switch to {other_gender.lower()} voices",
+                value=f"__page_{page_idx}", emoji="📑",
+                description=f"{len(other)} voices"))
+
+        for name, character, _gender in chunk:
+            options.append(discord.SelectOption(
+                label=name, value=name, description=character,
+                default=(name == current)))
+
+        select = ui.Select(
+            placeholder=f"Choose a voice ({gender.lower()}, {len(chunk)})...",
+            options=options, row=row)
+
+        async def callback(interaction: discord.Interaction):
+            chosen = select.values[0]
+            if chosen.startswith("__page_"):
+                self.voice_page = int(chosen.rsplit("_", 1)[1])
+            else:
+                self._apply(key, chosen)
+            self._build_view()
+            await interaction.response.edit_message(**self._render())
+
+        select.callback = callback
+        self.add_item(select)
+
+
+class SingleProfileMediaOptionsView(MediaOptionsMixin, ui.View):
+    """Image output settings and TTS voice for one profile, written as they are chosen.
+
+    One view over both subjects rather than two near-identical ones: they differ only
+    in which selects get built, which is `mode`.
+    """
+
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str,
+                 mode: str, is_borrowed: bool = False, user_id: Optional[int] = None):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.original_interaction = interaction
+        self.user_id = user_id or interaction.user.id
+        self.profile_name = profile_name
+        self.is_borrowed = is_borrowed
+        self.mode = mode
+        self.voice_page = 0
+        self._build_view()
+
+    def _profile(self) -> Dict[str, Any]:
+        return self.cog.profile_manager._get_profile_config(
+            self.user_id, self.profile_name, self.is_borrowed) or {}
+
+    def _current_value(self, key: str):
+        return self._profile().get(key)
+
+    def _apply(self, key: str, value: Any):
+        data = self._profile()
+        data[key] = value
+        self.cog.profile_manager._save_profile_config(
+            self.user_id, self.profile_name, data, self.is_borrowed)
+
+    def _render(self) -> Dict[str, Any]:
+        return {"content": self._feedback(), "view": self}
+
+    def _feedback(self) -> str:
+        data = self._profile()
+        lines = [f"**Profile:** `{self.profile_name}`"]
+
+        if self.mode == "image":
+            raw = data.get("image_generation_model") or DEFAULT_IMAGE_MODEL
+            caps = image_model_caps(raw)
+            lines.append(f"**Image model:** `{raw}`")
+            lines.append(f"**Aspect ratio:** `{data.get('image_aspect_ratio') or 'model default'}`")
+            if caps["sizes"]:
+                lines.append(f"**Resolution:** `{data.get('image_size') or 'model default'}`")
+            else:
+                lines.append("**Resolution:** `fixed by the model` — this model renders at one "
+                             "size and rejects a resolution request.")
+            if caps["thinking"]:
+                lines.append(f"**Thinking:** `{data.get('image_thinking_level') or 'model default'}`")
+            lines.append(f"\nOptions are limited to what `{raw}` accepts. Anything this model "
+                         "does not carry is kept on the profile but left out of the request, so "
+                         "switching models back restores it.")
+            if not data.get("image_generation_enabled"):
+                lines.append("\n⚠️ Image generation is currently **off** for this profile.")
+        else:
+            voice = data.get("speech_voice") or DEFAULT_SPEECH_VOICE
+            described = " · ".join(d for d in (TTS_VOICE_GENDER.get(voice),
+                                               TTS_VOICE_CHARACTER.get(voice)) if d)
+            lines.append(f"**Voice:** `{voice}`" + (f" ({described})" if described else ""))
+            lines.append(f"**Speech model:** `{data.get('speech_model') or DEFAULT_SPEECH_MODEL}`")
+            lines.append("\nVoices are grouped by gender, then described by Google's own "
+                         "one-word character. Everything beyond that — accent, mood, pacing — is "
+                         "the Director's Desk, not the voice.")
+            if not data.get("speech_tts_enabled"):
+                lines.append("\n⚠️ TTS is currently **off** for this profile.")
+
+        return "\n".join(lines)
+
+    def _build_view(self):
+        self.clear_items()
+        if self.mode == "image":
+            caps = image_model_caps(self._profile().get("image_generation_model") or DEFAULT_IMAGE_MODEL)
+            self._add_choice_select("image_aspect_ratio", "Aspect ratio...",
+                                    caps["ratios"], IMAGE_ASPECT_RATIO_NOTES, 0)
+            if caps["sizes"]:
+                self._add_choice_select("image_size", "Resolution...",
+                                        caps["sizes"], IMAGE_SIZE_NOTES, 1)
+            if caps["thinking"]:
+                self._add_choice_select("image_thinking_level", "Thinking level...",
+                                        IMAGE_THINKING_LEVELS, IMAGE_THINKING_NOTES, 2)
+        else:
+            self._add_voice_select("speech_voice", 0)
+
+
 class ModelPickerMixin:
     """The model-selection machinery shared by the single-profile and bulk pickers.
 
@@ -909,6 +1409,95 @@ class ModelPickerMixin:
         """Where this view reads the configured Ollama host from."""
         raise NotImplementedError
 
+    #: category -> the (config key, wording, default) triples it presents, in row order.
+    #: Shared so the two pickers cannot disagree about which models a category holds --
+    #: they already had, with the single-profile summary defaulting the image model to an
+    #: unprefixed id that its own builder prefixed.
+    #: One category per function, each holding that function's primary and its retry.
+    #: Media and Tools used to pair two unrelated functions in one category, which left
+    #: nowhere to put a fallback for either of them -- two slots, both already spoken
+    #: for. Splitting them gives every model in the bot the same primary/fallback shape
+    #: the response model has always had.
+    _CATEGORY_KEYS = {
+        'response':  (("primary_model", "Primary", PRIMARY_MODEL_NAME),
+                      ("fallback_model", "Fallback", FALLBACK_MODEL_NAME)),
+        'image':     (("image_generation_model", "Image Generation", DEFAULT_IMAGE_MODEL),
+                      ("image_generation_fallback_model", "Image Fallback", NO_FALLBACK)),
+        'tts':       (("speech_model", "Text-to-Speech", DEFAULT_SPEECH_MODEL),
+                      ("speech_fallback_model", "TTS Fallback", NO_FALLBACK)),
+        'grounding': (("grounding_rag_model", "Grounding Summariser", FALLBACK_MODEL_NAME),
+                      ("grounding_rag_fallback_model", "Grounding Fallback", NO_FALLBACK)),
+        'critic':    (("critic_model", "Anti-Repetition Critic", FALLBACK_MODEL_NAME),
+                      ("critic_fallback_model", "Critic Fallback", NO_FALLBACK)),
+        'ltm':       (("ltm_model", "LTM Summariser", FALLBACK_MODEL_NAME),
+                      ("ltm_fallback_model", "LTM Fallback", NO_FALLBACK)),
+    }
+
+    _CATEGORY_LABELS = (
+        ("response", "Response", "The models behind the profile's own replies."),
+        ("image", "Image Generation", "The model behind !image and !imagine."),
+        ("tts", "TTS Generation", "The speech model used for voice rounds."),
+        ("grounding", "Grounding Summariser", "Summarises web search results in RAG mode."),
+        ("critic", "Anti-Repetition Critic", "Screens replies for semantic repetition."),
+        ("ltm", "LTM Summariser", "Turns conversations into long-term memories."),
+    )
+
+    #: Categories whose every slot is in GOOGLE_ONLY_MODEL_KEYS. They pin the API
+    #: switch to Google rather than letting a stale mode sit behind a disabled button.
+    #: Grounding joins image and TTS here: it attaches the native `google_search` tool,
+    #: so an OpenRouter id in that slot was never honoured -- it resolved to the Google
+    #: default at call time, which read as the picker having accepted the choice.
+    _GOOGLE_ONLY_CATEGORIES = ("image", "tts", "grounding")
+
+    @classmethod
+    def display_model(cls, value) -> str:
+        """How a stored model value reads in a summary."""
+        if not is_real_model(value):
+            return "None (no retry)"
+        return cls.strip_prefix(value)
+
+    @staticmethod
+    def strip_prefix(value) -> str:
+        """Drops the internal routing prefix so the user sees the model they picked."""
+        text = str(value)
+        for prefix in ("GOOGLE/", "OPENROUTER/", "OLLAMA/"):
+            if text.startswith(prefix):
+                return text[len(prefix):]
+        return text
+
+    def _add_category_select(self, row: int = 0):
+        """The category picker, as a dropdown rather than a button that cycles.
+
+        It was one button labelled with the *current* category, advancing a step per
+        click: reaching LTM from Response took three clicks, and the other three
+        categories were named nowhere in the interface. The single-profile view then
+        carried a second, redundant row of category buttons besides. One dropdown, four
+        named options, one click to any of them.
+        """
+        options = [discord.SelectOption(label=f"Category: {label}", value=value,
+                                        description=desc, default=(self.category == value))
+                   for value, label, desc in self._CATEGORY_LABELS]
+        select = ui.Select(placeholder="Choose a model category...", options=options, row=row)
+
+        async def callback(interaction: discord.Interaction):
+            self.category = select.values[0]
+            self._build_view()
+            await interaction.response.edit_message(**self._picker_render())
+
+        select.callback = callback
+        self.add_item(select)
+
+    def _picker_render(self) -> Dict[str, Any]:
+        """Edit kwargs for this picker's own message.
+
+        A hook because the two adopters render differently: the single-profile picker
+        is a plain-text message, and the bulk picker is a step of the embed-rendered
+        wizard. Every rebuild in this mixin -- and in CustomModelModal and
+        OllamaHostModal, which reach back into the view -- goes through here, so
+        neither one can overwrite the other's message body with the wrong shape.
+        """
+        return {"content": self._get_selection_feedback_message(), "view": self}
+
     class GenericModelSelect(ui.Select):
         def __init__(self, placeholder: str, options: list, row: int, target_config_key: str):
             super().__init__(placeholder=placeholder, options=options, row=row)
@@ -924,12 +1513,23 @@ class ModelPickerMixin:
             else: 
                 view._save_changes(self.target_config_key, self.values[0])
                 view._build_view()
-                await interaction.response.edit_message(content=view._get_selection_feedback_message(), view=view)
+                await interaction.response.edit_message(**view._picker_render())
 
     def _create_model_options(self, current_val: str, target_config_key: str) -> List[discord.SelectOption]:
         top_models = self._get_top_models(self.view_mode, target_config_key)
         opts = [discord.SelectOption(label="Custom Model...", value="custom_option", description="Enter manually via modal")]
-        
+
+        # Only the five utility fallbacks can be switched off. The response fallback is
+        # what _instantiate_model retries onto when the primary will not construct, so
+        # it has to name a real model.
+        if target_config_key in UTILITY_FALLBACK_KEYS.values():
+            opts.append(discord.SelectOption(
+                label="None (no retry)", value=NO_FALLBACK,
+                description="Do not try a second model when this one fails.",
+                default=not is_real_model(current_val)))
+            if not is_real_model(current_val):
+                current_val = None
+
         if current_val:
             # The [:100] truncation was present only in the single-profile copy. Discord
             # rejects an option label over 100 characters, so the bulk picker would raise
@@ -940,7 +1540,7 @@ class ModelPickerMixin:
         if self.view_mode == 'openrouter': prefix = "OPENROUTER/"
         elif self.view_mode == 'ollama': prefix = "OLLAMA/"
         
-        if target_config_key in ['image_generation_model', 'speech_model']:
+        if target_config_key in GOOGLE_ONLY_MODEL_KEYS:
             prefix = "GOOGLE/"
             
         added = len(opts)
@@ -968,12 +1568,18 @@ class ModelPickerMixin:
             self.ollama_working = False
             self.cached_ollama_models = []
 
-    def _add_api_and_category_buttons(self, *, row: int = 2):
-        """The API-mode / Ollama-host / category button row, identical in both pickers."""
+    def _add_api_buttons(self, *, row: int = 3):
+        """The API-mode and Ollama-host buttons, identical in both pickers.
+
+        The category button that used to live here is now `_add_category_select`, which
+        leaves room on this row for the fallback-indicator toggle that had a row of its
+        own.
+        """
         api_modes = ['google', 'openrouter', 'ollama']
         api_labels = {'google': 'API: Google', 'openrouter': 'API: OpenRouter', 'ollama': 'API: Ollama (Local)'}
         
-        btn_api = ui.Button(label=api_labels[self.view_mode], style=discord.ButtonStyle.primary, row=row, disabled=(self.category == 'media'))
+        btn_api = ui.Button(label=api_labels[self.view_mode], style=discord.ButtonStyle.primary, row=row,
+                            disabled=(self.category in self._GOOGLE_ONLY_CATEGORIES))
         async def api_cb(i: discord.Interaction):
             next_idx = (api_modes.index(self.view_mode) + 1) % len(api_modes)
             self.view_mode = api_modes[next_idx]
@@ -982,10 +1588,10 @@ class ModelPickerMixin:
                 self.ollama_working = "processing"
                 await self._update_ollama_status()
                 self._build_view()
-                await i.edit_original_response(content=self._get_selection_feedback_message(), view=self)
+                await i.edit_original_response(**self._picker_render())
             else:
                 self._build_view()
-                await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+                await i.response.edit_message(**self._picker_render())
         btn_api.callback = api_cb
         self.add_item(btn_api)
         
@@ -1009,17 +1615,6 @@ class ModelPickerMixin:
                 await i.response.send_message(OLLAMA_GUIDE_TEXT, ephemeral=True)
             btn_guide.callback = guide_cb
             self.add_item(btn_guide)
-
-        categories = ['response', 'media', 'tools', 'ltm']
-        cat_labels = {'response': 'Response', 'media': 'Media', 'tools': 'Tools', 'ltm': 'LTM'}
-        btn_cat = ui.Button(label=f"Category: {cat_labels[self.category]}", style=discord.ButtonStyle.blurple, row=row)
-        async def cat_cb(i: discord.Interaction):
-            next_idx = (categories.index(self.category) + 1) % len(categories)
-            self.category = categories[next_idx]
-            self._build_view()
-            await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-        btn_cat.callback = cat_cb
-        self.add_item(btn_cat)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: ui.Item):
         print(f"Error in {type(self).__name__}: {error}")
@@ -1078,151 +1673,163 @@ class SingleProfileModelView(ModelPickerMixin, ui.View):
 
     def _get_selection_feedback_message(self) -> str:
         data = self._get_current_profile_data()
-        
-        def clean(val):
-            if not val: return "None"
-            s = str(val)
-            for prefix in ("GOOGLE/", "OPENROUTER/", "OLLAMA/"):
-                if s.startswith(prefix):
-                    return s[len(prefix):]
-            return s
-            
-        msg = f"**Profile:** `{self.profile_name}`\n"
+        lines = [f"**Profile:** `{self.profile_name}`"]
         if self.view_mode == 'openrouter':
-            msg += "⚠️ **Note:** OpenRouter / Custom models require **RAG Mode** for Grounding and URL Context.\n\n"
+            lines.append("⚠️ **Note:** OpenRouter / Custom models require **RAG Mode** for "
+                         "Grounding and URL Context.\n")
         elif self.view_mode == 'ollama':
-            msg += "⚠️ **Note:** Localhost models run on your machine's hardware. Processing speed depends on your GPU/CPU.\n\n"
-        
+            lines.append("⚠️ **Note:** Localhost models run on your machine's hardware. "
+                         "Processing speed depends on your GPU/CPU.\n")
+
+        for key, wording, default in self._CATEGORY_KEYS[self.category]:
+            lines.append(f"**{wording}:** `{self.display_model(data.get(key, default))}`")
         if self.category == 'response':
-            p_clean = clean(data.get("primary_model", PRIMARY_MODEL_NAME))
-            f_clean = clean(data.get("fallback_model", FALLBACK_MODEL_NAME))
-            fb_status = "ON" if data.get("show_fallback_indicator", True) else "OFF"
-            msg += f"**Primary:** `{p_clean}`\n**Fallback:** `{f_clean}`\n**Fallback Indicator:** `{fb_status}`\n"
-        elif self.category == 'media':
-            i_clean = clean(data.get("image_generation_model", "gemini-2.5-flash-image"))
-            t_clean = clean(data.get("speech_model", "gemini-2.5-flash-preview-tts"))
-            msg += f"**Image Generation:** `{i_clean}`\n**Text-to-Speech:** `{t_clean}`\n"
-        elif self.category == 'tools':
-            g_clean = clean(data.get("grounding_rag_model", FALLBACK_MODEL_NAME))
-            c_clean = clean(data.get("critic_model", FALLBACK_MODEL_NAME))
-            msg += f"**Grounding RAG:** `{g_clean}`\n**Anti-Repetition Critic:** `{c_clean}`\n"
-        elif self.category == 'ltm':
-            l_clean = clean(data.get("ltm_model", FALLBACK_MODEL_NAME))
-            msg += f"**LTM Summariser:** `{l_clean}`\n"
-            
-        return msg
+            state = "ON" if data.get("show_fallback_indicator", True) else "OFF"
+            lines.append(f"**Fallback Indicator:** `{state}`")
+        return "\n".join(lines)
 
     def _build_view(self):
         self.clear_items()
         data = self._get_current_profile_data()
-        
-        # Enforce Google Mode for Media
-        if self.category == 'media':
-            self.view_mode = 'google'
-            
-        # --- Row 0 & 1: Dropdowns ---
-        if self.category == 'response':
-            p_val = data.get("primary_model", PRIMARY_MODEL_NAME)
-            f_val = data.get("fallback_model", FALLBACK_MODEL_NAME)
-            self.add_item(self.GenericModelSelect("Select Primary Model...", self._create_model_options(p_val, "primary_model"), 0, "primary_model"))
-            self.add_item(self.GenericModelSelect("Select Fallback Model...", self._create_model_options(f_val, "fallback_model"), 1, "fallback_model"))
-            
-        elif self.category == 'media':
-            i_val = data.get("image_generation_model", "GOOGLE/gemini-2.5-flash-image")
-            t_val = data.get("speech_model", "GOOGLE/gemini-2.5-flash-preview-tts")
-            self.add_item(self.GenericModelSelect("Select Image Gen Model...", self._create_model_options(i_val, "image_generation_model"), 0, "image_generation_model"))
-            self.add_item(self.GenericModelSelect("Select Text-to-Speech Model...", self._create_model_options(t_val, "speech_model"), 1, "speech_model"))
-            
-        elif self.category == 'tools':
-            g_val = data.get("grounding_rag_model", FALLBACK_MODEL_NAME)
-            c_val = data.get("critic_model", FALLBACK_MODEL_NAME)
-            self.add_item(self.GenericModelSelect("Select Grounding RAG Model...", self._create_model_options(g_val, "grounding_rag_model"), 0, "grounding_rag_model"))
-            self.add_item(self.GenericModelSelect("Select Critic Model...", self._create_model_options(c_val, "critic_model"), 1, "critic_model"))
-            
-        elif self.category == 'ltm':
-            l_val = data.get("ltm_model", FALLBACK_MODEL_NAME)
-            self.add_item(self.GenericModelSelect("Select LTM Summariser Model...", self._create_model_options(l_val, "ltm_model"), 0, "ltm_model"))
 
-        # --- Row 2 Actions ---
-        self._add_api_and_category_buttons()
+        if self.category in self._GOOGLE_ONLY_CATEGORIES:
+            self.view_mode = 'google'
+
+        self._add_category_select(0)
+
+        for offset, (key, wording, default) in enumerate(self._CATEGORY_KEYS[self.category]):
+            self.add_item(self.GenericModelSelect(
+                f"Select {wording} Model...",
+                self._create_model_options(data.get(key, default), key), offset + 1, key))
+
+        self._add_api_buttons(row=3)
 
         if self.category == 'response':
             show_fb = data.get("show_fallback_indicator", True)
-            fb_label = "Fallback Indicator: ON" if show_fb else "Fallback Indicator: OFF"
-            fb_style = discord.ButtonStyle.success if show_fb else discord.ButtonStyle.secondary
-            btn_fallback = ui.Button(label=fb_label, style=fb_style, row=2)
-            
+            btn_fallback = ui.Button(
+                label=f"Fallback Indicator: {'ON' if show_fb else 'OFF'}",
+                style=discord.ButtonStyle.success if show_fb else discord.ButtonStyle.secondary,
+                row=3)
+
             async def fallback_cb(i: discord.Interaction):
-                curr = self._get_current_profile_data().get("show_fallback_indicator", True)
-                self._save_changes("show_fallback_indicator", not curr)
+                self._save_changes("show_fallback_indicator", not show_fb)
                 self._build_view()
-                await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-                
+                await i.response.edit_message(**self._picker_render())
+
             btn_fallback.callback = fallback_cb
             self.add_item(btn_fallback)
 
-        # --- Row 4: Category Navigation ---
-        cats = [
-            ("Response", "response"),
-            ("Media", "media"),
-            ("Tools", "tools"),
-            ("LTM", "ltm")
-        ]
-        
-        for label, val in cats:
-            btn_style = discord.ButtonStyle.primary if self.category == val else discord.ButtonStyle.secondary
-            btn = ui.Button(label=label, style=btn_style, row=4, disabled=(self.category == val))
-            
-            def make_nav_cb(target_cat):
-                async def nav_cb(i: discord.Interaction):
-                    self.category = target_cat
-                    self._build_view()
-                    await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-                return nav_cb
-                
-            btn.callback = make_nav_cb(val)
-            self.add_item(btn)
 
-class ModelApplyView(ModelPickerMixin, ui.View):
-    def __init__(self, cog: 'MimicCog', user_id: int, interaction: discord.Interaction):
-        super().__init__(timeout=300)
-        self.cog = cog
-        self.user_id = user_id
-        self.interaction = interaction
-        self.target_profiles: Set[str] = set()
-        self.current_page = 0
-        self.view_mode = 'google' 
-        self.category = 'response'
-        self.show_fallback_indicator = None 
-        self.view_source = 'personal'
-        
-        self.models_state = {
-            'primary_model': None,
-            'fallback_model': None,
-            'image_generation_model': None,
-            'speech_model': None,
-            'grounding_rag_model': None,
-            'critic_model': None,
-            'ltm_model': None,
-            'ollama_host_url': None
-        }
+#: Shared by the wizard and every sub-view. Deliberately under fifteen minutes: after a
+#: modal submit the panel can only be refreshed through the slash command's own
+#: interaction token, and that token dies at fifteen. The views have to go first.
+_BULK_TIMEOUT = 840
 
-        self._load_lists()
+
+class _BulkSubView(ui.View):
+    """A wizard step that borrows the wizard's message instead of opening its own.
+
+    Every step of the bulk flow used to be a fresh `followup.send(ephemeral=True)`,
+    which is why there was never a Back button: there was nothing to go back *to*, only
+    a trail of dead ephemeral messages with the live one at the bottom. A sub-view is
+    edited onto the same message and carries a Back that restores the panel exactly as
+    it was left.
+    """
+
+    def __init__(self, wizard, *, timeout: int = _BULK_TIMEOUT):
+        super().__init__(timeout=timeout)
+        self.wizard = wizard
+        self.cog = wizard.cog
+        self.user_id = wizard.user_id
+        self.session = wizard.session
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Keeps the wizard's timer alive while the user is working inside a sub-view.
+
+        A view's timeout only resets when its own components are used, and a sub-view
+        occupies the wizard's message -- so a long visit to the timezone or model picker
+        would let the panel expire underneath it and discard everything staged.
+        `_refresh_timeout` is discord.py's own mechanism for this (View.dispatch calls it
+        on every interaction); guarded so a rename in a future release degrades to the
+        old behaviour rather than breaking the view.
+        """
+        refresh = getattr(self.wizard, "_refresh_timeout", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                pass
+        return True
+
+    def _add_back(self, row: int, label: str = "◀ Back"):
+        btn = ui.Button(label=label, style=discord.ButtonStyle.secondary, row=row)
+
+        async def cb(interaction: discord.Interaction):
+            await self.wizard.refresh(interaction)
+
+        btn.callback = cb
+        self.add_item(btn)
+
+    def embed(self) -> discord.Embed:
+        raise NotImplementedError
+
+    def _build_view(self):
+        raise NotImplementedError
+
+    async def refresh(self, interaction: discord.Interaction):
         self._build_view()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: ui.Item):
+        print(f"Error in {type(self).__name__}: {error}")
+        traceback.print_exc()
+        if not interaction.response.is_done():
+            await interaction.response.send_message("An unexpected error occurred with this view.", ephemeral=True)
+        else:
+            await interaction.followup.send("An unexpected error occurred with this view.", ephemeral=True)
+
+
+class ModelApplyView(ModelPickerMixin, _BulkSubView):
+    """The bulk model picker, as a staging step.
+
+    It used to own a profile picker and an apply loop of its own, which is precisely
+    why choosing models could not be combined with anything else -- it selected its own
+    targets and finished. It now writes into the wizard's changeset and hands control
+    back, so "set the primary model, raise the temperature and turn realistic typing
+    on" costs one read-modify-write per profile rather than three.
+    """
 
     #: The bulk picker refers to the shared select under its historical name.
     GenericBulkModelSelect = ModelPickerMixin.GenericModelSelect
 
+    def __init__(self, wizard):
+        super().__init__(wizard)
+        self.view_mode = 'google'
+        self.category = 'response'
+        self.ollama_working = None
+        self.cached_ollama_models = []
+        self.models_state = {k: None for k in (
+            'primary_model', 'fallback_model',
+            'image_generation_model', 'image_generation_fallback_model',
+            'speech_model', 'speech_fallback_model',
+            'grounding_rag_model', 'grounding_rag_fallback_model',
+            'critic_model', 'critic_fallback_model',
+            'ltm_model', 'ltm_fallback_model',
+            'ollama_host_url')}
+        self.show_fallback_indicator = None
+
+        # Seeded from whatever an earlier visit already staged, so reopening the picker
+        # shows the pending value instead of reporting "Unchanged" over the top of it.
+        for key in self.models_state:
+            if key in self.session.config:
+                self.models_state[key] = self.session.config[key]
+        if "show_fallback_indicator" in self.session.config:
+            self.show_fallback_indicator = self.session.config["show_fallback_indicator"]
+
+        self._build_view()
+
     def _ollama_host_url(self) -> str:
         return self.models_state.get("ollama_host_url")
-
-    def _load_lists(self):
-        index = self.cog.profile_manager._get_user_index(self.user_id)
-        self.personal_profiles = sorted(list(index.get("personal", {}).keys())) if isinstance(index.get("personal"), dict) else sorted(list(index.get("personal", [])))
-        self.borrowed_profiles = sorted(list(index.get("borrowed", {}).keys())) if isinstance(index.get("borrowed"), dict) else sorted(list(index.get("borrowed", [])))
-
-    def _get_active_list(self):
-        return self.personal_profiles if self.view_source == 'personal' else self.borrowed_profiles
 
     def _save_changes(self, key: str, value: Any):
         if key == "show_fallback_indicator":
@@ -1230,293 +1837,338 @@ class ModelApplyView(ModelPickerMixin, ui.View):
         else:
             self.models_state[key] = value
 
+    def _picker_render(self) -> Dict[str, Any]:
+        return {"content": None, "embed": self.embed(), "view": self}
+
+    @classmethod
+    def _clean(cls, val) -> str:
+        """As the mixin's, plus the nothing-staged case only the bulk picker has.
+
+        `None` means "this slot is not part of the changeset"; the explicit NONE
+        sentinel means "stage the absence of a retry". They read differently because
+        they do different things.
+        """
+        if val is None:
+            return "Unchanged"
+        if isinstance(val, bool):
+            return "On" if val else "Off"
+        return cls.display_model(val)
+
+    def _pending(self) -> Dict[str, Any]:
+        """The config keys this picker would stage, given what is currently chosen."""
+        updates = {k: v for k, v in self.models_state.items() if v is not None}
+        if self.show_fallback_indicator is not None:
+            updates["show_fallback_indicator"] = self.show_fallback_indicator
+        return updates
+
     def _get_selection_feedback_message(self) -> str:
-        count = len(self.target_profiles)
-        
-        def clean(val):
-            if not val: return "Unchanged"
-            s = str(val)
-            for prefix in ("GOOGLE/", "OPENROUTER/", "OLLAMA/"):
-                if s.startswith(prefix):
-                    return s[len(prefix):]
-            return s
-            
-        msg = f"**Category:** `{self.category.title()}`\n"
+        """Named by the mixin. This picker renders an embed, so it is only a fallback."""
+        return self.embed().description or ""
+
+    def embed(self) -> discord.Embed:
+        e = discord.Embed(title="Set Models", colour=discord.Colour.blurple())
+        # The declared label, not category.title(): the ids are short keys, so titling
+        # them rendered "Tts" and "Ltm" at the user.
+        wording = next((lbl for value, lbl, _ in self._CATEGORY_LABELS if value == self.category),
+                       self.category.title())
+        lines = [f"**{wording}** — switch categories to stage more than one kind of model "
+                 f"in the same pass."]
         if self.view_mode == 'openrouter':
-            msg += "⚠️ **Note:** OpenRouter / Custom models require **RAG Mode** for Grounding and URL Context.\n\n"
+            lines.append("-# OpenRouter and custom models require **RAG mode** for Grounding "
+                         "and URL Context.")
         elif self.view_mode == 'ollama':
-            msg += "⚠️ **Note:** Localhost models run on your machine's hardware. Processing speed depends on your GPU/CPU.\n\n"
-        
+            lines.append("-# Localhost models run on your own hardware; speed depends on "
+                         "your GPU/CPU.")
+        e.description = "\n".join(lines)
+
+        for key, wording, _default in self._CATEGORY_KEYS[self.category]:
+            e.add_field(name=wording, value=f"`{self._clean(self.models_state[key])}`", inline=True)
         if self.category == 'response':
-            p_clean = clean(self.models_state['primary_model'])
-            f_clean = clean(self.models_state['fallback_model'])
-            fb_status = "Unchanged" if self.show_fallback_indicator is None else ("ON" if self.show_fallback_indicator else "OFF")
-            msg += f"**Primary:** `{p_clean}`\n**Fallback:** `{f_clean}`\n**Fallback Indicator:** `{fb_status}`\n\n"
-        elif self.category == 'media':
-            i_clean = clean(self.models_state['image_generation_model'])
-            t_clean = clean(self.models_state['speech_model'])
-            msg += f"**Image Generation:** `{i_clean}`\n**Text-to-Speech:** `{t_clean}`\n\n"
-        elif self.category == 'tools':
-            g_clean = clean(self.models_state['grounding_rag_model'])
-            c_clean = clean(self.models_state['critic_model'])
-            msg += f"**Grounding RAG:** `{g_clean}`\n**Anti-Repetition Critic:** `{c_clean}`\n\n"
-        elif self.category == 'ltm':
-            l_clean = clean(self.models_state['ltm_model'])
-            msg += f"**LTM Summariser:** `{l_clean}`\n\n"
-            
-        if count == 0:
-            msg += "Use the dropdowns below to select models and the profiles to apply them to."
-            return msg
-        
-        profile_list = sorted(list(self.target_profiles))
-        msg += f"**Selected Profiles ({count}):**\n"
-        msg += "\n".join(f"- `{name}`" for name in profile_list[:10])
-        if count > 10:
-            msg += f"\n...and {count - 10} more."
-        return msg
+            state = self.show_fallback_indicator
+            e.add_field(name="Fallback Indicator",
+                        value=f"`{'Unchanged' if state is None else self._clean(state)}`",
+                        inline=True)
+
+        pending = self._pending()
+        if pending:
+            body = "\n".join(f"• {k.replace('_', ' ').title()}: `{self._clean(v)}`"
+                             for k, v in pending.items())
+            e.add_field(name=f"Staged from this picker ({len(pending)})",
+                        value=body[:1024], inline=False)
+
+        e.set_footer(text=f"{len(self.wizard.selected_profiles)} profile(s) selected · "
+                          f"nothing is written until Apply")
+        return e
 
     def _build_view(self):
         self.clear_items()
-        
-        if self.category == 'media':
+        if self.category in self._GOOGLE_ONLY_CATEGORIES:
             self.view_mode = 'google'
-            
-        if self.category == 'response':
-            p_val = self.models_state["primary_model"]
-            f_val = self.models_state["fallback_model"]
-            self.add_item(self.GenericBulkModelSelect("Select Primary Model...", self._create_model_options(p_val, "primary_model"), 0, "primary_model"))
-            self.add_item(self.GenericBulkModelSelect("Select Fallback Model...", self._create_model_options(f_val, "fallback_model"), 1, "fallback_model"))
-            
-        elif self.category == 'media':
-            i_val = self.models_state["image_generation_model"]
-            t_val = self.models_state["speech_model"]
-            self.add_item(self.GenericBulkModelSelect("Select Image Gen Model...", self._create_model_options(i_val, "image_generation_model"), 0, "image_generation_model"))
-            self.add_item(self.GenericBulkModelSelect("Select Text-to-Speech Model...", self._create_model_options(t_val, "speech_model"), 1, "speech_model"))
-            
-        elif self.category == 'tools':
-            g_val = self.models_state["grounding_rag_model"]
-            c_val = self.models_state["critic_model"]
-            self.add_item(self.GenericBulkModelSelect("Select Grounding RAG Model...", self._create_model_options(g_val, "grounding_rag_model"), 0, "grounding_rag_model"))
-            self.add_item(self.GenericBulkModelSelect("Select Critic Model...", self._create_model_options(c_val, "critic_model"), 1, "critic_model"))
-            
-        elif self.category == 'ltm':
-            l_val = self.models_state["ltm_model"]
-            self.add_item(self.GenericBulkModelSelect("Select LTM Summariser Model...", self._create_model_options(l_val, "ltm_model"), 0, "ltm_model"))
 
-        active_list = self._get_active_list()
-        per_page = 23
-        num_pages = max(1, (len(active_list) - 1) // per_page + 1)
-        if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
-        
-        start = self.current_page * per_page
-        page_profiles = active_list[start : start + per_page]
+        self._add_category_select(0)
 
-        self._add_api_and_category_buttons()
+        for offset, (key, wording, _default) in enumerate(self._CATEGORY_KEYS[self.category]):
+            self.add_item(self.GenericBulkModelSelect(
+                f"Select {wording} Model...",
+                self._create_model_options(self.models_state[key], key), offset + 1, key))
+
+        self._add_api_buttons(row=3)
 
         if self.category == 'response':
-            fb_label = "Fallback Indicator: Unchanged" if self.show_fallback_indicator is None else ("Fallback Indicator: ON" if self.show_fallback_indicator else "Fallback Indicator: OFF")
-            fb_style = discord.ButtonStyle.success if self.show_fallback_indicator else (discord.ButtonStyle.secondary if self.show_fallback_indicator is None else discord.ButtonStyle.danger)
-            btn_fallback = ui.Button(label=fb_label, style=fb_style, row=2, custom_id="toggle_fallback")
+            state = self.show_fallback_indicator
+            label = ("Fallback Indicator: Unchanged" if state is None
+                     else f"Fallback Indicator: {'ON' if state else 'OFF'}")
+            style = (discord.ButtonStyle.secondary if state is None
+                     else (discord.ButtonStyle.success if state else discord.ButtonStyle.danger))
+            btn = ui.Button(label=label, style=style, row=3)
+
             async def fallback_cb(i: discord.Interaction):
-                if self.show_fallback_indicator is None:
-                    self.show_fallback_indicator = True
-                elif self.show_fallback_indicator:
-                    self.show_fallback_indicator = False
-                else:
-                    self.show_fallback_indicator = None
+                # Tri-state: unchanged -> on -> off -> unchanged, so the indicator can be
+                # taken back out of the changeset without abandoning the model choices.
+                self.show_fallback_indicator = True if state is None else (False if state else None)
                 self._build_view()
-                await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-            btn_fallback.callback = fallback_cb
-            self.add_item(btn_fallback)
-        
-        options = []
-        if page_profiles:
-            page_set = set(page_profiles)
-            page_selected = page_set.issubset(self.target_profiles)
-            page_label = "Unselect Page" if page_selected else "Select Page"
-            options.append(discord.SelectOption(label=page_label, value="toggle_page", description="Toggle selection for all profiles on this page.", emoji="📄"))
-            
-            all_set = set(active_list)
-            all_selected = all_set.issubset(self.target_profiles)
-            all_label = "Unselect All" if all_selected else "Select All"
-            options.append(discord.SelectOption(label=all_label, value="toggle_all", description="Toggle selection for all profiles in this source.", emoji="📚"))
+                await i.response.edit_message(**self._picker_render())
 
-        for name in page_profiles:
-            options.append(discord.SelectOption(label=name, value=name, default=(name in self.target_profiles)))
-        
-        if options:
-            profile_select = ui.Select(placeholder=f"Select {self.view_source} profiles...", min_values=0, max_values=len(options), options=options, row=3)
-            profile_select.callback = self.profile_callback
-            self.add_item(profile_select)
+            btn.callback = fallback_cb
+            self.add_item(btn)
 
-        # Row 4 Pagination & Navigation
-        style_src = discord.ButtonStyle.blurple if self.view_source == 'personal' else discord.ButtonStyle.green
-        source_btn = ui.Button(label=f"Source: {self.view_source.title()}", style=style_src, row=4)
-        source_btn.callback = self.toggle_source_callback
-        self.add_item(source_btn)
+        self._add_back(4)
+        stage = ui.Button(label="Stage Models", style=discord.ButtonStyle.success, row=4,
+                          disabled=not self._pending())
+        stage.callback = self._stage_callback
+        self.add_item(stage)
 
-        build_pagination_controls(self, self.current_page, num_pages, 4, self.prev_page_callback, self.next_page_callback)
-
-        apply_btn = ui.Button(label="Apply", style=discord.ButtonStyle.success, row=4)
-        apply_btn.callback = self.apply_settings
-        self.add_item(apply_btn)
-
-    async def toggle_source_callback(self, interaction: discord.Interaction):
-        self.view_source = 'borrowed' if self.view_source == 'personal' else 'personal'
-        self.current_page = 0
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def prev_page_callback(self, interaction: discord.Interaction):
-        self.current_page -= 1
-        self._build_view()
-        await interaction.response.edit_message(view=self)
-
-    async def next_page_callback(self, interaction: discord.Interaction):
-        self.current_page += 1
-        self._build_view()
-        await interaction.response.edit_message(view=self)
-
-    async def profile_callback(self, interaction: discord.Interaction):
-        vals = interaction.data.get('values', [])
-        
-        per_page = 23
-        active_list = self._get_active_list()
-        start = self.current_page * per_page
-        page_profiles = active_list[start : start + per_page]
-        
-        if "toggle_page" in vals:
-            page_set = set(page_profiles)
-            if page_set.issubset(self.target_profiles): self.target_profiles.difference_update(page_set)
-            else: self.target_profiles.update(page_set)
-        elif "toggle_all" in vals:
-            all_set = set(active_list)
-            if all_set.issubset(self.target_profiles): self.target_profiles.difference_update(all_set)
-            else: self.target_profiles.update(all_set)
-        else:
-            self.target_profiles.difference_update(set(page_profiles))
-            self.target_profiles.update(vals)
-            
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
-
-    async def apply_settings(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        
-        has_any_model = any(v is not None for v in self.models_state.values())
-        if not has_any_model and self.show_fallback_indicator is None:
-            await interaction.followup.send("Please select at least one setting to change.", ephemeral=True)
+    async def _stage_callback(self, interaction: discord.Interaction):
+        pending = self._pending()
+        if not pending:
+            await interaction.response.send_message(
+                "Choose at least one model first.", ephemeral=True)
             return
-            
-        if not self.target_profiles:
-            await interaction.followup.send("Please select at least one profile.", ephemeral=True)
-            return
+        self.wizard._stage_change("models", config=pending)
+        await self.wizard.refresh(interaction)
 
-        success_count = 0
-        index = self.cog.profile_manager._get_user_index(self.user_id)
-        for profile_name in self.target_profiles:
-            is_borrowed = profile_name in index.get("borrowed", [])
-            profile = self.cog.profile_manager._get_profile_config(self.user_id, profile_name, is_borrowed)
-            if profile:
-                for k, v in self.models_state.items():
-                    if v is not None:
-                        profile[k] = v
-                        
-                if self.show_fallback_indicator is not None:
-                    profile["show_fallback_indicator"] = self.show_fallback_indicator
-                    
-                self.cog.profile_manager._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
-                success_count += 1
-                
-        if success_count > 0:
-            keys_to_delete = []
-            for k in list(self.cog.channel_models.keys()):
-                key_user_id = None
-                if isinstance(k, tuple) and len(k) == 3:
-                    key_user_id = k[1]
-                elif isinstance(k, tuple) and len(k) == 2:
-                    key_user_id = k[1]
-                
-                if key_user_id == self.user_id:
-                    keys_to_delete.append(k)
 
-            for k in keys_to_delete:
-                self.cog.channel_models.pop(k, None)
-                self.cog.channel_model_last_profile_key.pop(k, None)
+class _MediaOptionsApplyView(MediaOptionsMixin, _BulkSubView):
+    """The bulk counterpart: same dropdowns, staged instead of written.
 
-        msg = f"Updated models for {success_count} profiles." if success_count else "No profiles updated."
-        await interaction.edit_original_response(content=msg, view=None)
+    Offers the *full* option set rather than one model's, because the selection can hold
+    profiles on four different image models. Nothing is lost by that:
+    `resolve_image_output_params` drops a setting the chosen model does not carry at
+    request time, per profile, which is the same answer the single-profile picker
+    reaches by filtering the list up front.
+    """
 
-class UnifiedBulkTargetView(BaseBulkProfileView):
-    def __init__(self, cog: 'MimicCog', user_id: int, action_key: str, payload: Any, include_borrowed: bool = True, exclude_public: bool = False):
-        super().__init__(cog, user_id, include_borrowed=include_borrowed, exclude_public=exclude_public)
-        self.action_key = action_key
-        self.payload = payload
+    #: Subclass hooks: which keys this view stages, and under which action name.
+    ACTION = ""
+    TITLE = ""
+
+    def __init__(self, wizard):
+        super().__init__(wizard)
+        self.voice_page = 0
+        self.staged: Dict[str, Any] = {}
         self._build_view()
+
+    def _current_value(self, key: str):
+        return self.staged.get(key)
+
+    def _apply(self, key: str, value: Any):
+        self.staged[key] = value
+
+    def _render(self) -> Dict[str, Any]:
+        return {"embed": self.embed(), "view": self}
+
+    def _stage_row(self, row: int, label: str):
+        self._add_back(row)
+        stage = ui.Button(label=label, style=discord.ButtonStyle.success, row=row,
+                          disabled=not self.staged)
+        stage.callback = self._stage_callback
+        self.add_item(stage)
+
+    async def _stage_callback(self, interaction: discord.Interaction):
+        if not self.staged:
+            await interaction.response.send_message("Choose something first.", ephemeral=True)
+            return
+        self.wizard._stage_change(self.ACTION, config=dict(self.staged))
+        await self.wizard.refresh(interaction)
+
+
+class ImageOutputApplyView(_MediaOptionsApplyView):
+    ACTION = "image_output"
+    TITLE = "Set Image Output"
+
+    def embed(self) -> discord.Embed:
+        chosen = {k: self.staged.get(k) for k in IMAGE_OUTPUT_KEYS}
+        e = discord.Embed(
+            title=self.TITLE, colour=discord.Colour.blurple(),
+            description=("Aspect ratio, resolution and reasoning depth for generated "
+                         "images.\n\nThe full list is offered here because the selected "
+                         "profiles may be on different image models. Each request drops "
+                         "whatever its own model does not accept, so a profile on a model "
+                         "with one fixed resolution simply ignores a staged one."))
+        for key, label in (("image_aspect_ratio", "Aspect ratio"),
+                           ("image_size", "Resolution"),
+                           ("image_thinking_level", "Thinking")):
+            value = chosen.get(key)
+            shown = "model default" if value == "" else (value or "unchanged")
+            e.add_field(name=label, value=f"`{shown}`", inline=True)
+        e.set_footer(text=f"{len(self.wizard.selected_profiles)} profile(s) selected · "
+                          f"nothing is written until Apply")
+        return e
 
     def _build_view(self):
         self.clear_items()
-        self._build_profile_select_ui(row=1)
-        apply_btn = ui.Button(label="Apply Settings", style=discord.ButtonStyle.green, row=3)
-        apply_btn.callback = self.apply_action_callback
-        self.add_item(apply_btn)
+        self._add_choice_select("image_aspect_ratio", "Aspect ratio...",
+                                IMAGE_ASPECT_RATIOS_FULL, IMAGE_ASPECT_RATIO_NOTES, 0)
+        self._add_choice_select("image_size", "Resolution...",
+                                IMAGE_SIZES_ALL, IMAGE_SIZE_NOTES, 1)
+        self._add_choice_select("image_thinking_level", "Thinking level...",
+                                IMAGE_THINKING_LEVELS, IMAGE_THINKING_NOTES, 2)
+        self._stage_row(3, "Stage Image Output")
 
-    async def apply_action_callback(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        targets = list(self.selected_profiles)
-        if not targets:
-            await interaction.edit_original_response(content="You must select at least one profile.", view=None)
-            return
 
-        success_count = 0
-        index = self.cog.profile_manager._get_user_index(self.user_id)
-        
-        for name in targets:
-            is_borrowed = name in index.get("borrowed", [])
+class VoiceApplyView(_MediaOptionsApplyView):
+    ACTION = "voice"
+    TITLE = "Choose TTS Voice"
 
-            if self.action_key == "adult_declaration":
-                # Not a config key this loop can set: the declaration is a
-                # content_rating record with its own writer, its own cache
-                # invalidation, and its own refusals -- a classifier verdict or an
-                # exemption is not the owner's to overwrite in bulk either. The
-                # manager persists it, so this skips the save below.
-                if self.payload is not None and self.cog.profile_manager.set_owner_adult_declaration(
-                        self.user_id, name, bool(self.payload)):
-                    success_count += 1
-                continue
+    def embed(self) -> discord.Embed:
+        chosen = self.staged.get("speech_voice")
+        e = discord.Embed(
+            title=self.TITLE, colour=discord.Colour.blurple(),
+            description=("One of the thirty prebuilt Gemini voices, grouped by gender and "
+                         "described by Google's own one-word character.\n\nThe voice is the "
+                         "instrument; accent, mood and pacing come from the Director's Desk, "
+                         "which is a separate row."))
+        described = " · ".join(d for d in (TTS_VOICE_GENDER.get(chosen),
+                                           TTS_VOICE_CHARACTER.get(chosen)) if d)
+        e.add_field(name="Voice",
+                    value=f"`{chosen or 'unchanged'}`" + (f" ({described})" if described else ""),
+                    inline=True)
+        e.set_footer(text=f"{len(self.wizard.selected_profiles)} profile(s) selected · "
+                          f"nothing is written until Apply")
+        return e
 
-            profile = self.cog.profile_manager._get_profile_config(self.user_id, name, is_borrowed)
-            
+    def _build_view(self):
+        self.clear_items()
+        self._add_voice_select("speech_voice", 0)
+        self._stage_row(1, "Stage Voice")
+
+
+class _BulkSession:
+    """Everything the wizard has collected, as one changeset.
+
+    This is the whole point of the wizard shape. The four action keys the old bulk
+    manager carried -- `update_config`, `set_key`, `update_both` and `update_prompts` --
+    all reduce to merging into one of two dicts, so several actions staged together cost
+    one read-modify-write per profile instead of one per action per profile. On the
+    deployment target that is the difference between forty and a hundred and twenty
+    Fernet+zstd round trips for three settings across forty profiles.
+
+    `scope` is fixed at step one and is what lets the action list be filtered rather
+    than the write silently skipping: a personal-only row is never offered against a
+    selection that contains borrowed profiles.
+    """
+
+    __slots__ = ("scope", "targets", "config", "prompts", "declaration", "staged")
+
+    def __init__(self):
+        self.scope = "personal"
+        self.targets: Set[str] = set()
+        self.config: Dict[str, Any] = {}
+        self.prompts: Dict[str, Any] = {}
+        # Not a config key: the 18+ declaration is a content_rating record with its own
+        # writer and its own refusals, applied separately below.
+        self.declaration: Optional[bool] = None
+        # action value -> bulk label, in stage order. Drives the review screen's warning
+        # list and the ✓ marks; the *values* shown on review come from config/prompts, so
+        # two actions touching one key show the resolved truth rather than both writes.
+        self.staged: Dict[str, str] = {}
+
+    @property
+    def has_changes(self) -> bool:
+        return bool(self.config or self.prompts or self.declaration is not None)
+
+    def clear_changes(self):
+        self.config.clear()
+        self.prompts.clear()
+        self.declaration = None
+        self.staged.clear()
+
+
+async def _apply_bulk_session(cog, user_id: int, session: _BulkSession) -> Dict[str, int]:
+    """Writes the whole changeset in one pass over the targets.
+
+    Returns counts rather than a message so the caller decides the wording:
+    `changed`, plus `skipped_prompts` and `skipped_declaration` for the profiles a
+    write could not legitimately touch. Reporting those explicitly is deliberate --
+    the previous apply loop saved an untouched config back to disk for a borrowed
+    profile and counted it as a success, so it claimed to have replaced forty personas
+    while replacing none.
+    """
+    counts = {"changed": 0, "skipped_prompts": 0, "skipped_declaration": 0}
+    index = cog.profile_manager._get_user_index(user_id)
+    borrowed = set(index.get("borrowed", []) or [])
+
+    published: Set[str] = set()
+    if session.declaration is not None:
+        # A published profile flipped to 18+ fails the publish gate and has to be found
+        # and reverted by hand, so it is withheld here rather than half-applied. One
+        # pass over the public index, not an is-published call per profile.
+        published = {d["profile_name"] for d in cog.profile_manager._iter_public_entries(user_id)}
+
+    for position, name in enumerate(sorted(session.targets)):
+        is_borrowed = name in borrowed
+        touched = False
+
+        # Declaration first: it re-reads and rewrites the config itself, so doing it
+        # ahead of the config merge means the merge below reads the post-declaration
+        # file rather than clobbering it from a stale copy.
+        if session.declaration is not None:
+            if is_borrowed or name in published:
+                counts["skipped_declaration"] += 1
+            elif cog.profile_manager.set_owner_adult_declaration(user_id, name, session.declaration):
+                touched = True
+            else:
+                counts["skipped_declaration"] += 1
+
+        if session.prompts:
+            # Prompts live only on profiles the user owns.
+            if is_borrowed:
+                counts["skipped_prompts"] += 1
+            else:
+                prompts = cog.profile_manager._get_profile_prompts(user_id, name)
+                if prompts:
+                    prompts.update(session.prompts)
+                    cog.profile_manager._save_profile_prompts(user_id, name, prompts)
+                    touched = True
+
+        if session.config:
+            profile = cog.profile_manager._get_profile_config(user_id, name, is_borrowed)
             if profile:
-                if self.action_key == "update_config":
-                    profile.update(self.payload)
-                elif self.action_key == "set_key":
-                    k, v = self.payload
-                    if v is not None: profile[k] = v
-                elif self.action_key == "update_prompts" and not is_borrowed:
-                    prompts = self.cog.profile_manager._get_profile_prompts(self.user_id, name)
-                    if prompts:
-                        prompts.update(self.payload)
-                        self.cog.profile_manager._save_profile_prompts(self.user_id, name, prompts)
-                elif self.action_key == "update_both":
-                    if "config" in self.payload:
-                        profile.update(self.payload["config"])
-                    if "prompts" in self.payload and not is_borrowed:
-                        prompts = self.cog.profile_manager._get_profile_prompts(self.user_id, name)
-                        if prompts:
-                            prompts.update(self.payload["prompts"])
-                            self.cog.profile_manager._save_profile_prompts(self.user_id, name, prompts)
-                
-                self.cog.profile_manager._save_profile_config(self.user_id, name, profile, is_borrowed)
-                success_count += 1
-                
-        if success_count > 0:
-            keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and len(k) >= 2 and k[1] == self.user_id]
-            for k in keys:
-                self.cog.channel_models.pop(k, None)
-                self.cog.channel_model_last_profile_key.pop(k, None)
+                profile.update(session.config)
+                cog.profile_manager._save_profile_config(user_id, name, profile, is_borrowed)
+                touched = True
 
-        await interaction.edit_original_response(content=f"Successfully applied settings to {success_count} profile(s).", view=None)
+        if touched:
+            # One profile counts once, however many files it took.
+            counts["changed"] += 1
+
+        # Each profile is a Fernet decrypt, a zstd round trip and an atomic write, and
+        # a hundred of them back to back holds the loop long enough to miss a Discord
+        # heartbeat. Yielding periodically costs nothing and keeps the gateway alive.
+        if position % 10 == 9:
+            await asyncio.sleep(0)
+
+    if counts["changed"]:
+        # Hot-swap: a live session holding a cached model for any of this user's
+        # profiles would otherwise keep the pre-edit settings until eviction.
+        keys = [k for k in cog.channel_models.keys()
+                if isinstance(k, tuple) and len(k) >= 2 and k[1] == user_id]
+        for k in keys:
+            cog.channel_models.pop(k, None)
+            cog.channel_model_last_profile_key.pop(k, None)
+
+    return counts
+
 
 from ..utils.helpers import _resolve_zoneinfo
 
@@ -1739,100 +2391,91 @@ class CustomTimezoneModal(ui.Modal, title="Enter Custom Timezone"):
             await interaction.response.edit_message(content=f"✅ Timezone set to **{canonical_tz}**.", view=None)
         else:
             self.parent_view.selected_tz = canonical_tz
-            self.parent_view._build_view()
-            await interaction.response.edit_message(content=self.parent_view._get_selection_feedback_message(), view=self.parent_view)
+            await self.parent_view.refresh(interaction)
 
 # Alias for backward compatibility
 BulkTimezoneModal = CustomTimezoneModal
 
-class BulkTimezoneView(BaseBulkProfileView):
-    def __init__(self, cog: 'MimicCog', user_id: int):
-        super().__init__(cog, user_id, include_borrowed=True)
-        self.selected_tz = None
+class BulkTimezoneView(_BulkSubView):
+    """Timezone picker, as a staging step.
+
+    Four pages of twenty zones plus manual IANA entry is more than fits beside anything
+    else, which is why this is a sub-view rather than a plain choice step. It no longer
+    owns a profile picker or an apply loop: it produces two config keys and hands them
+    back.
+    """
+
+    def __init__(self, wizard):
+        super().__init__(wizard)
+        self.selected_tz = self.session.config.get("timezone")
         self.tz_page = 0
         self.tz_total_pages = (len(EXTENSIVE_TIMEZONES) - 1) // 20 + 1
         self._build_view()
+
+    def embed(self) -> discord.Embed:
+        e = discord.Embed(
+            title="Set Time & Timezone",
+            colour=discord.Colour.blurple(),
+            description=("Staging a timezone also switches **time awareness on** for every "
+                         "selected profile — a zone set on a profile that never reads the "
+                         "clock does nothing.\n\nBrowse a region, jump between regions, or "
+                         "enter any IANA timezone ID by hand."))
+        e.add_field(name="Region", value=PARTITION_NAMES[self.tz_page], inline=True)
+        e.add_field(name="Chosen", value=f"`{self.selected_tz or 'nothing yet'}`", inline=True)
+        e.set_footer(text=f"{len(self.wizard.selected_profiles)} profile(s) selected · "
+                          f"nothing is written until Apply")
+        return e
 
     def _build_view(self):
         self.clear_items()
         per_page = 20
         start = self.tz_page * per_page
-        page_tzs = EXTENSIVE_TIMEZONES[start:start + per_page]
 
-        options = [
-            discord.SelectOption(label="⚙️ Custom / Manual Timezone ID...", value="custom", description="Enter any custom IANA timezone ID manually.", emoji="✏️")
-        ]
-
-        # Add 3 Partition Jump options
+        options = [discord.SelectOption(
+            label="⚙️ Custom / Manual Timezone ID...", value="custom",
+            description="Enter any custom IANA timezone ID manually.", emoji="✏️")]
         for page_idx, p_name in enumerate(PARTITION_NAMES):
             if page_idx != self.tz_page:
                 options.append(discord.SelectOption(
-                    label=f"🌍 Jump: {p_name}",
-                    value=f"jump_{page_idx}",
-                    description=f"Switch to page {page_idx + 1} ({p_name})",
-                    emoji="📑"
-                ))
-
-        # Add 20 Timezone options for the active page
-        for label, tz_val, desc in page_tzs:
+                    label=f"🌍 Jump: {p_name}", value=f"jump_{page_idx}",
+                    description=f"Switch to page {page_idx + 1} ({p_name})", emoji="📑"))
+        for label, tz_val, desc in EXTENSIVE_TIMEZONES[start:start + per_page]:
             options.append(discord.SelectOption(
-                label=label[:100],
-                value=tz_val,
-                description=desc[:100],
-                default=(tz_val == self.selected_tz)
-            ))
+                label=label[:100], value=tz_val, description=desc[:100],
+                default=(tz_val == self.selected_tz)))
 
-        select = ui.Select(placeholder=f"Choose a timezone ({PARTITION_NAMES[self.tz_page]})...", options=options, row=0)
+        select = ui.Select(placeholder=f"Choose a timezone ({PARTITION_NAMES[self.tz_page]})...",
+                           options=options, row=0)
         select.callback = self.tz_callback
         self.add_item(select)
 
-        self._build_profile_select_ui(row=1)
-        
-        apply_btn = ui.Button(label="Apply Timezone", style=discord.ButtonStyle.green, row=3)
-        apply_btn.callback = self.apply_action
-        self.add_item(apply_btn)
+        self._add_back(1)
+        stage = ui.Button(label="Stage Timezone", style=discord.ButtonStyle.success, row=1,
+                          disabled=not self.selected_tz)
+        stage.callback = self._stage_callback
+        self.add_item(stage)
 
     async def tz_callback(self, interaction: discord.Interaction):
         val = interaction.data['values'][0]
         if val == "custom":
             await interaction.response.send_modal(CustomTimezoneModal(self))
             return
-
         if val.startswith("jump_"):
-            target_page = int(val.split("_")[1])
-            self.tz_page = target_page
-            self._build_view()
-            await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+            self.tz_page = int(val.split("_")[1])
+            await self.refresh(interaction)
             return
-
         _, canonical = _resolve_zoneinfo(val)
         self.selected_tz = canonical
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+        await self.refresh(interaction)
 
-    async def apply_action(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        if not self.selected_tz or not self.selected_profiles:
-            await interaction.edit_original_response(content="Select a timezone and at least one profile.", view=None)
+    async def _stage_callback(self, interaction: discord.Interaction):
+        if not self.selected_tz:
+            await interaction.response.send_message("Choose a timezone first.", ephemeral=True)
             return
+        self.wizard._stage_change(
+            "time", config={"timezone": self.selected_tz, "time_tracking_enabled": True})
+        await self.wizard.refresh(interaction)
 
-        updated_count = 0
-        index = self.cog.profile_manager._get_user_index(self.user_id)
-        for name in self.selected_profiles:
-            is_borrowed = name in index.get("borrowed", [])
-            p = self.cog.profile_manager._get_profile_config(self.user_id, name, is_borrowed)
-            if p:
-                p["timezone"] = self.selected_tz
-                p["time_tracking_enabled"] = True
-                self.cog.profile_manager._save_profile_config(self.user_id, name, p, is_borrowed)
-                updated_count += 1
-        
-        if updated_count > 0:
-            keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.user_id]
-            for k in keys: 
-                self.cog.channel_models.pop(k, None)
-
-        await interaction.edit_original_response(content=f"Timezone set to **{self.selected_tz}** for {updated_count} profiles.", view=None)
 
 def ProfileGenerationVisualModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
     raw = current_params.get("placeholder_emoji") or ""
@@ -1867,106 +2510,192 @@ def ProfileGenerationVisualModal(cog, profile_name: str, current_params: Dict[st
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Generation Visual", fields, parser, callback, target_user_id)
 
-class BulkResetView(BaseBulkProfileView):
-    def __init__(self, cog: 'MimicCog', user_id: int):
-        super().__init__(cog, user_id, include_borrowed=True)
+def _unlink_profiles(cog, user_id: int, names: List[str]) -> List[str]:
+    """Removes profiles from the index and returns the directories left to remove.
+
+    Split from the removal itself deliberately. `_get_user_index` hands back the dict
+    it caches on the cog, shared with every other handler, so mutating it from a worker
+    thread is a live race -- but `shutil.rmtree` over a hundred profile directories is
+    exactly the kind of blocking work that should not sit on the event loop. The index
+    work stays here; the caller threads the filesystem half.
+
+    Personal profiles cascade to the copies other users borrowed from them; a borrowed
+    entry only unlinks the borrower's own copy.
+    """
+    user_id_str = str(user_id)
+    index = cog.profile_manager._get_user_index(user_id)
+    doomed = []
+
+    for name in names:
+        if name in index.get("borrowed", {}):
+            if isinstance(index["borrowed"], dict):
+                pid = index["borrowed"].pop(name)
+            else:
+                index["borrowed"].remove(name)
+                pid = name
+        elif name in index.get("personal", {}):
+            if isinstance(index["personal"], dict):
+                pid = index["personal"].pop(name)
+            else:
+                index["personal"].remove(name)
+                pid = name
+            cog.profile_manager._cascade_delete_borrowed_profiles(user_id, pid, name)
+        else:
+            continue
+        doomed.append(os.path.join(cog.USERS_DIR, user_id_str, "profiles", pid))
+
+    if doomed:
+        cog.profile_manager._save_user_index(user_id, index)
+    return doomed
+
+
+def _remove_profile_dirs(paths: List[str]):
+    """The blocking half of a bulk delete. Always called through asyncio.to_thread."""
+    import shutil
+    for path in paths:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+class BulkResetView(_BulkSubView):
+    """Wiping long-term memories or training examples across the selected profiles.
+
+    Terminal rather than staged: this deletes shard files. There is nothing to merge
+    into a changeset, and nothing sensible about running it in the same pass as a
+    settings edit -- which is why the wizard refuses to open it while changes are
+    pending.
+    """
+
+    def __init__(self, wizard):
+        super().__init__(wizard)
         self.reset_choice = None
         self._build_view()
 
+    def _targets(self) -> List[str]:
+        """Training examples exist only on owned profiles, so borrowed ones drop out."""
+        names = sorted(self.wizard.selected_profiles)
+        if self.reset_choice != "reset_examples":
+            return names
+        index = self.cog.profile_manager._get_user_index(self.user_id)
+        borrowed = set(index.get("borrowed", []) or [])
+        return [n for n in names if n not in borrowed]
+
+    def embed(self) -> discord.Embed:
+        if not self.reset_choice:
+            return discord.Embed(
+                title="Reset Profile Data",
+                colour=discord.Colour.orange(),
+                description=("Choose what to wipe from the "
+                             f"**{len(self.wizard.selected_profiles)} selected profile(s)**.\n\n"
+                             "This deletes stored data outright and is not undoable. It runs on "
+                             "its own rather than being staged with settings changes."))
+
+        targets = self._targets()
+        wording = ("training examples" if self.reset_choice == "reset_examples"
+                   else "long-term memories")
+        e = discord.Embed(
+            title="Reset Profile Data",
+            colour=discord.Colour.red(),
+            description=f"⚠️ **All {wording} are deleted from {len(targets)} profile(s). "
+                        f"This cannot be undone.**")
+        e.add_field(name=f"Affected ({len(targets)})",
+                    value=_cap_names(targets) or "*none*", inline=False)
+        dropped = len(self.wizard.selected_profiles) - len(targets)
+        if dropped:
+            e.add_field(name="Withheld",
+                        value=f"{dropped} borrowed profile(s) — training examples belong to "
+                              f"the profile's owner.", inline=False)
+        return e
+
     def _build_view(self):
         self.clear_items()
-        reset_options = [
-            discord.SelectOption(label="Reset Training Examples (Personal Only)", value="reset_examples", default=(self.reset_choice == "reset_examples")),
-            discord.SelectOption(label="Reset Long-Term Memories (All Profiles)", value="reset_ltm", default=(self.reset_choice == "reset_ltm"))
+        options = [
+            discord.SelectOption(label="Reset Training Examples", value="reset_examples",
+                                 description="Personal profiles only.",
+                                 default=(self.reset_choice == "reset_examples")),
+            discord.SelectOption(label="Reset Long-Term Memories", value="reset_ltm",
+                                 description="Applies to every selected profile.",
+                                 default=(self.reset_choice == "reset_ltm")),
         ]
-        reset_select = ui.Select(placeholder="Choose what to reset...", options=reset_options, row=0)
-        reset_select.callback = self.reset_type_callback
-        self.add_item(reset_select)
+        select = ui.Select(placeholder="Choose what to reset...", options=options, row=0)
+        select.callback = self.reset_type_callback
+        self.add_item(select)
 
-        if self.reset_choice:
-            # Dynamic include_borrowed update
-            self.include_borrowed = (self.reset_choice == "reset_ltm")
-            # If switching to a mode that doesn't support borrowed, reset view source to personal
-            if not self.include_borrowed and self.view_source == 'borrowed':
-                self.view_source = 'personal'
-                self.current_page = 0
-            
-            self._build_profile_select_ui(row=1)
-
-        apply_button = ui.Button(label="Confirm & Reset Data", style=discord.ButtonStyle.danger, row=3, disabled=(not self.reset_choice))
-        apply_button.callback = self.apply_action
-        self.add_item(apply_button)
+        self._add_back(1)
+        confirm = ui.Button(label="Confirm & Reset Data", style=discord.ButtonStyle.danger,
+                            row=1, disabled=(not self.reset_choice or not self._targets()))
+        confirm.callback = self.apply_action
+        self.add_item(confirm)
 
     async def reset_type_callback(self, interaction: discord.Interaction):
         self.reset_choice = interaction.data['values'][0]
-        self.selected_profiles.clear()
-        self.current_page = 0
-        self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+        await self.refresh(interaction)
 
-    async def apply_action(self, interaction: discord.Interaction, button: ui.Button = None):
+    async def apply_action(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        target_profiles = list(self.selected_profiles)
-        if not self.reset_choice or not target_profiles:
-            await interaction.edit_original_response(content="Please select a reset action and at least one profile.", view=None); return
+        targets = self._targets()
+        if not self.reset_choice or not targets:
+            await interaction.edit_original_response(
+                content="Nothing to reset.", embed=None, view=None)
+            return
 
-        final_message = "An unknown action was attempted."
         if self.reset_choice == "reset_examples":
-            final_message = await self.cog.memory_manager.bulk_reset_examples(self.user_id, target_profiles)
-        elif self.reset_choice == "reset_ltm":
-            final_message = await self.cog.memory_manager.bulk_reset_ltm(self.user_id, target_profiles)
-        
-        await interaction.edit_original_response(content=final_message, view=None)
+            message = await self.cog.memory_manager.bulk_reset_examples(self.user_id, targets)
+        else:
+            message = await self.cog.memory_manager.bulk_reset_ltm(self.user_id, targets)
 
-class BulkDeleteView(BaseBulkProfileView):
-    def __init__(self, cog: 'MimicCog', user_id: int):
-        super().__init__(cog, user_id, include_borrowed=True)
+        await interaction.edit_original_response(
+            content=None, embed=discord.Embed(description=f"✅ {message}",
+                                              colour=discord.Colour.green()), view=None)
+
+
+class BulkDeleteView(_BulkSubView):
+    """The confirmation for deleting the selected profiles.
+
+    No picker of its own any more -- the wizard already knows which profiles are in
+    play, and re-asking on a second screen was how a selection made under one scope
+    could be silently widened under another.
+    """
+
+    def __init__(self, wizard):
+        super().__init__(wizard)
         self._build_view()
+
+    def embed(self) -> discord.Embed:
+        names = sorted(self.wizard.selected_profiles)
+        e = discord.Embed(
+            title="Delete Profiles",
+            colour=discord.Colour.red(),
+            description=(f"⚠️ **{len(names)} profile(s) and all of their data are deleted "
+                         f"permanently.** Personas, memories, training examples and child-bot "
+                         f"links go with them, and deleting a personal profile also removes "
+                         f"every copy other users borrowed from it."))
+        e.add_field(name=f"Affected ({len(names)})", value=_cap_names(names) or "*none*",
+                    inline=False)
+        return e
 
     def _build_view(self):
         self.clear_items()
-        self._build_profile_select_ui(row=0)
-        confirm_button = ui.Button(label="Confirm & Delete Selected Profiles", style=discord.ButtonStyle.danger, row=2)
-        confirm_button.callback = self.confirm_delete_callback
-        self.add_item(confirm_button)
+        self._add_back(0)
+        confirm = ui.Button(label="Confirm & Delete", style=discord.ButtonStyle.danger, row=0,
+                            disabled=not self.wizard.selected_profiles)
+        confirm.callback = self.confirm_delete_callback
+        self.add_item(confirm)
 
     async def confirm_delete_callback(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        items_to_delete = list(self.selected_profiles)
-        if not items_to_delete:
-            await interaction.edit_original_response(content="You must select profiles to delete.", view=None); return
+        names = sorted(self.wizard.selected_profiles)
+        if not names:
+            await interaction.edit_original_response(
+                content="No profiles selected.", embed=None, view=None)
+            return
+        doomed = _unlink_profiles(self.cog, self.user_id, names)
+        await asyncio.to_thread(_remove_profile_dirs, doomed)
+        await interaction.edit_original_response(
+            content=None,
+            embed=discord.Embed(description=f"✅ Deleted {len(doomed)} profile(s).",
+                                colour=discord.Colour.green()),
+            view=None)
 
-        deleted_count = 0
-        user_id_str = str(self.user_id)
-        index = self.cog.profile_manager._get_user_index(self.user_id)
-        
-        for name in items_to_delete:
-            if name in index.get("borrowed", {}):
-                if isinstance(index["borrowed"], dict):
-                    pid = index["borrowed"].pop(name)
-                else:
-                    index["borrowed"].remove(name)
-                    pid = name
-                deleted_count += 1
-                import shutil
-                p_dir = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", pid)
-                shutil.rmtree(p_dir, ignore_errors=True)
-            elif name in index.get("personal", {}):
-                if isinstance(index["personal"], dict):
-                    pid = index["personal"].pop(name)
-                else:
-                    index["personal"].remove(name)
-                    pid = name
-                
-                # Pass the pid to cascade delete to match the method signature
-                self.cog.profile_manager._cascade_delete_borrowed_profiles(self.user_id, pid, name)
-                deleted_count += 1
-                import shutil
-                p_dir = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", pid)
-                shutil.rmtree(p_dir, ignore_errors=True)
-        
-        if deleted_count > 0: self.cog.profile_manager._save_user_index(self.user_id, index)
-        await interaction.edit_original_response(content=f"Successfully deleted {deleted_count} profiles.", view=None)
 
 class AppearanceModal(ui.Modal):
     def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction, profile_name: str,
@@ -2080,211 +2809,780 @@ def ProfileNeuroModal(cog, profile_name: str, current_params: Dict[str, Any], is
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Neuro-Endocrine Engine Configuration", fields, parser, callback, target_user_id)
 
-class BulkManageView(ui.View):
-    def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction):
-        super().__init__(timeout=600)
-        self.cog = cog
-        self.original_interaction = original_interaction
-        self.user_id = original_interaction.user.id
+_SCOPE_LABELS = {"personal": "Personal", "borrowed": "Borrowed", "both": "Both"}
 
-        options = [
-            discord.SelectOption(label="Set Models", value="models", description="Apply model settings to multiple profiles."),
-            discord.SelectOption(label="Set Generation Parameters & STM", value="gen_params", description="Apply Temp, Top P, Top K, and STM Length."),
-            discord.SelectOption(label="Set Advanced Parameters (OpenRouter)", value="adv_params", description="Apply penalties, Min P, and Top A."),
-            discord.SelectOption(label="Set Thinking Parameters", value="thinking_params", description="Apply thinking settings to multiple profiles."),
-            discord.SelectOption(label="Set Response Mode", value="response_mode", description="Apply Mention/Reply behavior to multiple profiles."),
-            discord.SelectOption(label="Toggle Grounding", value="grounding", description="Enable or disable grounding for multiple profiles."),
-            discord.SelectOption(label="Configure Image Generation", value="image_gen", description="Setup models, prompts, and toggles for multiple profiles."),
-            discord.SelectOption(label="Toggle URL Context Fetching", value="url_context", description="Enable or disable link scraping for multiple profiles."),
-            discord.SelectOption(label="Set Time & Timezone", value="timezone", description="Enable time-awareness and set a specific timezone."),
-            discord.SelectOption(label="Set Generation Visual", value="generation_visual", description="Apply custom placeholder emoji to multiple profiles."),
-            discord.SelectOption(label="Toggle Critic (Anti-Repetition)", value="critic", description="Enable or disable the critic for multiple profiles."),
-            discord.SelectOption(label="Toggle Neuro-Endocrine Engine", value="neuro", description="Enable or disable hormonal simulation for multiple profiles."),
-            discord.SelectOption(label="Toggle Help Mode (Guide RAG)", value="help_mode", description="Allow profiles to answer technical bot questions."),
-            discord.SelectOption(label="Toggle Realistic Typing", value="typing", description="Enable or disable realistic typing for multiple profiles."),
-            discord.SelectOption(label="Set Adult 18+ Declaration", value="adult_declaration", description="Declare or withdraw 18+ across multiple profiles."),
-            discord.SelectOption(label="Set Training Parameters", value="train_params", description="Set training settings to multiple personal profiles."),
-            discord.SelectOption(label="Set LTM Parameters", value="ltm_params", description="Apply LTM settings to multiple personal profiles."),
-            discord.SelectOption(label="Set LTM Summarization Prompt", value="ltm_summarization", description="Apply a custom LTM summarization prompt."),
-            discord.SelectOption(label="Reset Profile Data", value="data_reset", description="Reset LTM or Training Examples for personal profiles."),
-            discord.SelectOption(label="Delete Profiles", value="delete_items", description="Permanently delete multiple profiles.")
-        ]
-        
-        select = ui.Select(placeholder="Choose a bulk action to perform...", options=options)
-        select.callback = self.select_callback
-        self.add_item(select)
-    
-    async def select_callback(self, interaction: discord.Interaction):
-        choice = interaction.data['values'][0]
+#: Steps the footer counts through. "choice" is a detour inside "actions", not a step.
+_WIZARD_STEPS = ("scope", "targets", "actions", "review")
+
+
+def _cap_names(names, limit: int = 900) -> str:
+    """A backticked name list truncated to fit an embed field.
+
+    An embed field caps at 1024 characters and LIMIT_PROFILES is 100, so a full
+    selection overruns on the names alone. Truncating here rather than at each call
+    site means the review screen cannot be the one place that forgot.
+    """
+    names = list(names)
+    out, used = [], 0
+    for index, name in enumerate(names):
+        piece = f"`{name}`"
+        if used + len(piece) + 2 > limit:
+            out.append(f"…and {len(names) - index} more")
+            break
+        out.append(piece)
+        used += len(piece) + 2
+    return ", ".join(out)
+
+
+def _describe_value(value) -> str:
+    """One short, readable rendering of a staged config value."""
+    if isinstance(value, bool):
+        return "On" if value else "Off"
+    if isinstance(value, (list, tuple)):
+        return f"{len(value)} item(s)"
+    if isinstance(value, dict):
+        return f"{len(value)} section(s)"
+    text = str(value)
+    for prefix in ("GOOGLE/", "OPENROUTER/", "OLLAMA/"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return text if len(text) <= 60 else text[:57] + "…"
+
+
+class BulkManageView(BaseBulkProfileView):
+    """The bulk dashboard: one message, four steps, one changeset.
+
+    The old shape was action-first and one-action-at-a-time: pick a setting, pick the
+    profiles, apply, and start again from the top for the next setting. Every step was
+    a fresh `followup.send(ephemeral=True)`, so there was no Back button and no panel to
+    go back to -- only a trail of dead messages with the live one at the bottom.
+
+    Scope now comes first, and it is load-bearing rather than cosmetic. `_Bulk.scope`
+    used to be enforced at write time, with the profile picker offering a Source toggle
+    that let one selection span both sources; a personal-only row then silently dropped
+    the borrowed half of it. Choosing Personal, Borrowed or Both up front turns scope
+    into a session invariant that filters the *action list*, so a row that cannot apply
+    to the selection is never offered in the first place.
+
+    Targets then come before actions, which is what makes staging possible: with the
+    profiles already settled, an action only has to produce a value. Those values merge
+    into one `_BulkSession`, and the whole changeset is written in a single pass -- so
+    "set the models, raise the temperature and turn on realistic typing" is one
+    read-modify-write per profile instead of three, and one confirmation instead of
+    three.
+
+    Two rows do not stage. Delete and Reset Profile Data remove files rather than
+    merging into a dict, so they run alone and the wizard refuses to open them while
+    anything is pending.
+    """
+
+    def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction):
+        # Set before super().__init__, which reaches _load_profile_lists below.
+        self.session = _BulkSession()
+        self.step = "scope"
+        self.current_tab = "home"
+        self.current_action = None
+        self._choice = None
+        self._anchor = None
+        self._anchor_config: Dict[str, Any] = {}
+        self._anchor_prompts: Dict[str, Any] = {}
+        self._anchor_page = 0
+        self._inherit_picks: Set[str] = set()
+        super().__init__(cog, original_interaction.user.id, include_borrowed=True,
+                         timeout=_BULK_TIMEOUT)
+        self.original_interaction = original_interaction
+        self._build_view()
+
+    # --- Scope -------------------------------------------------------------
+
+    def _load_profile_lists(self):
+        """Scope-aware source lists, re-read whenever the scope changes.
+
+        `_n_personal` / `_n_borrowed` keep the unscoped totals, because the scope step
+        has to offer counts for the sources it is not currently showing.
+        """
         index = self.cog.profile_manager._get_user_index(self.user_id)
-        all_profiles = list(index.get("personal", [])) + list(index.get("borrowed", []))
-        
-        if not all_profiles:
-            await interaction.response.send_message("You have no profiles to apply settings to.", ephemeral=True)
+        personal = sorted(list(index.get("personal", [])))
+        borrowed = sorted(list(index.get("borrowed", [])))
+        self._n_personal, self._n_borrowed = len(personal), len(borrowed)
+        self.excluded_public = []
+
+        scope = self.session.scope
+        if scope == "personal":
+            self.personal_profiles, self.borrowed_profiles = personal, []
+            self.view_source, self.include_borrowed = "personal", False
+        elif scope == "borrowed":
+            self.personal_profiles, self.borrowed_profiles = [], borrowed
+            self.view_source, self.include_borrowed = "borrowed", False
+        else:
+            self.personal_profiles, self.borrowed_profiles = personal, borrowed
+            self.view_source, self.include_borrowed = "personal", True
+
+        self._cached_personal_opts = [discord.SelectOption(label=n, value=n) for n in self.personal_profiles]
+        self._cached_borrowed_opts = [discord.SelectOption(label=n, value=n) for n in self.borrowed_profiles]
+        self.current_page = 0
+
+    def _allowed(self, action) -> bool:
+        """Whether a row can apply to every profile the current scope can reach."""
+        return (action.bulk is not None
+                and (action.bulk.scope == "all" or self.session.scope == "personal"))
+
+    def _tabs(self):
+        return [t for t in PROFILE_TABS
+                if any(a.tab == t and self._allowed(a) for a in PROFILE_ACTIONS)]
+
+    def _actions_for_tab(self, tab):
+        return [a for a in PROFILE_ACTIONS if a.tab == tab and self._allowed(a)]
+
+    # --- Anchor (copy one profile's setup onto the rest) --------------------
+
+    def _load_anchor(self, name: str):
+        """Reads the anchor's settings once, when it is chosen.
+
+        Prompt blobs are carried across verbatim rather than decrypted and re-encrypted:
+        the recipients are the same user's profiles under the same key, so the stored
+        ciphertext is already the right ciphertext.
+        """
+        self._anchor = name
+        index = self.cog.profile_manager._get_user_index(self.user_id)
+        is_borrowed = name in (index.get("borrowed", []) or [])
+        self._anchor_config = self.cog.profile_manager._get_profile_config(
+            self.user_id, name, is_borrowed) or {}
+        # Prompts exist only on owned profiles, and every prompt-writing row is
+        # personal-scope anyway, so a borrowed anchor simply offers none.
+        self._anchor_prompts = ({} if is_borrowed else
+                                (self.cog.profile_manager._get_profile_prompts(self.user_id, name) or {}))
+        self._inherit_picks = set()
+
+    def _anchor_present(self, action) -> int:
+        """How many of a row's declared settings the anchor actually has set.
+
+        Only what the anchor has is copied. A setting it never touched is on the
+        default, and writing a default over a recipient's deliberate override would
+        make "inherit" mean "reset" for some rows and not others.
+        """
+        return (sum(1 for k in action.bulk.keys if k in self._anchor_config)
+                + sum(1 for k in action.bulk.prompt_keys if k in self._anchor_prompts))
+
+    def _inherit_rows(self, tab: Optional[str] = None):
+        """Rows the anchor can actually contribute to, in the current scope."""
+        return [a for a in PROFILE_ACTIONS
+                if a.bulk is not None and a.bulk.copyable and self._allowed(a)
+                and self._anchor_present(a)
+                and (tab is None or a.tab == tab)]
+
+    def _inherit_tabs(self):
+        return [t for t in PROFILE_TABS if self._inherit_rows(t)]
+
+    # --- Changeset ---------------------------------------------------------
+
+    def _stage_change(self, action_value: str, config: Optional[Dict] = None,
+                      prompts: Optional[Dict] = None, declaration: Optional[bool] = None):
+        """Merges one action's output into the changeset and returns to the action list."""
+        if config:
+            self.session.config.update(config)
+        if prompts:
+            self.session.prompts.update(prompts)
+        if declaration is not None:
+            self.session.declaration = declaration
+        action = PROFILE_ACTIONS_BY_VALUE.get(action_value)
+        self.session.staged[action_value] = action.bulk_label() if action else action_value
+        self._choice = None
+        self.step = "actions"
+
+    async def _stage_from_modal(self, interaction: discord.Interaction, action_value: str,
+                                config: Dict, prompts: Dict):
+        """Stages a modal's payload and puts the panel back where the user left it.
+
+        ConfigModal and the persona/instruction modals defer with `thinking=True` before
+        handing over, which spends the response on a placeholder message -- so the panel
+        cannot be edited through that interaction at all. The placeholder is removed and
+        the panel refreshed through the wizard's own token instead. Modals that have not
+        responded (ActionTextInputModal) edit the message directly, one round trip fewer.
+        """
+        if not (config or prompts):
+            await self._modal_reply(interaction, "Nothing was entered, so nothing was staged.")
             return
 
-        if choice == "gen_params":
-            async def modal_callback(i: discord.Interaction, params: Dict):
-                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=True)
-                await i.followup.send(content="Parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal = ProfileParamsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
-            await interaction.response.send_modal(modal)
+        self._stage_change(action_value, config=config, prompts=prompts)
+        self._build_view()
 
-        elif choice == "adv_params":
-            async def modal_callback(i: discord.Interaction, params: Dict):
-                if not params: await i.followup.send("No parameters set.", ephemeral=True); return
-                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=True)
-                await i.followup.send(content="Advanced parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal = ProfileAdvancedParamsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
-            await interaction.response.send_modal(modal)
+        if interaction.response.is_done():
+            try:
+                await self.original_interaction.edit_original_response(
+                    embed=self.embed(), view=self)
+            except discord.HTTPException:
+                # Sub-views keep this view's timer alive, so it can outlive the fifteen
+                # minutes the slash command's token lasts. Say so rather than leaving the
+                # change staged on a panel that will never show it again.
+                self.stop()
+                await interaction.followup.send(
+                    "This bulk panel has expired, so that change could not be added to it. "
+                    "Nothing was written — run `/profile bulk manage` again.", ephemeral=True)
+                return
+            try:
+                await interaction.delete_original_response()
+            except discord.HTTPException:
+                pass
+        else:
+            await interaction.response.edit_message(embed=self.embed(), view=self)
 
-        elif choice == "thinking_params":
-            async def modal_callback(i: discord.Interaction, params: Dict):
-                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=True)
-                await i.followup.send(content="Thinking parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal = ProfileThinkingParamsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
-            await interaction.response.send_modal(modal)
+    async def _modal_reply(self, interaction: discord.Interaction, text: str):
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
 
-        elif choice == "train_params":
-            async def modal_callback(i: discord.Interaction, params: Dict):
-                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=False)
-                await i.followup.send(content="Parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal = ProfileTrainingParamsModal(self.cog, "BULK_APPLY", {}, callback=modal_callback)
-            await interaction.response.send_modal(modal)
+    def _open_choice(self, action_value: str, placeholder: str,
+                     options: List[discord.SelectOption], on_pick):
+        """Routes to the value step for a row whose value comes from a fixed list."""
+        self._choice = {"action": action_value, "placeholder": placeholder,
+                        "options": options, "on_pick": on_pick, "chosen": None}
+        self.step = "choice"
 
-        elif choice == "ltm_params":
-            async def modal_callback(i: discord.Interaction, params: Dict):
-                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=True)
-                await i.followup.send(content="Parameters validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal = ProfileLTMParamsModal(self.cog, "BULK_APPLY", {}, callback=modal_callback)
-            await interaction.response.send_modal(modal)
+    def _warnings(self) -> List[str]:
+        out = []
+        for value in self.session.staged:
+            action = PROFILE_ACTIONS_BY_VALUE.get(value)
+            if action and action.bulk and action.bulk.destructive and action.bulk.warning:
+                out.append(f"**{action.bulk_label()}** — {action.bulk.warning}")
+        return out
 
-        elif choice == "ltm_summarization":
-            async def modal_callback(i: discord.Interaction, params: Dict):
-                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_prompts", params.get("prompts", {}), include_borrowed=False)
-                await i.followup.send(content="Prompt received. Now select the profiles to apply it to:", view=view, ephemeral=True)
-            modal = ProfileLTMSummarizationModal(self.cog, "BULK_APPLY", self.cog.profile_manager._default_ltm_summarization_instructions(), callback=modal_callback)
-            await interaction.response.send_modal(modal)
+    def _resolved_field(self) -> str:
+        """The changeset as resolved fields, not as a list of actions.
 
-        elif choice == "models":
-            view = ModelApplyView(self.cog, self.user_id, self.original_interaction)
-            await interaction.response.send_message(content="Select models and profiles:", view=view, ephemeral=True)
+        Two staged rows can touch the same key -- Set Response Mode and a modal that
+        also carries it -- and last write wins. Showing the actions would imply two
+        writes; showing the resolved keys shows the value that will actually land.
+        """
+        lines = [f"• {k.replace('_', ' ').title()} → `{_describe_value(v)}`"
+                 for k, v in self.session.config.items()]
+        lines += [f"• {k.replace('_', ' ').title()} → *replaced*" for k in self.session.prompts]
+        if self.session.declaration is not None:
+            state = "declared" if self.session.declaration else "withdrawn"
+            lines.append(f"• Adult 18+ Declaration → `{state}`")
+        if not lines:
+            return "*nothing yet*"
 
-        elif choice == "image_gen":
-            async def modal_callback(i: discord.Interaction, params: Dict):
-                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_both", params, include_borrowed=True)
-                await i.followup.send(content="Image settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal = ProfileImageGenSettingsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
-            await interaction.response.send_modal(modal)
-            
-        elif choice == "generation_visual":
-            async def modal_callback(i: discord.Interaction, params: Dict):
-                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=True)
-                await i.followup.send(content="Visual settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal = ProfileGenerationVisualModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
-            await interaction.response.send_modal(modal)
+        kept, used = [], 0
+        for index, line in enumerate(lines):
+            if used + len(line) + 1 > 960:
+                kept.append(f"…and {len(lines) - index} more")
+                break
+            kept.append(line)
+            used += len(line) + 1
+        return "\n".join(kept)
 
-        elif choice == "neuro":
-            async def modal_callback(i: discord.Interaction, params: Dict):
-                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=True)
-                await i.followup.send(content="Neuro settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal = ProfileNeuroModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
-            await interaction.response.send_modal(modal)
+    # --- Rendering ---------------------------------------------------------
 
-        elif choice == "typing":
-            async def modal_callback(i: discord.Interaction, params: Dict):
-                view = UnifiedBulkTargetView(self.cog, self.user_id, "update_config", params.get("config", {}), include_borrowed=True)
-                await i.followup.send(content="Typing settings validated. Select the profiles to apply them to:", view=view, ephemeral=True)
-            modal = ProfileTypingSettingsModal(self.cog, "BULK_APPLY", {}, False, callback=modal_callback)
-            await interaction.response.send_modal(modal)
+    def embed(self) -> discord.Embed:
+        e = getattr(self, f"_embed_{self.step}")()
+        e.set_footer(text=self._footer())
+        return e
 
-        elif choice == "grounding":
-            opts = [discord.SelectOption(label=l, value=v) for l,v in [("Off", "off"), ("Native", "native"), ("RAG", "rag")]]
-            view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("grounding_mode", None), include_borrowed=True)
-            sel = ui.Select(placeholder="Select Grounding Mode...", options=opts, row=0)
-            async def sel_cb(inter): view.payload = ("grounding_mode", sel.values[0]); await inter.response.defer()
-            sel.callback = sel_cb
-            view.add_item(sel)
-            await interaction.response.send_message(content="Select mode and profiles:", view=view, ephemeral=True)
+    def _footer(self) -> str:
+        # The value pickers and the anchor detour all resolve back to the action step,
+        # which is the step the user is really on while inside them.
+        step = "actions" if self.step in ("choice", "anchor", "inherit") else self.step
+        bits = [f"Step {_WIZARD_STEPS.index(step) + 1} of {len(_WIZARD_STEPS)}"]
+        if self.step != "scope":
+            bits.append(f"{_SCOPE_LABELS[self.session.scope]} · "
+                        f"{len(self.selected_profiles)} selected")
+        if self.session.staged:
+            bits.append(f"{len(self.session.staged)} staged")
+        bits.append("nothing is written until you press Apply")
+        return " · ".join(bits)
 
-        elif choice == "response_mode":
-            opts = [discord.SelectOption(label=l, value=v) for l,v in [("Regular", "regular"), ("Mention", "mention"), ("Reply", "reply"), ("Mention+Reply", "mention_reply")]]
-            view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("response_mode", None), include_borrowed=True)
-            sel = ui.Select(placeholder="Select Response Mode...", options=opts, row=0)
-            async def sel_cb(inter): view.payload = ("response_mode", sel.values[0]); await inter.response.defer()
-            sel.callback = sel_cb
-            view.add_item(sel)
-            await interaction.response.send_message(content="Select mode and profiles:", view=view, ephemeral=True)
+    def _embed_scope(self) -> discord.Embed:
+        e = discord.Embed(
+            title="Bulk Manage — Choose a scope",
+            colour=discord.Colour.blurple(),
+            description=("Which profiles are you working on?\n\n"
+                         "This fixes which actions are available for the rest of the session. "
+                         "Persona, Instructions, TTS Instructions, Training Parameters, the LTM "
+                         "Summarisation Prompt and the 18+ declaration all write content only a "
+                         "profile's owner holds, so they are offered under **Personal** only."))
+        e.add_field(name="Personal", value=f"{self._n_personal} profile(s)", inline=True)
+        e.add_field(name="Borrowed", value=f"{self._n_borrowed} profile(s)", inline=True)
+        return e
 
-        elif choice == "url_context":
-            opts = [discord.SelectOption(label=l, value=v) for l,v in [("Off", "off"), ("Native", "native"), ("RAG", "rag")]]
-            view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("url_mode", None), include_borrowed=True)
-            sel = ui.Select(placeholder="Select URL Mode...", options=opts, row=0)
-            async def sel_cb(inter): 
-                view.action_key = "update_config"
-                view.payload = {"url_mode": sel.values[0], "url_fetching_enabled": sel.values[0] == "rag"}
-                await inter.response.defer()
-            sel.callback = sel_cb
-            view.add_item(sel)
-            await interaction.response.send_message(content="Select mode and profiles:", view=view, ephemeral=True)
+    def _embed_targets(self) -> discord.Embed:
+        chosen = sorted(self.selected_profiles)
+        e = discord.Embed(
+            title="Bulk Manage — Select profiles",
+            colour=discord.Colour.blurple(),
+            description=(f"Choose which of your **{_SCOPE_LABELS[self.session.scope].lower()}** "
+                         f"profiles receive the changes. *Select All* takes the whole source in "
+                         f"one click."))
+        e.add_field(name=f"Selected ({len(chosen)})",
+                    value=_cap_names(chosen) or "*none yet*", inline=False)
+        return e
 
-        elif choice == "critic":
-            opts = [discord.SelectOption(label="Enable Critic", value="true"), discord.SelectOption(label="Disable Critic", value="false")]
-            view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("critic_enabled", False), include_borrowed=True)
-            sel = ui.Select(placeholder="Select action...", options=opts, row=0)
-            async def sel_cb(inter): view.payload = ("critic_enabled", sel.values[0] == "true"); await inter.response.defer()
-            sel.callback = sel_cb
-            view.add_item(sel)
-            await interaction.response.send_message(content="Select action and profiles:", view=view, ephemeral=True)
-            
-        elif choice == "help_mode":
-            opts = [discord.SelectOption(label="Enable Help Mode", value="true"), discord.SelectOption(label="Disable Help Mode", value="false")]
-            view = UnifiedBulkTargetView(self.cog, self.user_id, "set_key", ("help_mode_enabled", False), include_borrowed=True)
-            sel = ui.Select(placeholder="Select action...", options=opts, row=0)
-            async def sel_cb(inter): view.payload = ("help_mode_enabled", sel.values[0] == "true"); await inter.response.defer()
-            sel.callback = sel_cb
-            view.add_item(sel)
-            await interaction.response.send_message(content="Select action and profiles:", view=view, ephemeral=True)
-            
-        elif choice == "adult_declaration":
-            opts = [
-                discord.SelectOption(label="Declare Adult 18+", value="declare",
-                                     description="Confine to age-restricted channels."),
-                discord.SelectOption(label="Withdraw Declaration", value="withdraw",
-                                     description="Hand the profile back to the classifier."),
-            ]
-            # Borrowed profiles are excluded: the rating is resolved from the source
-            # profile, so writing the borrower's local copy would change nothing.
-            view = UnifiedBulkTargetView(self.cog, self.user_id, "adult_declaration", None,
-                                         include_borrowed=False, exclude_public=True)
-            sel = ui.Select(placeholder="Declare or withdraw...", options=opts, row=0)
-            async def sel_cb(inter): view.payload = sel.values[0] == "declare"; await inter.response.defer()
-            sel.callback = sel_cb
-            view.add_item(sel)
-            # Say what was withheld rather than letting profiles quietly go missing
-            # from the list.
-            msg = "Select an action and the profiles to apply it to:"
-            if view.excluded_public:
-                names = ", ".join(f"`{n}`" for n in view.excluded_public)
-                msg += (f"\n-# Withheld ({len(view.excluded_public)} published to the Public Library, "
-                        f"which only accepts General profiles): {names}")
-            if len(msg) > 2000:
-                msg = (f"Select an action and the profiles to apply it to:\n-# Withheld "
-                       f"{len(view.excluded_public)} profile(s) published to the Public Library, "
-                       "which only accepts General profiles.")
-            await interaction.response.send_message(content=msg, view=view, ephemeral=True)
+    def _embed_actions(self) -> discord.Embed:
+        e = discord.Embed(
+            title="Bulk Manage — Stage changes",
+            colour=discord.Colour.blurple(),
+            description=("Pick an action, give it a value, and it joins the changeset below. "
+                         "Stage as many as you like — they are written in a single pass over "
+                         "the selected profiles."))
+        if self.session.staged:
+            e.add_field(name=f"Staged actions ({len(self.session.staged)})",
+                        value="\n".join(f"• {label}" for label in self.session.staged.values())[:1024],
+                        inline=False)
+            e.add_field(name="Resolved values", value=self._resolved_field(), inline=False)
+        else:
+            e.add_field(name="Staged actions (0)", value="*nothing yet*", inline=False)
 
-        elif choice == "timezone":
-            view = BulkTimezoneView(self.cog, self.user_id)
-            await interaction.response.send_message(content="Select a timezone and the profiles to apply it to:", view=view, ephemeral=True)
+        if self.session.scope != "personal":
+            e.add_field(
+                name="Hidden for this scope",
+                value=("Persona, Instructions, TTS Instructions, Training Parameters, the LTM "
+                       "Summarisation Prompt and the 18+ declaration write content only a "
+                       "profile's owner holds. Choose **Personal** at step one to reach them."),
+                inline=False)
+        return e
 
-        elif choice == "data_reset":
-            view = BulkResetView(self.cog, self.user_id)
-            await interaction.response.send_message(content="Select reset action:", view=view, ephemeral=True)
+    def _embed_anchor(self) -> discord.Embed:
+        return discord.Embed(
+            title="Bulk Manage — Copy from a profile",
+            colour=discord.Colour.blurple(),
+            description=("Choose one of the selected profiles as the **anchor**. Its settings "
+                         "are read once and staged as ordinary changes, so the rest of the "
+                         "selection ends up matching it.\n\n"
+                         "You choose which parts to inherit next, and you can keep staging your "
+                         "own changes on top afterwards. Only settings the anchor has actually "
+                         "set are copied — anything it leaves on the default is left alone on "
+                         "the others."))
 
-        elif choice == "delete_items":
-            view = BulkDeleteView(self.cog, self.user_id)
-            await interaction.response.send_message(content="Select profiles to delete:", view=view, ephemeral=True)
+    def _embed_inherit(self) -> discord.Embed:
+        e = discord.Embed(title=f"Bulk Manage — Inherit from `{self._anchor}`",
+                          colour=discord.Colour.blurple())
+        rows = self._inherit_rows()
+        if not rows:
+            e.description = (f"`{self._anchor}` has nothing to copy — every setting reachable "
+                             f"in this scope is still on its default. Go back and choose a "
+                             f"different anchor, or set the values yourself.")
+            return e
+
+        e.description = ("Tick everything the other profiles should inherit. Each entry copies "
+                         "that group of settings exactly as the anchor holds them."
+                         "\n-# The anchor is part of the selection too; it simply keeps its "
+                         "own values.")
+
+        picked = [PROFILE_ACTIONS_BY_VALUE[v] for v in self._inherit_picks
+                  if v in PROFILE_ACTIONS_BY_VALUE]
+        if picked:
+            total = sum(self._anchor_present(a) for a in picked)
+            body = "\n".join(f"• {a.bulk_label()}"
+                             for a in sorted(picked, key=lambda a: a.bulk_label()))
+            e.add_field(name=f"Selected ({len(picked)} group(s), {total} setting(s))",
+                        value=body[:1024], inline=False)
+            if any(a.bulk.destructive for a in picked):
+                e.add_field(
+                    name="⚠️ One of these overwrites authored content",
+                    value=("Copying a persona, instruction set or summarisation prompt replaces "
+                           "whatever the other profiles have. The review step names them again "
+                           "before anything is written."), inline=False)
+        return e
+
+    def _embed_choice(self) -> discord.Embed:
+        action = PROFILE_ACTIONS_BY_VALUE.get(self._choice["action"]) if self._choice else None
+        lead = f"{action.bulk_description()}\n\n" if (action and action.bulk_description()) else ""
+        return discord.Embed(
+            title=f"Bulk Manage — {action.bulk_label() if action else 'Choose a value'}",
+            colour=discord.Colour.blurple(),
+            description=f"{lead}Pick a value; it is staged and you return to the action list.")
+
+    def _embed_review(self) -> discord.Embed:
+        warnings = self._warnings()
+        names = sorted(self.selected_profiles)
+        e = discord.Embed(
+            title="Bulk Manage — Review",
+            colour=discord.Colour.red() if warnings else discord.Colour.green(),
+            description=(f"**{len(names)} profile(s)** will be updated with "
+                         f"**{len(self.session.staged)} change(s)**. Nothing has been written "
+                         f"yet; this is the last step before it is."))
+        e.add_field(name=f"Profiles ({len(names)})", value=_cap_names(names) or "*none*",
+                    inline=False)
+        e.add_field(name="Changes", value=self._resolved_field(), inline=False)
+        if warnings:
+            e.add_field(name="⚠️ Overwrites authored content, and cannot be undone",
+                        value="\n\n".join(warnings)[:1024], inline=False)
+        return e
+
+    def _build_view(self):
+        self.clear_items()
+        getattr(self, f"_build_{self.step}_step")()
+
+    def _build_scope_step(self):
+        for scope in ("personal", "borrowed", "both"):
+            if scope == "both":
+                # Offering "Both" with one source empty is offering the same set twice.
+                if not (self._n_personal and self._n_borrowed):
+                    continue
+                count = self._n_personal + self._n_borrowed
+            else:
+                count = self._n_personal if scope == "personal" else self._n_borrowed
+            btn = ui.Button(
+                label=f"{_SCOPE_LABELS[scope]} ({count})", row=0, disabled=(count == 0),
+                style=(discord.ButtonStyle.primary if self.session.scope == scope
+                       else discord.ButtonStyle.secondary))
+            btn.callback = self._pick_scope(scope)
+            self.add_item(btn)
+        self._add_cancel(1)
+
+    def _build_targets_step(self):
+        self._build_profile_select_ui(row=0)  # occupies rows 0 and 1
+        back = ui.Button(label="◀ Scope", style=discord.ButtonStyle.secondary, row=2)
+        back.callback = self._nav("scope", clear_changes=True)
+        self.add_item(back)
+        copy = ui.Button(label="Copy From Profile ▶", style=discord.ButtonStyle.secondary,
+                         row=2, disabled=len(self.selected_profiles) < 2)
+        copy.callback = self._nav("anchor")
+        self.add_item(copy)
+        nxt = ui.Button(label="Choose Actions ▶", style=discord.ButtonStyle.primary, row=2,
+                        disabled=not self.selected_profiles)
+        nxt.callback = self._nav("actions")
+        self.add_item(nxt)
+        self._add_cancel(2)
+
+    def _build_anchor_step(self):
+        names = sorted(self.selected_profiles)
+        per_page = 25
+        pages = max(1, (len(names) - 1) // per_page + 1)
+        self._anchor_page = max(0, min(self._anchor_page, pages - 1))
+        start = self._anchor_page * per_page
+
+        options = [discord.SelectOption(label=n[:100], value=n, default=(n == self._anchor))
+                   for n in names[start:start + per_page]]
+        select = ui.Select(placeholder="Choose the profile to copy from…", options=options, row=0)
+        select.callback = self._anchor_callback
+        self.add_item(select)
+
+        async def prev_cb(i: discord.Interaction):
+            self._anchor_page -= 1
+            await self.refresh(i)
+
+        async def next_cb(i: discord.Interaction):
+            self._anchor_page += 1
+            await self.refresh(i)
+
+        build_pagination_controls(self, self._anchor_page, pages, 1, prev_cb, next_cb)
+
+        back = ui.Button(label="◀ Profiles", style=discord.ButtonStyle.secondary, row=2)
+        back.callback = self._nav("targets")
+        self.add_item(back)
+        self._add_cancel(2)
+
+    def _build_inherit_step(self):
+        tabs = self._inherit_tabs()
+        if self.current_tab not in tabs and tabs:
+            self.current_tab = tabs[0]
+
+        rows = self._inherit_rows(self.current_tab)
+        if rows:
+            options = []
+            for action in rows:
+                found = self._anchor_present(action)
+                label = action.bulk_label()
+                if action.bulk.destructive:
+                    label = f"⚠️ {label}"
+                options.append(discord.SelectOption(
+                    label=label[:100], value=action.value,
+                    description=f"{found} setting{'' if found == 1 else 's'} to copy",
+                    default=(action.value in self._inherit_picks)))
+            select = ui.Select(
+                placeholder=f"Choose {self.current_tab.title()} settings to inherit…",
+                options=options, row=0, min_values=0, max_values=len(options))
+            select.callback = self._inherit_callback
+            self.add_item(select)
+
+        for tab in tabs:
+            btn = ui.Button(
+                label=tab.title(), row=1, disabled=(tab == self.current_tab),
+                style=(discord.ButtonStyle.primary if tab == self.current_tab
+                       else discord.ButtonStyle.secondary))
+            btn.callback = self._pick_tab(tab)
+            self.add_item(btn)
+
+        back = ui.Button(label="◀ Anchor", style=discord.ButtonStyle.secondary, row=2)
+        back.callback = self._nav("anchor")
+        self.add_item(back)
+        copy = ui.Button(label=f"Copy Selected ({len(self._inherit_picks)}) ▶",
+                         style=discord.ButtonStyle.primary, row=2,
+                         disabled=not self._inherit_picks)
+        copy.callback = self._copy_callback
+        self.add_item(copy)
+        self._add_cancel(2)
+
+    def _build_actions_step(self):
+        tabs = self._tabs()
+        if self.current_tab not in tabs and tabs:
+            self.current_tab = tabs[0]
+
+        options = []
+        for action in self._actions_for_tab(self.current_tab):
+            label, desc = action.bulk_label(), action.bulk_description()
+            if action.value in self.session.staged:
+                label = f"✓ {label}"
+            elif action.bulk.destructive:
+                label = f"⚠️ {label}"
+            elif action.bulk.terminal:
+                label = f"🗑️ {label}"
+            options.append(discord.SelectOption(
+                label=label[:100], value=action.value,
+                description=(desc[:100] if desc else None)))
+        if options:
+            select = ui.Select(placeholder=f"Choose a {self.current_tab.title()} action…",
+                               options=options, row=0)
+            select.callback = self._action_callback
+            self.add_item(select)
+
+        for tab in tabs:
+            btn = ui.Button(
+                label=tab.title(), row=1, disabled=(tab == self.current_tab),
+                style=(discord.ButtonStyle.primary if tab == self.current_tab
+                       else discord.ButtonStyle.secondary))
+            btn.callback = self._pick_tab(tab)
+            self.add_item(btn)
+
+        back = ui.Button(label="◀ Profiles", style=discord.ButtonStyle.secondary, row=2)
+        back.callback = self._nav("targets")
+        self.add_item(back)
+        if self.session.has_changes:
+            clear = ui.Button(label="Clear Staged", style=discord.ButtonStyle.secondary, row=2)
+            clear.callback = self._nav("actions", clear_changes=True)
+            self.add_item(clear)
+        review = ui.Button(label=f"Review & Apply ({len(self.session.staged)})",
+                           style=discord.ButtonStyle.success, row=2,
+                           disabled=not self.session.has_changes)
+        review.callback = self._nav("review")
+        self.add_item(review)
+        self._add_cancel(2)
+
+    def _build_choice_step(self):
+        for option in self._choice["options"]:
+            option.default = (option.value == self._choice["chosen"])
+        select = ui.Select(placeholder=self._choice["placeholder"],
+                           options=self._choice["options"], row=0)
+        select.callback = self._choice_callback
+        self.add_item(select)
+        back = ui.Button(label="◀ Back", style=discord.ButtonStyle.secondary, row=1)
+        back.callback = self._nav("actions")
+        self.add_item(back)
+        self._add_cancel(1)
+
+    def _build_review_step(self):
+        destructive = bool(self._warnings())
+        apply_btn = ui.Button(
+            label="Overwrite & Apply" if destructive else "Apply",
+            style=discord.ButtonStyle.danger if destructive else discord.ButtonStyle.success,
+            row=0, disabled=not (self.session.has_changes and self.selected_profiles))
+        apply_btn.callback = self._apply_callback
+        self.add_item(apply_btn)
+        back = ui.Button(label="◀ Back", style=discord.ButtonStyle.secondary, row=0)
+        back.callback = self._nav("actions")
+        self.add_item(back)
+        self._add_cancel(0)
+
+    def _add_cancel(self, row: int):
+        btn = ui.Button(label="Cancel", style=discord.ButtonStyle.secondary, row=row)
+
+        async def callback(interaction: discord.Interaction):
+            self.stop()
+            await interaction.response.edit_message(
+                embed=discord.Embed(description="Cancelled. Nothing was changed.",
+                                    colour=discord.Colour.greyple()), view=None)
+
+        btn.callback = callback
+        self.add_item(btn)
+
+    # --- Navigation --------------------------------------------------------
+
+    async def _edit(self, interaction: discord.Interaction):
+        """The hook BaseBulkProfileView's own callbacks re-render through."""
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def refresh(self, interaction: discord.Interaction):
+        self._build_view()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def start(self, interaction: discord.Interaction):
+        await interaction.response.send_message(embed=self.embed(), view=self, ephemeral=True)
+
+    def _pick_scope(self, scope: str):
+        async def callback(interaction: discord.Interaction):
+            self.session.scope = scope
+            # A new scope is a new set of reachable profiles and a new set of applicable
+            # actions, so neither the selection nor the changeset survives it.
+            self.selected_profiles.clear()
+            self.session.clear_changes()
+            self._load_profile_lists()
+            self.step = "targets"
+            await self.refresh(interaction)
+        return callback
+
+    def _pick_tab(self, tab: str):
+        async def callback(interaction: discord.Interaction):
+            self.current_tab = tab
+            await self.refresh(interaction)
+        return callback
+
+    def _nav(self, step: str, *, clear_changes: bool = False):
+        async def callback(interaction: discord.Interaction):
+            if clear_changes:
+                self.session.clear_changes()
+            if step == "review":
+                self.session.targets = set(self.selected_profiles)
+            if step == "anchor":
+                self._anchor_page = 0
+            self._choice = None
+            self.step = step
+            await self.refresh(interaction)
+        return callback
+
+    async def _action_callback(self, interaction: discord.Interaction):
+        action = PROFILE_ACTIONS_BY_VALUE.get(interaction.data['values'][0])
+        if action is None or not self._allowed(action):
+            await self.refresh(interaction)
+            return
+        if action.bulk.terminal and self.session.has_changes:
+            await interaction.response.send_message(
+                f"**{action.bulk_label()}** removes data rather than changing a setting, so it "
+                f"runs on its own. Apply or clear your {len(self.session.staged)} staged "
+                f"change(s) first.", ephemeral=True)
+            return
+        self.current_action = action
+        await action.bulk.run(self, interaction)
+
+    async def _anchor_callback(self, interaction: discord.Interaction):
+        self._load_anchor(interaction.data['values'][0])
+        self.step = "inherit"
+        await self.refresh(interaction)
+
+    async def _inherit_callback(self, interaction: discord.Interaction):
+        # Picks are kept across tabs, so a dropdown only ever owns its own tab's rows.
+        self._inherit_picks -= {a.value for a in self._inherit_rows(self.current_tab)}
+        self._inherit_picks.update(interaction.data.get('values', []))
+        await self.refresh(interaction)
+
+    async def _copy_callback(self, interaction: discord.Interaction):
+        for value in sorted(self._inherit_picks):
+            action = PROFILE_ACTIONS_BY_VALUE.get(value)
+            if action is None or action.bulk is None or not action.bulk.copyable:
+                continue
+            config = {k: self._anchor_config[k] for k in action.bulk.keys
+                      if k in self._anchor_config}
+            prompts = {k: self._anchor_prompts[k] for k in action.bulk.prompt_keys
+                       if k in self._anchor_prompts}
+            if config or prompts:
+                # Staged exactly as if the row had been filled in by hand, so the review
+                # screen, the warnings and the apply pass need to know nothing about
+                # where the values came from.
+                self._stage_change(value, config=config, prompts=prompts)
+        self._inherit_picks.clear()
+        self.step = "actions"
+        await self.refresh(interaction)
+
+    async def _choice_callback(self, interaction: discord.Interaction):
+        value = interaction.data['values'][0]
+        self._choice["chosen"] = value
+        # on_pick stages the value, which also returns the wizard to the action list.
+        self._choice["on_pick"](self, value)
+        await self.refresh(interaction)
+
+    async def _apply_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        self.session.targets = set(self.selected_profiles)
+        counts = await _apply_bulk_session(self.cog, self.user_id, self.session)
+        self.stop()
+
+        changed = counts["changed"]
+        e = discord.Embed(
+            title="Bulk Manage — Applied" if changed else "Bulk Manage — Nothing Changed",
+            colour=discord.Colour.green() if changed else discord.Colour.greyple(),
+            description=(f"Updated **{changed}** of {len(self.session.targets)} selected "
+                         f"profile(s) with {len(self.session.staged)} change(s)."))
+        notes = []
+        if counts["skipped_prompts"]:
+            notes.append(f"• {counts['skipped_prompts']} borrowed profile(s) kept their persona, "
+                         f"instructions and prompts — those belong to the profile's owner.")
+        if counts["skipped_declaration"]:
+            notes.append(f"• {counts['skipped_declaration']} profile(s) kept their content "
+                         f"rating — a published profile, a classifier verdict and an exemption "
+                         f"are none of them the owner's to overwrite in bulk.")
+        if notes:
+            e.add_field(name="Skipped", value="\n".join(notes)[:1024], inline=False)
+
+        await interaction.edit_original_response(embed=e, view=None)
+
+    async def on_timeout(self):
+        try:
+            await self.original_interaction.edit_original_response(
+                embed=discord.Embed(
+                    description=("This bulk session timed out and nothing was written. Run "
+                                 "`/profile bulk manage` again to start over."),
+                    colour=discord.Colour.greyple()),
+                view=None)
+        except Exception:
+            pass
+
+    # --- Bespoke rows ------------------------------------------------------
+
+    async def _bulk_error_response(self, interaction: discord.Interaction):
+        async def modal_callback(i: discord.Interaction, new_val: str):
+            await self._stage_from_modal(
+                i, "error_response",
+                {"error_response": new_val.strip() or "An error has occurred."}, {})
+
+        await interaction.response.send_modal(ActionTextInputModal(
+            title="Set Custom Error Message",
+            label="Error Message",
+            placeholder="Shown to users when generation fails...",
+            default="An error has occurred.",
+            required=False,
+            on_submit_callback=modal_callback))
+
+    async def _bulk_edit_persona(self, interaction: discord.Interaction):
+        async def modal_callback(i: discord.Interaction, persona_data: Dict[str, List[str]]):
+            # An entirely blank form stages "clear every persona section", which is a
+            # legitimate thing to want and an unlikely thing to mean. Refuse it here
+            # rather than carry it to a confirmation the user reads as an overwrite.
+            if not any(any(line.strip() for line in lines) for lines in persona_data.values()):
+                await self._modal_reply(
+                    i, "Every persona section was left blank, so nothing was staged.")
+                return
+            await self._stage_from_modal(i, "edit_persona", {}, {"persona": persona_data})
+
+        await interaction.response.send_modal(EditUserProfilePersonaModal(
+            self.cog, "BULK_APPLY", {}, self.user_id, callback=modal_callback))
+
+    async def _bulk_edit_instructions(self, interaction: discord.Interaction):
+        async def modal_callback(i: discord.Interaction, instr_list: List[str]):
+            if not any(part.strip() for part in instr_list):
+                await self._modal_reply(
+                    i, "Every instruction part was left blank, so nothing was staged.")
+                return
+            await self._stage_from_modal(i, "edit_instructions", {}, {"ai_instructions": instr_list})
+
+        await interaction.response.send_modal(EditUserProfileAIInstructionsModal(
+            self.cog, "BULK_APPLY", "", self.user_id, callback=modal_callback))
+
+    async def _bulk_adult_declaration(self, interaction: discord.Interaction):
+        options = [
+            discord.SelectOption(label="Declare Adult 18+", value="declare",
+                                 description="Confine these profiles to age-restricted channels."),
+            discord.SelectOption(label="Withdraw Declaration", value="withdraw",
+                                 description="Hand the profile back to the classifier."),
+        ]
+        # Profiles in the Public Library are withheld at apply time and reported, rather
+        # than filtered out of the picker: the selection was made before this row was
+        # chosen, so quietly shrinking it here would be the change going missing.
+        self._open_choice(
+            "content_safety", "Declare or withdraw…", options,
+            lambda w, v: w._stage_change("content_safety", declaration=(v == "declare")))
+        await self.refresh(interaction)
 
 
 class ContentSafetyView(ui.View):

@@ -14,7 +14,8 @@ from .constants import (
     PATTERN_SYSTEM_XML_BLOCKS, PATTERN_SYSTEM_XML_ORPHANS,
     PATTERN_REASONING_BLOCKS, PATTERN_REASONING_ORPHANS, PATTERN_SYSTEM_HEADER,
     PATTERN_TIMESTAMP_HEADER, PATTERN_METADATA, PATTERN_MESSAGE_LINK,
-    PATTERN_WHITESPACE_CLEANUP,
+    PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK,
+    IMAGE_MODEL_CAPS, IMAGE_MODEL_CAPS_DEFAULT, IMAGE_THINKING_LEVELS,
 )
 
 
@@ -506,3 +507,82 @@ def _format_api_error(error: Exception) -> str:
 
     clean_err = error_str.replace('"', "'").replace('{', '').replace('}', '').replace('\n', ' ')
     return clean_err[:80] + "..." if len(clean_err) > 80 else clean_err
+
+
+def image_model_caps(raw_name: Optional[str]) -> dict:
+    """What image options `raw_name` will honour: allowed ratios, sizes, thinkingLevel.
+
+    Shared by the picker, which uses it to decide what to offer, and by
+    MediaService.resolve_image_output_params, which uses it to decide what to send. If
+    those two ever answered differently the dropdown would be offering settings the
+    request path then silently dropped.
+
+    An unrecognised id -- a model newer than this table, or a typo -- gets the
+    conservative default rather than the full set.
+    """
+    name = raw_name or ""
+    if name.upper().startswith("GOOGLE/"):
+        name = name[7:]
+    return IMAGE_MODEL_CAPS.get(name.lower(), IMAGE_MODEL_CAPS_DEFAULT)
+
+
+def resolve_image_output_params(image_config, raw_name: Optional[str]) -> dict:
+    """The aspect ratio, resolution and thinking level `raw_name` will actually take.
+
+    Resolved per model rather than once per request, because the four image models do
+    not carry the same options: the two 3.1 models take the extreme banner ratios, 2.5
+    Flash has one fixed resolution and rejects imageSize outright, and only the 3.x
+    models take a thinkingLevel. A fallback onto a different model therefore needs its
+    own answer, which is why the image paths resolve inside the attempt rather than
+    beside it.
+
+    An option the chosen model does not carry is dropped rather than sent and 400'd.
+    That is deliberate: a profile set to 2K on 3.1 Flash keeps its stored preference
+    when its owner switches to 2.5 Flash for an afternoon, instead of having it
+    silently rewritten to something the previous model would not honour.
+
+    Lives here rather than on MediaService because /profile manage reports the resolved
+    settings and a manager importing a service to do it would be the wrong direction.
+    """
+    caps = image_model_caps(raw_name)
+    cfg = image_config or {}
+    out = {}
+
+    # Not a stored preference: it is what this model must be asked to return. Resolved
+    # here anyway because it varies per model exactly as the other three do, and this
+    # is already the one place that knows which model the request is going to.
+    if caps["modalities"]:
+        out["modalities"] = caps["modalities"]
+
+    ratio = cfg.get("image_aspect_ratio") or ""
+    if ratio in caps["ratios"]:
+        out["aspect_ratio"] = ratio
+
+    size = cfg.get("image_size") or ""
+    if size in caps["sizes"]:
+        out["image_size"] = size
+
+    level = (cfg.get("image_thinking_level") or "").upper()
+    if caps["thinking"] and level in IMAGE_THINKING_LEVELS:
+        out["thinking_level"] = level
+
+    return out
+
+
+def is_real_model(name: Optional[str]) -> bool:
+    """False for the empty, missing and explicit "no fallback" values.
+
+    The utility fallback dropdowns offer a None option and an unset key reads back as
+    absent or "", so the pickers, the apply paths and `run_with_fallback` all need the
+    same three-way answer to "is there a second model to try".
+    """
+    if not name:
+        return False
+    text = str(name).strip()
+    if not text:
+        return False
+    for prefix in ("GOOGLE/", "OPENROUTER/", "OLLAMA/"):
+        if text.upper().startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return text.upper() != NO_FALLBACK

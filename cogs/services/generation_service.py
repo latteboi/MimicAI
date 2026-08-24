@@ -19,6 +19,7 @@ from ..utils.constants import (
     DEFAULT_WHISPER_RECAP, DEFAULT_DIRECTOR_USER_PROMPT,
     DEFAULT_IMAGE_GROUNDING, DEFAULT_NEGATIVE_CONSTRAINTS, DEFAULT_IMAGE_PRESENT,
     DEFAULT_IMAGE_PRESENT_OTHER, DEFAULT_IMAGE_FAILED,
+    DEFAULT_SPEECH_VOICE, TTS_SYNTHESIS_PREAMBLE,
 )
 from ..utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt,
@@ -1255,7 +1256,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             
                         # --- Placeholder Update & Sending ---
                         if not was_blocked:
-                            await self._update_sending_placeholder(channel, participant.get('method', 'webhook'), participant.get('bot_id'), state_container, t1_start_mono)
+                            # spawn_after: everything below this point -- speech synthesis
+                            # above all -- happens before the turn is delivered, and a child
+                            # bot with no placeholder of its own has nothing on screen once
+                            # its typing indicator expires nine seconds in.
+                            await self._update_sending_placeholder(channel, participant.get('method', 'webhook'), participant.get('bot_id'), state_container, t1_start_mono, spawn_after=10.0)
 
                         t2_end_mono = time.monotonic()
                         duration = t2_end_mono - t1_start_mono
@@ -1387,7 +1392,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     audio_file_for_send = None
                     
                     if profile_settings.get("speech_tts_enabled", False) and session.get("audio_mode", "off") == "on":
-                        s_voice = profile_settings.get("speech_voice", "Aoede")
+                        s_voice = profile_settings.get("speech_voice", DEFAULT_SPEECH_VOICE)
                         s_model = profile_settings.get("speech_model")
                         if s_model and "none" not in s_model.lower():
                             # 1. Build Contextual Round Transcript
@@ -1424,16 +1429,34 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 prompt_parts.append(f"#### SAMPLE CONTEXT\nPrevious turn flow:\n{round_transcript.strip()}")
                             prompt_parts.append(f"#### TRANSCRIPT\n{speaker_display_name}: {response_text}")
 
+                            # Only once there is direction above it -- see
+                            # TTS_SYNTHESIS_PREAMBLE. prompt_parts always ends with the
+                            # transcript, so anything beyond it is a director section.
+                            if len(prompt_parts) > 1:
+                                prompt_parts.insert(0, TTS_SYNTHESIS_PREAMBLE)
+
                             tts_priming_prompt = "\n\n".join(prompt_parts)
                             
                             # 3. Synthesise Audio
-                            turn_audio_stream = await self.cog.media_service._generate_google_tts(
-                                tts_priming_prompt, 
-                                channel.guild.id, 
-                                model_id=s_model, 
-                                voice_name=s_voice, 
-                                temperature=s_temp
-                            )
+                            #
+                            # The heartbeat started before this is still the one running, so
+                            # the phase is renamed rather than restarted. Without it a TTS
+                            # round trip reads as "Sending..." for half a minute, which is
+                            # both wrong and the least informative thing it could say.
+                            if state_container:
+                                state_container['phase_label'] = "Synthesising speech"
+                            try:
+                                turn_audio_stream = await self.cog.media_service._generate_google_tts(
+                                    tts_priming_prompt,
+                                    channel.guild.id,
+                                    model_id=s_model,
+                                    voice_name=s_voice,
+                                    temperature=s_temp,
+                                    fallback_model_id=profile_settings.get("speech_fallback_model"),
+                                )
+                            finally:
+                                if state_container:
+                                    state_container['phase_label'] = "Sending"
                             
                             if turn_audio_stream:
                                 audio_file_for_send = discord.File(turn_audio_stream, filename=f"voice_{turn_id[:4]}.wav")
@@ -1460,8 +1483,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     # here keeps the placeholder (and its "Sending..." heartbeat) up until
                     # the turn is genuinely ready to be delivered.
                     if is_realistic_typing:
-                        if state_container and state_container.get('sending_task'):
-                            state_container['sending_task'].cancel()
+                        await self._stop_sending_heartbeat(state_container)
                         msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
                         msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
                         await self._safe_delete_placeholder(channel, msg_a_to_delete)
@@ -1472,8 +1494,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                     if participant.get('method') == 'child_bot':
                         # Stop any pending sending heartbeat task immediately
-                        if state_container and state_container.get('sending_task'):
-                            state_container['sending_task'].cancel()
+                        await self._stop_sending_heartbeat(state_container)
 
                         # Delete placeholder before child bot delivers
                         msg_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
@@ -1617,9 +1638,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             await self.cog.session_manager._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
                     
                     # --- Dispatch Warnings and Clean Up Placeholders ---
-                    if state_container and state_container.get('sending_task'):
-                        state_container['sending_task'].cancel()
-                        
+                    await self._stop_sending_heartbeat(state_container)
+
                     msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
                     msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
 
@@ -1846,7 +1866,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                         _, _, _, temp, top_p, top_k, primary_model, _ = await asyncio.to_thread(
                                             self._construct_system_instructions, o_id, p_name, channel_id, is_multi_profile=True
                                         )
-                                        ltm_d = await self.cog.memory_manager._generate_ltm_data_from_history(evts, r_author, {"temperature": temp, "top_p": top_p, "top_k": top_k}, primary_model, g_id, profile_owner_id=o_id, profile_name=p_name)
+                                        ltm_d = await self.cog.memory_manager._generate_ltm_data_from_history(evts, r_author, {"temperature": temp, "top_p": top_p, "top_k": top_k}, g_id, profile_owner_id=o_id, profile_name=p_name)
                                         if ltm_d:
                                             summary_embedding = await self.cog.memory_manager._get_embedding(ltm_d, g_id, task_type="RETRIEVAL_DOCUMENT")
                                             if summary_embedding:

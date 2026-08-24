@@ -13,9 +13,11 @@ from ..utils.constants import (
     WARN_MAIN_MODEL_FAILED, ERR_REASON_EMPTY_RESPONSE,
     defaultConfig, IMAGE_QUEUE_PRIORITY,
     DEFAULT_IMAGE_PRESENT, DEFAULT_IMAGE_FAILED, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING,
+    DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
+    IMAGE_OUTPUT_KEYS,
 )
 from .api_service import GoogleGenAIModel, generate_google_tts_audio
-from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text
+from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, resolve_image_output_params
 from ..utils.memory_tuning import maybe_trim_malloc
 
 
@@ -30,15 +32,50 @@ class MediaService:
     def __init__(self, cog):
         self.cog = cog
 
-    async def _generate_google_tts(self, text: str, guild_id: int, model_id: str = "GOOGLE/gemini-2.5-flash-preview-tts", voice_name: str = "Aoede", temperature: float = 1.0):
-        """Generates a playable WAV audio stream utilising Google Gemini Speech Generation models."""
+    @staticmethod
+    def resolve_image_output_params(image_config, raw_name: str) -> dict:
+        """See helpers.resolve_image_output_params -- kept here as the name the image
+        paths and their tests already reach for."""
+        return resolve_image_output_params(image_config, raw_name)
+
+    @staticmethod
+    def build_image_model(raw_name: str, api_key: str, system_instruction, safety_settings,
+                          image_config=None):
+        """One image-model constructor for the three places that build one.
+
+        All three stripped the GOOGLE/ prefix by hand and two of them defaulted to an
+        unprefixed id that the third prefixed, so the "same" default was two different
+        strings depending on which path reached it.
+
+        `image_config` is the profile's raw IMAGE_OUTPUT_KEYS, not a validated payload:
+        validation depends on `raw_name`, and this is the one place that knows both.
+        """
+        name = raw_name[7:] if raw_name.upper().startswith("GOOGLE/") else raw_name
+        return GoogleGenAIModel(api_key=api_key, model_name=name,
+                                system_instruction=system_instruction,
+                                safety_settings=safety_settings,
+                                image_params=MediaService.resolve_image_output_params(
+                                    image_config, raw_name))
+
+    async def _generate_google_tts(self, text: str, guild_id: int, model_id: str = DEFAULT_SPEECH_MODEL, voice_name: str = "Aoede", temperature: float = 1.0, fallback_model_id: Optional[str] = None):
+        """Generates a playable WAV audio stream utilising Google Gemini Speech Generation models.
+
+        One choke point for every TTS call in the bot, which is why the retry lives here
+        rather than at each caller: a preview speech model going 404 or 503 mid-session
+        otherwise silences the whole round with nothing tried in its place.
+        """
         import wave
         api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id)
         if not api_key:
             return None
 
         try:
-            raw_audio_bytes = await generate_google_tts_audio(api_key, model_id, text, voice_name=voice_name, temperature=temperature)
+            async def _attempt(name, _is_fallback):
+                return await generate_google_tts_audio(
+                    api_key, name, text, voice_name=voice_name, temperature=temperature)
+
+            raw_audio_bytes, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
+                model_id, fallback_model_id, _attempt, label="Text-to-speech")
 
             if raw_audio_bytes:
                 wav_io = io.BytesIO()
@@ -130,15 +167,11 @@ class MediaService:
                                 api_key = self.cog.storage_manager._get_api_key_for_guild(package['guild_id'])
                                 if not api_key: raise ValueError("Server API key not configured.")
 
-                                img_model_name = package.get("image_generation_model", "GOOGLE/gemini-2.5-flash-image")
-                                if img_model_name.upper().startswith("GOOGLE/"): img_model_name = img_model_name[7:]
-
-                                image_model = GoogleGenAIModel(
-                                    api_key=api_key,
-                                    model_name=img_model_name,
-                                    system_instruction=package['system_instruction'],
-                                    safety_settings=package['safety_settings']
-                                )
+                                img_model_raw = package.get("image_generation_model", DEFAULT_IMAGE_MODEL)
+                                img_fallback_raw = package.get("image_generation_fallback_model")
+                                image_model = self.build_image_model(
+                                    img_model_raw, api_key, package['system_instruction'],
+                                    package['safety_settings'], package.get('image_output'))
                                 parts = [package['prompt_text']]
                                 for ref in package.get("reference_image_urls", []):
                                     parts.append({"url": ref["url"], "mime_type": ref.get("mime_type", "image/png")})
@@ -161,9 +194,21 @@ class MediaService:
 
                                     participant = {"method": "child_bot", "bot_id": package.get("bot_id")} if is_child_bot else None
 
-                                    response, state_container = await self.cog.generation_service._generate_with_heartbeat(
-                                        image_model, [{'role': 'user', 'parts': parts}], None, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type=state_container['message_type']
-                                    )
+                                    async def _attempt(raw_name, _is_fallback):
+                                        nonlocal image_model
+                                        image_model = self.build_image_model(
+                                            raw_name, api_key, package['system_instruction'],
+                                            package['safety_settings'], package.get('image_output'))
+                                        # The state container is mutated in place, so a retry
+                                        # re-uses the placeholder the first attempt created
+                                        # rather than stacking a second one beside it.
+                                        return await self.cog.generation_service._generate_with_heartbeat(
+                                            image_model, [{'role': 'user', 'parts': parts}], None, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type=state_container['message_type']
+                                        )
+
+                                    result, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
+                                        img_model_raw, img_fallback_raw, _attempt, label="Image generation")
+                                    response, state_container = result
                                     status = "blocked_by_safety" if not response.candidates else "success"
                                 except Exception as e:
                                     failure_reason = _format_api_error(e)
@@ -490,19 +535,23 @@ class MediaService:
                     api_key = self.cog.storage_manager._get_api_key_for_guild(request_data['guild_id'])
                     if not api_key: raise ValueError("Server API key is not configured.")
 
-                    img_model_name = request_data.get("image_generation_model", "GOOGLE/gemini-2.5-flash-image")
-                    if img_model_name.upper().startswith("GOOGLE/"): img_model_name = img_model_name[7:]
-
-                    image_model = GoogleGenAIModel(
-                        api_key=api_key,
-                        model_name=img_model_name,
-                        system_instruction=request_data['system_instruction'],
-                        safety_settings=request_data['safety_settings']
-                    )
+                    img_model_raw = request_data.get("image_generation_model", DEFAULT_IMAGE_MODEL)
+                    img_fallback_raw = request_data.get("image_generation_fallback_model")
+                    image_model = self.build_image_model(
+                        img_model_raw, api_key, request_data['system_instruction'],
+                        request_data['safety_settings'], request_data.get('image_output'))
 
                     status = "api_error"
                     try:
-                        response = await image_model.generate_content_async([{'role': 'user', 'parts': [request_data['prompt_text']]}])
+                        async def _attempt(raw_name, _is_fallback):
+                            nonlocal image_model
+                            image_model = self.build_image_model(
+                                raw_name, api_key, request_data['system_instruction'],
+                                request_data['safety_settings'], request_data.get('image_output'))
+                            return await image_model.generate_content_async([{'role': 'user', 'parts': [request_data['prompt_text']]}])
+
+                        response, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
+                            img_model_raw, img_fallback_raw, _attempt, label="Image generation")
                         status = "blocked_by_safety" if not response.candidates else "success"
                     finally:
                         self.cog._log_api_call(user_id=request_data['author_id'], guild_id=request_data['guild_id'], context="image_generation_prefetch", model_used=image_model, status=status)
@@ -761,7 +810,12 @@ class MediaService:
                 "bot_display_name": bot_display_name, "safety_settings": dynamic_safety_settings,
                 "system_instruction": system_instruction, "reference_image_urls": reference_image_urls, "placeholder_message": placeholder_message,
                 "grounding_sources": grounding_sources, "grounding_mode": grounding_mode,
-                "image_generation_model": profile_data.get("image_generation_model", "gemini-2.5-flash-image")
+                "image_generation_model": profile_data.get("image_generation_model", DEFAULT_IMAGE_MODEL),
+                "image_generation_fallback_model": profile_data.get("image_generation_fallback_model"),
+                # Carried rather than re-read off the profile in the worker: the request
+                # may sit in the queue behind others while its owner edits the profile,
+                # and the image should come back the shape it was asked for.
+                "image_output": {k: profile_data.get(k) for k in IMAGE_OUTPUT_KEYS},
             }
             
             await self.cog.image_request_queue.put((IMAGE_QUEUE_PRIORITY, time.time(), request_data))

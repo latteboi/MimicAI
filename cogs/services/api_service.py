@@ -12,10 +12,45 @@ from discord.ext import tasks
 from ..utils.constants import (
     OLLAMA_LOCAL_URL, MODELS_DATA_DIR, PRICING_CACHE_FILE, IMAGE_MODELS, AUDIO_MODELS,
     ALLOWED_MODELS, defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
+    IMAGE_MODEL_KEYS, AUDIO_MODEL_KEYS, DEFAULT_SPEECH_VOICE,
 )
-from ..utils.helpers import _resolve_safety_settings
+from ..utils.helpers import _resolve_safety_settings, is_real_model
 from ..utils.http_client import get_shared_client
 from ..utils.memory_tuning import maybe_trim_malloc
+
+# How long a key that just got rate-limited is skipped for. storage_manager's
+# _get_api_key_for_guild/_get_api_key_for_user consult cog.api_key_cooldowns before
+# handing a key back out, so this is what stops a 429'd BYO key from being retried
+# on the very next turn instead of backing off.
+_KEY_COOLDOWN_SECONDS = 60.0
+
+
+
+
+
+def _cooldown_key_on_rate_limit(cog, api_key: Optional[str], error: BaseException) -> None:
+    if not api_key:
+        return
+    err_str = str(error)
+    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+        cog.api_key_cooldowns[api_key] = time.time() + _KEY_COOLDOWN_SECONDS
+
+
+def _with_key_cooldown_tracking(cog, model, api_key: str):
+    """Wraps model.generate_content_async so a rate-limit response cools the BYO key down."""
+    original = model.generate_content_async
+
+    async def _tracked(*args, **kwargs):
+        try:
+            return await original(*args, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _cooldown_key_on_rate_limit(cog, api_key, e)
+            raise
+
+    model.generate_content_async = _tracked
+    return model
 
 
 class OpenRouterModel:
@@ -760,13 +795,20 @@ class GoogleRESTModel:
     .prompt_feedback and token counts.
     """
 
-    def __init__(self, api_key, model_name, system_instruction=None, safety_settings=None, thinking_params=None, tools=None):
+    def __init__(self, api_key, model_name, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, image_params=None):
         self.api_key = api_key
         self.model_name = model_name.replace("OPENROUTER/", "").replace("GOOGLE/", "")
         self.system_instruction = system_instruction
         self.safety_settings = safety_settings
         self.thinking_params = thinking_params or {}
         self.tools = tools
+        #: Output controls for an image request: aspect_ratio, image_size,
+        #: thinking_level. Carried on the model rather than passed per call because
+        #: MediaService.build_image_model is the one constructor every image path goes
+        #: through, and none of those three call sites builds a generation_config.
+        #: Already validated against IMAGE_MODEL_CAPS by the time it arrives -- this
+        #: class only maps it onto the wire shape.
+        self.image_params = image_params or {}
 
     # -- media ------------------------------------------------------------------
 
@@ -1052,6 +1094,39 @@ class GoogleRESTModel:
                         budget = 128
                     cfg["thinkingConfig"] = {"includeThoughts": include_thoughts, "thinkingBudget": budget}
 
+        # Image output controls. Sits outside the is_utility_model branch above on
+        # purpose: an image model rejects the *text* thinking config, but the 3.x image
+        # models do take a thinkingLevel of their own, and only when one was explicitly
+        # chosen -- an absent key means "let the model use its own default", which is
+        # not the same as sending MINIMAL.
+        if self.image_params:
+            # Pinned so an image model cannot answer with text alone. Which combination
+            # is legal is per model -- see IMAGE_MODEL_CAPS -- and an unknown model gets
+            # none of this rather than a guess.
+            if self.image_params.get("modalities"):
+                cfg["responseModalities"] = list(self.image_params["modalities"])
+
+            # `imageConfig`, not `responseFormat.image`. v1beta carries both, and they
+            # are not the same field: ResponseFormatConfig.image is a strict protobuf
+            # enum wanting ASPECT_RATIO_NINE_BY_SIXTEEN and IMAGE_SIZE_FIVE_TWELVE,
+            # while ImageConfig takes the "9:16" / "512" strings the docs show. The
+            # published curl examples send the plain strings to responseFormat because
+            # they post to /v1; this client posts to /v1beta, where that combination is
+            # a 400 naming both fields. Checked against the v1beta discovery document.
+            image_cfg = {}
+            if self.image_params.get("aspect_ratio"):
+                image_cfg["aspectRatio"] = self.image_params["aspect_ratio"]
+            if self.image_params.get("image_size"):
+                image_cfg["imageSize"] = self.image_params["image_size"]
+            if image_cfg:
+                cfg["imageConfig"] = image_cfg
+            level = self.image_params.get("thinking_level")
+            if level:
+                # includeThoughts stays off: the thought parts on an image request are
+                # interstitial draft images, and _write_img takes the first inline_data
+                # part it finds. Billed either way, per the API docs.
+                cfg["thinkingConfig"] = {"includeThoughts": False, "thinkingLevel": level}
+
         return cfg
 
     def _build_safety_settings(self) -> List[dict]:
@@ -1162,13 +1237,14 @@ async def generate_google_tts_audio(
     api_key: str,
     model_id: str,
     text: str,
-    voice_name: str = "Aoede",
+    voice_name: str = DEFAULT_SPEECH_VOICE,
     temperature: float = 1.0,
 ) -> Optional[bytes]:
-    """Returns raw PCM audio bytes for `text`, or None if the response carried none.
+    """Returns raw PCM audio bytes for `text`.
 
     Raises on network/API failure — same contract as generate_content_async — so
-    media_service's existing try/except keeps handling errors uniformly.
+    media_service's existing try/except keeps handling errors uniformly. A response
+    that parsed cleanly but carried no audio raises too: see the retry loop below.
     """
     if model_id.upper().startswith("GOOGLE/"):
         model_id = model_id[7:]
@@ -1186,26 +1262,52 @@ async def generate_google_tts_audio(
         },
     }
     model_path = model_id if model_id.startswith("models/") else f"models/{model_id}"
+    client = get_google_rest_client()
 
-    try:
-        client = get_google_rest_client()
-        response = await client.post(
-            f"/v1beta/{model_path}:generateContent",
-            content=json.dumps(payload),
-            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-        )
-    except httpx.RequestError as e:
-        raise Exception(f"Google API Network Error: {str(e)}")
+    # Two attempts on the *same* model, which is not the retry run_with_fallback
+    # performs: that one moves to a different model, and skips entirely when no second
+    # model is configured. Google documents a failure mode this cannot cover -- the
+    # 3.1 TTS model occasionally emits text tokens instead of audio, which the server
+    # answers with a 500, "randomly in a very small percentage of requests", with an
+    # explicit recommendation to retry. Retrying the same model is the only thing that
+    # helps there; a fallback model would be answering a fault the primary does not
+    # actually have.
+    last_error = None
+    for attempt in range(2):
+        try:
+            response = await client.post(
+                f"/v1beta/{model_path}:generateContent",
+                content=json.dumps(payload),
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            )
+        except httpx.RequestError as e:
+            raise Exception(f"Google API Network Error: {str(e)}")
 
-    if response.status_code != 200:
-        raise Exception(f"Google API Error {response.status_code}: {response.text}")
+        if response.status_code != 200:
+            error = Exception(f"Google API Error {response.status_code}: {response.text}")
+            # 4xx is a bad request -- a voice that does not exist, a model that is not a
+            # TTS model, an exhausted quota. Sending it again changes nothing.
+            if response.status_code < 500 or attempt == 1:
+                raise error
+            last_error = error
+            print(f"Google TTS: {model_id} returned {response.status_code}; retrying once.")
+            continue
 
-    parsed = GoogleRESTResponse(json.loads(response.content))
-    if parsed.candidates and parsed.candidates[0].content and parsed.candidates[0].content.parts:
-        for part in parsed.candidates[0].content.parts:
-            if getattr(part, 'inline_data', None) and part.inline_data.data:
-                return part.inline_data.data
-    return None
+        parsed = GoogleRESTResponse(json.loads(response.content))
+        if parsed.candidates and parsed.candidates[0].content and parsed.candidates[0].content.parts:
+            for part in parsed.candidates[0].content.parts:
+                if getattr(part, 'inline_data', None) and part.inline_data.data:
+                    return part.inline_data.data
+
+        # A 200 carrying no audio part is the same fault surfacing without the 500.
+        # Raising rather than returning None is deliberate: None reads as "this text
+        # produced no speech" and stops there, so a configured fallback model was never
+        # tried for what is a transient fault on the primary.
+        last_error = Exception(f"Google TTS Error: {model_id} returned no audio data.")
+        if attempt == 0:
+            print(f"Google TTS: {model_id} returned no audio; retrying once.")
+
+    raise last_error
 
 
 # --- Google adapter routing ----------------------------------------------------
@@ -1253,18 +1355,60 @@ class APIService:
         if is_openrouter:
             api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id, "openrouter") if guild_id else self.cog.storage_manager._get_api_key_for_user(user_id, "openrouter")
             if not api_key: raise ValueError(openrouter_key_error or "OpenRouter API Key not found. Use `/settings` to add one.")
-            return OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params)
+            model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params)
+            return _with_key_cooldown_tracking(self.cog, model, api_key)
         elif is_ollama:
             ollama_host = p_settings.get("ollama_host_url", OLLAMA_LOCAL_URL)
             return OllamaModel(actual_name, api_url=ollama_host, system_instruction=system_instruction, thinking_params=t_params)
         else:
             api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id) if guild_id else self.cog.storage_manager._get_api_key_for_user(user_id)
             if not api_key: raise ValueError(google_key_error or "Google API Key not found. Use `/settings` to add one.")
-            return GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instruction, safety_settings=safety_settings, thinking_params=t_params, tools=tools)
+            model = GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instruction, safety_settings=safety_settings, thinking_params=t_params, tools=tools)
+            return _with_key_cooldown_tracking(self.cog, model, api_key)
+
+    async def run_with_fallback(self, primary: str, fallback: Optional[str], attempt,
+                                *, label: str = "utility"):
+        """Runs one utility generation on `primary`, retrying once on `fallback`.
+
+        `attempt(model_name, is_fallback)` owns the construction and the response
+        handling; this owns only which name to try and when to stop. That puts the five
+        utility paths -- critic, grounding, LTM, image and speech -- on one retry policy
+        without forcing them into one call shape, which they genuinely do not share: one
+        returns audio bytes, one drives a heartbeat, three return a candidate list.
+
+        Only exceptions retry. An empty or safety-blocked response is a decision about
+        the content, not a statement about the model being unavailable, and re-rolling
+        it on a second model spends another call to be refused again.
+
+        A fallback equal to the primary is skipped rather than tried twice, which is
+        what makes the shipped defaults cost nothing: every utility fallback defaults to
+        the same model as its primary, so the retry only becomes live once someone
+        actually changes one of them.
+
+        Returns (result, model_used, used_fallback). If both fail the second error is
+        raised -- callers report the error they are handed, and the fallback's is the
+        one that actually ended the attempt.
+        """
+        attempts = [(primary, False)]
+        if is_real_model(fallback) and fallback != primary:
+            attempts.append((fallback, True))
+
+        last_error = None
+        for name, is_fallback in attempts:
+            try:
+                return await attempt(name, is_fallback), name, is_fallback
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last_error = e
+                if not is_fallback and len(attempts) > 1:
+                    print(f"{label}: primary '{name}' failed "
+                          f"({type(e).__name__}: {e}); retrying on '{attempts[1][0]}'.")
+        raise last_error
 
     def get_top_models(self, provider: str, target_config_key: str) -> List[str]:
-        if target_config_key == 'image_generation_model': return list(get_args(IMAGE_MODELS))
-        if target_config_key == 'speech_model': return list(get_args(AUDIO_MODELS))
+        if target_config_key in IMAGE_MODEL_KEYS: return list(get_args(IMAGE_MODELS))
+        if target_config_key in AUDIO_MODEL_KEYS: return list(get_args(AUDIO_MODELS))
         if provider == 'google': return list(get_args(ALLOWED_MODELS))
         elif provider == 'ollama': return getattr(self, 'cached_ollama_models', [])
 

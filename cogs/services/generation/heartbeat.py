@@ -174,11 +174,27 @@ class HeartbeatMixin:
                 pass
             raise
 
-    async def _update_sending_placeholder(self, channel, participant_method, bot_id, state_container, start_time_mono):
+    async def _update_sending_placeholder(self, channel, participant_method, bot_id, state_container,
+                                          start_time_mono, spawn_after=None):
+        """Keeps the placeholder ticking through everything that happens after generation.
+
+        `state_container['phase_label']` names the phase and may be changed while this is
+        running, so speech synthesis reads as itself rather than as a "Sending..." that
+        sits there for half a minute.
+
+        `spawn_after` is the number of seconds after which this will create a placeholder
+        that does not exist yet, and is only passed by paths that can be slow here. The
+        original rule was never to spawn one during sending, which was right when sending
+        meant one upload: a placeholder created and deleted inside the same second is a
+        flicker and nothing else. TTS broke the premise rather than the rule -- synthesis
+        runs ten to thirty seconds -- so the rule now carries the threshold it always
+        implied. Left None, the behaviour is exactly as before.
+        """
         if not state_container: return
-        
-        # If no placeholder was ever created during generation, do not spawn a new one during sending
-        if not state_container.get('msg_a_id') and not (state_container.get('message_type') == 'embed' and state_container.get('placeholder_msg')):
+
+        has_target = bool(state_container.get('msg_a_id')) or bool(
+            state_container.get('message_type') == 'embed' and state_container.get('placeholder_msg'))
+        if not has_target and spawn_after is None:
             return
 
         async def heartbeat_loop():
@@ -188,7 +204,8 @@ class HeartbeatMixin:
                 mins = int(elapsed) // 60
                 secs = int(elapsed) % 60
                 time_str = f"{mins}:{secs:02d}"
-                sending_text = f"-# Sending... ({time_str})"
+                label = state_container.get('phase_label') or "Sending"
+                sending_text = f"-# {label}... ({time_str})"
 
                 async def do_update(text):
                     if state_container.get('message_type') == 'embed' and state_container.get('placeholder_msg'):
@@ -233,11 +250,74 @@ class HeartbeatMixin:
                     mins = int(elapsed) // 60
                     secs = int(elapsed) % 60
                     time_str = f"{mins}:{secs:02d}"
-                    sending_text = f"-# Sending... ({time_str})"
+                    label = state_container.get('phase_label') or "Sending"
+                    sending_text = f"-# {label}... ({time_str})"
+
+                    if spawn_after is not None and elapsed >= spawn_after:
+                        await maybe_spawn(f"{state_container.get('custom_emoji', PLACEHOLDER_EMOJI)}\n\n{sending_text}")
 
                     await do_update(sending_text)
 
             except asyncio.CancelledError:
                 pass
 
+        async def maybe_spawn(content):
+            """Creates the placeholder this phase is trying to edit, if there is none.
+
+            Only child bots reach this: a webhook turn always has one by now, and
+            spawning a webhook message here would need the appearance data that only the
+            caller holds.
+
+            The send runs as its own shielded task, recorded in the state container. A
+            round can end while this is in flight, and by then the child bot has already
+            posted the message -- so cancelling the heartbeat must not take the id down
+            with it, or that message stays in the channel with nothing able to address
+            it. `_stop_sending_heartbeat` collects the id from the task instead.
+            """
+            if state_container.get('msg_a_id') or participant_method != 'child_bot' or not bot_id:
+                return
+            if state_container.get('spawn_task'):
+                return
+            task = asyncio.create_task(self._send_child_bot_placeholder(bot_id, channel.id, content))
+            state_container['spawn_task'] = task
+            try:
+                new_id = await asyncio.shield(task)
+            except Exception:
+                return
+            if new_id:
+                state_container['msg_a_id'] = new_id
+
         state_container['sending_task'] = asyncio.create_task(heartbeat_loop())
+
+    async def _stop_sending_heartbeat(self, state_container):
+        """Cancels the post-generation heartbeat and waits for it to actually stop.
+
+        The wait is what makes `maybe_spawn` safe: cancel() only schedules the
+        CancelledError, so a caller that cancelled and immediately read `msg_a_id` could
+        read it before a placeholder created microseconds earlier was recorded, and
+        leave that message stranded in the channel.
+        """
+        if not state_container:
+            return
+
+        task = state_container.get('sending_task')
+        if task:
+            task.cancel()
+            try:
+                await task
+            except (Exception, asyncio.CancelledError):
+                pass
+            state_container['sending_task'] = None
+
+        # Shielded, so cancelling the loop above left it running. Collect what it
+        # produced: the message is already in the channel either way, and the id is the
+        # only thing that can delete it.
+        spawn_task = state_container.get('spawn_task')
+        if spawn_task:
+            try:
+                new_id = await spawn_task
+                if new_id and not state_container.get('msg_a_id'):
+                    state_container['msg_a_id'] = new_id
+            except (Exception, asyncio.CancelledError):
+                pass
+            state_container['spawn_task'] = None

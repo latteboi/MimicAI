@@ -13,7 +13,8 @@ from discord.ext import commands
 
 from ..utils.constants import (
     PLACEHOLDER_EMOJI, IMAGE_QUEUE_PRIORITY,
-    DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING,
+    DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING, DEFAULT_IMAGE_MODEL,
+    IMAGE_OUTPUT_KEYS,
 )
 from ..utils.helpers import _resolve_safety_settings, _split_into_sentences_with_abbreviations
 from ..utils.http_client import get_shared_client
@@ -950,7 +951,9 @@ class ChildBotManager:
                 "system_instruction": system_instruction, "reference_image_urls": reference_image_urls,
                 "placeholder_message": placeholder_message_obj,
                 "grounding_sources": grounding_sources, "grounding_mode": grounding_mode,
-                "image_generation_model": profile_data.get("image_generation_model", "gemini-2.5-flash-image")
+                "image_generation_model": profile_data.get("image_generation_model", DEFAULT_IMAGE_MODEL),
+                "image_generation_fallback_model": profile_data.get("image_generation_fallback_model"),
+                "image_output": {k: profile_data.get(k) for k in IMAGE_OUTPUT_KEYS},
             }
 
             await self.cog.image_request_queue.put((IMAGE_QUEUE_PRIORITY, time.time(), request_data))

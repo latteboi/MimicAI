@@ -11,7 +11,7 @@ from ..utils.constants import (
     DEFAULT_WEB_GROUNDING_TEXT, PATTERN_HTML_CONTAINERS, PATTERN_HTML_TAGS,
     PATTERN_HTML_BLANKLINES, DEFAULT_GROUNDING_RAG_PAYLOAD,
 )
-from ..utils.helpers import _add_inline_citations, _format_api_error, _truncate_text_by_char
+from ..utils.helpers import _add_inline_citations, _format_api_error, _truncate_text_by_char, is_real_model
 from .api_service import GoogleGenAIModel
 
 
@@ -100,6 +100,10 @@ class ToolsService:
         # we will use the fallback model for now to keep the signature clean, or fetch it via active session.
         # To perfectly align, let's fetch it via the active session in this guild.
         critic_model_raw = FALLBACK_MODEL_NAME
+        # Hoisted rather than probed with `'p_config' in locals()` further down: the
+        # profile may simply not be in this session, and a name lookup that depends on
+        # whether a loop body ran is a trap waiting for the next edit.
+        p_config = {}
         session = self.cog.multi_profile_channels.get(guild_id) # guild_id is actually channel_id in the _multi_profile_worker call
         if session:
             for p in session.get("profiles", []):
@@ -114,9 +118,15 @@ class ToolsService:
             t_params = {"thinking_budget": 512, "thinking_summary_visible": "off", "thinking_level": "low"}
             critic_cfg = {"temperature": 0.1, "top_p": 0.95}
 
-            model = self.cog.api_service._instantiate_model(critic_model_raw, guild_id, None, system_instruction, None, t_params, None, p_config if 'p_config' in locals() else {})
+            async def _attempt(model_name, _is_fallback):
+                model = self.cog.api_service._instantiate_model(
+                    model_name, guild_id, None, system_instruction, None, t_params, None, p_config)
+                return await model.generate_content_async(
+                    [f"Transcript:\n{transcript}"], generation_config=critic_cfg)
 
-            resp = await model.generate_content_async([f"Transcript:\n{transcript}"], generation_config=critic_cfg)
+            resp, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
+                critic_model_raw, p_config.get("critic_fallback_model"), _attempt,
+                label="Anti-repetition critic")
 
             if resp.text:
                 if "PASS" not in resp.text.upper():
@@ -269,6 +279,7 @@ class ToolsService:
 
             # [NEW] Utility Routing Logic for Grounding RAG
             rag_model_raw = FALLBACK_MODEL_NAME
+            rag_fallback_raw = None
             session_id = mapping_key[1] if isinstance(mapping_key, tuple) else None
             if session_id:
                 session = self.cog.multi_profile_channels.get(session_id)
@@ -280,41 +291,63 @@ class ToolsService:
                         is_b = first_p["profile_name"] in p_idx.get("borrowed", [])
                         p_cfg = self.cog.profile_manager._get_profile_config(first_p["owner_id"], first_p["profile_name"], is_b) or {}
                         rag_model_raw = p_cfg.get("grounding_rag_model", FALLBACK_MODEL_NAME)
-
-            is_or = False
-            actual_model_name = rag_model_raw
-            if rag_model_raw.upper().startswith("OPENROUTER/"):
-                actual_model_name = rag_model_raw[11:]
-                is_or = True
-            elif rag_model_raw.upper().startswith("GOOGLE/"):
-                actual_model_name = rag_model_raw[7:]
-                is_or = False
-            elif "/" in rag_model_raw:
-                is_or = True
+                        rag_fallback_raw = p_cfg.get("grounding_rag_fallback_model")
 
             t_params = {"thinking_budget": 512, "thinking_summary_visible": "off", "thinking_level": "low"}
-
-            if is_or:
-                # OpenRouter doesn't support the Google Search Tool natively yet in our adapter
-                # We will fall back to Google for the RAG phase if they attempt to route grounding to OpenRouter
-                actual_model_name = FALLBACK_MODEL_NAME
-
-            # Set after the OpenRouter fallback above, so the log names the model the
-            # call is actually made against rather than the one that was requested.
-            model_name = actual_model_name
-
-            model = GoogleGenAIModel(
-                api_key=api_key,
-                model_name=actual_model_name,
-                system_instruction=system_instruction,
-                safety_settings=safety_settings,
-                thinking_params=t_params,
-                tools=[grounding_tool]
-            )
-
             gen_config = {"temperature": 0.1, "top_p": 0.95}
 
-            grounding_response = await model.generate_content_async([user_prompt], generation_config=gen_config)
+            def _is_rerouted(raw: str) -> bool:
+                """True when `raw` names a model this phase cannot honour.
+
+                The native Google Search tool has no OpenRouter equivalent in our
+                adapter, so anything routed there -- or to any other provider -- cannot
+                serve this phase and is answered by the standard Google fallback.
+                """
+                return bool(raw) and "/" in raw and not raw.upper().startswith("GOOGLE/")
+
+            def _resolve_google_name(raw: str) -> str:
+                """The bare Google model id this raw name resolves to.
+
+                GoogleGenAIModel is constructed directly here rather than through
+                _instantiate_model, so the provider prefix has to come off on every
+                branch -- including the reroute one, whose default carries one.
+                """
+                name = FALLBACK_MODEL_NAME if (not raw or _is_rerouted(raw)) else raw
+                return name[7:] if name.upper().startswith("GOOGLE/") else name
+
+            # Resolved before the retry rather than inside it, so run_with_fallback's
+            # "skip a fallback equal to the primary" rule sees the model that will
+            # actually be called. Two different OpenRouter ids both answer as the Google
+            # default, and retrying that is one more call to be refused the same way.
+            rag_primary = _resolve_google_name(rag_model_raw)
+            rag_fallback = _resolve_google_name(rag_fallback_raw) if is_real_model(rag_fallback_raw) else None
+
+            for raw, resolved, slot in ((rag_model_raw, rag_primary, "primary"),
+                                        (rag_fallback_raw, rag_fallback, "fallback")):
+                if resolved and _is_rerouted(raw):
+                    print(f"Grounding summariser: {slot} '{raw}' cannot serve the native "
+                          f"search tool; using '{resolved}' instead.")
+
+            # Set inside the attempt so the log names the model the call was actually
+            # made against -- including which of the two it ended up on.
+            model_name = rag_primary
+            model = None
+
+            async def _attempt(name, _is_fallback):
+                nonlocal model_name, model
+                model_name = name
+                model = GoogleGenAIModel(
+                    api_key=api_key,
+                    model_name=model_name,
+                    system_instruction=system_instruction,
+                    safety_settings=safety_settings,
+                    thinking_params=t_params,
+                    tools=[grounding_tool]
+                )
+                return await model.generate_content_async([user_prompt], generation_config=gen_config)
+
+            grounding_response, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
+                rag_primary, rag_fallback, _attempt, label="Grounding summariser")
             status = "success"
 
             if not grounding_response.text:

@@ -30,7 +30,10 @@ from ..utils.constants import (
     CONTENT_RATING_ADULT, CONTENT_RATING_EXEMPT,
     CONTENT_RATING_CAPABILITIES, CONTENT_CAPABILITY_DENIALS,
     CONTENT_RATING_EMOJI,
+    DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE, UTILITY_FALLBACK_KEYS,
+    TTS_VOICE_CHARACTER, TTS_VOICE_GENDER,
 )
+from ..utils.helpers import is_real_model, resolve_image_output_params
 from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
@@ -735,11 +738,16 @@ class ProfileManager:
                 "primary_model": PRIMARY_MODEL_NAME, "fallback_model": FALLBACK_MODEL_NAME,
                 "time_tracking_enabled": True, "timezone": "UTC",
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
-                "image_generation_enabled": False, "image_generation_model": "GOOGLE/gemini-2.5-flash-image",
+                "image_generation_enabled": False, "image_generation_model": DEFAULT_IMAGE_MODEL,
+                # Empty means "send no such field" -- see
+                # MediaService.resolve_image_output_params. Not defaulted to a ratio,
+                # because every image model already has one and ours would only
+                # override it on profiles nobody configured.
+                "image_aspect_ratio": "", "image_size": "", "image_thinking_level": "",
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
                 "thinking_level": "low", "thinking_budget": -1,
-                "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": "Aoede",
-                "speech_model": "GOOGLE/gemini-2.5-flash-preview-tts", "speech_temperature": 1.0,
+                "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": DEFAULT_SPEECH_VOICE,
+                "speech_model": DEFAULT_SPEECH_MODEL, "speech_temperature": 1.0,
                 "neuro_engine_enabled": False, "neuro_state": {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20},
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }
@@ -783,11 +791,16 @@ class ProfileManager:
                 "primary_model": "GOOGLE/gemini-2.5-flash-lite", "fallback_model": "GOOGLE/gemini-2.5-flash-lite",
                 "time_tracking_enabled": True, "timezone": "UTC", "generation_metadata_enabled": False,
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
-                "image_generation_enabled": False, "image_generation_model": "GOOGLE/gemini-2.5-flash-image",
+                "image_generation_enabled": False, "image_generation_model": DEFAULT_IMAGE_MODEL,
+                # Empty means "send no such field" -- see
+                # MediaService.resolve_image_output_params. Not defaulted to a ratio,
+                # because every image model already has one and ours would only
+                # override it on profiles nobody configured.
+                "image_aspect_ratio": "", "image_size": "", "image_thinking_level": "",
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
                 "thinking_level": "low", "thinking_budget": -1,
-                "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": "Aoede",
-                "speech_model": "GOOGLE/gemini-2.5-flash-preview-tts", "speech_temperature": 1.0,
+                "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": DEFAULT_SPEECH_VOICE,
+                "speech_model": DEFAULT_SPEECH_MODEL, "speech_temperature": 1.0,
                 "neuro_engine_enabled": False, "neuro_state": {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20},
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "help_mode_enabled": False
@@ -2413,22 +2426,30 @@ class ProfileManager:
             if not m_str: return "None"
             return str(m_str)
 
-        img_model = config.get("image_generation_model", "gemini-2.5-flash-image")
-        aud_model = config.get("speech_model", "gemini-2.5-flash-preview-tts")
-        grd_model = config.get("grounding_rag_model", FALLBACK_MODEL_NAME)
-        crt_model = config.get("critic_model", FALLBACK_MODEL_NAME)
-        ltm_model = config.get("ltm_model", FALLBACK_MODEL_NAME)
-
-        models_val = (
-            f"Primary: `{clean_m(prim_model)}`\n"
-            f"Fallback: `{clean_m(fall_model)}`\n"
-            f"Image: `{clean_m(img_model)}`\n"
-            f"Audio: `{clean_m(aud_model)}`\n"
-            f"Grounding: `{clean_m(grd_model)}`\n"
-            f"Critic: `{clean_m(crt_model)}`\n"
-            f"LTM: `{clean_m(ltm_model)}`"
+        #: label -> (primary key, its default). The fallback key comes from
+        #: UTILITY_FALLBACK_KEYS so this listing cannot name a different slot than the
+        #: one the generation paths actually retry onto.
+        utility_slots = (
+            ("Image", "image_generation_model", DEFAULT_IMAGE_MODEL),
+            ("Audio", "speech_model", DEFAULT_SPEECH_MODEL),
+            ("Grounding", "grounding_rag_model", FALLBACK_MODEL_NAME),
+            ("Critic", "critic_model", FALLBACK_MODEL_NAME),
+            ("LTM", "ltm_model", FALLBACK_MODEL_NAME),
         )
-        embed.add_field(name="Models", value=models_val, inline=False)
+
+        model_lines = [f"Primary: `{clean_m(prim_model)}`",
+                       f"Fallback: `{clean_m(fall_model)}`"]
+        for label, key, default in utility_slots:
+            primary = config.get(key) or default
+            fallback = config.get(UTILITY_FALLBACK_KEYS[key])
+            # The shipped default is no second model, and an arrow to nothing on five
+            # rows is noise -- so the fallback only shows once it is really set.
+            if is_real_model(fallback) and fallback != primary:
+                model_lines.append(f"{label}: `{clean_m(primary)}` → `{clean_m(fallback)}`")
+            else:
+                model_lines.append(f"{label}: `{clean_m(primary)}`")
+
+        embed.add_field(name="Models", value="\n".join(model_lines), inline=False)
 
         stm_length = config.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
         gen_val = (
@@ -2468,6 +2489,17 @@ class ProfileManager:
         embed.add_field(name="Thinking/Reasoning", value=thinking_val, inline=True)
 
         img_gen = "**`ON`**" if config.get("image_generation_enabled", False) else "`OFF`"
+        # Resolved rather than read straight off the config, so this reports what the
+        # request will actually carry: a ratio the profile's current image model does
+        # not accept is stored but not sent, and claiming it here would be a lie the
+        # user could only catch by inspecting the generated image.
+        img_out = resolve_image_output_params(
+            config, config.get("image_generation_model") or DEFAULT_IMAGE_MODEL)
+        img_detail = " · ".join(v for v in (img_out.get("aspect_ratio"), img_out.get("image_size"),
+                                            img_out.get("thinking_level")) if v)
+        if img_detail:
+            img_gen += f" `{img_detail}`"
+
         
         raw_ground_mode = config.get("grounding_mode", "off")
         if isinstance(raw_ground_mode, bool): raw_ground_mode = "rag" if raw_ground_mode else "off"
@@ -2511,14 +2543,18 @@ class ProfileManager:
         )
         embed.add_field(name="Neuro Engine", value=neuro_val, inline=True)
 
-        s_voice = config.get("speech_voice", "Aoede")
-        s_model = config.get("speech_model", "gemini-2.5-flash-preview-tts")
+        s_voice = config.get("speech_voice", DEFAULT_SPEECH_VOICE)
         s_temp = config.get("speech_temperature", 1.0)
         s_enabled = "**`ON`**" if config.get("speech_tts_enabled", False) else "`OFF`"
-        
+        # Gender and character are what tell thirty star names apart at a glance; an
+        # unknown name is left bare rather than guessed at, which is also how a voice
+        # stored before the picker existed shows up.
+        s_described = " · ".join(d for d in (TTS_VOICE_GENDER.get(s_voice),
+                                             TTS_VOICE_CHARACTER.get(s_voice)) if d)
+
         speech_val = (
             f"Enabled: {s_enabled}\n"
-            f"Voice: `{s_voice}`\n"
+            f"Voice: `{s_voice}`" + (f" ({s_described})\n" if s_described else "\n") +
             f"Temperature: `{s_temp}`"
         )
         embed.add_field(name="Speech TTS", value=speech_val, inline=True)

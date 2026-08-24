@@ -670,7 +670,16 @@ class MemoryManager:
 
         return await get_embedding_vector(api_key, text, task_type=task_type, output_dimensionality=256, timeout=5.0)
 
-    async def _generate_ltm_data_from_history(self, hist:list, user_dn:str, gen_config_params: Dict[str, Any], model_name_to_use: str, guild_id: Optional[int], bot_dn: str = "Bot", profile_owner_id: int = None, profile_name: str = None, warning_channel: Optional[discord.abc.Messageable] = None) -> Optional[str]:
+    async def _generate_ltm_data_from_history(self, hist:list, user_dn:str, gen_config_params: Dict[str, Any], guild_id: Optional[int], bot_dn: str = "Bot", profile_owner_id: int = None, profile_name: str = None, warning_channel: Optional[discord.abc.Messageable] = None) -> Optional[str]:
+        """Summarises a slice of history into a long-term memory.
+
+        The summariser model comes from the profile's own `ltm_model`, retried on
+        `ltm_fallback_model`. It used to take a `model_name_to_use` argument that both
+        callers filled in -- one with the response primary, one with the response
+        fallback -- and that nothing in the body has ever read. Removed rather than
+        wired: honouring it would have silently moved every LTM summary onto the
+        response model.
+        """
         if not hist or len(hist) < MIN_HISTORY_FOR_LTM_CREATION: return None
 
         # [UPDATED] Standardize history for the LTM Summarizer
@@ -730,6 +739,10 @@ class MemoryManager:
             convo = convo[-3000:]
 
         instructions = self.cog.profile_manager._default_ltm_summarization_instructions()
+        # Bound unconditionally: it is only populated for a known profile, and the reads
+        # below used to hedge on `'params_source' in locals()` -- which is correct and
+        # invisible, so the next edit is one NameError away.
+        params_source: Dict[str, Any] = {}
         if profile_owner_id and profile_name:
             user_index = self.cog.profile_manager._get_user_index(profile_owner_id)
             is_borrowed = profile_name in user_index.get("borrowed", [])
@@ -746,18 +759,22 @@ class MemoryManager:
 
         cfg = {"temperature": 0.2}
 
-        # [NEW] Utility Routing Logic for LTM
-        ltm_model_raw = FALLBACK_MODEL_NAME
-        if profile_owner_id and profile_name:
-            ltm_model_raw = params_source.get("ltm_model", FALLBACK_MODEL_NAME) if 'params_source' in locals() else FALLBACK_MODEL_NAME
+        ltm_model_raw = params_source.get("ltm_model", FALLBACK_MODEL_NAME)
+        ltm_fallback_raw = params_source.get("ltm_fallback_model")
 
         effective_guild_id = guild_id or 0
 
         status = "api_error"
         try:
-            m = self.cog.api_service._instantiate_model(ltm_model_raw, effective_guild_id if effective_guild_id else None, profile_owner_id, instructions, DEFAULT_SAFETY_SETTINGS, {}, None, params_source if 'params_source' in locals() else {})
+            async def _attempt(model_name, _is_fallback):
+                m = self.cog.api_service._instantiate_model(
+                    model_name, effective_guild_id if effective_guild_id else None,
+                    profile_owner_id, instructions, DEFAULT_SAFETY_SETTINGS, {}, None, params_source)
+                return await m.generate_content_async(
+                    [f"<target_transcript>\n{convo}\n</target_transcript>"], generation_config=cfg)
 
-            r = await m.generate_content_async([f"<target_transcript>\n{convo}\n</target_transcript>"], generation_config=cfg)
+            r, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
+                ltm_model_raw, ltm_fallback_raw, _attempt, label="LTM summariser")
             status = "blocked_by_safety" if not r.candidates else "success"
 
             response_text = ""
@@ -836,7 +853,7 @@ class MemoryManager:
 
             warning_target = context_obj.channel if isinstance(context_obj, discord.Message) else context_obj
 
-            summary = await self._generate_ltm_data_from_history(sanitized_history, sanitized_author, effective_gen_config, fallback_model, guild_id, bot_dn=bot_display_name, profile_owner_id=profile_owner_id, profile_name=profile_name, warning_channel=warning_target)
+            summary = await self._generate_ltm_data_from_history(sanitized_history, sanitized_author, effective_gen_config, guild_id, bot_dn=bot_display_name, profile_owner_id=profile_owner_id, profile_name=profile_name, warning_channel=warning_target)
             if summary:
                 summary_embedding = await self._get_embedding(summary, guild_id, task_type="RETRIEVAL_DOCUMENT")
                 if summary_embedding:

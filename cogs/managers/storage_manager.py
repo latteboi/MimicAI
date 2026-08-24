@@ -161,12 +161,8 @@ class StorageManager:
         if shard_type in ["ltm", "training"]:
             pid = self.cog.profile_manager._get_pid_from_name_any(int(entity_id), sub_key)
             return os.path.join(self.cog.USERS_DIR, str(entity_id), "profiles", pid, f"{shard_type}.json.gz")
-        elif shard_type == "personal_keys":
-            return os.path.join(self.cog.USERS_DIR, str(entity_id), "keys.json.gz")
         elif shard_type == "profile_shares":
             return os.path.join(self.cog.USERS_DIR, str(entity_id), "shares.json.gz")
-        elif shard_type == "server_keys":
-            return os.path.join(self.cog.SERVERS_DIR, str(entity_id), "api_keys.json.gz")
         raise ValueError(f"Unknown shard type: {shard_type}")
 
     def _load_shard(self, shard_type: str, entity_id: str, sub_key: Optional[str] = None) -> Optional[Any]:
@@ -233,45 +229,6 @@ class StorageManager:
                 has_shares = (user_dir / "shares.json.gz").exists()
                 if not has_keys and not has_shares:
                     shutil.rmtree(str(user_dir), ignore_errors=True)
-
-    def _load_server_api_keys(self):
-        self.cog.server_api_keys = {}
-        servers_dir = self.cog.SERVERS_DIR
-        if not os.path.isdir(servers_dir):
-            return
-
-        for server_id_str in os.listdir(servers_dir):
-            server_path = os.path.join(servers_dir, server_id_str)
-            if os.path.isdir(server_path) and server_id_str.isdigit():
-                api_keys_file = os.path.join(server_path, "api_keys.json.gz")
-                if os.path.exists(api_keys_file):
-                    server_keys_data = self._load_json_gzip(api_keys_file)
-                    if server_keys_data and server_keys_data.get("primary"):
-                        # Primary key data might now contain 'openrouter_key'
-                        self.cog.server_api_keys[server_id_str] = server_keys_data.get("primary")
-
-    def _save_server_api_key_shard(self, server_id_str: str, primary_key_data: Optional[Dict]):
-        self._save_shard("server_keys", server_id_str, {
-            "primary": primary_key_data
-        })
-
-    def _load_personal_api_keys(self):
-        self.cog.personal_api_keys = {}
-        if not os.path.isdir(self.cog.USERS_DIR):
-            return
-        for user_id_str in os.listdir(self.cog.USERS_DIR):
-            if not user_id_str.isdigit(): continue
-            file_path = os.path.join(self.cog.USERS_DIR, user_id_str, "keys.json.gz")
-            if os.path.exists(file_path):
-                data = IOManager.read_json_gzip(file_path, self.fernet)
-                if data and isinstance(data, dict) and "key" in data:
-                    self.cog.personal_api_keys[user_id_str] = data["key"]
-
-    def _save_personal_api_key_shard(self, user_id_str: str, encrypted_key: Optional[str]):
-        if not encrypted_key:
-            self._delete_shard("personal_keys", user_id_str)
-        else:
-            self._save_shard("personal_keys", user_id_str, {"key": encrypted_key})
 
     def _get_user_keys_data(self, user_id: int) -> Dict[str, Any]:
         path = os.path.join(self.cog.USERS_DIR, str(user_id), "keys.json.gz")
@@ -677,7 +634,10 @@ class StorageManager:
     async def _has_api_key_access(self, user_id: int, guild_id: Optional[int] = None) -> bool:
         def _sync_check():
             keys_data = self._get_user_keys_data(user_id)
-            if keys_data.get("slots"):
+            # A key sitting unassigned in a slot isn't usable -- generation only ever
+            # reads personal_assignments (or a server's assigned_keys), so that's what
+            # actually has to be non-empty for "you have a way to use profiles" to hold.
+            if keys_data.get("personal_assignments"):
                 return True
 
             if guild_id:

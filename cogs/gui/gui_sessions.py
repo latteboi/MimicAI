@@ -344,7 +344,24 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
         system_prefixes = ("GOOGLE/", "OPENROUTER/", "OLLAMA/")
         
         has_explicit_prefix = any(value.startswith(p) for p in system_prefixes)
-        
+
+        # The dropdown pins these slots to Google, but rule 1 above would still honour a
+        # typed 'OPENROUTER/' here -- and image, speech and grounding all construct a
+        # Google client directly, so the id would reach the Google API verbatim and 404.
+        # Refused rather than rewritten: 'OPENROUTER/x-ai/grok-4' has no Google meaning,
+        # and silently saving 'GOOGLE/x-ai/grok-4' would only move the 404 later.
+        if self.target_config_key in GOOGLE_ONLY_MODEL_KEYS:
+            if has_explicit_prefix and not value.startswith("GOOGLE/"):
+                await interaction.response.send_message(
+                    f"`{self.target_config_key}` only accepts Google models — image, "
+                    "speech and grounding have no OpenRouter or Ollama path in the "
+                    "adapters. Enter the model id without a provider prefix.",
+                    ephemeral=True)
+                return
+            if not has_explicit_prefix:
+                value = "GOOGLE/" + value
+            has_explicit_prefix = True
+
         if not has_explicit_prefix:
             prefix = "GOOGLE/"
             if getattr(self.parent_view, 'view_mode', None) == "openrouter":
@@ -356,8 +373,9 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
 
         self.parent_view._save_changes(self.target_config_key, value)
         self.parent_view._build_view()
-        await interaction.response.edit_message(content=self.parent_view._get_selection_feedback_message(), view=self.parent_view)
-        await interaction.response.edit_message(content=self.parent_view._get_selection_feedback_message(), view=self.parent_view)
+        # Once, not twice: the second call raised InteractionResponded on every custom
+        # model entry and was swallowed by Modal.on_error as a logged traceback.
+        await interaction.response.edit_message(**self.parent_view._picker_render())
 
 class GlobalChatHistoryView(ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, user_id: int, initial_profile: Optional[str] = None):

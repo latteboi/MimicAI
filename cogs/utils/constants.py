@@ -106,6 +106,187 @@ AUDIO_MODELS = Literal[
     'gemini-3.1-flash-tts-preview', 'gemini-2.5-pro-preview-tts', 'gemini-2.5-flash-preview-tts'
 ]
 
+#: --- Media output options -----------------------------------------------------
+#
+#: The image models take their output controls in `generationConfig.imageConfig`
+#: and the TTS models take a voice name in `speechConfig`. Neither is a free string: an
+#: unknown voice or an aspect ratio the model does not carry comes back as a 400, and for
+#: TTS that surfaces as silence rather than an error, because _generate_google_tts
+#: swallows the failure and returns no stream. So the pickers offer these lists and
+#: nothing else.
+
+#: Every aspect ratio the Gemini 3 image models accept. The 2.5 model and 3 Pro carry
+#: the ten "photographic" ones only -- the four extreme banner ratios are 3.1-exclusive,
+#: which is what IMAGE_MODEL_CAPS below encodes.
+IMAGE_ASPECT_RATIOS_FULL = (
+    '1:1', '1:4', '1:8', '2:3', '3:2', '3:4', '4:1', '4:3', '4:5', '5:4',
+    '8:1', '9:16', '16:9', '21:9',
+)
+IMAGE_ASPECT_RATIOS_COMMON = (
+    '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9',
+)
+
+#: Deliberately stops at 2K though 3.1 Flash and 3 Pro both generate 4K. Two reasons,
+#: either one sufficient: a 4K PNG routinely clears Discord's 10 MB attachment limit on
+#: an unboosted guild, and the image path holds roughly 3.6x the file resident at peak
+#: (wire body, base64, decode) -- on a 1 GB box that is the largest allocation the bot
+#: would ever make, for an image it then fails to upload.
+IMAGE_SIZE_CAP = '2K'
+IMAGE_SIZES_ALL = ('512', '1K', '2K')
+
+#: model id -> what it will actually honour. Keyed bare, without the GOOGLE/ prefix,
+#: because that is what reaches the API. `sizes` empty means the model has one fixed
+#: resolution and rejects imageSize; `thinking` marks the models that accept a
+#: thinkingLevel on an image request.
+#:
+#: `modalities` is what the request asks the model to return. Pinned rather than left
+#: unset so an image request cannot come back as a paragraph of text and nothing else.
+#: 2.5 Flash Image is the exception: every example Google publishes for it asks for
+#: TEXT and IMAGE together, and the API rejects a combination a model does not list, so
+#: pinning it to IMAGE alone would 400 every request on what is still the default model.
+IMAGE_MODEL_CAPS = {
+    'gemini-3.1-flash-image':      {'sizes': ('512', '1K', '2K'), 'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'modalities': ('IMAGE',)},
+    'gemini-3.1-flash-lite-image': {'sizes': ('512', '1K'),       'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'modalities': ('IMAGE',)},
+    'gemini-3-pro-image':          {'sizes': ('1K', '2K'),        'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': True,  'modalities': ('IMAGE',)},
+    'gemini-2.5-flash-image':      {'sizes': (),                  'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': False, 'modalities': ('TEXT', 'IMAGE')},
+}
+
+#: What an unknown image model gets: ratios every listed model shares, no imageSize and
+#: no thinkingLevel. A custom id typed into the picker is likelier to be a new model than
+#: a typo, and sending it the narrower payload fails softer than sending it a field it
+#: has never heard of.
+#: An empty `modalities` means "send no responseModalities at all", which is what an
+#: unrecognised model gets: asking for a combination it does not support is an error,
+#: and we cannot know which combinations a model we have never seen lists.
+IMAGE_MODEL_CAPS_DEFAULT = {'sizes': (), 'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': False,
+                            'modalities': ()}
+
+#: What each ratio is *for*. A dropdown of fourteen bare numbers tells nobody which one
+#: is the phone-shaped one, and the four extreme ratios are easy to pick by accident.
+IMAGE_ASPECT_RATIO_NOTES = {
+    '1:1': 'Square', '1:4': 'Tall banner', '1:8': 'Extreme tall banner',
+    '2:3': 'Portrait', '3:2': 'Landscape', '3:4': 'Portrait',
+    '4:1': 'Wide banner', '4:3': 'Landscape', '4:5': 'Portrait (social)',
+    '5:4': 'Landscape (social)', '8:1': 'Extreme wide banner',
+    '9:16': 'Tall (phone / story)', '16:9': 'Widescreen', '21:9': 'Ultrawide',
+}
+
+IMAGE_SIZE_NOTES = {
+    '512': '0.5K — fastest and cheapest',
+    '1K': '1024px on the long edge — the usual choice',
+    '2K': '2048px — the largest that still uploads to Discord',
+}
+
+IMAGE_THINKING_NOTES = {
+    'MINIMAL': "Draw straight away. The API's own default.",
+    'HIGH': 'Refine the composition first. Slower, and billed for the thinking.',
+}
+
+#: Reasoning depth on an image request, for the models that take one. MINIMAL is the
+#: API's own default on 3.1 Flash; HIGH spends longer refining composition before it
+#: draws, and is billed for the thinking tokens either way.
+IMAGE_THINKING_LEVELS = ('MINIMAL', 'HIGH')
+
+#: The 30 prebuilt TTS voices: name, the character Google documents, and the voice's
+#: gender. The character comes from the Gemini API speech docs; the gender is not
+#: published there at all, but Cloud Text-to-Speech serves the same thirty voices and
+#: lists it in a column of its own. Both are load-bearing in the picker -- thirty star
+#: names sort into nothing on their own, and gender is the first thing anyone casting a
+#: character actually filters on.
+TTS_VOICES = (
+    ('Zephyr', 'Bright', 'Female'),          ('Puck', 'Upbeat', 'Male'),
+    ('Charon', 'Informative', 'Male'),       ('Kore', 'Firm', 'Female'),
+    ('Fenrir', 'Excitable', 'Male'),         ('Leda', 'Youthful', 'Female'),
+    ('Orus', 'Firm', 'Male'),                ('Aoede', 'Breezy', 'Female'),
+    ('Callirrhoe', 'Easy-going', 'Female'),  ('Autonoe', 'Bright', 'Female'),
+    ('Enceladus', 'Breathy', 'Male'),        ('Iapetus', 'Clear', 'Male'),
+    ('Umbriel', 'Easy-going', 'Male'),       ('Algieba', 'Smooth', 'Male'),
+    ('Despina', 'Smooth', 'Female'),         ('Erinome', 'Clear', 'Female'),
+    ('Algenib', 'Gravelly', 'Male'),         ('Rasalgethi', 'Informative', 'Male'),
+    ('Laomedeia', 'Upbeat', 'Female'),       ('Achernar', 'Soft', 'Female'),
+    ('Alnilam', 'Firm', 'Male'),             ('Schedar', 'Even', 'Male'),
+    ('Gacrux', 'Mature', 'Female'),          ('Pulcherrima', 'Forward', 'Female'),
+    ('Achird', 'Friendly', 'Male'),          ('Zubenelgenubi', 'Casual', 'Male'),
+    ('Vindemiatrix', 'Gentle', 'Female'),    ('Sadachbia', 'Lively', 'Male'),
+    ('Sadaltager', 'Knowledgeable', 'Male'), ('Sulafat', 'Warm', 'Female'),
+)
+
+#: The picker's pages. Grouped by gender rather than sliced by count: fourteen and
+#: sixteen each fit inside Discord's 25-option select with room for the jump row, and
+#: "the female ones" is how a voice actually gets chosen -- an alphabetical page break
+#: after Erinome is a page break in the middle of nothing.
+TTS_VOICE_GROUPS = tuple(
+    (gender, tuple(v for v in TTS_VOICES if v[2] == gender))
+    for gender in ('Female', 'Male')
+)
+
+#: name -> its one-word character, and name -> gender, for the picker and the
+#: /profile manage embed.
+TTS_VOICE_CHARACTER = {name: character for name, character, _ in TTS_VOICES}
+TTS_VOICE_GENDER = {name: gender for name, _, gender in TTS_VOICES}
+
+#: Lowercased name -> canonical spelling, so a typed "kore" is corrected rather than
+#: sent as-is and answered with a 400.
+TTS_VOICE_LOOKUP = {name.lower(): name for name, _, _ in TTS_VOICES}
+
+DEFAULT_SPEECH_VOICE = 'Aoede'
+
+#: Prepended to a Director's Desk prompt whenever it carries any direction at all.
+#: Google documents two failure modes for a styled TTS prompt: the synthesis classifier
+#: rejects a vague one as PROHIBITED_CONTENT, or -- worse, because it is silent about it
+#: -- the model reads the director's notes out loud instead of interpreting them. The
+#: documented fix is a preamble stating that speech is wanted plus an explicit label for
+#: where the spoken text starts, which is what the TRANSCRIPT heading below it is.
+#: A bare transcript with no direction gets no preamble: there is nothing there to
+#: mistake for lines, and it is the shape the docs call a simple transcript.
+TTS_SYNTHESIS_PREAMBLE = (
+    "Synthesise speech for the transcript at the end of this prompt. Everything before "
+    "the TRANSCRIPT heading is performance direction describing how to say it, and must "
+    "never be spoken aloud."
+)
+
+#: The three per-profile image output settings, named once so the picker, the bulk row
+#: and the queue payload cannot disagree about which keys travel together.
+IMAGE_OUTPUT_KEYS = ('image_aspect_ratio', 'image_size', 'image_thinking_level')
+
+#: Defaults for the two media slots, named rather than repeated as literals across the
+#: profile template, the pickers and four generation call sites -- which had already
+#: drifted, one summary defaulting to an unprefixed id its own builder prefixed.
+DEFAULT_IMAGE_MODEL = 'GOOGLE/gemini-2.5-flash-image'
+DEFAULT_SPEECH_MODEL = 'GOOGLE/gemini-2.5-flash-preview-tts'
+
+#: Config keys whose option list is the image or audio catalogue rather than the text
+#: one, and whose values are always Google-routed. The fallback slots belong here too:
+#: without them a fallback dropdown would offer text models for an image slot.
+IMAGE_MODEL_KEYS = frozenset({'image_generation_model', 'image_generation_fallback_model'})
+AUDIO_MODEL_KEYS = frozenset({'speech_model', 'speech_fallback_model'})
+
+#: Slots that may only ever hold a Google model, and the reason differs per slot.
+#: Image and speech are Google-only because the OpenRouter adapter speaks
+#: chat/completions and those live on separate OpenRouter endpoints. Grounding is
+#: Google-only because the phase attaches the native `google_search` tool, which has no
+#: equivalent our adapter can send -- an OpenRouter id here never ran on OpenRouter, it
+#: silently resolved to the Google default. The pickers refuse these rather than storing
+#: a value that cannot be honoured.
+GOOGLE_ONLY_MODEL_KEYS = IMAGE_MODEL_KEYS | AUDIO_MODEL_KEYS | frozenset({
+    'grounding_rag_model', 'grounding_rag_fallback_model',
+})
+
+#: The dropdown value meaning "do not retry on anything". Only the utility fallback
+#: slots offer it; the response fallback is what _instantiate_model retries onto when
+#: the primary will not construct, so it has to name a real model.
+NO_FALLBACK = 'NONE'
+
+#: utility primary key -> its fallback key. One table so the pickers, the bulk action
+#: row and the generation paths cannot disagree about which slot backs which.
+UTILITY_FALLBACK_KEYS = {
+    'image_generation_model': 'image_generation_fallback_model',
+    'speech_model': 'speech_fallback_model',
+    'grounding_rag_model': 'grounding_rag_fallback_model',
+    'critic_model': 'critic_fallback_model',
+    'ltm_model': 'ltm_fallback_model',
+}
+
 COGS_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DATA_DIR = os.path.join(COGS_BASE, "data")

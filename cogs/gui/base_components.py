@@ -265,7 +265,18 @@ class BaseBulkProfileView(ui.View):
         self.include_borrowed = include_borrowed
         self.exclude_public = exclude_public
         self.selected_profiles = set()
-        
+        self.current_page = 0
+        self.view_source = 'personal'
+        self._load_profile_lists()
+
+    def _load_profile_lists(self):
+        """Reads the profile index into the two source lists and their cached options.
+
+        Split out of `__init__` so a view whose scope can change after construction --
+        the bulk wizard, where Personal/Borrowed/Both is chosen as a first step -- can
+        re-scope in place instead of rebuilding the view object and losing the message
+        it is attached to.
+        """
         index = self.cog.profile_manager._get_user_index(self.user_id)
         self.personal_profiles = sorted(list(index.get("personal", [])))
 
@@ -276,20 +287,28 @@ class BaseBulkProfileView(ui.View):
         # one at a time. Resolved in a single pass over the public index rather than
         # a _is_profile_public call per profile.
         self.excluded_public = []
-        if exclude_public:
+        if self.exclude_public:
             published = {d["profile_name"]
                          for d in self.cog.profile_manager._iter_public_entries(self.user_id)}
             self.excluded_public = [n for n in self.personal_profiles if n in published]
             self.personal_profiles = [n for n in self.personal_profiles if n not in published]
 
-        self.borrowed_profiles = sorted(list(index.get("borrowed", []))) if include_borrowed else []
-        
+        self.borrowed_profiles = sorted(list(index.get("borrowed", []))) if self.include_borrowed else []
+
         # Pre-compute options once to save massive UI overhead
         self._cached_personal_opts = [discord.SelectOption(label=p, value=p) for p in self.personal_profiles]
         self._cached_borrowed_opts = [discord.SelectOption(label=p, value=p) for p in self.borrowed_profiles]
-        
-        self.current_page = 0
-        self.view_source = 'personal'
+
+    async def _edit(self, interaction: discord.Interaction):
+        """Re-renders this view onto the message it already occupies.
+
+        A hook rather than a literal `edit_message(content=...)` repeated at each of
+        the five call sites below, because the bulk wizard renders as an embed: without
+        it, paging or selecting a profile would replace that embed with a plain-text
+        selection summary.
+        """
+        await interaction.response.edit_message(
+            content=self._get_selection_feedback_message(), view=self)
 
     def _get_active_list(self):
         return self.personal_profiles if self.view_source == 'personal' else self.borrowed_profiles
@@ -332,26 +351,26 @@ class BaseBulkProfileView(ui.View):
 
         btn_row = row + 1
         
+        # No standalone page counter, and none baked into the Source label either:
+        # build_pagination_controls already puts one between the arrows, so both of
+        # those were a second copy of the same number sitting next to the first. It
+        # also frees the slot that used to take this row to its five-button cap.
         if self.include_borrowed:
-            label = f"Source: {self.view_source.title()} ({self.current_page + 1}/{num_pages})"
             style = discord.ButtonStyle.blurple if self.view_source == 'personal' else discord.ButtonStyle.green
-            mode_btn = ui.Button(label=label, style=style, custom_id="toggle_source", row=btn_row)
+            mode_btn = ui.Button(label=f"Source: {self.view_source.title()}", style=style,
+                                 custom_id="toggle_source", row=btn_row)
             mode_btn.callback = self.toggle_source_callback
             self.add_item(mode_btn)
-        else:
-            label = f"Page {self.current_page + 1}/{num_pages}"
-            info_btn = ui.Button(label=label, style=discord.ButtonStyle.grey, disabled=True, row=btn_row)
-            self.add_item(info_btn)
 
         async def p_cb(i: discord.Interaction):
             self.current_page -= 1
             self._build_view()
-            await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+            await self._edit(i)
 
         async def n_cb(i: discord.Interaction):
             self.current_page += 1
             self._build_view()
-            await i.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+            await self._edit(i)
 
         build_pagination_controls(self, self.current_page, num_pages, btn_row, p_cb, n_cb)
 
@@ -368,14 +387,13 @@ class BaseBulkProfileView(ui.View):
         """Drops the whole selection, both sources, every page."""
         self.selected_profiles.clear()
         self._build_view()
-        await interaction.response.edit_message(
-            content=self._get_selection_feedback_message(), view=self)
+        await self._edit(interaction)
 
     async def toggle_source_callback(self, interaction: discord.Interaction):
         self.view_source = 'borrowed' if self.view_source == 'personal' else 'personal'
         self.current_page = 0
         self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+        await self._edit(interaction)
 
     async def profile_select_callback(self, interaction: discord.Interaction):
         vals = interaction.data.get('values', [])
@@ -398,7 +416,7 @@ class BaseBulkProfileView(ui.View):
             self.selected_profiles.update(vals)
             
         self._build_view()
-        await interaction.response.edit_message(content=self._get_selection_feedback_message(), view=self)
+        await self._edit(interaction)
 
     def _get_selection_feedback_message(self) -> str:
         count = len(self.selected_profiles)

@@ -1,10 +1,9 @@
 import os
 import asyncio
 
-from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE
+from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_MODEL
 from ...utils.helpers import _format_api_error, _resolve_safety_settings
 from ...utils.memory_tuning import maybe_trim_malloc
-from ..api_service import GoogleGenAIModel
 
 
 class ImageRoundMixin:
@@ -46,8 +45,8 @@ class ImageRoundMixin:
             api_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id)
             if not api_key: raise ValueError("Server API key not configured.")
 
-            img_model_name = gen_cfg.get("image_generation_model", "GOOGLE/gemini-2.5-flash-image")
-            if img_model_name.upper().startswith("GOOGLE/"): img_model_name = img_model_name[7:]
+            img_model_raw = gen_cfg.get("image_generation_model", DEFAULT_IMAGE_MODEL)
+            img_fallback_raw = gen_cfg.get("image_generation_fallback_model")
 
             system_instruction = self.cog.media_service._get_image_gen_system_instruction(gen_owner_id, gen_profile_name)
 
@@ -81,12 +80,10 @@ class ImageRoundMixin:
             # Determine safety
             dynamic_safety_settings = _resolve_safety_settings(channel, gen_cfg)
 
-            image_model = GoogleGenAIModel(
-                api_key=api_key,
-                model_name=img_model_name,
-                system_instruction=system_instruction,
-                safety_settings=dynamic_safety_settings
-            )
+            # Built up front so the `finally` that logs the call has a model to name even
+            # if the first attempt raises before rebinding it.
+            image_model = self.cog.media_service.build_image_model(
+                img_model_raw, api_key, system_instruction, dynamic_safety_settings, gen_cfg)
 
             status = "api_error"
 
@@ -119,17 +116,27 @@ class ImageRoundMixin:
                 'custom_emoji': gen_cfg.get("placeholder_emoji") or PLACEHOLDER_EMOJI,
             }
 
-            response, image_state_container = await self._generate_with_heartbeat(
-                image_model,
-                [{'role': 'user', 'parts': parts}],
-                None,
-                channel,
-                first_participant,
-                img_msg_a_id,
-                app_name=gen_app_name,
-                app_avatar=gen_app_avatar,
-                existing_state=image_state_container,
-            )
+            async def _attempt(raw_name, _is_fallback):
+                nonlocal image_model
+                image_model = self.cog.media_service.build_image_model(
+                    raw_name, api_key, system_instruction, dynamic_safety_settings, gen_cfg)
+                # image_state_container is mutated in place by the heartbeat, so a retry
+                # edits the placeholder the first attempt made rather than adding one.
+                return await self._generate_with_heartbeat(
+                    image_model,
+                    [{'role': 'user', 'parts': parts}],
+                    None,
+                    channel,
+                    first_participant,
+                    img_msg_a_id,
+                    app_name=gen_app_name,
+                    app_avatar=gen_app_avatar,
+                    existing_state=image_state_container,
+                )
+
+            result, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
+                img_model_raw, img_fallback_raw, _attempt, label="Image generation")
+            response, image_state_container = result
             status = "blocked_by_safety" if not response.candidates else "success"
 
             if not response.candidates:

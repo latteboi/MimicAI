@@ -148,10 +148,6 @@ class MimicCog(commands.Cog, EventListeners):
 
         self.multi_profile_channels: Dict[int, Dict[str, Any]] = {}
         self.sessions_loaded = False
-        self.server_api_keys: Dict[int, str] = {}
-        self.storage_manager._load_server_api_keys()
-        self.personal_api_keys: Dict[str, str] = {}
-        self.storage_manager._load_personal_api_keys()
         self.decrypted_key_cache: LRUCache = LRUCache(max_size=100)
         self.server_key_pointers: LRUCache = LRUCache(max_size=200)
         self.profile_shares: Dict[str, List[Dict[str, Any]]] = {}
@@ -459,7 +455,7 @@ class MimicCog(commands.Cog, EventListeners):
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     async def bulk_manage_slash(self, interaction: discord.Interaction):
         view = BulkManageView(self, interaction)
-        await interaction.response.send_message("Choose a bulk action to perform from the dropdown below.", view=view, ephemeral=True)
+        await view.start(interaction)
 
     @profile_group.command(name="list", description="Lists all of your saved profile names.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
