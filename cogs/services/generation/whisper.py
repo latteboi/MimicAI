@@ -16,6 +16,7 @@ from ...utils.helpers import (
     _get_user_hash, _scrub_response_text,
 )
 from ...gui.gui_sessions import WhisperActionView
+from ...managers.session_manager import intern_turn
 
 
 class WhisperMixin:
@@ -255,13 +256,13 @@ class WhisperMixin:
 
         target_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
 
-        session.setdefault("unified_log", []).append({
+        session.setdefault("unified_log", []).append(intern_turn({
             "turn_id": whisper_turn_id, "type": "whisper",
             "is_user": True, "speaker_pid": str(interaction.user.id), "target_pid": target_pid,
             "message_ids":[],
             "content": whisper_content,
             "timestamp": interaction.created_at.isoformat()
-        })
+        }))
 
         response_turn_id = str(uuid.uuid4())
         profile_id = self.cog.profile_manager._get_profile_id(effective_owner_id, effective_profile_name)
@@ -279,7 +280,7 @@ class WhisperMixin:
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
 
-        session.setdefault("unified_log", []).append(resp_log)
+        session.setdefault("unified_log", []).append(intern_turn(resp_log))
 
         # Both turns are already in unified_log above; _build_history_for_participant
         # wraps them in <private_whisper> / <private_response> when it derives this
@@ -290,7 +291,7 @@ class WhisperMixin:
 
         # [NEW] Immediate persistence for private whisper turns
         session_type = session.get("type", "multi")
-        await self.cog.session_manager._save_session_to_disk((interaction.channel_id, None, None), session_type, session["unified_log"])
+        await self.cog.session_manager.flush_session((interaction.channel_id, None, None), session_type)
 
         # Send the private response to the user
         embed = discord.Embed(description=response_text, color=discord.Color.dark_grey())
@@ -307,7 +308,7 @@ class WhisperMixin:
         # Inject the message ID back into the log turn
         if resp_msg:
             resp_log["message_ids"] = [resp_msg.id]
-            await self.cog.session_manager._save_session_to_disk((interaction.channel_id, None, None), session_type, session["unified_log"])
+            await self.cog.session_manager.flush_session((interaction.channel_id, None, None), session_type)
 
     async def _execute_whisper_regeneration(self, interaction: discord.Interaction, whisper_turn_id: str, response_turn_id: str, target_participant: Dict, whisper_message: str):
         """Gate, claim, run, release -- the same contract as _execute_whisper.
@@ -407,19 +408,11 @@ class WhisperMixin:
                 batch_start_index = i
                 break
 
-        past_log = sliced_log[:batch_start_index]
-        current_batch_log = sliced_log[batch_start_index:]
-
-        stm_length = int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
-        if stm_length > 0:
-            past_log = past_log[-stm_length:]
-        else:
-            past_log = []
-
-        combined_log = past_log + current_batch_log
-
         bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
-        participant_history = self.cog.session_manager._build_history_for_participant(combined_log, bot_pid, p_settings)
+        participant_history = self.cog.session_manager._build_history_for_participant(
+            sliced_log, bot_pid, p_settings,
+            reserved_tail=len(sliced_log) - batch_start_index,
+        )
 
         gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "thinking_config": {"include_thoughts": True}}
 

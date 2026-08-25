@@ -4,6 +4,7 @@ import datetime
 
 from ...utils.helpers import _format_debug_prompt, _format_history_entry, _get_user_hash
 from ...utils.http_client import get_shared_client
+from ...managers.session_manager import intern_turn
 
 
 class TriggerIntakeMixin:
@@ -69,7 +70,7 @@ class TriggerIntakeMixin:
                         "message_ids": [],
                         "content": system_content
                     }
-                    session.setdefault("unified_log", []).append(turn_object)
+                    session.setdefault("unified_log", []).append(intern_turn(turn_object))
 
                     new_round_turn_data.append((system_content, None, []))
 
@@ -192,13 +193,15 @@ class TriggerIntakeMixin:
                             del turn["url_context"]
                     turn_object["url_context"] = url_text_content
 
-                session.setdefault("unified_log", []).append(turn_object)
+                session.setdefault("unified_log", []).append(intern_turn(turn_object))
 
                 if pending_url_fetches and pending_url_fetches[-1]["turn_data_index"] == len(new_round_turn_data):
                     pending_url_fetches[-1]["turn_object"] = turn_object
 
                 # [NEW] Immediate persistence for user turns
-                await self.cog.session_manager._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
+                # Appends only, and the round-end flush is moments away -- see
+                # SessionManager.mark_session_dirty.
+                self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
 
                 # Initialize list for standard message attachments/reply images
                 new_message_parts = []

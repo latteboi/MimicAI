@@ -27,6 +27,7 @@ from ..utils.helpers import (
     _split_into_sentences_with_abbreviations,
 )
 from ..managers.memory_manager import encode_embedding_b64
+from ..managers.session_manager import intern_turn
 
 from .generation._shared import _strip_neuro_update_and_scrub
 from .generation.heartbeat import HeartbeatMixin
@@ -38,11 +39,12 @@ from .generation.global_chat import GlobalChatMixin
 from .generation.whisper import WhisperMixin
 from .generation.image_round import ImageRoundMixin
 from .generation.triggers import TriggerIntakeMixin
+from .generation.compaction import SessionCompactionMixin
 
 
 class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, RegenerationMixin,
                         SpeakAsMixin, GlobalChatMixin, WhisperMixin, ImageRoundMixin,
-                        TriggerIntakeMixin):
+                        TriggerIntakeMixin, SessionCompactionMixin):
     """Owns the core generation engine: the multi-participant turn-rotation worker
     (_multi_profile_worker, defined here) plus the heartbeat/prompt-building/delivery/
     regeneration/speak/global-chat/whisper mixins (each in cogs/services/generation/) that
@@ -590,11 +592,19 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             if session.get("unified_log"):
                                 session["unified_log"][-1]["grounding_context"] = g_context
 
+                            # The purge above rewrites turns anywhere in the log, including
+                            # ones already sealed into the cold segment, so this cannot ride
+                            # out on a tail write -- a stale grounding blob left on disk is
+                            # re-injected as context on the next hydration.
+                            self.cog.session_manager.mark_session_dirty(
+                                (channel_id, None, None), session_type, structural=True)
+
                         grounding_sources = g_sources
                     grounding_profile_key = (g_owner_id, g_profile_name)
 
                 # Unpack and apply URL results
                 url_updates_made = False
+                url_purged_cold_turns = False
                 for i, (u_t, u_m, u_w) in enumerate(url_results):
                     fetch_info = pending_url_fetches[i]
                     pre_generation_warnings.extend(u_w)
@@ -611,6 +621,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             for turn in session.get("unified_log", []):
                                 if turn is not fetch_info["turn_object"] and "url_context" in turn:
                                     del turn["url_context"]
+                                    url_purged_cold_turns = True
                                     
                     if u_m:
                         url_media_parts.extend(u_m)
@@ -621,7 +632,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         new_round_turn_data[idx] = (user_line, url_text_content if u_t else old_url_text, old_media)
                         
                 if url_updates_made:
-                    await self.cog.session_manager._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
+                    # Structural for the same reason as the grounding purge above: the
+                    # loop clears url_context from older turns as well as setting it on
+                    # the current one.
+                    self.cog.session_manager.mark_session_dirty(
+                        (channel_id, None, None), session_type, structural=url_purged_cold_turns)
 
                 # --- NEW IMAGE GENERATION LOGIC ---
                 if is_image_gen_round and generator_profile_key:
@@ -837,28 +852,21 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         }
 
                         image_gen_error_msg = None
-                        if p_settings.get("url_fetching_enabled", False) and round_url_text_contexts:
-                            url_instr = "<url_research>\n[Context from links in current messages]:\n" + "\n".join(round_url_text_contexts) + "\n</url_research>"
-                            contents_for_api_call.append({'role': 'user', 'parts': [url_instr]})
 
-                        if not contents_for_api_call:
-                            contents_for_api_call.append({'role': 'user', 'parts':[self.cog.global_prompts.get("KICKSTART_START", DEFAULT_KICKSTART_START)]})
-
-                        # [NEW] Hybrid STM: Rebuild history dynamically from unified_log
+                        # [NEW] Hybrid STM: Rebuild history dynamically from unified_log.
+                        # Whatever this round appended is reserved, so a batch of user
+                        # messages does not push history out of the window. Anything built
+                        # into contents_for_api_call before this point would be discarded
+                        # by the assignment -- the URL context and the kickstart fallback
+                        # are both re-applied below, from supplementary_parts.
                         bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
-                        
+
                         unified_log = session.get("unified_log", [])
-                        past_log = unified_log[:batch_start_index]
-                        current_batch_log = unified_log[batch_start_index:]
-                        
-                        stm_length = int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
-                        if stm_length > 0:
-                            past_log = past_log[-stm_length:]
-                        else:
-                            past_log = []
-                            
-                        combined_log = past_log + current_batch_log
-                        contents_for_api_call = self.cog.session_manager._build_history_for_participant(combined_log, bot_pid, p_settings)
+                        contents_for_api_call = self.cog.session_manager._build_history_for_participant(
+                            unified_log, bot_pid, p_settings,
+                            len(profile_order) or 1,
+                            reserved_tail=len(unified_log) - batch_start_index,
+                        )
 
                         round_context_text = "\n".join([t[0] for t in new_round_turn_data])
                         dynamic_context_for_turn = (round_context_text + "\n" + "\n".join(responses_this_round)).strip()
@@ -1381,12 +1389,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     # Clean up any legacy signature if it exists
                     turn_object.pop('thought_signature', None)
                     
-                    session.setdefault("unified_log", []).append(turn_object)
+                    session.setdefault("unified_log", []).append(intern_turn(turn_object))
                     session['last_speaker_key'] = participant_key
 
-                    # [UPDATED] Persist log immediately
+                    # Append only. The delivery branches below flush as soon as the
+                    # message_ids are known, and the round-end flush backs that up.
                     session_type = session.get("type", "multi")
-                    await self.cog.session_manager._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
+                    self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
 
                     # [NEW] Unified Synthesis Logic
                     audio_file_for_send = None
@@ -1595,7 +1604,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # messages stayed in the channel with nothing able to address them.
                         if turn_object.get("message_ids"):
                             session_type = session.get("type", "multi")
-                            await self.cog.session_manager._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                            await self.cog.session_manager.flush_session((channel_id, None, None), session_type)
 
                     else: # Webhook logic
                         sent_messages = await self._send_channel_message(
@@ -1635,7 +1644,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             for msg in sent_messages:
                                 turn_object.setdefault("message_ids", []).append(msg.id)
                             
-                            await self.cog.session_manager._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
+                            await self.cog.session_manager.flush_session((channel_id, None, None), session_type)
                     
                     # --- Dispatch Warnings and Clean Up Placeholders ---
                     await self._stop_sending_heartbeat(state_container)
@@ -1772,7 +1781,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     }
                                     if url_text_batch:
                                         new_turn_object["url_context"] = url_text_batch
-                                    session.setdefault("unified_log", []).append(new_turn_object)
+                                    session.setdefault("unified_log", []).append(intern_turn(new_turn_object))
 
                             all_triggers_for_round.extend(batched_triggers)
                     
@@ -1784,7 +1793,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     # the pass only ever reclaimed reference cycles the automatic collector
                     # would have caught anyway.
 
-                await self.cog.session_manager._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
+                self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
 
                 for trigger in all_triggers_for_round:
                     if trigger is not None:
@@ -1892,11 +1901,24 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 # Trim the unified log to be the single source of truth for the session's history window.
                 if len(session.get("unified_log", [])) > 1000:
                     session["unified_log"] = session["unified_log"][-1000:]
+                    # A new list object whose head no longer matches the cold segment.
+                    # Zeroing the boundary makes the round-end flush a full rewrite,
+                    # which re-seals the trimmed log.
+                    session["_log_cold_len"] = 0
 
                 # [NEW] Mandatory Round-End Persistence
                 # Ensures the transcript is saved immediately after the last participant speaks.
                 dummy_session_key = (channel_id, None, None)
-                await self.cog.session_manager._save_session_to_disk(dummy_session_key, session_type, session.get("unified_log", []))
+                await self.cog.session_manager.flush_session(dummy_session_key, session_type)
+
+                # Rolling synopsis, after the round's own flush has landed. Not earlier:
+                # inserting a synopsis turn shifts every index after it, and
+                # batch_start_index -- captured at round start -- is read while each
+                # participant's prompt is built. No-ops unless the session enables it.
+                try:
+                    await self._run_session_compaction(channel_id)
+                except Exception as e:
+                    print(f"Session compaction failed for channel {channel_id}: {e}")
 
             except asyncio.CancelledError:
                 break

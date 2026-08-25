@@ -3,6 +3,7 @@ import uuid
 import discord
 
 from ...utils.helpers import _format_history_entry
+from ...managers.session_manager import intern_turn
 
 
 class SpeakAsMixin:
@@ -103,11 +104,12 @@ class SpeakAsMixin:
                 "message_ids": [],
                 "content": history_line
             }
-            session.setdefault("unified_log", []).append(turn_object)
+            session.setdefault("unified_log", []).append(intern_turn(turn_object))
 
             session_type = session.get("type", "multi")
             self.cog.session_last_accessed[channel.id] = time.time()
-            await self.cog.session_manager._save_session_to_disk((channel.id, None, None), session_type, session["unified_log"])
+            # message_ids land below once the send returns, and that flush persists both.
+            self.cog.session_manager.mark_session_dirty((channel.id, None, None), session_type)
 
         sent_messages = []
         if delivery_method == 'child_bot' and child_bot_id:
@@ -131,6 +133,6 @@ class SpeakAsMixin:
             for msg in sent_messages:
                 turn_object.setdefault("message_ids", []).append(msg.id)
             session['last_bot_message_id'] = sent_messages[-1].id
-            await self.cog.session_manager._save_session_to_disk((channel.id, None, None), session.get("type", "multi"), session["unified_log"])
+            await self.cog.session_manager.flush_session((channel.id, None, None), session.get("type", "multi"))
 
         await interaction_to_respond.followup.send("Message sent.", ephemeral=True)

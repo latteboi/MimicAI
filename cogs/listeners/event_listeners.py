@@ -809,6 +809,7 @@ class EventListeners:
                 self.session_manager._safe_cancel_task(session_data['worker_task'])
                 session_data['worker_task'] = None
         
+        self.dirty_sessions.clear()
         for session_key, session_data in self.global_chat_sessions.items():
             await self.session_manager._save_session_to_disk(session_key, 'global_chat', session_data)
         for ch_id, session_data in self.multi_profile_channels.items():

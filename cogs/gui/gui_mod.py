@@ -437,7 +437,50 @@ class ModStatsView(ModBaseView):
         if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
 
         self._add_page_controls(num_pages, 1)
+        self._add_wipe_button()
         self._add_nav_buttons()
+
+    def _add_wipe_button(self):
+        """Instance-wide `/suspend`.
+
+        The per-channel command only reaches the channel it is typed in, so recovering
+        from a bad deploy meant visiting every session by hand. This runs the same
+        teardown across every channel the bot holds a session for.
+        """
+        live = len(self.cog.multi_profile_channels)
+        # Never disabled at zero live sessions: the disk sweep still has work to do
+        # when every session is dehydrated or its channel has gone uncached.
+        btn = ui.Button(label=f"Wipe All Sessions ({live})", style=discord.ButtonStyle.danger, row=2)
+
+        async def wipe_cb(i: discord.Interaction):
+            async def confirm(confirm_i: discord.Interaction):
+                await confirm_i.response.edit_message(
+                    content=f"Suspending `{live}` session(s) across every server...",
+                    view=None, embed=None)
+                channels, guilds, swept = await self.cog.session_manager.suspend_all_sessions()
+                await confirm_i.edit_original_response(
+                    content=(f"**Global suspend complete.**\n"
+                             f"• Live sessions suspended: `{channels}`\n"
+                             f"• Servers affected: `{guilds}`\n"
+                             f"• Session log directories removed: `{swept}`\n\n"
+                             "Every channel is now silent until a session is configured again."),
+                    view=None)
+                # The button's count is now stale -- repaint the dashboard rather than
+                # leave a live-looking control behind on it.
+                self._build_view()
+                await self.update_display()
+
+            await i.response.send_message(
+                f"**Suspend every session on this instance?**\n"
+                f"`{live}` live channel session(s) will be torn down exactly as `/suspend` does: "
+                "chat logs deleted, child bots told to drop the channel, Freewill triggers "
+                "disabled. Any session log left on disk for a channel the bot can no longer "
+                "see is swept too. Profiles, memories and settings are untouched.\n\n"
+                "This cannot be undone.",
+                view=build_confirm_view("Wipe Every Session", confirm), ephemeral=True)
+
+        btn.callback = wipe_cb
+        self.add_item(btn)
 
     def _get_embed(self):
         embed = discord.Embed(title="MimicAI Statistics", color=discord.Color.gold())
@@ -610,6 +653,8 @@ MOD_PROMPT_CATEGORIES = [
         ("Kickstart: Continue", "KICKSTART_CONTINUE", DEFAULT_KICKSTART_CONTINUE),
         ("Kickstart: Idle", "KICKSTART_IDLE", DEFAULT_KICKSTART_IDLE),
         ("AI Director Prompt", "DIRECTOR_USER_PROMPT", DEFAULT_DIRECTOR_USER_PROMPT),
+        ("Session Synopsis: System", "SESSION_SYNOPSIS", DEFAULT_SESSION_SYNOPSIS_PROMPT),
+        ("Session Synopsis: User", "SESSION_SYNOPSIS_USER", DEFAULT_SESSION_SYNOPSIS_USER_PROMPT),
     ]),
     ("Image Generation", [
         ("Image: Present (own)", "IMAGE_PRESENT", DEFAULT_IMAGE_PRESENT),
@@ -655,6 +700,8 @@ MOD_PROMPT_PLACEHOLDERS: Dict[str, Tuple[Set[str], str]] = {
     "WHISPER_INJECTION": ({"whisper_content"}, "format"),
     "WHISPER_RECAP": ({"whispers"}, "format"),
     "DIRECTOR_USER_PROMPT": ({"history"}, "format"),
+    "SESSION_SYNOPSIS": ({"max_words"}, "format"),
+    "SESSION_SYNOPSIS_USER": ({"previous_synopsis", "transcript"}, "format"),
     "IMAGE_PRESENT": ({"prompt"}, "format"),
     "IMAGE_PRESENT_OTHER": ({"name", "prompt"}, "format"),
     "IMAGE_FAILED": ({"prompt", "reason"}, "format"),

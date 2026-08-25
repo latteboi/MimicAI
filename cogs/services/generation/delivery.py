@@ -349,6 +349,6 @@ class DeliveryMixin:
                 )
                 if sent_msgs and turn_object and session:
                     turn_object.setdefault("message_ids", []).extend([m.id for m in sent_msgs])
-                    await self.cog.session_manager._save_session_to_disk((channel.id, None, None), session.get("type", "multi"), session.get("unified_log", []))
+                    await self.cog.session_manager.flush_session((channel.id, None, None), session.get("type", "multi"))
         except Exception as e:
             print(f"Failed to dispatch warnings: {e}")

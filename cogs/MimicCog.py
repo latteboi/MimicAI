@@ -193,7 +193,11 @@ class MimicCog(commands.Cog, EventListeners):
         self.server_manager._load_blacklist()
         self.session_last_accessed = {}
         self.eviction_heap = []
+        # session_key -> session_type for logs with unpersisted appends. Bounded by the
+        # number of live sessions, and drained every SESSION_FLUSH_INTERVAL_SECONDS.
+        self.dirty_sessions: Dict[Any, str] = {}
         self.session_manager.evict_inactive_sessions_task.start()
+        self.session_manager.flush_dirty_sessions_task.start()
         self.message_cooldown = commands.CooldownMapping.from_cooldown(5, 60.0, commands.BucketType.user)
         self.processed_child_messages: LRUCache = LRUCache(max_size=25)
         self.all_bot_ids: Set[int] = set()
@@ -1075,44 +1079,11 @@ class MimicCog(commands.Cog, EventListeners):
         await interaction.response.defer(ephemeral=True)
         
         ch_id = interaction.channel_id
-        session = self.multi_profile_channels.pop(ch_id, None)
 
-        if not session:
+        if not await self.session_manager.suspend_channel_session(ch_id):
             await interaction.followup.send("There is no active session in this channel to suspend.", ephemeral=True)
             return
 
-        # [NEW] Robust Counter Cleanup
-        for participant in session.get("profiles", []):
-            p_oid = participant.get("owner_id")
-            p_name = participant.get("profile_name")
-            if p_oid and p_name:
-                # Clear the round counter for this specific profile
-                self.message_counters_for_ltm.pop((p_oid, p_name, "guild"), None)
-                
-                # [NEW] Reset LTM recall history (penalty system) for this channel
-                full_session_key = (ch_id, p_oid, p_name)
-                self.ltm_recall_history.pop(full_session_key, None)
-
-            if participant.get("method") == "child_bot":
-                bot_id = participant.get("bot_id")
-                if bot_id:
-                    await self.manager_queue.put({
-                        "action": "send_to_child", "bot_id": bot_id,
-                        "payload": {"action": "session_update_remove", "channel_id": ch_id}
-                    })
-                    await self.manager_queue.put({
-                        "action": "send_to_child", "bot_id": bot_id,
-                        "payload": {"action": "stop_typing", "channel_id": ch_id}
-                    })
-
-        session_type = session.get("type", "multi")
-        dummy_session_key = (ch_id, None, None)
-        await self.session_manager._delete_session_from_disk(dummy_session_key, session_type)
-
-        if session.get('worker_task'):
-            self.session_manager._safe_cancel_task(session['worker_task'])
-        
-        self.session_last_accessed.pop(ch_id, None)
         self.session_manager._save_multi_profile_sessions()
 
         await interaction.followup.send(f"Session suspended for {interaction.channel.mention} and Freewill triggers disabled. The bot will be silent until mentioned or configured again.", ephemeral=True)

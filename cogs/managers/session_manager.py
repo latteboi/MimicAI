@@ -1,8 +1,10 @@
 import os
+import sys
 import gzip
 import zstandard as zstd
 import uuid
 import heapq
+import shutil
 import asyncio
 import random
 import time
@@ -18,8 +20,48 @@ import orjson as json
 from ..utils.constants import (
     USERS_DIR, SERVERS_DIR, SESSIONS_GLOBAL_DIR, defaultConfig,
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
+    COMPACTION_THRESHOLD_DEFAULT, COMPACTION_CHUNK_DEFAULT,
+    COMPACTION_MODEL_DEFAULT, COMPACTION_FALLBACK_MODEL_DEFAULT,
 )
-from .storage_manager import IOManager, _delete_file_shard
+from .storage_manager import IOManager, _delete_file_shard, _get_compressor, _get_decompressor
+
+# Turns allowed to accumulate in the tail sidecar before the next flush re-seals the
+# whole log into the cold segment. Sized so the common case -- a round appending a
+# handful of turns -- never rewrites the 264 KiB cold file, while the tail itself stays
+# small enough that writing it is cheap on the e2-micro.
+SESSION_HOT_TAIL_MAX = 250
+
+# How often the coalescing flusher drains the dirty set. Every operation that ends a
+# turn, deletes history, or evicts a session still flushes immediately; this interval
+# only bounds how long a mid-round append can sit in memory.
+SESSION_FLUSH_INTERVAL_SECONDS = 5.0
+
+# Compaction is opt-in: a session that never enables it behaves exactly as before.
+DEFAULT_COMPACTION_CONFIG = {
+    "enabled": False,
+    "threshold": COMPACTION_THRESHOLD_DEFAULT,
+    "chunk": COMPACTION_CHUNK_DEFAULT,
+    "model": COMPACTION_MODEL_DEFAULT,
+    "fallback_model": COMPACTION_FALLBACK_MODEL_DEFAULT,
+}
+
+# Repeated verbatim on every turn of a session's log: interning them means one string
+# object per session instead of one per turn.
+_INTERNED_TURN_FIELDS = ("speaker_pid", "target_pid", "profile_name", "role", "type", "speaker_name")
+
+
+def intern_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
+    """Collapse a turn's repeated field values onto shared string objects, in place.
+
+    A 1000-turn log carries 1000 copies of the same handful of pids, profile names and
+    role tags -- roughly 10% of the log's ~1 MB resident footprint for data with a
+    handful of distinct values. Returns the same dict so it can wrap an append.
+    """
+    for field in _INTERNED_TURN_FIELDS:
+        value = turn.get(field)
+        if type(value) is str:
+            turn[field] = sys.intern(value)
+    return turn
 
 
 class SessionManager:
@@ -55,6 +97,107 @@ class SessionManager:
         dir_path = self._get_session_dir_path(session_key, session_type)
         # All other session types use a unified log
         return dir_path / "session_log.json.gz"
+
+    def _get_session_hot_path(self, session_key: Any, session_type: str) -> Optional[pathlib.Path]:
+        """Sidecar holding the unsealed tail of a channel session's unified_log.
+
+        None for global_chat, which is already capped at STM_LIMIT_MAX * 2 turns and
+        is not worth segmenting.
+        """
+        if session_type == 'global_chat':
+            return None
+        return self._get_session_dir_path(session_key, session_type) / "session_log.hot.json.gz"
+
+    def _encode_session_bytes(self, payload: Any) -> bytes:
+        """orjson -> zstd -> Fernet, the on-disk format for every session file.
+
+        Only ever called from inside asyncio.to_thread, so it goes through
+        _get_compressor() rather than building a ZstdCompressor per call -- see the
+        thread-safety note at the top of storage_manager.
+        """
+        serialized_bytes = json.dumps(payload, option=json.OPT_SERIALIZE_NUMPY | json.OPT_NON_STR_KEYS)
+        return self.cog.fernet.encrypt(_get_compressor().compress(serialized_bytes))
+
+    @staticmethod
+    def _atomic_write(path: pathlib.Path, blob: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(path.suffix + '.tmp')
+        with open(temp_path, 'wb') as f:
+            f.write(blob)
+        try:
+            os.replace(temp_path, path)
+        except FileNotFoundError:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(temp_path, path)
+
+    def _get_live_session(self, session_key: Any, session_type: str) -> Optional[Dict]:
+        """The in-memory session dict a save/flush refers to, or None if it is gone."""
+        if session_type == 'global_chat':
+            return self.cog.global_chat_sessions.get(session_key)
+        channel_id, _, _ = session_key
+        return self.cog.multi_profile_channels.get(channel_id)
+
+    def _note_cold_length(self, session_key: Any, session_type: str, saved_log: Any, length: int) -> None:
+        """Record how much of unified_log the cold segment now holds.
+
+        The tail flush is only correct while `cold file == unified_log[:_log_cold_len]`.
+        Every caller that saves a channel session passes session['unified_log'] itself,
+        so identity is a reliable test that the invariant holds; anything else resets the
+        counter to 0, which costs one full flush rather than writing a tail that does not
+        line up with its cold segment.
+        """
+        if session_type == 'global_chat':
+            return
+        session = self._get_live_session(session_key, session_type)
+        if session is None:
+            return
+        session['_log_cold_len'] = length if session.get('unified_log') is saved_log else 0
+
+    async def _save_session_tail_to_disk(self, session_key: Any, session_type: str, session: Dict) -> bool:
+        """Persist only the turns appended since the last full flush.
+
+        A channel session's log is append-mostly, but every writer used to rewrite the
+        whole file: a 1000-turn log is 264 KiB on disk and ~1.6 ms of orjson/zstd/Fernet
+        per save, and a four-participant round did that six or more times. This writes a
+        second file holding just unified_log[_log_cold_len:], so a round's flush is
+        proportional to the turns it actually added.
+
+        Returns False when the tail has grown past SESSION_HOT_TAIL_MAX (or the invariant
+        cannot be trusted), meaning the caller should fall back to a full flush -- which
+        re-seals everything into the cold segment and starts a fresh tail.
+        """
+        unified_log = session.get('unified_log')
+        if unified_log is None:
+            return True
+
+        cold_len = session.get('_log_cold_len', 0)
+        if not isinstance(cold_len, int) or cold_len <= 0 or cold_len > len(unified_log):
+            return False
+
+        tail = unified_log[cold_len:]
+        if len(tail) > SESSION_HOT_TAIL_MAX:
+            return False
+        if not tail:
+            return True
+
+        hot_path = self._get_session_hot_path(session_key, session_type)
+        if hot_path is None:
+            return False
+
+        channel_id, _, _ = session_key
+        channel = self.cog.bot.get_channel(channel_id)
+        if not channel or not getattr(channel, 'guild', None):
+            return True
+
+        payload = {"cold_len": cold_len, "turns": tail}
+        try:
+            await asyncio.to_thread(
+                lambda: self._atomic_write(hot_path, self._encode_session_bytes(payload))
+            )
+        except Exception as e:
+            print(f"Error saving session tail for key {session_key}: {e}")
+            return False
+        return True
 
     async def _save_session_to_disk(self, session_key: Any, session_type: str, session_data: Union[List[Dict], Dict]):
         if not session_data:
@@ -94,50 +237,100 @@ class SessionManager:
 
         try:
             path = self._get_session_path(session_key, session_type)
+            hot_path = self._get_session_hot_path(session_key, session_type)
             data_copy = list(data_to_save) if isinstance(data_to_save, list) else data_to_save.copy()
 
             def _thread_save():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                serialized_bytes = json.dumps(data_copy, option=json.OPT_SERIALIZE_NUMPY | json.OPT_NON_STR_KEYS)
-                compressed_bytes = zstd.ZstdCompressor(level=1).compress(serialized_bytes)
-                encrypted_compressed_bytes = self.cog.fernet.encrypt(compressed_bytes)
-
-                temp_path = path.with_suffix(path.suffix + '.tmp')
-                with open(temp_path, 'wb') as f:
-                    f.write(encrypted_compressed_bytes)
-                
-                try:
-                    os.replace(temp_path, path)
-                except FileNotFoundError:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(temp_path, path)
+                self._atomic_write(path, self._encode_session_bytes(data_copy))
+                if hot_path is not None:
+                    # A full flush seals the whole log into the cold segment, so the tail
+                    # sidecar is now redundant. Written first, deleted second: a crash in
+                    # between leaves a stale tail that _load_session_from_disk reconciles
+                    # back to the pre-flush state rather than to a torn one.
+                    try:
+                        os.unlink(hot_path)
+                    except FileNotFoundError:
+                        pass
 
             await asyncio.to_thread(_thread_save)
+            self._note_cold_length(session_key, session_type, data_to_save, len(data_copy))
+            # The log on disk is now current, so any queued flush is satisfied.
+            self.cog.dirty_sessions.pop(session_key, None)
         except Exception as e:
             print(f"Error saving session for key {session_key}: {e}")
 
+    def _decode_session_file(self, path: pathlib.Path) -> Any:
+        """Read one session file. Runs inside asyncio.to_thread."""
+        with open(path, 'rb') as f:
+            encrypted_compressed_bytes = f.read()
+        decrypted_compressed_bytes = self.cog.fernet.decrypt(encrypted_compressed_bytes)
+        try:
+            json_bytes = _get_decompressor().decompress(decrypted_compressed_bytes)
+        except zstd.ZstdError:
+            json_bytes = gzip.decompress(decrypted_compressed_bytes)
+        if not json_bytes:
+            return None
+        return json.loads(json_bytes)
+
+    @staticmethod
+    def _reconcile_log_segments(cold: Any, hot: Any) -> Tuple[Any, int]:
+        """Splice a cold segment and its tail sidecar back into one log.
+
+        Returns (log, cold_len). A session written before segmentation existed has no
+        sidecar and loads as-is, which is what keeps the format backward compatible.
+
+        The tail records the cold length it was written against. Anything else means a
+        crash landed between the two writes of a full flush: the tail is either stale
+        (its cold_len is behind, so the prefix it names still reconstructs the log the
+        session had before that flush) or orphaned ahead of a cold segment that never
+        landed, in which case the only self-consistent state is the cold segment alone.
+        """
+        if not isinstance(cold, list):
+            return cold, 0
+        if not isinstance(hot, dict):
+            return cold, len(cold)
+
+        cold_len = hot.get("cold_len")
+        turns = hot.get("turns")
+        if not isinstance(cold_len, int) or not isinstance(turns, list) or not (0 <= cold_len <= len(cold)):
+            return cold, len(cold)
+        return cold[:cold_len] + turns, cold_len
+
     async def _load_session_from_disk(self, session_key: Any, session_type: str) -> Optional[Union[List[Dict], Dict]]:
+        data, _ = await self._load_session_segments(session_key, session_type)
+        return data
+
+    async def _load_session_segments(self, session_key: Any, session_type: str) -> Tuple[Optional[Union[List[Dict], Dict]], int]:
+        """_load_session_from_disk, plus how much of the returned log is already sealed.
+
+        Only _ensure_session_hydrated needs the second value, and only when it actually
+        adopts the disk log -- if it keeps a longer in-memory log instead, the disk
+        segment boundary does not describe it and the counter must stay 0.
+        """
         try:
             path = self._get_session_path(session_key, session_type)
             if not path.exists():
-                return None
+                return None, 0
+            hot_path = self._get_session_hot_path(session_key, session_type)
 
             def _thread_load():
-                with open(path, 'rb') as f:
-                    encrypted_compressed_bytes = f.read()
-                decrypted_compressed_bytes = self.cog.fernet.decrypt(encrypted_compressed_bytes)
-                try:
-                    json_bytes = zstd.ZstdDecompressor().decompress(decrypted_compressed_bytes)
-                except zstd.ZstdError:
-                    json_bytes = gzip.decompress(decrypted_compressed_bytes)
-                if not json_bytes: return None
-                return json.loads(json_bytes)
+                cold = self._decode_session_file(path)
+                hot = None
+                if hot_path is not None and hot_path.exists():
+                    try:
+                        hot = self._decode_session_file(hot_path)
+                    except Exception as e:
+                        # A tail we cannot read is recoverable -- the cold segment is a
+                        # complete log as of the last full flush. Only the unsealed turns
+                        # are lost, so fall through rather than failing the whole load.
+                        print(f"Warning: unreadable session tail at {hot_path}: {e}. Using cold segment only.")
+                return self._reconcile_log_segments(cold, hot)
 
-            data = await asyncio.to_thread(_thread_load)
+            data, cold_len = await asyncio.to_thread(_thread_load)
 
             if not data:
                 await self._delete_session_from_disk(session_key, session_type)
-                return None
+                return None, 0
 
             if session_type == 'global_chat':
                 if data and isinstance(data, list) and 'parts' in data[0]:
@@ -152,30 +345,209 @@ class SessionManager:
                             "content": content,
                             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
                         }
-                        unified_log.append(log_item)
+                        unified_log.append(intern_turn(log_item))
 
-                    return {'unified_log': unified_log}
+                    return {'unified_log': unified_log}, 0
 
                 elif data and isinstance(data, list) and 'turn_id' in data[0]:
-                    return {'unified_log': data}
+                    for item in data:
+                        intern_turn(item)
+                    return {'unified_log': data}, 0
 
-                return None
+                return None, 0
 
             else:
-                return data
+                if isinstance(data, list):
+                    # One pass at hydration collapses the log's repeated pid/name/role
+                    # strings onto shared objects for as long as the session stays
+                    # resident; appends afterwards intern as they arrive.
+                    for item in data:
+                        intern_turn(item)
+                return data, cold_len
         except (gzip.BadGzipFile, zstd.ZstdError, json.JSONDecodeError, InvalidToken):
              print(f"Warning: Corrupted or old-format session file for key {session_key}. Deleting file.")
              await self._delete_session_from_disk(session_key, session_type)
         except Exception as e:
             print(f"Error loading session for key {session_key}: {e}")
-        return None
+        return None, 0
 
     async def _delete_session_from_disk(self, session_key: Any, session_type: str):
         try:
             path = self._get_session_path(session_key, session_type)
             await asyncio.to_thread(_delete_file_shard, str(path))
+            hot_path = self._get_session_hot_path(session_key, session_type)
+            if hot_path is not None:
+                await asyncio.to_thread(_delete_file_shard, str(hot_path))
+            self._note_cold_length(session_key, session_type, None, 0)
+            # A queued flush predates the delete, so honouring it would write the file
+            # back -- with whatever the delete was meant to remove still in it.
+            self.cog.dirty_sessions.pop(session_key, None)
         except Exception as e:
             print(f"Error deleting session file for key {session_key}: {e}")
+
+    async def suspend_channel_session(self, channel_id: int) -> bool:
+        """Tear one channel's session down -- the body of `/suspend`.
+
+        Pops the session, clears its per-profile LTM counters and recall penalties,
+        tells child bot participants to drop the channel and stop typing, deletes the
+        log from disk and cancels the worker. Returns False if there was no session.
+
+        Does *not* persist the blueprint index: a caller suspending many channels
+        calls `_save_multi_profile_sessions` once at the end instead of per channel,
+        since that rewrites every server index each time.
+        """
+        session = self.cog.multi_profile_channels.pop(channel_id, None)
+        if not session:
+            return False
+
+        for participant in session.get("profiles", []):
+            p_oid = participant.get("owner_id")
+            p_name = participant.get("profile_name")
+            if p_oid and p_name:
+                # Clear the round counter and the LTM recall penalty history for this
+                # profile, or a fresh session inherits a half-elapsed cadence.
+                self.cog.message_counters_for_ltm.pop((p_oid, p_name, "guild"), None)
+                self.cog.ltm_recall_history.pop((channel_id, p_oid, p_name), None)
+
+            if participant.get("method") == "child_bot":
+                bot_id = participant.get("bot_id")
+                if bot_id:
+                    await self.cog.manager_queue.put({
+                        "action": "send_to_child", "bot_id": bot_id,
+                        "payload": {"action": "session_update_remove", "channel_id": channel_id}
+                    })
+                    await self.cog.manager_queue.put({
+                        "action": "send_to_child", "bot_id": bot_id,
+                        "payload": {"action": "stop_typing", "channel_id": channel_id}
+                    })
+
+        session_type = session.get("type", "multi")
+        await self._delete_session_from_disk((channel_id, None, None), session_type)
+
+        if session.get('worker_task'):
+            self._safe_cancel_task(session['worker_task'])
+
+        self.cog.session_last_accessed.pop(channel_id, None)
+        return True
+
+    async def suspend_all_sessions(self) -> Tuple[int, int, int]:
+        """Suspend every session on this instance.
+
+        Returns (channels suspended, guilds touched, leftover session dirs swept).
+        """
+        guild_ids = set()
+        suspended = 0
+
+        for channel_id in list(self.cog.multi_profile_channels.keys()):
+            channel = self.cog.bot.get_channel(channel_id)
+            guild = getattr(channel, "guild", None)
+            if await self.suspend_channel_session(channel_id):
+                suspended += 1
+                if guild:
+                    guild_ids.add(guild.id)
+            # 0.25 vCPU baseline: each channel deletes two files and may queue child
+            # bot traffic, so yield between them rather than holding the loop for the
+            # whole instance.
+            await asyncio.sleep(0)
+
+        # Clearing the dict is what empties every server index, so this has to land
+        # even when no channel was live.
+        self._save_multi_profile_sessions()
+
+        swept = await asyncio.to_thread(self._sweep_orphaned_session_dirs)
+        return suspended, len(guild_ids), swept
+
+    def _sweep_orphaned_session_dirs(self) -> int:
+        """Delete every `<server>/sessions/` tree left on disk. Returns the count.
+
+        `_delete_session_from_disk` resolves a channel's directory through
+        `bot.get_channel`, so a session whose channel is uncached -- deleted, or in a
+        guild the bot has lost access to -- keeps its log no matter how many times it
+        is suspended. Those are precisely the logs a global wipe exists to reach, so
+        the sweep goes by path rather than by live channel. Nothing but session logs
+        lives under `sessions/`; profiles, memories and the server index sit elsewhere.
+        """
+        removed = 0
+        servers_path = pathlib.Path(SERVERS_DIR)
+        if not servers_path.is_dir():
+            return 0
+
+        for server_dir in list(servers_path.iterdir()):
+            sessions_dir = server_dir / "sessions"
+            if not sessions_dir.is_dir():
+                continue
+            for channel_dir in list(sessions_dir.iterdir()):
+                if not channel_dir.is_dir():
+                    continue
+                try:
+                    shutil.rmtree(channel_dir)
+                    removed += 1
+                except OSError as e:
+                    print(f"Error removing session directory {channel_dir}: {e}")
+        return removed
+
+    def mark_session_dirty(self, session_key: Any, session_type: str, structural: bool = False) -> None:
+        """Queue a session's log for the next coalesced flush.
+
+        The turn path used to persist synchronously after every append, so a four-
+        participant round rewrote the whole log six or more times to reach a state only
+        the last of those writes described. Marking instead collapses a round into a
+        single write, and the tail segmentation keeps that write proportional to the
+        turns the round added rather than to the length of the log.
+
+        Only for changes that a later flush is guaranteed to supersede. Anything that
+        finishes an operation -- a delivered turn's message_ids, a whisper landing, a
+        regeneration, an edit, any deletion, eviction -- flushes immediately instead, so
+        the coalescing window can never swallow a completed turn or resurrect deleted
+        history.
+
+        Pass structural=True when the change touched turns that may already be sealed
+        into the cold segment -- an in-place edit, a filtered log, anything that is not
+        an append. A tail write only rewrites unified_log[_log_cold_len:], so without
+        this the change would never reach disk.
+        """
+        existing = self.cog.dirty_sessions.get(session_key)
+        if existing is not None:
+            structural = structural or existing[1]
+        self.cog.dirty_sessions[session_key] = (session_type, structural)
+
+    async def flush_session(self, session_key: Any, session_type: str, structural: bool = False) -> None:
+        """Write one session now, preferring the tail sidecar over a full rewrite."""
+        pending = self.cog.dirty_sessions.pop(session_key, None)
+        if pending is not None:
+            structural = structural or pending[1]
+
+        session = self._get_live_session(session_key, session_type)
+        if session is None:
+            return
+
+        if session_type == 'global_chat':
+            await self._save_session_to_disk(session_key, session_type, session)
+            return
+
+        # Dehydrated between the mark and now: eviction already wrote the log out and
+        # dropped it, so there is nothing left to persist.
+        if not session.get("is_hydrated") or session.get("unified_log") is None:
+            return
+
+        if not structural and await self._save_session_tail_to_disk(session_key, session_type, session):
+            return
+        await self._save_session_to_disk(session_key, session_type, session["unified_log"])
+
+    async def flush_all_dirty(self) -> None:
+        """Drain the dirty set. Used by the periodic task and by shutdown."""
+        for session_key, (session_type, structural) in list(self.cog.dirty_sessions.items()):
+            try:
+                await self.flush_session(session_key, session_type, structural=structural)
+            except Exception as e:
+                print(f"Error flushing session {session_key}: {e}")
+                self.cog.dirty_sessions.pop(session_key, None)
+
+    @tasks.loop(seconds=SESSION_FLUSH_INTERVAL_SECONDS)
+    async def flush_dirty_sessions_task(self):
+        if not self.cog.has_lock:
+            return
+        await self.flush_all_dirty()
 
     def _get_mapping_path(self, mapping_key: Any) -> pathlib.Path:
         session_type, key_id = mapping_key
@@ -266,7 +638,8 @@ class SessionManager:
                         "session_prompt": session_data.get("session_prompt"),
                         "session_mode": session_data.get("session_mode", "sequential"),
                         "type": "multi",
-                        "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 20, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."})
+                        "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 20, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
+                        "compaction": session_data.get("compaction", DEFAULT_COMPACTION_CONFIG.copy()),
                     }
                 except Exception as e:
                     print(f"Unexpected error reloading multi-profile sessions for server {server_id_str}, channel {ch_id_str}: {e}")
@@ -301,7 +674,8 @@ class SessionManager:
                     "session_prompt": session_data.get("session_prompt"),
                     "session_mode": session_data.get("session_mode", "sequential"),
                     "type": "multi",
-                    "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."})
+                    "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
+                    "compaction": session_data.get("compaction", DEFAULT_COMPACTION_CONFIG.copy()),
                 }
 
                 current_server_sessions[server_id_str][category][str(channel_id)] = blueprint
@@ -549,6 +923,7 @@ class SessionManager:
                             "session_mode": session_config.get("session_mode", "sequential"),
                             "type": "multi",
                             "proactivity": session_config.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
+                            "compaction": session_config.get("compaction", DEFAULT_COMPACTION_CONFIG.copy()),
                             "task_queue": asyncio.Queue(),
                             "is_running": False
                         }
@@ -561,21 +936,28 @@ class SessionManager:
                         session["session_mode"] = session_config.get("session_mode", "sequential")
                         session["type"] = "multi"
                         session["proactivity"] = session_config.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."})
+                        session["compaction"] = session_config.get("compaction", DEFAULT_COMPACTION_CONFIG.copy())
 
         if not session: return None
 
         # 2. Load History Log
         dummy_session_key = (channel_id, None, None)
-        disk_log = await self._load_session_from_disk(dummy_session_key, session_type) or []
+        disk_log, disk_cold_len = await self._load_session_segments(dummy_session_key, session_type)
+        disk_log = disk_log or []
 
         current_mem_log = session.get("unified_log", [])
         if not disk_log and current_mem_log:
+            session["unified_log"] = current_mem_log
             await self._save_session_to_disk(dummy_session_key, session_type, current_mem_log)
             unified_log = current_mem_log
         elif current_mem_log and len(current_mem_log) >= len(disk_log):
             unified_log = current_mem_log
+            # The in-memory log won, so the segment boundary just read off disk does not
+            # describe it. Zero forces the next flush to be a full one, which re-seals.
+            session["_log_cold_len"] = 0
         else:
             unified_log = disk_log
+            session["_log_cold_len"] = disk_cold_len
 
         session["unified_log"] = unified_log
 
@@ -686,6 +1068,9 @@ class SessionManager:
 
                     if unified_log is not None:
                         dummy_session_key = (key, None, None)
+                        # Full flush, not a tail one: the log is about to leave memory,
+                        # so the cold segment has to be complete on its own.
+                        self.cog.dirty_sessions.pop(dummy_session_key, None)
                         await self._save_session_to_disk(dummy_session_key, session_type, unified_log)
 
                     # Use safe cancel to prevent "Task destroyed but pending"
@@ -699,6 +1084,9 @@ class SessionManager:
                     # Clear the large data structures from the in-memory dictionary.
                     if 'unified_log' in session_to_evict:
                         del session_to_evict['unified_log']
+                    # Meaningless without the log it indexes, and stale if the session
+                    # rehydrates from a file another process has since rewritten.
+                    session_to_evict.pop('_log_cold_len', None)
                     # Both are re-derived on the next hydration (pending_whispers from
                     # the log, cancellations only matter for a queued trigger), and
                     # dropping the cancellation set is what bounds it for a session
@@ -718,6 +1106,7 @@ class SessionManager:
             elif isinstance(key, tuple):
                 session_to_save = self.cog.global_chat_sessions.get(key)
                 if session_to_save:
+                    self.cog.dirty_sessions.pop(key, None)
                     await self._save_session_to_disk(key, 'global_chat', session_to_save)
 
                 self.cog.global_chat_sessions.pop(key, None)
@@ -762,28 +1151,98 @@ class SessionManager:
         await self._evict_inactive_sessions()
 
     def _get_pending_whispers_for_participant(self, log_list: List[Dict], bot_pid: str) -> List[str]:
+        """Whispers aimed at bot_pid that it has not spoken since.
+
+        Scanned backwards and stopped at the participant's own last ordinary turn: that
+        turn is what clears the list, so nothing before it can contribute. The forward
+        version walked the entire log to build a list it then discarded most of, once
+        per participant -- 0.47 ms per hydration for a six-cast, 1000-turn session,
+        against a handful of turns here.
+        """
         pending = []
-        for turn in log_list:
+        for turn in reversed(log_list):
             if turn.get("is_hidden", False): continue
             turn_type = turn.get("type")
             if not turn_type:
                 if turn.get("speaker_pid") == bot_pid:
-                    pending.clear()
+                    break
             elif turn_type == "whisper":
                 if turn.get("target_pid") == bot_pid:
                     pending.append(turn.get("content"))
+        pending.reverse()
         return pending
 
-    def _build_history_for_participant(self, full_log: List[Dict], bot_pid: str, p_settings: Dict[str, Any], num_participants: int = 1) -> List[Dict]:
+    @staticmethod
+    def get_latest_synopsis(session: Optional[Dict]) -> Optional[str]:
+        """The most recent rolling synopsis for a session, or None.
+
+        Read by _construct_system_instructions on every turn, so it walks backwards and
+        stops at the first hit rather than scanning the log.
+        """
+        if not session:
+            return None
+        for turn in reversed(session.get("unified_log") or []):
+            if turn.get("type") == "synopsis":
+                return (turn.get("content") or "").strip() or None
+        return None
+
+    @staticmethod
+    def _select_history_window(full_log: List[Dict], window: int) -> List[Dict]:
+        """The trailing slice of `full_log` holding `window` turns that will actually
+        be shown.
+
+        Counting raw turns instead would let muted and compacted turns eat the window:
+        `full_log[-40:]` on a log whose oldest 25 turns were compacted yields 40 turns
+        of which only 35 survive the emit loop -- so compacting a session, which exists
+        to give a profile *more* usable context, silently gave it less.
+
+        Walks backwards and stops as soon as the quota is met, so it costs O(window)
+        plus whatever hidden turns it steps over, not O(log).
+        """
+        if window <= 0:
+            return []
+        kept = 0
+        for index in range(len(full_log) - 1, -1, -1):
+            turn = full_log[index]
+            if turn.get("is_hidden") or turn.get("compacted") or turn.get("type") == "synopsis":
+                continue
+            kept += 1
+            if kept >= window:
+                return full_log[index:]
+        return list(full_log)
+
+    def _build_history_for_participant(self, full_log: List[Dict], bot_pid: str, p_settings: Dict[str, Any], num_participants: int = 1, reserved_tail: int = 0) -> List[Dict]:
+        """This participant's view of the log: the last `stm_length` turns, with other
+        participants' private exchanges hidden and its own rewritten into their XML tags.
+
+        `reserved_tail` exempts that many trailing turns from the window -- the turns a
+        round has just added, which the participant is being asked to respond to. STM
+        governs how far back it remembers, not how much of the present it is allowed to
+        see, so a busy round must not push the conversation out of its own prompt.
+
+        Callers used to express that by pre-slicing `past[-stm:] + batch` and passing the
+        result here, which then re-sliced it to `stm` and dropped the oldest `len(batch)`
+        turns of history to make room -- so a profile's memory silently shortened in
+        proportion to how many people spoke at once. Windowing lives here now; pass the
+        whole log and say how much of its tail is the current round.
+        """
         stm_length = int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
         effective_stm = max(stm_length, num_participants) if stm_length > 0 else 0
-        log_slice = full_log[-effective_stm:] if effective_stm > 0 else []
-        
+        # stm_length 0 means "no memory", but the current round is still in front of it.
+        window = effective_stm + max(0, reserved_tail)
+        log_slice = self._select_history_window(full_log, window)
+
         participant_history = []
         for turn in log_slice:
-            if turn.get("is_hidden"): continue
-            
+            if turn.get("is_hidden") or turn.get("compacted"): continue
+
             turn_type = turn.get("type")
+            # Not conversation. A synopsis is standing context injected into the system
+            # instruction by _construct_system_instructions, for the same reason
+            # <archive_context> is: it summarises turns that have left the window, so
+            # placing it *in* the window means a session with more live turns than
+            # stm_length never sees it -- which is every session compaction is for.
+            if turn_type == "synopsis": continue
             if not turn_type:
                 role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
                 parts = [turn.get("content")]
@@ -859,7 +1318,8 @@ class SessionManager:
                 "session_mode": "sequential",
                 "pending_image_gen_data": None,
                 "pending_whispers": {},
-                "audio_mode": "off"
+                "audio_mode": "off",
+                "compaction": DEFAULT_COMPACTION_CONFIG.copy(),
             }
             self.cog.multi_profile_channels[interaction.channel_id] = session
 

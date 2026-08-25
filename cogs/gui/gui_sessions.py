@@ -9,6 +9,7 @@ import asyncio
 from typing import TYPE_CHECKING, List, Dict, Any, Optional
 from ..utils.helpers import _estimate_text_tokens
 from .base_components import PageJumpModal, build_pagination_controls
+from ..services.generation.compaction import resolve_compaction_settings
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -942,6 +943,58 @@ class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
         except ValueError:
             await interaction.response.send_message("Invalid chance or cooldown.", ephemeral=True)
 
+class CompactionSettingsModal(ui.Modal, title="Rolling Synopsis"):
+    threshold_input = ui.TextInput(label=f"Compact after N turns ({COMPACTION_THRESHOLD_MIN}-{COMPACTION_THRESHOLD_MAX})", placeholder=f"Default: {COMPACTION_THRESHOLD_DEFAULT}", required=True, max_length=3)
+    chunk_input = ui.TextInput(label="Turns to fold each time", placeholder=f"Default: {COMPACTION_CHUNK_DEFAULT}", required=True, max_length=3)
+    model_input = ui.TextInput(label="Summariser Model", placeholder=f"Default: {COMPACTION_MODEL_DEFAULT}", required=False, max_length=100)
+    fallback_input = ui.TextInput(label="Fallback Model", placeholder=f"Default: {COMPACTION_FALLBACK_MODEL_DEFAULT}", required=False, max_length=100)
+
+    def __init__(self, view: 'SessionConfigView'):
+        super().__init__()
+        self.view = view
+        cfg = resolve_compaction_settings(view.session)
+        self.threshold_input.default = str(cfg["threshold"])
+        self.chunk_input.default = str(cfg["chunk"])
+        self.model_input.default = cfg["model"]
+        self.fallback_input.default = cfg["fallback_model"]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            threshold = int(self.threshold_input.value)
+            chunk = int(self.chunk_input.value)
+        except ValueError:
+            await interaction.response.send_message("❌ Turn counts must be whole numbers.", ephemeral=True)
+            return
+
+        cfg = self.view.session.setdefault("compaction", {})
+        cfg["threshold"] = threshold
+        cfg["chunk"] = chunk
+        # Unprefixed ids default to Google, matching the Director model field. Both
+        # providers are valid here -- unlike image, speech and grounding, summarisation
+        # is an ordinary text slot.
+        for field, key, default in (
+            (self.model_input, "model", COMPACTION_MODEL_DEFAULT),
+            (self.fallback_input, "fallback_model", COMPACTION_FALLBACK_MODEL_DEFAULT),
+        ):
+            raw = field.value.strip()
+            if not raw:
+                cfg[key] = default
+            elif raw.upper().startswith(("GOOGLE/", "OPENROUTER/", "OLLAMA/")):
+                cfg[key] = raw
+            else:
+                cfg[key] = "GOOGLE/" + raw
+
+        # Re-read through the clamp so the embed shows what will actually run rather
+        # than what was typed.
+        applied = resolve_compaction_settings(self.view.session)
+        cfg["threshold"] = applied["threshold"]
+        cfg["chunk"] = applied["chunk"]
+
+        self.view.cog.session_manager._save_multi_profile_sessions()
+        await interaction.response.defer()
+        await self.view.update_display()
+
+
 class ResponseLimitModal(ui.Modal, title="Set Response Limit"):
     limit_input = ui.TextInput(label="Max Responses per Round (1-10)", placeholder="Enter a number between 1 and 10 (Default: 10)", required=False, max_length=2)
     def __init__(self, view):
@@ -1111,7 +1164,7 @@ class SessionConfigView(ui.View):
         }
 
     def _add_nav_buttons(self):
-        tabs = ["cast", "config", "reactivity", "proactivity"]
+        tabs = ["cast", "config", "reactivity", "proactivity", "memory"]
         for tab in tabs:
             btn = ui.Button(label=tab.title(), style=discord.ButtonStyle.primary if self.current_tab == tab else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab == tab))
             def make_cb(t):
@@ -1556,6 +1609,65 @@ class SessionConfigView(ui.View):
             async def edit_cb(i): await i.response.send_modal(ProactivitySettingsModal(self))
             edit_btn.callback = edit_cb
             self.add_item(edit_btn)
+
+        elif self.current_tab == "memory":
+            cfg = resolve_compaction_settings(self.session)
+            enabled = cfg["enabled"]
+            embed.description = (
+                "Fold the oldest part of a long conversation into a running synopsis, so the "
+                "cast keeps the thread of a scene after it scrolls past their Short-Term Memory.\n\n"
+                "Folded turns are hidden from prompts, not deleted \u2014 the transcript, "
+                "regeneration and the audit view are unaffected, and turning this off brings "
+                "them back. Private whispers are never summarised."
+            )
+            embed.add_field(name="Status", value="**`ON`**" if enabled else "`OFF`", inline=True)
+            embed.add_field(name="Trigger", value=f"Every `{cfg['threshold']}` turns", inline=True)
+            embed.add_field(name="Fold Size", value=f"`{cfg['chunk']}` turns", inline=True)
+            embed.add_field(
+                name="Summariser",
+                value=f"`{cfg['model']}`\nFallback: `{cfg['fallback_model']}`",
+                inline=False,
+            )
+
+            log = self.session.get("unified_log") or []
+            visible = sum(
+                1 for t in log
+                if not t.get("type") and not t.get("compacted") and not t.get("is_hidden")
+            )
+            folded = sum(1 for t in log if t.get("compacted"))
+            synopses = sum(1 for t in log if t.get("type") == "synopsis")
+            embed.add_field(
+                name="This Session",
+                value=(
+                    f"`{visible}` live turn(s) \u2022 `{folded}` folded \u2022 "
+                    f"`{synopses}` synopsis block(s)"
+                ),
+                inline=False,
+            )
+            if synopses:
+                latest = next(
+                    (t.get("content", "") for t in reversed(log) if t.get("type") == "synopsis"), ""
+                )
+                if latest:
+                    embed.add_field(name="Latest Synopsis", value=f"```{latest[:900]}```", inline=False)
+
+            tgl_btn = ui.Button(
+                label="Toggle Rolling Synopsis",
+                style=discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger,
+                row=0,
+            )
+            async def compaction_tgl_cb(i):
+                self.session.setdefault("compaction", {})["enabled"] = not enabled
+                self.cog.session_manager._save_multi_profile_sessions()
+                await i.response.defer()
+                await self.update_display()
+            tgl_btn.callback = compaction_tgl_cb
+            self.add_item(tgl_btn)
+
+            c_edit_btn = ui.Button(label="Edit Settings", style=discord.ButtonStyle.primary, row=0)
+            async def compaction_edit_cb(i): await i.response.send_modal(CompactionSettingsModal(self))
+            c_edit_btn.callback = compaction_edit_cb
+            self.add_item(c_edit_btn)
 
         try:
             await self.original_interaction.edit_original_response(embed=embed, view=self)

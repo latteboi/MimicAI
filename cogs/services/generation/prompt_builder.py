@@ -84,6 +84,15 @@ class PromptBuilderMixin:
             if session and session.get("session_prompt"):
                 final_instr_parts.append(f"<scene_prompt>\n{session['session_prompt']}\n</scene_prompt>")
 
+            # Standing context, not a history turn: the synopsis summarises turns that
+            # have already left the STM window, so competing for a slot inside that
+            # window would hide it from exactly the long sessions it exists for. Shared
+            # by the whole cast -- only public turns are ever compacted, so it can carry
+            # nothing a participant was not already entitled to see.
+            synopsis = self.cog.session_manager.get_latest_synopsis(session)
+            if synopsis:
+                final_instr_parts.append(f"<session_synopsis>\n{synopsis}\n</session_synopsis>")
+
         if neuro_enabled:
             neuro_block = self.cog.global_prompts.get("NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION).format(
                 d=neuro_state.get('dopamine', 50),

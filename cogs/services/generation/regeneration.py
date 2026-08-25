@@ -101,19 +101,15 @@ class RegenerationMixin:
                     batch_start_index = i
                     break
 
-            past_log = sliced_unified_log[:batch_start_index]
-            current_batch_log = sliced_unified_log[batch_start_index:]
+            # The turns since the last user message are what this regeneration is
+            # answering; STM governs how far back it remembers, not those. See
+            # SessionManager._build_history_for_participant.
+            reserved_tail = len(sliced_unified_log) - batch_start_index
 
-            stm_length = int(p_profile.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
-            if stm_length > 0:
-                past_log = past_log[-stm_length:]
-            else:
-                past_log = []
-
-            combined_log = past_log + current_batch_log
-
-            participant_history = self.cog.session_manager._build_history_for_participant(combined_log, bot_pid, p_profile)
-            pending_whispers_for_regen = self.cog.session_manager._get_pending_whispers_for_participant(combined_log, bot_pid)
+            participant_history = self.cog.session_manager._build_history_for_participant(
+                sliced_unified_log, bot_pid, p_profile, reserved_tail=reserved_tail
+            )
+            pending_whispers_for_regen = self.cog.session_manager._get_pending_whispers_for_participant(sliced_unified_log, bot_pid)
 
             # Pseudo-turn injection to ensure history ends with a 'user' role
             if participant_history and participant_history[-1].get('role', 'user') == 'model':

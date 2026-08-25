@@ -704,6 +704,7 @@ class ShutdownConfirmView(ui.View):
         await asyncio.sleep(2)
 
         # 2. Flush all in-memory sessions to disk
+        self.cog.dirty_sessions.clear()
         for session_key, session_data in self.cog.global_chat_sessions.items():
             await self.cog.session_manager._save_session_to_disk(session_key, 'global_chat', session_data)
         

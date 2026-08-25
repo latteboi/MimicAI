@@ -202,6 +202,13 @@ async def main():
         # Graceful shutdown
         print("Shutting down bot instance...")
         mimic_cog = bot.get_cog("MimicCog")
+        if mimic_cog and hasattr(mimic_cog, "session_manager"):
+            # Mid-round appends are coalesced rather than written per turn, so the last
+            # few turns of every active session live only in memory until now.
+            try:
+                await mimic_cog.session_manager.flush_all_dirty()
+            except Exception as e:
+                print(f"Error flushing session logs on shutdown: {e}")
         if mimic_cog and hasattr(mimic_cog, "child_bot_manager"):
             await mimic_cog.child_bot_manager.shutdown_all()
         print("All processes terminated. Exiting.")

@@ -1065,13 +1065,23 @@ class ChildBotManager:
                 session = self.cog.multi_profile_channels.get(channel_id)
                 if session:
                     session['last_bot_message_id'] = message_ids[-1]
-                    for turn in session.get("unified_log", []):
+                    # Track where the turn sat: a confirmation for a turn that has since
+                    # been sealed into the cold segment cannot be persisted by a tail
+                    # write, and message_ids is what regenerate, delete and the audit
+                    # view key off.
+                    unified_log = session.get("unified_log", [])
+                    turn_index = -1
+                    for i, turn in enumerate(unified_log):
                         if turn.get("turn_id") == turn_id:
                             turn.setdefault("message_ids", []).extend(message_ids)
+                            turn_index = i
                             break
 
-                    session_type = session.get("type", "multi")
-                    await self.cog.session_manager._save_session_to_disk((channel_id, None, None), session_type, session.get("unified_log", []))
+                    if turn_index >= 0:
+                        session_type = session.get("type", "multi")
+                        await self.cog.session_manager.flush_session(
+                            (channel_id, None, None), session_type,
+                            structural=turn_index < session.get("_log_cold_len", 0))
 
         except Exception as e:
             print(f"[ChildBotManager] Confirmation processing error ({correlation_id}): {e}")

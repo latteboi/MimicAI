@@ -669,6 +669,50 @@ DEFAULT_KICKSTART_IDLE = "<internal_note>No response from anyone OR no user is p
 
 DEFAULT_DIRECTOR_USER_PROMPT = "Recent History:\n{history}\n\nGenerate your Director's prompt."
 
+# --- Rolling session synopsis -------------------------------------------------
+# Compaction folds the oldest public turns of a session into a running synopsis so a
+# long scene stays coherent past the STM window instead of falling off it. Private
+# turns are never summarised -- see SessionCompactionMixin.
+
+# Defaults chosen so a session that turns this on does something sensible without
+# further configuration: compact once the visible public transcript reaches
+# COMPACTION_THRESHOLD turns, folding the oldest COMPACTION_CHUNK of them.
+COMPACTION_THRESHOLD_DEFAULT = 50
+COMPACTION_CHUNK_DEFAULT = 25
+COMPACTION_THRESHOLD_MIN = 10
+COMPACTION_THRESHOLD_MAX = 400
+# A chunk must leave something behind, or compaction would swallow the whole window.
+COMPACTION_CHUNK_MIN = 5
+COMPACTION_MAX_CHUNK_RATIO = 0.8
+
+# Cheap and fast: this runs on every session that enables it, and its output is
+# read far more often than it is written. Nova is only reachable through OpenRouter;
+# the Google fallback is what runs when a server has no OpenRouter key.
+COMPACTION_MODEL_DEFAULT = "OPENROUTER/amazon/nova-micro-v1"
+COMPACTION_FALLBACK_MODEL_DEFAULT = "GOOGLE/gemini-2.5-flash-lite"
+
+DEFAULT_SESSION_SYNOPSIS_PROMPT = (
+    "You are a continuity editor for an ongoing roleplay scene. You will be given a "
+    "transcript excerpt and, sometimes, the synopsis of everything that came before it.\n\n"
+    "Write a single tight synopsis covering BOTH, in past tense, third person. Preserve: "
+    "who was present and what they did, decisions made, promises, threats, revelations, "
+    "changes of location or time, unresolved questions, and any object or fact a later "
+    "scene would need. Preserve distinctive names verbatim.\n\n"
+    "Discard: turn-by-turn phrasing, greetings, small talk, and anything already implied "
+    "by what you keep.\n\n"
+    "Do not invent events. Do not address the reader. Do not use XML tags, headings or "
+    "bullet points -- write flowing prose of at most {max_words} words."
+)
+
+DEFAULT_SESSION_SYNOPSIS_USER_PROMPT = (
+    "{previous_synopsis}Transcript excerpt to fold in:\n{transcript}\n\n"
+    "Write the updated synopsis."
+)
+
+# Roughly a paragraph per compaction; the synopsis replaces many turns, so it has to
+# stay cheaper than what it replaces or compaction gains nothing.
+COMPACTION_SYNOPSIS_MAX_WORDS = 220
+
 DEFAULT_IMAGE_PRESENT = (
     "<image_context>You have just generated the following image based on the prompt: "
     "'{prompt}'. Present it with a comment.</image_context>"
@@ -896,7 +940,8 @@ SYSTEM_XML_TAGS = [
     "whisper_context", "private_whisper", "private_response", "internal_note",
     "scene_prompt", "neuro_endocrine_engine", "neuro_update", "persona_profile",
     "technical_manual", "training_data", "context_rules", "image_context",
-    "system_note", "reply_context", "negative_constraints", "content_policy"
+    "system_note", "reply_context", "negative_constraints", "content_policy",
+    "session_synopsis"
 ]
 _tags_pattern = "|".join(SYSTEM_XML_TAGS)
 
