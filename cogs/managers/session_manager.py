@@ -1054,7 +1054,7 @@ class SessionManager:
                     # profile answer with no history at all.
                     if session and (session.get('is_running') or session.get('is_regenerating')
                                     or session.get('is_purging') or session.get('is_whispering')
-                                    or session.get('whisper_waiting')):
+                                    or session.get('is_memorising') or session.get('whisper_waiting')):
                         continue
                 keys_to_evict.add(key)
 
@@ -1367,6 +1367,7 @@ class SessionManager:
             session['is_regenerating'] = False
             session['is_purging'] = False
             session['is_whispering'] = False
+            session['is_memorising'] = False
 
             # Drain task queue completely
             q = session.get('task_queue')

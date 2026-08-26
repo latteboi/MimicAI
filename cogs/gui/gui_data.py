@@ -225,12 +225,16 @@ class DataManageView(ui.View):
         ltm_filter_options = []
 
         if self.mode == 'training':
-            self.full_data_list = self.cog.memory_manager._load_training_shard(user_id_str, self.profile_name) or []
+            # Shards are append-only (edits mutate an entry in place rather than moving
+            # it), so insertion order is chronological. Reversed here, once, so every
+            # downstream consumer -- filtering, search, pagination, the item count --
+            # sees latest-first without having to know that.
+            self.full_data_list = list(reversed(self.cog.memory_manager._load_training_shard(user_id_str, self.profile_name) or []))
             title_prefix = "Training Examples"
             self.displayed_data_list = self.full_data_list
         else: # ltm
             ltm_shard = self.cog.memory_manager._load_ltm_shard(user_id_str, self.profile_name)
-            self.full_data_list = ltm_shard.get("guild", []) if ltm_shard else []
+            self.full_data_list = list(reversed(ltm_shard.get("guild", []))) if ltm_shard else []
             title_prefix = "Long-Term Memories"
 
             server_filters = {}

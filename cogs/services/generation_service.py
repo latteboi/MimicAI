@@ -26,7 +26,6 @@ from ..utils.helpers import (
     _format_history_entry, _get_user_hash, _resolve_safety_settings, _scrub_response_text,
     _split_into_sentences_with_abbreviations,
 )
-from ..managers.memory_manager import encode_embedding_b64
 from ..managers.session_manager import intern_turn
 
 from .generation._shared import _strip_neuro_update_and_scrub
@@ -40,11 +39,12 @@ from .generation.whisper import WhisperMixin
 from .generation.image_round import ImageRoundMixin
 from .generation.triggers import TriggerIntakeMixin
 from .generation.compaction import SessionCompactionMixin
+from .generation.ltm_capture import LtmCaptureMixin
 
 
 class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, RegenerationMixin,
                         SpeakAsMixin, GlobalChatMixin, WhisperMixin, ImageRoundMixin,
-                        TriggerIntakeMixin, SessionCompactionMixin):
+                        TriggerIntakeMixin, SessionCompactionMixin, LtmCaptureMixin):
     """Owns the core generation engine: the multi-participant turn-rotation worker
     (_multi_profile_worker, defined here) plus the heartbeat/prompt-building/delivery/
     regeneration/speak/global-chat/whisper mixins (each in cogs/services/generation/) that
@@ -84,7 +84,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 try:
                     initial_trigger = await session['task_queue'].get()
                     
-                    while session.get('is_purging') or session.get('is_regenerating'):
+                    while session.get('is_purging') or session.get('is_regenerating') or session.get('is_memorising'):
                         await asyncio.sleep(0.5)
 
                     # Yield to a whisper that is already queued for this channel. Without
@@ -1839,59 +1839,23 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         participant['ltm_counter'] = participant.get('ltm_counter', 0) + 1
                         
                         interval = p_settings.get("ltm_creation_interval", 10)
-                        context_size = p_settings.get("ltm_summarization_context", 10)
-              
-                        if participant['ltm_counter'] >= interval:
-                            # Derived per participant from unified_log. This previously read
-                            # next(iter(session['chat_sessions'].values())) — whichever participant
-                            # happened to be first in dict order — so in a multi-profile session
-                            # every profile's long-term memory was written from another profile's
-                            # view of the conversation, private turns included.
-                            #
-                            # The STM floor keeps the summarisation window governed by
-                            # ltm_summarization_context rather than by this profile's STM length,
-                            # which is what the old unbounded shadow history effectively did.
-                            ltm_p_settings = dict(p_settings)
-                            ltm_p_settings["stm_length"] = max(
-                                int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)),
-                                context_size * 2,
-                            )
-                            ltm_bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
-                            ltm_history = self.cog.session_manager._build_history_for_participant(
-                                session.get("unified_log", []), ltm_bot_pid, ltm_p_settings, len(profile_order) or 1
-                            )
-                            if len(ltm_history) >= 2:
-                                # Turn history is consolidated
-                                events_for_summary = []
-                                for turn in ltm_history[-context_size:]:
-                                    parts = turn.get('parts', [])
-                                    if parts:
-                                        text_val = "\n".join(p if isinstance(p, str) else p.get('text', '') for p in parts)
-                                        events_for_summary.append(text_val)
-                                
-                                # [FIX] Offload LTM generation to a background task so it doesn't block the queue
-                                async def background_ltm_gen(o_id, p_name, evts, r_author, g_id, t_user_id):
-                                    try:
-                                        _, _, _, temp, top_p, top_k, primary_model, _ = await asyncio.to_thread(
-                                            self._construct_system_instructions, o_id, p_name, channel_id, is_multi_profile=True
-                                        )
-                                        ltm_d = await self.cog.memory_manager._generate_ltm_data_from_history(evts, r_author, {"temperature": temp, "top_p": top_p, "top_k": top_k}, g_id, profile_owner_id=o_id, profile_name=p_name)
-                                        if ltm_d:
-                                            summary_embedding = await self.cog.memory_manager._get_embedding(ltm_d, g_id, task_type="RETRIEVAL_DOCUMENT")
-                                            if summary_embedding:
-                                                b64_emb = encode_embedding_b64(summary_embedding)
-                                                await self.cog.memory_manager._add_ltm(o_id, p_name, ltm_d, b64_emb, g_id, t_user_id, r_author)
-                                                
-                                                # Link LTM creation to the turn metadata for trace transparency
-                                                bot_pid = self.cog.profile_manager._get_pid_from_name_any(o_id, p_name)
-                                                last_turn = next((t for t in reversed(session.get("unified_log", [])) if t.get("speaker_pid") == bot_pid), None)
-                                                if last_turn and "meta" in last_turn:
-                                                    last_turn["meta"]["ltm_created"] = True
-                                    except Exception as e:
-                                        print(f"Background LTM generation failed for {p_name}: {e}")
 
-                                asyncio.create_task(background_ltm_gen(owner_id, profile_name, events_for_summary, round_author_name, guild_id, triggering_user_id))
-                            
+                        if participant['ltm_counter'] >= interval:
+                            # Offloaded to a background task so a slow summary doesn't block the
+                            # queue. The actual summarise -> embed -> store chain lives in
+                            # LtmCaptureMixin._summarize_and_store_ltm, shared with /memorise, which
+                            # awaits it directly instead since it has to report success back to the
+                            # admin who ran it.
+                            async def background_ltm_gen(o_id, p_name, p_stgs, r_author, g_id, t_user_id):
+                                try:
+                                    await self._summarize_and_store_ltm(
+                                        channel_id, session, o_id, p_name, p_stgs, g_id, r_author, t_user_id
+                                    )
+                                except Exception as e:
+                                    print(f"Background LTM generation failed for {p_name}: {e}")
+
+                            asyncio.create_task(background_ltm_gen(owner_id, profile_name, p_settings, round_author_name, guild_id, triggering_user_id))
+
                             participant['ltm_counter'] = 0
 
                 # AGGRESSIVE GC: Clear references

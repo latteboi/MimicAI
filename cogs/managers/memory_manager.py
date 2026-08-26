@@ -787,7 +787,12 @@ class MemoryManager:
                 return response_text
         except Exception as e:
             err_str = str(e)
-            if "429" not in err_str and "RESOURCE_EXHAUSTED" not in err_str and "503" not in err_str and "UNAVAILABLE" not in err_str:
+            # A missing/misconfigured key is a configuration state, not a transient
+            # failure -- same treatment as the rate-limit/unavailable cases below, since
+            # both primary and fallback routinely miss a key on a server that has only
+            # configured one provider, and that should not read as a crash.
+            if ("429" not in err_str and "RESOURCE_EXHAUSTED" not in err_str and "503" not in err_str
+                    and "UNAVAILABLE" not in err_str and "API Key not found" not in err_str):
                 print(f"LTM Gen err {user_dn}: {e}")
                 traceback.print_exc()
                 if warning_channel:

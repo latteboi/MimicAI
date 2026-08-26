@@ -346,7 +346,7 @@ PURGE_BUSY_WAIT_TIMEOUT_SECONDS = 30.0
 WHISPER_BUSY_WAIT_TIMEOUT_SECONDS = 300.0
 # Every flag that means "this channel is mid-operation". A whisper claims the channel only
 # once all of them are clear; the check and the claim must be in the same synchronous step.
-SESSION_BUSY_FLAGS = ('is_running', 'is_regenerating', 'is_purging', 'is_whispering')
+SESSION_BUSY_FLAGS = ('is_running', 'is_regenerating', 'is_purging', 'is_whispering', 'is_memorising')
 WHISPER_WAITING_NOTICE = "\u23f3 Waiting for turns to finish..."
 PROMPT_CACHE_MAX_SIZE = 20
 MAX_USER_PROFILES = 50
@@ -375,6 +375,15 @@ NEXT_SPEAKER_EMOJI = "⏯️"
 CONTINUE_ROUND_EMOJI = "🍿"
 MUTE_TURN_EMOJI = ["🔇", "🔕"]
 SKIP_PARTICIPANT_EMOJI = ["❌", "✖️"]
+TRAIN_INPUT_EMOJI = "1️⃣"
+TRAIN_OUTPUT_EMOJI = "2️⃣"
+# /train arms a channel rather than capturing immediately, so a forgotten arm must not
+# silently harvest reactions indefinitely. Checked lazily on the next reaction rather
+# than via a background sweep.
+TRAIN_ARM_TIMEOUT_SECONDS = 900
+# Bound for armed_training_channels, keyed by channel_id -- realistically only a
+# handful of channels are ever armed at once, but per policy this must still be bounded.
+TRAIN_ARMED_CACHE_MAX_SIZE = 100
 
 DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS = (
     "You are a memory consolidation AI. Your task is to analyze a conversation excerpt and create a concise, third-person summary of the most important information to be stored as a long-term memory.\n\n"

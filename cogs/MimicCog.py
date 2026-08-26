@@ -4,8 +4,8 @@ from .utils.constants import (
     FALLBACK_MODEL_NAME, LOCK_REFRESH_INTERVAL_SECONDS, LOCK_STALE_THRESHOLD_SECONDS,
     MAX_MULTI_PROFILES, MOD_DATA_DIR, PRIMARY_MODEL_NAME, PUBLIC_PROFILES_DIR,
     PURGED_MESSAGE_ID_CACHE_MAX_SIZE, PURGE_BUSY_WAIT_TIMEOUT_SECONDS, SERVERS_DIR,
-    SESSIONS_GLOBAL_DIR, USERS_DIR, defaultConfig, is_admin_or_owner_check,
-    is_owner_in_dm_check,
+    SESSIONS_GLOBAL_DIR, SESSION_BUSY_FLAGS, TRAIN_ARMED_CACHE_MAX_SIZE, TRAIN_INPUT_EMOJI,
+    TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check, is_owner_in_dm_check,
 )
 from .services.api_service import OpenRouterModel, GoogleGenAIModel
 from .listeners.event_listeners import EventListeners
@@ -188,6 +188,9 @@ class MimicCog(commands.Cog, EventListeners):
         self.debug_users: Set[int] = set()
         self.global_chat_sessions: LRUCache = LRUCache(max_size=10)
         self.purged_message_ids: LRUCache = LRUCache(PURGED_MESSAGE_ID_CACHE_MAX_SIZE)
+        # /train arms a channel to capture a training example from 1️⃣/2️⃣ reactions.
+        # Keyed by channel_id; see EventListeners._handle_train_reaction.
+        self.armed_training_channels: LRUCache = LRUCache(TRAIN_ARMED_CACHE_MAX_SIZE)
         self.pending_child_confirmations: LRUCache = LRUCache(max_size=200)
         self.global_blacklist: Set[int] = set()
         self.server_manager._load_blacklist()
@@ -1088,30 +1091,22 @@ class MimicCog(commands.Cog, EventListeners):
 
         await interaction.followup.send(f"Session suspended for {interaction.channel.mention} and Freewill triggers disabled. The bot will be silent until mentioned or configured again.", ephemeral=True)
 
-    @app_commands.command(name="purge", description="Purges messages and memory, or gracefully dehydrates the session (Admin Only).")
+    @app_commands.command(name="purge", description="Purges messages and the associated session memory (Admin Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     @app_commands.guild_only()
     @is_admin_or_owner_check()
-    @app_commands.describe(amount="Messages to delete (1-100). Leave blank to gracefully dehydrate the session.")
-    async def purge_slash(self, interaction: discord.Interaction, amount: Optional[app_commands.Range[int,1,100]] = None):
+    @app_commands.describe(amount="Messages to delete (1-100).")
+    async def purge_slash(self, interaction: discord.Interaction, amount: app_commands.Range[int,1,100]):
         if not self.has_lock : return
         await interaction.response.defer(ephemeral=True)
 
         if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
             await interaction.followup.send("Purge command not supported in this channel type.", ephemeral=True)
             return
-            
+
         app_perms = interaction.app_permissions
         if not app_perms or not app_perms.manage_messages:
             await interaction.followup.send("I lack 'Manage Messages' permission.", ephemeral=True); return
-
-        if amount is None:
-            if interaction.channel_id in self.multi_profile_channels:
-                self.session_last_accessed[interaction.channel_id] = 0
-                await interaction.followup.send("Session marked for graceful dehydration. It will be unloaded from RAM when inactive.", ephemeral=True)
-            else:
-                await interaction.followup.send("No active session found in RAM to dehydrate.", ephemeral=True)
-            return
 
         def check_and_track(m):
             self.purged_message_ids[m.id] = True
@@ -1134,7 +1129,7 @@ class MimicCog(commands.Cog, EventListeners):
                 # died with is_running still set is exactly what produces that.
                 wait_deadline = time.monotonic() + PURGE_BUSY_WAIT_TIMEOUT_SECONDS
                 while (session_lock.get('is_running') or session_lock.get('is_regenerating')
-                       or session_lock.get('is_whispering')):
+                       or session_lock.get('is_whispering') or session_lock.get('is_memorising')):
                     if time.monotonic() > wait_deadline:
                         await interaction.followup.send(
                             f"The session is still generating after {int(PURGE_BUSY_WAIT_TIMEOUT_SECONDS)}s. "
@@ -1220,6 +1215,148 @@ class MimicCog(commands.Cog, EventListeners):
         finally:
             if session_lock:
                 session_lock['is_purging'] = False
+
+    @app_commands.command(name="memorise", description="Forces long-term memory summarisation for this session's cast, right now.")
+    @app_commands.checks.cooldown(2, 60.0, key=lambda i: i.user.id)
+    @app_commands.guild_only()
+    @app_commands.describe(profile="Optional: summarise only this participant. Leave blank for the whole cast.")
+    @app_commands.autocomplete(profile=EventListeners.master_autocomplete)
+    async def memorise_slash(self, interaction: discord.Interaction, profile: Optional[str] = None):
+        if not self.has_lock: return
+        await interaction.response.defer(ephemeral=True)
+
+        session = self.multi_profile_channels.get(interaction.channel_id)
+        if not session:
+            await interaction.followup.send("No active session found in this channel.", ephemeral=True)
+            return
+
+        target_participant = None
+        if profile:
+            try:
+                p_owner_id_str, p_name = profile.split(":", 1)
+                p_owner_id = int(p_owner_id_str)
+            except ValueError:
+                p_owner_id = None
+                p_name = profile
+
+            target_participant = next(
+                (p for p in session.get("profiles", [])
+                 if p.get("profile_name") == p_name and (p_owner_id is None or p.get("owner_id") == p_owner_id)),
+                None,
+            )
+            if not target_participant:
+                await interaction.followup.send(f"Could not find participant '{p_name}' in this session.", ephemeral=True)
+                return
+
+        is_admin = interaction.user.guild_permissions.administrator
+        if target_participant:
+            if not (is_admin or interaction.user.id == target_participant['owner_id']):
+                await interaction.followup.send(
+                    "You can only force memory summarisation for a profile you own (or be an administrator).",
+                    ephemeral=True)
+                return
+        elif not is_admin:
+            await interaction.followup.send(
+                "Summarising the whole cast requires administrator permission. Name a single profile you own instead.",
+                ephemeral=True)
+            return
+
+        session_type = session.get("type", "multi")
+        if not session.get("is_hydrated"):
+            session = await self.session_manager._ensure_session_hydrated(interaction.channel_id, session_type)
+            if not session:
+                await interaction.followup.send("Could not hydrate the session.", ephemeral=True)
+                return
+
+        self.session_last_accessed[interaction.channel_id] = time.time()
+
+        if not await self.session_manager._wait_for_session_flags(session, SESSION_BUSY_FLAGS, PURGE_BUSY_WAIT_TIMEOUT_SECONDS):
+            await interaction.followup.send(
+                f"The session is still busy after {int(PURGE_BUSY_WAIT_TIMEOUT_SECONDS)}s. Try again in a moment.",
+                ephemeral=True)
+            return
+        session['is_memorising'] = True
+
+        try:
+            guild_id = interaction.guild.id
+            targets = [target_participant] if target_participant else list(session.get("profiles", []))
+
+            summarised, skipped, failed = [], [], []
+            for p in targets:
+                owner_id = p['owner_id']
+                p_name = p['profile_name']
+                p_index = self.profile_manager._get_user_index(owner_id)
+                p_is_borrowed = p_name in p_index.get("borrowed", [])
+                p_settings = self.profile_manager._get_profile_config(owner_id, p_name, p_is_borrowed) or {}
+
+                if not p_settings.get("ltm_creation_enabled", False):
+                    skipped.append(f"{p_name} (LTM disabled)")
+                    continue
+
+                try:
+                    created, detail = await self.generation_service._summarize_and_store_ltm(
+                        interaction.channel_id, session, owner_id, p_name, p_settings,
+                        guild_id, interaction.user.display_name, interaction.user.id,
+                        warning_channel=interaction.channel,
+                    )
+                except Exception as e:
+                    created, detail = False, str(e)
+
+                p['ltm_counter'] = 0
+                (summarised if created else failed).append(p_name if created else f"{p_name} ({detail})")
+
+            lines = []
+            if summarised:
+                lines.append(f"**Summarised:** {', '.join(summarised)}")
+            if skipped:
+                lines.append(f"**Skipped:** {', '.join(skipped)}")
+            if failed:
+                lines.append(f"**No new memory:** {', '.join(failed)}")
+            if not lines:
+                lines.append("Nothing to summarise.")
+
+            await interaction.followup.send("\n".join(lines), ephemeral=True)
+        finally:
+            if session:
+                session['is_memorising'] = False
+
+    @app_commands.command(name="train", description="Arms this channel to capture a training example from reactions (1️⃣ input, 2️⃣ output).")
+    @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)
+    @app_commands.guild_only()
+    @app_commands.describe(profile="Your own profile to train (borrowed and system profiles are not eligible).")
+    @app_commands.autocomplete(profile=EventListeners.master_autocomplete)
+    async def train_slash(self, interaction: discord.Interaction, profile: str):
+        if not self.has_lock: return
+        await interaction.response.defer(ephemeral=True)
+
+        candidates = gather_owned_candidates(self, interaction.user.id, only=lambda name, kind: kind == "personal")
+        candidate_names = {c.value for c in candidates}
+
+        if profile not in candidate_names:
+            corrected = autocorrect_profile(profile, candidates)
+            if corrected is not None:
+                profile = corrected
+            else:
+                async def on_pick(pick_interaction: discord.Interaction, picked: str):
+                    await self.train_slash.callback(self, pick_interaction, profile=picked)
+
+                await suggest_profile(self, interaction, profile, candidates, on_pick)
+                return
+
+        self.armed_training_channels[interaction.channel_id] = {
+            "owner_id": interaction.user.id,
+            "profile_name": profile,
+            "armed_by": interaction.user.id,
+            "guild_id": interaction.guild.id,
+            "last_activity": time.time(),
+            "slot1": None,
+            "slot2": None,
+        }
+        await interaction.followup.send(
+            f"Armed to train **{profile}**. React {TRAIN_INPUT_EMOJI} on the input message and {TRAIN_OUTPUT_EMOJI} on "
+            "the output message (any two messages, from anyone, in any order). Stays armed for more pairs -- only your "
+            "reactions count, and arming expires after 15 minutes of inactivity.",
+            ephemeral=True)
 
     @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
     async def view_generation_trace(self, interaction: discord.Interaction, message: discord.Message):

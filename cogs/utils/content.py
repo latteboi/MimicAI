@@ -636,18 +636,20 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'The profile does not remember our server conversation in global chat.' Fix: Correct, and there is no setting for it. Global chat keeps a separate history of its own, and every long-term memory belongs to the server it formed in, so no server memory is ever recalled there."
     ),
     "sessions/maintenance_commands.txt": (
-        "Commands: `/refresh`, `/cancel`, `/suspend`, `/purge`, `/clear`, `/session view`, `/session trigger`, `/session audit`\n"
+        "Commands: `/refresh`, `/cancel`, `/suspend`, `/purge`, `/memorise`, `/clear`, `/session view`, `/session trigger`, `/session audit`\n"
         "- `/refresh`: Clears the short-term conversation buffer for this channel. Long-term memories and training examples are untouched. Use when a profile has become confused about recent events.\n"
         "- `/cancel`: Stops whatever generation or typing indicator is currently running in this channel.\n"
         "- `/suspend`: Administrators. Ends the session in this channel and stops the bot responding until it is configured again.\n"
-        "- `/purge`: Administrators. Deletes messages and the associated session memory, or gracefully dehydrates the session.\n"
+        "- `/purge`: Administrators. Deletes messages and the associated session memory.\n"
+        "- `/memorise`: Administrators (or a participant's owner, for a single named profile). Forces long-term memory summarisation for the session's cast right now, instead of waiting for the automatic creation interval.\n"
         "- `/clear`: Clears the bot's own messages from a DM channel.\n"
         "- `/session view`: Shows the current session configuration and participant status.\n"
         "- `/session trigger`: Forces a new round immediately without waiting for a user message.\n"
         "- `/session audit`: Reports token usage and diagnostics for the active session. Use it when you want to know what is actually filling the context window.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'The bot seems stuck typing forever.' Fix: Run `/cancel` in that channel.\n"
-        "- Symptom: 'Responses are getting expensive or slow and I do not know why.' Fix: Run `/session audit` to see the token breakdown per participant."
+        "- Symptom: 'Responses are getting expensive or slow and I do not know why.' Fix: Run `/session audit` to see the token breakdown per participant.\n"
+        "- Symptom: 'I want my characters to remember this conversation right now instead of waiting.' Fix: Run `/memorise`."
     ),
 
     # --- MEMORY ---
@@ -666,10 +668,12 @@ DEFAULT_HELP_DOCS = {
         "Retrieval: When a user speaks, their prompt is embedded and compared against the LTM archive. If the score exceeds the 'Relevance Threshold', the memory is injected as `<archive_context>`.\n"
         "Where a memory applies: Every memory belongs to the server it formed in and is recalled only there. A profile used in several servers keeps a separate archive per server, and none of them reach global chat.\n"
         "Management: Add, edit and delete memories at `/profile manage` -> Memory -> Manage Long-Term Memories. Tune recall with 'Set LTM Parameters', and rewrite the summarisation instruction with 'Set LTM Summarization Prompt'.\n"
+        "Manual trigger: `/memorise` in a session channel forces summarisation immediately for the whole cast (administrators) or one named profile (its owner), rather than waiting for the Creation Interval.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'The profile keeps bringing up irrelevant old events.' Fix: Raise the LTM Relevance Threshold in Set LTM Parameters before deleting memories.\n"
         "- Symptom: 'The profile never remembers anything.' Fix: Check LTM Auto-Creation is on, that the Creation Interval is not set very high, and that the Relevance Threshold is not too strict.\n"
-        "- Symptom: 'Memories are not being created.' Fix: Summarisation needs a working API key on the server. Check `/settings` -> API Keys."
+        "- Symptom: 'Memories are not being created.' Fix: Summarisation needs a working API key on the server. Check `/settings` -> API Keys.\n"
+        "- Symptom: 'I want a memory formed right now instead of waiting for the interval.' Fix: Run `/memorise`."
     ),
     "memory/training_examples.txt": (
         "Concept: Training Examples are explicit input-output pairs you author by hand to dictate a profile's voice, formatting and tone. Maximum 100 per profile.\n"
@@ -677,9 +681,11 @@ DEFAULT_HELP_DOCS = {
         "Best use: Situational voice -- how the character greets someone, reacts to an insult, or handles a question it cannot answer.\n"
         "Management: `/profile manage` -> Memory -> Manage Training Examples. Tune matching with 'Set Training Parameters'.\n"
         "Availability: Training Examples belong to the profile owner. They cannot be edited on a borrowed profile.\n"
+        "Quick capture via reactions: Run `/train <profile>` to arm a channel, then react 1️⃣ on any message to use as the input and 2️⃣ on any message to use as the output -- any two messages, from anyone, in any order, whether or not either one is part of an active session. Each completed pair becomes one example immediately and the channel stays armed for more. Only your own reactions count while armed, and arming expires after 15 minutes of inactivity.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'My training examples never seem to apply.' Fix: Lower the relevance threshold in Set Training Parameters, or rewrite the example input to resemble how users actually phrase things.\n"
-        "- Symptom: 'The character copies my examples word for word.' Fix: Provide several varied examples for the same situation rather than one, and raise temperature slightly."
+        "- Symptom: 'The character copies my examples word for word.' Fix: Provide several varied examples for the same situation rather than one, and raise temperature slightly.\n"
+        "- Symptom: 'Reacting 1️⃣/2️⃣ does nothing.' Fix: Run `/train <profile>` first to arm the channel -- reactions only count while a channel is armed, only from whoever ran the command, and only within 15 minutes of the last matching reaction."
     ),
     "memory/context_metadata_and_xml.txt": (
         "Concept: MimicAI uses an XML partitioning protocol to keep background technical context isolated from conversational chat. Models separate tagged system data from user speech far more reliably than they separate prose from prose.\n"

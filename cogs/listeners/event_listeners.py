@@ -230,12 +230,20 @@ class EventListeners:
             return
 
         emoji_str = str(payload.emoji)
+
+        # /train reactions work whether or not this channel has any active/logged chat
+        # session at all, so this is handled and short-circuited before the
+        # session-required bail-out below.
+        if emoji_str in (TRAIN_INPUT_EMOJI, TRAIN_OUTPUT_EMOJI):
+            await self._handle_train_reaction(payload, emoji_str == TRAIN_INPUT_EMOJI)
+            return
+
         is_regen = (emoji_str == REGENERATE_EMOJI)
         is_next = (emoji_str == NEXT_SPEAKER_EMOJI)
         is_continue = (emoji_str == CONTINUE_ROUND_EMOJI)
         is_mute = (emoji_str in MUTE_TURN_EMOJI)
         is_skip = (emoji_str in SKIP_PARTICIPANT_EMOJI)
-        
+
         if not any([is_regen, is_next, is_continue, is_mute, is_skip]):
             return
 
@@ -420,12 +428,22 @@ class EventListeners:
         if not self.has_lock: return
         
         emoji_str = str(payload.emoji)
+
+        if emoji_str in (TRAIN_INPUT_EMOJI, TRAIN_OUTPUT_EMOJI):
+            entry = self.armed_training_channels.get(payload.channel_id)
+            if entry and payload.user_id == entry["armed_by"]:
+                slot_key = "slot1" if emoji_str == TRAIN_INPUT_EMOJI else "slot2"
+                slot = entry.get(slot_key)
+                if slot and slot["message_id"] == payload.message_id:
+                    entry[slot_key] = None
+            return
+
         is_mute = (emoji_str in MUTE_TURN_EMOJI)
         is_skip = (emoji_str in SKIP_PARTICIPANT_EMOJI)
         is_regen = (emoji_str == REGENERATE_EMOJI)
         is_next = (emoji_str == NEXT_SPEAKER_EMOJI)
         is_continue = (emoji_str == CONTINUE_ROUND_EMOJI)
-        
+
         if not any([is_mute, is_skip, is_regen, is_next, is_continue]): return
 
         channel_id = payload.channel_id
@@ -487,7 +505,123 @@ class EventListeners:
                         msg = await channel.fetch_message(payload.message_id)
                         await msg.remove_reaction(payload.emoji, self.bot.user)
                     except: pass
-            
+
+
+    async def _handle_train_reaction(self, payload: discord.RawReactionActionEvent, is_input_slot: bool) -> bool:
+        """React 1️⃣/2️⃣ into a training example while /train has armed this channel.
+
+        Works whether or not the reacted message belongs to any active/logged session --
+        by design, per /train, neither the reacted messages' session membership nor their
+        authorship matters.
+        """
+        entry = self.armed_training_channels.get(payload.channel_id)
+        if not entry:
+            return False
+
+        if time.time() - entry["last_activity"] > TRAIN_ARM_TIMEOUT_SECONDS:
+            self.armed_training_channels.pop(payload.channel_id, None)
+            return False
+
+        # Only the user who ran /train counts -- authorship of the reacted messages is
+        # irrelevant, so anyone else's reaction would otherwise let them write training
+        # data onto someone else's profile.
+        if payload.user_id != entry["armed_by"]:
+            return False
+
+        text, is_user = await self._resolve_reacted_message_text(payload)
+        if text is None:
+            return False
+
+        slot_key = "slot1" if is_input_slot else "slot2"
+        other_key = "slot2" if is_input_slot else "slot1"
+        other = entry.get(other_key)
+        if other and other["message_id"] == payload.message_id:
+            return False  # same message reacted with both emoji -- not a valid pair
+
+        entry[slot_key] = {
+            "message_id": payload.message_id,
+            "text": text[:1000 if is_input_slot else 2000],
+            "is_user": is_user,
+        }
+        entry["last_activity"] = time.time()
+
+        # Same indicator pattern as mute/skip: react back with the same emoji immediately
+        # so the armer sees the reaction was registered. Cleared once the pair commits.
+        async def _ack():
+            try:
+                ch = self.bot.get_channel(payload.channel_id)
+                msg = await ch.fetch_message(payload.message_id)
+                await msg.add_reaction(payload.emoji)
+            except Exception:
+                pass
+        asyncio.create_task(_ack())
+
+        if entry.get("slot1") and entry.get("slot2"):
+            await self._commit_training_pair(payload.channel_id, entry)
+        return True
+
+    async def _resolve_reacted_message_text(self, payload: discord.RawReactionActionEvent):
+        """The text and (if known) speaker of the reacted message, for /train capture.
+
+        Prefers the already-cleaned unified_log turn when this channel has a hydrated
+        session and the message is in it -- no I/O. Otherwise falls back to fetching the
+        raw Discord message; a session is deliberately never force-hydrated just to check,
+        since that would defeat the point of /train working independent of any session.
+        """
+        session = self.multi_profile_channels.get(payload.channel_id)
+        if session and session.get("is_hydrated"):
+            for turn in session.get("unified_log", []):
+                if payload.message_id in turn.get("message_ids", []):
+                    return turn.get("content", ""), turn.get("is_user")
+
+        try:
+            ch = self.bot.get_channel(payload.channel_id)
+            if ch is None:
+                return None, None
+            msg = await ch.fetch_message(payload.message_id)
+            return msg.content, None
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None, None
+
+    async def _commit_training_pair(self, channel_id: int, entry: Dict[str, Any]):
+        s1, s2 = entry["slot1"], entry["slot2"]
+        warn = ""
+        if s1["is_user"] is not None and s2["is_user"] is not None and s1["is_user"] == s2["is_user"]:
+            warn = "\n⚠️ Both messages look like they're from the same side of the conversation."
+
+        success, msg = await self.memory_manager.add_new_training_example(
+            entry["owner_id"], entry["profile_name"], s1["text"], s2["text"], entry["guild_id"])
+
+        entry["slot1"] = None
+        entry["slot2"] = None
+
+        if not success and "Limit Reached" in msg:
+            self.armed_training_channels.pop(channel_id, None)
+            msg += " Disarming `/train` for this channel."
+
+        ch = self.bot.get_channel(channel_id)
+        if ch:
+            try:
+                await ch.send(f"{msg}{warn}", delete_after=30 if success else None)
+            except discord.HTTPException:
+                pass
+
+            # Each message only ever carried its own slot's emoji (the armer's reaction
+            # plus this bot's own ack), so clearing that one emoji per message is enough --
+            # same clear_reaction(emoji) call a queued reaction trigger makes once it's
+            # actually picked up, in cogs/services/generation/triggers.py.
+            async def _cleanup():
+                try:
+                    m1 = await ch.fetch_message(s1["message_id"])
+                    await m1.clear_reaction(TRAIN_INPUT_EMOJI)
+                except Exception:
+                    pass
+                try:
+                    m2 = await ch.fetch_message(s2["message_id"])
+                    await m2.clear_reaction(TRAIN_OUTPUT_EMOJI)
+                except Exception:
+                    pass
+            asyncio.create_task(_cleanup())
 
     @commands.Cog.listener()
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
@@ -878,7 +1012,7 @@ class EventListeners:
         pending: List[Tuple[str, str]] = []
         meta: Dict[str, Any] = {}
 
-        if cmd_name in ["speak", "whisper"]:
+        if cmd_name in ["speak", "whisper", "memorise"]:
             server_id_str = str(interaction.guild_id) if interaction.guild_id else "dm"
             server_index = self.server_manager._get_server_index(server_id_str)
             channel_str = str(interaction.channel_id)
