@@ -1437,6 +1437,7 @@ class GoogleRESTModel:
         with mem_probe.probe("    api: parse skeleton"):
             parsed = json.loads(skeleton)
         skeleton = None
+        mem_probe.describe_bulk(parsed)
         return GoogleRESTResponse(parsed, blob_paths=blob_paths)
 
 

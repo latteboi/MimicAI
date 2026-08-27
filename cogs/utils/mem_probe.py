@@ -17,6 +17,14 @@ A phase where RSS jumps and the Python heap does not is *not* a Python problem, 
 no amount of dropping references will fix it. That distinction is why both numbers
 are here; chasing the wrong one costs days.
 
+**`heap peak` over-reports orjson by ~13x.** `orjson.loads` on a 2.3 MB document
+reports a 30 MB tracemalloc peak and costs 2.4 MB of real RSS -- measured with
+`ru_maxrss`, a high-water mark that a genuine transient could not hide from. The
+Rust-side buffer growth is traced in a way the peak counts but the OS never
+materialises. Read `rss kept` for any phase whose work is an orjson parse; a
+`heap peak` in the tens of MB there is the instrument, not the program. `heap
+kept` is unaffected and stays trustworthy.
+
 Note for anyone profiling on macOS or musl: `memory_tuning` is a no-op off glibc.
 `M_MMAP_THRESHOLD`, `M_ARENA_MAX` and `malloc_trim` are what keep the resident set
 from ratcheting on the deployment target, and none of them exist on a Mac. RSS
@@ -163,6 +171,40 @@ def probe(label: str, peak: bool = True):
                 if shown >= _TOP_N:
                     break
             del snap_after, diff
+
+def describe_bulk(obj, top: int = 6, min_bytes: int = 65536) -> None:
+    """Prints where a parsed response's bulk actually is, by key path.
+
+    Only key *names* and byte counts are printed, never values -- this runs against
+    live session content. The question it answers is the one a total cannot: a
+    skeleton that stays large after the image has been diverted is carrying
+    something else, and naming that field is the difference between diverting it too
+    and guessing at it.
+    """
+    if not ENABLED:
+        return
+    sizes = {}
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, f"{path}.{k}" if path else str(k))
+        elif isinstance(node, (list, tuple)):
+            for v in node:
+                walk(v, f"{path}[]")
+        elif isinstance(node, (str, bytes, bytearray)):
+            if len(node) >= 1024:
+                sizes[path] = sizes.get(path, 0) + len(node)
+
+    try:
+        walk(obj, "")
+    except RecursionError:
+        return
+    rows = [kv for kv in sorted(sizes.items(), key=lambda kv: -kv[1])[:top]
+            if kv[1] >= min_bytes]
+    for path, n in rows:
+        print(f"[mem]       bulk {n / 1e6:7.2f} MB  {path}")
+
 
 async def reporter(interval: float = 5.0):
     """Prints a heap/RSS line every `interval` seconds, and in `full` mode the

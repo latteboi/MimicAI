@@ -109,8 +109,16 @@ class InlineBlobExtractor:
         self._buf += chunk
         self._run()
 
-    def finish(self) -> Tuple[bytes, List[str]]:
-        """Returns (skeleton_json, blob_paths). The caller owns the files from here."""
+    def finish(self) -> Tuple[bytearray, List[str]]:
+        """Returns (skeleton_json, blob_paths). The caller owns both from here.
+
+        The skeleton is handed over as the bytearray it was built in rather than
+        copied to `bytes`. orjson parses either, and the copy was not free: an image
+        response's skeleton is a couple of MB even with the image diverted, so
+        `bytes(...)` put two of it in the heap at once and left the bytearray alive
+        for as long as the extractor was. Ownership transfers -- the attribute is
+        dropped here, so the extractor no longer references what it returned.
+        """
         if self._state != _OUTSIDE:
             self.cleanup()
             raise TruncatedJSONError(
@@ -118,7 +126,9 @@ class InlineBlobExtractor:
                 f"{len(self._buf)} bytes unconsumed)")
         self.skeleton += self._buf
         self._buf.clear()
-        return bytes(self.skeleton), list(self.blob_paths)
+        skeleton = self.skeleton
+        self.skeleton = bytearray()
+        return skeleton, list(self.blob_paths)
 
     def cleanup(self) -> None:
         """Unlinks everything already written. For the error paths -- a partial
