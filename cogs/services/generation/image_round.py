@@ -1,9 +1,7 @@
-import os
-import asyncio
-
 from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_MODEL
 from ...utils.helpers import _format_api_error, _resolve_safety_settings
 from ...utils.memory_tuning import maybe_trim_malloc
+from ...utils import mem_probe
 
 
 class ImageRoundMixin:
@@ -36,11 +34,12 @@ class ImageRoundMixin:
         if not gen_cfg.get("image_generation_enabled", False):
             return generated_image_path_for_round, image_gen_placeholder_id, image_gen_error_msg
 
-        # Hoisted out of the try so the finally below can still read it when
+        # Hoisted out of the try so the finally below can still read them when
         # generation raises: _generate_with_heartbeat mutates the container it
         # is handed, so a placeholder it created is recorded there even on the
-        # error path.
+        # error path, and the response owns any blob file that has to be unlinked.
         image_state_container = None
+        response = None
         try:
             api_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id)
             if not api_key: raise ValueError("Server API key not configured.")
@@ -134,8 +133,9 @@ class ImageRoundMixin:
                     existing_state=image_state_container,
                 )
 
-            result, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                img_model_raw, img_fallback_raw, _attempt, label="Image generation")
+            with mem_probe.probe("  image gen: API call"):
+                result, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
+                    img_model_raw, img_fallback_raw, _attempt, label="Image generation")
             response, image_state_container = result
             status = "blocked_by_safety" if not response.candidates else "success"
 
@@ -149,23 +149,16 @@ class ImageRoundMixin:
                 if candidate.finish_reason.name != 'STOP':
                     image_gen_error_msg = f"process stopped: {candidate.finish_reason.name.replace('_', ' ').title()}"
                 else:
-                    img_bytes = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
-                    if img_bytes:
-                        def _write_img(data=img_bytes):
-                            import tempfile
-                            fd, path = tempfile.mkstemp(suffix=".png")
-                            with os.fdopen(fd, 'wb') as f:
-                                f.write(data)
-                            return path
-                        generated_image_path_for_round = await asyncio.to_thread(_write_img)
-                        # From here the temp file is the only carrier the round
-                        # needs — the media part, the discord.File, and the
-                        # re-read on the send path all go through the path. Drop
-                        # the in-RAM copies now rather than at end of round:
-                        # these are multi-megabyte and would otherwise stay
-                        # resident through every participant's turn.
-                        img_bytes = None
-                        _write_img = None
+                    img_data = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
+                    if img_data:
+                        # Already on disk: the response streamed it there rather
+                        # than through the heap (cogs/utils/blob_stream), so this
+                        # is a rename. A small enough image is still bytes and
+                        # gets written here, exactly as it always was.
+                        with mem_probe.probe("  image gen: to file"):
+                            generated_image_path_for_round = await self.cog.api_service.materialise_inline_data(
+                                response, img_data, ".png")
+                        img_data = None
                     else:
                         image_gen_error_msg = "no image data returned"
 
@@ -183,23 +176,25 @@ class ImageRoundMixin:
             if image_state_container:
                 image_gen_placeholder_id = image_state_container.get('msg_a_id')
 
-            # The image response body carries the base64 payload (~1.33x the
-            # image) and _RestView's memoised decode of it (~1x). Nothing needs
-            # either once the bytes are on disk, but both are reachable from
-            # this frame's locals and would otherwise stay resident for the
-            # entire participant loop.
+            # The response no longer carries the image -- blob_stream diverted it
+            # to a file on the way off the socket -- so this is now about the file
+            # rather than the bytes: close() unlinks any blob the round did not
+            # take, which is what a safety block or a fallback retry leaves behind.
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
             response = None
             candidate = None
             image_state_container = None
 
-            # Those three, plus the wire body and the parsed base64 that
-            # GoogleRESTResponse dropped on the way here, are the largest run of
-            # frees the bot ever performs -- roughly 3.6x the generated image,
-            # measured. Freeing them only returns the pages to glibc's arenas;
-            # without this they sit there until some later call happens to reach
-            # the trim inside APIService._resolve_media_uri, which for a generated
-            # image is a whole round away. Rate-limited, so a round that also
-            # moves media through the File API still trims once, not twice.
+            # Kept, smaller in scope than it was. The multi-megabyte frees this
+            # used to answer for are gone with the buffered read, but the round
+            # still churns the allocator through the skeleton parse and the File
+            # API upload of the generated image, and an arena that is never
+            # trimmed is how the resident set ratchets. Rate-limited, so a round
+            # that also moves media through the File API trims once, not twice.
             maybe_trim_malloc()
 
         return generated_image_path_for_round, image_gen_placeholder_id, image_gen_error_msg

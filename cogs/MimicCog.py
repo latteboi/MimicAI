@@ -1351,6 +1351,7 @@ class MimicCog(commands.Cog, EventListeners):
             "last_activity": time.time(),
             "slot1": None,
             "slot2": None,
+            "interaction": interaction,
         }
         await interaction.followup.send(
             f"Armed to train **{profile}**. React {TRAIN_INPUT_EMOJI} on the input message and {TRAIN_OUTPUT_EMOJI} on "

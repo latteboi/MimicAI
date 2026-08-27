@@ -14,9 +14,11 @@ from ..utils.constants import (
     ALLOWED_MODELS, defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
     IMAGE_MODEL_KEYS, AUDIO_MODEL_KEYS, DEFAULT_SPEECH_VOICE,
 )
+from ..utils.blob_stream import InlineBlobExtractor, is_blob_sentinel, sentinel_path
 from ..utils.helpers import _resolve_safety_settings, is_real_model
 from ..utils.http_client import get_shared_client
 from ..utils.memory_tuning import maybe_trim_malloc
+from ..utils import mem_probe
 
 # How long a key that just got rate-limited is skipped for. storage_manager's
 # _get_api_key_for_guild/_get_api_key_for_user consult cog.api_key_cooldowns before
@@ -62,6 +64,11 @@ class OpenRouterModel:
 
     async def generate_content_async(self, contents, generation_config=None, safety_settings=None, stream_state=None):
         messages = []
+        # Local files referenced by the payload. Their base64 is spliced in while
+        # the body streams (see _plan_streamed_body) rather than interpolated into
+        # it here: OpenRouter needs the bytes inline, but nothing needs five copies
+        # of them in the heap at once.
+        blob_files: List[str] = []
         if self.system_instruction:
             messages.append({"role": "system", "content": self.system_instruction})
 
@@ -88,9 +95,16 @@ class OpenRouterModel:
                     mime_type = p.inline_data.mime_type
                     if mime_type.startswith("image/"):
                         try:
-                            b64_data = base64.b64encode(p.inline_data.data).decode('utf-8')
-                            data_uri = f"data:{mime_type};base64,{b64_data}"
-                            message_parts.append({"type": "image_url", "image_url": {"url": data_uri}})
+                            value = p.inline_data.data
+                            if isinstance(value, _BlobRef):
+                                token = _FILE_BLOB_TOKEN.format(len(blob_files))
+                                blob_files.append(value.path)
+                                message_parts.append({"type": "image_url", "image_url": {
+                                    "url": f"data:{mime_type};base64,{token}"}})
+                            else:
+                                b64_data = base64.b64encode(value).decode('utf-8')
+                                data_uri = f"data:{mime_type};base64,{b64_data}"
+                                message_parts.append({"type": "image_url", "image_url": {"url": data_uri}})
                         except Exception as e:
                             print(f"Error encoding legacy image for OpenRouter: {e}")
                 elif isinstance(p, dict) and 'url' in p:
@@ -101,12 +115,12 @@ class OpenRouterModel:
                             message_parts.append({"type": "image_url", "image_url": {"url": url}})
                         elif os.path.exists(url):
                             try:
-                                with open(url, 'rb') as img_f:
-                                    b64_data = base64.b64encode(img_f.read()).decode('utf-8')
-                                data_uri = f"data:{mime_type};base64,{b64_data}"
-                                message_parts.append({"type": "image_url", "image_url": {"url": data_uri}})
+                                token = _FILE_BLOB_TOKEN.format(len(blob_files))
+                                blob_files.append(url)
+                                message_parts.append({"type": "image_url", "image_url": {
+                                    "url": f"data:{mime_type};base64,{token}"}})
                             except Exception as e:
-                                print(f"Error encoding local image for OpenRouter: {e}")
+                                print(f"Error referencing local image for OpenRouter: {e}")
 
             if message_parts:
                 if len(message_parts) == 1 and message_parts[0]["type"] == "text":
@@ -161,7 +175,19 @@ class OpenRouterModel:
 
         try:
             client = get_shared_client()
-            response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=120.0)
+            if blob_files:
+                # Explicit Content-Length keeps httpx off chunked encoding, so the
+                # request on the wire matches the buffered one this replaces.
+                segments, content_length = _plan_streamed_body(payload, blob_files)
+                payload.clear()
+                response = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    content=_aiter_streamed_body(segments),
+                    headers={**headers, "Content-Type": "application/json",
+                             "Content-Length": str(content_length)},
+                    timeout=120.0)
+            else:
+                response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=120.0)
             if response.status_code != 200:
                 raise Exception(f"OpenRouter API Error {response.status_code}: {response.text}")
 
@@ -242,6 +268,11 @@ class OllamaModel:
     async def generate_content_async(self, contents, generation_config=None, safety_settings=None, stream_state=None):
         import re
         messages = []
+        # As in the OpenRouter adapter: files whose base64 is spliced in as the
+        # body streams. `staged_files` are the ones this call downloaded and so
+        # has to delete again.
+        blob_files: List[str] = []
+        staged_files: List[str] = []
         if self.system_instruction:
             messages.append({"role": "system", "content": self.system_instruction})
 
@@ -268,8 +299,12 @@ class OllamaModel:
                     mime_type = p.inline_data.mime_type
                     if mime_type.startswith("image/"):
                         try:
-                            b64_data = base64.b64encode(p.inline_data.data).decode('utf-8')
-                            images.append(b64_data)
+                            value = p.inline_data.data
+                            if isinstance(value, _BlobRef):
+                                images.append(_FILE_BLOB_TOKEN.format(len(blob_files)))
+                                blob_files.append(value.path)
+                            else:
+                                images.append(base64.b64encode(value).decode('utf-8'))
                         except Exception as e:
                             print(f"Error encoding legacy image for Ollama: {e}")
                 elif isinstance(p, dict) and 'url' in p:
@@ -278,17 +313,19 @@ class OllamaModel:
                     if mime_type.startswith("image/"):
                         if url.startswith(('http://', 'https://')):
                             try:
-                                resp = await get_shared_client().get(url, follow_redirects=True, timeout=15.0)
-                                resp.raise_for_status()
-                                b64_data = base64.b64encode(resp.content).decode('utf-8')
-                                images.append(b64_data)
+                                # Staged to disk rather than buffered: this used to
+                                # be resp.content plus its base64, both full size,
+                                # for every participant that referenced the image.
+                                path = await _stream_to_tempfile(url, get_shared_client())
+                                staged_files.append(path)
+                                images.append(_FILE_BLOB_TOKEN.format(len(blob_files)))
+                                blob_files.append(path)
                             except Exception as e:
-                                print(f"Ollama failed to fetch and encode remote image {url}: {e}")
+                                print(f"Ollama failed to fetch remote image {url}: {e}")
                         elif os.path.exists(url):
                             try:
-                                with open(url, 'rb') as img_f:
-                                    b64_data = base64.b64encode(img_f.read()).decode('utf-8')
-                                images.append(b64_data)
+                                images.append(_FILE_BLOB_TOKEN.format(len(blob_files)))
+                                blob_files.append(url)
                             except Exception as e:
                                 print(f"Ollama failed to read local image {url}: {e}")
                         else:
@@ -342,7 +379,17 @@ class OllamaModel:
                 reasoning_content = ""
                 finish_reason = "STOP"
 
-                async with client.stream("POST", f"{self.api_url}/api/chat", json=payload, headers=headers, timeout=120.0) as response:
+                if blob_files:
+                    segments, content_length = _plan_streamed_body(payload, blob_files)
+                    payload.clear()
+                    request_kwargs = {
+                        "content": _aiter_streamed_body(segments),
+                        "headers": {**headers, "Content-Length": str(content_length)},
+                    }
+                else:
+                    request_kwargs = {"json": payload, "headers": headers}
+
+                async with client.stream("POST", f"{self.api_url}/api/chat", timeout=120.0, **request_kwargs) as response:
                     if response.status_code != 200:
                         err_text = await response.aread()
                         raise Exception(f"Ollama API Error {response.status_code}: {err_text.decode('utf-8', errors='ignore')}")
@@ -408,6 +455,15 @@ class OllamaModel:
                 raise Exception(f"Ollama Network Error: {str(e)}")
             except asyncio.CancelledError:
                 raise
+            finally:
+                # Only the ones this call downloaded. A local path handed in by the
+                # caller -- a generated image the round still needs -- is not ours
+                # to delete.
+                for path in staged_files:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
 
 
 # --- Google REST adapter -------------------------------------------------------
@@ -615,6 +671,124 @@ async def _aiter_file_bytes(path: str, chunk_size: int = _UPLOAD_CHUNK_BYTES):
             yield chunk
 
 
+#: Read size for base64-encoding a file into a request body. A multiple of 3, so
+#: every block encodes to a whole number of base64 quads and padding can only ever
+#: appear on the final short read -- which is what makes the concatenation of the
+#: blocks identical to encoding the file in one go.
+_B64_READ_BYTES = 192 * 1024
+
+#: Marks the spot in a serialised payload where a file's base64 belongs. The token
+#: has to survive JSON encoding unchanged and never collide with real content;
+#: `@` is outside the base64 alphabet and the rest is not a substring of anything
+#: the bot sends.
+_FILE_BLOB_TOKEN = "@@MIMIC_FILE_BLOB_{}@@"
+
+
+def _b64_encoded_length(byte_length: int) -> int:
+    """Length of the base64 of `byte_length` bytes, padding included."""
+    return 4 * ((byte_length + 2) // 3)
+
+
+def _plan_streamed_body(payload: dict, file_paths: List[str]) -> Tuple[List[Any], int]:
+    """Splits a serialised payload around its file placeholders.
+
+    Returns (segments, content_length), where a segment is either `bytes` to send
+    as-is or an open file handle whose base64 goes in its place. Nothing here reads
+    the file contents — the length comes from `fstat`, so a payload carrying a 6 MB
+    image costs the size of the *rest* of the JSON, not the image.
+
+    The handles are opened *now*, not while the body streams, and that is
+    load-bearing: Content-Length is already on the wire by then, so a file that has
+    since been deleted -- a round tears its generated image down in a `finally` --
+    would abort a request mid-flight instead of failing cleanly before it starts.
+    An open descriptor still reads fine after the path is unlinked.
+
+    Used by the OpenRouter and Ollama adapters, which unlike Google have to send
+    image bytes inline: the provider takes a data URI, not a file handle. Building
+    that the obvious way -- read, b64encode, decode, interpolate, serialise -- put
+    about five copies of the image in the heap at once, per participant per round,
+    with nothing shared between participants.
+
+    The caller must send the segments (`_aiter_streamed_body` closes the handles) or
+    close them itself.
+    """
+    body = json.dumps(payload)
+    segments: List[Any] = []
+    total = 0
+    rest = body
+    try:
+        for idx, path in enumerate(file_paths):
+            token = _FILE_BLOB_TOKEN.format(idx).encode('ascii')
+            head, sep, rest = rest.partition(token)
+            if not sep:
+                raise ValueError(f"payload lost its placeholder for {path}")
+            segments.append(head)
+            total += len(head)
+            handle = open(path, "rb")
+            segments.append(handle)
+            total += _b64_encoded_length(os.fstat(handle.fileno()).st_size)
+    except BaseException:
+        _close_body_segments(segments)
+        raise
+    segments.append(rest)
+    total += len(rest)
+    return segments, total
+
+
+def _close_body_segments(segments: List[Any]) -> None:
+    for segment in segments:
+        if not isinstance(segment, bytes):
+            try:
+                segment.close()
+            except Exception:
+                pass
+
+
+async def _aiter_streamed_body(segments: List[Any]):
+    """Yields the request body planned by `_plan_streamed_body`, closing its handles.
+
+    Async for the reason `_aiter_file_bytes` is, and paired with an explicit
+    Content-Length for the same reason: it keeps httpx off `Transfer-Encoding:
+    chunked`, so the request on the wire is identical to the buffered one this
+    replaces.
+    """
+    try:
+        for segment in segments:
+            if isinstance(segment, bytes):
+                yield segment
+                continue
+            while True:
+                block = segment.read(_B64_READ_BYTES)
+                if not block:
+                    break
+                yield base64.b64encode(block)
+    finally:
+        # Covers the abandoned-generator case too: httpx never finishing the body
+        # would otherwise leak a descriptor per image.
+        _close_body_segments(segments)
+
+
+async def _stream_to_tempfile(url: str, client, timeout: float = 15.0) -> str:
+    """Downloads `url` to a temp file without ever holding it in RAM. Returns the
+    path; the caller owns it."""
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".tmp")
+    try:
+        async with client.stream("GET", url, follow_redirects=True, timeout=timeout) as resp:
+            resp.raise_for_status()
+            with os.fdopen(fd, 'wb') as f:
+                async for chunk in resp.aiter_bytes(chunk_size=_DOWNLOAD_CHUNK_BYTES):
+                    f.write(chunk)
+    except BaseException:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
 # --- Gemini File API URI cache -------------------------------------------------
 #
 # _build_parts resolves every {'url': ...} part by downloading the bytes and
@@ -771,6 +945,36 @@ class _RestView:
         return f"_RestView({object.__getattribute__(self, '_data')!r})"
 
 
+class _BlobRef:
+    """An `inline_data.data` value that was streamed to disk instead of decoded
+    into RAM.
+
+    Returned in place of `bytes` for any blob over `blob_stream`'s threshold, which
+    in practice means every generated image and most synthesised audio. Truthy, so
+    the `if part.inline_data.data` guards at the call sites read the same as they
+    always did; `materialise_inline_data` is what turns it into a path.
+
+    Ownership sits with the `GoogleRESTResponse` that produced it until a caller
+    takes it, so an abandoned response -- a safety block, a fallback retry, an
+    exception between here and the write -- does not strand the file.
+    """
+
+    __slots__ = ("path",)
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def __bool__(self):
+        return True
+
+    def read_bytes(self) -> bytes:
+        with open(self.path, 'rb') as f:
+            return f.read()
+
+    def __repr__(self):
+        return f"_BlobRef({self.path!r})"
+
+
 def _wrap_rest(name: str, value):
     if isinstance(value, dict):
         return _RestView(value)
@@ -781,6 +985,11 @@ def _wrap_rest(name: str, value):
             return _EnumStr(value)
         if name == "data":
             # inline_data.data is base64 on the wire; the SDK hands call sites bytes.
+            # Anything large enough to matter never got as far as this string --
+            # blob_stream diverted it to a file on the way off the socket and left
+            # a sentinel here in its place.
+            if is_blob_sentinel(value):
+                return _BlobRef(sentinel_path(value))
             try:
                 return base64.b64decode(value)
             except Exception:
@@ -954,10 +1163,11 @@ class GoogleRESTModel:
         _file_uri_inflight[key] = future
         uri = None
         try:
-            if is_remote:
-                uri = await self._download_and_upload(url, mime_type)
-            else:
-                uri = await self._upload_file(url, mime_type)
+            with mem_probe.probe("  media -> File API"):
+                if is_remote:
+                    uri = await self._download_and_upload(url, mime_type)
+                else:
+                    uri = await self._upload_file(url, mime_type)
             if uri:
                 _file_uri_cache_put(key, uri)
         except Exception as e:
@@ -991,17 +1201,9 @@ class GoogleRESTModel:
         # both as "Failed to fetch media from URL".
         stage = "download"
         try:
-            import tempfile
-
             # Streamed to disk rather than buffered, so a large attachment
             # never sits in RAM in full.
-            fd, temp_path = tempfile.mkstemp(suffix=".tmp")
-            client_http = get_google_rest_client()
-            async with client_http.stream("GET", url, follow_redirects=True, timeout=15.0) as resp:
-                resp.raise_for_status()
-                with os.fdopen(fd, 'wb') as f:
-                    async for chunk in resp.aiter_bytes(chunk_size=_DOWNLOAD_CHUNK_BYTES):
-                        f.write(chunk)
+            temp_path = await _stream_to_tempfile(url, get_google_rest_client())
 
             stage = "upload"
             return await self._upload_file(temp_path, mime_type)
@@ -1039,10 +1241,18 @@ class GoogleRESTModel:
                     if getattr(p, 'text', None):
                         new_parts.append({"text": p.text})
                     elif getattr(p, 'inline_data', None):
+                        value = p.inline_data.data
+                        # A part echoed back out of a streamed response carries a
+                        # _BlobRef, not bytes. Reading it back is the wrong shape
+                        # for a large blob, but this branch only ever sees the
+                        # small legacy parts described above -- and raising a
+                        # TypeError here instead would drop the part silently.
+                        if isinstance(value, _BlobRef):
+                            value = value.read_bytes()
                         new_parts.append({
                             "inlineData": {
                                 "mimeType": p.inline_data.mime_type,
-                                "data": base64.b64encode(p.inline_data.data).decode('ascii'),
+                                "data": base64.b64encode(value).decode('ascii'),
                             }
                         })
                 formatted.append({"role": item.role, "parts": new_parts})
@@ -1123,8 +1333,8 @@ class GoogleRESTModel:
             level = self.image_params.get("thinking_level")
             if level:
                 # includeThoughts stays off: the thought parts on an image request are
-                # interstitial draft images, and _write_img takes the first inline_data
-                # part it finds. Billed either way, per the API docs.
+                # interstitial draft images, and the call sites take the first
+                # inline_data part they find. Billed either way, per the API docs.
                 cfg["thinkingConfig"] = {"includeThoughts": False, "thinkingLevel": level}
 
         return cfg
@@ -1175,26 +1385,44 @@ class GoogleRESTModel:
 
         model_path = self.model_name if self.model_name.startswith("models/") else f"models/{self.model_name}"
 
+        body = json.dumps(payload)
+        payload.clear()
+
+        # Streamed, not buffered, and the reason is memory rather than latency: an
+        # image response carries the PNG as base64, and reading it with
+        # `json.loads(response.content)` costs ~3.7x the image in simultaneous
+        # copies (see cogs/utils/blob_stream). The extractor below diverts the blob
+        # to a file as it comes off the socket, so the peak is one chunk whatever
+        # the image weighs.
+        extractor = InlineBlobExtractor()
         try:
             client = get_google_rest_client()
-            response = await client.post(
+            async with client.stream(
+                "POST",
                 f"/v1beta/{model_path}:generateContent",
-                content=json.dumps(payload),
+                content=body,
                 headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
-            )
+            ) as response:
+                if response.status_code != 200:
+                    # The body carries the status name ("RESOURCE_EXHAUSTED") that
+                    # helpers._get_friendly_api_error matches on, so pass it through
+                    # intact. Error bodies are small; read it in one go.
+                    detail = (await response.aread()).decode('utf-8', 'replace')
+                    raise Exception(f"Google API Error {response.status_code}: {detail}")
+
+                async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK_BYTES):
+                    extractor.feed(chunk)
+                skeleton, blob_paths = extractor.finish()
         except httpx.RequestError as e:
+            extractor.cleanup()
             raise Exception(f"Google API Network Error: {str(e)}")
-        except asyncio.CancelledError:
+        except BaseException:
+            # Covers CancelledError as well, which is exactly when a half-written
+            # blob would otherwise be left behind.
+            extractor.cleanup()
             raise
-        finally:
-            payload.clear()
 
-        if response.status_code != 200:
-            # The body carries the status name ("RESOURCE_EXHAUSTED") that
-            # helpers._get_friendly_api_error matches on, so pass it through intact.
-            raise Exception(f"Google API Error {response.status_code}: {response.text}")
-
-        return GoogleRESTResponse(json.loads(response.content))
+        return GoogleRESTResponse(json.loads(skeleton), blob_paths=blob_paths)
 
 
 class GoogleRESTResponse:
@@ -1204,7 +1432,11 @@ class GoogleRESTResponse:
     the call sites that reach past the shared interface into .raw keep working.
     """
 
-    def __init__(self, body: dict):
+    def __init__(self, body: dict, blob_paths: Optional[List[str]] = None):
+        #: Files blob_stream wrote while this response streamed in, still owned by
+        #: this object. `materialise_inline_data` moves one out; `close()` unlinks
+        #: whatever is left.
+        self._blob_paths = list(blob_paths or [])
         self.raw = _RestView(body)
         self.text = ""
         self.thought = ""
@@ -1227,6 +1459,79 @@ class GoogleRESTResponse:
     def __bool__(self):
         return bool(self.candidates)
 
+    def release(self, path: str) -> None:
+        """Hands ownership of one streamed blob to the caller, so `close()` leaves
+        it alone."""
+        try:
+            self._blob_paths.remove(path)
+        except ValueError:
+            pass
+
+    def close(self) -> None:
+        """Unlinks any streamed blob nobody took.
+
+        Worth calling explicitly on every path that finishes with a response --
+        a safety-blocked image response still carries whatever partial part the
+        model returned, and `run_with_fallback` can produce one of these per
+        attempt.
+        """
+        paths, self._blob_paths = self._blob_paths, []
+        for path in paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def __del__(self):
+        # Backstop, not the mechanism: the explicit close() calls are. This only
+        # covers the paths that drop a response without one -- an exception between
+        # the parse and the write, mostly -- where the alternative is a multi-megabyte
+        # file left in /tmp on a box with no room for it.
+        try:
+            if self._blob_paths:
+                self.close()
+        except Exception:
+            pass
+
+
+async def materialise_inline_data(response, value, suffix: str = ".png") -> Optional[str]:
+    """Returns a filesystem path for an `inline_data.data` value, whichever form it
+    arrived in, transferring ownership to the caller.
+
+    Large values are already on disk (blob_stream streamed them there) and cost
+    nothing here. Small ones -- under the divert threshold, so still `bytes` -- are
+    written the way they always were. Call sites get one path either way and no
+    longer care which happened.
+    """
+    if isinstance(value, _BlobRef):
+        path = value.path
+        if suffix and not path.endswith(suffix):
+            # The extractor cannot know the mime type: `data` sometimes precedes
+            # `mimeType` on the wire. Renaming is a metadata operation within the
+            # same directory, so it costs nothing and keeps /tmp legible.
+            renamed = path[:path.rfind('.')] + suffix if '.' in os.path.basename(path) else path + suffix
+            try:
+                os.rename(path, renamed)
+                path = renamed
+            except OSError:
+                pass
+        if response is not None:
+            response.release(value.path)
+        return path
+
+    if isinstance(value, (bytes, bytearray)):
+        data = bytes(value)
+
+        def _write():
+            import tempfile
+            fd, path = tempfile.mkstemp(suffix=suffix)
+            with os.fdopen(fd, 'wb') as f:
+                f.write(data)
+            return path
+
+        return await asyncio.to_thread(_write)
+
+    return None
 
 
 # Migration 2 step 3. TTS calls generateContent directly with a response_modalities /
@@ -1272,32 +1577,62 @@ async def generate_google_tts_audio(
     # explicit recommendation to retry. Retrying the same model is the only thing that
     # helps there; a fallback model would be answering a fault the primary does not
     # actually have.
+    body = json.dumps(payload)
+
     last_error = None
     for attempt in range(2):
+        # Streamed for the same reason generate_content_async is: PCM does not
+        # compress on the wire the way a PNG does, so a long line costs as much
+        # in transient copies as a small image. The audio still ends up in RAM --
+        # _stitch_wav_segments and discord.File both want bytes -- but it arrives
+        # there once instead of three times over.
+        extractor = InlineBlobExtractor(suffix=".pcm")
         try:
-            response = await client.post(
+            async with client.stream(
+                "POST",
                 f"/v1beta/{model_path}:generateContent",
-                content=json.dumps(payload),
+                content=body,
                 headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            )
+            ) as response:
+                if response.status_code != 200:
+                    detail = (await response.aread()).decode('utf-8', 'replace')
+                    error = Exception(f"Google API Error {response.status_code}: {detail}")
+                    # 4xx is a bad request -- a voice that does not exist, a model that
+                    # is not a TTS model, an exhausted quota. Sending it again changes
+                    # nothing.
+                    if response.status_code < 500 or attempt == 1:
+                        raise error
+                    last_error = error
+                    print(f"Google TTS: {model_id} returned {response.status_code}; retrying once.")
+                    skeleton = None
+                else:
+                    async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK_BYTES):
+                        extractor.feed(chunk)
+                    skeleton, blob_paths = extractor.finish()
         except httpx.RequestError as e:
+            extractor.cleanup()
             raise Exception(f"Google API Network Error: {str(e)}")
+        except BaseException:
+            extractor.cleanup()
+            raise
 
-        if response.status_code != 200:
-            error = Exception(f"Google API Error {response.status_code}: {response.text}")
-            # 4xx is a bad request -- a voice that does not exist, a model that is not a
-            # TTS model, an exhausted quota. Sending it again changes nothing.
-            if response.status_code < 500 or attempt == 1:
-                raise error
-            last_error = error
-            print(f"Google TTS: {model_id} returned {response.status_code}; retrying once.")
+        if skeleton is None:
             continue
 
-        parsed = GoogleRESTResponse(json.loads(response.content))
-        if parsed.candidates and parsed.candidates[0].content and parsed.candidates[0].content.parts:
-            for part in parsed.candidates[0].content.parts:
-                if getattr(part, 'inline_data', None) and part.inline_data.data:
-                    return part.inline_data.data
+        parsed = GoogleRESTResponse(json.loads(skeleton), blob_paths=blob_paths)
+        try:
+            if parsed.candidates and parsed.candidates[0].content and parsed.candidates[0].content.parts:
+                for part in parsed.candidates[0].content.parts:
+                    if getattr(part, 'inline_data', None) and part.inline_data.data:
+                        value = part.inline_data.data
+                        if isinstance(value, _BlobRef):
+                            # Read once and drop the file: the caller's contract is
+                            # bytes, and the stitching and upload paths below both
+                            # need it in memory anyway.
+                            return await asyncio.to_thread(value.read_bytes)
+                        return value
+        finally:
+            parsed.close()
 
         # A 200 carrying no audio part is the same fault surfacing without the 500.
         # Raising rather than returning None is deliberate: None reads as "this text
@@ -1327,6 +1662,11 @@ class APIService:
     (API key resolution), per the transitional Dependency Injection pattern in
     CLAUDE.md.
     """
+
+    #: Exposed here so call sites reach it through `self.cog.api_service` like
+    #: everything else on this service, rather than adding an import edge from
+    #: media_service and the generation mixins back into this module.
+    materialise_inline_data = staticmethod(materialise_inline_data)
 
     def __init__(self, cog):
         self.cog = cog

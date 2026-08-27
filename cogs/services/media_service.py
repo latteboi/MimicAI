@@ -162,7 +162,11 @@ class MediaService:
                     try:
                         # --- Just-in-Time Generation for Reference Images ---
                         if package.get("reference_image_urls"):
-                            image_bytes, failure_reason = None, None
+                            image_data, failure_reason, response = None, None, None
+                            # response is reset per request, not merely on the error path:
+                            # these workers loop inside one frame, so a generation that
+                            # raises before rebinding it would otherwise leave the
+                            # *previous* request's response to be closed here.
                             try:
                                 api_key = self.cog.storage_manager._get_api_key_for_guild(package['guild_id'])
                                 if not api_key: raise ValueError("Server API key not configured.")
@@ -227,32 +231,29 @@ class MediaService:
                                         candidate = response.candidates[0]
                                         if candidate.finish_reason.name != 'STOP': failure_reason = f"the process being stopped for reason: **{candidate.finish_reason.name.replace('_', ' ').title()}**"
                                         else:
-                                            image_bytes = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
-                                            if not image_bytes: failure_reason = "an unknown issue (the model returned no image data)"
+                                            image_data = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
+                                            if not image_data: failure_reason = "an unknown issue (the model returned no image data)"
                             except Exception as e:
                                 if not failure_reason: failure_reason = f"an unexpected error: `{e}`"
 
-                            if image_bytes:
-                                # data= binds the blob as a default argument rather
-                                # than closing over the name, so nulling image_bytes
-                                # below actually drops the last reference.
-                                def _write_img(data=image_bytes):
-                                    import tempfile
-                                    fd, path = tempfile.mkstemp(suffix=".png")
-                                    with os.fdopen(fd, 'wb') as f:
-                                        f.write(data)
-                                    return path
-                                package['generated_image_path'] = await asyncio.to_thread(_write_img)
-                                # Same reasoning as the multi-profile round in
-                                # generation_service: from here the temp file is the
-                                # only carrier anything needs. Holding the decoded
-                                # PNG -- and `response`, whose parsed body still has
-                                # the base64 original of it -- across the text
-                                # generation that follows costs several megabytes for
-                                # the length of another API call.
-                                image_bytes = None
-                                _write_img = None
+                            if image_data:
+                                # The image streamed straight to a file on the way
+                                # off the socket (cogs/utils/blob_stream), so this
+                                # takes ownership of that file rather than writing
+                                # one. A small enough image is still bytes and is
+                                # written here, as it always was.
+                                package['generated_image_path'] = await self.cog.api_service.materialise_inline_data(
+                                    response, image_data, ".png")
+                                image_data = None
+                            if response is not None:
+                                # Unlinks any blob the package did not take -- what a
+                                # safety block or a fallback attempt leaves behind.
+                                try:
+                                    response.close()
+                                except Exception:
+                                    pass
                                 response = None
+                            if package.get('generated_image_path'):
                                 # Returns the freed pages to the OS rather than
                                 # leaving them at the top of a glibc arena for the
                                 # text generation that follows to sit on top of.
@@ -530,7 +531,11 @@ class MediaService:
                     continue
 
                 # --- Pre-fetch Logic ---
-                image_bytes, failure_reason = None, None
+                image_data, failure_reason, response = None, None, None
+                # response is reset per request, not merely on the error path:
+                # these workers loop inside one frame, so a generation that
+                # raises before rebinding it would otherwise leave the
+                # *previous* request's response to be closed here.
                 try:
                     api_key = self.cog.storage_manager._get_api_key_for_guild(request_data['guild_id'])
                     if not api_key: raise ValueError("Server API key is not configured.")
@@ -565,27 +570,29 @@ class MediaService:
                         if candidate.finish_reason.name != 'STOP':
                             failure_reason = f"the process being stopped for reason: **{candidate.finish_reason.name.replace('_', ' ').title()}**"
                         else:
-                            image_bytes = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
-                            if not image_bytes: failure_reason = "an unknown issue (the model returned no image data)"
+                            image_data = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
+                            if not image_data: failure_reason = "an unknown issue (the model returned no image data)"
                 except Exception as e:
                     failure_reason = f"an unexpected error: `{e}`"
 
-                if image_bytes:
-                    def _write_img():
-                        import tempfile
-                        fd, path = tempfile.mkstemp(suffix=".png")
-                        with os.fdopen(fd, 'wb') as f:
-                            f.write(image_bytes)
-                        return path
-                    request_data['generated_image_path'] = await asyncio.to_thread(_write_img)
-                    # image_bytes is only rebound when the *next* request arrives, so
-                    # without this the decoded PNG stays resident for the whole idle
-                    # period between generations -- the worker spends most of its life
-                    # blocked on the queue below. The temp file is the only carrier the
-                    # text stage needs.
-                    image_bytes = None
-                    _write_img = None
+                if image_data:
+                    # Takes ownership of the file blob_stream already wrote; only a
+                    # sub-threshold image is still bytes needing a write here.
+                    request_data['generated_image_path'] = await self.cog.api_service.materialise_inline_data(
+                        response, image_data, ".png")
+                # image_data and response are only rebound when the *next* request
+                # arrives, and this worker spends most of its life blocked on the
+                # queue below -- so without dropping them here, whatever the last
+                # generation returned stays resident for the whole idle period. The
+                # close() also unlinks a blob no request took.
+                image_data = None
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
                     response = None
+                if request_data.get('generated_image_path'):
                     maybe_trim_malloc()
 
                 request_data['failure_reason'] = failure_reason

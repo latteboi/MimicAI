@@ -26,6 +26,7 @@ from ..utils.helpers import (
     _format_history_entry, _get_user_hash, _resolve_safety_settings, _scrub_response_text,
     _split_into_sentences_with_abbreviations,
 )
+from ..utils import mem_probe
 from ..managers.session_manager import intern_turn
 
 from .generation._shared import _strip_neuro_update_and_scrub
@@ -640,14 +641,15 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                 # --- NEW IMAGE GENERATION LOGIC ---
                 if is_image_gen_round and generator_profile_key:
-                    (generated_image_path_for_round,
-                     image_gen_placeholder_id,
-                     image_gen_error_msg) = await self._run_image_generation_round(
-                        session, channel, generator_profile_key, image_gen_prompt,
-                        generator_display_name, first_participant, feedback_task,
-                        new_round_turn_data, generated_image_path_for_round,
-                        image_gen_placeholder_id, image_gen_error_msg,
-                    )
+                    with mem_probe.probe("image round (total)", peak=False):
+                        (generated_image_path_for_round,
+                         image_gen_placeholder_id,
+                         image_gen_error_msg) = await self._run_image_generation_round(
+                            session, channel, generator_profile_key, image_gen_prompt,
+                            generator_display_name, first_participant, feedback_task,
+                            new_round_turn_data, generated_image_path_for_round,
+                            image_gen_placeholder_id, image_gen_error_msg,
+                        )
 
                 for i, participant in enumerate(profile_order):
                     turn_warnings = []
@@ -1117,7 +1119,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
                                 ))
 
-                                response, state_container = await gen_task
+                                with mem_probe.probe(f"  participant turn {i}"):
+                                    response, state_container = await gen_task
 
                                 if not response or not response.candidates:
                                     raise ValueError("Response blocked or empty")
@@ -1231,14 +1234,14 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                                 for chunk in metadata.grounding_chunks:
                                                     if hasattr(chunk, 'web'):
                                                         turn_grounding_sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
-                                        
+
                                         if hasattr(response.raw.candidates[0], 'url_context_metadata'):
                                             url_metadata = response.raw.candidates[0].url_context_metadata
                                             if hasattr(url_metadata, 'url_metadata') and url_metadata.url_metadata is not None:
                                                 for u in url_metadata.url_metadata:
                                                     if hasattr(u, 'retrieved_url') and u.retrieved_url:
                                                         turn_grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
-                                                        
+
                                     sources_text_list = _format_citation_subtext(turn_grounding_sources)
                                 
                                 # [UPDATED] Differentiated error messaging for spammed vs empty content
@@ -1873,7 +1876,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 # [NEW] Mandatory Round-End Persistence
                 # Ensures the transcript is saved immediately after the last participant speaks.
                 dummy_session_key = (channel_id, None, None)
-                await self.cog.session_manager.flush_session(dummy_session_key, session_type)
+                with mem_probe.probe("  end-of-round flush"):
+                    await self.cog.session_manager.flush_session(dummy_session_key, session_type)
 
                 # Rolling synopsis, after the round's own flush has landed. Not earlier:
                 # inserting a synopsis turn shifts every index after it, and

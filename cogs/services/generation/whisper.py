@@ -220,7 +220,23 @@ class WhisperMixin:
         response_text = re.sub(r'</?whisper_context>', '', response_text, flags=re.IGNORECASE)
         response_text = re.sub(r'</?private_context>', '', response_text, flags=re.IGNORECASE)
 
-        response_text = _scrub_response_text(response_text, participant_names=[display_name])
+        # Every session participant's name is XML-tag-wrapped in the history this profile
+        # sees (_format_history_entry), plus the whisperer's own -- a hallucinated
+        # continuation as any of them leaves a bare closing tag with no [ID:...] header for
+        # PATTERN_SYSTEM_HEADER to catch, so the name scrubber is the only thing that can.
+        # Scrubbing only this profile's own name (as opposed to every session participant,
+        # per Chat Sessions) left every other name's closing tag in the clear.
+        # A whisper's own private_response turn is logged under the raw profile_name
+        # (below, and in _run_whisper_regeneration), not the appearance-resolved display
+        # name -- the two diverge whenever a custom display name is set, so both must be
+        # in the scrub list or a hallucinated close using the raw name survives.
+        whisper_participant_names = [interaction.user.name]
+        for p_data_temp in session.get("profiles", []):
+            whisper_participant_names.append(p_data_temp['profile_name'])
+            other_name, _ = self._resolve_appearance_data(p_data_temp['owner_id'], p_data_temp['profile_name'])
+            whisper_participant_names.append(other_name)
+
+        response_text = _scrub_response_text(response_text, participant_names=whisper_participant_names)
 
         # [NEW] Safety Fallback for empty responses
         if not response_text or not response_text.strip():
@@ -441,7 +457,17 @@ class WhisperMixin:
         response_text, _ = self._extract_and_apply_neuro_state(response_text, owner_id, profile_name)
 
         response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
-        response_text = _scrub_response_text(response_text, participant_names=[display_name])
+
+        # See _run_whisper_turn: both the raw profile_name and the appearance-resolved
+        # display name must be scrubbed, since private_response turns are logged under
+        # the former while this list would otherwise only carry the latter.
+        whisper_participant_names = [interaction.user.name]
+        for p_data_temp in session.get("profiles", []):
+            whisper_participant_names.append(p_data_temp['profile_name'])
+            other_name, _ = self._resolve_appearance_data(p_data_temp['owner_id'], p_data_temp['profile_name'])
+            whisper_participant_names.append(other_name)
+
+        response_text = _scrub_response_text(response_text, participant_names=whisper_participant_names)
 
         # [NEW] Safety Fallback for empty responses
         if not response_text or not response_text.strip():

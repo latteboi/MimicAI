@@ -12,6 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..utils.constants import *
+from ..utils import mem_probe
 from ..utils.helpers import _format_history_entry
 from ..utils.fuzzy import rank_keyed
 
@@ -64,6 +65,9 @@ class EventListeners:
                 await self.storage_manager._perform_data_cleanup()
                 print("Initial cleanup finished. Starting daily cleanup task.")
                 self.storage_manager.daily_cleanup_task.start()
+
+        if mem_probe.ENABLED and not getattr(self, '_mem_reporter_task', None):
+            self._mem_reporter_task = self.bot.loop.create_task(mem_probe.reporter())
 
         if self.has_lock and not self.image_finisher_worker_task:
             self.image_finisher_worker_task = self.bot.loop.create_task(self.media_service._image_finisher_worker())
@@ -595,17 +599,24 @@ class EventListeners:
         entry["slot1"] = None
         entry["slot2"] = None
 
+        disarmed = False
         if not success and "Limit Reached" in msg:
             self.armed_training_channels.pop(channel_id, None)
             msg += " Disarming `/train` for this channel."
+            disarmed = True
 
-        ch = self.bot.get_channel(channel_id)
-        if ch:
+        interaction = entry.get("interaction")
+        if interaction:
+            content = f"{'✅' if success else '❌'} {msg}{warn}"
+            if success and not disarmed:
+                content += "\n\nStill armed -- react to capture another pair."
             try:
-                await ch.send(f"{msg}{warn}", delete_after=30 if success else None)
+                await interaction.edit_original_response(content=content, embed=None, view=None)
             except discord.HTTPException:
                 pass
 
+        ch = self.bot.get_channel(channel_id)
+        if ch:
             # Each message only ever carried its own slot's emoji (the armer's reaction
             # plus this bot's own ack), so clearing that one emoji per message is enough --
             # same clear_reaction(emoji) call a queued reaction trigger makes once it's

@@ -218,7 +218,7 @@ class GlobalChatMixin:
                     raise ValueError("Response blocked or empty")
 
                 raw_text_check = getattr(response, 'text', "").strip()
-                temp_scrubbed = _strip_neuro_update_and_scrub(raw_text_check, [app_name])
+                temp_scrubbed = _strip_neuro_update_and_scrub(raw_text_check, [app_name] + [t['display_name'] for t in queued_turns])
 
                 if not temp_scrubbed:
                     raise ValueError("Empty Response (AI produced no text content)")
@@ -296,7 +296,7 @@ class GlobalChatMixin:
                         status = "blocked_by_safety" if not response or not response.candidates else "success"
                         if status == "success":
                             fb_raw_check = getattr(response, 'text', "").strip()
-                            temp_scrubbed = _strip_neuro_update_and_scrub(fb_raw_check, [app_name])
+                            temp_scrubbed = _strip_neuro_update_and_scrub(fb_raw_check, [app_name] + [t['display_name'] for t in queued_turns])
 
                             if not temp_scrubbed:
                                 raise ValueError("Empty Response (AI produced no text content)")
@@ -358,8 +358,13 @@ class GlobalChatMixin:
 
             raw_text, _ = self._extract_and_apply_neuro_state(raw_text, host_user_id, profile_name)
 
-            # Apply filters
-            response_text = _scrub_response_text(raw_text, participant_names=[app_name])
+            # Apply filters. Every speaker's name is XML-tag-wrapped in the history the
+            # model sees (_format_history_entry), so a hallucinated continuation as one of
+            # the queued users leaves a bare closing tag that only the name scrubber can
+            # catch -- scrubbing just the bot's own name left every other name's closing
+            # tag in the clear.
+            chat_participant_names = [app_name] + [t['display_name'] for t in queued_turns]
+            response_text = _scrub_response_text(raw_text, participant_names=chat_participant_names)
 
             if response_text:
                 grounding_sources = []

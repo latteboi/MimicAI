@@ -11,7 +11,7 @@ from ..utils.constants import (
     DEFAULT_WEB_GROUNDING_TEXT, PATTERN_HTML_CONTAINERS, PATTERN_HTML_TAGS,
     PATTERN_HTML_BLANKLINES, DEFAULT_GROUNDING_RAG_PAYLOAD,
 )
-from ..utils.helpers import _add_inline_citations, _format_api_error, _truncate_text_by_char, is_real_model
+from ..utils.helpers import _format_api_error, _truncate_text_by_char, is_real_model
 from .api_service import GoogleGenAIModel
 
 
@@ -353,10 +353,7 @@ class ToolsService:
             if not grounding_response.text:
                 return None, [], False, None
 
-            # [NEW] Apply inline citations to the RAG model's text before passing it to the profile
             rag_text = grounding_response.text
-            if hasattr(grounding_response, 'raw') and grounding_response.raw.candidates and hasattr(grounding_response.raw.candidates[0], 'grounding_metadata'):
-                rag_text = _add_inline_citations(rag_text, grounding_response.raw.candidates[0].grounding_metadata)
 
             lines = rag_text.strip().split('\n')
             decision = lines[0].strip().lower()
@@ -375,7 +372,7 @@ class ToolsService:
             else:
                 summary_context = (
                     f"<external_context>\n"
-                    f"FOOTNOTES (e.g. **[1]** **[2]**) MUST BE INCLUDED IN YOUR TEXT; DO NOT INCLUDE URLS.\n"
+                    f"DO NOT include footnotes, citation markers, or URLs in your text.\n"
                     f"{truncated_summary}\n"
                     f"</external_context>"
                 )

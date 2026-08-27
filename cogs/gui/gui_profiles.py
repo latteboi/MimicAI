@@ -3806,7 +3806,7 @@ class ContentSafetyView(ui.View):
         view = ProfileManageView(self.cog, self.original_interaction, self.profile_name,
                                  self.is_borrowed, self.mod_return_user_id, self.is_mod_view)
         await i.response.defer()
-        await view.update_display()
+        await view._refresh_dashboard(i)
 
     async def submit_cb(self, i: discord.Interaction):
         await i.response.defer()
