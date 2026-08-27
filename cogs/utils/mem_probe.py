@@ -41,6 +41,13 @@ _TOP_N = 12
 _started = False
 _libproc = None
 
+#: How many peak-owning `probe()` contexts are currently open. `reset_peak()` is
+#: process-global, so the reporter tick below must not call it while a phase is
+#: measuring -- a tick landing mid-phase otherwise truncates that phase's peak to
+#: "everything after the tick" and reports the real number against itself, which
+#: reads as the phase being cheap and some unrelated tick being expensive.
+_peak_depth = 0
+
 
 def _rss_bytes() -> Optional[int]:
     """Current resident set size, or None where it cannot be read cheaply."""
@@ -115,16 +122,20 @@ def probe(label: str, peak: bool = True):
         yield
         return
 
+    global _peak_depth
     start()
     rss_before = _rss_bytes()
     heap_before, _ = tracemalloc.get_traced_memory()
     if peak:
         tracemalloc.reset_peak()
+        _peak_depth += 1
     snap_before = tracemalloc.take_snapshot() if _FULL else None
     try:
         yield
     finally:
         heap_after, heap_peak = tracemalloc.get_traced_memory()
+        if peak:
+            _peak_depth -= 1
         rss_after = _rss_bytes()
         kept_rss = None if (rss_before is None or rss_after is None) else rss_after - rss_before
         peak_col = _fmt(heap_peak - heap_before) if peak else "    --   "
@@ -181,7 +192,11 @@ async def reporter(interval: float = 5.0):
         heap, heap_peak = tracemalloc.get_traced_memory()
         rss = _rss_bytes()
         d_rss = None if (rss is None or prev_rss is None) else rss - prev_rss
-        print(f"[mem] tick  heap {heap / 1e6:7.2f} MB (peak {heap_peak / 1e6:7.2f} MB, "
+        # `*` marks a peak this tick did not get to reset because a phase probe
+        # owns the window: it is cumulative since that phase began, not since the
+        # previous tick, and belongs to the phase rather than to these five seconds.
+        held = "*" if _peak_depth else " "
+        print(f"[mem] tick  heap {heap / 1e6:7.2f} MB (peak {heap_peak / 1e6:7.2f} MB{held}, "
               f"{_fmt(heap - prev_heap)})   rss "
               f"{'  n/a  ' if rss is None else f'{rss / 1e6:7.2f} MB'} ({_fmt(d_rss)})")
 
@@ -205,4 +220,5 @@ async def reporter(interval: float = 5.0):
             prev_snapshot = snapshot
 
         prev_rss, prev_heap = rss, heap
-        tracemalloc.reset_peak()
+        if not _peak_depth:
+            tracemalloc.reset_peak()

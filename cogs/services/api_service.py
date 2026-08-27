@@ -1364,29 +1364,30 @@ class GoogleRESTModel:
         return out or None
 
     async def generate_content_async(self, contents, generation_config=None, stream_state=None):
-        payload = {"contents": await self._build_contents(contents)}
+        with mem_probe.probe("    api: build payload"):
+            payload = {"contents": await self._build_contents(contents)}
 
-        if self.system_instruction:
-            # role is what the SDK sends here; the API ignores it, but matching keeps
-            # the two adapters' wire payloads diffable while both are live.
-            payload["systemInstruction"] = {"role": "user", "parts": [{"text": self.system_instruction}]}
+            if self.system_instruction:
+                # role is what the SDK sends here; the API ignores it, but matching keeps
+                # the two adapters' wire payloads diffable while both are live.
+                payload["systemInstruction"] = {"role": "user", "parts": [{"text": self.system_instruction}]}
 
-        safety = self._build_safety_settings()
-        if safety:
-            payload["safetySettings"] = safety
+            safety = self._build_safety_settings()
+            if safety:
+                payload["safetySettings"] = safety
 
-        tools = self._build_tools()
-        if tools:
-            payload["tools"] = tools
+            tools = self._build_tools()
+            if tools:
+                payload["tools"] = tools
 
-        gen_cfg = self._build_generation_config(generation_config)
-        if gen_cfg:
-            payload["generationConfig"] = gen_cfg
+            gen_cfg = self._build_generation_config(generation_config)
+            if gen_cfg:
+                payload["generationConfig"] = gen_cfg
 
-        model_path = self.model_name if self.model_name.startswith("models/") else f"models/{self.model_name}"
+            model_path = self.model_name if self.model_name.startswith("models/") else f"models/{self.model_name}"
 
-        body = json.dumps(payload)
-        payload.clear()
+            body = json.dumps(payload)
+            payload.clear()
 
         # Streamed, not buffered, and the reason is memory rather than latency: an
         # image response carries the PNG as base64, and reading it with
@@ -1395,24 +1396,27 @@ class GoogleRESTModel:
         # to a file as it comes off the socket, so the peak is one chunk whatever
         # the image weighs.
         extractor = InlineBlobExtractor()
+        wire_bytes = 0
         try:
             client = get_google_rest_client()
-            async with client.stream(
-                "POST",
-                f"/v1beta/{model_path}:generateContent",
-                content=body,
-                headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
-            ) as response:
-                if response.status_code != 200:
-                    # The body carries the status name ("RESOURCE_EXHAUSTED") that
-                    # helpers._get_friendly_api_error matches on, so pass it through
-                    # intact. Error bodies are small; read it in one go.
-                    detail = (await response.aread()).decode('utf-8', 'replace')
-                    raise Exception(f"Google API Error {response.status_code}: {detail}")
+            with mem_probe.probe("    api: stream+extract"):
+                async with client.stream(
+                    "POST",
+                    f"/v1beta/{model_path}:generateContent",
+                    content=body,
+                    headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
+                ) as response:
+                    if response.status_code != 200:
+                        # The body carries the status name ("RESOURCE_EXHAUSTED") that
+                        # helpers._get_friendly_api_error matches on, so pass it through
+                        # intact. Error bodies are small; read it in one go.
+                        detail = (await response.aread()).decode('utf-8', 'replace')
+                        raise Exception(f"Google API Error {response.status_code}: {detail}")
 
-                async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK_BYTES):
-                    extractor.feed(chunk)
-                skeleton, blob_paths = extractor.finish()
+                    async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK_BYTES):
+                        wire_bytes += len(chunk)
+                        extractor.feed(chunk)
+                    skeleton, blob_paths = extractor.finish()
         except httpx.RequestError as e:
             extractor.cleanup()
             raise Exception(f"Google API Network Error: {str(e)}")
@@ -1422,7 +1426,18 @@ class GoogleRESTModel:
             extractor.cleanup()
             raise
 
-        return GoogleRESTResponse(json.loads(skeleton), blob_paths=blob_paths)
+        if mem_probe.ENABLED:
+            # The skeleton is the part that still has to be parsed into the heap, so
+            # `wire` vs `skeleton` is the whole question: a skeleton that tracks the
+            # wire size means a blob was *not* diverted and the old buffered cost is
+            # back, whatever the extractor's unit tests say.
+            print(f"[mem]     wire {wire_bytes / 1e6:7.2f} MB   "
+                  f"skeleton {len(skeleton) / 1e6:7.2f} MB   blobs {len(blob_paths)}")
+
+        with mem_probe.probe("    api: parse skeleton"):
+            parsed = json.loads(skeleton)
+        skeleton = None
+        return GoogleRESTResponse(parsed, blob_paths=blob_paths)
 
 
 class GoogleRESTResponse:

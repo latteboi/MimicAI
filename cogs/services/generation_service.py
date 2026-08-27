@@ -1119,7 +1119,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
                                 ))
 
-                                with mem_probe.probe(f"  participant turn {i}"):
+                                with mem_probe.probe(f"  participant turn {i}", peak=False):
                                     response, state_container = await gen_task
 
                                 if not response or not response.candidates:

@@ -133,7 +133,7 @@ class ImageRoundMixin:
                     existing_state=image_state_container,
                 )
 
-            with mem_probe.probe("  image gen: API call"):
+            with mem_probe.probe("  image gen: API call", peak=False):
                 result, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
                     img_model_raw, img_fallback_raw, _attempt, label="Image generation")
             response, image_state_container = result
