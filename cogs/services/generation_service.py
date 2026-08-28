@@ -11,7 +11,7 @@ import collections
 import datetime
 from zoneinfo import ZoneInfo
 from ..utils.constants import (
-    defaultConfig, PLACEHOLDER_EMOJI,
+    defaultConfig, PLACEHOLDER_EMOJI, GAME_BEAT_STALE_SECONDS,
     ERR_GENERAL_ERROR, ERR_REASON_EMPTY_RESPONSE, ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK,
     WHISPER_BUSY_WAIT_TIMEOUT_SECONDS,
     WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED, WARN_VOICE_SYNTHESIS_FAILED,
@@ -59,6 +59,79 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
     def __init__(self, cog):
         self.cog = cog
+
+    @staticmethod
+    def _promote_game_beats(session, triggers):
+        """Drop the game beats that are no longer worth answering, and put the survivor
+        at the front of the round.
+
+        Returns `(triggers, seated_participant_or_None, cast)`, where `cast` is empty
+        for an ordinary beat and holds the whole seated table for a finale.
+
+        Two beats are dropped rather than answered. One that has waited out a long round
+        is describing a table that has since moved on -- reacting to it late is worse
+        than not reacting, because it reads as a character talking about the wrong hand.
+        And one whose character has been muted in this session goes too: the alternative
+        is the starting override falling through to somebody else, who would then react
+        to a Draw Four that landed on a different player.
+
+        A finale is the same trigger with a cast attached. It supersedes any ordinary
+        beat batched with it -- the game has ended, which is the most permanent version
+        of "the table has moved on" the stale rule exists for -- and it survives one
+        thing an ordinary beat does not: a muted lead. The end of a game belongs to everyone who
+        played it, so a muted winner hands the round to the next seat rather than taking
+        the aftermath down with it. That rebinds the trigger, because index 2 is what
+        `_collect_round_triggers` reads the starting override from.
+
+        The reorder is the queue jump. Everything else batched into this round still
+        gets answered -- it just answers after the character the table was actually
+        looking at. `_collect_round_triggers` reads the starting override off index 0
+        only, so putting the beat there is what carries it.
+        """
+        beat_participant = None
+        beat_cast = []
+        surviving = []
+        queue = session.get('task_queue')
+
+        def drop():
+            if queue is not None:
+                try:
+                    queue.task_done()
+                except ValueError:
+                    pass
+
+        # A finale in the batch supersedes every ordinary beat in it. The game has
+        # ended, which is the most permanent version of "the table has moved on" the
+        # stale rule exists for -- and it also settles the ordering, since the round's
+        # starting override is read off index 0 and there can only be one of those.
+        has_finale = any(isinstance(t, tuple) and t[0] == 'game_beat'
+                         and t[1].get('finale') for t in triggers)
+
+        for trigger in triggers:
+            if isinstance(trigger, tuple) and trigger[0] == 'game_beat':
+                payload, seated = trigger[1], trigger[2]
+                if has_finale and not payload.get('finale'):
+                    drop()
+                    continue
+                stale = (time.monotonic() - payload.get('queued_at', 0)
+                         > payload.get('stale_after', GAME_BEAT_STALE_SECONDS))
+                cast = [p for p in (payload.get('cast') or [])
+                        if not p.get('is_skipped')]
+                if seated.get('is_skipped'):
+                    seated = cast[0] if cast else None
+                    if seated is not None:
+                        trigger = (trigger[0], payload, seated)
+                if stale or seated is None:
+                    drop()
+                    continue
+                if beat_participant is None:
+                    beat_participant, beat_cast = seated, cast
+            surviving.append(trigger)
+
+        if beat_participant is not None:
+            surviving.sort(key=lambda t: 0 if (isinstance(t, tuple)
+                                               and t[0] == 'game_beat') else 1)
+        return surviving, beat_participant, beat_cast
 
     async def _multi_profile_worker(self, channel_id: int):
         session = self.cog.multi_profile_channels.get(channel_id)
@@ -122,6 +195,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     valid_triggers.append(t)
                 
                 all_triggers_for_round = valid_triggers
+
+                (all_triggers_for_round, game_beat_participant,
+                 game_beat_cast) = self._promote_game_beats(
+                    session, all_triggers_for_round)
+                if game_beat_participant is not None:
+                    initial_trigger = all_triggers_for_round[0]
 
                 # This drain is the only consumer of cancelled_reaction_triggers, so a
                 # key that survives it is stale: it cancelled a trigger that was never
@@ -273,6 +352,19 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 is_single_turn_only = False
                 if isinstance(initial_trigger, tuple) and initial_trigger[0] == 'reaction_single':
                     is_single_turn_only = True
+                elif game_beat_participant is not None and not game_beat_cast and all(
+                        isinstance(t, tuple) and t[0] == 'game_beat'
+                        for t in all_triggers_for_round if t is not None):
+                    # A beat on its own is one character's moment, not a cue for the
+                    # whole cast -- five profiles all reacting to one Draw Four is the
+                    # noise the batched narrator was removed for. A beat batched with
+                    # real conversation is different: the others are answering the
+                    # people, not the card, so they keep their turn.
+                    #
+                    # A finale carries a cast, and is the one beat that is meant for all
+                    # of them: the game has ended, and a table that empties in silence
+                    # is what this whole path exists to prevent.
+                    is_single_turn_only = True
 
                 trigger_content_lower = ""
                 for t in all_triggers_for_round:
@@ -294,6 +386,17 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         will_respond = (random.randint(1, 100) <= chance)
 
                     if will_respond: active_participants.append(p)
+
+                # The seat the beat landed on speaks regardless of its response chance.
+                # A reaction that rolls a die against `chance` is a reaction that
+                # silently vanishes for the profile the table is looking at, and the
+                # beat has already been paid for by the time it reaches here. For a
+                # finale that is every seat that played, not just the lead -- the whole
+                # point of the aftermath is that the table answers it.
+                if game_beat_participant is not None:
+                    for seated in (game_beat_cast or [game_beat_participant]):
+                        if not any(p is seated for p in active_participants):
+                            active_participants.insert(0, seated)
 
                 if not active_participants:
                     for trigger in all_triggers_for_round:

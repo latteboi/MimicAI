@@ -396,6 +396,15 @@ class SessionManager:
         calls `_save_multi_profile_sessions` once at the end instead of per channel,
         since that rewrites every server index each time.
         """
+        # A live game outlives the session unless it is explicitly stopped -- the game
+        # cache is keyed by channel and holds no reference to the session at all, so a
+        # suspended channel would otherwise keep a table running against a cast that
+        # no longer exists. Done before the early return so it also covers a game left
+        # behind by a session that was already gone.
+        game_service = getattr(self.cog, "game_service", None)
+        if game_service:
+            game_service.teardown_channel(channel_id)
+
         session = self.cog.multi_profile_channels.pop(channel_id, None)
         if not session:
             return False
@@ -1130,6 +1139,13 @@ class SessionManager:
         for channel_id, session in list(self.cog.multi_profile_channels.items()):
             pro = session.get("proactivity", {})
             if not pro.get("enabled"): continue
+
+            # The Director exists to break a silence. A live game means the channel is
+            # anything but silent, and with the cast seated the round it queues would
+            # find nobody to speak -- so it would spend a director model call to
+            # produce nothing. Skip the channel until the table clears.
+            game_service = getattr(self.cog, "game_service", None)
+            if game_service and game_service.has_live_game(channel_id): continue
             
             last_event = session.setdefault("last_proactive_event", 0)
             cooldown = pro.get("cooldown", 300)

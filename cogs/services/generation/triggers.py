@@ -35,6 +35,24 @@ class TriggerIntakeMixin:
 
             message_trigger, reaction_trigger, message_payload = None, None, None
 
+            # A game beat is neither a message nor a reaction: nobody said it, the table
+            # did. It contributes the round's system note and, at index 0, the seat that
+            # has to answer it -- and it is handled ahead of the index-0 branch below
+            # because the batch branch would otherwise read its payload dict as a child
+            # bot's message and go looking for an author.
+            #
+            # Deliberately not appended to `unified_log`. The mechanical record already
+            # lives in `<game_context>`; a log carrying bracketed stage directions would
+            # have every later round reading them back as things that were said.
+            if isinstance(trigger, tuple) and trigger[0] == 'game_beat':
+                payload = trigger[1]
+                if i == 0:
+                    starting_profile_override = trigger[2]
+                content = payload.get('content')
+                if content:
+                    new_round_turn_data.append((content, None, []))
+                continue
+
             if i == 0:
                 if isinstance(trigger, tuple):
                     if trigger[0] == 'reply':

@@ -3,7 +3,8 @@ from .utils.constants import (
     DEFAULT_PROFILE_GENERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS, DEFAULT_SYSTEM_INSTRUCTION,
     FALLBACK_MODEL_NAME, LOCK_REFRESH_INTERVAL_SECONDS, LOCK_STALE_THRESHOLD_SECONDS,
     MAX_MULTI_PROFILES, MOD_DATA_DIR, PRIMARY_MODEL_NAME, PUBLIC_PROFILES_DIR,
-    PURGED_MESSAGE_ID_CACHE_MAX_SIZE, PURGE_BUSY_WAIT_TIMEOUT_SECONDS, SERVERS_DIR,
+    GAME_CACHE_MAX_SIZE, PURGED_MESSAGE_ID_CACHE_MAX_SIZE,
+    PURGE_BUSY_WAIT_TIMEOUT_SECONDS, SERVERS_DIR,
     SESSIONS_GLOBAL_DIR, SESSION_BUSY_FLAGS, TRAIN_ARMED_CACHE_MAX_SIZE, TRAIN_INPUT_EMOJI,
     TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check, is_owner_in_dm_check,
 )
@@ -34,6 +35,8 @@ from .services.tools_service import ToolsService
 from .services.generation_service import GenerationService
 from .services.api_service import APIService
 from .services.help_service import HelpService
+from .services.game_service import GameService
+from .services.games.eights import RuleSet as GameRuleSet
 
 from discord.ext import commands, tasks
 import discord
@@ -129,6 +132,7 @@ class MimicCog(commands.Cog, EventListeners):
         self.generation_service = GenerationService(self)
         self.api_service = APIService(self)
         self.help_service = HelpService(self)
+        self.game_service = GameService(self)
 
         self.server_manager._load_global_prompts()
 
@@ -192,6 +196,10 @@ class MimicCog(commands.Cog, EventListeners):
         # Keyed by channel_id; see EventListeners._handle_train_reaction.
         self.armed_training_channels: LRUCache = LRUCache(TRAIN_ARMED_CACHE_MAX_SIZE)
         self.pending_child_confirmations: LRUCache = LRUCache(max_size=200)
+        # Live table games, keyed by channel_id. Bounded like every other channel-keyed
+        # cache, but /play refuses past GAME_MAX_CONCURRENT (which is lower), so the LRU
+        # never actually evicts a running game out from under its task.
+        self.active_games: LRUCache = LRUCache(max_size=GAME_CACHE_MAX_SIZE)
         self.global_blacklist: Set[int] = set()
         self.server_manager._load_blacklist()
         self.session_last_accessed = {}
@@ -971,6 +979,84 @@ class MimicCog(commands.Cog, EventListeners):
         view = SessionView(self, interaction, session_view_data)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
+    play_group = app_commands.Group(name="play", description="Table games with this channel's cast.", guild_only=True)
+
+    @play_group.command(name="eights", description="Deal a game of Mimic Eights to the profiles in this channel's session.")
+    @app_commands.checks.cooldown(3, 60.0, key=lambda i: i.channel_id)
+    @app_commands.describe(
+        seats="How many seats at the table (2-6). Defaults to as many as fit.",
+        join="Sit down yourself, or deal a table of profiles and watch. Defaults to sitting down.",
+        stacking="Answer a Draw Two with another Draw Two instead of picking up. Default on.",
+        stack_draw_four="Also allow Draw Fours to be stacked. Default off.",
+        draw_to_match="Keep drawing until you get a playable card. Default off — draw one.",
+        strict_draw_four="Only allow a Draw Four when you hold none of the active colour. Default off.",
+        turn_seconds="Seconds a person gets before the table plays for them (15-120). Default 45.")
+    async def play_eights_slash(self, interaction: discord.Interaction,
+                             seats: Optional[app_commands.Range[int, 2, 6]] = None,
+                             join: bool = True,
+                             stacking: bool = True,
+                             stack_draw_four: bool = False,
+                             draw_to_match: bool = False,
+                             strict_draw_four: bool = False,
+                             turn_seconds: Optional[app_commands.Range[int, 15, 120]] = None):
+        if not self.has_lock: return
+        await interaction.response.defer(ephemeral=True)
+
+        # Snapshotted into the game at deal time, so changing the rules mid-hand is
+        # impossible by construction rather than by a check.
+        rules = GameRuleSet(
+            stack_draw_two=stacking,
+            stack_draw_four=stack_draw_four,
+            draw_to_match=draw_to_match,
+            strict_draw_four=strict_draw_four,
+            turn_seconds=turn_seconds if turn_seconds is not None else GameRuleSet().turn_seconds,
+        )
+
+        error = await self.game_service.start_eights(interaction, seats_wanted=seats, join=join, rules=rules)
+        if error:
+            await interaction.followup.send(error, ephemeral=True)
+            return
+
+        game = self.active_games.get(interaction.channel_id)
+        names = ", ".join(f"`{seat.display}`" for seat in game.seats) if game else ""
+        hint = (" Use the **Your hand** button on the table to play."
+                if game and any(s.kind == "human" for s in game.seats) else "")
+        house = []
+        if not stacking: house.append("no stacking")
+        if stack_draw_four: house.append("Draw Fours stack")
+        if draw_to_match: house.append("draw to match")
+        if strict_draw_four: house.append("strict Draw Four")
+        if turn_seconds: house.append(f"{turn_seconds}s turns")
+        rule_note = f" House rules: {', '.join(house)}." if house else ""
+        await interaction.followup.send(
+            f"Dealt. {names} are playing — the table is posted in the channel.{rule_note}{hint}",
+            ephemeral=True)
+
+    @play_group.command(name="stop", description="End the game running in this channel.")
+    @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.channel_id)
+    async def play_stop_slash(self, interaction: discord.Interaction):
+        if not self.has_lock: return
+
+        game = self.active_games.get(interaction.channel_id)
+        if not game:
+            await interaction.response.send_message(
+                "There is no game running in this channel.", ephemeral=True)
+            return
+
+        # The person who dealt it, or anyone who could have suspended the session.
+        is_admin = bool(getattr(interaction.user, "guild_permissions", None)
+                        and interaction.user.guild_permissions.administrator)
+        if interaction.user.id != game.started_by and not is_admin and \
+                interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
+            await interaction.response.send_message(
+                "Only whoever dealt the game, or a server administrator, can end it.",
+                ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        await self.game_service.stop_game(interaction.channel_id, reason="stopped early")
+        await interaction.followup.send("Game ended.", ephemeral=True)
+
     @app_commands.command(name="refresh", description="Clears the bot's short-term memory for the current context.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     @app_commands.guild_only()
@@ -1113,6 +1199,10 @@ class MimicCog(commands.Cog, EventListeners):
             return True
 
         session_lock = self.multi_profile_channels.get(interaction.channel_id)
+
+        # A purge deletes the table message out from under a running game, and the
+        # game cache is independent of the session, so it has to be torn down here.
+        self.game_service.teardown_channel(interaction.channel_id)
 
         try:
             if session_lock:

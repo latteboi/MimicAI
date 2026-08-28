@@ -77,6 +77,15 @@ class EventListeners:
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
+        # The game table is a sticky message, so anything landing in the channel buries
+        # it. This sits above every guard below deliberately: during a game most of the
+        # channel's traffic is webhook and child-bot posts, and none of that gets past
+        # the `author.bot` return a few lines down. `nudge_table` is synchronous and
+        # costs one dict lookup, which is what the emptiness check in front of it keeps
+        # it to on the overwhelmingly common no-game path.
+        if self.active_games:
+            self.game_service.nudge_table(message.channel.id, message.id)
+
         if message.id in self.processed_child_messages:
             return
 
@@ -84,6 +93,22 @@ class EventListeners:
             return
         
         if not message.guild or not self.has_lock or message.author.bot:
+            return
+
+        # Calling Last Card is a thing you say, not a button you press, so this sits
+        # ahead of the trigger paths below rather than inside them -- and it *returns*.
+        # The call is a game control input, not a line of dialogue: letting it fall
+        # through queued a whole round off the word "one". The cast still hears it,
+        # because `Ev.CALL_MADE` is in `GameService.REACT_ON` and draws a beat when the
+        # call rides the next play, which is the moment it actually lands. Ordinary chat
+        # is untouched -- `arm_last_call` answers in one dict lookup with no game here,
+        # and returns False for anyone who is not seated at this table.
+        if self.active_games and self.game_service.arm_last_call(
+                message.channel.id, message.author.id, message.content):
+            try:
+                await message.add_reaction("🖐")
+            except Exception:
+                pass
             return
 
         # Validate the user's active profile in this channel first to prune dangling references

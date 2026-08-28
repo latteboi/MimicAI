@@ -385,6 +385,152 @@ TRAIN_ARM_TIMEOUT_SECONDS = 900
 # handful of channels are ever armed at once, but per policy this must still be bounded.
 TRAIN_ARMED_CACHE_MAX_SIZE = 100
 
+# --- Table games -------------------------------------------------------------------
+# active_games is keyed by channel_id and must be bounded like every other such cache,
+# but evicting a *live* game would orphan its task silently. GAME_MAX_CONCURRENT sits
+# below the cache size and is enforced at /play, so eviction is unreachable in practice
+# and the LRU is only a backstop.
+GAME_MAX_CONCURRENT = 12
+GAME_CACHE_MAX_SIZE = 16
+
+# Seconds between moves. A table that resolves instantly is unreadable, and this is
+# also what keeps a whole game's worth of embed edits inside Discord's rate limits.
+GAME_TURN_PACE_SECONDS = 2.0
+
+# Floor between status-embed edits. Laps and dramatic moments force a redraw anyway;
+# this only throttles the quiet turns in between.
+GAME_EMBED_MIN_INTERVAL_SECONDS = 4.0
+
+# The table is a sticky message: it is deleted and reposted whenever anything lands
+# under it, so the controls are always at the bottom of the channel where a player is
+# looking. That is two API calls, and during a game the channel is busy -- so a floor
+# stops a burst of dialogue turning into a burst of reposts. A repost that arrives
+# during the floor is not dropped, it is deferred to the end of it, which is why this
+# reads as instant while still being bounded.
+GAME_TABLE_REPOST_MIN_SECONDS = 2.0
+
+# How long a private hand panel stays *pushable* by the bot. A component click mints a
+# fresh 15-minute token and the panel is re-bound to it, so anyone actually playing
+# keeps a live handle indefinitely; this only decides when to stop trying for someone
+# who has wandered off. Just under Discord's 15 minutes, to lose the race rather than
+# the request.
+GAME_PANEL_PUSH_WINDOW_SECONDS = 14 * 60
+
+# Dialogue is one generation per notable beat, spoken by the character the beat happened
+# to. It is not generated here: the beat is put on the channel's own task queue as a
+# trigger and the multi-profile worker runs it, so a reaction is an ordinary round --
+# same instructions, training, LTM, critic, placeholder and typing indicator as any
+# other reply, and serialised behind whatever the channel was already saying.
+#
+# The arithmetic that matters: a four-hander runs ~55 turns, and beats loud enough to
+# earn a reaction land around 7-10 of them. GAME_REACTION_MAX_CALLS is a hard ceiling so
+# a pathological game cannot run away, set above the expected count rather than at it.
+GAME_REACTION_MAX_CALLS = 14
+GAME_REACTION_MAX_WORDS = 25
+
+# A game beat is only worth queueing while it is still the current moment. One that has
+# waited out a long round is stale -- the table has moved on -- so the worker drops it
+# rather than making a character react to something two turns old.
+GAME_BEAT_STALE_SECONDS = 45.0
+
+# The finale is the exception to that. Once the last card is down the table has stopped
+# moving, so there is no state left for the beat to go stale against -- but the channel
+# still has, so it expires eventually rather than never.
+GAME_FINALE_STALE_SECONDS = 180.0
+GAME_FINALE_MAX_WORDS = 40
+
+# How long the closing table keeps answering `context_block` after the game has been
+# popped from `active_games`. The finale round is queued behind whatever the channel was
+# already saying, so the game is usually gone by the time the characters reach it -- and
+# the chat that follows a game ("that Draw Four was filthy") deserves the same grounding
+# the game itself had. Written only at `_finish`, so the bound is trimmed there.
+GAME_EPILOGUE_SECONDS = 300.0
+GAME_EPILOGUE_CACHE_MAX_SIZE = 16
+
+# What a seated player types in the channel to call Last Card. Matched case-insensitively
+# against the whole message, stripped -- so "last card!" arms and "last card is a
+# silly rule" does not. The call arms the seat; the next play carries it, exactly
+# as the old button did.
+GAME_LAST_CALL_WORDS = frozenset({"one", "one!", "last card", "last card!"})
+
+# Recent events carried in `<game_context>`. The ledger holds the long view; this is
+# just enough for a reply to land in the right moment.
+GAME_CONTEXT_EVENTS_KEEP = 6
+
+# The standing block injected by `_construct_system_instructions` while a game is live
+# in the channel, alongside `<session_synopsis>`. It is standing context rather than a
+# history turn for the same reason the synopsis is: it describes state, not something
+# somebody said, and a busy table would push it straight out of the STM window.
+#
+# Every generation in the channel gets this, not only game reactions -- which is what
+# lets a seated character answer "why did you do that?" correctly while a hand is live.
+DEFAULT_GAME_CONTEXT = (
+    "{opening}\n\n"
+    "{table}\n\n"
+    "Players:\n{cast}\n\n"
+    "{ledger}\n\n"
+    "Recently:\n{events}\n\n"
+    "How this table runs:\n{rules}\n\n"
+    "WHAT YOU CAN SEE: everything above, and nothing else -- the top card, the active "
+    "colour, how many cards are left in the pile, how many cards each player is "
+    "holding, and the handful of things listed under Recently.\n"
+    "WHAT YOU CANNOT SEE: any actual card in any hand. You are not shown your own hand "
+    "here and you never see anyone else's. You know how many cards you have, not which "
+    "ones.\n"
+    "SO, WHEN THE GAME COMES UP:\n"
+    "- Never name a card as being in a hand, your own included. Talk in counts -- "
+    "\"I'm down to two\" -- not in cards.\n"
+    "- The only cards you may name are the top card and the active colour above.\n"
+    "- Never describe a play that is not listed under Recently. If it is not written "
+    "above it did not happen, and you must not fill in the gap.\n"
+    "- Every figure you cite must actually appear above.\n"
+    "- React to what the table did. Do not narrate your own turn as though you were "
+    "choosing cards -- the game moves you, you only get to have an opinion about it."
+)
+
+# Shown at the head of `<game_context>` while a hand is live, and after it is not. The
+# same block serves both, because the epilogue is the closing table kept warm for a few
+# minutes -- see GAME_EPILOGUE_SECONDS.
+DEFAULT_GAME_OPENING_LIVE = (
+    "You are at a table playing Mimic Eights in this channel -- a Crazy Eights "
+    "variant. Cards match the top of the pile by colour or by value; Skip, Reverse "
+    "and Draw Two act on the next player; Wild and Wild Draw Four change the colour. "
+    "A player down to one card must call \"last card\" or take a penalty. This is "
+    "the state of the game right now."
+)
+DEFAULT_GAME_OPENING_OVER = (
+    "You have just been playing Mimic Eights at a table in this channel -- a Crazy "
+    "Eights variant -- and the game has finished. This is how it ended."
+)
+
+# The user turn for a reaction. Short on purpose: the persona, the neuro state and the
+# whole table are already in the system instruction, so this only has to say which
+# moment is being reacted to.
+# The round's user-side turn for a game beat. It is a system note rather than a user
+# line because nobody said it -- the table did. It is deliberately *not* appended to
+# `unified_log`: the mechanical record lives in `<game_context>`, and a log full of
+# bracketed stage directions would be read back by every later round.
+DEFAULT_GAME_REACTION_USER = (
+    "<system_note>\n"
+    "The game just moved: {beat}\n"
+    "React out loud, in character, in the channel. At most {max_words} words, one line, "
+    "dialogue only -- no narration, no stage directions, no asterisks, no XML tags.\n"
+    "</system_note>"
+)
+
+# The round's user-side turn for the end of a game. Unlike a beat, this one goes to
+# every seated character at once: a game that ends in silence is the one moment players
+# actually notice the cast is absent. The whole table speaks, in seating order behind
+# whoever won.
+DEFAULT_GAME_FINALE_USER = (
+    "<system_note>\n"
+    "The game is over. {beat}\n"
+    "Say your piece now that it has finished -- gloat, sulk, congratulate, blame the "
+    "deck, whatever actually fits you. At most {max_words} words, one line, dialogue "
+    "only -- no narration, no stage directions, no asterisks, no XML tags.\n"
+    "</system_note>"
+)
+
 DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS = (
     "You are a memory consolidation AI. Your task is to analyze a conversation excerpt and create a concise, third-person summary of the most important information to be stored as a long-term memory.\n\n"
     "Focus on capturing the following:\n"
@@ -950,7 +1096,7 @@ SYSTEM_XML_TAGS = [
     "scene_prompt", "neuro_endocrine_engine", "neuro_update", "persona_profile",
     "technical_manual", "training_data", "context_rules", "image_context",
     "system_note", "reply_context", "negative_constraints", "content_policy",
-    "session_synopsis"
+    "session_synopsis", "game_context"
 ]
 _tags_pattern = "|".join(SYSTEM_XML_TAGS)
 

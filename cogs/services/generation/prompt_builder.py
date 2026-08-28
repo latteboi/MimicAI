@@ -93,6 +93,15 @@ class PromptBuilderMixin:
             if synopsis:
                 final_instr_parts.append(f"<session_synopsis>\n{synopsis}\n</session_synopsis>")
 
+            # Standing context for the same reason, and injected here rather than into
+            # the game's own call so that *every* generation in the channel sees it --
+            # a seated character answering ordinary chatter mid-hand knows what it just
+            # played, which is what removed the need to bench the cast during a game.
+            # Returns None on the overwhelmingly common no-game path, for one dict get.
+            game_block = self.cog.game_service.context_block(channel_id)
+            if game_block:
+                final_instr_parts.append(f"<game_context>\n{game_block}\n</game_context>")
+
         if neuro_enabled:
             neuro_block = self.cog.global_prompts.get("NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION).format(
                 d=neuro_state.get('dopamine', 50),
