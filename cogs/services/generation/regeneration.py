@@ -6,12 +6,15 @@ import datetime
 from typing import Dict
 
 from ...utils.constants import (
-    defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, PLACEHOLDER_EMOJI,
+    defaultConfig, PLACEHOLDER_EMOJI,
     ERR_GENERAL_ERROR, ERR_RATE_LIMIT, ERR_REASON_EMPTY_RESPONSE, ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK,
     WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED,
     DEFAULT_KICKSTART_START, DEFAULT_KICKSTART_IDLE, DEFAULT_IMAGE_PRESENT, DEFAULT_WHISPER_RECAP,
 )
-from ...utils.helpers import _add_inline_citations, _format_api_error, _format_history_entry, _resolve_safety_settings, _scrub_response_text
+from ...utils.helpers import (
+    _add_inline_citations, _format_api_error, _format_history_entry, _resolve_safety_settings,
+    _scrub_response_text, is_real_model,
+)
 from ._shared import _strip_neuro_update_and_scrub
 
 
@@ -19,6 +22,34 @@ class RegenerationMixin:
     """Re-runs generation for a single existing turn (triggered by the regenerate
     reaction), editing the message in place instead of sending a new one.
     """
+
+    async def _restore_regenerated_message(self, channel, participant, message_id,
+                                           content, attachments):
+        """Puts the message back to what it said before the regeneration started.
+
+        Every exit that produces no new text has to come through here. The message was
+        overwritten with the placeholder emoji before any work began, so returning
+        early -- a safety refusal, a model that would not construct, a cancellation --
+        used to leave the turn showing a bare emoji with nothing able to fix it but
+        another regeneration.
+        """
+        if not content:
+            return
+        try:
+            if participant.get('method') == 'child_bot':
+                await self.cog.manager_queue.put({
+                    "action": "send_to_child", "bot_id": participant['bot_id'],
+                    "payload": {
+                        "action": "regenerate_message", "channel_id": channel.id,
+                        "message_id": message_id, "content": content
+                    }
+                })
+                return
+            wh = await self.cog.server_manager._get_or_create_webhook(channel)
+            if wh:
+                await wh.edit_message(message_id, content=content, attachments=attachments or [])
+        except Exception:
+            pass
 
     async def _execute_regeneration(self, payload: discord.RawReactionActionEvent, session: Dict, turn_id: str, participant: Dict):
         channel = self.cog.bot.get_channel(payload.channel_id)
@@ -50,6 +81,24 @@ class RegenerationMixin:
 
         custom_emoji = p_profile.get("placeholder_emoji") or PLACEHOLDER_EMOJI
 
+        # The message being regenerated is edited in place, so its current text is the
+        # only copy of what to put back if this cannot run or is cancelled. Read once,
+        # here, because every path below has already overwritten it with the emoji.
+        #
+        # The cancel handlers used to call _safe_delete_placeholder on it instead --
+        # correct in the worker, where msg_a_id is a throwaway placeholder, but here
+        # msg_a_id *is* the turn's real message, so a cancelled regeneration deleted it
+        # out of the channel and left its unified_log entry pointing at nothing.
+        original_message_content = None
+        original_attachments = []
+        try:
+            _original_message = await channel.fetch_message(payload.message_id)
+            original_message_content = _original_message.content
+            original_attachments = [a for a in _original_message.attachments
+                                    if a.content_type and a.content_type.startswith("image/")]
+        except Exception:
+            pass
+
         # Pre-emptive visual feedback before disk I/O and context gathering
         if participant.get('method') == 'child_bot':
             await self.cog.manager_queue.put({
@@ -63,13 +112,16 @@ class RegenerationMixin:
             wh = await self.cog.server_manager._get_or_create_webhook(channel)
             if wh:
                 try:
-                    msg = await channel.fetch_message(payload.message_id)
-                    kept_atts = [a for a in msg.attachments if a.content_type and a.content_type.startswith("image/")]
-                    await wh.edit_message(payload.message_id, content=custom_emoji, attachments=kept_atts)
+                    await wh.edit_message(payload.message_id, content=custom_emoji,
+                                          attachments=original_attachments)
                 except Exception: pass
 
         session_type = session.get("type", "multi")
         dummy_key = (channel.id, None, None)
+        # Set once the new text is on the message. Everything after that point --
+        # notably the session flush -- must not roll the channel back to the old reply,
+        # because the log already holds the new one.
+        delivered = False
 
         # Flush session state to disk in parallel with initial cleanups
         self.cog.session_manager._save_multi_profile_sessions()
@@ -118,11 +170,23 @@ class RegenerationMixin:
                 participant_history.append({'role': 'user', 'parts': [self.cog.global_prompts.get("KICKSTART_START", DEFAULT_KICKSTART_START)]})
 
             # 4. Re-run Generation
-            model, _, temp, top_p, top_k, _, fallback_model_name = await self.cog.api_service._get_or_create_model_for_channel(
-                channel.id, payload.user_id, channel.guild.id,
-                profile_owner_override=p_owner_id, profile_name_override=p_name
-            )
-            if not model: return
+            #
+            # The model is built further down, from _construct_system_instructions and
+            # _instantiate_model, exactly as the worker builds it. This used to call
+            # _get_or_create_model_for_channel here and `return` when it handed back
+            # None -- which it does for a missing key or a failed instantiation as well
+            # as for a policy refusal. That return left the message showing the bare
+            # placeholder emoji for good, reported nothing, and never tried the
+            # configured fallback. It also mutated `system_instruction` on the shared
+            # cached instance that path returns.
+            #
+            # The one refusal that genuinely must stop is the safety policy, so it is
+            # checked here rather than inferred from a None further down.
+            if not self.cog.profile_manager._check_unrestricted_safety_policy(p_owner_id, p_name, channel):
+                await self._restore_regenerated_message(
+                    channel, participant, payload.message_id,
+                    original_message_content, original_attachments)
+                return
 
             last_user_turn = next((t for t in reversed(sliced_unified_log) if t.get("is_user") is True), None)
             trigger_content = last_user_turn.get("content", "") if last_user_turn else ""
@@ -130,16 +194,14 @@ class RegenerationMixin:
             # Media Recovery Logic for Regeneration (Handles both User & Bot Generated Media)
             recovered_media_parts = []
             
-            # 1. Check if the bot message being regenerated has an attached generated image
-            regen_msg = None
-            try:
-                regen_msg = await channel.fetch_message(payload.message_id)
-            except Exception:
-                pass
-
+            # 1. Check if the bot message being regenerated has an attached generated image.
+            # Read from the copy taken before the placeholder edit rather than fetching
+            # again: it is the same set for a webhook turn, it is the only reliable set
+            # for a child bot turn (whose edit goes through the manager queue), and it
+            # saves a REST round trip on every regeneration.
             is_generated_image_turn = False
-            if regen_msg and regen_msg.attachments:
-                bot_image_attachments = [a for a in regen_msg.attachments if a.content_type and a.content_type.startswith("image/")]
+            if original_attachments:
+                bot_image_attachments = list(original_attachments)
                 if bot_image_attachments:
                     is_generated_image_turn = True
                     
@@ -205,13 +267,14 @@ class RegenerationMixin:
 
             ltm_recall_text = await self.cog.memory_manager._get_relevant_ltm_for_prompt((channel.id, p_owner_id, p_name), participant_history, p_owner_id, p_name, trigger_content, "User", channel.guild.id, payload.user_id)
             training_examples = await self.cog.memory_manager._get_relevant_training_examples(p_owner_id, p_name, trigger_content, channel.guild.id)
-            full_system_instruction, _, _, _, _, _, _, _ = await asyncio.to_thread(
+            # One source for the sampling parameters and both model names. They used to
+            # come from _get_or_create_model_for_channel and then be overwritten from
+            # the profile config sixteen lines later, so the two could disagree.
+            (full_system_instruction, _, _, temp, top_p, top_k,
+             primary_model, fallback_model_name) = await asyncio.to_thread(
                 self._construct_system_instructions,
                 p_owner_id, p_name, channel.id, is_multi_profile=True, training_examples_list=training_examples, recalled_ltm=ltm_recall_text
             )
-
-            if hasattr(model, 'system_instruction'):
-                model.system_instruction = full_system_instruction
 
             # [NEW] Advanced Params Injection for Regeneration
             index = self.cog.profile_manager._get_user_index(p_owner_id)
@@ -229,10 +292,6 @@ class RegenerationMixin:
 
             gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "_advanced_params": adv_params}
 
-            # [FIXED] Define missing variables for Fallback logic
-            primary_model = p_profile.get("primary_model", PRIMARY_MODEL_NAME)
-            fallback_model_name = p_profile.get("fallback_model", FALLBACK_MODEL_NAME)
-
             dynamic_safety_settings = _resolve_safety_settings(channel, p_profile)
 
             t_params_worker = {
@@ -241,8 +300,37 @@ class RegenerationMixin:
                 "thinking_budget": p_profile.get("thinking_budget", -1)
             }
 
+            model_tools = self._resolve_native_tools(p_profile)
+
+            model = None
+            model_warning = None
+            try:
+                model = self.cog.api_service._instantiate_model(
+                    primary_model, channel.guild.id, payload.user_id,
+                    full_system_instruction, dynamic_safety_settings,
+                    t_params_worker, model_tools, p_profile)
+            except ValueError as e:
+                model_warning = str(e)
+            except Exception as e:
+                model_warning = f"Model Initialization Error: Failed to instantiate model '{primary_model}'. {e}"
+
             app_name, app_avatar = self._resolve_appearance_data(p_owner_id, p_name)
-            state_container = None
+            # Seeded rather than left None. The fallback call passes this straight back
+            # in as existing_state, and only TimeoutError carries a state_container on
+            # the exception -- so on any other primary failure _generate_with_heartbeat
+            # built a fresh dict and the profile's custom emoji reverted to the global
+            # one halfway through the regeneration.
+            state_container = {
+                'msg_a_id': payload.message_id,
+                'msg_b_id': None,
+                'app_name': app_name,
+                'app_avatar': app_avatar,
+                'message_type': "text",
+                'custom_emoji': custom_emoji,
+            }
+            # Published so /cancel can tell "still generating, safe to undo" from
+            # "applying, too late". Released in the finally.
+            self.cog.session_manager.register_in_flight(session, state_container)
             status = "api_error"
             was_blocked = False
             turn_warnings = []
@@ -258,8 +346,15 @@ class RegenerationMixin:
 
             t_start_regen = time.monotonic()
             try:
+                # Same rule as the worker: a primary that could not be constructed goes
+                # to the handler below, so the fallback is tried rather than skipped.
+                if not model:
+                    init_error = RuntimeError(model_warning or "Internal API Initialization Error")
+                    init_error.formatted_reason = model_warning or "Internal API Initialization Error"
+                    raise init_error
+
                 response, state_container = await self._generate_with_heartbeat(
-                    model, participant_history, gen_config, channel, participant, payload.message_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state={"custom_emoji": custom_emoji}
+                    model, participant_history, gen_config, channel, participant, payload.message_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
                 )
 
                 if not response or not response.candidates:
@@ -272,37 +367,24 @@ class RegenerationMixin:
                     raise ValueError("Empty Response (AI produced no text content)")
 
             except asyncio.CancelledError:
-                if state_container:
-                    if state_container.get('sending_task'): state_container['sending_task'].cancel()
-                    await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
-                    await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
+                await self._stop_sending_heartbeat(state_container)
+                # msg_a_id is the turn's own message here, not a placeholder to bin.
+                await self._safe_delete_placeholder(
+                    channel, state_container.get('msg_b_id'), bot_id=participant.get('bot_id'))
+                await self._restore_regenerated_message(
+                    channel, participant, payload.message_id,
+                    original_message_content, original_attachments)
                 session['is_regenerating'] = False
                 return
             except Exception as e:
                 is_timeout_main = isinstance(e, TimeoutError)
-                main_api_error = _format_api_error(e)
+                main_api_error = getattr(e, 'formatted_reason', None) or _format_api_error(e)
                 if hasattr(e, 'state_container'): state_container = e.state_container
 
-                if not fallback_model_name or primary_model == fallback_model_name:
+                if not is_real_model(fallback_model_name) or primary_model == fallback_model_name:
                     api_error_reason = main_api_error
                 else:
                     try:
-                        grounding_mode_native = p_profile.get("grounding_mode", "off")
-                        if isinstance(grounding_mode_native, bool): grounding_mode_native = "rag" if grounding_mode_native else "off"
-                        elif grounding_mode_native in ["on", "on+"]: grounding_mode_native = "rag"
-
-                        url_mode_native = p_profile.get("url_mode", "off")
-                        if "url_mode" not in p_profile:
-                            url_mode_native = "rag" if p_profile.get("url_fetching_enabled", False) else "off"
-
-                        model_tools_list = []
-                        if grounding_mode_native == "native":
-                            model_tools_list.append({"google_search": {}})
-                        if url_mode_native == "native":
-                            model_tools_list.append({"url_context": {}})
-
-                        model_tools = model_tools_list if model_tools_list else None
-
                         fallback_instance = self.cog.api_service._instantiate_model(
                             fallback_model_name, channel.guild.id, payload.user_id, full_system_instruction, dynamic_safety_settings, t_params_worker, model_tools, p_profile,
                             openrouter_key_error="No OpenRouter key for fallback", use_broad_openrouter_heuristic=False
@@ -323,10 +405,13 @@ class RegenerationMixin:
 
                         fallback_used = True
                     except asyncio.CancelledError:
-                        if state_container:
-                            if state_container.get('sending_task'): state_container['sending_task'].cancel()
-                            await self._safe_delete_placeholder(channel, state_container.get('msg_a_id'))
-                            await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
+                        await self._stop_sending_heartbeat(state_container)
+                        await self._safe_delete_placeholder(
+                            channel, (state_container or {}).get('msg_b_id'),
+                            bot_id=participant.get('bot_id'))
+                        await self._restore_regenerated_message(
+                            channel, participant, payload.message_id,
+                            original_message_content, original_attachments)
                         session['is_regenerating'] = False
                         return
                     except Exception as retry_e:
@@ -337,6 +422,19 @@ class RegenerationMixin:
                             api_error_reason = ERR_REASON_TIMEOUT_BOTH
                         else:
                             api_error_reason = _format_api_error(retry_e)
+
+            # The post-generation phase, as the worker and global chat both run it.
+            # Regeneration was the only generation path that never started this, so its
+            # message sat frozen on the last "Still generating" tick through the warning
+            # assembly, the history rewrite and the disk flush -- and the three
+            # `sending_task.cancel()` calls scattered through this function were
+            # cancelling a task nothing had ever created.
+            t1_start_mono = time.monotonic()
+            if state_container:
+                state_container['phase_label'] = "Applying"
+            await self._update_sending_placeholder(
+                channel, participant.get('method', 'webhook'), participant.get('bot_id'),
+                state_container, t1_start_mono)
 
             if not response or not response.candidates:
                 new_text = p_profile.get("error_response", ERR_GENERAL_ERROR)
@@ -353,7 +451,7 @@ class RegenerationMixin:
                 elif "Rate Limit" in reason:
                     turn_warnings.append(ERR_RATE_LIMIT)
                 else:
-                    if fallback_model_name and primary_model != fallback_model_name:
+                    if is_real_model(fallback_model_name) and primary_model != fallback_model_name:
                         turn_warnings.append(WARN_BOTH_MODELS_FAILED.format(reason=reason))
                     else:
                         turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=reason))
@@ -384,7 +482,8 @@ class RegenerationMixin:
                 display_text += warning_str
 
             if state_container:
-                await self._safe_delete_placeholder(channel, state_container.get('msg_b_id'))
+                await self._safe_delete_placeholder(
+                    channel, state_container.get('msg_b_id'), bot_id=participant.get('bot_id'))
                 state_container['msg_b_id'] = None
 
             # 5. Apply Changes
@@ -394,9 +493,14 @@ class RegenerationMixin:
             p_profile = self.cog.profile_manager._get_profile_config(p_owner_id, p_name, p_is_borrowed) or {}
             tz_str = p_profile.get("timezone", "UTC")
 
-            sp_name = p_name
-            app_data = self.cog.user_appearances.get(str(p_owner_id), {}).get(p_name, {})
-            if app_data.get("custom_display_name"): sp_name = app_data["custom_display_name"]
+            # Through the accessor, not the raw cache. _get_user_appearance resolves the
+            # effective profile first and populates the entry from config when it is
+            # cold; reading self.cog.user_appearances directly did neither, so a
+            # borrowed profile -- or any profile whose appearance had not been cached
+            # yet -- came back empty and the regenerated turn was rewritten under the
+            # bare profile name instead of the character's display name.
+            app_data = self.cog.profile_manager._get_user_appearance(p_owner_id, p_name)
+            sp_name = app_data.get("custom_display_name") or p_name
 
             profile_id = self.cog.profile_manager._get_profile_id(p_owner_id, p_name)
             
@@ -424,7 +528,8 @@ class RegenerationMixin:
             # [NEW] Meta collection for regeneration
             meta = {
                 "duration": round(time.monotonic() - t_start_regen, 2) if 't_start_regen' in locals() else 0.0,
-                "model": model.model_name.replace("models/", "").replace("OPENROUTER/", "").replace("GOOGLE/", "") if hasattr(model, 'model_name') else fallback_model_name,
+                "model": (model.model_name.replace("models/", "").replace("OPENROUTER/", "").replace("GOOGLE/", "")
+                          if getattr(model, 'model_name', None) else (fallback_model_name if fallback_used else primary_model)),
                 "fallback": fallback_used,
                 "input_tokens": getattr(response, 'input_tokens', 0) if response else 0,
                 "output_tokens": getattr(response, 'output_tokens', 0) if response else 0,
@@ -446,8 +551,7 @@ class RegenerationMixin:
             # Clean up legacy signatures from the turn if they exist
             final_target_turn.pop('thought_signature', None)
 
-            if state_container and state_container.get('sending_task'):
-                state_container['sending_task'].cancel()
+            await self._stop_sending_heartbeat(state_container)
 
             # Truncate text strictly for Discord's 2000 character limit on edits
             safe_text = display_text
@@ -469,7 +573,9 @@ class RegenerationMixin:
                         msg = await channel.fetch_message(payload.message_id)
                         kept_atts = [a for a in msg.attachments if a.content_type and a.content_type.startswith("image/")]
                         await wh.edit_message(payload.message_id, content=safe_text, attachments=kept_atts)
-                    except: pass
+                    except Exception: pass
+
+            delivered = True
 
             # Re-sync memory and save final state
             await self.cog.session_manager._save_session_to_disk(dummy_key, session_type, session["unified_log"])
@@ -477,7 +583,25 @@ class RegenerationMixin:
             # No rebuild: a regenerated turn only changes its own content, which no
             # derived session state reads. See _recompute_pending_whispers.
 
+        except asyncio.CancelledError:
+            # /cancel, or a shutdown. Anywhere outside the two generation calls -- which
+            # handle it themselves -- the message is still showing the placeholder
+            # emoji, so it has to be put back before the cancellation propagates.
+            if not delivered:
+                await self._restore_regenerated_message(
+                    channel, participant, payload.message_id,
+                    original_message_content, original_attachments)
+            raise
         except Exception as e:
             print(f"Regeneration failed: {e}")
+            # Otherwise the message keeps the placeholder emoji this function wrote over
+            # it, with no path back but another regeneration.
+            if not delivered:
+                await self._restore_regenerated_message(
+                    channel, participant, payload.message_id,
+                    original_message_content, original_attachments)
         finally:
+            if 'state_container' in locals():
+                await self._stop_sending_heartbeat(state_container)
+                self.cog.session_manager.release_in_flight(session, state_container)
             session['is_regenerating'] = False

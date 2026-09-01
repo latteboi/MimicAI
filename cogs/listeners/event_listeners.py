@@ -13,7 +13,7 @@ from discord.ext import commands
 
 from ..utils.constants import *
 from ..utils import mem_probe
-from ..utils.helpers import _format_history_entry
+from ..utils.helpers import _format_history_entry, _get_user_hash
 from ..utils.fuzzy import rank_keyed
 
 
@@ -346,26 +346,31 @@ class EventListeners:
 
                     async def queue_regeneration():
                         was_busy = is_busy
-                        # Now bounded. This spun unbounded at 2 Hz on flags it does not own,
-                        # and it waits on is_whispering as well now, so a leaked flag would
-                        # have stranded the task for the life of the process. On timeout the
-                        # regeneration is dropped rather than run against a live round --
-                        # the same outcome as the user pulling the reaction back off.
-                        if not await self.session_manager._wait_for_session_flags(
-                            session, SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS
-                        ):
-                            session.get('regen_tasks', {}).pop(payload.message_id, None)
-                            print(f"Regeneration for message {payload.message_id} timed out waiting for the channel; dropped.")
-                            return
+                        try:
+                            # Now bounded. This spun unbounded at 2 Hz on flags it does not own,
+                            # and it waits on is_whispering as well now, so a leaked flag would
+                            # have stranded the task for the life of the process. On timeout the
+                            # regeneration is dropped rather than run against a live round --
+                            # the same outcome as the user pulling the reaction back off.
+                            if not await self.session_manager._wait_for_session_flags(
+                                session, SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS
+                            ):
+                                print(f"Regeneration for message {payload.message_id} timed out waiting for the channel; dropped.")
+                                return
 
-                        session.get('regen_tasks', {}).pop(payload.message_id, None)
-                        
-                        if was_busy:
-                            asyncio.create_task(_ack_regen_reaction(False))
-                        
-                        still_exists = any(t.get("turn_id") == turn_id_to_find for t in session.get("unified_log", []))
-                        if still_exists:
-                            await self.generation_service._execute_regeneration(payload, session, turn_id_to_find, reacted_to_participant)
+                            if was_busy:
+                                asyncio.create_task(_ack_regen_reaction(False))
+
+                            still_exists = any(t.get("turn_id") == turn_id_to_find for t in session.get("unified_log", []))
+                            if still_exists:
+                                await self.generation_service._execute_regeneration(payload, session, turn_id_to_find, reacted_to_participant)
+                        finally:
+                            # Deregistered when the work is actually over, not before it
+                            # starts. This used to pop the handle immediately after the
+                            # wait and then run the regeneration, so for its entire
+                            # lifetime nothing held a reference to it -- /cancel had
+                            # nothing to cancel, which is why regeneration ignored it.
+                            session.get('regen_tasks', {}).pop(payload.message_id, None)
 
                     task = asyncio.create_task(queue_regeneration())
                     session.setdefault('regen_tasks', {})[payload.message_id] = task
@@ -862,8 +867,19 @@ class EventListeners:
                 break
 
         if turn_object:
-            # We only edit user messages. If a bot message is edited natively, we ignore it to prevent looping.
-            if turn_object.get("is_user") is False:
+            # We only rewrite plain user messages.
+            #
+            # `is not True`, not `is False`. A bot turn written before `is_user` existed
+            # reads back as absent, and `None is False` is False -- so the guard let it
+            # through and this handler rewrote the profile's own turn as if a user had
+            # typed it: the webhook's display name, the rendered text with "(edited)"
+            # appended, and no entity id. Regeneration edits the bot's message through
+            # the webhook, which fires this event, so regenerating a turn from an older
+            # session was enough to trigger it.
+            #
+            # Whispers and private responses carry is_user but are not channel messages
+            # either; rewriting one here would flatten its type and leak it.
+            if turn_object.get("is_user") is not True or turn_object.get("type"):
                 return
             
             channel = self.bot.get_channel(channel_id)
@@ -891,7 +907,12 @@ class EventListeners:
             
             # Format and inject, keeping the original timestamp
             original_ts = msg.created_at
-            new_history_line = _format_history_entry(msg.author.display_name, original_ts, new_content, user_tz)
+            # The same hash triggers.py stamped on the turn when it was first written.
+            # Omitting it rewrote a real user id as "00000000" on every message edit,
+            # so an edited message stopped matching the author it came from.
+            new_history_line = _format_history_entry(
+                msg.author.display_name, original_ts, new_content, user_tz,
+                entity_id=_get_user_hash(author_id))
             
             turn_object["content"] = new_history_line
             

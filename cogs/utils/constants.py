@@ -612,6 +612,33 @@ CONTENT_RATING_REASON_LABELS = {
 }
 CONTENT_RATING_REASON_FALLBACK = "Adult themes"
 
+# --- Anti-Repetition Critic ---------------------------------------------------
+#: The critic used to be one boolean, which bought the whole thing or none of it: the
+#: lexical scan below is free and runs in-process, but the only way to reach it was to
+#: also pay for a model call on every single turn.
+CRITIC_MODES = ("off", "lexical", "full")
+#: "self" screens the profile against its own recent replies. "session" screens it
+#: against every profile's, which is the repetition a roleplay session actually falls
+#: into -- four characters converging on one rhythm, none of them individually looping.
+CRITIC_SCOPES = ("self", "session")
+CRITIC_STRICTNESS_LEVELS = ("lenient", "normal", "strict")
+#: strictness -> the shortest repeated n-gram that counts as repetition. Lower is
+#: stricter. Expressed as this one number because it is the only knob
+#: mimic_core.scan_repetition takes, and the native scanner and the NumPy/Python
+#: fallback have to stay interchangeable.
+CRITIC_STRICTNESS_MIN_GRAM = {"lenient": 6, "normal": 4, "strict": 3}
+DEFAULT_CRITIC_MODE = "off"
+DEFAULT_CRITIC_SCOPE = "self"
+DEFAULT_CRITIC_STRICTNESS = "normal"
+#: Model turns the critic reads back through. Two is the minimum the lexical scan can
+#: compare and three the minimum worth sending to a model.
+DEFAULT_CRITIC_LOOKBACK = 4
+CRITIC_LOOKBACK_MIN, CRITIC_LOOKBACK_MAX = 2, 12
+#: Extra rounds a generated constraint stays in force after the round that earned it.
+#: 1 reproduces the behaviour this shipped with (current round plus one more).
+DEFAULT_CRITIC_PERSISTENCE = 1
+CRITIC_PERSISTENCE_MIN, CRITIC_PERSISTENCE_MAX = 0, 10
+
 DEFAULT_ANTI_REPETITION_PROMPT = (
     "You are a linguistic pattern analyzer for the character '{char_name}'.\n"
     "Your task is to detect repetitive structural and semantic patterns across the provided transcript.\n\n"

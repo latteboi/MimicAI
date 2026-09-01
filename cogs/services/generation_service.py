@@ -24,7 +24,7 @@ from ..utils.constants import (
 from ..utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt,
     _format_history_entry, _get_user_hash, _resolve_safety_settings, _scrub_response_text,
-    _split_into_sentences_with_abbreviations,
+    _split_into_sentences_with_abbreviations, is_real_model, resolve_critic_settings,
 )
 from ..utils import mem_probe
 from ..managers.session_manager import intern_turn
@@ -1001,23 +1001,50 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             owner_id, profile_name, channel.id, is_multi_profile=True, training_examples_list=training_examples_list, recalled_ltm=ltm_recall_text
                         )
                         
-                        # [UPDATED] Critic Persistence Logic (2 Rounds)
+                        # Critic persistence: how many further rounds a generated
+                        # constraint stays in force is the profile's to set now, where it
+                        # was fixed at one.
                         critic_constraints = None
-                        if p_settings.get("critic_enabled", False):
+                        critic_settings = resolve_critic_settings(p_settings)
+                        if critic_settings["enabled"]:
                             # Check for cached constraints in the session
                             cache = session.setdefault("critic_cache", {}).get(participant_key)
-                            
+
                             if cache and cache.get("rounds", 0) > 0:
                                 critic_constraints = cache["text"]
                                 cache["rounds"] -= 1
                             else:
+                                # "session" scope screens this profile against every
+                                # participant's recent lines instead of only its own.
+                                # Walked backwards and stopped at the quota, not filtered
+                                # over the whole log: this is tail-local state.
+                                session_transcript = None
+                                if critic_settings["scope"] == "session":
+                                    session_transcript = []
+                                    for _t in reversed(unified_log):
+                                        if (_t.get("is_user") or _t.get("type")
+                                                or _t.get("is_hidden") or _t.get("compacted")):
+                                            continue
+                                        session_transcript.append(_t.get("content", ""))
+                                        if len(session_transcript) >= critic_settings["lookback"]:
+                                            break
+                                    session_transcript.reverse()
+
                                 # Generate fresh constraints
                                 # _run_critic scans recent role=='model' turns; contents_for_api_call is
                                 # already the unified_log-derived history for this participant.
-                                critic_constraints = await self.cog.tools_service._run_critic(contents_for_api_call, speaker_display_name, channel.guild.id)
-                                if critic_constraints:
-                                    # Store constraints and set to 1 round (current + 1 future)
-                                    session["critic_cache"][participant_key] = {"text": critic_constraints, "rounds": 1}
+                                critic_constraints = await self.cog.tools_service._run_critic(
+                                    contents_for_api_call, speaker_display_name, channel.guild.id,
+                                    p_config=p_settings,
+                                    session_transcript=session_transcript,
+                                    instructions=self.cog.profile_manager.resolve_critic_instructions(
+                                        owner_id, profile_name),
+                                )
+                                if critic_constraints and critic_settings["persistence"] > 0:
+                                    session["critic_cache"][participant_key] = {
+                                        "text": critic_constraints,
+                                        "rounds": critic_settings["persistence"],
+                                    }
 
                         if critic_constraints:
                             constraints_block = self.cog.global_prompts.get("NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS)
@@ -1037,21 +1064,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         }
                         
                         # [NEW] Re-evaluate Tools for internal model reconstruction
-                        grounding_mode_native = p_settings.get("grounding_mode", "off")
-                        if isinstance(grounding_mode_native, bool): grounding_mode_native = "rag" if grounding_mode_native else "off"
-                        elif grounding_mode_native in ["on", "on+"]: grounding_mode_native = "rag"
-                        
-                        url_mode_native = p_settings.get("url_mode", "off")
-                        if "url_mode" not in p_settings:
-                            url_mode_native = "rag" if p_settings.get("url_fetching_enabled", False) else "off"
-
-                        model_tools_list = []
-                        if grounding_mode_native == "native":
-                            model_tools_list.append({"google_search": {}})
-                        if url_mode_native == "native":
-                            model_tools_list.append({"url_context": {}})
-                            
-                        model_tools = model_tools_list if model_tools_list else None
+                        model_tools = self._resolve_native_tools(p_settings)
 
                         # Provider resolution goes through APIService._instantiate_model, the one
                         # factory. The worker used to inline its own copy of the prefix parsing,
@@ -1179,6 +1192,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 'message_type': "text",
                                 'custom_emoji': custom_emoji
                             }
+
+                        # Published so /cancel can tell generation from delivery. Released
+                        # below, after the heartbeat is stopped and the placeholders are
+                        # gone -- releasing earlier would let a cancel land in the gap.
+                        self.cog.session_manager.register_in_flight(session, state_container)
                         
                         all_participant_names = []
                         for p_data_temp in session.get("profiles", []):
@@ -1198,101 +1216,120 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 display_name_temp = appearance_data_temp["custom_display_name"]
                             all_participant_names.append(display_name_temp)
                         
-                        if model:
-                            try:
-                                if feedback_task_i:
-                                    try:
-                                        feedback_result_i = await feedback_task_i
-                                        if participant.get('method') == 'child_bot' and p_settings.get("child_bot_placeholder", False):
-                                            if feedback_result_i:
-                                                try: first_placeholder_message = await channel.fetch_message(feedback_result_i)
-                                                except: pass
-                                                msg_a_id = feedback_result_i
-                                        else:
-                                            if feedback_result_i:
-                                                first_placeholder_message = feedback_result_i[0]
-                                                msg_a_id = first_placeholder_message.id
-                                                
-                                        if state_container:
-                                            state_container['msg_a_id'] = msg_a_id
-                                    except Exception as e:
-                                        print(f"Feedback task error: {e}")
-
-                                gen_task = asyncio.create_task(self._generate_with_heartbeat(
-                                    model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
-                                ))
-
-                                with mem_probe.probe(f"  participant turn {i}", peak=False):
-                                    response, state_container = await gen_task
-
-                                if not response or not response.candidates:
-                                    raise ValueError("Response blocked or empty")
-                                
-                                raw_text_check = getattr(response, 'text', "").strip()
-                                temp_scrubbed = _strip_neuro_update_and_scrub(raw_text_check, all_participant_names)
-
-                                if not temp_scrubbed:
-                                    raise ValueError("Empty Response (AI produced no text content)")
-
-                                status = "success"
-                            except asyncio.CancelledError:
-                                if state_container and state_container.get('sending_task'):
-                                    state_container['sending_task'].cancel()
-                                await self._safe_delete_placeholder(channel, state_container.get('msg_a_id') if state_container else msg_a_id, bot_id=participant.get('bot_id'))
-                                await self._safe_delete_placeholder(channel, state_container.get('msg_b_id') if state_container else None, bot_id=participant.get('bot_id'))
-                                if 'contents_for_api_call' in locals():
-                                    contents_for_api_call.clear()
-                                    del contents_for_api_call
-                                raise
-                            except Exception as e:
-                                is_timeout_main = isinstance(e, TimeoutError)
-                                main_api_error = _format_api_error(e)
-                                if hasattr(e, 'state_container'): state_container = e.state_container
-                                
-                                if not fallback_model_name or primary_model == fallback_model_name:
-                                    api_error_reason = main_api_error
-                                else:
-                                    try:
-                                        fb_name = fallback_model_name
-                                        fallback_instance = self.cog.api_service._instantiate_model(fb_name, channel.guild.id, triggering_user_id, full_system_instruction, dynamic_safety_settings, t_params_worker, model_tools, p_settings)
-                                        
-                                        response, state_container = await self._generate_with_heartbeat(
-                                            fallback_instance, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
-                                        )
+                        try:
+                            if feedback_task_i:
+                                try:
+                                    feedback_result_i = await feedback_task_i
+                                    if participant.get('method') == 'child_bot' and p_settings.get("child_bot_placeholder", False):
+                                        if feedback_result_i:
+                                            try: first_placeholder_message = await channel.fetch_message(feedback_result_i)
+                                            except: pass
+                                            msg_a_id = feedback_result_i
+                                    else:
+                                        if feedback_result_i:
+                                            first_placeholder_message = feedback_result_i[0]
+                                            msg_a_id = first_placeholder_message.id
                                             
-                                        if not response or not response.candidates:
-                                            raise ValueError("Response blocked or empty")
-                                        
-                                        fb_raw_check = getattr(response, 'text', "").strip()
-                                        temp_scrubbed = _strip_neuro_update_and_scrub(fb_raw_check, all_participant_names)
+                                    if state_container:
+                                        state_container['msg_a_id'] = msg_a_id
+                                except Exception as e:
+                                    print(f"Feedback task error: {e}")
 
-                                        if not temp_scrubbed:
-                                            raise ValueError("Empty Response (AI produced no text content)")
+                            # A primary that could not even be constructed is an error like any other,
+                            # and has to reach the same handler. Reporting it here instead meant a
+                            # configured fallback -- quite possibly a different provider whose key is
+                            # present -- never got the chance it gets whenever the primary constructs
+                            # and then fails, so a missing OpenRouter key was fatal rather than a
+                            # reason to fall back. The pre-formatted text rides on the exception so
+                            # the handler reports the configuration error, not a truncation of it.
+                            if not model:
+                                init_error = RuntimeError(warning_message or 'Internal API Initialization Error')
+                                init_error.formatted_reason = warning_message or 'Internal API Initialization Error'
+                                raise init_error
 
-                                        fallback_used = True
-                                        self.cog._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile_fallback", model_used=fb_name, status="success")
-                                    except asyncio.CancelledError:
-                                        if state_container and state_container.get('sending_task'):
-                                            state_container['sending_task'].cancel()
-                                        await self._safe_delete_placeholder(channel, state_container.get('msg_a_id') if state_container else msg_a_id, bot_id=participant.get('bot_id'))
-                                        await self._safe_delete_placeholder(channel, state_container.get('msg_b_id') if state_container else None, bot_id=participant.get('bot_id'))
-                                        if 'contents_for_api_call' in locals():
-                                            contents_for_api_call.clear()
-                                            del contents_for_api_call
-                                        raise
-                                    except Exception as retry_e:
-                                        is_timeout_fallback = isinstance(retry_e, TimeoutError)
-                                        if hasattr(retry_e, 'state_container'): state_container = retry_e.state_container
+                            gen_task = asyncio.create_task(self._generate_with_heartbeat(
+                                model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
+                            ))
+
+                            with mem_probe.probe(f"  participant turn {i}", peak=False):
+                                response, state_container = await gen_task
+
+                            if not response or not response.candidates:
+                                raise ValueError("Response blocked or empty")
+                            
+                            raw_text_check = getattr(response, 'text', "").strip()
+                            temp_scrubbed = _strip_neuro_update_and_scrub(raw_text_check, all_participant_names)
+
+                            if not temp_scrubbed:
+                                raise ValueError("Empty Response (AI produced no text content)")
+
+                            status = "success"
+                        except asyncio.CancelledError:
+                            if state_container and state_container.get('sending_task'):
+                                state_container['sending_task'].cancel()
+                            await self._safe_delete_placeholder(channel, state_container.get('msg_a_id') if state_container else msg_a_id, bot_id=participant.get('bot_id'))
+                            await self._safe_delete_placeholder(channel, state_container.get('msg_b_id') if state_container else None, bot_id=participant.get('bot_id'))
+                            if 'contents_for_api_call' in locals():
+                                contents_for_api_call.clear()
+                                del contents_for_api_call
+                            raise
+                        except Exception as e:
+                            is_timeout_main = isinstance(e, TimeoutError)
+                            # An instantiation failure arrives already phrased for the
+                            # user; _format_api_error would truncate that to 80 chars and
+                            # lose the half naming the key that is missing.
+                            main_api_error = getattr(e, 'formatted_reason', None) or _format_api_error(e)
+                            if hasattr(e, 'state_container'): state_container = e.state_container
+
+                            # is_real_model, not truthiness: an explicit "no fallback"
+                            # reads back as the string NONE, which is truthy and unequal
+                            # to the primary, so the retry was spent instantiating a model
+                            # by that name. Same three-way answer run_with_fallback uses.
+                            if not is_real_model(fallback_model_name) or primary_model == fallback_model_name:
+                                api_error_reason = main_api_error
+                            else:
+                                try:
+                                    fb_name = fallback_model_name
+                                    fallback_instance = self.cog.api_service._instantiate_model(fb_name, channel.guild.id, triggering_user_id, full_system_instruction, dynamic_safety_settings, t_params_worker, model_tools, p_settings)
+                                    
+                                    response, state_container = await self._generate_with_heartbeat(
+                                        fallback_instance, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
+                                    )
                                         
-                                        if is_timeout_main and is_timeout_fallback:
-                                            api_error_reason = ERR_REASON_TIMEOUT_BOTH
-                                        else:
-                                            api_error_reason = _format_api_error(retry_e)
-                                        status = "api_error"
-                            finally:
-                                self.cog._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile", model_used=model, status=status)
-                        else:
-                            api_error_reason = warning_message or "Internal API Initialization Error"
+                                    if not response or not response.candidates:
+                                        raise ValueError("Response blocked or empty")
+                                    
+                                    fb_raw_check = getattr(response, 'text', "").strip()
+                                    temp_scrubbed = _strip_neuro_update_and_scrub(fb_raw_check, all_participant_names)
+
+                                    if not temp_scrubbed:
+                                        raise ValueError("Empty Response (AI produced no text content)")
+
+                                    fallback_used = True
+                                    self.cog._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile_fallback", model_used=fb_name, status="success")
+                                except asyncio.CancelledError:
+                                    if state_container and state_container.get('sending_task'):
+                                        state_container['sending_task'].cancel()
+                                    await self._safe_delete_placeholder(channel, state_container.get('msg_a_id') if state_container else msg_a_id, bot_id=participant.get('bot_id'))
+                                    await self._safe_delete_placeholder(channel, state_container.get('msg_b_id') if state_container else None, bot_id=participant.get('bot_id'))
+                                    if 'contents_for_api_call' in locals():
+                                        contents_for_api_call.clear()
+                                        del contents_for_api_call
+                                    raise
+                                except Exception as retry_e:
+                                    is_timeout_fallback = isinstance(retry_e, TimeoutError)
+                                    if hasattr(retry_e, 'state_container'): state_container = retry_e.state_container
+                                    
+                                    if is_timeout_main and is_timeout_fallback:
+                                        api_error_reason = ERR_REASON_TIMEOUT_BOTH
+                                    else:
+                                        api_error_reason = _format_api_error(retry_e)
+                                    status = "api_error"
+                        finally:
+                            # `or primary_model`: this block now also runs when the primary
+                            # never constructed, and a log row naming no model at all says
+                            # less than one naming the model that could not be built.
+                            self.cog._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile", model_used=model or primary_model, status=status)
 
                         was_blocked = False
                         if not response or not response.candidates:
@@ -1310,7 +1347,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             elif "Rate Limit" in reason:
                                 turn_warnings.append(reason)
                             else:
-                                if fallback_model_name and primary_model != fallback_model_name:
+                                if is_real_model(fallback_model_name) and primary_model != fallback_model_name:
                                     turn_warnings.append(WARN_BOTH_MODELS_FAILED.format(reason=reason))
                                 else:
                                     turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=reason))
@@ -1381,7 +1418,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         sent_timestamp = datetime.datetime.now(datetime.timezone.utc) # Approximation
 
                         timezone_str = profile_settings.get("timezone", "UTC")
-                        main_history_line = _format_history_entry(speaker_display_name, sent_timestamp, response_text, timezone_str)
+                        main_history_line = _format_history_entry(
+                            speaker_display_name, sent_timestamp, response_text, timezone_str,
+                            entity_id=self.cog.profile_manager._get_profile_id(owner_id, profile_name))
                         try:
                             t1_formatted = t1_start_utc.astimezone(ZoneInfo(timezone_str)).strftime('%I:%M:%S %p %Z')
                         except Exception:
@@ -1754,6 +1793,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     
                     # --- Dispatch Warnings and Clean Up Placeholders ---
                     await self._stop_sending_heartbeat(state_container)
+                    self.cog.session_manager.release_in_flight(session, state_container)
 
                     msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
                     msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
@@ -2004,6 +2044,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             finally:
                 # Round has concluded, AI is no longer active
                 session['is_running'] = False
+                # Nothing this round published is in flight any more. The per-participant
+                # release below the delivery step handles the normal path; this catches
+                # the cancelled and errored ones, which leave the loop without reaching
+                # it and would otherwise grow this list by one per abandoned round.
+                session['in_flight'] = [c for c in session.get('in_flight', ())
+                                        if c.get('sending_task')]
         
         # [NEW] Lifecycle protection: Remove from background set and clear reference
         ctask = asyncio.current_task()

@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 from ..utils.constants import (
     FALLBACK_MODEL_NAME, MAX_URL_CONTEXT_CHARACTERS, MAX_URL_FETCH_BYTES, WARN_URL_FETCHING_FAILED,
-    WARN_GROUNDING_FAILED, DEFAULT_ANTI_REPETITION_PROMPT, DEFAULT_WEB_GROUNDING_VISUAL,
+    WARN_GROUNDING_FAILED, DEFAULT_WEB_GROUNDING_VISUAL,
     DEFAULT_WEB_GROUNDING_TEXT, PATTERN_HTML_CONTAINERS, PATTERN_HTML_TAGS,
     PATTERN_HTML_BLANKLINES, DEFAULT_GROUNDING_RAG_PAYLOAD,
 )
@@ -62,57 +62,75 @@ class ToolsService:
     def __init__(self, cog):
         self.cog = cog
 
-    async def _run_critic(self, history: list, char_name: str, guild_id: int) -> Optional[str]:
-        """Uses fast lexical heuristics and a reasoning model to find linguistic loops and robotic staleness."""
-        from ..utils.helpers import _fast_repetition_scan
+    async def _run_critic(self, history: list, char_name: str, guild_id: int,
+                          p_config: Optional[Dict[str, Any]] = None,
+                          session_transcript: Optional[List[str]] = None,
+                          instructions: Optional[str] = None) -> Optional[str]:
+        """Finds linguistic loops in recent output and returns a negative constraint.
 
-        recent_turns = []
-        count = 0
-        for turn in reversed(history):
-            if isinstance(turn, dict) and turn.get('role') == 'model':
-                parts = [p if isinstance(p, str) else p.get('text', '') for p in turn.get('parts', [])]
-                if parts:
-                    recent_turns.append(" ".join(parts))
-                    count += 1
-            if count >= 4: break
+        `p_config` is the speaking profile's config, passed in by the caller. It used to
+        be hunted for here by scanning `cog.multi_profile_channels` for a session whose
+        participant matched `char_name` -- but that dict is keyed by channel id and the
+        only caller passed `channel.guild.id`, so the lookup never hit. `critic_model`
+        and `critic_fallback_model` were configurable in three places and had never once
+        been read; every critic call ran on FALLBACK_MODEL_NAME with an empty config,
+        which also cost Ollama-hosted profiles their host URL.
 
-        if len(recent_turns) < 2: return None
+        `session_transcript` is what "session" scope supplies: every participant's recent
+        lines rather than this profile's own. Passed in for the same reason -- the log
+        belongs to the caller, and reaching back into the cog for it is what broke this.
+        """
+        from ..utils.helpers import _fast_repetition_scan, resolve_critic_settings
 
-        chronological_turns = list(reversed(recent_turns))
+        p_config = p_config or {}
+        settings = resolve_critic_settings(p_config)
+        if not settings["enabled"]:
+            return None
+
+        if session_transcript is not None:
+            chronological_turns = [t for t in session_transcript if t and t.strip()]
+            chronological_turns = chronological_turns[-settings["lookback"]:]
+        else:
+            recent_turns = []
+            for turn in reversed(history):
+                if isinstance(turn, dict) and turn.get('role') == 'model':
+                    parts = [p if isinstance(p, str) else p.get('text', '') for p in turn.get('parts', [])]
+                    if parts:
+                        recent_turns.append(" ".join(parts))
+                        if len(recent_turns) >= settings["lookback"]:
+                            break
+            chronological_turns = list(reversed(recent_turns))
+
+        if len(chronological_turns) < 2:
+            return None
 
         # 1. Ultra-fast local lexical scan (0ms latency fast-path)
-        is_repetitive, reason = _fast_repetition_scan(chronological_turns)
+        is_repetitive, reason = _fast_repetition_scan(chronological_turns, settings["min_gram"])
         if is_repetitive and reason:
             return f"DO NOT repeat phrasing or structure. {reason}."
 
-        if len(recent_turns) < 3: return None
+        # "lexical" stops here by design: the scan is free and in-process, so it is the
+        # mode that costs a profile nothing per turn. Only "full" buys the model pass.
+        if settings["mode"] != "full":
+            return None
+
+        if len(chronological_turns) < 3:
+            return None
 
         transcript = "\n---\n".join(chronological_turns)
 
-        system_instruction = self.cog.global_prompts.get("ANTI_REPETITION", DEFAULT_ANTI_REPETITION_PROMPT).format(char_name=char_name)
+        # Resolved by the caller (profile prompt, then /mod's instance-wide override,
+        # then the shipped default), for the same reason p_config is: the prompt lives
+        # encrypted in the profile's `prompts`, which is the caller's to read.
+        # str.format on user-authored text, so an unknown or stray brace is a ValueError
+        # or a KeyError rather than a crashed turn.
+        instructions = instructions or self.cog.profile_manager._default_critic_instructions()
+        try:
+            system_instruction = instructions.format(char_name=char_name)
+        except (KeyError, IndexError, ValueError):
+            system_instruction = instructions
 
-        # [NEW] Route to profile's defined critic model
-        # We need the profile to fetch the setting, pass via kwargs or fetch via guild context.
-        # For simplicity since this is called mid-generation, we will rely on the Fallback model if we can't find the profile context easily here,
-        # but we should pass profile data.
-
-        # Since _run_critic signature is (_run_critic(self, history: list, char_name: str, guild_id: int)),
-        # we will use the fallback model for now to keep the signature clean, or fetch it via active session.
-        # To perfectly align, let's fetch it via the active session in this guild.
-        critic_model_raw = FALLBACK_MODEL_NAME
-        # Hoisted rather than probed with `'p_config' in locals()` further down: the
-        # profile may simply not be in this session, and a name lookup that depends on
-        # whether a loop body ran is a trap waiting for the next edit.
-        p_config = {}
-        session = self.cog.multi_profile_channels.get(guild_id) # guild_id is actually channel_id in the _multi_profile_worker call
-        if session:
-            for p in session.get("profiles", []):
-                if p["profile_name"] == char_name or self.cog.user_appearances.get(str(p["owner_id"]), {}).get(p["profile_name"], {}).get("custom_display_name") == char_name:
-                    p_index = self.cog.profile_manager._get_user_index(p["owner_id"])
-                    p_is_b = p["profile_name"] in p_index.get("borrowed", [])
-                    p_config = self.cog.profile_manager._get_profile_config(p["owner_id"], p["profile_name"], p_is_b) or {}
-                    critic_model_raw = p_config.get("critic_model", FALLBACK_MODEL_NAME)
-                    break
+        critic_model_raw = p_config.get("critic_model") or FALLBACK_MODEL_NAME
 
         try:
             t_params = {"thinking_budget": 512, "thinking_summary_visible": "off", "thinking_level": "low"}

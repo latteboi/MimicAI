@@ -9,20 +9,25 @@ import time
 from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional, Union
 from ..utils.content import OLLAMA_GUIDE_TEXT
-from ..utils.helpers import _pf, _pi, _ps, _pb, is_real_model, image_model_caps
+from ..utils.helpers import (
+    _pf, _pi, _ps, _pb, is_real_model, image_model_caps, resolve_critic_settings,
+)
 from ..utils.http_client import get_shared_client
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
     from ..MimicCog import MimicCog
 
-from .base_components import BaseBulkProfileView, ConfigModal, ActionTextInputModal, build_pagination_controls, build_confirm_view
+from .base_components import (
+    BaseBulkProfileView, ConfigModal, ActionTextInputModal, TimeoutCleanupMixin,
+    build_pagination_controls, build_confirm_view,
+)
 from .gui_data import DataManageView
 from .gui_hub import HubShareManagerView
 from .gui_sessions import CustomModelModal
 from .gui_settings import OllamaHostModal
 
-def ProfileAdvancedParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
+def ProfileAdvancedParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     def gv(k):
         v = current_params.get(k)
         return str(v) if v is not None else ""
@@ -45,7 +50,7 @@ def ProfileAdvancedParamsModal(cog, profile_name: str, current_params: Dict[str,
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Advanced Parameters (OpenRouter)", fields, parser, callback, target_user_id)
 
-def ProfileDirectorDeskModal(cog, profile_name: str, current_params: Dict[str, Any], callback=None, target_user_id: Optional[int] = None):
+def ProfileDirectorDeskModal(cog, profile_name: str, current_params: Dict[str, Any], values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     fields = [
         {"label": "Archetype (Who)", "custom_id": "speech_archetype", "default": str(current_params.get("speech_archetype", "")), "required": False, "max_length": 200, "placeholder": "e.g. A cynical noir detective, a bubbly influencer."},
         {"label": "Accent", "custom_id": "speech_accent", "default": str(current_params.get("speech_accent", "")), "required": False, "max_length": 200, "placeholder": "e.g. Australian (Melbourne), British (Brixton)."},
@@ -58,17 +63,22 @@ def ProfileDirectorDeskModal(cog, profile_name: str, current_params: Dict[str, A
     return ConfigModal(cog, profile_name, False, "Director's Desk: TTS Instructions", fields, parser, callback, target_user_id)
 
 
-def ProfileSpeechSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
+def ProfileSpeechSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     # No voice field: it moved to the Choose TTS Voice picker. A text box here accepted
     # any string, and an unknown voice name comes back as a 400 that _generate_google_tts
     # turns into silence -- the profile looked configured and simply never spoke.
-    fields = [
+    # values_only drops the fields the setting's own screen renders as controls. The
+    # full form is what the bulk wizard still opens, so nothing is unreachable there.
+    fields = [] if values_only else [
         {"label": "Enable TTS (on/off)", "custom_id": "speech_tts_enabled", "default": "on" if current_params.get("speech_tts_enabled", False) else "off", "required": True, "max_length": 10},
-        {"label": "Temperature (0.0 - 2.0)", "custom_id": "speech_temperature", "default": str(current_params.get("speech_temperature", 1.0)), "required": False, "max_length": 5}
     ]
+    fields.append(
+        {"label": "Temperature (0.0 - 2.0)", "custom_id": "speech_temperature", "default": str(current_params.get("speech_temperature", 1.0)), "required": False, "max_length": 5}
+    )
     def parser(v):
         c = {}
-        c["speech_tts_enabled"] = _pb(v["speech_tts_enabled"])
+        if "speech_tts_enabled" in v:
+            c["speech_tts_enabled"] = _pb(v["speech_tts_enabled"])
         t = _pf(v["speech_temperature"])
         if t is not None:
             if not (0.0 <= t <= 2.0): raise ValueError("Temperature out of range")
@@ -76,6 +86,7 @@ def ProfileSpeechSettingsModal(cog, profile_name: str, current_params: Dict[str,
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Speech Settings", fields, parser, callback, target_user_id)
 
+#: Tab order for ProfileManageView's nav bar. "persona" is hidden for borrowed profiles.
 #: Tab order for ProfileManageView's nav bar. "persona" is hidden for borrowed profiles.
 PROFILE_TABS = ("home", "persona", "params", "tools", "memory")
 
@@ -137,6 +148,104 @@ class _Bulk:
         return self.scope == "all"
 
 
+class _Toggle:
+    """A boolean a function screen flips with one click.
+
+    A two-option select would cost two interactions to say the same thing, so toggles
+    stay buttons. `read` and `to_payload` exist for the settings whose stored shape is
+    not a bare bool -- thinking_summary_visible is the string "on"/"off", and url_mode
+    has to drag its legacy companion flag along with it.
+    """
+
+    __slots__ = ("key", "label", "read", "to_payload")
+
+    def __init__(self, key, label, *, read=None, to_payload=None):
+        self.key = key
+        self.label = label
+        self.read = read or (lambda config: bool(config.get(key, False)))
+        self.to_payload = to_payload or (lambda on: {key: on})
+
+
+class _Choice:
+    """A fixed set of values a function screen picks with a select.
+
+    Every one of these was a free-text field in a modal, validated only on submit:
+    "lexical", "session", "strict", "native", "mention_reply" all had to be spelled
+    correctly with nothing on screen saying what the alternatives were. A select cannot
+    be misspelled and shows the options and the current value at once.
+
+    `options` are (label, value) or (label, value, description).
+    """
+
+    __slots__ = ("key", "label", "options", "read", "to_payload", "placeholder")
+
+    def __init__(self, key, label, options, *, read=None, to_payload=None, placeholder=None):
+        self.key = key
+        self.label = label
+        self.options = tuple(options)
+        self.read = read or (lambda config: config.get(key))
+        self.to_payload = to_payload or (lambda value: {key: value})
+        self.placeholder = placeholder or f"{label}..."
+
+
+class _Screen:
+    """One setting's own screen: its controls, and the modal holding its free values.
+
+    Declared on the `_Action` beside the row that opens it, for the same reason `render`
+    and `bulk` are. Discord has no numeric or paragraph control outside a modal, so a
+    screen carries selects and buttons for everything enumerable and hands the rest to
+    `modal` behind an Edit button -- the split is a platform constraint, not a
+    preference. A row with no `_Screen` keeps whatever it did before: the model, voice,
+    image-output and timezone pickers are already purpose-built screens, and the
+    operations (rename, duplicate, delete, the data managers) are not settings at all.
+    """
+
+    __slots__ = ("controls", "modal", "modal_label", "sub_view", "note")
+
+    def __init__(self, *controls, modal=None, modal_label="Edit values…",
+                 sub_view=None, note=None):
+        self.controls = tuple(controls)
+        self.modal = modal
+        self.modal_label = modal_label
+        #: (button label, row handler) for a screen that also opens a purpose-built
+        #: picker. The handler has the same shape as `_Action.run` and is called with
+        #: the parent dashboard, so the timezone picker is reached the same way it
+        #: always was rather than being reimplemented as controls.
+        self.sub_view = sub_view
+        self.note = note
+
+    @property
+    def choices(self):
+        return tuple(c for c in self.controls if isinstance(c, _Choice))
+
+    @property
+    def toggles(self):
+        return tuple(c for c in self.controls if isinstance(c, _Toggle))
+
+
+def _write_profile_config(cog, user_id: str, profile_name: str, is_borrowed: bool,
+                          updates: Dict[str, Any]) -> bool:
+    """Merge `updates` into a profile's config and drop any live model built from it.
+
+    The invalidation is what makes a setting take effect mid-session: a cached model
+    instance carries the system instruction and sampling parameters it was built with.
+    Copied out of _save_and_refresh, which is now one caller of this rather than the
+    only place that knew to do it.
+    """
+    target = cog.profile_manager._get_profile_config(user_id, profile_name, is_borrowed)
+    if target is None:
+        return False
+    target.update(updates)
+    cog.profile_manager._save_profile_config(user_id, profile_name, target, is_borrowed)
+
+    stale = [k for k in cog.channel_models
+             if isinstance(k, tuple) and len(k) == 3 and k[1] == user_id and k[2] == profile_name]
+    for k in stale:
+        cog.channel_models.pop(k, None)
+        cog.channel_model_last_profile_key.pop(k, None)
+    return True
+
+
 class _Action:
     """One row of ProfileManageView's dropdown.
 
@@ -155,12 +264,20 @@ class _Action:
     `bulk` is an optional `_Bulk` describing the same setting applied to many profiles
     at once. Rows with no `bulk` are the ones that cannot mean anything in bulk -- a
     rename, a duplicate, or an item-by-item data editor.
+
+    `render` is how this row shows up on the dashboard embed: a callable taking the
+    render context and returning `(field_name, field_value, inline)`, or None to
+    contribute no field. It lives here for the same reason `bulk` does -- a setting
+    that gains an action and a bulk form but no dashboard line is exactly the drift
+    this table exists to make impossible, and the embed used to be a 170-line wall
+    maintained in a different file from the actions it described.
     """
 
     __slots__ = ("value", "tab", "label", "description", "gate", "run", "_menu_label",
-                 "bulk")
+                 "render", "screen", "bulk")
 
     def __init__(self, value, tab, label, description, run, gate=None, menu_label=None,
+                 render=None, screen=None,
                  bulk=None):
         self.value = value
         self.tab = tab
@@ -169,6 +286,8 @@ class _Action:
         self.run = run
         self.gate = gate
         self._menu_label = menu_label
+        self.render = render
+        self.screen = screen
         self.bulk = bulk
 
     def bulk_label(self) -> str:
@@ -220,22 +339,25 @@ def _modal(factory_name: str, *, pass_borrowed: bool = True):
     return run
 
 
-def _toggle(key: str):
-    """Handler for a plain boolean flag on the profile config."""
+def _open_screen(action_value: str):
+    """Row handler that swaps the dashboard onto that setting's own screen.
+
+    Named by value rather than closing over the `_Action` because the table is defined
+    below the rows it points at -- the same reason `_modal` looks its factory up at
+    click time.
+    """
     async def run(view, interaction, profile):
-        profile[key] = not profile.get(key, False)
-        await view._save_and_refresh(interaction, profile, view.profile_name, view.is_borrowed)
+        action = PROFILE_ACTIONS_BY_VALUE[action_value]
+        screen = ProfileFunctionView(view, action)
+        await interaction.response.edit_message(embed=await screen.embed(), view=screen)
     return run
 
 
-def _cycle(key: str, order: tuple, default=None):
-    """Handler for a setting that advances through a fixed sequence."""
-    async def run(view, interaction, profile):
-        current = profile.get(key, default if default is not None else order[0])
-        index = order.index(current) + 1 if current in order else 0
-        profile[key] = order[index % len(order)]
-        await view._save_and_refresh(interaction, profile, view.profile_name, view.is_borrowed)
-    return run
+# _toggle and _cycle lived here. Every row that used them now declares a `_Screen`
+# instead: the toggles became buttons that say which way they will go, and the two
+# cyclers became selects. A cycle was the worst of the three -- reaching RAG from Off
+# took two clicks through a Native setting that silently does nothing on OpenRouter,
+# with no screen anywhere saying so.
 
 
 def _method(name: str, *args, wants_profile: bool = False, wants_borrowed: bool = False):
@@ -360,6 +482,188 @@ def _to_personal(view):
             and view.is_system)
 
 
+# --- Dashboard field renderers ------------------------------------------------
+#
+# One per setting, declared beside the action that changes it and pulled into the
+# embed by tab. The embed used to be a single 170-line block in ProfileManager that
+# rendered every group on every repaint regardless of which tab the view was on, so
+# the Tools tab showed you Top-K and the Params tab showed you hormone levels.
+#
+# Each takes the render context ProfileManager._build_profile_embed assembles and
+# returns (name, value, inline) or None. Returning None omits the field entirely,
+# which is how a row says "nothing to report here" -- see the persona sections.
+
+_ON = "**`ON`**"
+_OFF = "`OFF`"
+
+
+def _flag(value) -> str:
+    return _ON if value else _OFF
+
+
+def _mode_display(raw, *, legacy_true="rag") -> str:
+    """off/native/rag, coercing the two legacy encodings this setting has had.
+
+    grounding_mode was a bool before it was a string and briefly took "on"/"on+";
+    url_mode reads off the older url_fetching_enabled flag when it is absent.
+    """
+    if isinstance(raw, bool):
+        raw = legacy_true if raw else "off"
+    elif raw in ("on", "on+"):
+        raw = legacy_true
+    return {"off": _OFF, "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(raw, _OFF)
+
+
+def _grounding_mode(config) -> str:
+    raw = config.get("grounding_mode", "off")
+    if isinstance(raw, bool):
+        return "rag" if raw else "off"
+    return "rag" if raw in ("on", "on+") else raw
+
+
+def _url_mode(config) -> str:
+    if "url_mode" not in config:
+        return "rag" if config.get("url_fetching_enabled", False) else "off"
+    return config.get("url_mode", "off")
+
+
+
+
+
+
+
+
+def _render_thinking(ctx):
+    config = ctx["config"]
+    budget = config.get("thinking_budget", -1)
+    return "Thinking / Reasoning", (
+        f"Summary: {_flag(str(config.get('thinking_summary_visible', 'off')).lower() == 'on')}\n"
+        f"Effort: `{str(config.get('thinking_level', 'high')).title()}`\n"
+        f"Budget: `{'Dynamic (-1)' if budget == -1 else budget}`"
+    ), True
+
+
+def _render_speech(ctx):
+    config = ctx["config"]
+    return "Speech TTS", (
+        f"Enabled: {_flag(config.get('speech_tts_enabled', False))}\n"
+        f"Temperature: `{config.get('speech_temperature', 1.0)}`"
+    ), True
+
+
+
+
+def _render_image_toggle(ctx):
+    config = ctx["config"]
+    return "Image Generation", (
+        f"Enabled: {_flag(config.get('image_generation_enabled', False))}\n"
+        f"Model: `{config.get('image_generation_model') or DEFAULT_IMAGE_MODEL}`"
+    ), True
+
+
+
+
+def _render_grounding(ctx):
+    return "Grounding (Web Search)", _mode_display(ctx["config"].get("grounding_mode", "off")), True
+
+
+def _render_url(ctx):
+    return "URL Context", _mode_display(_url_mode(ctx["config"])), True
+
+
+def _render_help_mode(ctx):
+    return "Help Mode (Guide RAG)", _flag(ctx["config"].get("help_mode_enabled", False)), True
+
+
+def _render_response_mode(ctx):
+    raw = str(ctx["config"].get("response_mode", "regular"))
+    return "Response Mode", f"`{raw.replace('_', ' ').title()}`", True
+
+
+def _render_time(ctx):
+    config = ctx["config"]
+    return "Time & Timezone", (
+        f"Tracking: {_flag(config.get('time_tracking_enabled', False))}\n"
+        f"Zone: `{config.get('timezone', 'UTC')}`"
+    ), True
+
+
+def _render_typing(ctx):
+    config = ctx["config"]
+    if not config.get("realistic_typing_enabled", False):
+        return "Realistic Typing", _OFF, True
+    return "Realistic Typing", (
+        f"{_ON}\n"
+        f"Mode: `{config.get('typing_mode', 'sentence')}`\n"
+        f"Rate: `{config.get('typing_cps', 30.0)}` cps\n"
+        f"Max Delay: `{config.get('typing_max_delay', 2.5)}`s"
+    ), True
+
+
+def _render_critic(ctx):
+    critic = resolve_critic_settings(ctx["config"])
+    if critic["mode"] == "off":
+        return "Anti-Repetition Critic", _OFF, True
+    lines = [f"Mode: **`{critic['mode'].upper()}`**",
+             f"Scope: `{critic['scope']}`",
+             f"Strictness: `{critic['strictness']}`",
+             f"Lookback: `{critic['lookback']}` turns",
+             f"Persistence: `{critic['persistence']}` rounds"]
+    if critic["mode"] == "lexical":
+        lines.append("-# Local scan only, no API call.")
+    return "Anti-Repetition Critic", "\n".join(lines), True
+
+
+
+
+def _render_neuro(ctx):
+    config = ctx["config"]
+    if not config.get("neuro_engine_enabled", False):
+        return "Neuro Engine", _OFF, True
+    state = config.get("neuro_state") or {}
+    return "Neuro Engine", (
+        f"{_ON}\n"
+        f"Dopamine: `{state.get('dopamine', 50)}`\n"
+        f"Cortisol: `{state.get('cortisol', 20)}`\n"
+        f"Oxytocin: `{state.get('oxytocin', 50)}`\n"
+        f"Adrenaline: `{state.get('adrenaline', 20)}`"
+    ), True
+
+
+
+
+
+
+
+
+
+
+
+
+def _render_ltm_creation(ctx):
+    return "LTM Auto-Creation", _flag(ctx["config"].get("ltm_creation_enabled", False)), True
+
+
+
+
+
+
+
+
+
+
+
+
+def _render_generation_visual(ctx):
+    config = ctx["config"]
+    return "Generation Visual", (
+        f"Placeholder: {config.get('placeholder_emoji') or '`Default`'}\n"
+        f"Child Bot Placeholder: {_flag(config.get('child_bot_placeholder', False))}"
+    ), True
+
+
+
+
 #: The dropdown, in render order, grouped by tab. Order within a tab is the order the
 #: user sees, so rows must not be resorted.
 PROFILE_ACTIONS = (
@@ -378,7 +682,10 @@ PROFILE_ACTIONS = (
             bulk=_Bulk(_bulk_method("_bulk_error_response"), scope="all",
                        keys=("error_response",))),
     _Action("generation_visual", "home", "Generation Visual", "Set custom placeholder emoji and child bot behavior.",
-            _modal("ProfileGenerationVisualModal"), _own,
+            _open_screen("generation_visual"), _own,
+            render=_render_generation_visual,
+            screen=_Screen(_Toggle("child_bot_placeholder", "Child Bot Placeholder"),
+                           modal="ProfileGenerationVisualModal", modal_label="Edit emoji…"),
             bulk=_Bulk(_bulk_modal("ProfileGenerationVisualModal"), scope="all",
                        keys=("placeholder_emoji", "child_bot_placeholder"))),
     _Action("convert_to_system", "home", "Copy to System Profile", "Create a global System Profile copy from this profile.",
@@ -457,11 +764,23 @@ PROFILE_ACTIONS = (
                        keys=("frequency_penalty", "presence_penalty", "repetition_penalty",
                              "min_p", "top_a"))),
     _Action("thinking_params", "params", "Set Thinking Parameters", "Set thinking persistence, level, and budget.",
-            _modal("ProfileThinkingParamsModal"),
+            _open_screen("thinking_params"), render=_render_thinking,
+            screen=_Screen(
+                _Choice("thinking_level", "Reasoning Effort",
+                        (("Extra High", "xhigh"), ("High", "high"), ("Medium", "medium"),
+                         ("Low", "low"), ("Minimal", "minimal"), ("None", "none")),
+                        read=lambda c: str(c.get("thinking_level", "high")).lower(),
+                        placeholder="Reasoning effort..."),
+                _Toggle("thinking_summary_visible", "Show Summary",
+                        read=lambda c: str(c.get("thinking_summary_visible", "off")).lower() == "on",
+                        to_payload=lambda on: {"thinking_summary_visible": "on" if on else "off"}),
+                modal="ProfileThinkingParamsModal", modal_label="Edit budget…"),
             bulk=_Bulk(_bulk_modal("ProfileThinkingParamsModal"), scope="all",
                        keys=("thinking_level", "thinking_budget", "thinking_summary_visible"))),
     _Action("speech_settings", "params", "Set Speech Settings", "Turn TTS on or off and set its temperature.",
-            _modal("ProfileSpeechSettingsModal"),
+            _open_screen("speech_settings"), render=_render_speech,
+            screen=_Screen(_Toggle("speech_tts_enabled", "TTS"),
+                           modal="ProfileSpeechSettingsModal", modal_label="Edit temperature…"),
             bulk=_Bulk(_bulk_modal("ProfileSpeechSettingsModal"), scope="all",
                        keys=("speech_tts_enabled", "speech_temperature"))),
     _Action("voice", "params", "Choose TTS Voice", "Pick from the thirty prebuilt Gemini voices.",
@@ -471,8 +790,10 @@ PROFILE_ACTIONS = (
                        keys=("speech_voice",))),
 
     # --- Tools ---
-    _Action("image_toggle", "tools", "Toggle Image Generation", "Allow this profile to generate images via !image/!imagine.",
-            _method("_act_image_toggle", wants_profile=True),
+    _Action("image_toggle", "tools", "Image Generation", "Allow this profile to generate images via !image/!imagine.",
+            _open_screen("image_toggle"), render=_render_image_toggle,
+            screen=_Screen(_Toggle("image_generation_enabled", "Image Generation"),
+                           modal="ProfileImageGenSettingsModal", modal_label="Edit prompt…"),
             bulk=_Bulk(_bulk_modal("ProfileImageGenSettingsModal", action_key="update_both"),
                        scope="all", label="Configure Image Generation",
                        description="Set up models, prompts, and toggles for multiple profiles.",
@@ -483,17 +804,37 @@ PROFILE_ACTIONS = (
             bulk=_Bulk(_bulk_sub("ImageOutputApplyView"), scope="all", label="Set Image Output",
                        description="Stage aspect ratio, resolution and thinking level.",
                        keys=IMAGE_OUTPUT_KEYS)),
-    _Action("grounding", "tools", "Toggle Grounding (Web Search)", "Cycle Grounding: OFF -> NATIVE -> RAG.",
-            _method("_act_grounding", wants_profile=True),
+    _Action("grounding", "tools", "Grounding (Web Search)", "Choose Off, Native or RAG web search.",
+            _open_screen("grounding"), render=_render_grounding,
+            # A select, not the old three-way cycle: going Off -> Native -> RAG -> Off
+            # meant two clicks to reach RAG and no indication that Native is
+            # Google-only until the turn failed.
+            screen=_Screen(_Choice(
+                "grounding_mode", "Grounding",
+                (("Off", "off", "No web search."),
+                 ("Native", "native", "Provider-side Google Search. Google models only."),
+                 ("RAG", "rag", "Search, then summarise. Works on any provider.")),
+                read=_grounding_mode, placeholder="Grounding mode..."),
+                note="-# OpenRouter and Ollama models must use **RAG**; Native is a Google-side tool."),
             bulk=_Bulk(_bulk_choice("Select Grounding Mode...",
                                     [("Off", "off"), ("Native", "native"), ("RAG", "rag")],
                                     to_payload=lambda v: {"grounding_mode": v}),
                        scope="all", label="Set Grounding Mode", keys=("grounding_mode",),
                        description="Choose Off, Native or RAG for every selected profile.")),
-    _Action("url_toggle", "tools", "Toggle URL Context Fetching", "Cycle URL Context: OFF -> NATIVE -> RAG.",
-            _method("_act_url_toggle", wants_profile=True),
+    _Action("url_toggle", "tools", "URL Context Fetching", "Choose Off, Native or RAG link reading.",
+            _open_screen("url_toggle"), render=_render_url,
             # url_fetching_enabled is the legacy flag the turn path still reads, so it
-            # has to move with url_mode or a bulk sweep leaves the two disagreeing.
+            # has to move with url_mode -- on the screen as well as in bulk, or setting
+            # it one way leaves the two disagreeing.
+            screen=_Screen(_Choice(
+                "url_mode", "URL Context",
+                (("Off", "off", "Links posted in chat are ignored."),
+                 ("Native", "native", "Provider-side URL fetching. Google models only."),
+                 ("RAG", "rag", "Fetch and scrape the page. Works on any provider.")),
+                read=_url_mode,
+                to_payload=lambda v: {"url_mode": v, "url_fetching_enabled": v == "rag"},
+                placeholder="URL context mode..."),
+                note="-# OpenRouter and Ollama models must use **RAG**; Native is a Google-side tool."),
             bulk=_Bulk(_bulk_choice("Select URL Mode...",
                                     [("Off", "off"), ("Native", "native"), ("RAG", "rag")],
                                     to_payload=lambda v: {"url_mode": v,
@@ -501,8 +842,16 @@ PROFILE_ACTIONS = (
                        scope="all", label="Set URL Context Mode",
                        keys=("url_mode", "url_fetching_enabled"),
                        description="Choose Off, Native or RAG for every selected profile.")),
-    _Action("cycle_response", "tools", "Cycle Response Mode", "Cycle: Regular -> Mention -> Reply -> Mention Reply.",
-            _cycle("response_mode", ("regular", "mention", "reply", "mention_reply")),
+    _Action("cycle_response", "tools", "Response Mode", "Choose how a reply attaches to your message.",
+            _open_screen("cycle_response"), render=_render_response_mode,
+            screen=_Screen(_Choice(
+                "response_mode", "Response Mode",
+                (("Regular", "regular", "Post as a normal message."),
+                 ("Mention", "mention", "Mention the user who triggered the reply."),
+                 ("Reply", "reply", "Reply to the triggering message."),
+                 ("Mention + Reply", "mention_reply", "Both.")),
+                read=lambda c: c.get("response_mode", "regular"),
+                placeholder="Response mode...")),
             bulk=_Bulk(_bulk_choice("Select Response Mode...",
                                     [("Regular", "regular"), ("Mention", "mention"),
                                      ("Reply", "reply"), ("Mention+Reply", "mention_reply")],
@@ -510,32 +859,84 @@ PROFILE_ACTIONS = (
                        scope="all", label="Set Response Mode", keys=("response_mode",),
                        description="Choose Regular, Mention, Reply or Mention+Reply.")),
     _Action("time", "tools", "Set Time & Timezone", "Enable time awareness and set the profile's timezone.",
-            _method("_handle_timezone", wants_profile=True, wants_borrowed=True),
+            _open_screen("time"), render=_render_time,
+            # Picking a timezone force-sets time_tracking_enabled, and nothing in the
+            # single-profile GUI could set it back -- a profile that had ever chosen a
+            # zone was stuck with time awareness on unless it went through the bulk
+            # manager. The toggle here is the off switch that was missing.
+            screen=_Screen(
+                _Toggle("time_tracking_enabled", "Time Awareness"),
+                sub_view=("Choose timezone…",
+                          _method("_handle_timezone", wants_profile=True, wants_borrowed=True))),
             bulk=_Bulk(_bulk_sub("BulkTimezoneView"), scope="all",
                        keys=("timezone", "time_tracking_enabled"))),
-    _Action("typing", "tools", "Toggle Realistic Typing", "Enable a human-like delay when the bot sends messages.",
-            _modal("ProfileTypingSettingsModal"),
+    _Action("typing", "tools", "Realistic Typing", "Enable a human-like delay when the bot sends messages.",
+            _open_screen("typing"), render=_render_typing,
+            screen=_Screen(
+                _Choice("typing_mode", "Chunking",
+                        (("Sentence", "sentence", "Split the reply on sentence boundaries."),
+                         ("Line", "line", "Split the reply on line breaks.")),
+                        read=lambda c: c.get("typing_mode", "sentence"),
+                        placeholder="Chunking mode..."),
+                _Toggle("realistic_typing_enabled", "Realistic Typing"),
+                modal="ProfileTypingSettingsModal", modal_label="Edit speed…"),
             bulk=_Bulk(_bulk_modal("ProfileTypingSettingsModal"), scope="all",
                        keys=("realistic_typing_enabled", "typing_mode", "typing_cps",
                              "typing_max_delay"))),
-    _Action("critic", "tools", "Toggle Anti-Repetition Critic", "Enable semantic repetition analysis (Adds latency).",
-            _toggle("critic_enabled"),
-            bulk=_Bulk(_bulk_choice("Select action...",
-                                    [("Enable Critic", "true"), ("Disable Critic", "false")],
-                                    to_payload=lambda v: {"critic_enabled": v == "true"}),
-                       scope="all", label="Set Anti-Repetition Critic", keys=("critic_enabled",),
-                       description="Turn semantic repetition analysis on or off.")),
-    _Action("neuro", "tools", "Toggle Neuro-Endocrine Engine", "Simulate hormonal states for dynamic emotions.",
-            _modal("ProfileNeuroModal"),
+    _Action("critic", "tools", "Configure Anti-Repetition Critic",
+            "Mode, scope, strictness, lookback and constraint persistence.",
+            _open_screen("critic"), render=_render_critic,
+            screen=_Screen(
+                _Choice("critic_mode", "Mode",
+                        (("Off", "off", "No repetition screening."),
+                         ("Lexical", "lexical", "Local n-gram scan. No API call, no added latency."),
+                         ("Full", "full", "Adds a model pass. One extra call per reply.")),
+                        read=lambda c: resolve_critic_settings(c)["mode"],
+                        to_payload=lambda v: {"critic_mode": v, "critic_enabled": v != "off"},
+                        placeholder="Critic mode..."),
+                _Choice("critic_scope", "Scope",
+                        (("Self", "self", "Screen against this profile's own recent replies."),
+                         ("Session", "session", "Screen against every participant's replies.")),
+                        read=lambda c: resolve_critic_settings(c)["scope"],
+                        placeholder="Critic scope..."),
+                _Choice("critic_strictness", "Strictness",
+                        (("Lenient", "lenient", "Only longer repeated phrases count."),
+                         ("Normal", "normal", "The shipped default."),
+                         ("Strict", "strict", "Short repeated phrases count.")),
+                        read=lambda c: resolve_critic_settings(c)["strictness"],
+                        placeholder="Critic strictness..."),
+                modal="ProfileCriticSettingsModal", modal_label="Edit lookback & persistence…"),
+            bulk=_Bulk(_bulk_modal("ProfileCriticSettingsModal"), scope="all",
+                       label="Configure Anti-Repetition Critic",
+                       description="Set mode, scope, strictness, lookback and persistence.",
+                       keys=("critic_mode", "critic_enabled", "critic_scope",
+                             "critic_strictness", "critic_lookback", "critic_persistence"))),
+    _Action("critic_instructions", "tools", "Set Critic Instructions",
+            "Customise the prompt the critic screens replies with.",
+            _method("_act_critic_instructions", wants_profile=True), _own,
+            bulk=_Bulk(_bulk_modal("ProfileCriticInstructionsModal",
+                                   action_key="update_prompts", pass_borrowed=False,
+                                   seed=lambda c: c.profile_manager._default_critic_instructions()),
+                       scope="personal", destructive=True,
+                       prompt_keys=("critic_instructions",),
+                       warning="Every selected profile's **critic prompt** is replaced. "
+                               "Profiles using a customised prompt lose it.")),
+    _Action("neuro", "tools", "Neuro-Endocrine Engine", "Simulate hormonal states for dynamic emotions.",
+            _open_screen("neuro"), render=_render_neuro,
+            screen=_Screen(_Toggle("neuro_engine_enabled", "Neuro Engine"),
+                           modal="ProfileNeuroModal", modal_label="Edit hormones…"),
             bulk=_Bulk(_bulk_modal("ProfileNeuroModal"), scope="all",
                        keys=("neuro_engine_enabled", "neuro_state"))),
-    _Action("help_mode", "tools", "Toggle Help Mode (Guide RAG)", "Allow profile to answer technical bot questions.",
-            _toggle("help_mode_enabled"),
+    _Action("help_mode", "tools", "Help Mode (Guide RAG)", "Allow profile to answer technical bot questions.",
+            _open_screen("help_mode"), render=_render_help_mode,
+            screen=_Screen(_Toggle("help_mode_enabled", "Help Mode")),
             bulk=_Bulk(_bulk_choice("Select action...",
                                     [("Enable Help Mode", "true"), ("Disable Help Mode", "false")],
                                     to_payload=lambda v: {"help_mode_enabled": v == "true"}),
                        scope="all", label="Set Help Mode", keys=("help_mode_enabled",),
                        description="Turn the documentation RAG on or off.")),
+
+    # --- Behaviour (how the profile conducts itself) ---
 
     # --- Memory ---
     _Action("manage_ltm", "memory", "Manage Long-Term Memories", "Add, list, edit, or delete memories.",
@@ -551,8 +952,9 @@ PROFILE_ACTIONS = (
             bulk=_Bulk(_bulk_modal("ProfileTrainingParamsModal", pass_borrowed=False),
                        scope="personal",
                        keys=("training_context_size", "training_relevance_threshold"))),
-    _Action("ltm_creation", "memory", "Toggle LTM Auto-Creation", "Automatically create memories from conversations.",
-            _toggle("ltm_creation_enabled"),
+    _Action("ltm_creation", "memory", "LTM Auto-Creation", "Automatically create memories from conversations.",
+            _open_screen("ltm_creation"), render=_render_ltm_creation,
+            screen=_Screen(_Toggle("ltm_creation_enabled", "Auto-Creation")),
             bulk=_Bulk(_bulk_choice("Select action...",
                                     [("Enable LTM Auto-Creation", "true"),
                                      ("Disable LTM Auto-Creation", "false")],
@@ -629,12 +1031,18 @@ class ProfileManageView(ui.View):
             select.callback = self.dropdown_callback
             self.add_item(select)
 
-        # --- 2. Navigation Buttons (Row 1) ---
-        for tab in valid_tabs:
+        # --- 2. Navigation Buttons (Rows 1-2) ---
+        # Discord fits five components to an action row, and there are six tabs. They
+        # all used to be pinned to row 1, which was fine at five and raises
+        # "item would not fit at row 1" at six -- inside __init__, so the whole
+        # dashboard failed to open rather than degrading. Split evenly rather than
+        # 5 + 1, so the second row reads as a continuation instead of an orphan.
+        per_row = len(valid_tabs) if len(valid_tabs) <= 5 else (len(valid_tabs) + 1) // 2
+        for position, tab in enumerate(valid_tabs):
             btn = ui.Button(
-                label=tab.title(), 
-                style=discord.ButtonStyle.primary if self.current_tab == tab else discord.ButtonStyle.secondary, 
-                row=1, 
+                label=tab.title(),
+                style=discord.ButtonStyle.primary if self.current_tab == tab else discord.ButtonStyle.secondary,
+                row=1 + (position // per_row),
                 disabled=(self.current_tab == tab)
             )
             btn.callback = self.create_nav_callback(tab)
@@ -748,16 +1156,6 @@ class ProfileManageView(ui.View):
                                       is_borrowed=self.is_borrowed, user_id=self.user_id)
         await interaction.response.send_message(view._get_selection_feedback_message(), view=view, ephemeral=True)
 
-    async def _act_image_toggle(self, interaction: discord.Interaction, profile: Dict[str, Any]):
-        # Inject prompt into current_params to avoid breaking the modal signature
-        if not self.is_borrowed:
-            prompts = self.cog.profile_manager._get_profile_prompts(self.user_id, self.profile_name) or {}
-            profile["image_generation_prompt"] = prompts.get("image_generation_prompt")
-
-        modal = ProfileImageGenSettingsModal(self.cog, self.profile_name, profile, self.is_borrowed,
-                                             callback=self._refresh_dashboard, target_user_id=self.user_id)
-        await interaction.response.send_modal(modal)
-
     async def _act_image_output(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         await self._open_media_options(interaction, "image")
 
@@ -768,23 +1166,6 @@ class ProfileManageView(ui.View):
         view = SingleProfileMediaOptionsView(self.cog, self.original_interaction, self.profile_name,
                                              mode, is_borrowed=self.is_borrowed, user_id=self.user_id)
         await interaction.response.send_message(view._feedback(), view=view, ephemeral=True)
-
-    async def _act_grounding(self, interaction: discord.Interaction, profile: Dict[str, Any]):
-        current_mode = profile.get("grounding_mode", "off")
-        if isinstance(current_mode, bool): current_mode = "rag" if current_mode else "off"
-        elif current_mode == "on" or current_mode == "on+": current_mode = "rag" # Legacy migration
-        cycle_map = {"off": "native", "native": "rag", "rag": "off"}
-        profile["grounding_mode"] = cycle_map.get(current_mode, "off")
-        await self._save_and_refresh(interaction, profile, self.profile_name, self.is_borrowed)
-
-    async def _act_url_toggle(self, interaction: discord.Interaction, profile: Dict[str, Any]):
-        current_mode = profile.get("url_mode", "off")
-        if "url_mode" not in profile:
-            current_mode = "rag" if profile.get("url_fetching_enabled", False) else "off"
-        cycle_map = {"off": "native", "native": "rag", "rag": "off"}
-        profile["url_mode"] = cycle_map.get(current_mode, "off")
-        profile["url_fetching_enabled"] = (profile["url_mode"] == "rag") # Legacy support
-        await self._save_and_refresh(interaction, profile, self.profile_name, self.is_borrowed)
 
     async def _act_manage_ltm(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         view = DataManageView(self.cog, interaction, self.profile_name, self.is_borrowed,
@@ -800,6 +1181,14 @@ class ProfileManageView(ui.View):
         # verbatim from the pre-refactor branch rather than silently fixed -- see the
         # note accompanying this refactor.
         await interaction.response.defer()
+
+    async def _act_critic_instructions(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        # Resolved, not read raw: the box has to show what this profile actually screens
+        # with today -- its own prompt, else the instance-wide one, else the default --
+        # or editing it starts from a blank that means something different.
+        instr = self.cog.profile_manager.resolve_critic_instructions(self.user_id, self.profile_name)
+        modal = ProfileCriticInstructionsModal(self.cog, self.profile_name, instr, target_user_id=self.user_id)
+        await interaction.response.send_modal(modal)
 
     async def _act_ltm_summarization(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         instr = profile.get("ltm_summarization_instructions") or self.cog.profile_manager._default_ltm_summarization_instructions()
@@ -821,7 +1210,8 @@ class ProfileManageView(ui.View):
             self.cog.channel_models.pop(k, None)
             self.cog.channel_model_last_profile_key.pop(k, None)
 
-        new_embed = await self.cog.profile_manager._build_profile_manage_embed(interaction, profile_name, target_user_id=self.user_id)
+        new_embed = await self.cog.profile_manager._build_profile_manage_embed(
+            interaction, profile_name, target_user_id=self.user_id)
         await interaction.response.edit_message(embed=new_embed, view=self)
 
     async def _handle_content_safety(self, interaction):
@@ -979,6 +1369,160 @@ class ProfileManageView(ui.View):
         try: await self.original_interaction.edit_original_response(content="Manager timed out.", view=None)
         except: pass
 
+class ProfileFunctionView(TimeoutCleanupMixin, ui.View):
+    """One setting's screen, rendered from its `_Screen` declaration.
+
+    Swaps onto the dashboard's own message rather than stacking a fresh ephemeral under
+    it, so Back returns to the tab it came from instead of leaving a dead panel behind
+    -- the same rule _BulkSubView follows.
+
+    Layout is forced by Discord's five-components-per-row: a select occupies a whole
+    row, so the choices take rows 0..n and everything that is a button -- the toggles,
+    the Edit button, Back -- shares the row after them. No declared screen has more
+    than three choices or one toggle, which is what keeps that inside the five-row cap.
+    """
+
+    def __init__(self, parent: 'ProfileManageView', action: '_Action'):
+        super().__init__(timeout=300)
+        self.parent = parent
+        self.cog = parent.cog
+        self.action = action
+        self.screen = action.screen
+        self.original_interaction = parent.original_interaction
+        self._build_view()
+
+    @property
+    def _config(self) -> Dict[str, Any]:
+        return self.cog.profile_manager._get_profile_config(
+            self.parent.user_id, self.parent.profile_name, self.parent.is_borrowed) or {}
+
+    async def embed(self) -> discord.Embed:
+        e = await self.cog.profile_manager.build_function_embed(
+            self.parent.user_id, self.parent.profile_name,
+            self.original_interaction.channel_id, self.action.value)
+        if self.screen.note:
+            e.description = f"{e.description}\n\n{self.screen.note}" if e.description else self.screen.note
+        return e
+
+    async def _apply(self, interaction: discord.Interaction, updates: Dict[str, Any]):
+        _write_profile_config(self.cog, self.parent.user_id, self.parent.profile_name,
+                              self.parent.is_borrowed, updates)
+        self._build_view()
+        await interaction.response.edit_message(embed=await self.embed(), view=self)
+
+    def _build_view(self):
+        self.clear_items()
+        config = self._config
+
+        row = 0
+        for choice in self.screen.choices:
+            current = choice.read(config)
+            options = []
+            for option in choice.options:
+                label, value = option[0], option[1]
+                description = option[2] if len(option) > 2 else None
+                options.append(discord.SelectOption(
+                    label=label[:100], value=value,
+                    description=description[:100] if description else None,
+                    default=(value == current)))
+            select = ui.Select(placeholder=choice.placeholder, options=options, row=row)
+            select.callback = self._choice_callback(choice)
+            self.add_item(select)
+            row += 1
+
+        for toggle in self.screen.toggles:
+            on = toggle.read(config)
+            btn = ui.Button(
+                label=f"{toggle.label}: {'On' if on else 'Off'}",
+                style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary,
+                row=row)
+            btn.callback = self._toggle_callback(toggle, on)
+            self.add_item(btn)
+
+        if self.screen.modal:
+            btn = ui.Button(label=self.screen.modal_label, style=discord.ButtonStyle.primary, row=row)
+            btn.callback = self._modal_callback
+            self.add_item(btn)
+
+        if self.screen.sub_view:
+            label, handler = self.screen.sub_view
+            btn = ui.Button(label=label, style=discord.ButtonStyle.primary, row=row)
+
+            async def sub_callback(interaction: discord.Interaction, _handler=handler):
+                await _handler(self.parent, interaction, self._config)
+
+            btn.callback = sub_callback
+            self.add_item(btn)
+
+        back = ui.Button(label="◀ Back", style=discord.ButtonStyle.secondary, row=row)
+        back.callback = self._back_callback
+        self.add_item(back)
+
+    def _choice_callback(self, choice: '_Choice'):
+        async def callback(interaction: discord.Interaction):
+            await self._apply(interaction, choice.to_payload(interaction.data['values'][0]))
+        return callback
+
+    def _toggle_callback(self, toggle: '_Toggle', currently_on: bool):
+        # The current value is captured when the button is built rather than re-read on
+        # click: the button's own label already told the user which way it will go, and
+        # re-reading would let a double click land on a stale read and flip twice.
+        async def callback(interaction: discord.Interaction):
+            await self._apply(interaction, toggle.to_payload(not currently_on))
+        return callback
+
+    async def _modal_callback(self, interaction: discord.Interaction):
+        factory = globals()[self.screen.modal]
+        config = dict(self._config)
+
+        # The image prompt lives in `prompts`, encrypted, and its modal reads it off the
+        # config dict it is handed. Seeded here for the same reason _act_image_toggle
+        # seeded it: the factory signature takes one dict.
+        if self.screen.modal == "ProfileImageGenSettingsModal" and not self.parent.is_borrowed:
+            prompts = self.cog.profile_manager._get_profile_prompts(
+                self.parent.user_id, self.parent.profile_name) or {}
+            config["image_generation_prompt"] = prompts.get("image_generation_prompt")
+
+        args = [self.cog, self.parent.profile_name, config]
+        if _MODAL_TAKES_BORROWED.get(self.screen.modal, True):
+            args.append(self.parent.is_borrowed)
+        await interaction.response.send_modal(factory(
+            *args, values_only=True, callback=self._after_modal,
+            target_user_id=self.parent.user_id))
+
+    async def _after_modal(self, interaction: discord.Interaction):
+        self._build_view()
+        await self.original_interaction.edit_original_response(embed=await self.embed(), view=self)
+
+    async def _back_callback(self, interaction: discord.Interaction):
+        self.stop()
+        self.parent._build_view()
+        embed = await self.cog.profile_manager._build_profile_manage_embed(
+            interaction, self.parent.profile_name,
+            target_user_id=self.parent.user_id)
+        await interaction.response.edit_message(embed=embed, view=self.parent)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: ui.Item):
+        print(f"ProfileFunctionView({self.action.value}) error: {error}")
+        traceback.print_exc()
+        try:
+            await interaction.followup.send("Something went wrong applying that.", ephemeral=True)
+        except Exception:
+            pass
+
+
+#: Factories that predate the `is_borrowed` positional and do not take it.
+_MODAL_TAKES_BORROWED = {
+    "ProfileDirectorDeskModal": False,
+    "ProfileTrainingParamsModal": False,
+    "ProfileLTMParamsModal": False,
+    "ProfileLTMSummarizationModal": False,
+    "ProfileCriticInstructionsModal": False,
+}
+
+
+
+
 class EditUserProfilePersonaModal(ui.Modal):
     def __init__(self, cog_instance, profile_name: str, current_persona_data: Dict[str, List[str]], user_id: int, callback=None):
         self.cog_instance: MimicCog = cog_instance
@@ -1072,7 +1616,7 @@ class EditUserProfileAIInstructionsModal(ui.Modal):
                 self.cog, i, self.user_id, self.profile_name)
     async def on_error(self, i:discord.Interaction,e:Exception): print(f"EditUserProfileAIInstrModal err: {e}"); traceback.print_exc(); await i.followup.send('Form error.',ephemeral=True)
 
-def ProfileParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
+def ProfileParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     fields = [
         {"label": "Temperature (0.0-2.0)", "custom_id": "temperature", "default": str(current_params.get("temperature", defaultConfig.GEMINI_TEMPERATURE)), "required": False},
         {"label": "Top P (0.0-1.0)", "custom_id": "top_p", "default": str(current_params.get("top_p", defaultConfig.GEMINI_TOP_P)), "required": False},
@@ -1097,7 +1641,7 @@ def ProfileParamsModal(cog, profile_name: str, current_params: Dict[str, Any], i
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Set Profile Generation Parameters", fields, parser, callback, target_user_id)
 
-def ProfileTrainingParamsModal(cog, profile_name: str, current_params: Dict[str, Any], callback=None, target_user_id: Optional[int] = None):
+def ProfileTrainingParamsModal(cog, profile_name: str, current_params: Dict[str, Any], values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     fields = [
         {"label": "Context Size (0-10)", "custom_id": "training_context_size", "default": str(current_params.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE)), "required": False},
         {"label": "Relevance Threshold (0.0-1.0)", "custom_id": "training_relevance_threshold", "default": str(current_params.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD)), "required": False}
@@ -1114,27 +1658,31 @@ def ProfileTrainingParamsModal(cog, profile_name: str, current_params: Dict[str,
         return {"config": c}
     return ConfigModal(cog, profile_name, False, "Set Profile Training Parameters", fields, parser, callback, target_user_id)
 
-def ProfileThinkingParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
-    fields = [
+def ProfileThinkingParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
+    fields = [] if values_only else [
         {"label": "Thinking Summary (on/off)", "custom_id": "thinking_summary_visible", "default": current_params.get("thinking_summary_visible", "off"), "required": False, "placeholder": "Display reasoning tokens below your message."},
         {"label": "Reasoning Effort / Level", "custom_id": "thinking_level", "default": current_params.get("thinking_level", "low"), "required": False, "placeholder": "xhigh, high, medium, low, minimal, none"},
-        {"label": "Reasoning Token Budget (-1=dyn)", "custom_id": "thinking_budget", "default": str(current_params.get("thinking_budget", -1)), "required": False, "placeholder": "-1 = dynamic, 128+ = token limit"}
     ]
+    fields.append(
+        {"label": "Reasoning Token Budget (-1=dyn)", "custom_id": "thinking_budget", "default": str(current_params.get("thinking_budget", -1)), "required": False, "placeholder": "-1 = dynamic, 128+ = token limit"}
+    )
     def parser(v):
         c = {}
-        sv = _ps(v["thinking_summary_visible"])
-        c["thinking_summary_visible"] = "on" if sv and sv.lower() == "on" else "off"
-        
-        lv = _ps(v["thinking_level"])
-        c["thinking_level"] = lv.lower() if lv and lv.lower() in ["xhigh", "high", "medium", "low", "minimal", "none"] else "high"
-        
+        if "thinking_summary_visible" in v:
+            sv = _ps(v["thinking_summary_visible"])
+            c["thinking_summary_visible"] = "on" if sv and sv.lower() == "on" else "off"
+
+        if "thinking_level" in v:
+            lv = _ps(v["thinking_level"])
+            c["thinking_level"] = lv.lower() if lv and lv.lower() in ["xhigh", "high", "medium", "low", "minimal", "none"] else "high"
+
         bv = _pi(v["thinking_budget"])
         c["thinking_budget"] = min(bv if bv is not None and bv >= -1 else -1, 32768)
         
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Thinking & Reasoning Parameters", fields, parser, callback, target_user_id)
 
-def ProfileLTMParamsModal(cog, profile_name: str, current_params: Dict[str, Any], callback=None, target_user_id: Optional[int] = None):
+def ProfileLTMParamsModal(cog, profile_name: str, current_params: Dict[str, Any], values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     fields = [
         {"label": "Creation Interval (5-100 msgs)", "custom_id": "ltm_creation_interval", "default": str(current_params.get("ltm_creation_interval", 10)), "required": False, "placeholder": "Default: 10"},
         {"label": "Summarization Context (5-50 msgs)", "custom_id": "ltm_summarization_context", "default": str(current_params.get("ltm_summarization_context", 10)), "required": False, "placeholder": "Default: 10"},
@@ -1160,7 +1708,7 @@ def ProfileLTMParamsModal(cog, profile_name: str, current_params: Dict[str, Any]
         return {"config": c}
     return ConfigModal(cog, profile_name, False, "LTM Parameters", fields, parser, callback, target_user_id)
 
-def ProfileLTMSummarizationModal(cog, profile_name: str, current_instructions: str, callback=None, target_user_id: Optional[int] = None):
+def ProfileLTMSummarizationModal(cog, profile_name: str, current_instructions: str, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     decrypted = cog.storage_manager._decrypt_data(current_instructions)
     fields = [{
         "label": "AI Instructions for Summarization",
@@ -1176,17 +1724,116 @@ def ProfileLTMSummarizationModal(cog, profile_name: str, current_instructions: s
         return {"prompts": {"ltm_summarization_instructions": cog.storage_manager._encrypt_data(ins)}}
     return ConfigModal(cog, profile_name, False, "Set LTM Summarization Instructions", fields, parser, callback, target_user_id)
 
-def ProfileTypingSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
-    fields = [
+def ProfileCriticSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
+    """The Anti-Repetition Critic's five knobs.
+
+    Mode replaces what was a plain on/off toggle. The lexical scan is in-process and
+    costs nothing, but the boolean only ever bought it together with a model call on
+    every turn, so "lexical" is the setting that gives a profile repetition screening
+    for free -- which matters most on the smallest deployments, where the critic was
+    the first thing the docs told people to switch off.
+    """
+    current = resolve_critic_settings(current_params)
+    fields = [] if values_only else [
+        {"label": "Mode (off/lexical/full)", "custom_id": "critic_mode",
+         "default": current["mode"], "required": True,
+         "placeholder": "lexical = free local scan; full = adds a model call"},
+        {"label": "Scope (self/session)", "custom_id": "critic_scope",
+         "default": current["scope"], "required": False,
+         "placeholder": "session = screen against every participant's lines"},
+        {"label": "Strictness (lenient/normal/strict)", "custom_id": "critic_strictness",
+         "default": current["strictness"], "required": False, "placeholder": "Default: normal"},
+    ]
+    fields.extend([
+        {"label": f"Lookback ({CRITIC_LOOKBACK_MIN}-{CRITIC_LOOKBACK_MAX} turns)", "custom_id": "critic_lookback",
+         "default": str(current["lookback"]), "required": False,
+         "placeholder": f"Default: {DEFAULT_CRITIC_LOOKBACK}"},
+        {"label": f"Persistence ({CRITIC_PERSISTENCE_MIN}-{CRITIC_PERSISTENCE_MAX} rounds)", "custom_id": "critic_persistence",
+         "default": str(current["persistence"]), "required": False,
+         "placeholder": f"Extra rounds a constraint holds. Default: {DEFAULT_CRITIC_PERSISTENCE}"},
+    ])
+
+    def parser(v):
+        c = {}
+        if "critic_mode" in v:
+            mode = (_ps(v["critic_mode"]) or "").lower()
+            if mode not in CRITIC_MODES:
+                raise ValueError(f"Mode must be one of: {', '.join(CRITIC_MODES)}")
+            # critic_enabled is written alongside critic_mode, not retired. Borrowed
+            # copies and exports made on an older build read the boolean, and a profile
+            # round-tripping through one of those must not come back with the critic
+            # silently on.
+            c["critic_mode"] = mode
+            c["critic_enabled"] = mode != "off"
+
+        if "critic_scope" in v:
+            scope = (_ps(v["critic_scope"]) or DEFAULT_CRITIC_SCOPE).lower()
+            if scope not in CRITIC_SCOPES:
+                raise ValueError(f"Scope must be one of: {', '.join(CRITIC_SCOPES)}")
+            c["critic_scope"] = scope
+
+        if "critic_strictness" in v:
+            strictness = (_ps(v["critic_strictness"]) or DEFAULT_CRITIC_STRICTNESS).lower()
+            if strictness not in CRITIC_STRICTNESS_LEVELS:
+                raise ValueError(f"Strictness must be one of: {', '.join(CRITIC_STRICTNESS_LEVELS)}")
+            c["critic_strictness"] = strictness
+
+        lb = _pi(v["critic_lookback"])
+        if lb is not None:
+            if not (CRITIC_LOOKBACK_MIN <= lb <= CRITIC_LOOKBACK_MAX):
+                raise ValueError(f"Lookback out of range ({CRITIC_LOOKBACK_MIN}-{CRITIC_LOOKBACK_MAX})")
+            c["critic_lookback"] = lb
+
+        pr = _pi(v["critic_persistence"])
+        if pr is not None:
+            if not (CRITIC_PERSISTENCE_MIN <= pr <= CRITIC_PERSISTENCE_MAX):
+                raise ValueError(f"Persistence out of range ({CRITIC_PERSISTENCE_MIN}-{CRITIC_PERSISTENCE_MAX})")
+            c["critic_persistence"] = pr
+
+        return {"config": c}
+
+    return ConfigModal(cog, profile_name, is_borrowed, "Anti-Repetition Critic", fields, parser, callback, target_user_id)
+
+
+def ProfileCriticInstructionsModal(cog, profile_name: str, current_instructions: str, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
+    """Per-profile critic prompt, seeded from whatever the profile resolves to today.
+
+    Submitting blank clears the override rather than storing an empty prompt, so the
+    profile goes back to following /mod's instance-wide ANTI_REPETITION.
+    """
+    fields = [{
+        "label": "Critic Instructions",
+        "custom_id": "critic_instructions",
+        "style": discord.TextStyle.paragraph,
+        "default": current_instructions,
+        "required": False,
+        "max_length": 2000,
+        "placeholder": "{char_name} is substituted. Clear the box to follow the global prompt.",
+    }]
+
+    def parser(v):
+        ins = _ps(v["critic_instructions"])
+        return {"prompts": {"critic_instructions": cog.storage_manager._encrypt_data(ins) if ins else ""}}
+
+    return ConfigModal(cog, profile_name, False, "Set Critic Instructions", fields, parser, callback, target_user_id)
+
+
+def ProfileTypingSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
+    fields = [] if values_only else [
         {"label": "Enable Realistic Typing (on/off)", "custom_id": "realistic_typing_enabled", "default": "on" if current_params.get("realistic_typing_enabled") else "off", "required": True},
         {"label": "Mode (sentence/line)", "custom_id": "typing_mode", "default": current_params.get("typing_mode", "sentence"), "required": False, "placeholder": "Default: sentence"},
+    ]
+    fields.extend([
         {"label": "Characters per Second", "custom_id": "typing_cps", "default": str(current_params.get("typing_cps", 30.0)), "required": False, "placeholder": "Default: 30.0"},
         {"label": "Max Delay per Chunk (Seconds)", "custom_id": "typing_max_delay", "default": str(current_params.get("typing_max_delay", 2.5)), "required": False, "placeholder": "Default: 2.5"}
-    ]
+    ])
     def parser(v):
-        c = {"realistic_typing_enabled": _pb(v["realistic_typing_enabled"])}
-        m = _ps(v["typing_mode"])
-        if m: c["typing_mode"] = "line" if m.lower() == "line" else "sentence"
+        c = {}
+        if "realistic_typing_enabled" in v:
+            c["realistic_typing_enabled"] = _pb(v["realistic_typing_enabled"])
+        if "typing_mode" in v:
+            m = _ps(v["typing_mode"])
+            if m: c["typing_mode"] = "line" if m.lower() == "line" else "sentence"
         cps = _pf(v["typing_cps"])
         if cps is not None: c["typing_cps"] = cps
         md = _pf(v["typing_max_delay"])
@@ -1194,8 +1841,8 @@ def ProfileTypingSettingsModal(cog, profile_name: str, current_params: Dict[str,
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Realistic Typing Settings", fields, parser, callback, target_user_id)
 
-def ProfileImageGenSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
-    fields = [
+def ProfileImageGenSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
+    fields = [] if values_only else [
         {"label": "Enable Image Gen (on/off)", "custom_id": "image_generation_enabled", "default": "on" if current_params.get("image_generation_enabled") else "off", "required": True}
     ]
     if not is_borrowed:
@@ -1204,7 +1851,9 @@ def ProfileImageGenSettingsModal(cog, profile_name: str, current_params: Dict[st
         fields.append({"label": "Image Generation Prompt", "custom_id": "image_generation_prompt", "style": discord.TextStyle.paragraph, "default": dec, "required": False, "max_length": 2000})
         
     def parser(v):
-        c = {"image_generation_enabled": _pb(v["image_generation_enabled"])}
+        c = {}
+        if "image_generation_enabled" in v:
+            c["image_generation_enabled"] = _pb(v["image_generation_enabled"])
         p = {}
         if not is_borrowed and "image_generation_prompt" in v:
             pr = _ps(v["image_generation_prompt"])
@@ -2362,7 +3011,9 @@ class SingleProfileTimezoneView(ui.View):
         for k in keys:
             self.cog.channel_models.pop(k, None)
 
-        new_embed = await self.cog.profile_manager._build_profile_manage_embed(interaction, self.parent_manage_view.profile_name, target_user_id=self.parent_manage_view.user_id)
+        new_embed = await self.cog.profile_manager._build_profile_manage_embed(
+            interaction, self.parent_manage_view.profile_name,
+            target_user_id=self.parent_manage_view.user_id)
         await self.parent_manage_view.original_interaction.edit_original_response(embed=new_embed, view=self.parent_manage_view)
         await interaction.response.edit_message(content=f"✅ Timezone set to **{canonical_tz}**.", view=None)
 
@@ -2386,7 +3037,9 @@ class CustomTimezoneModal(ui.Modal, title="Enter Custom Timezone"):
             for k in keys:
                 self.parent_view.cog.channel_models.pop(k, None)
 
-            new_embed = await self.parent_view.cog.profile_manager._build_profile_manage_embed(interaction, self.parent_view.parent_manage_view.profile_name, target_user_id=self.parent_view.parent_manage_view.user_id)
+            new_embed = await self.parent_view.cog.profile_manager._build_profile_manage_embed(
+                interaction, self.parent_view.parent_manage_view.profile_name,
+                target_user_id=self.parent_view.parent_manage_view.user_id)
             await self.parent_view.parent_manage_view.original_interaction.edit_original_response(embed=new_embed, view=self.parent_view.parent_manage_view)
             await interaction.response.edit_message(content=f"✅ Timezone set to **{canonical_tz}**.", view=None)
         else:
@@ -2477,7 +3130,7 @@ class BulkTimezoneView(_BulkSubView):
         await self.wizard.refresh(interaction)
 
 
-def ProfileGenerationVisualModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
+def ProfileGenerationVisualModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     raw = current_params.get("placeholder_emoji") or ""
     name_val, id_val = "", ""
     if raw.startswith("<") and raw.endswith(">"):
@@ -2491,8 +3144,11 @@ def ProfileGenerationVisualModal(cog, profile_name: str, current_params: Dict[st
     fields = [
         {"label": "Emote Name (or Native Emote)", "custom_id": "name", "default": name_val, "required": False, "max_length": 100, "placeholder": "e.g. mimic_thinking or 🤔"},
         {"label": "Emote ID (Blank if native)", "custom_id": "id", "default": id_val, "required": False, "max_length": 30, "placeholder": "e.g. 1441782350752120874"},
-        {"label": "Placeholder for Child Bot (on/off)", "custom_id": "child_bot_placeholder", "default": "on" if current_params.get("child_bot_placeholder") else "off", "required": True, "max_length": 10}
     ]
+    if not values_only:
+        fields.append(
+            {"label": "Placeholder for Child Bot (on/off)", "custom_id": "child_bot_placeholder", "default": "on" if current_params.get("child_bot_placeholder") else "off", "required": True, "max_length": 10}
+        )
     def parser(v):
         c = {}
         n = _ps(v["name"]); i = _ps(v["id"])
@@ -2506,7 +3162,8 @@ def ProfileGenerationVisualModal(cog, profile_name: str, current_params: Dict[st
                 if i: p_emoji = f"<a:{n}:{i}>" if is_a else f"<:{n}:{i}>"
                 else: p_emoji = n
         c["placeholder_emoji"] = p_emoji if p_emoji else None
-        c["child_bot_placeholder"] = _pb(v["child_bot_placeholder"])
+        if "child_bot_placeholder" in v:
+            c["child_bot_placeholder"] = _pb(v["child_bot_placeholder"])
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Generation Visual", fields, parser, callback, target_user_id)
 
@@ -2778,26 +3435,30 @@ class AppearanceModal(ui.Modal):
                 valid_timestamps.append(now)
                 self.cog.child_bot_edit_cooldowns[linked_bot_id] = valid_timestamps
 
-        new_embed = await self.cog.profile_manager._build_profile_manage_embed(self.original_interaction, self.profile_name, target_user_id=owner_id)
+        new_embed = await self.cog.profile_manager._build_profile_manage_embed(
+            self.original_interaction, self.profile_name, target_user_id=owner_id)
         await self.original_interaction.edit_original_response(embed=new_embed)
         await interaction.followup.send("Appearance updated.", ephemeral=True)
         # The display name and avatar are part of the classified surface, so an
         # appearance edit invalidates a rating exactly as a persona edit does.
         await maybe_prompt_rating_after_edit(self.cog, interaction, owner_id, self.profile_name)
 
-def ProfileNeuroModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
+def ProfileNeuroModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     state = current_params.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
-    fields = [
+    fields = [] if values_only else [
         {"label": "Engine Status (on/off)", "custom_id": "neuro_engine_enabled", "default": "on" if current_params.get("neuro_engine_enabled") else "off", "required": False, "placeholder": "Enable or disable the engine."},
+    ]
+    fields.extend([
         {"label": "Dopamine (0-100)", "custom_id": "dopamine", "default": str(state.get("dopamine", 50)), "required": False, "placeholder": "Motivation and joy."},
         {"label": "Cortisol (0-100)", "custom_id": "cortisol", "default": str(state.get("cortisol", 20)), "required": False, "placeholder": "Stress and anxiety."},
         {"label": "Oxytocin (0-100)", "custom_id": "oxytocin", "default": str(state.get("oxytocin", 50)), "required": False, "placeholder": "Bonding and trust."},
         {"label": "Adrenaline (0-100)", "custom_id": "adrenaline", "default": str(state.get("adrenaline", 20)), "required": False, "placeholder": "Energy and urgency."}
-    ]
+    ])
     def parser(v):
         c = {}
-        ns = _ps(v["neuro_engine_enabled"])
-        if ns: c["neuro_engine_enabled"] = (ns.lower() == "on")
+        if "neuro_engine_enabled" in v:
+            ns = _ps(v["neuro_engine_enabled"])
+            if ns: c["neuro_engine_enabled"] = (ns.lower() == "on")
         
         nstate = {}
         for k in ["dopamine", "cortisol", "oxytocin", "adrenaline"]:

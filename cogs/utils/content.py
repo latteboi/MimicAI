@@ -143,7 +143,8 @@ HELP_CATEGORIES = {
         "Making a Profile Faster": (
             "In rough order of effect:\n\n"
             "• **Lower the Reasoning Level**, or cap the token budget.\n"
-            "• **Disable the Anti-Repetition Critic.** It is an extra model call before every reply.\n"
+            "• **Set the Anti-Repetition Critic to `lexical`, or off.** `full` is an extra model call before every reply; "
+            "`lexical` keeps the free local scan and costs nothing.\n"
             "• **Set Grounding and URL Context to OFF**, or to Native if your model supports it. RAG mode is an extra call each.\n"
             "• **Reduce STM Length**, and reduce LTM context size.\n"
             "• **Switch to a lighter primary model.** A flash-lite variant answers near-instantly at some cost in reasoning depth.\n\n"
@@ -167,7 +168,7 @@ HELP_CATEGORIES = {
             "injected as `<archive_context>`, up to the LTM context size.\n\n"
             "**Where a memory applies.** Every memory belongs to the server it was formed in, and is only ever recalled there. A profile "
             "used in two servers keeps two separate archives, and neither is visible in global chat.\n\n"
-            "Turn creation off entirely with **Toggle LTM Auto-Creation** if you would rather curate the archive by hand at "
+            "Turn creation off entirely from **LTM Auto-Creation** if you would rather curate the archive by hand at "
             "`/profile manage` -> **Memory**.\n\n"
             "**Limit:** 5,000 memories per profile."
         ),
@@ -212,12 +213,12 @@ HELP_CATEGORIES = {
             "and a long cooldown."
         ),
         "Response Modes and Delivery": (
-            "**Response Mode** (`/profile manage` -> Tools -> Cycle Response Mode) controls how a reply is attached to your message:\n\n"
+            "**Response Mode** (`/profile manage` -> Tools -> Response Mode) controls how a reply is attached to your message:\n\n"
             "• **Regular** -- a plain message.\n"
             "• **Mention** -- prepends your ping.\n"
             "• **Reply** -- uses Discord's native reply reference.\n"
             "• **Mention + Reply** -- both.\n\n"
-            "**Realistic Typing** (Tools -> Toggle Realistic Typing) splits the reply on sentence boundaries and streams it with a delay based "
+            "**Realistic Typing** (Tools -> Realistic Typing) splits the reply on sentence boundaries and streams it with a delay based "
             "on length and your configured characters-per-second, instead of posting one block."
         ),
         "Private and One-Off Speech": (
@@ -238,14 +239,14 @@ HELP_CATEGORIES = {
     },
     "6. Tools and Media": {
         "Web Grounding": (
-            "`/profile manage` -> **Tools** -> Toggle Grounding. Cycles **OFF -> NATIVE -> RAG**.\n\n"
+            "`/profile manage` -> **Tools** -> Grounding (Web Search). Pick **OFF**, **NATIVE** or **RAG**.\n\n"
             "• **Native** -- Google's own search tool. Accurate, gives inline citations, and works *only* on Google Gemini models.\n"
             "• **RAG** -- a background model searches and summarises before your profile sees the result. Works with every provider, including "
             "OpenRouter and Ollama. Costs one extra call per message.\n\n"
             "If your profile runs on anything other than a Google model, RAG is the only mode that will do anything."
         ),
         "URL Context": (
-            "`/profile manage` -> **Tools** -> Toggle URL Context Fetching. Also cycles **OFF -> NATIVE -> RAG**.\n\n"
+            "`/profile manage` -> **Tools** -> URL Context Fetching. Also **OFF**, **NATIVE** or **RAG**.\n\n"
             "• **Native** -- Google fetches the link server-side, including large files and PDFs. Google models only.\n"
             "• **RAG** -- the bot fetches the page, strips it to text, and injects it as `<document_context>`. Works everywhere.\n\n"
             "Fetched text is truncated to keep it from swallowing the context window."
@@ -279,15 +280,20 @@ HELP_CATEGORIES = {
             "'Unsupported File Format (Model lacks Vision/Audio support)'. Switch the profile's model, or leave the attachment off."
         ),
         "Anti-Repetition Critic": (
-            "`/profile manage` -> **Tools** -> Toggle Anti-Repetition Critic.\n\n"
-            "Before a reply is sent, a lightweight model reviews recent output for structural repetition -- the same opening phrase every turn, "
-            "the same sentence rhythm, a verbatim loop. If it finds one, it writes a negative constraint into the prompt banning that specific "
-            "pattern for the coming turn.\n\n"
-            "It works, and it costs an extra model call per message. Worth it on a long-running session where a character has started to sound "
-            "like itself on repeat; not worth it on a fast, casual profile."
+            "`/profile manage` -> **Tools** -> Configure Anti-Repetition Critic.\n\n"
+            "Before a reply is sent, recent output is screened for structural repetition -- the same opening phrase every turn, the same "
+            "sentence rhythm, a verbatim loop. If a pattern is found, a negative constraint goes into the prompt banning it for the coming turn.\n\n"
+            "**Mode.** `lexical` runs only the local n-gram scan: no extra API call, no added latency, and it catches verbatim loops and "
+            "repeated openings. `full` adds a model pass that also catches the softer cases -- recycled suggestions, a tone the character keeps "
+            "falling back into -- at the cost of one extra call per message. `off` disables both.\n\n"
+            "**Scope.** `self` screens a profile against its own recent replies. `session` screens it against every participant's, which is the "
+            "repetition a multi-profile roleplay actually falls into: four characters converging on one rhythm, none of them individually looping.\n\n"
+            "**Strictness** sets how short a repeated phrase has to be before it counts. **Lookback** is how many turns are read back through. "
+            "**Persistence** is how many further rounds a constraint stays in force after the round that earned it.\n\n"
+            "The prompt itself is editable per profile at **Tools** -> Set Critic Instructions. Leave it blank to follow the bot-wide prompt."
         ),
         "Neuro-Endocrine Engine": (
-            "`/profile manage` -> **Tools** -> Toggle Neuro-Endocrine Engine.\n\n"
+            "`/profile manage` -> **Tools** -> Neuro-Endocrine Engine.\n\n"
             "The profile carries four variables between turns, each 0-100: **Dopamine** (joy, motivation), **Cortisol** (stress, frustration), "
             "**Oxytocin** (bonding, trust), and **Adrenaline** (urgency).\n\n"
             "Its current state is described in the prompt, and at the end of each reply the model emits a hidden update reflecting how the "
@@ -368,7 +374,7 @@ HELP_CATEGORIES = {
             "sees the answer.\n\n"
             "**`/help`** with no question toggles **MimicGuide**, a built-in system profile, in and out of the current session, so you can ask "
             "follow-ups conversationally.\n\n"
-            "**Help Mode** (`/profile manage` -> Tools -> Toggle Help Mode) lets one of *your* profiles answer bot questions in character. When "
+            "**Help Mode** (`/profile manage` -> Tools -> Help Mode) lets one of *your* profiles answer bot questions in character. When "
             "someone asks something technical, the relevant documentation is retrieved and injected for that turn only; the profile answers as "
             "itself. If the question is not technical, nothing is injected and the profile just talks normally."
         ),
@@ -396,7 +402,7 @@ HELP_CATEGORIES = {
             "You can set what users see on failure at `/profile manage` -> Home -> Custom Error Message."
         ),
         "When a Character Feels Wrong": (
-            "**Repetitive.** Enable the Anti-Repetition Critic; raise temperature; add repetition penalties on OpenRouter models; add Training "
+            "**Repetitive.** Set the Anti-Repetition Critic to `lexical` (free) or `full`, and to `session` scope in a multi-profile session; raise temperature; add repetition penalties on OpenRouter models; add Training "
             "Examples showing variety.\n\n"
             "**Ignoring its persona.** Reduce STM Length -- a very long context dilutes system instructions. Check whether your Instructions "
             "contradict your Persona. On a reasoning model, try cutting instructions down rather than adding more.\n\n"
@@ -591,7 +597,7 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'One character keeps dominating the round.' Fix: React with ❌ on one of its messages to skip it for a while."
     ),
     "sessions/response_modes.txt": (
-        "Setup: Configured via `/profile manage` -> Tools -> Cycle Response Mode.\n"
+        "Setup: Configured via `/profile manage` -> Tools -> Response Mode.\n"
         "Modes:\n"
         "- Regular: The bot replies normally without pings.\n"
         "- Mention: The bot prepends the user's Discord ping to the message payload.\n"
@@ -664,7 +670,7 @@ DEFAULT_HELP_DOCS = {
     ),
     "memory/ltm_archive.txt": (
         "Concept: Long-Term Memory (LTM) is a persistent, vector-embedded archive of past conversations. Maximum 5,000 memories per profile.\n"
-        "Creation: The bot tracks the exchange volume. Once the 'Creation Interval' is met, an auxiliary model extracts the recent conversation and condenses it into a third-person factual summary. Toggle this off with 'Toggle LTM Auto-Creation' if you would rather curate by hand.\n"
+        "Creation: The bot tracks the exchange volume. Once the 'Creation Interval' is met, an auxiliary model extracts the recent conversation and condenses it into a third-person factual summary. Toggle this off from 'LTM Auto-Creation' if you would rather curate by hand.\n"
         "Retrieval: When a user speaks, their prompt is embedded and compared against the LTM archive. If the score exceeds the 'Relevance Threshold', the memory is injected as `<archive_context>`.\n"
         "Where a memory applies: Every memory belongs to the server it formed in and is recalled only there. A profile used in several servers keeps a separate archive per server, and none of them reach global chat.\n"
         "Management: Add, edit and delete memories at `/profile manage` -> Memory -> Manage Long-Term Memories. Tune recall with 'Set LTM Parameters', and rewrite the summarisation instruction with 'Set LTM Summarization Prompt'.\n"
@@ -702,7 +708,7 @@ DEFAULT_HELP_DOCS = {
         "Capabilities: Profiles can generate `.png` visuals. The generated image is then shown to the profile's own text model, which writes an in-character comment to send with it -- so the character presents the picture as something it made or found.\n"
         "Self-portraits: The system automatically injects the profile's 'Appearance' text into the image prompt if the request appears to be for a picture of the character itself, keeping it consistent between generations.\n"
         "Editing: Reply to an existing image with `!image` and a new instruction to iterate on that image.\n"
-        "Enabling: `/profile manage` -> Tools -> Toggle Image Generation.\n"
+        "Enabling: `/profile manage` -> Tools -> Image Generation.\n"
         "Output settings: `/profile manage` -> Tools -> Set Image Output chooses aspect ratio, resolution and thinking level. The options offered are only the ones the profile's chosen image model accepts, so the list changes with the model. Leaving a setting on 'Model default' sends no preference at all.\n"
         "Resolution: 512, 1K and 2K. 4K is not offered -- a 4K render usually exceeds Discord's attachment limit and would fail to upload after being paid for.\n"
         "Thinking level: Only the Gemini 3 image models take one. HIGH refines the composition before drawing, which is slower and billed for the extra thinking; MINIMAL draws straight away.\n"
@@ -728,7 +734,7 @@ DEFAULT_HELP_DOCS = {
         "Concept: The Neuro-Endocrine Engine simulates hormonal states to produce dynamic emotional characterisation that carries between turns.\n"
         "Variables: Four values on a 0-100 scale -- Dopamine (joy, motivation, reward), Cortisol (stress, anxiety, frustration), Oxytocin (bonding, trust, empathy), and Adrenaline (energy, urgency).\n"
         "Execution: The current state is described in the system prompt. At the end of each response the model emits a hidden update tag reflecting how the exchange affected it, and the next turn reads that state back. None of this is visible in chat.\n"
-        "Enabling: `/profile manage` -> Tools -> Toggle Neuro-Endocrine Engine.\n"
+        "Enabling: `/profile manage` -> Tools -> Neuro-Endocrine Engine.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'The character is stuck in a bad mood.' Fix: Cortisol has climbed and is carrying forward. Reopen the Neuro settings to reset the values, or `/refresh` the channel."
     ),
@@ -742,17 +748,20 @@ DEFAULT_HELP_DOCS = {
     ),
     "features/typing_simulation.txt": (
         "Concept: Realistic Typing splits a reply on sentence boundaries and streams it with human-like delays instead of posting one block.\n"
-        "Configuration: `/profile manage` -> Tools -> Toggle Realistic Typing. Set the characters-per-second rate, a maximum delay cap, and the chunking mode.\n"
+        "Configuration: `/profile manage` -> Tools -> Realistic Typing. Set the characters-per-second rate, a maximum delay cap, and the chunking mode.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Messages take far too long to arrive.' Fix: Raise the characters-per-second value or lower the maximum delay cap. Long replies multiply the effect."
     ),
     "features/repetition_critic.txt": (
         "Concept: The Anti-Repetition Critic is a secondary evaluation layer that detects a profile falling into linguistic loops.\n"
         "Mechanism: Before a message is sent, the Critic reviews recent output for structural repetition -- the same opening phrase every turn, the same sentence rhythm, verbatim loops. If it finds one, it injects an explicit negative constraint banning that pattern for the coming turn.\n"
-        "Tradeoff: It reduces repetition noticeably and costs one extra API call per message. Worth enabling on long-running sessions; not worth it on a fast casual profile.\n"
-        "Enabling: `/profile manage` -> Tools -> Toggle Anti-Repetition Critic.\n"
+        "Modes: 'off' disables it. 'lexical' runs only the local n-gram scan -- no API call, no added latency. 'full' adds a model pass that also catches recycled suggestions and tonal sameness, at one extra API call per message.\n"
+        "Scope: 'self' screens a profile against its own recent replies; 'session' screens it against every participant's, which is what catches a multi-profile session converging on one rhythm.\n"
+        "Tuning: strictness (lenient/normal/strict) sets how short a repeated phrase has to be to count; lookback is how many turns are read; persistence is how many further rounds a constraint stays in force.\n"
+        "Prompt: editable per profile at `/profile manage` -> Tools -> Set Critic Instructions. Left blank, the profile follows the bot-wide ANTI_REPETITION prompt.\n"
+        "Enabling: `/profile manage` -> Tools -> Configure Anti-Repetition Critic.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'Replies became noticeably slower.' Fix: The Critic is an extra model call per message. Disable it if latency matters more than variety."
+        "- Symptom: 'Replies became noticeably slower.' Fix: 'full' mode is an extra model call per message. Switch to 'lexical' to keep repetition screening at no latency cost."
     ),
     "features/multimodal_media_handling.txt": (
         "Concept: Multimodal processing allows profiles to analyse media files (images, audio, video) attached to your Discord messages.\n"
@@ -766,7 +775,7 @@ DEFAULT_HELP_DOCS = {
     "features/help_mode.txt": (
         "Commands: `/help`, `/help ask:<question>`, `/guide`\n"
         "Concept: `/help ask` answers a technical question about the bot directly, retrieving from the documentation. The answer is ephemeral. `/help` with no argument toggles MimicGuide, a built-in system profile, in and out of the current session so you can ask follow-ups conversationally. `/guide` opens a browsable documentation menu.\n"
-        "Help Mode on your own profiles: `/profile manage` -> Tools -> Toggle Help Mode lets one of your own characters answer technical questions in character. Relevant documentation is retrieved and injected for that turn only; if the question is not technical, nothing is injected and the profile talks normally.\n"
+        "Help Mode on your own profiles: `/profile manage` -> Tools -> Help Mode lets one of your own characters answer technical questions in character. Relevant documentation is retrieved and injected for that turn only; if the question is not technical, nothing is injected and the profile talks normally.\n"
         "Operator control: The documentation corpus is editable at `/mod` -> Docs, and re-embeds when saved.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: '/help ask says documentation vectors are not loaded.' Fix: The bot operator has no Google API key configured. Embedding the documentation requires one.\n"

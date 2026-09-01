@@ -24,6 +24,33 @@ class PromptBuilderMixin:
         avatar_url = app.get("custom_avatar_url") or (self.cog.bot.user.display_avatar.url if self.cog.bot.user else "")
         return display_name, avatar_url
 
+    @staticmethod
+    def _resolve_native_tools(p_settings: Dict[str, Any]) -> Optional[List[Dict]]:
+        """The `tools` list an instantiated model needs for native grounding/URL context.
+
+        Three copies of this lived inline -- the worker's primary, the worker's fallback
+        and regeneration's fallback -- each re-deriving the same legacy coercions
+        (`grounding_mode` was once a bool and once "on"/"on+"; `url_mode` reads off the
+        older `url_fetching_enabled` flag when absent). Regeneration's primary had no
+        copy at all, so a profile on native grounding regenerated without the tool.
+        """
+        grounding_mode = p_settings.get("grounding_mode", "off")
+        if isinstance(grounding_mode, bool):
+            grounding_mode = "rag" if grounding_mode else "off"
+        elif grounding_mode in ("on", "on+"):
+            grounding_mode = "rag"
+
+        url_mode = p_settings.get("url_mode", "off")
+        if "url_mode" not in p_settings:
+            url_mode = "rag" if p_settings.get("url_fetching_enabled", False) else "off"
+
+        tools = []
+        if grounding_mode == "native":
+            tools.append({"google_search": {}})
+        if url_mode == "native":
+            tools.append({"url_context": {}})
+        return tools or None
+
     def _channel_allows_adult_content(self, channel_id: int) -> bool:
         """True only when the destination channel is flagged age-restricted.
 

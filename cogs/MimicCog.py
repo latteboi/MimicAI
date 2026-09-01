@@ -1120,10 +1120,37 @@ class MimicCog(commands.Cog, EventListeners):
     @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
     @app_commands.guild_only()
     async def cancel_slash(self, interaction: discord.Interaction):
+        """Stops what this channel is generating, if it is still safe to stop it.
+
+        Two things are cancellable and they mean different things. A round in progress
+        is *aborted*: nothing has been written, so the placeholder goes and no turn is
+        recorded -- there is no earlier version of a fresh reply to go back to. A
+        regeneration is *undone*: it overwrote a message that already existed, so
+        cancelling puts the original text back.
+
+        Both are refused once the operation reaches its sending phase -- the point the
+        placeholder starts reading "Sending...". By then the model has returned, the
+        turn is being assembled, speech may be part-way through synthesis, and a
+        regeneration has already replaced the message it was going to restore. That is
+        the one window where stopping leaves the channel in a worse state than letting
+        it finish.
+
+        Whisper and global chat are deliberately not covered: they are their own
+        interactions and get their own controls rather than being reachable from a
+        channel-wide command.
+        """
         if not self.has_lock: return
         session = self.multi_profile_channels.get(interaction.channel_id)
-        
-        if not session or (not session.get('is_running') and not session.get('is_regenerating')):
+
+        live_regens = {
+            message_id: task
+            for message_id, task in (session or {}).get('regen_tasks', {}).items()
+            if task and not task.done()
+        }
+        busy = bool(session) and (session.get('is_running') or session.get('is_regenerating')
+                                  or live_regens)
+
+        if not busy:
             await interaction.response.send_message("Nothing is currently being generated in this channel.", ephemeral=True)
             return
 
@@ -1131,13 +1158,30 @@ class MimicCog(commands.Cog, EventListeners):
             await interaction.response.send_message("Only the session owner or a server administrator can cancel generation.", ephemeral=True)
             return
 
+        if self.session_manager.is_delivering(session):
+            await interaction.response.send_message(
+                "That response has already been generated and is being sent — cancelling now "
+                "would leave it half-delivered. Wait for it to finish.", ephemeral=True)
+            return
+
+        cancelled = []
+
         if session.get('worker_task') and not session['worker_task'].done():
             self.session_manager._safe_cancel_task(session['worker_task'])
             session['worker_task'] = None
-            
+            cancelled.append("generation")
         session['is_running'] = False
-        session['is_regenerating'] = False
-        
+
+        for task in live_regens.values():
+            self.session_manager._safe_cancel_task(task)
+        if live_regens:
+            cancelled.append(f"{len(live_regens)} regeneration" + ("s" if len(live_regens) > 1 else ""))
+        else:
+            # Only safe to clear when nothing is actually running under it. Clearing it
+            # unconditionally -- which this used to do -- released the gate every other
+            # path waits on while a regeneration was still rewriting the log under it.
+            session['is_regenerating'] = False
+
         for p in session.get('profiles', []):
             if p.get('method') == 'child_bot' and p.get('bot_id'):
                 await self.manager_queue.put({
@@ -1145,7 +1189,10 @@ class MimicCog(commands.Cog, EventListeners):
                     "payload": {"action": "stop_typing", "channel_id": interaction.channel_id}
                 })
 
-        await interaction.response.send_message("Generation and typing cancelled for this channel.", ephemeral=True)
+        summary = " and ".join(cancelled) if cancelled else "typing"
+        note = " The original messages have been restored." if live_regens else ""
+        await interaction.response.send_message(
+            f"Cancelled {summary} for this channel.{note}", ephemeral=True)
 
     @app_commands.command(name="shutdown", description="Gracefully shuts down this bot instance (Bot Owner Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)

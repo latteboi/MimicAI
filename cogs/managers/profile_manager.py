@@ -22,6 +22,8 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from ..utils.constants import (
     USERS_DIR, PUBLIC_PROFILES_DIR, defaultConfig,
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS,
+    DEFAULT_ANTI_REPETITION_PROMPT, UTILITY_FALLBACK_KEYS,
+    TTS_VOICE_GENDER, TTS_VOICE_CHARACTER,
     DEFAULT_SAFETY_SETTINGS,
     CONTENT_RATING_LABELS, CHANNEL_ACCESS_LABELS,
     CONTENT_RATING_REASON_LABELS, CONTENT_RATING_REASON_FALLBACK,
@@ -30,10 +32,8 @@ from ..utils.constants import (
     CONTENT_RATING_ADULT, CONTENT_RATING_EXEMPT,
     CONTENT_RATING_CAPABILITIES, CONTENT_CAPABILITY_DENIALS,
     CONTENT_RATING_EMOJI,
-    DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE, UTILITY_FALLBACK_KEYS,
-    TTS_VOICE_CHARACTER, TTS_VOICE_GENDER,
-)
-from ..utils.helpers import is_real_model, resolve_image_output_params
+    DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE, )
+from ..utils.helpers import is_real_model, resolve_critic_settings, resolve_image_output_params
 from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
@@ -2304,12 +2304,71 @@ class ProfileManager:
         return embed
     
 
+    async def _build_render_context(self, user_id: int, profile_name: str, channel_id: int,
+                                    *, with_prompts: bool = False,
+                                    with_counts: bool = False) -> Dict[str, Any]:
+        """Everything a setting's own screen renders, gathered once.
+
+        Read by ProfileFunctionView through build_function_embed. The two expensive
+        reads are opt-in: the memory counts cost a decrypt each, and the prompts are a
+        second full profile read.
+        """
+        index = self._get_user_index(user_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
+        effective_owner_id, effective_profile_name = self._resolve_effective_profile(user_id, profile_name)
+
+        config = self._get_profile_config(user_id, profile_name, is_borrowed) or {}
+        appearance_data = self._get_user_appearance(effective_owner_id, effective_profile_name)
+
+        ltm_count = train_count = 0
+        if with_counts:
+            ltm_shard = self.cog.memory_manager._load_ltm_shard(str(user_id), profile_name)
+            ltm_count = len(ltm_shard.get("guild", [])) if ltm_shard else 0
+            training_shard = self.cog.memory_manager._load_training_shard(str(effective_owner_id), effective_profile_name)
+            train_count = len(training_shard) if training_shard else 0
+
+        prompts = {}
+        if with_prompts:
+            prompts = self._get_profile_prompts(effective_owner_id, effective_profile_name) or {}
+
+        return {
+            "config": config,
+            "prompts": prompts,
+            "appearance": appearance_data,
+            "display_name": appearance_data.get("custom_display_name") or effective_profile_name,
+            "ltm_count": ltm_count,
+            "training_count": train_count,
+            "is_borrowed": is_borrowed,
+        }
+
+    async def build_function_embed(self, user_id: int, profile_name: str, channel_id: int,
+                                   action_value: str) -> discord.Embed:
+        """The embed behind one setting's own screen: what it is, and where it stands."""
+        from ..gui.gui_profiles import PROFILE_ACTIONS_BY_VALUE
+
+        action = PROFILE_ACTIONS_BY_VALUE.get(action_value)
+        label = action.menu_label if action else action_value.replace("_", " ").title()
+
+        embed = discord.Embed(title=label, colour=discord.Colour.blurple())
+        if action is not None:
+            embed.description = action.description
+
+        if action is not None and action.render is not None:
+            ctx = await self._build_render_context(
+                user_id, profile_name, channel_id, with_prompts=True, with_counts=True)
+            field = action.render(ctx)
+            if field:
+                name, value, _inline = field
+                embed.add_field(name=name, value=str(value)[:1024], inline=False)
+
+        return embed
+
     async def _build_profile_embed(self, user_id: int, profile_name: str, channel_id: int) -> discord.Embed:
         index = self._get_user_index(user_id)
         is_borrowed = profile_name in index.get("borrowed", [])
-        
+
         embed = discord.Embed(title=f"Profile Dashboard: '{profile_name}'", color=discord.Color.blue())
-        
+
         effective_owner_id, effective_profile_name = self._resolve_effective_profile(user_id, profile_name)
         profile_type = "Personal"
 
@@ -2322,7 +2381,7 @@ class ProfileManager:
         )
 
         config = self._get_profile_config(user_id, profile_name, is_borrowed) or {}
-        
+
         ltm_shard = self.cog.memory_manager._load_ltm_shard(str(user_id), profile_name)
         ltm_count = len(ltm_shard.get("guild", [])) if ltm_shard else 0
         training_shard = self.cog.memory_manager._load_training_shard(str(effective_owner_id), effective_profile_name)
@@ -2336,14 +2395,14 @@ class ProfileManager:
                 ts = int(dt.timestamp())
                 created_display = f"<t:{ts}:D>"
             except: pass
-        
+
         appearance_data = self._get_user_appearance(effective_owner_id, effective_profile_name)
         display_name = appearance_data.get("custom_display_name") or effective_profile_name
 
         embed.add_field(name="Profile Type", value=f"`{profile_type}`", inline=True)
         embed.add_field(name="Created", value=created_display, inline=True)
         embed.add_field(name="Display Name", value=f"`{display_name}`", inline=True)
-        
+
         enforced = self._resolve_enforced_safety_level(user_id, profile_name)
         verdict, verdict_reason = self._content_rating_state(user_id, profile_name)
         declared = self._is_owner_declared_adult(user_id, profile_name)
@@ -2374,7 +2433,7 @@ class ProfileManager:
                            ("\u200b", "\u200b")]
 
             if profile_id.startswith("X"):
-                embed.description = f"⚠️ **System Profile.** Global settings managed by Bot Admin.\n\n" + (embed.description or "")
+                embed.description = f"\u26a0\ufe0f **System Profile.** Global settings managed by Bot Admin.\n\n" + (embed.description or "")
                 profile_type = "System"
 
         embed.add_field(name=left_column[0][0], value=left_column[0][1], inline=True)
@@ -2384,7 +2443,7 @@ class ProfileManager:
 
         embed.add_field(name=left_column[1][0], value=left_column[1][1], inline=True)
         embed.add_field(name="Public Library",
-                        value="🌐 `Published`" if is_public else "`Not published`", inline=True)
+                        value="\U0001f310 `Published`" if is_public else "`Not published`", inline=True)
         embed.add_field(name="\u200b", value="\u200b", inline=True)
 
         if verdict == CONTENT_RATING_PENDING and verdict_reason:
@@ -2392,17 +2451,17 @@ class ProfileManager:
             # indistinguishable from one still in flight. This reason describes an
             # operational failure rather than the persona, so it is shown as stored.
             embed.description = ((embed.description or "") +
-                                 f"\n⏳ **Classification unavailable:** {verdict_reason}").strip()
+                                 f"\n\u23f3 **Classification unavailable:** {verdict_reason}").strip()
         if verdict == "adult" and declared:
             embed.description = ((embed.description or "") +
-                                 "\n🔞 **Declared as adult content by you.** This profile is "
+                                 "\n\U0001f51e **Declared as adult content by you.** This profile is "
                                  "limited to age-restricted channels and cannot be published. "
                                  "Withdraw the declaration from Content Safety to have it "
                                  "classified normally.").strip()
         elif verdict == "adult":
             # A category, never the classifier's own words about the persona.
             embed.description = ((embed.description or "") +
-                                 "\n🔞 **Classified as adult content: "
+                                 "\n\U0001f51e **Classified as adult content: "
                                  + CONTENT_RATING_REASON_LABELS.get(
                                      verdict_reason, CONTENT_RATING_REASON_FALLBACK) +
                                  ".** This profile is limited to age-restricted channels. "
@@ -2416,7 +2475,7 @@ class ProfileManager:
 
         if is_public:
             embed.description = ((embed.description or "") +
-                                 "\n🌐 **Published to the Public Library.** The 18+ declaration is "
+                                 "\n\U0001f310 **Published to the Public Library.** The 18+ declaration is "
                                  "withheld while listed, and bulk rating changes skip this profile. "
                                  "Unpublish via `/profile hub` to change it.").strip()
 
@@ -2445,7 +2504,7 @@ class ProfileManager:
             # The shipped default is no second model, and an arrow to nothing on five
             # rows is noise -- so the fallback only shows once it is really set.
             if is_real_model(fallback) and fallback != primary:
-                model_lines.append(f"{label}: `{clean_m(primary)}` → `{clean_m(fallback)}`")
+                model_lines.append(f"{label}: `{clean_m(primary)}` \u2192 `{clean_m(fallback)}`")
             else:
                 model_lines.append(f"{label}: `{clean_m(primary)}`")
 
@@ -2495,30 +2554,34 @@ class ProfileManager:
         # user could only catch by inspecting the generated image.
         img_out = resolve_image_output_params(
             config, config.get("image_generation_model") or DEFAULT_IMAGE_MODEL)
-        img_detail = " · ".join(v for v in (img_out.get("aspect_ratio"), img_out.get("image_size"),
+        img_detail = " \u00b7 ".join(v for v in (img_out.get("aspect_ratio"), img_out.get("image_size"),
                                             img_out.get("thinking_level")) if v)
         if img_detail:
             img_gen += f" `{img_detail}`"
 
-        
+
         raw_ground_mode = config.get("grounding_mode", "off")
         if isinstance(raw_ground_mode, bool): raw_ground_mode = "rag" if raw_ground_mode else "off"
         elif raw_ground_mode in ["on", "on+"]: raw_ground_mode = "rag"
         grounding_display = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(raw_ground_mode, "`OFF`")
-        
+
         raw_url_mode = config.get("url_mode", "off")
         if "url_mode" not in config:
             raw_url_mode = "rag" if config.get("url_fetching_enabled", False) else "off"
         url_ctx = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(raw_url_mode, "`OFF`")
-        
+
         timezone = config.get("timezone", "UTC")
         typing = "**`ON`**" if config.get("realistic_typing_enabled", False) else "`OFF`"
-        critic = "**`ON`**" if config.get("critic_enabled", False) else "`OFF`"
+        # The one line that is not a straight restoration: the critic has three modes
+        # now, and rendering "ON" for the lexical scan would report a per-turn model
+        # call this profile does not make. Same single line, resolved value.
+        critic_mode = resolve_critic_settings(config)["mode"]
+        critic = "`OFF`" if critic_mode == "off" else f"**`{critic_mode.upper()}`**"
         help_mode = "**`ON`**" if config.get("help_mode_enabled", False) else "`OFF`"
         resp_mode = config.get("response_mode", "regular").replace('_', ' ').title()
 
         ph_text = f"{config.get('placeholder_emoji') or 'Default'}"
-        
+
         tools_val = (
             f"Image Gen: {img_gen}\n"
             f"Grounding: {grounding_display}\n"
@@ -2549,7 +2612,7 @@ class ProfileManager:
         # Gender and character are what tell thirty star names apart at a glance; an
         # unknown name is left bare rather than guessed at, which is also how a voice
         # stored before the picker existed shows up.
-        s_described = " · ".join(d for d in (TTS_VOICE_GENDER.get(s_voice),
+        s_described = " \u00b7 ".join(d for d in (TTS_VOICE_GENDER.get(s_voice),
                                              TTS_VOICE_CHARACTER.get(s_voice)) if d)
 
         speech_val = (
@@ -2586,7 +2649,6 @@ class ProfileManager:
             embed.set_thumbnail(url=appearance_data["custom_avatar_url"])
 
         return embed
-    
 
     def _default_ltm_summarization_instructions(self) -> str:
         """The LTM summariser prompt a profile gets when it has none of its own.
@@ -2601,9 +2663,35 @@ class ProfileManager:
         return self.cog.global_prompts.get(
             "LTM_SUMMARIZATION_INSTRUCTIONS", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
 
+    def _default_critic_instructions(self) -> str:
+        """The Anti-Repetition Critic prompt a profile gets when it has none of its own."""
+        return self.cog.global_prompts.get("ANTI_REPETITION", DEFAULT_ANTI_REPETITION_PROMPT)
+
+    def resolve_critic_instructions(self, owner_id: Optional[int], profile_name: Optional[str]) -> str:
+        """Profile prompt, else /mod's instance-wide override, else the shipped default.
+
+        Unlike the LTM summariser this is deliberately *not* seeded into a profile's
+        prompts at creation. An unseeded profile resolves through the global every time,
+        so an operator editing ANTI_REPETITION in /mod changes the behaviour of every
+        profile that never customised it -- which is what an instance-wide prompt is for.
+        Seeding would have frozen a copy at creation and made the global govern nothing
+        but profiles made after it was last edited.
+        """
+        default = self._default_critic_instructions()
+        if not owner_id or not profile_name:
+            return default
+
+        source_owner_id, source_profile_name = self._resolve_effective_profile(owner_id, profile_name)
+        prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
+        encrypted = prompts.get("critic_instructions")
+        if encrypted:
+            # A stored-but-blank value must not yield a blank system instruction.
+            return self.cog.storage_manager._decrypt_data(encrypted).strip() or default
+        return default
+
     async def _build_profile_manage_embed(self, interaction: discord.Interaction, profile_name: str, target_user_id: Optional[int] = None) -> discord.Embed:
         return await self._build_profile_embed(target_user_id or interaction.user.id, profile_name, interaction.channel_id)
-    
+
 
     def _invalidate_channel_model_cache(self, key: Tuple[int, int]):
         if key in self.cog.channel_models: del self.cog.channel_models[key]

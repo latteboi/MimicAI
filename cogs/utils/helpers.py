@@ -16,6 +16,11 @@ from .constants import (
     PATTERN_TIMESTAMP_HEADER, PATTERN_METADATA, PATTERN_MESSAGE_LINK,
     PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK,
     IMAGE_MODEL_CAPS, IMAGE_MODEL_CAPS_DEFAULT, IMAGE_THINKING_LEVELS,
+    CRITIC_MODES, CRITIC_SCOPES, CRITIC_STRICTNESS_LEVELS, CRITIC_STRICTNESS_MIN_GRAM,
+    DEFAULT_CRITIC_MODE, DEFAULT_CRITIC_SCOPE, DEFAULT_CRITIC_STRICTNESS,
+    DEFAULT_CRITIC_LOOKBACK, DEFAULT_CRITIC_PERSISTENCE,
+    CRITIC_LOOKBACK_MIN, CRITIC_LOOKBACK_MAX,
+    CRITIC_PERSISTENCE_MIN, CRITIC_PERSISTENCE_MAX,
 )
 
 
@@ -331,7 +336,16 @@ def _resolve_zoneinfo(tz_str: Optional[str]) -> Tuple[ZoneInfo, str]:
                 return ZoneInfo(canonical), canonical
         return ZoneInfo("UTC"), "UTC"
 
-def _format_history_entry(display_name: str, timestamp: Union[datetime.datetime, str], content: str, timezone_str: str = "UTC", entity_id: str = "00000000") -> str:
+def _format_history_entry(display_name: str, timestamp: Union[datetime.datetime, str], content: str, timezone_str: str = "UTC", *, entity_id: str) -> str:
+    """One turn's stored form: the identity header the model reads, plus the content.
+
+    `entity_id` is required and keyword-only. It used to default to "00000000", which
+    is not a marker of anything -- it is a plausible-looking id that reads as real. Two
+    call sites had quietly been taking it: editing a Discord message rewrote the user's
+    turn with it in place of their stable hash, and the debug prompt dump showed it
+    instead of the speaking profile's PID. Both were invisible because the output still
+    looked well-formed. A missing id is now a TypeError at the call site.
+    """
     # Convert string timestamp to datetime object if necessary
     if isinstance(timestamp, str):
         try:
@@ -586,3 +600,51 @@ def is_real_model(name: Optional[str]) -> bool:
             text = text[len(prefix):]
             break
     return text.upper() != NO_FALLBACK
+
+
+def resolve_critic_settings(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The Anti-Repetition Critic's effective settings for one profile.
+
+    Every critic call site reads through here so the legacy flag is folded in exactly
+    once. `critic_enabled` is what older profiles carry and what the boolean toggle
+    wrote; an absent `critic_mode` reads off it, and True means "full", because the
+    model pass is the only thing that boolean ever selected. Both keys are written
+    together by the dashboard, so a profile edited on one version still reads correctly
+    on the other.
+
+    Values out of range are clamped rather than rejected: these arrive from a Discord
+    modal, and a critic that silently runs at a sane lookback beats a turn that fails
+    because someone typed 400.
+    """
+    config = config or {}
+
+    mode = str(config.get("critic_mode") or "").strip().lower()
+    if mode not in CRITIC_MODES:
+        mode = "full" if config.get("critic_enabled", False) else DEFAULT_CRITIC_MODE
+
+    scope = str(config.get("critic_scope") or "").strip().lower()
+    if scope not in CRITIC_SCOPES:
+        scope = DEFAULT_CRITIC_SCOPE
+
+    strictness = str(config.get("critic_strictness") or "").strip().lower()
+    if strictness not in CRITIC_STRICTNESS_LEVELS:
+        strictness = DEFAULT_CRITIC_STRICTNESS
+
+    def _clamp(key, default, low, high):
+        try:
+            value = int(config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return max(low, min(high, value))
+
+    return {
+        "mode": mode,
+        "enabled": mode != "off",
+        "scope": scope,
+        "strictness": strictness,
+        "min_gram": CRITIC_STRICTNESS_MIN_GRAM[strictness],
+        "lookback": _clamp("critic_lookback", DEFAULT_CRITIC_LOOKBACK,
+                           CRITIC_LOOKBACK_MIN, CRITIC_LOOKBACK_MAX),
+        "persistence": _clamp("critic_persistence", DEFAULT_CRITIC_PERSISTENCE,
+                              CRITIC_PERSISTENCE_MIN, CRITIC_PERSISTENCE_MAX),
+    }

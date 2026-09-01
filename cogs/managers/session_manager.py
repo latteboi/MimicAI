@@ -1369,6 +1369,36 @@ class SessionManager:
         
         await interaction.edit_original_response(content=msg, view=None)
 
+    @staticmethod
+    def register_in_flight(session: Dict, state_container: Dict) -> None:
+        """Publish a live operation's heartbeat state so /cancel can see its phase.
+
+        The container is what knows whether generation has returned: `sending_task` is
+        set by _update_sending_placeholder and cleared by _stop_sending_heartbeat, so
+        its presence is exactly the window the placeholder reads "Sending...".
+        """
+        session.setdefault("in_flight", []).append(state_container)
+
+    @staticmethod
+    def release_in_flight(session: Dict, state_container: Dict) -> None:
+        containers = session.get("in_flight")
+        if not containers:
+            return
+        # Identity, not equality: two participants in a round can hold containers that
+        # compare equal while only one of them is finishing.
+        session["in_flight"] = [c for c in containers if c is not state_container]
+
+    @staticmethod
+    def is_delivering(session: Dict) -> bool:
+        """True once a model has returned and the turn is being built and sent.
+
+        Cancelling here is the one case that cannot be made safe: the response exists,
+        the placeholder is mid-edit, TTS may be part-way through a synthesis, and for a
+        regeneration the original message has already been overwritten. Everything
+        before this point either has nothing to undo or can be put back.
+        """
+        return any(c.get("sending_task") for c in session.get("in_flight", ()))
+
     def _safe_cancel_task(self, task: asyncio.Task):
         if task and not task.done():
             task.cancel()
