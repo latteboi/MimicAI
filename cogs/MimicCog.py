@@ -179,6 +179,11 @@ class MimicCog(commands.Cog, EventListeners):
         # Profiles queued for content classification, so a burst of edits collapses
         # into one job each and a failed job can be retried with a bounded count.
         self.pending_classifications: Dict[Tuple[int, str], int] = {}
+        # One Event per in-flight job, so a dashboard can wait for the verdict
+        # instead of guessing at how long it will take. Created and torn down in
+        # lockstep with pending_classifications above, so it is bounded by the same
+        # thing: the number of jobs actually running.
+        self.classification_events: Dict[Tuple[int, str], asyncio.Event] = {}
 
         # LRU rather than plain dicts: keyed by (channel_id, owner_id, profile_name), these
         # otherwise grow for the life of the process. The two are written together and read
@@ -442,8 +447,7 @@ class MimicCog(commands.Cog, EventListeners):
         index = self.profile_manager._get_user_index(user_id)
         if profile_name in index.get("personal", []) or profile_name in index.get("borrowed", []):
             return True
-        owner_idx = self.profile_manager._get_user_index(int(defaultConfig.DISCORD_OWNER_ID))
-        return profile_name in owner_idx.get("system", {})
+        return profile_name in self.profile_manager._system_index()
 
     async def _open_profile_manage(self, interaction: discord.Interaction, profile_name: str,
                                    *, repaint: bool = False):
@@ -483,9 +487,17 @@ class MimicCog(commands.Cog, EventListeners):
         personal_names = sorted(list(index.get("personal", {})))
         borrowed_names = sorted(list(index.get("borrowed", {})))
         
-        system_names = []
-        if interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID):
-            system_names = sorted(list(index.get("system", {})))
+        # System profiles are addressable by everyone -- _resolve_effective_profile
+        # has always granted access to them -- so everyone is shown them. This used
+        # to read the CALLER's index behind an owner-only gate, and a member's index
+        # has no "system" map, so the section was doubly dead for anyone but the bot
+        # owner: they could use a System profile but never discover its name.
+        # _is_system_name applies the same personal-and-borrowed-shadow-System
+        # precedence as resolution, so a name listed here means what it will mean
+        # when the user types it.
+        system_names = sorted(
+            n for n in self.profile_manager._system_index()
+            if self.profile_manager._is_system_name(interaction.user.id, n))
 
         if not personal_names and not borrowed_names and not system_names:
             await interaction.followup.send("You have no saved profiles yet.", ephemeral=True)
@@ -516,7 +528,9 @@ class MimicCog(commands.Cog, EventListeners):
         for t, v in build_fields("Borrowed Profiles", borrowed_names):
             embed.add_field(name=t, value=v, inline=False)
 
-        for t, v in build_fields("System Profiles", system_names):
+        sys_title = ("System Profiles" if interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)
+                     else "System Profiles (Read-Only)")
+        for t, v in build_fields(sys_title, system_names):
             embed.add_field(name=t, value=v, inline=False)
 
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -752,8 +766,11 @@ class MimicCog(commands.Cog, EventListeners):
             is_borrowed = profile_name in index.get("borrowed", [])
             
             owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-            owner_idx = self.profile_manager._get_user_index(owner_id)
-            is_system = profile_name in owner_idx.get("system", {})
+            # _is_system_name, not a bare System-index test: with the latter a user
+            # who owned a profile sharing a System name got is_personal AND
+            # is_system, and participant_owner below then joined the System profile
+            # instead of theirs.
+            is_system = self.profile_manager._is_system_name(interaction.user.id, profile_name)
             
             if not is_personal and not is_borrowed and not is_system:
                 candidates = gather_owned_candidates(self, interaction.user.id)

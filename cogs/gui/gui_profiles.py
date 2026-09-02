@@ -987,13 +987,17 @@ class ProfileManageView(ui.View):
         self.original_interaction = original_interaction
         
         owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-        owner_idx = self.cog.profile_manager._get_user_index(owner_id)
-        if profile_name in owner_idx.get("system", {}):
+        # _is_system_name, not a bare System-index test. The bare test ran before any
+        # personal lookup, so a user who owned a profile sharing a System name had
+        # this view rewrite user_id to the bot owner and open the System profile
+        # read-only -- their own profile was unreachable from the dashboard.
+        viewer_id = target_user_id or original_interaction.user.id
+        if self.cog.profile_manager._is_system_name(viewer_id, profile_name):
             self.target_user_id = owner_id
             self.user_id = owner_id
             self.is_system = True
         else:
-            self.target_user_id = target_user_id or original_interaction.user.id
+            self.target_user_id = viewer_id
             self.user_id = self.target_user_id
             self.is_system = False
 
@@ -4403,7 +4407,18 @@ class ContentSafetyView(ui.View):
         # Why a Pending profile is still pending.
         if verdict == CONTENT_RATING_PENDING:
             retry_after = rating.get("retry_after")
-            if retry_after and time.time() < retry_after:
+            in_flight = (int(self.user_id), self.profile_name) in self.cog.pending_classifications
+            if in_flight:
+                # Pending meant two different things on this page -- "a job is
+                # working on it" and "a job failed and it is waiting to retry" --
+                # and the embed rendered them identically, so a user watching a
+                # live classification could not tell it from a stalled one.
+                embed.add_field(
+                    name="Analysing",
+                    value="The classifier is running now. This page will update "
+                          "itself when the verdict lands.",
+                    inline=False)
+            elif retry_after and time.time() < retry_after:
                 embed.add_field(
                     name="Held up",
                     value=(f"The last attempt failed and it will retry "
@@ -4461,6 +4476,28 @@ class ContentSafetyView(ui.View):
         self._build_view()
         await i.edit_original_response(embed=self.get_embed(), view=self)
 
+    async def _repaint(self, i: discord.Interaction):
+        """Redraws from state already in hand.
+
+        refresh_state hashes the persona and scans every user's borrow index, which
+        is far too much to spend on the interim "it is running now" frame -- nothing
+        it reads can have changed since the click that got us here.
+        """
+        self._build_view()
+        await i.edit_original_response(embed=self.get_embed(), view=self)
+
+    async def _await_verdict(self, i: discord.Interaction):
+        """Shows that the job started, waits for it, then shows the verdict.
+
+        Replaces a fixed `asyncio.sleep(2.5)`. The sleep was shorter than a real
+        classifier call, so the repaint after it usually rendered the same Pending
+        the user was already looking at, and nothing updated the page afterwards --
+        which is why reopening the dashboard was the only way to see a verdict.
+        """
+        await self._repaint(i)
+        await self.cog.profile_manager.await_classification(self.user_id, self.profile_name)
+        await self._refresh(i)
+
     # --- actions --------------------------------------------------------------
 
     async def back_cb(self, i: discord.Interaction):
@@ -4475,10 +4512,9 @@ class ContentSafetyView(ui.View):
             self.user_id, self.profile_name)
         await i.followup.send(msg, ephemeral=True)
         if ok:
-            # The job is fire-and-forget; give it a beat so the common case renders
-            # the finished verdict rather than a Pending the user has to refresh past.
-            await asyncio.sleep(2.5)
-        await self._refresh(i)
+            await self._await_verdict(i)
+        else:
+            await self._refresh(i)
 
     async def recheck_cb(self, i: discord.Interaction):
         """Refreshes a Pending profile, re-queueing it if nothing is actually running.
@@ -4494,8 +4530,13 @@ class ContentSafetyView(ui.View):
         key = (int(self.user_id), self.profile_name)
         if verdict == CONTENT_RATING_PENDING and key not in self.cog.pending_classifications:
             pm.schedule_content_classification(self.user_id, self.profile_name)
-            await asyncio.sleep(2.5)
-        await self._refresh(i)
+        if key in self.cog.pending_classifications:
+            # Wait whether this call queued the job or found one already running --
+            # the button's whole purpose is to answer "is it done yet", and it used
+            # to return the same Pending unless it had queued the job itself.
+            await self._await_verdict(i)
+        else:
+            await self._refresh(i)
 
     async def declare_cb(self, i: discord.Interaction):
         pm = self.cog.profile_manager
@@ -4525,8 +4566,7 @@ class ContentSafetyView(ui.View):
         await i.response.defer()
         self.cog.profile_manager.schedule_content_classification(self.user_id, self.profile_name)
         await i.followup.send("Re-classification queued.", ephemeral=True)
-        await asyncio.sleep(2.5)
-        await self._refresh(i)
+        await self._await_verdict(i)
 
 
 class PostEditRatingView(ui.View):
@@ -4562,10 +4602,20 @@ class PostEditRatingView(ui.View):
     @ui.button(label="Re-check the rating", style=discord.ButtonStyle.success)
     async def recheck(self, i: discord.Interaction, _: ui.Button):
         await i.response.defer()
-        self.cog.profile_manager.schedule_content_classification(self.user_id, self.profile_name)
+        pm = self.cog.profile_manager
+        pm.schedule_content_classification(self.user_id, self.profile_name)
         await i.edit_original_response(
-            content=f"Re-checking the rating for '{self.profile_name}'.", view=None)
+            content=f"Re-checking the rating for '{self.profile_name}'…", view=None)
         self.stop()
+        # This prompt used to end here, so the one place the user was told a
+        # re-check had started was also the last thing they heard about it. Waiting
+        # costs nothing -- the view is already stopped and the message is already
+        # theirs -- and it turns a dead end into the answer.
+        await pm.await_classification(self.user_id, self.profile_name)
+        verdict, _rating = pm._content_rating_state(self.user_id, self.profile_name)
+        await i.edit_original_response(
+            content=(f"'{self.profile_name}' is now **{CONTENT_RATING_LABELS[verdict]}**."),
+            view=None)
 
     @ui.button(label="Set to Unrated", style=discord.ButtonStyle.secondary)
     async def unrate(self, i: discord.Interaction, _: ui.Button):

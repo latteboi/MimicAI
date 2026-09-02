@@ -65,20 +65,91 @@ class ProfileManager:
     # quietly did not exist. System stays the fallback, so a name with no personal
     # profile behind it still resolves to it exactly as before.
 
-    def _get_pid_from_name(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> str:
+    def _system_index(self) -> Dict[str, str]:
+        """The System name -> PID map. Always the bot owner's index, never the caller's.
+
+        System profiles are stored in the bot owner's tree like any other profile --
+        an X-prefixed PID under users/<owner>/profiles/ -- but they are addressable
+        by everyone. Every reader must therefore look them up in the OWNER's index;
+        a member's own index has an empty "system" map and always will.
+
+        This is the single point that knows that. Sites used to re-derive it three
+        different ways -- the caller's index, the owner's index, and a
+        pid.startswith("X") test -- and the ones reading the caller's index silently
+        found nothing, which is why System profiles were invisible to everyone but
+        the owner in listings and autocomplete while _resolve_effective_profile
+        happily granted access to them.
+        """
+        owner_index = self._get_user_index(int(defaultConfig.DISCORD_OWNER_ID))
+        system = owner_index.get("system", {})
+        return system if isinstance(system, dict) else {}
+
+    def _is_system_name(self, user_id: int, profile_name: str) -> bool:
+        """Whether `profile_name` resolves to a System profile *for this user*.
+
+        Personal and borrowed shadow System, matching _resolve_effective_profile, so
+        discovery and resolution cannot disagree about which profile a name means.
+        Callers that test the System index on its own get this wrong for a user who
+        owns a profile sharing a System name.
+        """
         index = self._get_user_index(user_id)
-        if not is_borrowed:
-            personal = index.get("personal", {})
-            if isinstance(personal, dict) and profile_name in personal:
-                return personal[profile_name]
-            if isinstance(index.get("system"), dict) and profile_name in index.get("system", {}):
-                return index["system"][profile_name]
-            mapping = personal
-        else:
+        if profile_name in index.get("personal", {}) or profile_name in index.get("borrowed", {}):
+            return False
+        return profile_name in self._system_index()
+
+    def _resolve_owner_and_pid(self, user_id: int, profile_name: str,
+                               is_borrowed: bool = False) -> Tuple[int, str]:
+        """(owner whose tree holds the shard, PID within it).
+
+        Resolving the PID alone is not enough for a System profile: the shard lives
+        under the bot owner's id, so a caller's id would build a path that does not
+        exist. Owner and PID have to be resolved together, which is what every
+        _get_profile / _save_profile now does.
+
+        A borrow short-circuits -- the borrow shard genuinely belongs to the
+        borrower, and its config is what names the source.
+        """
+        index = self._get_user_index(user_id)
+
+        if is_borrowed:
             mapping = index.get("borrowed", {})
-        if isinstance(mapping, dict):
-            return mapping.get(profile_name, profile_name)
-        return profile_name
+            if isinstance(mapping, dict):
+                return user_id, mapping.get(profile_name, profile_name)
+            return user_id, profile_name
+
+        personal = index.get("personal", {})
+        if isinstance(personal, dict) and profile_name in personal:
+            return user_id, personal[profile_name]
+
+        system = self._system_index()
+        if profile_name in system and profile_name not in index.get("borrowed", {}):
+            return int(defaultConfig.DISCORD_OWNER_ID), system[profile_name]
+
+        if isinstance(personal, dict):
+            return user_id, personal.get(profile_name, profile_name)
+        return user_id, profile_name
+
+    def _resolve_prompt_owner_and_pid(self, user_id: int, profile_name: str) -> Tuple[int, str]:
+        """(owner whose tree holds the shard, PID) without needing an is_borrowed flag.
+
+        The prompt accessors take a name and no class, so they search personal,
+        then borrowed, then System -- a borrow keeps its own copy of the prompts,
+        which is why it is consulted before the System fallback.
+        """
+        index = self._get_user_index(user_id)
+        for key in ("personal", "borrowed"):
+            mapping = index.get(key, {})
+            if isinstance(mapping, dict) and profile_name in mapping:
+                return user_id, mapping[profile_name]
+
+        system = self._system_index()
+        if profile_name in system:
+            return int(defaultConfig.DISCORD_OWNER_ID), system[profile_name]
+
+        return user_id, profile_name
+
+    def _get_pid_from_name(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> str:
+        return self._resolve_owner_and_pid(user_id, profile_name, is_borrowed)[1]
 
     def _get_pid_from_name_any(self, user_id: int, profile_name: str) -> str:
         index = self._get_user_index(user_id)
@@ -86,8 +157,9 @@ class ProfileManager:
             return index["personal"][profile_name]
         if isinstance(index.get("borrowed"), dict) and profile_name in index["borrowed"]:
             return index["borrowed"][profile_name]
-        if isinstance(index.get("system"), dict) and profile_name in index["system"]:
-            return index["system"][profile_name]
+        system = self._system_index()
+        if profile_name in system:
+            return system[profile_name]
         return profile_name
 
     def _get_name_from_pid(self, user_id: int, target_pid: str) -> Optional[str]:
@@ -288,8 +360,7 @@ class ProfileManager:
         index = self._get_user_index(user_id)
         is_borrowed = profile_name in index.get("borrowed", [])
 
-        effective_owner_id = user_id
-        effective_pid = self._get_pid_from_name_any(user_id, profile_name)
+        effective_owner_id, effective_pid = self._resolve_prompt_owner_and_pid(user_id, profile_name)
 
         if is_borrowed:
             b_config = self._get_profile_config(user_id, profile_name, True) or {}
@@ -346,18 +417,27 @@ class ProfileManager:
     def _get_profile(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> Optional[Dict[str, Any]]:
         if not profile_name:
             return None
-        pid = self._get_pid_from_name(user_id, profile_name, is_borrowed)
+        eff_owner, pid = self._resolve_owner_and_pid(user_id, profile_name, is_borrowed)
         if not pid:
             return None
-        return self._get_profile_by_pid(user_id, pid)
+        return self._get_profile_by_pid(eff_owner, pid)
 
     def _save_profile(self, user_id: int, profile_name: str, data: Dict[str, Any], is_borrowed: bool = False):
         if not profile_name:
             return
-        pid = self._get_pid_from_name(user_id, profile_name, is_borrowed)
+        eff_owner, pid = self._resolve_owner_and_pid(user_id, profile_name, is_borrowed)
         if not pid:
             return
-        self._save_profile_by_pid(user_id, pid, data)
+        # A resolved owner that is not the caller means a System profile reached
+        # here under a member's id. Reads resolve across trees on purpose -- that is
+        # what makes System profiles usable by everyone -- but writes must not: the
+        # UI already refuses them (ProfileManageView.is_read_only), and every
+        # legitimate System write arrives with the bot owner's id because
+        # ProfileManageView rewrites it. Before resolution crossed trees this landed
+        # in a junk directory and was harmless; now it would land on the real shard.
+        if eff_owner != user_id:
+            return
+        self._save_profile_by_pid(eff_owner, pid, data)
 
     def _get_profile_by_pid(self, user_id: int, pid: str) -> Optional[Dict[str, Any]]:
         if not pid:
@@ -615,11 +695,16 @@ class ProfileManager:
                 # carrying a stray id are repaired on their next read. The write
                 # happens once per affected profile; afterwards the values agree and
                 # this is a string comparison.
-                pid = self._get_pid_from_name(user_id, profile_name, is_borrowed)
+                eff_owner, pid = self._resolve_owner_and_pid(user_id, profile_name, is_borrowed)
                 # A name that does not map -- mid-repair, or one that never mapped --
                 # comes back as the name itself. Leave the field alone in that case
                 # rather than writing an id that would outlive the confusion.
-                if pid and pid != profile_name and config.get("profile_id") != pid:
+                #
+                # eff_owner != user_id means a member is reading a System profile.
+                # _save_profile refuses that write, so attempting it would only burn
+                # a resolve on every read; the bot owner's own read repairs it.
+                if (eff_owner == user_id and pid and pid != profile_name
+                        and config.get("profile_id") != pid):
                     config["profile_id"] = pid
                     p_data["config"] = config
                     self._save_profile(user_id, profile_name, p_data, is_borrowed)
@@ -654,11 +739,8 @@ class ProfileManager:
         if profile_name in index.get("personal", []):
             return user_id, profile_name
 
-        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-        if user_id != owner_id:
-            owner_idx = self._get_user_index(owner_id)
-            if profile_name in owner_idx.get("system", {}):
-                return owner_id, profile_name
+        if profile_name in self._system_index():
+            return int(defaultConfig.DISCORD_OWNER_ID), profile_name
 
         return user_id, profile_name
 
@@ -677,9 +759,9 @@ class ProfileManager:
         return data
 
     def _get_profile_prompts(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
-        pid = self._get_pid_from_name_any(user_id, profile_name)
+        eff_owner, pid = self._resolve_prompt_owner_and_pid(user_id, profile_name)
         if not pid: return None
-        p_data = self._get_profile_by_pid(user_id, pid)
+        p_data = self._get_profile_by_pid(eff_owner, pid)
         if p_data is not None:
             return p_data.get("prompts", {})
         return None
@@ -696,9 +778,12 @@ class ProfileManager:
         decides what to do about the rating going stale, interactively where there
         is a user to ask, and via resolve_stale_rating everywhere else.
         """
-        pid = self._get_pid_from_name_any(user_id, profile_name)
+        eff_owner, pid = self._resolve_prompt_owner_and_pid(user_id, profile_name)
         if not pid: return
-        p_data = self._get_profile_by_pid(user_id, pid)
+        # See the note in _save_profile: reads cross into the bot owner's tree for a
+        # System profile, writes do not.
+        if eff_owner != user_id: return
+        p_data = self._get_profile_by_pid(eff_owner, pid)
         if p_data is None:
             p_data = {
                 "name": profile_name,
@@ -708,7 +793,7 @@ class ProfileManager:
             }
         else:
             p_data["prompts"] = data
-        self._save_profile_by_pid(user_id, pid, p_data)
+        self._save_profile_by_pid(eff_owner, pid, p_data)
         self._invalidate_content_rating(user_id, profile_name)
 
     def _get_or_create_user_profile(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
@@ -1831,10 +1916,43 @@ class ProfileManager:
                   f"worker thread with no event loop and has been dropped. Call this "
                   f"from the loop.")
             self.cog.pending_classifications.pop(key, None)
+            self.cog.classification_events.pop(key, None)
             return
 
         self.cog.pending_classifications[key] = 0
+        # Created before the task, so a dashboard that starts waiting in the same
+        # tick finds an Event to wait on rather than concluding nothing is running.
+        self.cog.classification_events[key] = asyncio.Event()
         asyncio.create_task(self._run_classification_job(owner_id, profile_name))
+
+    async def await_classification(self, owner_id: int, profile_name: str,
+                                   timeout: Optional[float] = None) -> bool:
+        """Waits for an in-flight classification to land. True if it finished in time.
+
+        The dashboards used to `asyncio.sleep(2.5)` and repaint. That is a guess, and
+        a bad one: a classifier call plus an avatar fetch routinely outruns it, and
+        the repaint then renders the same Pending the user was already looking at --
+        with nothing left in the system to update it afterwards. Reopening the
+        dashboard appeared to fix it only because that re-read the config once the
+        job had already landed.
+
+        Returns False on timeout, which is not an error: the job is still running and
+        the caller should repaint with whatever the current state is.
+        """
+        if timeout is None:
+            timeout = defaultConfig.CONTENT_CLASSIFY_UI_WAIT_SECONDS
+        key = (int(owner_id), profile_name)
+        event = self.cog.classification_events.get(key)
+        if event is None:
+            # No job registered. Either it finished between the caller's check and
+            # this call -- the common case, and a success -- or nothing was ever
+            # queued, which the caller's repaint will show as it is.
+            return key not in self.cog.pending_classifications
+        try:
+            await asyncio.wait_for(event.wait(), timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def _run_classification_job(self, owner_id: int, profile_name: str):
         key = (int(owner_id), profile_name)
@@ -1868,6 +1986,13 @@ class ProfileManager:
             await asyncio.to_thread(self._record_classification_failure, owner_id, profile_name, reason)
         finally:
             self.cog.pending_classifications.pop(key, None)
+            # Popped before it is set, so a waiter arriving after this point falls
+            # through to the pending_classifications check and sees "finished"
+            # rather than waiting on an Event nothing will ever set again. Waiters
+            # already inside wait() hold their own reference and are still woken.
+            done = self.cog.classification_events.pop(key, None)
+            if done is not None:
+                done.set()
 
     @tasks.loop(hours=1.0)
     async def hourly_self_repair_task(self):

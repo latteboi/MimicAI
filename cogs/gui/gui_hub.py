@@ -188,7 +188,7 @@ class HubHomeView(HubBaseView):
         user_borrowed = len(user_borrowed_dict) if isinstance(user_borrowed_dict, dict) else len(user_borrowed_dict)
         
         embed = discord.Embed(title="MimicAI Profile Hub", description=defaultConfig.MIMIC_NEWS, color=discord.Color.gold())
-        embed.set_thumbnail(url="https://cdn.discordapp.com/emojis/1441750712160878643.gif")
+        embed.set_thumbnail(url=THINKING_THUMBNAIL_URL)
         
         embed.add_field(name="Global Stats", value=f"`{total_public} Public Profiles`\n`{unique_creators_count} Creators`", inline=True)
         embed.add_field(name="Your Stats", value=f"`{user_owned} Personal Profiles`\n`{user_borrowed} Borrowed Profiles`", inline=True)

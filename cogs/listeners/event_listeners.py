@@ -1145,11 +1145,19 @@ class EventListeners:
                 pending.append((b_name, b_name))
                 meta[b_name] = {"kind": "borrowed", "pid": None}
 
-            if user_id == int(defaultConfig.DISCORD_OWNER_ID):
-                owner_idx = self.profile_manager._get_user_index(user_id)
-                for s_name in owner_idx.get("system", {}):
-                    pending.append((s_name, s_name))
-                    meta[s_name] = {"kind": "system", "pid": owner_idx["system"][s_name]}
+            # Offered to everyone, not just the bot owner. This read the CALLER's
+            # index behind an owner-only gate, and a member's index has no "system"
+            # map, so System profiles never appeared for anyone but the owner --
+            # while _resolve_effective_profile accepted them from everyone. The
+            # names were usable and undiscoverable.
+            system_index = self.profile_manager._system_index()
+            for s_name, s_pid in system_index.items():
+                # Personal and borrowed shadow System, so a name the user has
+                # already claimed is offered once, as theirs.
+                if not self.profile_manager._is_system_name(user_id, s_name):
+                    continue
+                pending.append((s_name, s_name))
+                meta[s_name] = {"kind": "system", "pid": s_pid}
 
         # Shared formatting for the two owned-profile branches. Only the ranked
         # survivors reach here, so the per-candidate config reads below are bounded at
@@ -1164,7 +1172,8 @@ class EventListeners:
                 continue
 
             if kind == "system":
-                app = self.profile_manager._get_user_appearance(user_id, name)
+                app = self.profile_manager._get_user_appearance(
+                    int(defaultConfig.DISCORD_OWNER_ID), name)
                 disp_name = app.get("custom_display_name") or name
                 choices.append(app_commands.Choice(
                     name=format_choice_name(disp_name, name, m["pid"], "System", True),

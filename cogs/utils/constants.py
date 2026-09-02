@@ -79,6 +79,12 @@ class DefaultConfigNamespace:
         # a key on cooldown or none configured -- and burned the whole retry budget
         # again each time.
         self.CONTENT_CLASSIFY_RETRY_AFTER = 1800
+        # How long a dashboard will wait on an in-flight classification before it
+        # gives up and repaints anyway. Covers the worst honest case -- three
+        # attempts with the 5s/10s backoff between them, plus the calls themselves --
+        # and stays far inside the 15-minute interaction-token window, so the repaint
+        # after the wait always lands.
+        self.CONTENT_CLASSIFY_UI_WAIT_SECONDS = 90.0
 
         self.MIMIC_NEWS = ""
 
@@ -322,6 +328,15 @@ MAX_TRAINING_EXAMPLES_PER_PROFILE = 50
 PERSONA_TEXT_INPUT_MAX_LENGTH = 4000
 AI_INSTRUCTIONS_PART_MAX_LENGTH = 4000
 PLACEHOLDER_EMOJI = defaultConfig.PLACEHOLDER_EMOJI
+# Thumbnail for the "thinking" state on the hub and settings embeds. One constant
+# rather than the literal repeated per view, so a swap is one edit and the two
+# surfaces cannot drift apart.
+THINKING_THUMBNAIL_URL = (
+    "https://media.discordapp.net/attachments/1466353749172682854/"
+    "1544349430088728747/mimic_thinking_sierra.gif"
+    "?ex=6a982efc&is=6a96dd7c"
+    "&hm=70e0136ac4236ea1fef473642ad264c4b9c5572dc95b0bf3fcdea8563fd3479b&="
+)
 LOCK_STALE_THRESHOLD_SECONDS = 60 
 LOCK_REFRESH_INTERVAL_SECONDS = 30 
 # Bound for channel_models / channel_model_last_profile_key, keyed

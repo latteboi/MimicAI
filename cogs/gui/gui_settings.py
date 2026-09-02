@@ -198,7 +198,7 @@ class SettingsHomeView(SettingsBaseView):
                     break
 
         embed = discord.Embed(title="MimicAI Control Panel", description="Manage your API keys and personal bots from one place.", color=discord.Color.dark_teal())
-        embed.set_thumbnail(url="https://cdn.discordapp.com/emojis/1441750712160878643.gif")
+        embed.set_thumbnail(url=THINKING_THUMBNAIL_URL)
         
         embed.add_field(name="API Key Slots", value=f"**Google Gemini:** {stat_gemini}\n**OpenRouter:** {stat_or}", inline=True)
         embed.add_field(name="Child Bots", value=bot_text, inline=True)

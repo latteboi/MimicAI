@@ -282,8 +282,6 @@ def gather_owned_candidates(cog: 'MimicCog', user_id: int, *,
     on a failure path that must stay cheap even for an account at the 100/100 limit.
     `only` filters on (name, kind) for commands that accept a subset.
     """
-    from ..utils.constants import defaultConfig
-
     index = cog.profile_manager._get_user_index(user_id)
     candidates: List[ProfileCandidate] = []
 
@@ -296,9 +294,12 @@ def gather_owned_candidates(cog: 'MimicCog', user_id: int, *,
             candidates.append(ProfileCandidate(name, name, "borrowed", "Borrowed profile"))
 
     if include_system:
-        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-        owner_index = cog.profile_manager._get_user_index(owner_id)
-        for name in sorted(owner_index.get("system", {})):
+        # _is_system_name skips names the user has already claimed personally or by
+        # borrow -- those were emitted above, and without the filter a clashing name
+        # appeared twice in the same "Did you mean?" card under two different kinds.
+        for name in sorted(cog.profile_manager._system_index()):
+            if not cog.profile_manager._is_system_name(user_id, name):
+                continue
             if only is None or only(name, "system"):
                 candidates.append(ProfileCandidate(name, name, "system", "System profile"))
 
