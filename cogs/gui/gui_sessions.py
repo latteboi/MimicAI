@@ -1860,6 +1860,49 @@ class SessionAuditView(ui.View):
 
         return PageJumpModal(self.num_pages, _jump, zero_indexed=True)
 
+    #: How the critic reached its verdict, for the inspector's second line. "cache" is a
+    #: constraint carried over by `critic_persistence` from an earlier round, which is
+    #: worth showing plainly: it is the one source that costs nothing *and* did not
+    #: re-examine this turn's history.
+    _CRITIC_SOURCE_LABELS = {
+        "lexical": "Local lexical scan (no API call)",
+        "model": "Critic model pass",
+        "cache": "Carried over from an earlier round",
+    }
+
+    def _critic_field(self, meta: dict) -> Optional[str]:
+        """The critic's verdict for one turn, or None if it was not running.
+
+        Absent key means the profile had the critic off for that turn, or the turn
+        predates the audit record -- both render as nothing rather than as an empty
+        verdict, which is the same contract `neuro_state` has.
+        """
+        critic = meta.get("critic")
+        if not isinstance(critic, dict):
+            return None
+
+        mode = critic.get("mode", "unknown")
+        scope = critic.get("scope", "self")
+        strictness = critic.get("strictness", "normal")
+        lookback = critic.get("lookback", 0)
+        source = critic.get("source")
+        text = (critic.get("text") or "").strip()
+
+        lines = [
+            f"├── Configuration: `{mode}` / scope `{scope}` / `{strictness}` "
+            f"over `{lookback}` turns",
+            f"├── Verdict: `{self._CRITIC_SOURCE_LABELS.get(source, 'Pass -- no repetition found')}`",
+        ]
+        if text:
+            # The constraint is already capped at CRITIC_AUDIT_TEXT_MAX on write. The
+            # trim here is for the field as a whole: the two lines above eat into the
+            # same 1024 characters Discord allows.
+            head = "\n".join(lines) + "\n└── Constraint injected:\n"
+            room = 1024 - len(head) - 10
+            body = text if len(text) <= room else text[:max(0, room - 3)] + "..."
+            return f"{head}```\n{body}\n```"
+        return "\n".join(lines[:-1] + [lines[-1].replace("├──", "└──")])
+
     def _build_embed(self) -> discord.Embed:
         try:
             embed = discord.Embed(title=f"Chat Session Diagnostic: #{self.original_interaction.channel.name}", color=discord.Color.brand_green())
@@ -1919,6 +1962,10 @@ class SessionAuditView(ui.View):
                     grounded = len(meta.get("grounding_sources", []))
                     
                     embed.add_field(name="Context Injections", value=f"├── LTM Archive: `{recalled} memories`\n├── Training Examples: `{trained} injected`\n└── Web Grounding: `{grounded} sources`", inline=False)
+
+                    critic_field = self._critic_field(meta)
+                    if critic_field:
+                        embed.add_field(name="Anti-Repetition Critic", value=critic_field, inline=False)
 
             elif self.mode == "simulator":
                 if not self.simulate_profile_key:

@@ -53,7 +53,7 @@ from ..services.games.eights import COLOURS, Card, Move
 
 if TYPE_CHECKING:
     from ..MimicCog import MimicCog
-    from ..services.game_service import Game
+    from ..services.game_service import Game, Lobby
 
 #: Discord's hard ceilings. Named rather than inlined because both are load-bearing.
 MAX_SELECT_OPTIONS = 25
@@ -139,6 +139,175 @@ def build_hand_embed(game: "Game", seat_id: str) -> discord.Embed:
     elif state.current.seat_id != seat_id:
         embed.set_footer(text="Not your turn yet.")
     return embed
+
+
+def build_lobby_embed(cog: "MimicCog", lobby: "Lobby") -> discord.Embed:
+    """The table before it is dealt: who is sitting, and who fills the rest.
+
+    The profile fill is recomputed rather than stored, so the moment a fifth person sits
+    at a six-seat table the cast list shortens in front of everyone. Showing a roster
+    that would not survive the next Sit Down is worse than showing none.
+    """
+    fill = cog.game_service.roster_preview(lobby)
+    total = len(lobby.humans) + len(fill)
+    # Seats the *cast* is not already committed to. Counting the profile fill as
+    # "filled" would report every table as full, since the fill always tops it up --
+    # which is exactly the number nobody deciding whether to sit needs to know.
+    free = max(0, lobby.limit - len(lobby.humans))
+
+    embed = discord.Embed(
+        title="Mimic Eights — table forming",
+        colour=0x217D47 if lobby.open else 0x2B2F36,
+    )
+    if free:
+        room = (f"**{free}** more {'person' if free == 1 else 'people'} can sit"
+                if lobby.open else
+                f"**{free}** seat{'' if free == 1 else 's'} a profile will take "
+                "unless the host unlocks the table")
+    else:
+        room = "**every seat is taken**"
+    embed.description = (
+        f"**{len(lobby.humans)}** seated at a table of **{lobby.limit}** — {room}."
+    )
+
+    if lobby.humans:
+        people = "\n".join(
+            f"{'👑 ' if uid == lobby.host_id else '· '}{name}"
+            for uid, name in lobby.humans.items())
+    else:
+        people = "*Nobody yet — the table will play itself.*"
+    embed.add_field(name=f"Players ({len(lobby.humans)})", value=people[:1024],
+                    inline=False)
+
+    if fill:
+        cast = "\n".join(f"· {seat.display}" for seat in fill)
+    else:
+        cast = "*No room left for the session's cast.*"
+    embed.add_field(name=f"Profiles filling the table ({len(fill)})",
+                    value=cast[:1024], inline=False)
+
+    house = cog.game_service.house_rule_summary(lobby.rules)
+    if house:
+        embed.add_field(name="House rules", value=house[:1024], inline=False)
+
+    if total < 2:
+        embed.set_footer(text="Needs at least two players before it can start.")
+    else:
+        embed.set_footer(text="Sit Down again to leave the table. "
+                              "The host presses Start when everyone is seated.")
+    return embed
+
+
+class LobbyView(ui.View):
+    """The forming table's three controls: Start, Sit Down, and the lock.
+
+    Deliberately not timed out, for the same reason `TableView` is not: a lobby that
+    stops answering its own buttons looks alive and is not. Its lifetime is the lobby's,
+    and `/play stop` or `teardown_channel` is what ends both.
+
+    The lock mirrors a global chat session exactly -- locked by default, host-only to
+    toggle, and the emoji is the entire indicator. Anyone may press any of these; what
+    comes back depends on whether they are the host, which is the same access model the
+    table itself uses.
+    """
+
+    def __init__(self, cog: "MimicCog", channel_id: int):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.channel_id = channel_id
+        self._sync()
+
+    def _lobby(self) -> Optional["Lobby"]:
+        return self.cog.game_service.lobby_for(self.channel_id)
+
+    def _sync(self) -> None:
+        """Repaint the lock button from the lobby's current state."""
+        lobby = self._lobby()
+        is_open = bool(lobby and lobby.open)
+        self.lock.emoji = "🔓" if is_open else "🔒"
+        self.lock.style = (discord.ButtonStyle.success if is_open
+                           else discord.ButtonStyle.danger)
+
+    async def _repaint(self, interaction: discord.Interaction, lobby: "Lobby") -> None:
+        self._sync()
+        await interaction.response.edit_message(
+            embed=build_lobby_embed(self.cog, lobby), view=self)
+
+    async def _gone(self, interaction: discord.Interaction) -> None:
+        """The lobby went away under a click -- started, stopped, or purged."""
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content="This table is no longer forming.", view=self)
+
+    @ui.button(label="Start", style=discord.ButtonStyle.primary)
+    async def start(self, interaction: discord.Interaction, _button: ui.Button):
+        lobby = self._lobby()
+        if lobby is None:
+            await self._gone(interaction)
+            return
+        if interaction.user.id != lobby.host_id:
+            await interaction.response.send_message(
+                "Only the host can start this table.", ephemeral=True)
+            return
+
+        # Deal first, then take the lobby message down: if the deal is refused the
+        # lobby is still standing and still usable, which is the whole point of
+        # reporting the refusal instead of clearing the table.
+        error = await self.cog.game_service.start_from_lobby(lobby)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+
+        self.stop()
+        try:
+            await interaction.response.defer()
+            if lobby.message is not None:
+                await lobby.message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    @ui.button(label="Sit Down", style=discord.ButtonStyle.success)
+    async def sit(self, interaction: discord.Interaction, _button: ui.Button):
+        lobby = self._lobby()
+        if lobby is None:
+            await self._gone(interaction)
+            return
+
+        user_id = interaction.user.id
+        if user_id in lobby.humans:
+            # The same button stands you up again. One control for sitting rather than
+            # two for sitting and leaving: the seat is a toggle, and the footer says so.
+            del lobby.humans[user_id]
+            await self._repaint(interaction, lobby)
+            return
+
+        if not lobby.open and user_id != lobby.host_id:
+            await interaction.response.send_message(
+                "This table is locked. The host can unlock it with 🔒 to let others sit.",
+                ephemeral=True)
+            return
+        if len(lobby.humans) >= lobby.limit:
+            await interaction.response.send_message(
+                f"Every seat is taken — this table only has {lobby.limit}.",
+                ephemeral=True)
+            return
+
+        lobby.humans[user_id] = getattr(interaction.user, "display_name", "Player")
+        await self._repaint(interaction, lobby)
+
+    @ui.button(emoji="🔒", style=discord.ButtonStyle.danger)
+    async def lock(self, interaction: discord.Interaction, _button: ui.Button):
+        lobby = self._lobby()
+        if lobby is None:
+            await self._gone(interaction)
+            return
+        if interaction.user.id != lobby.host_id:
+            await interaction.response.send_message(
+                "Only the host can lock or unlock this table.", ephemeral=True)
+            return
+        lobby.open = not lobby.open
+        await self._repaint(interaction, lobby)
 
 
 class ColourChoiceView(ui.View):

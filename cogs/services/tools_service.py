@@ -65,8 +65,15 @@ class ToolsService:
     async def _run_critic(self, history: list, char_name: str, guild_id: int,
                           p_config: Optional[Dict[str, Any]] = None,
                           session_transcript: Optional[List[str]] = None,
-                          instructions: Optional[str] = None) -> Optional[str]:
+                          instructions: Optional[str] = None
+                          ) -> Tuple[Optional[str], Optional[str]]:
         """Finds linguistic loops in recent output and returns a negative constraint.
+
+        Returns `(constraint, source)`. `source` is "lexical" when the free in-process
+        scan caught it, "model" when the critic model wrote it, and None when nothing
+        was produced -- which is what `/session audit` reports per turn. It matters
+        because a profile in "full" mode still short-circuits on the lexical scan, so
+        "full" in the config does not mean a model call was actually paid for.
 
         `p_config` is the speaking profile's config, passed in by the caller. It used to
         be hunted for here by scanning `cog.multi_profile_channels` for a session whose
@@ -80,42 +87,54 @@ class ToolsService:
         lines rather than this profile's own. Passed in for the same reason -- the log
         belongs to the caller, and reaching back into the cog for it is what broke this.
         """
-        from ..utils.helpers import _fast_repetition_scan, resolve_critic_settings
+        from ..utils.helpers import (_fast_repetition_scan, resolve_critic_settings,
+                                     strip_history_envelope)
 
         p_config = p_config or {}
         settings = resolve_critic_settings(p_config)
         if not settings["enabled"]:
-            return None
+            return None, None
 
+        # Both sources arrive as *stored* turns -- `<Name> [ID: pid] [timestamp]:` around
+        # the dialogue, and sometimes a Duration line under it. That envelope is byte
+        # for byte identical on every turn a profile speaks, so handing it to a
+        # repetition detector flags every session after three turns on the scaffolding
+        # alone: `_fast_repetition_scan` compares the first five words of each turn, and
+        # for one speaker those words are its name, its pid and the date. The strip is
+        # on this transcript only; the log and the generating model keep the envelope.
         if session_transcript is not None:
-            chronological_turns = [t for t in session_transcript if t and t.strip()]
-            chronological_turns = chronological_turns[-settings["lookback"]:]
+            candidates = session_transcript
         else:
-            recent_turns = []
+            candidates = []
             for turn in reversed(history):
                 if isinstance(turn, dict) and turn.get('role') == 'model':
                     parts = [p if isinstance(p, str) else p.get('text', '') for p in turn.get('parts', [])]
                     if parts:
-                        recent_turns.append(" ".join(parts))
-                        if len(recent_turns) >= settings["lookback"]:
+                        candidates.append(" ".join(parts))
+                        # Counted before the strip, so a turn that scrubs down to nothing
+                        # does not silently pull an older one into the window.
+                        if len(candidates) >= settings["lookback"]:
                             break
-            chronological_turns = list(reversed(recent_turns))
+            candidates.reverse()
+
+        chronological_turns = [c for c in (strip_history_envelope(t) for t in candidates) if c]
+        chronological_turns = chronological_turns[-settings["lookback"]:]
 
         if len(chronological_turns) < 2:
-            return None
+            return None, None
 
         # 1. Ultra-fast local lexical scan (0ms latency fast-path)
         is_repetitive, reason = _fast_repetition_scan(chronological_turns, settings["min_gram"])
         if is_repetitive and reason:
-            return f"DO NOT repeat phrasing or structure. {reason}."
+            return f"DO NOT repeat phrasing or structure. {reason}.", "lexical"
 
         # "lexical" stops here by design: the scan is free and in-process, so it is the
         # mode that costs a profile nothing per turn. Only "full" buys the model pass.
         if settings["mode"] != "full":
-            return None
+            return None, None
 
         if len(chronological_turns) < 3:
-            return None
+            return None, None
 
         transcript = "\n---\n".join(chronological_turns)
 
@@ -148,10 +167,10 @@ class ToolsService:
 
             if resp.text:
                 if "PASS" not in resp.text.upper():
-                    return resp.text.strip()
+                    return resp.text.strip(), "model"
         except Exception as e:
             print(f"Critic error: {e}")
-        return None
+        return None, None
 
     async def _process_urls_in_content(self, content: str, guild_id: int, profile_settings: Dict[str, Any], warning_channel: Optional[discord.abc.Messageable] = None) -> Tuple[List[str], List[Dict], List[str]]:
         warnings = []

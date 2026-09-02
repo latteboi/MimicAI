@@ -404,7 +404,8 @@ TRAIN_ARMED_CACHE_MAX_SIZE = 100
 # active_games is keyed by channel_id and must be bounded like every other such cache,
 # but evicting a *live* game would orphan its task silently. GAME_MAX_CONCURRENT sits
 # below the cache size and is enforced at /play, so eviction is unreachable in practice
-# and the LRU is only a backstop.
+# and the LRU is only a backstop. pending_lobbies shares both numbers: a forming table
+# counts against the concurrency limit, because it is a table that intends to be dealt.
 GAME_MAX_CONCURRENT = 12
 GAME_CACHE_MAX_SIZE = 16
 
@@ -653,6 +654,12 @@ CRITIC_LOOKBACK_MIN, CRITIC_LOOKBACK_MAX = 2, 12
 #: 1 reproduces the behaviour this shipped with (current round plus one more).
 DEFAULT_CRITIC_PERSISTENCE = 1
 CRITIC_PERSISTENCE_MIN, CRITIC_PERSISTENCE_MAX = 0, 10
+#: Cap on the constraint text stored in a turn's `meta["critic"]` for `/session audit`.
+#: The record rides in every turn of a 1000-turn log that is re-serialised, recompressed
+#: and re-encrypted on every structural flush, so the audit trail is capped rather than
+#: verbatim. Sits just under Discord's 1024-char embed field limit so the inspector can
+#: render one without a second truncation.
+CRITIC_AUDIT_TEXT_MAX = 900
 
 DEFAULT_ANTI_REPETITION_PROMPT = (
     "You are a linguistic pattern analyzer for the character '{char_name}'.\n"
@@ -664,6 +671,7 @@ DEFAULT_ANTI_REPETITION_PROMPT = (
     "4. **Robotic Transitions:** Target phrases like 'noted', 'acknowledged', 'remains to provide', 'evaluating inputs', or 'operate within parameters'.\n\n"
     "OUTPUT RULES:\n"
     "- If no significant repetition is found, respond with ONLY 'PASS'.\n"
+    "- The transcript is dialogue only. Any speaker label, ID, timestamp, XML tag or timing note that survives into it is session scaffolding written by the system, not by the character. Ignore it completely and never base a constraint on it.\n"
     "- Do NOT provide negative constraints for intentional formatting, such as lines of text following '-# ', '# ', '*', etc.\n"
     "- If repetition is found, provide a strict negative constraint. Examples:\n"
     "  * 'Do not acknowledge or reference the user's frustration or feedback.'\n"
@@ -1149,6 +1157,10 @@ PATTERN_REASONING_ORPHANS = re.compile(r'</?(think|thought|reasoning)>', flags=r
 PATTERN_SYSTEM_HEADER = re.compile(r'(?i)(?:^|\n)(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[ID:[^\]\r\n]+\](?:\s*\[[^\]\r\n]+\])?:\s*')
 PATTERN_TIMESTAMP_HEADER = re.compile(r'(?i)(?:^|\n)(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\]\r\n]+\]:\s*')
 PATTERN_METADATA = re.compile(r'\(?\s*(?:Thought Initiated:)?\s*[^|\n\r]*?\|?\s*Duration: \d+\.\d+s\s*\)?', flags=re.IGNORECASE)
+#: The `</Alice>` that closes a stored turn. The speaker's display name is dynamic, so
+#: this matches a closing tag alone on its line rather than a known tag -- which is what
+#: `_format_history_entry` emits and what in-character prose essentially never is.
+PATTERN_SPEAKER_CLOSE = re.compile(r'(?m)^[ \t]*</[^>\r\n]{1,64}>[ \t]*$')
 PATTERN_MESSAGE_LINK = re.compile(r'Message\s*#[\w-]+')
 PATTERN_WHITESPACE_CLEANUP = re.compile(r'\n{3,}')
 

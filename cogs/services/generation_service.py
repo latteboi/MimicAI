@@ -19,7 +19,7 @@ from ..utils.constants import (
     DEFAULT_WHISPER_RECAP, DEFAULT_DIRECTOR_USER_PROMPT,
     DEFAULT_IMAGE_GROUNDING, DEFAULT_NEGATIVE_CONSTRAINTS, DEFAULT_IMAGE_PRESENT,
     DEFAULT_IMAGE_PRESENT_OTHER, DEFAULT_IMAGE_FAILED,
-    DEFAULT_SPEECH_VOICE, TTS_SYNTHESIS_PREAMBLE,
+    DEFAULT_SPEECH_VOICE, TTS_SYNTHESIS_PREAMBLE, CRITIC_AUDIT_TEXT_MAX,
 )
 from ..utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt,
@@ -776,6 +776,17 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     response_text = ""
                     was_blocked = False
                     placeholder_message = None
+                    # Critic audit trail. Bound out here because the meta block that
+                    # records them sits after the generation try/except, and a turn that
+                    # failed before the critic ran still writes a turn object.
+                    critic_constraints = None
+                    critic_settings = None
+                    critic_source = None
+                    # Bound per participant, not per round: the teardown paths below sit
+                    # outside the generation try/except, so an early failure used to reach
+                    # them with the *previous* participant's container -- or, on the first
+                    # participant, with none at all (UnboundLocalError).
+                    state_container = None
                     
                     # Resolve Real-time settings
                     p_owner_id = participant['owner_id']
@@ -914,9 +925,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         is_generator = turn_is_image_gen and participant_key == generator_profile_key
 
                     try:
-                        api_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id)
-                        if not api_key: raise ValueError("Server API key is not configured.")
-                        
+                        # No key gate here. The provider-aware gate above already broke out
+                        # of the loop if this participant has nothing to route with. Re-checking
+                        # only the Gemini slot killed every turn on OpenRouter-only or Ollama
+                        # servers, and on a Gemini server whose key was inside the 60s 429
+                        # cooldown -- both reported as "not configured", which they are not.
                         msg_a_id = None
                         app_name, app_avatar = self._resolve_appearance_data(owner_id, profile_name)
                         
@@ -1004,7 +1017,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # Critic persistence: how many further rounds a generated
                         # constraint stays in force is the profile's to set now, where it
                         # was fixed at one.
-                        critic_constraints = None
                         critic_settings = resolve_critic_settings(p_settings)
                         if critic_settings["enabled"]:
                             # Check for cached constraints in the session
@@ -1012,6 +1024,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                             if cache and cache.get("rounds", 0) > 0:
                                 critic_constraints = cache["text"]
+                                critic_source = "cache"
                                 cache["rounds"] -= 1
                             else:
                                 # "session" scope screens this profile against every
@@ -1033,7 +1046,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 # Generate fresh constraints
                                 # _run_critic scans recent role=='model' turns; contents_for_api_call is
                                 # already the unified_log-derived history for this participant.
-                                critic_constraints = await self.cog.tools_service._run_critic(
+                                critic_constraints, critic_source = await self.cog.tools_service._run_critic(
                                     contents_for_api_call, speaker_display_name, channel.guild.id,
                                     p_config=p_settings,
                                     session_transcript=session_transcript,
@@ -1519,6 +1532,21 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         
                     if 'parsed_neuro_state' in locals() and parsed_neuro_state:
                         meta["neuro_state"] = parsed_neuro_state
+
+                    # Anti-Repetition Critic. Recorded only when the critic was actually
+                    # enabled for this profile, so an absent key reads as "off" rather
+                    # than as an empty verdict -- the same contract as neuro_state. The
+                    # text is capped because this rides in every turn of a 1000-turn log
+                    # that is re-serialised, re-compressed and re-encrypted on flush.
+                    if critic_settings and critic_settings["enabled"]:
+                        meta["critic"] = {
+                            "mode": critic_settings["mode"],
+                            "scope": critic_settings["scope"],
+                            "strictness": critic_settings["strictness"],
+                            "lookback": critic_settings["lookback"],
+                            "source": critic_source,
+                            "text": (critic_constraints or "")[:CRITIC_AUDIT_TEXT_MAX],
+                        }
 
                     turn_object = {
                         "turn_id": turn_id,

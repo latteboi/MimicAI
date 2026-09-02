@@ -205,6 +205,11 @@ class MimicCog(commands.Cog, EventListeners):
         # cache, but /play refuses past GAME_MAX_CONCURRENT (which is lower), so the LRU
         # never actually evicts a running game out from under its task.
         self.active_games: LRUCache = LRUCache(max_size=GAME_CACHE_MAX_SIZE)
+        # Tables that are forming but not dealt, keyed by channel_id. A lobby holds no
+        # task and no rules state, so an evicted one is an abandoned guest list rather
+        # than an orphan -- but it counts against GAME_MAX_CONCURRENT while it stands,
+        # so it cannot be used to queue up more games than the instance will run.
+        self.pending_lobbies: LRUCache = LRUCache(max_size=GAME_CACHE_MAX_SIZE)
         self.global_blacklist: Set[int] = set()
         self.server_manager._load_blacklist()
         self.session_last_accessed = {}
@@ -998,11 +1003,11 @@ class MimicCog(commands.Cog, EventListeners):
 
     play_group = app_commands.Group(name="play", description="Table games with this channel's cast.", guild_only=True)
 
-    @play_group.command(name="eights", description="Deal a game of Mimic Eights to the profiles in this channel's session.")
+    @play_group.command(name="eights", description="Open a table of Mimic Eights for this channel's session and cast.")
     @app_commands.checks.cooldown(3, 60.0, key=lambda i: i.channel_id)
     @app_commands.describe(
         seats="How many seats at the table (2-6). Defaults to as many as fit.",
-        join="Sit down yourself, or deal a table of profiles and watch. Defaults to sitting down.",
+        join="Take a seat yourself, or open a table of profiles and watch. Defaults to sitting down.",
         stacking="Answer a Draw Two with another Draw Two instead of picking up. Default on.",
         stack_draw_four="Also allow Draw Fours to be stacked. Default off.",
         draw_to_match="Keep drawing until you get a playable card. Default off — draw one.",
@@ -1029,24 +1034,14 @@ class MimicCog(commands.Cog, EventListeners):
             turn_seconds=turn_seconds if turn_seconds is not None else GameRuleSet().turn_seconds,
         )
 
-        error = await self.game_service.start_eights(interaction, seats_wanted=seats, join=join, rules=rules)
+        error = await self.game_service.open_lobby(interaction, seats_wanted=seats, join=join, rules=rules)
         if error:
             await interaction.followup.send(error, ephemeral=True)
             return
 
-        game = self.active_games.get(interaction.channel_id)
-        names = ", ".join(f"`{seat.display}`" for seat in game.seats) if game else ""
-        hint = (" Use the **Your hand** button on the table to play."
-                if game and any(s.kind == "human" for s in game.seats) else "")
-        house = []
-        if not stacking: house.append("no stacking")
-        if stack_draw_four: house.append("Draw Fours stack")
-        if draw_to_match: house.append("draw to match")
-        if strict_draw_four: house.append("strict Draw Four")
-        if turn_seconds: house.append(f"{turn_seconds}s turns")
-        rule_note = f" House rules: {', '.join(house)}." if house else ""
         await interaction.followup.send(
-            f"Dealt. {names} are playing — the table is posted in the channel.{rule_note}{hint}",
+            "Table posted. It is **locked** — press 🔓 on it to let other people sit "
+            "down, then **Start** when everyone is seated. Nothing is on a clock.",
             ephemeral=True)
 
     @play_group.command(name="stop", description="End the game running in this channel.")
@@ -1055,15 +1050,19 @@ class MimicCog(commands.Cog, EventListeners):
         if not self.has_lock: return
 
         game = self.active_games.get(interaction.channel_id)
-        if not game:
+        lobby = self.game_service.lobby_for(interaction.channel_id)
+        if not game and not lobby:
             await interaction.response.send_message(
                 "There is no game running in this channel.", ephemeral=True)
             return
 
-        # The person who dealt it, or anyone who could have suspended the session.
+        # The person who dealt it, or anyone who could have suspended the session. A
+        # lobby answers to its host on the same terms -- it is the same claim on the
+        # channel, just one that has not been dealt yet.
+        owner_id = game.started_by if game else lobby.host_id
         is_admin = bool(getattr(interaction.user, "guild_permissions", None)
                         and interaction.user.guild_permissions.administrator)
-        if interaction.user.id != game.started_by and not is_admin and \
+        if interaction.user.id != owner_id and not is_admin and \
                 interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
             await interaction.response.send_message(
                 "Only whoever dealt the game, or a server administrator, can end it.",
@@ -1071,8 +1070,17 @@ class MimicCog(commands.Cog, EventListeners):
             return
 
         await interaction.response.defer(ephemeral=True)
-        await self.game_service.stop_game(interaction.channel_id, reason="stopped early")
-        await interaction.followup.send("Game ended.", ephemeral=True)
+        if lobby:
+            self.game_service.cancel_lobby(interaction.channel_id)
+            if lobby.message is not None:
+                try:
+                    await lobby.message.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+        if game:
+            await self.game_service.stop_game(interaction.channel_id, reason="stopped early")
+        await interaction.followup.send(
+            "Game ended." if game else "Table cleared.", ephemeral=True)
 
     @app_commands.command(name="refresh", description="Clears the bot's short-term memory for the current context.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)

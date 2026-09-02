@@ -7,10 +7,15 @@ under `games/` knows what a channel is.
 
 Three things are worth knowing before reading further.
 
-**The roster is a snapshot.** `/play` copies the session's cast at the moment it runs,
-and from then on the roster owns who is at the table. Removing a profile from the
-session mid-game does not unseat it; adding one does not seat it. That turns every
-session mutation from a correctness problem into a casting question.
+**The roster is a snapshot.** `/play` opens a `Lobby` -- a guest list with no rules
+engine behind it -- and the cast is copied at the moment the host presses Start, not
+when the command ran. From then on the roster owns who is at the table. Removing a
+profile from the session mid-game does not unseat it; adding one does not seat it. That
+turns every session mutation from a correctness problem into a casting question.
+
+**A human seat is not special.** Seats are dealt from `Lobby.humans` in the order people
+sat down, and the run loop dispatches on `seat.kind` rather than on a single known
+player, so a table of six people and no profiles runs the same code as a table of one.
 
 **The game is not in the session.** It lives in `cog.active_games`, a bounded cache
 keyed by channel, and it dies on restart. Nothing about a live hand is persisted, so
@@ -136,6 +141,37 @@ class Seat:
 
 
 @dataclass
+class Lobby:
+    """A table that is forming but has not been dealt.
+
+    Separate from `Game` rather than a phase on it, because everything that reads
+    `cog.active_games` -- `has_live_game`, the channel listener's Last Card hook,
+    `context_block`, the finale -- would otherwise have to learn to ignore a game with
+    no `state`. A lobby has no rules engine behind it at all; it is a guest list.
+
+    `humans` is a dict for the ordering as much as the lookup: seats are dealt in the
+    order people sat down, and insertion order is what preserves that.
+    """
+
+    channel_id: int
+    guild_id: Optional[int]
+    host_id: int
+    rules: RuleSet
+    #: Total seats the host asked for, profiles included. None means "as many as fit".
+    seats_wanted: Optional[int]
+    humans: "OrderedDict[int, str]" = field(default_factory=OrderedDict)
+    #: Locked by default, mirroring a global chat session: until the host unlocks it,
+    #: nobody else can take a seat. The emoji on the button is the whole UI for this.
+    open: bool = False
+    message: Optional[discord.Message] = None
+
+    @property
+    def limit(self) -> int:
+        """Seats at this table, profiles included."""
+        return min(self.seats_wanted or self.rules.seats_max, self.rules.seats_max)
+
+
+@dataclass
 class Game:
     kind: str
     state: GameState
@@ -247,7 +283,8 @@ class GameService:
         `_get_user_appearance` memoises into `cog.user_appearances`, so this is a dict
         hit for every profile the channel has already spoken as, and one config read for
         one that has not. Same cost class as `_load_profile_state` beside it, on the same
-        `start_eights` path.
+        deal path -- and now also on every lobby repaint, via `roster_preview`, which is
+        what the memoisation is carrying.
         """
         try:
             appearance = self.cog.profile_manager._get_user_appearance(
@@ -264,6 +301,11 @@ class GameService:
         without both seats sharing a neuro state and a ledger line.
         """
         seats: List[Seat] = []
+        if limit <= 0:
+            # Reachable now that the caller subtracts a human count that a lobby lets
+            # grow to fill the table on its own. The loop below only tests its limit
+            # *after* appending, so without this a full table still seats one profile.
+            return seats
         seen = set()
         for participant in session.get("profiles", []):
             owner_id = participant.get("owner_id")
@@ -313,44 +355,119 @@ class GameService:
 
     # ------------------------------------------------------------------ lifecycle
 
-    async def start_eights(
+    def lobby_for(self, channel_id: int) -> Optional[Lobby]:
+        return self.cog.pending_lobbies.get(channel_id)
+
+    def _table_blocked(self, channel_id: Optional[int]) -> Optional[str]:
+        """Why this channel cannot open a table right now, or None."""
+        if channel_id is None:
+            return "Games need a channel."
+        if channel_id in self.cog.active_games:
+            return "A game is already running in this channel. `/play stop` ends it."
+        if self.cog.pending_lobbies.get(channel_id) is not None:
+            return ("A table is already forming in this channel. Sit down at it, or "
+                    "`/play stop` to clear it.")
+        # A lobby is a claim on one of the concurrent slots. Counting it here is what
+        # stops twelve open lobbies dealing themselves into a thirteenth game.
+        in_use = len(self.cog.active_games) + len(self.cog.pending_lobbies)
+        if in_use >= GAME_MAX_CONCURRENT:
+            return (f"This instance is already running {GAME_MAX_CONCURRENT} games. "
+                    "Try again when one finishes.")
+        return None
+
+    async def open_lobby(
         self,
         interaction: discord.Interaction,
         seats_wanted: Optional[int] = None,
         rules: Optional[RuleSet] = None,
         join: bool = True,
     ) -> Optional[str]:
-        """Set a table up and hand it to the runner. Returns an error string, or None."""
+        """Post a table that has not been dealt yet. Returns an error string, or None.
+
+        Nothing is on a clock. The lobby stands until the host starts it or somebody
+        clears it with `/play stop` -- a countdown would only ever fire on the sitting
+        that was still deciding, and `pending_lobbies` is bounded, so an abandoned one
+        costs a cache slot rather than a task.
+        """
+        from ..gui.gui_games import LobbyView, build_lobby_embed
+
         channel_id = interaction.channel_id
-        if channel_id is None:
-            return "Games need a channel."
-        if channel_id in self.cog.active_games:
-            return "A game is already running in this channel. `/play stop` ends it."
-        if len(self.cog.active_games) >= GAME_MAX_CONCURRENT:
-            return (f"This instance is already running {GAME_MAX_CONCURRENT} games. "
-                    "Try again when one finishes.")
+        blocked = self._table_blocked(channel_id)
+        if blocked:
+            return blocked
 
         session = self.cog.multi_profile_channels.get(channel_id)
         if not session or session.get("type") != "multi":
             return ("There is no active session in this channel. Use `/session config` "
                     "to build a cast first — the table is drawn from it.")
 
-        ruleset: RuleSet = rules if rules is not None else RuleSet()
-        limit = min(seats_wanted or ruleset.seats_max, ruleset.seats_max)
-
-        seats: List[Seat] = []
+        lobby = Lobby(
+            channel_id=channel_id,
+            guild_id=interaction.guild_id,
+            host_id=interaction.user.id,
+            rules=rules if rules is not None else RuleSet(),
+            seats_wanted=seats_wanted,
+        )
         if join:
-            seats.append(Seat(
-                seat_id=f"user:{interaction.user.id}",
-                display=getattr(interaction.user, "display_name", "Player"),
-                kind="human",
-            ))
-        seats.extend(self._build_roster(session, limit - len(seats)))
-        if len(seats) < 2:
-            return ("Mimic Eights needs at least two players, and this session's cast has "
-                    f"{len(seats) - (1 if join else 0)} profile(s). Add more with "
-                    "`/session config`.")
+            lobby.humans[interaction.user.id] = getattr(
+                interaction.user, "display_name", "Player")
 
+        # Registered before the send, so a second `/play eights` racing this one is
+        # refused by `_table_blocked` rather than posting a second lobby.
+        self.cog.pending_lobbies[channel_id] = lobby
+        try:
+            lobby.message = await interaction.channel.send(
+                embed=build_lobby_embed(self.cog, lobby),
+                view=LobbyView(self.cog, channel_id))
+        except discord.HTTPException:
+            self.cog.pending_lobbies.pop(channel_id, None)
+            return "I could not post the table in this channel."
+        return None
+
+    def roster_preview(self, lobby: Lobby) -> List[Seat]:
+        """The profiles that would fill the seats the humans have not taken.
+
+        Recomputed on every render rather than snapshotted, so the lobby embed shows
+        who gets bumped as people sit down instead of promising a cast it will not deal.
+        """
+        session = self.cog.multi_profile_channels.get(lobby.channel_id)
+        if not session or session.get("type") != "multi":
+            return []
+        return self._build_roster(session, lobby.limit - len(lobby.humans))
+
+    def cancel_lobby(self, channel_id: int) -> Optional[Lobby]:
+        """Drop a forming table. Returns it if there was one, for the caller to tidy."""
+        return self.cog.pending_lobbies.pop(channel_id, None)
+
+    async def start_from_lobby(self, lobby: Lobby) -> Optional[str]:
+        """Deal the table a lobby describes. Returns an error string, or None.
+
+        The seat list is built here rather than carried on the lobby because the profile
+        fill depends on how many humans ended up sitting, and that is not settled until
+        the host presses Start.
+        """
+        session = self.cog.multi_profile_channels.get(lobby.channel_id)
+        if not session or session.get("type") != "multi":
+            return ("The session in this channel has gone. Use `/session config` to "
+                    "build a cast, then deal again.")
+
+        seats: List[Seat] = [
+            Seat(seat_id=f"user:{user_id}", display=display, kind="human")
+            for user_id, display in lobby.humans.items()
+        ][:lobby.limit]
+        seats.extend(self._build_roster(session, lobby.limit - len(seats)))
+
+        if len(seats) < 2:
+            return ("Mimic Eights needs at least two players. Sit down, unlock the table "
+                    "so others can, or add profiles with `/session config`.")
+
+        self.cog.pending_lobbies.pop(lobby.channel_id, None)
+        return self._deal(lobby.channel_id, lobby.guild_id, lobby.host_id,
+                          seats, lobby.rules)
+
+    def _deal(self, channel_id: int, guild_id: Optional[int], host_id: int,
+              seats: List[Seat], ruleset: RuleSet) -> Optional[str]:
+        """Turn a settled seat list into a running game."""
         states, temperaments = {}, {}
         for seat in seats:
             if seat.kind == "human":
@@ -374,7 +491,7 @@ class GameService:
             kind="eights", state=state, seats=seats, neuro=states,
             ledger=ledger_mod.Ledger([s.seat_id for s in seats]),
             temperaments=temperaments, channel_id=channel_id,
-            guild_id=interaction.guild_id, started_by=interaction.user.id,
+            guild_id=guild_id, started_by=host_id,
             rng=random.Random(seed ^ 0x5EED),
         )
         self.cog.active_games[channel_id] = game
@@ -613,8 +730,12 @@ class GameService:
         # epilogue is standing context, and standing context is exactly what /purge is
         # for removing.
         self._epilogues.pop(channel_id, None)
+        # A lobby is dealt from the session's cast, so a session that has just been
+        # suspended or purged has nothing left to deal. Dropped here rather than left
+        # for its own Start to discover, which would refuse with a stale error.
+        cleared_lobby = self.cog.pending_lobbies.pop(channel_id, None) is not None
         if not game:
-            return False
+            return cleared_lobby
         game.stopping = True
         if game.task and not game.task.done():
             game.task.cancel()

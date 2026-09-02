@@ -14,6 +14,7 @@ from .constants import (
     PATTERN_SYSTEM_XML_BLOCKS, PATTERN_SYSTEM_XML_ORPHANS,
     PATTERN_REASONING_BLOCKS, PATTERN_REASONING_ORPHANS, PATTERN_SYSTEM_HEADER,
     PATTERN_TIMESTAMP_HEADER, PATTERN_METADATA, PATTERN_MESSAGE_LINK,
+    PATTERN_SPEAKER_CLOSE,
     PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK,
     IMAGE_MODEL_CAPS, IMAGE_MODEL_CAPS_DEFAULT, IMAGE_THINKING_LEVELS,
     CRITIC_MODES, CRITIC_SCOPES, CRITIC_STRICTNESS_LEVELS, CRITIC_STRICTNESS_MIN_GRAM,
@@ -238,6 +239,33 @@ def _compile_name_scrub_patterns(escaped_names: Tuple[str, ...]) -> Tuple[re.Pat
     pattern_name_prefix = re.compile(rf'(?:^|\n)(?:<\s*(?:{names_pattern_part})\s*>|{names_pattern_part})\s*:\s*', flags=re.IGNORECASE)
     pattern_name_xml = re.compile(rf'</?\s*(?:{names_pattern_part})\s*>', flags=re.IGNORECASE)
     return pattern_name_prefix, pattern_name_xml
+
+
+def strip_history_envelope(text: str) -> str:
+    """A stored turn reduced to what the character actually wrote.
+
+    `_format_history_entry` wraps every turn in `<Name> [ID: pid] [timestamp]:` ...
+    `</Name>`, and some paths add a `(Thought Initiated: ... | Duration: 1.23s)` line.
+    That envelope is load-bearing for the model -- it is how a participant knows who
+    said what and when -- so it stays in `unified_log` and in the history handed to the
+    generating model. It must not reach anything that measures the *character's* prose,
+    because it is identical on every turn by construction.
+
+    Built from the patterns `_scrub_response_text` already uses, and deliberately not
+    from that function: this runs over a whole lookback window at once and must not take
+    `Timeout`'s `signal.alarm` with it.
+
+    XML markers are dropped without their contents. A `<private_response>` body is the
+    character writing; the tag around it is not.
+    """
+    if not text:
+        return ""
+    cleaned = PATTERN_SYSTEM_XML_ORPHANS.sub('', text)
+    cleaned = PATTERN_SYSTEM_HEADER.sub('', cleaned)
+    cleaned = PATTERN_TIMESTAMP_HEADER.sub('', cleaned)
+    cleaned = PATTERN_SPEAKER_CLOSE.sub('', cleaned)
+    cleaned = PATTERN_METADATA.sub('', cleaned)
+    return PATTERN_WHITESPACE_CLEANUP.sub('\n\n', cleaned).strip()
 
 
 def _scrub_response_text(text: str, participant_names: Optional[List[str]] = None) -> str:
