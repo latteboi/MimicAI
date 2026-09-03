@@ -45,9 +45,9 @@ class RegenerationMixin:
                     }
                 })
                 return
-            wh = await self.cog.server_manager._get_or_create_webhook(channel)
-            if wh:
-                await wh.edit_message(message_id, content=content, attachments=attachments or [])
+            await self.cog.server_manager.run_webhook(
+                channel, "edit_message", message_id, content=content,
+                attachments=attachments or [])
         except Exception:
             pass
 
@@ -109,12 +109,11 @@ class RegenerationMixin:
                 }
             })
         else:
-            wh = await self.cog.server_manager._get_or_create_webhook(channel)
-            if wh:
-                try:
-                    await wh.edit_message(payload.message_id, content=custom_emoji,
-                                          attachments=original_attachments)
-                except Exception: pass
+            try:
+                await self.cog.server_manager.run_webhook(
+                    channel, "edit_message", payload.message_id, content=custom_emoji,
+                    attachments=original_attachments)
+            except Exception: pass
 
         session_type = session.get("type", "multi")
         dummy_key = (channel.id, None, None)
@@ -567,13 +566,13 @@ class RegenerationMixin:
                     }
                 })
             else:
-                wh = await self.cog.server_manager._get_or_create_webhook(channel)
-                if wh:
-                    try:
-                        msg = await channel.fetch_message(payload.message_id)
-                        kept_atts = [a for a in msg.attachments if a.content_type and a.content_type.startswith("image/")]
-                        await wh.edit_message(payload.message_id, content=safe_text, attachments=kept_atts)
-                    except Exception: pass
+                try:
+                    msg = await channel.fetch_message(payload.message_id)
+                    kept_atts = [a for a in msg.attachments if a.content_type and a.content_type.startswith("image/")]
+                    await self.cog.server_manager.run_webhook(
+                        channel, "edit_message", payload.message_id,
+                        content=safe_text, attachments=kept_atts)
+                except Exception: pass
 
             delivered = True
 

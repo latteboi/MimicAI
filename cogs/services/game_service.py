@@ -1130,7 +1130,7 @@ class GameService:
         """Make sure something is going to take what we just queued.
 
         The channel worker is spawned lazily, by whatever first gives the session work
-        -- a message, a reaction, `/session trigger`, the Director. A table is a fifth
+        -- a message, a reaction, `/trigger`, the Director. A table is a fifth
         such source, and it used to be the one that did not spawn it: a session built
         with `/session config` and then handed straight to `/play eights` has a
         `task_queue` and no `worker_task`, so every beat the game queued sat in the

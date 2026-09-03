@@ -10,7 +10,7 @@ from ...utils.constants import (
     DEFAULT_TRAINING_DATA_INJECTION, DEFAULT_TIME_CONTEXT, DEFAULT_NEGATIVE_CONSTRAINTS,
     DEFAULT_CONTENT_POLICY,
 )
-from ...utils.helpers import Timeout
+from ...utils.helpers import Timeout, default_profile_avatar_url
 
 
 class PromptBuilderMixin:
@@ -19,9 +19,15 @@ class PromptBuilderMixin:
     """
 
     def _resolve_appearance_data(self, owner_id: int, profile_name: str) -> Tuple[str, str]:
+        """The name and avatar a profile speaks under, set or not.
+
+        The fallback is one of Discord's default avatars rather than the bot's own: in a
+        channel of unconfigured characters, the bot's face made every one of them look
+        like the bot. `default_profile_avatar_url` is stable across restarts.
+        """
         app = self.cog.profile_manager._get_user_appearance(owner_id, profile_name)
         display_name = app.get("custom_display_name") or profile_name
-        avatar_url = app.get("custom_avatar_url") or (self.cog.bot.user.display_avatar.url if self.cog.bot.user else "")
+        avatar_url = app.get("custom_avatar_url") or default_profile_avatar_url(profile_name)
         return display_name, avatar_url
 
     @staticmethod

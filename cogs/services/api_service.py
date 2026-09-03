@@ -1310,6 +1310,16 @@ class GoogleRESTModel:
         # chosen -- an absent key means "let the model use its own default", which is
         # not the same as sending MINIMAL.
         if self.image_params:
+            # Sampling for the image slot, from the profile's own image_* keys rather
+            # than the text profile's. Every image path calls generate_content_async
+            # with generation_config=None, so `temp`/`top_p`/`top_k` above are None on
+            # all of them -- but an explicit caller-supplied value still wins, which is
+            # what the `not in cfg` guard preserves.
+            for stored, wire in (("temperature", "temperature"),
+                                 ("top_p", "topP"), ("top_k", "topK")):
+                if wire not in cfg and self.image_params.get(stored) is not None:
+                    cfg[wire] = self.image_params[stored]
+
             # Pinned so an image model cannot answer with text alone. Which combination
             # is legal is per model -- see IMAGE_MODEL_CAPS -- and an unknown model gets
             # none of this rather than a guess.
@@ -1710,7 +1720,7 @@ class APIService:
 
         if is_openrouter:
             api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id, "openrouter") if guild_id else self.cog.storage_manager._get_api_key_for_user(user_id, "openrouter")
-            if not api_key: raise ValueError(openrouter_key_error or "OpenRouter API Key not found. Use `/settings` to add one.")
+            if not api_key: raise ValueError(openrouter_key_error or "OpenRouter API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
             model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params)
             return _with_key_cooldown_tracking(self.cog, model, api_key)
         elif is_ollama:
@@ -1718,7 +1728,7 @@ class APIService:
             return OllamaModel(actual_name, api_url=ollama_host, system_instruction=system_instruction, thinking_params=t_params)
         else:
             api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id) if guild_id else self.cog.storage_manager._get_api_key_for_user(user_id)
-            if not api_key: raise ValueError(google_key_error or "Google API Key not found. Use `/settings` to add one.")
+            if not api_key: raise ValueError(google_key_error or "Google API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
             model = GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instruction, safety_settings=safety_settings, thinking_params=t_params, tools=tools)
             return _with_key_cooldown_tracking(self.cog, model, api_key)
 

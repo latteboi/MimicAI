@@ -151,6 +151,7 @@ class SettingsBaseView(TimeoutCleanupMixin, ui.View):
         build_tab_nav_bar(self, self.current_tab, [
             ("Home", "home", self.nav_home),
             ("API Keys", "api", self.nav_api),
+            ("Defaults", "defaults", self.nav_defaults),
             ("Child Bots", "bots", self.nav_bots),
         ])
 
@@ -162,6 +163,15 @@ class SettingsBaseView(TimeoutCleanupMixin, ui.View):
     async def nav_api(self, i: discord.Interaction):
         await i.response.defer()
         view = SettingsAPIView(self.cog, self.original_interaction)
+        await view.update_display()
+
+    async def nav_defaults(self, i: discord.Interaction):
+        # Imported here, not at module scope: gui_defaults adopts ModelPickerMixin from
+        # gui_profiles, and gui_profiles imports OllamaHostModal from this module. A
+        # top-level import would close that cycle.
+        from .gui_defaults import SettingsDefaultsView
+        await i.response.defer()
+        view = SettingsDefaultsView(self.cog, self.original_interaction)
         await view.update_display()
 
     async def nav_bots(self, i: discord.Interaction):
@@ -264,7 +274,12 @@ class SettingsAPIView(SettingsBaseView):
             
             self.selected_scopes = set(current_assignments)
             
-            scope_options = [discord.SelectOption(label="Personal", value="personal", default=("personal" in self.selected_scopes))]
+            # "Personal" is not "in a DM": it is the key your own Global Chat and your
+            # profiles' background work run on, wherever you happen to run them.
+            scope_options = [discord.SelectOption(
+                label="Personal", value="personal",
+                description="Your Global Chat (anywhere) and your profiles' background work"[:100],
+                default=("personal" in self.selected_scopes))]
             for g in self.admin_guilds[:24]:
                 scope_options.append(discord.SelectOption(label=f"Server: {g.name}"[:100], value=str(g.id), default=(str(g.id) in self.selected_scopes)))
                 

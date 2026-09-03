@@ -14,10 +14,10 @@ from ..utils.constants import (
     defaultConfig, IMAGE_QUEUE_PRIORITY,
     DEFAULT_IMAGE_PRESENT, DEFAULT_IMAGE_FAILED, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING,
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
-    IMAGE_OUTPUT_KEYS,
+    IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS,
 )
 from .api_service import GoogleGenAIModel, generate_google_tts_audio
-from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, resolve_image_output_params
+from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, resolve_image_output_params, resolve_image_tools, resolve_typing_cursor
 from ..utils.memory_tuning import maybe_trim_malloc
 
 
@@ -54,6 +54,7 @@ class MediaService:
         return GoogleGenAIModel(api_key=api_key, model_name=name,
                                 system_instruction=system_instruction,
                                 safety_settings=safety_settings,
+                                tools=resolve_image_tools(image_config, raw_name),
                                 image_params=MediaService.resolve_image_output_params(
                                     image_config, raw_name))
 
@@ -395,6 +396,8 @@ class MediaService:
 
                         final_response_text = response_text
                         is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
+                        typing_cursor_mode, typing_cursor_emoji = resolve_typing_cursor(
+                            profile_settings, PLACEHOLDER_EMOJI)
 
                     except Exception as e:
                         final_response_text = f"An unexpected error occurred in the finalization stage: {e}"; print(f"Error in finisher stage: {e}"); traceback.print_exc()
@@ -434,6 +437,8 @@ class MediaService:
                             "typing_cps": profile_settings.get("typing_cps", 30.0),
                             "typing_max_delay": profile_settings.get("typing_max_delay", 2.5),
                             "typing_mode": profile_settings.get("typing_mode", "sentence"),
+                            "typing_cursor": typing_cursor_mode,
+                            "typing_cursor_emoji": typing_cursor_emoji,
                             "reply_to_id": reply_id, "ping": should_ping
                         }
                         if image_file_to_send:
@@ -822,7 +827,8 @@ class MediaService:
                 # Carried rather than re-read off the profile in the worker: the request
                 # may sit in the queue behind others while its owner edits the profile,
                 # and the image should come back the shape it was asked for.
-                "image_output": {k: profile_data.get(k) for k in IMAGE_OUTPUT_KEYS},
+                "image_output": {k: profile_data.get(k)
+                                 for k in IMAGE_OUTPUT_KEYS + IMAGE_SAMPLING_KEYS},
             }
             
             await self.cog.image_request_queue.put((IMAGE_QUEUE_PRIORITY, time.time(), request_data))

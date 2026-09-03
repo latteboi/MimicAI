@@ -25,6 +25,7 @@ from ..utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt,
     _format_history_entry, _get_user_hash, _resolve_safety_settings, _scrub_response_text,
     _split_into_sentences_with_abbreviations, is_real_model, resolve_critic_settings,
+    resolve_typing_cursor,
 )
 from ..utils import mem_probe
 from ..managers.session_manager import intern_turn
@@ -1655,6 +1656,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         file_to_send = audio_file_for_send
 
                     is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
+                    typing_cursor_mode, typing_cursor_emoji = resolve_typing_cursor(
+                        profile_settings, PLACEHOLDER_EMOJI)
 
                     # Realistic typing streams its own first chunk instead of editing the
                     # placeholder, so the placeholder has to come down before the send --
@@ -1701,6 +1704,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             "typing_cps": profile_settings.get("typing_cps", 30.0),
                             "typing_max_delay": profile_settings.get("typing_max_delay", 2.5),
                             "typing_mode": profile_settings.get("typing_mode", "sentence"),
+                            "typing_cursor": typing_cursor_mode,
+                            "typing_cursor_emoji": typing_cursor_emoji,
                             "reply_to_id": reply_id, "ping": should_ping
                         }
 

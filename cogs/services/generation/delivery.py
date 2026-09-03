@@ -6,7 +6,9 @@ import traceback
 from typing import Optional, List
 
 from ...utils.constants import PLACEHOLDER_EMOJI
-from ...utils.helpers import _split_into_sentences_with_abbreviations, _yield_message_chunks
+from ...utils.helpers import (_split_into_sentences_with_abbreviations, _yield_message_chunks,
+                              apply_typing_cursor, default_profile_avatar_url,
+                              resolve_typing_cursor, typing_cursor_cost)
 
 
 class DeliveryMixin:
@@ -48,6 +50,7 @@ class DeliveryMixin:
         is_realistic_typing = False
         typing_cps = 30.0
         typing_max_delay = 2.5
+        cursor_mode, cursor_emoji = "off", ""
         custom_display_name_to_use = None
         custom_avatar_url_to_use = None
 
@@ -63,6 +66,7 @@ class DeliveryMixin:
             is_realistic_typing = profile_data_to_use.get("realistic_typing_enabled", False)
             typing_cps = profile_data_to_use.get("typing_cps", 30.0)
             typing_max_delay = profile_data_to_use.get("typing_max_delay", 2.5)
+            cursor_mode, cursor_emoji = resolve_typing_cursor(profile_data_to_use, PLACEHOLDER_EMOJI)
 
             effective_owner_id, effective_profile_name = self.cog.profile_manager._resolve_effective_profile(profile_owner_id_for_appearance, profile_name_for_appearance)
 
@@ -80,17 +84,15 @@ class DeliveryMixin:
                 use_webhook = True
                 custom_display_name_to_use = appearance_data.get("custom_display_name") or custom_display_name_to_use
 
-                if appearance_data.get("custom_avatar_url"):
-                    custom_avatar_url_to_use = appearance_data["custom_avatar_url"]
-                else:
-                    avatar_index = hash(effective_profile_name) % 6
-                    custom_avatar_url_to_use = f"https://cdn.discordapp.com/embed/avatars/{avatar_index}.png"
+                custom_avatar_url_to_use = (appearance_data.get("custom_avatar_url")
+                                            or default_profile_avatar_url(effective_profile_name))
 
             elif profile_name_for_appearance:
+                # No appearance at all still speaks as itself: its own name, and one of
+                # Discord's default avatars rather than the bot's face.
                 use_webhook = True
                 custom_display_name_to_use = profile_name_for_appearance
-                avatar_index = hash(profile_name_for_appearance) % 6
-                custom_avatar_url_to_use = f"https://cdn.discordapp.com/embed/avatars/{avatar_index}.png"
+                custom_avatar_url_to_use = default_profile_avatar_url(profile_name_for_appearance)
 
         # [FIX] Never execute realistic typing on placeholder dispatches or when bypassed
         if is_placeholder or bypass_typing:
@@ -98,10 +100,10 @@ class DeliveryMixin:
 
         if target_message_to_edit and use_webhook and content != f"{PLACEHOLDER_EMOJI}":
             try:
-                webhook_for_delete = await self.cog.server_manager._get_or_create_webhook(channel) if isinstance(channel, (discord.TextChannel, discord.Thread)) else None
-                if webhook_for_delete:
+                if isinstance(channel, (discord.TextChannel, discord.Thread)):
                     try:
-                        await webhook_for_delete.delete_message(target_message_to_edit.id)
+                        await self.cog.server_manager.run_webhook(
+                            channel, "delete_message", target_message_to_edit.id)
                     except discord.NotFound:
                         pass
                     except discord.HTTPException:
@@ -135,6 +137,14 @@ class DeliveryMixin:
 
                 chunks = _split_into_sentences_with_abbreviations(content)
 
+                # The marker rides every chunk except the last, and the last edit is
+                # what removes it. Indexed rather than compared against len(chunks)-1
+                # because the loop skips whitespace-only chunks, and a trailing one
+                # would otherwise leave the emoji on a finished message forever.
+                last_chunk_index = max(
+                    (n for n, c in enumerate(chunks) if c.strip()), default=-1)
+                cursor_room = typing_cursor_cost(cursor_mode, cursor_emoji)
+
                 displayed_text = ""
                 last_edit_time = 0
                 sent_message = None
@@ -157,15 +167,27 @@ class DeliveryMixin:
 
                     separator = "\n" if typing_mode == "line" and displayed_text else (" " if displayed_text else "")
 
-                    if len(displayed_text) + len(separator) + len(chunk) > 2000:
+                    if len(displayed_text) + len(separator) + len(chunk) > 2000 - cursor_room:
+                        # This chunk starts a second message, so the one being left
+                        # behind is finished -- strip its marker now or it keeps a
+                        # "still typing" emoji nothing will ever come back to remove.
+                        if sent_message is not None and cursor_room and displayed_text:
+                            try:
+                                await webhook_to_use.edit_message(sent_message.id,
+                                                                  content=displayed_text)
+                            except Exception:
+                                pass
                         displayed_text = chunk
                         sent_message = None
                     else:
                         displayed_text += separator + chunk
 
+                    wire_text = displayed_text if i == last_chunk_index else apply_typing_cursor(
+                        displayed_text, cursor_mode, cursor_emoji)
+
                     if not sent_message:
                         send_kwargs = {
-                            "content": displayed_text,
+                            "content": wire_text,
                             "username": custom_display_name_to_use,
                             "avatar_url": custom_avatar_url_to_use,
                             "embeds": embeds if (i == 0 and embeds) else [],
@@ -193,7 +215,7 @@ class DeliveryMixin:
                             await asyncio.sleep(1.5 - (now - last_edit_time))
 
                         try:
-                            await webhook_to_use.edit_message(sent_message.id, content=displayed_text)
+                            await webhook_to_use.edit_message(sent_message.id, content=wire_text)
                         except RuntimeError as e:
                             if "Session is closed" in str(e): return sent_messages_list
                             print(f"Typing edit failed: {e}")
@@ -272,11 +294,7 @@ class DeliveryMixin:
 
             sent_message_part: Optional[discord.Message] = None
 
-            webhook_to_use = None
             if use_webhook and isinstance(channel, (discord.TextChannel, discord.Thread)):
-                webhook_to_use = await self.cog.server_manager._get_or_create_webhook(channel)
-
-            if webhook_to_use:
                 try:
                     send_kwargs = {
                         "content": final_content_for_send,
@@ -288,7 +306,10 @@ class DeliveryMixin:
                     if current_file_for_api: send_kwargs["file"] = current_file_for_api
                     if isinstance(channel, discord.Thread): send_kwargs["thread"] = channel
 
-                    sent_message_part = await webhook_to_use.send(**send_kwargs)
+                    # run_webhook, not a bare send: a webhook deleted in the server used to
+                    # send every profile here permanently, under the bot's own name.
+                    sent_message_part = await self.cog.server_manager.run_webhook(
+                        channel, "send", **send_kwargs)
                 except RuntimeError as e:
                     if "Session is closed" in str(e): return sent_messages_list
                     print(f"Webhook send failed, falling back to regular message. Error: {e}")

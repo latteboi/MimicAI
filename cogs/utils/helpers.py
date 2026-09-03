@@ -1,4 +1,5 @@
 import re
+import zlib
 import asyncio
 import platform
 import discord
@@ -17,12 +18,31 @@ from .constants import (
     PATTERN_SPEAKER_CLOSE,
     PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK,
     IMAGE_MODEL_CAPS, IMAGE_MODEL_CAPS_DEFAULT, IMAGE_THINKING_LEVELS,
+    IMAGE_GROUNDING_MODES, DEFAULT_TYPING_CURSOR,
     CRITIC_MODES, CRITIC_SCOPES, CRITIC_STRICTNESS_LEVELS, CRITIC_STRICTNESS_MIN_GRAM,
     DEFAULT_CRITIC_MODE, DEFAULT_CRITIC_SCOPE, DEFAULT_CRITIC_STRICTNESS,
     DEFAULT_CRITIC_LOOKBACK, DEFAULT_CRITIC_PERSISTENCE,
     CRITIC_LOOKBACK_MIN, CRITIC_LOOKBACK_MAX,
     CRITIC_PERSISTENCE_MIN, CRITIC_PERSISTENCE_MAX,
 )
+
+
+#: Discord serves six default avatars at this path. A profile with no avatar of its
+#: own gets one of them rather than the bot's face, so an unconfigured character still
+#: reads as its own speaker in a channel full of them.
+DEFAULT_AVATAR_COUNT = 6
+
+
+def default_profile_avatar_url(name: str) -> str:
+    """A stable default avatar for a profile that has none of its own.
+
+    `crc32`, not `hash()`: str hashing is salted per interpreter, so the previous
+    `hash(name) % 6` handed the same character a different face after every restart
+    -- and every child bot and webhook in a channel restarted together, so a whole
+    cast reshuffled at once.
+    """
+    index = zlib.crc32(str(name).encode("utf-8")) % DEFAULT_AVATAR_COUNT
+    return f"https://cdn.discordapp.com/embed/avatars/{index}.png"
 
 
 def _channel_is_age_restricted(channel: Any) -> bool:
@@ -608,7 +628,89 @@ def resolve_image_output_params(image_config, raw_name: Optional[str]) -> dict:
     if caps["thinking"] and level in IMAGE_THINKING_LEVELS:
         out["thinking_level"] = level
 
+    # Sampling. Carried through the same per-model filter as everything else even
+    # though no image model rejects these outright, so that one call -- and one
+    # stored profile -- decides the whole request. Absent stays absent: an image
+    # model with no temperature on the wire uses its own, which for the Gemini 3
+    # family is the value Google asks you not to move.
+    for stored, wire in (("image_temperature", "temperature"),
+                         ("image_top_p", "top_p"),
+                         ("image_top_k", "top_k")):
+        value = cfg.get(stored)
+        if value is None or value == "":
+            continue
+        try:
+            out[wire] = int(value) if wire == "top_k" else float(value)
+        except (TypeError, ValueError):
+            continue
+
     return out
+
+
+def resolve_typing_cursor(config: Optional[Dict[str, Any]], fallback_emoji: str) -> Tuple[str, str]:
+    """`(mode, emoji)` for the still-typing marker on one profile's replies.
+
+    Absent reads as the default rather than as "off" -- see TYPING_CURSOR_MODES -- so
+    profiles saved before the setting existed get the effect. The emoji is the same
+    `placeholder_emoji` the profile already shows while a reply is generating; the
+    caller passes the global PLACEHOLDER_EMOJI as the fallback so this module does not
+    have to reach for defaultConfig.
+
+    Shared by the webhook path (DeliveryMixin) and the child-bot path
+    (ChildBotManager), which run the same edit loop over two different message APIs.
+    """
+    cfg = config or {}
+    mode = str(cfg.get("typing_cursor") or DEFAULT_TYPING_CURSOR).lower()
+    if mode not in ("prefix", "below"):
+        mode = "off"
+    return mode, (cfg.get("placeholder_emoji") or fallback_emoji or "")
+
+
+def apply_typing_cursor(text: str, mode: str, emoji: str) -> str:
+    """`text` with the still-typing marker attached, or unchanged when it is off.
+
+    Never called for the final chunk: the last edit writes the bare text, which is
+    what removes the marker.
+    """
+    if not emoji or not text or mode not in ("prefix", "below"):
+        return text
+    return f"{emoji} {text}" if mode == "prefix" else f"{text}\n{emoji}"
+
+
+def typing_cursor_cost(mode: str, emoji: str) -> int:
+    """How much room the marker needs, so the 2000-character chunker leaves it some.
+
+    Without this a chunk sized exactly to the limit would produce a decorated body
+    Discord rejects, and the edit that carries the marker would be the one that fails.
+    """
+    if not emoji or mode not in ("prefix", "below"):
+        return 0
+    return len(emoji) + 1
+
+
+def resolve_image_tools(image_config, raw_name: Optional[str]) -> Optional[list]:
+    """The native search tool `raw_name` will actually take on an image request.
+
+    Separate from resolve_image_output_params because a tool is not a generationConfig
+    field -- it rides in `tools` at the top of the payload -- but it is resolved the
+    same way and for the same reason: a mode the chosen model does not carry is
+    dropped rather than sent and 400'd, and a fallback onto a different image model
+    needs its own answer.
+
+    Returns the snake_case declaration shape the adapters already take
+    (`_build_tools` camelCases the outer key), or None for no tool at all.
+    """
+    caps = image_model_caps(raw_name)
+    mode = ((image_config or {}).get("image_grounding_mode") or "off")
+    if mode not in IMAGE_GROUNDING_MODES or mode == "off":
+        return None
+    if not caps["grounding"]:
+        return None
+    if mode == "web_images" and caps["image_search"]:
+        # Nested inside the one google_search tool, not a second tool beside it.
+        # `searchTypes` stays camelCase here: _build_tools only maps the outer key.
+        return [{"google_search": {"searchTypes": {"webSearch": {}, "imageSearch": {}}}}]
+    return [{"google_search": {}}]
 
 
 def is_real_model(name: Optional[str]) -> bool:

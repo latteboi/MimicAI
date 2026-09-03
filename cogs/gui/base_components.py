@@ -204,15 +204,24 @@ class ActionTextInputModal(ui.Modal):
         await self.on_submit_callback(interaction, self.input.value)
 
 class DropdownContentView(ui.View):
-    def __init__(self, content_dict: dict, title: str, link_button_label: Optional[str] = None, link_button_url: Optional[str] = None):
+    def __init__(self, content_dict: dict, title: str, link_button_label: Optional[str] = None,
+                 link_button_url: Optional[str] = None, start_category: Optional[str] = None,
+                 start_page: Optional[str] = None):
         super().__init__(timeout=600)
         self.content_dict = content_dict
         self.view_title = title
         self.link_button_label = link_button_label
         self.link_button_url = link_button_url
-        
-        self.selected_category = list(self.content_dict.keys())[0]
-        self.selected_page = list(self.content_dict[self.selected_category].keys())[0]
+
+        # `start_category` / `start_page` open the browser on one page rather than at
+        # the beginning, which is what lets a "Read more" button elsewhere hand the
+        # reader the paragraph it was talking about instead of the table of contents.
+        # Validated rather than trusted: a caller naming a page that has since been
+        # renamed opens the guide at the top, which is a worse answer but not a crash.
+        self.selected_category = (start_category if start_category in self.content_dict
+                                  else list(self.content_dict.keys())[0])
+        pages = self.content_dict[self.selected_category]
+        self.selected_page = start_page if start_page in pages else list(pages.keys())[0]
         self._build_view()
 
     def _build_view(self):

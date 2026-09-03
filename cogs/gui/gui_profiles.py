@@ -592,11 +592,15 @@ def _render_typing(ctx):
     config = ctx["config"]
     if not config.get("realistic_typing_enabled", False):
         return "Realistic Typing", _OFF, True
+    cursor = str(config.get("typing_cursor") or DEFAULT_TYPING_CURSOR).lower()
+    if cursor not in TYPING_CURSOR_MODES:
+        cursor = DEFAULT_TYPING_CURSOR
     return "Realistic Typing", (
         f"{_ON}\n"
         f"Mode: `{config.get('typing_mode', 'sentence')}`\n"
         f"Rate: `{config.get('typing_cps', 30.0)}` cps\n"
-        f"Max Delay: `{config.get('typing_max_delay', 2.5)}`s"
+        f"Max Delay: `{config.get('typing_max_delay', 2.5)}`s\n"
+        f"Cursor: `{cursor}`"
     ), True
 
 
@@ -677,12 +681,24 @@ PROFILE_ACTIONS = (
     # so both stay owner-only rather than being silently wrong under /mod.
     _Action("share", "home", "Share Profile", "Share this profile with others or publish it.",
             _method("_handle_share"), _own_not_mod),
+    # These two were `_own` on the row and scope="all" in bulk, so a borrower could
+    # set their placeholder emoji on forty profiles at once and on none individually
+    # -- the same drift, running backwards, that co-declaring bulk beside single was
+    # introduced to stop. Both write local config (a borrow owns its config outright;
+    # only `prompts` resolve to the source), and both handlers already carried
+    # is_borrowed through to _get_profile_config and _write_profile_config. The gate
+    # was the only thing refusing, and it was refusing writes that work.
+    #
+    # Neither is identity. Appearance -- the webhook name and avatar everyone in the
+    # channel sees -- stays `_own` and stays inside the hidden persona tab: presenting
+    # someone else's character under a different face is a different act from picking
+    # the emoji that sits on your own screen while it types.
     _Action("error_response", "home", "Custom Error Message", "Set the message shown when generation fails.",
-            _method("_act_error_response", wants_profile=True), _own,
+            _method("_act_error_response", wants_profile=True),
             bulk=_Bulk(_bulk_method("_bulk_error_response"), scope="all",
                        keys=("error_response",))),
     _Action("generation_visual", "home", "Generation Visual", "Set custom placeholder emoji and child bot behavior.",
-            _open_screen("generation_visual"), _own,
+            _open_screen("generation_visual"),
             render=_render_generation_visual,
             screen=_Screen(_Toggle("child_bot_placeholder", "Child Bot Placeholder"),
                            modal="ProfileGenerationVisualModal", modal_label="Edit emoji…"),
@@ -799,11 +815,19 @@ PROFILE_ACTIONS = (
                        description="Set up models, prompts, and toggles for multiple profiles.",
                        keys=("image_generation_enabled",),
                        prompt_keys=("image_generation_prompt",))),
-    _Action("image_output", "tools", "Set Image Output", "Set aspect ratio, resolution and thinking level.",
+    _Action("image_output", "tools", "Set Image Output",
+            "Set aspect ratio, resolution, thinking level and search grounding.",
             _method("_act_image_output", wants_profile=True),
             bulk=_Bulk(_bulk_sub("ImageOutputApplyView"), scope="all", label="Set Image Output",
-                       description="Stage aspect ratio, resolution and thinking level.",
+                       description="Stage aspect ratio, resolution, thinking level and grounding.",
                        keys=IMAGE_OUTPUT_KEYS)),
+    _Action("image_sampling", "tools", "Set Image Sampling",
+            "Temperature, Top P and Top K for the image model.",
+            _modal("ProfileImageSamplingModal"),
+            bulk=_Bulk(_bulk_modal("ProfileImageSamplingModal"), scope="all",
+                       label="Set Image Sampling",
+                       description="Stage temperature, Top P and Top K for the image slot.",
+                       keys=IMAGE_SAMPLING_KEYS)),
     _Action("grounding", "tools", "Grounding (Web Search)", "Choose Off, Native or RAG web search.",
             _open_screen("grounding"), render=_render_grounding,
             # A select, not the old three-way cycle: going Off -> Native -> RAG -> Off
@@ -878,11 +902,21 @@ PROFILE_ACTIONS = (
                          ("Line", "line", "Split the reply on line breaks.")),
                         read=lambda c: c.get("typing_mode", "sentence"),
                         placeholder="Chunking mode..."),
+                _Choice("typing_cursor", "Cursor",
+                        (("Below the text", "below", TYPING_CURSOR_NOTES["below"]),
+                         ("In front of the text", "prefix", TYPING_CURSOR_NOTES["prefix"]),
+                         ("Off", "off", TYPING_CURSOR_NOTES["off"])),
+                        read=lambda c: (str(c.get("typing_cursor") or DEFAULT_TYPING_CURSOR).lower()
+                                        if str(c.get("typing_cursor") or DEFAULT_TYPING_CURSOR).lower()
+                                        in TYPING_CURSOR_MODES else DEFAULT_TYPING_CURSOR),
+                        placeholder="Typing cursor..."),
                 _Toggle("realistic_typing_enabled", "Realistic Typing"),
-                modal="ProfileTypingSettingsModal", modal_label="Edit speed…"),
+                modal="ProfileTypingSettingsModal", modal_label="Edit speed…",
+                note="-# The cursor is this profile's placeholder emoji, parked on the "
+                     "message between edits and removed by the last one."),
             bulk=_Bulk(_bulk_modal("ProfileTypingSettingsModal"), scope="all",
                        keys=("realistic_typing_enabled", "typing_mode", "typing_cps",
-                             "typing_max_delay"))),
+                             "typing_max_delay", "typing_cursor"))),
     _Action("critic", "tools", "Configure Anti-Repetition Critic",
             "Mode, scope, strictness, lookback and constraint persistence.",
             _open_screen("critic"), render=_render_critic,
@@ -1829,7 +1863,8 @@ def ProfileTypingSettingsModal(cog, profile_name: str, current_params: Dict[str,
     ]
     fields.extend([
         {"label": "Characters per Second", "custom_id": "typing_cps", "default": str(current_params.get("typing_cps", 30.0)), "required": False, "placeholder": "Default: 30.0"},
-        {"label": "Max Delay per Chunk (Seconds)", "custom_id": "typing_max_delay", "default": str(current_params.get("typing_max_delay", 2.5)), "required": False, "placeholder": "Default: 2.5"}
+        {"label": "Max Delay per Chunk (Seconds)", "custom_id": "typing_max_delay", "default": str(current_params.get("typing_max_delay", 2.5)), "required": False, "placeholder": "Default: 2.5"},
+        {"label": "Cursor (below/prefix/off)", "custom_id": "typing_cursor", "default": str(current_params.get("typing_cursor") or DEFAULT_TYPING_CURSOR), "required": False, "placeholder": f"Default: {DEFAULT_TYPING_CURSOR}"}
     ])
     def parser(v):
         c = {}
@@ -1842,8 +1877,59 @@ def ProfileTypingSettingsModal(cog, profile_name: str, current_params: Dict[str,
         if cps is not None: c["typing_cps"] = cps
         md = _pf(v["typing_max_delay"])
         if md is not None: c["typing_max_delay"] = md
+        cur = _ps(v.get("typing_cursor"))
+        if cur:
+            cur = cur.lower()
+            if cur not in TYPING_CURSOR_MODES:
+                raise ValueError(f"Cursor must be one of: {', '.join(TYPING_CURSOR_MODES)}")
+            c["typing_cursor"] = cur
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Realistic Typing Settings", fields, parser, callback, target_user_id)
+
+def ProfileImageSamplingModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
+    """Temperature / Top P / Top K for the *image* slot only.
+
+    Separate keys from the text profile's `temperature`/`top_p`/`top_k` because the
+    image request goes to a different model: one number cannot serve both, and the
+    image paths build no generation_config at all, so before these existed an image
+    request carried no sampling fields whatsoever.
+
+    Blank leaves a value alone; a single "-" clears it back to the model's own
+    default. That distinction has to be typed, because a modal cannot tell an
+    untouched field from a deliberately emptied one.
+    """
+    def gv(k):
+        v = current_params.get(k)
+        return "" if v in (None, "") else str(v)
+
+    fields = [
+        {"label": "Image Temperature (0.0-2.0)", "custom_id": "image_temperature", "default": gv("image_temperature"), "required": False, "placeholder": "Blank = model default. '-' clears."},
+        {"label": "Image Top P (0.0-1.0)", "custom_id": "image_top_p", "default": gv("image_top_p"), "required": False, "placeholder": "Blank = model default. '-' clears."},
+        {"label": "Image Top K (integer 0-100)", "custom_id": "image_top_k", "default": gv("image_top_k"), "required": False, "placeholder": "Blank = model default. '-' clears."},
+    ]
+
+    def parser(v):
+        c = {}
+        for key, cast, lo, hi in (("image_temperature", float, 0.0, 2.0),
+                                  ("image_top_p", float, 0.0, 1.0),
+                                  ("image_top_k", int, 0, 100)):
+            raw = (v.get(key) or "").strip()
+            if not raw:
+                continue
+            if raw == "-":
+                c[key] = ""
+                continue
+            try:
+                parsed = cast(raw)
+            except ValueError:
+                raise ValueError(f"{key.replace('_', ' ').title()} must be a number")
+            if not (lo <= parsed <= hi):
+                raise ValueError(f"{key.replace('_', ' ').title()} out of range ({lo}-{hi})")
+            c[key] = parsed
+        return {"config": c}
+
+    return ConfigModal(cog, profile_name, is_borrowed, "Image Sampling Parameters", fields, parser, callback, target_user_id)
+
 
 def ProfileImageGenSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     fields = [] if values_only else [
@@ -1887,15 +1973,17 @@ class MediaOptionsMixin:
     AUTO = "__auto__"
 
     def _add_choice_select(self, key: str, placeholder: str, values, notes: Dict[str, str],
-                           row: int, auto_label: str = "Model default"):
+                           row: int, auto_label: str = "Model default",
+                           auto_description: str = "Send no preference; the model picks.",
+                           labels: Optional[Dict[str, str]] = None):
         current = self._current_value(key)
         options = [discord.SelectOption(
             label=auto_label, value=self.AUTO,
-            description="Send no preference; the model picks.",
+            description=auto_description,
             default=not current)]
         for value in values:
             options.append(discord.SelectOption(
-                label=value, value=value,
+                label=(labels or {}).get(value, value), value=value,
                 description=(notes.get(value) or None),
                 default=(str(current or "") == value)))
 
@@ -2007,6 +2095,20 @@ class SingleProfileMediaOptionsView(MediaOptionsMixin, ui.View):
                              "size and rejects a resolution request.")
             if caps["thinking"]:
                 lines.append(f"**Thinking:** `{data.get('image_thinking_level') or 'model default'}`")
+            if caps["grounding"]:
+                mode = data.get("image_grounding_mode") or ""
+                lines.append("**Search grounding:** "
+                             f"`{IMAGE_GROUNDING_LABELS.get(mode, 'off')}`")
+            else:
+                lines.append("**Search grounding:** `unavailable` — this model takes no "
+                             "search tool on an image request.")
+            sampling = " · ".join(
+                f"{label} `{data.get(key)}`"
+                for key, label in (("image_temperature", "temp"),
+                                   ("image_top_p", "top P"),
+                                   ("image_top_k", "top K"))
+                if data.get(key) not in (None, ""))
+            lines.append(f"**Sampling:** {sampling or '`model default`'}")
             lines.append(f"\nOptions are limited to what `{raw}` accepts. Anything this model "
                          "does not carry is kept on the profile but left out of the request, so "
                          "switching models back restores it.")
@@ -2038,6 +2140,16 @@ class SingleProfileMediaOptionsView(MediaOptionsMixin, ui.View):
             if caps["thinking"]:
                 self._add_choice_select("image_thinking_level", "Thinking level...",
                                         IMAGE_THINKING_LEVELS, IMAGE_THINKING_NOTES, 2)
+            if caps["grounding"]:
+                # "Off" is this row's blank, not a value of its own: an empty
+                # image_grounding_mode and a stored "off" both resolve to no tool,
+                # and the AUTO option is what writes the empty one.
+                modes = ('web', 'web_images') if caps["image_search"] else ('web',)
+                self._add_choice_select("image_grounding_mode", "Search grounding...",
+                                        modes, IMAGE_GROUNDING_NOTES, 3,
+                                        auto_label="Off",
+                                        auto_description="No search tool on the request.",
+                                        labels=IMAGE_GROUNDING_LABELS)
         else:
             self._add_voice_select("speech_voice", 0)
 
@@ -2657,12 +2769,18 @@ class ImageOutputApplyView(_MediaOptionsApplyView):
                          "images.\n\nThe full list is offered here because the selected "
                          "profiles may be on different image models. Each request drops "
                          "whatever its own model does not accept, so a profile on a model "
-                         "with one fixed resolution simply ignores a staged one."))
+                         "with one fixed resolution simply ignores a staged one, and a "
+                         "profile on a model that takes no search tool ignores a staged "
+                         "grounding mode."))
         for key, label in (("image_aspect_ratio", "Aspect ratio"),
                            ("image_size", "Resolution"),
-                           ("image_thinking_level", "Thinking")):
+                           ("image_thinking_level", "Thinking"),
+                           ("image_grounding_mode", "Search grounding")):
             value = chosen.get(key)
-            shown = "model default" if value == "" else (value or "unchanged")
+            if key == "image_grounding_mode":
+                shown = "off" if value == "" else (IMAGE_GROUNDING_LABELS.get(value) or "unchanged")
+            else:
+                shown = "model default" if value == "" else (value or "unchanged")
             e.add_field(name=label, value=f"`{shown}`", inline=True)
         e.set_footer(text=f"{len(self.wizard.selected_profiles)} profile(s) selected · "
                           f"nothing is written until Apply")
@@ -2676,7 +2794,12 @@ class ImageOutputApplyView(_MediaOptionsApplyView):
                                 IMAGE_SIZES_ALL, IMAGE_SIZE_NOTES, 1)
         self._add_choice_select("image_thinking_level", "Thinking level...",
                                 IMAGE_THINKING_LEVELS, IMAGE_THINKING_NOTES, 2)
-        self._stage_row(3, "Stage Image Output")
+        self._add_choice_select("image_grounding_mode", "Search grounding...",
+                                ('web', 'web_images'), IMAGE_GROUNDING_NOTES, 3,
+                                auto_label="Off",
+                                auto_description="No search tool on the request.",
+                                labels=IMAGE_GROUNDING_LABELS)
+        self._stage_row(4, "Stage Image Output")
 
 
 class VoiceApplyView(_MediaOptionsApplyView):

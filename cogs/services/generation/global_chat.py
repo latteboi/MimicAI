@@ -4,7 +4,7 @@ import asyncio
 import discord
 import traceback
 import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from ...utils.constants import (
     defaultConfig, PRIMARY_MODEL_NAME, STM_LIMIT_MAX, PLACEHOLDER_EMOJI,
@@ -13,9 +13,120 @@ from ...utils.constants import (
 )
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_history_entry,
-    _get_user_hash, _resolve_safety_settings, _scrub_response_text,
+    _get_user_hash, _resolve_safety_settings, _scrub_response_text, default_profile_avatar_url,
 )
 from ._shared import _strip_neuro_update_and_scrub
+
+#: Speakers named on the card before the rest collapse into "+n". Four fits the footer
+#: and the field title at any sensible display-name length.
+MAX_NAMED_SPEAKERS = 4
+
+
+def _name_list(names: List[str], limit: int = MAX_NAMED_SPEAKERS) -> str:
+    """`Alice, Bob and Carol`, or `Alice, Bob, Carol, Dave +3` past the limit."""
+    names = [n for n in names if n]
+    if not names:
+        return "someone"
+    if len(names) <= limit:
+        return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    return ", ".join(names[:limit]) + f" +{len(names) - limit}"
+
+
+def _incoming_from_log(log: List[Dict]) -> List[Dict]:
+    """The user turns that produced the newest reply.
+
+    Walked backwards from the last model turn and stopped at the first non-user turn --
+    a multi-user round appends one user turn per speaker before the single model turn,
+    so the run is the whole round. Backwards rather than `log[::-1]`, which copies the
+    entire log on every render.
+    """
+    model_index = None
+    for i in range(len(log) - 1, -1, -1):
+        if log[i].get("role") == "model":
+            model_index = i
+            break
+    if model_index is None:
+        return []
+
+    incoming: List[Dict] = []
+    i = model_index - 1
+    while i >= 0 and log[i].get("role") == "user":
+        incoming.append(log[i])
+        i -= 1
+    incoming.reverse()
+    return incoming
+
+
+def build_global_chat_embed(cog, host_user_id: int, profile_name: str,
+                            session_data: Optional[Dict], *,
+                            description: Optional[str] = None,
+                            incoming: Optional[List[Dict]] = None,
+                            footer: Optional[str] = None,
+                            colour: Optional[discord.Colour] = None) -> discord.Embed:
+    """The Global Chat card, drawn one way wherever it is drawn.
+
+    The view and the generator had each grown their own version and they disagreed: one
+    drew grey with a `You: ...` footer under the *host's* avatar, the other blue with
+    every speaker's line run together on a single line under the avatar of whoever
+    pressed Play. With more than one person in the session both were simply false --
+    "You" named whoever happened to be reading, and neither avatar belonged to a
+    speaker. So speakers are named in a field, and the footer carries the state the
+    other people in a channel could not see at all: who may reply, and who is waiting.
+
+    `description` and `incoming` override what the log says, for the placeholder and for
+    the round being generated -- its turns are not in the log yet. `footer` replaces the
+    status line, which means nothing on a history browser looking at an old round.
+    """
+    session_data = session_data or {}
+    log = session_data.get("unified_log") or []
+
+    eff_owner, eff_name = cog.profile_manager._resolve_effective_profile(host_user_id, profile_name)
+    appearance = cog.profile_manager._get_user_appearance(eff_owner, eff_name) or {}
+    display_name = appearance.get("custom_display_name") or profile_name
+    avatar_url = appearance.get("custom_avatar_url") or default_profile_avatar_url(eff_name)
+
+    last_model = next((t for t in reversed(log) if t.get("role") == "model"), None)
+    body = description if description is not None else (last_model or {}).get("content")
+    has_reply = bool(body)
+    if not has_reply:
+        body = "Nothing said here yet. Press **Reply** to start."
+
+    embed = discord.Embed(
+        description=body[:4096],
+        colour=colour or (discord.Colour.blue() if has_reply else discord.Colour.dark_grey()),
+    )
+    embed.set_author(name=display_name[:256], icon_url=avatar_url)
+
+    if incoming is None:
+        incoming = _incoming_from_log(log)
+
+    if incoming:
+        # Budgeted per line, not truncated as a whole: one long message from the first
+        # speaker would otherwise push everyone else's out of the field entirely.
+        per_line = max(60, 1000 // len(incoming))
+        lines = []
+        for turn in incoming[:MAX_NAMED_SPEAKERS * 2]:
+            speaker = (turn.get("display_name") or "Someone")[:32]
+            text = " ".join((turn.get("content") or "").split()) or "—"
+            if len(text) > per_line:
+                text = text[:per_line - 1] + "…"
+            lines.append(f"**{speaker}** {text}")
+        title = ("In reply to" if len(incoming) == 1
+                 else f"In reply to {_name_list([t.get('display_name') for t in incoming])}")
+        embed.add_field(name=title[:256], value="\n".join(lines)[:1024], inline=False)
+
+    if footer is not None:
+        embed.set_footer(text=footer[:2048])
+        return embed
+
+    queue = session_data.get("pending_queue") or {}
+    locked = session_data.get("is_locked", True)
+    status = ["🔒 Only the host can reply" if locked else "🔓 Anyone here can reply"]
+    if queue:
+        status.append("waiting on " + _name_list(
+            [q.get("display_name") for q in queue.values()]))
+    embed.set_footer(text=" · ".join(status)[:2048])
+    return embed
 
 
 class GlobalChatMixin:
@@ -118,14 +229,6 @@ class GlobalChatMixin:
             session_data['unified_log'] = session_data['unified_log'][-(STM_LIMIT_MAX * 2):]
 
             combined_prompt_text = "\n\n".join([f"{t['display_name']}: {t['content']}" for t in queued_turns])
-            combined_footer_text = " ".join([f"{t['display_name']}: {t['content']}" for t in queued_turns])
-
-            source_owner_id, source_profile_name = self.cog.profile_manager._resolve_effective_profile(host_user_id, profile_name)
-
-            bot_display_name = source_profile_name
-            appearance = self.cog.user_appearances.get(str(source_owner_id), {}).get(source_profile_name)
-            if appearance and appearance.get("custom_display_name"):
-                bot_display_name = appearance.get("custom_display_name")
 
             contents_for_api_call =[]
 
@@ -201,9 +304,13 @@ class GlobalChatMixin:
             custom_emoji = profile_data.get("placeholder_emoji") or PLACEHOLDER_EMOJI
 
             # --- EDIT ORIGINAL RESPONSE ---
-            placeholder_embed = discord.Embed(description=f"{custom_emoji}", color=discord.Color.dark_grey())
-            placeholder_embed.set_author(name=bot_display_name, icon_url=appearance.get("custom_avatar_url") if appearance else self.cog.bot.user.display_avatar.url)
-            placeholder_embed.set_footer(text=combined_footer_text[:1000], icon_url=interaction.user.display_avatar.url)
+            # `incoming` is passed explicitly: this round's turns are only appended to
+            # unified_log once the reply lands, so the card would otherwise show the
+            # previous round's speakers while answering this one.
+            placeholder_embed = build_global_chat_embed(
+                self.cog, host_user_id, profile_name, session_data,
+                description=custom_emoji, incoming=queued_turns,
+                colour=discord.Colour.dark_grey())
 
             await interaction.edit_original_response(embed=placeholder_embed, view=None)
             placeholder_msg = await interaction.original_response()
@@ -419,9 +526,11 @@ class GlobalChatMixin:
 
             await self._update_sending_placeholder(interaction.channel, 'webhook', None, state_container, t1_start_mono)
 
-            embed = discord.Embed(description=text_for_embed, color=discord.Color.blue())
-            embed.set_author(name=app_name, icon_url=app_avatar or self.cog.bot.user.display_avatar.url)
-            embed.set_footer(text=combined_footer_text[:1000], icon_url=interaction.user.display_avatar.url)
+            # Same builder the view uses, so the refresh that follows in play_callback
+            # redraws an identical card instead of flipping colour and footer.
+            embed = build_global_chat_embed(
+                self.cog, host_user_id, profile_name, session_data,
+                description=text_for_embed, incoming=queued_turns)
 
             if state_container and state_container.get('sending_task'):
                 state_container['sending_task'].cancel()

@@ -35,6 +35,28 @@ _TAB_TITLES = {
 # Dashboards whose views are built imperatively. Kept as (heading, [(tab, [actions])]).
 _STATIC_DASHBOARDS = [
     (
+        "`/start` (the guided setup wizard; works in a DM or a server)",
+        [
+            ("Overview", [
+                "A context banner: where you are, your role there, whether that server has a key",
+                "A five-step checklist, probed live: key, character, voice, seat, speak",
+                "Steps that cannot be done from here are greyed with the reason, not hidden",
+            ]),
+            ("Step screens", [
+                "Step 1 Connect an API key (DM only; in a server, offers to DM you instead)",
+                "Step 2 Get a character: Browse Library, Generate one, or Blank",
+                "Step 3 Give it a voice: opens the profile dashboard",
+                "Step 4 Seat it in this channel: opens the cast editor (administrators)",
+                "Step 5 Say something to it: no button; just talk in the channel",
+                "Read more on any step opens /guide at that step's page",
+            ]),
+            ("Using it", [
+                "Just talk to it; Other ways to talk; Memory; Pictures and voice; "
+                "When something is wrong",
+            ]),
+        ],
+    ),
+    (
         "`/settings` (DM only)",
         [
             ("Home", ["Integration summary: key slots, child bots, server assignments"]),
@@ -43,6 +65,15 @@ _STATIC_DASHBOARDS = [
                 "Submit Key / Edit Key / Delete Key on the selected slot",
                 "Assign this key to... (Personal, and any server you administrate)",
                 "Save Assignments (an assignment is not stored until this is clicked)",
+            ]),
+            ("Defaults", [
+                "Standing preferences applied to profiles created or borrowed LATER",
+                "Category dropdown: Response, Image, TTS, Grounding, Critic, LTM, Behaviour",
+                "Each model slot: Platform default, or a specific model per provider",
+                "Behaviour: typing cursor, reasoning effort, realistic typing, LTM "
+                "auto-creation, short-term memory length, timezone",
+                "Saved on selection -- there is no Save button on this tab",
+                "Does not change existing profiles; /profile bulk manage does that",
             ]),
             ("Child Bots", [
                 "Create New Child Bot (bot owner only; links a PID to a bot token)",
@@ -54,7 +85,17 @@ _STATIC_DASHBOARDS = [
     (
         "`/session config` (server administrators)",
         [
-            ("Cast", ["Add or remove personal, borrowed and child-bot participants (max 200)"]),
+            ("Cast", ["Add or remove participants (max 200)",
+                      "Source cycles personal -> borrowed -> System -> child bot",
+                      "Choosing a profile seats and saves it; it does not start the session",
+                      "A profile speaks as a child bot or a webhook, never both",
+                      "Clear Cast empties every source at once"]),
+            ("(on every tab)", [
+                "Start / Update Session: marks the session started, saves the configuration, "
+                "loads the transcript, and announces the channel to every child bot in the cast. "
+                "Until it is pressed the footer reads Draft and nothing in the channel runs. "
+                "An empty cast is allowed.",
+            ]),
             ("Config", [
                 "Toggle Execution (sequential or random turn order)",
                 "Edit Master Prompt (the scene prompt every participant sees)",
@@ -76,6 +117,23 @@ _STATIC_DASHBOARDS = [
             ("Incoming Shares", ["Accept or reject profiles shared directly with you"]),
             ("Manage My Shares", ["Publish or unpublish, and revoke existing shares"]),
             ("Profile Cloning", ["Generate a clone code, producing an independent copy rather than a link"]),
+        ],
+    ),
+    (
+        "`/profile global_chat` (one card, no tabs; runs in a server channel or a DM)",
+        [
+            (None, [
+                "One embed, edited in place: the profile's latest reply is the body, "
+                "and the messages it answered are listed under it by name",
+                "A normal channel message, not ephemeral -- everyone who can read the "
+                "channel reads it; only your unplayed draft is private",
+                "Footer: who may reply, and who is still writing",
+                "Reply (opens a pop-up box; the queue it fills is shown to its author alone)",
+                "Play (sends everything queued as a single turn; reads how many people "
+                "it is waiting on while they write)",
+                "Host only 🔒 / Open to all 🔓 (who may press Reply and Play -- "
+                "never who may see the card)",
+            ]),
         ],
     ),
     (
@@ -186,17 +244,37 @@ def _render_bulk_dashboard() -> List[str]:
 
 
 def _render_static_dashboards() -> List[str]:
+    """Renders the hand-written half of the map.
+
+    A group name of None means the surface has no tabs -- `/profile global_chat` is a
+    single card with three buttons -- and its entries are rendered directly under the
+    heading. Printing `Tab: [...]` there would invent navigation Help Mode would then
+    tell people to look for.
+    """
     lines: List[str] = []
     for heading, tabs in _STATIC_DASHBOARDS:
         lines.append("")
         lines.append(f"DASHBOARD: {heading}")
-        for tab_index, (tab_name, actions) in enumerate(tabs):
-            is_last_tab = tab_index == len(tabs) - 1
-            tab_prefix = "└──" if is_last_tab else "├──"
-            continuation = "    " if is_last_tab else "│   "
-            lines.append(f"  {tab_prefix} Tab: [{tab_name}]")
-            for action_index, action in enumerate(actions):
-                is_last_action = action_index == len(actions) - 1
+
+        # Flattened first, so the last node draws its corner whether it is a tab or a
+        # bare entry -- the two kinds can sit side by side under one heading.
+        nodes = []
+        for tab_name, actions in tabs:
+            if tab_name is None:
+                nodes.extend((None, action) for action in actions)
+            else:
+                nodes.append((tab_name, actions))
+
+        for node_index, (tab_name, payload) in enumerate(nodes):
+            is_last = node_index == len(nodes) - 1
+            prefix = "└──" if is_last else "├──"
+            if tab_name is None:
+                lines.append(f"  {prefix} {payload}")
+                continue
+            continuation = "    " if is_last else "│   "
+            lines.append(f"  {prefix} Tab: [{tab_name}]")
+            for action_index, action in enumerate(payload):
+                is_last_action = action_index == len(payload) - 1
                 action_prefix = "└──" if is_last_action else "├──"
                 lines.append(f"  {continuation}{action_prefix} {action}")
     return lines

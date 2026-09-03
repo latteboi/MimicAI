@@ -13,6 +13,7 @@ from discord.ext import commands
 
 from ..utils.constants import *
 from ..utils import mem_probe
+from ..utils.content import WELCOME_MESSAGE, WELCOME_CHANNEL_HINTS
 from ..utils.helpers import _format_history_entry, _get_user_hash
 from ..utils.fuzzy import rank_keyed
 
@@ -36,6 +37,7 @@ class EventListeners:
         await self.child_bot_manager.start_all_child_bots()
 
         if self.has_lock:
+            await self._cache_command_ids()
             self.profile_manager._get_or_create_system_profile("mimicguide")
             self.bot.loop.create_task(self.help_service._load_and_embed_docs())
             
@@ -74,6 +76,87 @@ class EventListeners:
             for i in range(2):
                 worker = self.bot.loop.create_task(self.media_service._image_gen_worker(i))
                 self.image_gen_workers.append(worker)
+
+    async def _cache_command_ids(self):
+        """Resolve top-level command names to ids so `</start:id>` renders clickable.
+
+        One request, once per boot, and only the top level -- a subcommand is mentioned
+        through its parent's id, which is already here. Failure is not worth retrying
+        or reporting to anyone: `command_mention` falls back to a `/start` code span,
+        which is what every other line of copy in the bot already uses.
+        """
+        if self.command_ids:
+            return
+        try:
+            for cmd in await self.bot.tree.fetch_commands():
+                self.command_ids[cmd.name] = cmd.id
+        except Exception as e:
+            print(f"Could not fetch command ids for mentions: {type(e).__name__}({e})")
+
+    def _pick_welcome_channel(self, guild: discord.Guild):
+        """The best channel to say hello in, or None if there is nowhere we may speak.
+
+        `system_channel` first because that is literally the server's welcome channel --
+        it is where Discord itself posts join notices, so a greeting there is in the one
+        place the server has already nominated for greetings. Everything after it is a
+        fallback for a server that has none set.
+
+        Permissions are checked rather than assumed. A bot invited with a narrow role
+        can see channels it cannot post in, and an unhandled Forbidden on join is how a
+        bot looks broken in the first thirty seconds anyone has known it.
+        """
+        me = guild.me
+        if me is None:
+            return None
+
+        def usable(channel) -> bool:
+            # Both sources below already yield text channels; None is the real case.
+            if channel is None:
+                return False
+            perms = channel.permissions_for(me)
+            return perms.view_channel and perms.send_messages
+
+        if usable(guild.system_channel):
+            return guild.system_channel
+
+        # Named like a welcome or general channel, in hint order, so a server with both
+        # #welcome and #general gets the more deliberate of the two.
+        candidates = [c for c in guild.text_channels if usable(c)]
+        for hint in WELCOME_CHANNEL_HINTS:
+            match = next((c for c in candidates if hint in c.name.lower()), None)
+            if match is not None:
+                return match
+
+        # Otherwise the topmost channel we can actually speak in.
+        return candidates[0] if candidates else None
+
+    @commands.Cog.listener()
+    async def on_guild_join(self, guild: discord.Guild):
+        """The one message the bot sends unasked: a greeting, once, on being invited.
+
+        No state backs the "once" -- `on_guild_join` fires on a genuine join and not on
+        a reconnect, a restart or a resume, so the event *is* the guarantee, and a
+        re-invite genuinely greets again. A stored "already greeted" flag would only
+        add a way for the two to disagree, and something else to migrate.
+
+        `has_lock` is the guard that matters: two instances of the bot are both in the
+        guild and would both post.
+        """
+        if not self.has_lock:
+            return
+
+        channel = self._pick_welcome_channel(guild)
+        if channel is None:
+            return
+
+        await self._cache_command_ids()
+        try:
+            await channel.send(WELCOME_MESSAGE.format(
+                start=self.command_mention("start"), help=self.command_mention("help")))
+        except discord.Forbidden:
+            pass
+        except Exception as e:
+            print(f"Welcome message failed in guild {guild.id}: {type(e).__name__}({e})")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -122,7 +205,7 @@ class EventListeners:
                     return
 
             session = self.multi_profile_channels.get(message.channel.id)
-            if session:
+            if session and self.session_manager.is_started(session):
                 session_type = session.get("type", "multi")
                 if not session.get("is_hydrated"):
                     session = await self.session_manager._ensure_session_hydrated(message.channel.id, session_type)
@@ -226,7 +309,10 @@ class EventListeners:
 
             for bot_id in mentioned_child_ids:
                 event_data = {"bot_id": bot_id, "message": payload}
-                if message.channel.id in self.multi_profile_channels:
+                # A seated-but-unstarted session is not a session as far as an
+                # ordinary message is concerned, so a mention routes the standalone
+                # way -- exactly as it would in a channel with no session at all.
+                if self.session_manager.is_started(self.multi_profile_channels.get(message.channel.id)):
                     event_data["event_type"] = "message_received"
                     await self.child_bot_manager.handle_child_bot_event(event_data)
                 else:
@@ -239,7 +325,10 @@ class EventListeners:
         # --- 3. Normal Session Triggering ---
         session = self.multi_profile_channels.get(message.channel.id)
 
-        if session:
+        # Seating a cast does not make the channel live. Until `Start / Update Session`
+        # is pressed the session exists only as a draft, and ordinary chat passes
+        # through it untouched.
+        if session and self.session_manager.is_started(session):
             if 'task_queue' not in session or session['task_queue'] is None:
                 session['task_queue'] = asyncio.Queue()
 

@@ -31,18 +31,25 @@ HELP_CATEGORIES = {
             "Use the dropdowns below to browse the documentation. For a question you would rather just ask, use `/help ask:<your question>`."
         ),
         "First Steps": (
+            "**The short version: run `/start`.** It works out what you have already done, shows you what is left, "
+            "and opens the right screen for each step. Everything below is the same path done by hand.\n\n"
             "**1. Add an API key.** Open a DM with the bot and run `/settings` -> **API Keys**. Pick an empty slot, click **Submit Key**, "
-            "then use the assignment dropdown to point it at **Personal** (for DM chats) and at any server you administrate. "
+            "then use the assignment dropdown to point it at **Personal** (your own Global Chat, wherever you run it) and at any server "
+            "you administrate. "
             "Click **Save Assignments** -- nothing is stored until you do.\n\n"
             "**2. Create a profile.** `/profile create profile_name:detective`. If you would rather start from a concept than a blank form, "
             "`/profile generate` drafts a whole profile for you.\n\n"
             "**3. Shape it.** `/profile manage profile_name:detective` opens the dashboard. **Persona** -> Edit Persona for backstory and traits; "
             "Edit Instructions for speech and formatting; Edit Appearance for a display name and avatar URL.\n\n"
-            "**4. Start talking.** `/session config` -> add the profile to the cast -> **Start / Update Session**. Then just send a message in the channel."
+            "**4. Start talking.** `/session config` -> **Cast** -> pick your profile (it is seated as soon as you choose it) -> "
+            "**Start / Update Session**. Then just send a message in the channel.\n\n"
+            "*The bot posts this same pointer once, in a server, the moment it is invited. That is the only message it ever "
+            "sends without being asked.*"
         ),
         "API Keys and Where They Apply": (
             "You hold four key slots: two Google Gemini, two OpenRouter. Each slot can be assigned to two kinds of scope:\n\n"
-            "• **Personal:** used for your DM conversations (`/profile global_chat`) and for your own profiles' background work.\n"
+            "• **Personal:** used for your own Global Chat (`/profile global_chat`) wherever you run it -- a server channel or a DM -- "
+            "and for your own profiles' background work.\n"
             "• **A server:** used for every session in that server. Only administrators of that server can assign a key to it.\n\n"
             "A server needs *someone* to have assigned a key to it, otherwise its profiles cannot generate at all. "
             "If several people assign keys, the server index records the pointer -- the last assignment wins.\n\n"
@@ -110,6 +117,22 @@ HELP_CATEGORIES = {
             "**Fallback** is not optional infrastructure you can ignore. If the primary request fails -- rate limit, timeout, safety block -- "
             "the payload is immediately re-sent to the fallback. Choose something cheap and fast; a profile with a good fallback stays alive "
             "through an outage that would otherwise silence it."
+        ),
+        "Default Settings for New Profiles": (
+            "`/settings` -> **Defaults** (DM only). Standing preferences applied to profiles you create or borrow "
+            "**from then on**. Existing profiles are untouched -- `/profile bulk manage` is what changes those.\n\n"
+            "**Models.** Every one of the six model categories -- Response, Image, TTS, Grounding, Critic, LTM -- and both "
+            "slots of each. Set your Response Primary to an OpenRouter model once, and every profile you make afterwards "
+            "starts there instead of on the shipped Gemini default.\n\n"
+            "**Behaviour.** Typing cursor, reasoning effort, realistic typing, LTM auto-creation, short-term memory length "
+            "and timezone.\n\n"
+            "**Anything left on *Platform default* keeps following the bot's own value**, including if that value changes "
+            "in a later version. That is the point of leaving it alone rather than selecting the same model by hand.\n\n"
+            "**On a borrowed profile, only some of these apply.** Settings that are part of how a character reads or performs "
+            "-- temperature, Top P, Top K, TTS voice, placeholder emoji, the custom error message and the Director's Desk -- "
+            "are left as its author wrote them. Models, memory, timezone and the rest are yours to set. Nothing here can touch "
+            "a persona or an instruction block: those are read live from the original and are not stored on your borrow at all.\n\n"
+            "There is no Save button. A choice is written when you make it."
         ),
         "Core Sampling": (
             "At `/profile manage` -> **Params** -> Set Generation Parameters & STM.\n\n"
@@ -185,11 +208,16 @@ HELP_CATEGORIES = {
     "5. Sessions": {
         "Starting and Shaping a Session": (
             "`/session config` (administrators) opens the session dashboard.\n\n"
-            "**Cast** adds and removes participants -- personal, borrowed, or child bots. Up to 200.\n\n"
+            "**Cast** adds and removes participants -- personal, borrowed, System, or child bots. Up to 200. "
+            "A profile speaks as a child bot **or** as a webhook, never both, so seating the same one twice is refused.\n\n"
+            "Choosing a profile seats it and saves it at once; **Start / Update Session** is what makes the channel live. "
+            "Until then the dashboard footer reads *Draft* and nothing in the channel runs. An empty cast is a valid "
+            "session -- it simply has nobody to answer.\n\n"
             "**Config** sets how the round runs: **Toggle Execution** switches between sequential and random turn order, **Edit Master Prompt** "
             "sets the scene every participant sees, **Set Response Limit** caps replies per round, and **Toggle TTS** turns on audio.\n\n"
-            "`/session swap` changes the cast live without interrupting the conversation, including into a specific slot. "
-            "`/session view` dumps the current configuration and participant status. `/session trigger` forces a round. "
+            "`/session swap` changes the cast live without interrupting the conversation, including into a specific slot. Naming a profile "
+            "that is already in the session removes it, which is the same thing giving a slot with no profile name does. "
+            "`/session view` dumps the current configuration and participant status. `/trigger` forces a round. "
             "`/session audit` reports token usage and diagnostics for the active session."
         ),
         "Reaction Controls": (
@@ -219,7 +247,9 @@ HELP_CATEGORIES = {
             "• **Reply** -- uses Discord's native reply reference.\n"
             "• **Mention + Reply** -- both.\n\n"
             "**Realistic Typing** (Tools -> Realistic Typing) splits the reply on sentence boundaries and streams it with a delay based "
-            "on length and your configured characters-per-second, instead of posting one block."
+            "on length and your configured characters-per-second, instead of posting one block. A **cursor** -- the profile's own placeholder "
+            "emoji -- sits on the message between edits so a half-written reply does not read as a finished one; it is on by default, below "
+            "the text, and can be moved in front of it or turned off."
         ),
         "Private and One-Off Speech": (
             "**`/whisper`** sends a private message to one participant in an active session. Its reply is ephemeral -- only you see it -- and both "
@@ -229,12 +259,17 @@ HELP_CATEGORIES = {
             "delivers it in its own name and avatar.\n\n"
             "**`/profile global_chat`** opens a persistent conversation with one profile, kept separately from any server session and "
             "carried with you across servers. The profile needs a rating of **General**, or an operator **Exemption** -- it does not "
-            "have to be published to the Public Library, and never did have to be listed to be talked to privately.\n\n"
-            "It is not a DM and not a stream of messages. The whole conversation lives in **one embed**, posted wherever you ran the "
+            "have to be published to the Public Library, and never did have to be listed to be talked to one-to-one.\n\n"
+            "**It is not a DM feature.** It runs in a server channel and in a DM alike -- what makes it *global* is that the history "
+            "belongs to you and the character rather than to a channel, so the same conversation continues wherever you next open it.\n\n"
+            "It is also not a stream of messages. The whole conversation lives in **one embed**, posted wherever you ran the "
             "command and rewritten in place: the profile's latest reply is the body, your last message is the footer. **Reply** opens a "
             "text box, **Play** sends what is queued, and the 🔒 button decides who may use them. Locked (the default) means you alone; "
             "unlocked means anyone who can see the message, which is how a channel full of people holds one conversation with a "
-            "profile. Everyone who replies inside the same ten-second window is queued, and Play sends them as a single turn."
+            "profile. Everyone who replies inside the same ten-second window is queued, and Play sends them as a single turn.\n\n"
+            "**The card is a normal channel message, not an ephemeral one.** Everyone who can read the channel can read the reply, and "
+            "your own last line as its footer. The lock decides who may *press* the buttons, never who may look. Only what you are still "
+            "drafting is private -- Reply is a pop-up box, and the queue it goes into is shown to you alone until Play."
         ),
     },
     "6. Tools and Media": {
@@ -258,8 +293,15 @@ HELP_CATEGORIES = {
             "**Self-portraits:** if the prompt asks for a picture of the character, its Appearance text is injected into the image prompt "
             "automatically, so it looks consistent between generations.\n\n"
             "**Edits:** reply to an existing image with `!image` and a new instruction to iterate on it.\n\n"
-            "**Output** (`/profile manage` -> Tools -> Set Image Output) sets aspect ratio, resolution and thinking level. Only the options the "
-            "profile's image model accepts are offered, and 4K is deliberately absent -- it usually exceeds Discord's attachment limit.\n\n"
+            "**Output** (`/profile manage` -> Tools -> Set Image Output) sets aspect ratio, resolution, thinking level and search grounding. Only "
+            "the options the profile's image model accepts are offered, and 4K is deliberately absent -- it usually exceeds Discord's attachment "
+            "limit.\n\n"
+            "**Search grounding on an image** lets the model look things up before it draws: *Web search* for facts (a current logo, today's "
+            "weather), *Web + image search* to also pull real photographs off the web as visual reference. 3.1 Flash Image carries both, 3 Pro "
+            "Image web search only, and the Lite and 2.5 models neither.\n\n"
+            "**Sampling** (Tools -> Set Image Sampling) sets temperature, Top P and Top K for the image model specifically -- separate keys from "
+            "the text profile's. Blank sends nothing, which is the right answer for most profiles: Google asks that the Gemini 3 family be left "
+            "at its default temperature.\n\n"
             "**Requires a paid-tier Google key.** Image models are blocked on free-tier keys entirely."
         ),
         "Speech and the Director's Desk": (
@@ -415,14 +457,115 @@ HELP_CATEGORIES = {
         "Command Reference": (
             "**Profiles:** `/profile create`, `/profile generate`, `/profile manage`, `/profile list`, `/profile bulk manage`, `/profile hub`, "
             "`/profile global_chat`\n\n"
-            "**Sessions:** `/session config`, `/session swap`, `/session view`, `/session trigger`, `/session audit`\n\n"
+            "**Sessions:** `/session config`, `/session swap`, `/session view`, `/session audit`, `/trigger`\n\n"
             "**In-channel:** `/whisper`, `/speak`, `/refresh`, `/cancel`, `/suspend`, `/purge`, `/clear`\n\n"
             "**Setup and data:** `/settings`, `/export`, `/import`, `/privacy`, `/terms`, `/invite`, `/whoami`, `/viewavatar`\n\n"
-            "**Documentation:** `/guide` (this browser), `/help`\n\n"
+            "**Documentation:** `/start` (guided setup), `/guide` (this browser), `/help`\n\n"
             "**Operator:** `/mod`, `/shutdown`\n\n"
             "`/suspend` and `/purge` require administrator permission; `/mod` and `/shutdown` are bot-owner only."
         ),
     },
+}
+
+
+# --- `/start` wizard copy ---------------------------------------------------------
+#
+# The third corpus, and deliberately the shortest. `HELP_CATEGORIES` is where a reader
+# goes to understand something and `DEFAULT_HELP_DOCS` is what a question is matched
+# against; this is what someone reads while they are stuck partway through setup, with
+# a button in front of them. Two to four sentences per step, ending in what to press.
+#
+# Depth is not repeated here. Every step declares a `help_ref` in `gui_start` naming a
+# HELP_CATEGORIES page, and its Read More button opens the browser on that page -- so
+# the long-form explanation has exactly one home and this stays a nudge rather than a
+# fourth thing to keep in sync. A step whose blurb starts growing paragraphs is a step
+# whose help_ref is pointing at the wrong page.
+
+WIZARD_COPY = {
+    "key": (
+        "MimicAI is free, but the thinking is not: it calls a model provider with **your** key "
+        "and they bill you directly.\n\n"
+        "**Google Gemini** is the one to start with — it is the only provider here for images, "
+        "voice and web grounding. Free tier is fine for text. **OpenRouter** opens up Claude, GPT, "
+        "Llama and a few hundred others, text only.\n\n"
+        "You can add both, and **mix them inside a single character** — thinking on OpenRouter, "
+        "pictures and voice on Google. A picture it draws comes back into its own context, so it "
+        "can see and talk about what it just made.\n\n"
+        "Keys are entered in a DM. Paste the key into a slot, then point it at **Personal** and at "
+        "any server you run — **an unassigned key does nothing.**"
+    ),
+    "profile": (
+        "A **profile** is one character: a persona, a set of instructions, a model, and its own memory. "
+        "Profiles belong to you, not to a server, so they follow you everywhere.\n\n"
+        "Three ways to get one, fastest first:\n"
+        "• **Borrow** a finished character from the Public Library — no writing at all.\n"
+        "• **Generate** one from a concept like *a cynical noir detective* — one small API call.\n"
+        "• **Write** one from blank, if you already know who they are."
+    ),
+    "voice": (
+        "Two halves, and mixing them up is the usual reason a character will not behave.\n\n"
+        "**Persona** answers *who is this* — backstory, traits, likes, dislikes, appearance. It is descriptive.\n"
+        "**Instructions** answer *how should it write* — length, formatting, what never to do. It is imperative, "
+        "and it wins over persona bias during generation.\n\n"
+        "A borrowed character arrives already written, so this step is done the moment you have one."
+    ),
+    "seat": (
+        "A **session** is bound to one channel and holds a cast of characters sharing a single transcript, "
+        "each seeing it from their own point of view.\n\n"
+        "Pick your character on the **Cast** tab — it is seated the moment you choose it, so you can set its "
+        "reactivity straight away — then press **Start / Update Session**. Only server administrators can do "
+        "this: profiles are yours, but a channel is the server's."
+    ),
+    "speak": (
+        "Nothing else to configure. Send a message in the channel and the cast will answer.\n\n"
+        "If it stays quiet, that is usually **reactivity** — replies are a dice roll by default, so it does "
+        "not talk over everything. `/trigger` forces a round, and wakewords make it always answer."
+    ),
+}
+
+#: The second track: things worth knowing once setup is finished. Not steps -- none of
+#: them is a prerequisite and none has a completion state -- so they are pages, and a
+#: checklist that could never be finished is exactly what keeping them separate avoids.
+WIZARD_TOUR = {
+    "Just talk to it": (
+        "**There is no command for talking.** With a session running in a channel, send a message and the cast "
+        "answers.\n\n"
+        "**It did not reply.** Replies are a probability roll, tuned in `/session config` → Reactivity. "
+        "`/trigger` forces a round now; a **wakeword** makes a character always answer when the word appears.\n\n"
+        "**Too many replies.** Lower the chance, or set a response limit in `/session config` → Config."
+    ),
+    "Other ways to talk": (
+        "`/whisper` sends a message only one character sees. It answers in character, and its reply is ephemeral — "
+        "the exchange stays out of everyone else's view of the transcript.\n\n"
+        "`/profile global_chat` is one continuous conversation with a single character, carried between servers and "
+        "DMs and kept apart from every channel session. **It runs anywhere the command does** — it is not a DM "
+        "feature. The whole thing is one embed you write into with a button, not a stream of messages, and in a "
+        "channel that embed is an ordinary visible message: 🔒 controls who may press the buttons, not who can read "
+        "it.\n\n"
+        "`/speak` posts as one of your profiles without generating anything — you write the line yourself."
+    ),
+    "Memory": (
+        "**Short-term** is the recent transcript, a fixed number of turns. `/refresh` clears it when a character "
+        "gets stuck in a loop.\n\n"
+        "**Long-term** is summarised memories retrieved by relevance. `/memorise` forces summarisation right now "
+        "rather than waiting for the interval.\n\n"
+        "**Training examples** are input/output pairs teaching a character how to phrase things. `/train` arms the "
+        "channel to capture one from reactions — 1️⃣ for the input, 2️⃣ for the output."
+    ),
+    "Pictures and voice": (
+        "Turn them on per character in `/profile manage` → **Tools** → Image Generation, and → **Params** → Speech "
+        "Settings.\n\n"
+        "Then `!image` and `!imagine` in a channel produce pictures, and a TTS-enabled character speaks its rounds "
+        "aloud. Both are **Google-only**, whatever the character thinks on.\n\n"
+        "Images can also search the web for reference photographs first — `/profile manage` → Tools → Set Image Output."
+    ),
+    "When something is wrong": (
+        "`/help` puts **MimicGuide** into the channel, where it answers questions about the bot from its own "
+        "documentation. `/help ask:<question>` answers one question without joining.\n\n"
+        "`/cancel` stops a generation that is hanging. `/session audit` reports what a session is actually sending, "
+        "token by token, which is where a mysteriously expensive or forgetful character gives itself away.\n\n"
+        "`/guide` is the full manual."
+    ),
 }
 
 
@@ -441,6 +584,24 @@ HELP_CATEGORIES = {
 # Editing an entry here updates the on-disk shard on next boot *unless* the operator
 # has edited that shard themselves -- see HelpService._ensure_docs_directory.
 DEFAULT_HELP_DOCS = {
+    # --- GETTING STARTED ---
+    "start/setup_wizard.txt": (
+        "Command: `/start` opens a guided setup wizard. It is the first thing a new user should run.\n"
+        "Concept: Five steps -- connect an API key, get a character, give it a voice, seat it in a channel, say something to it. The wizard checks which are already done every time it is opened, so it can be closed and reopened freely and always resumes correctly. No progress is stored anywhere.\n"
+        "Context awareness: The wizard states where you are and what you can do there. API keys can only be entered in a DM. Seating a character in a channel requires server administrator permission. Steps that cannot be done from where you ran it are shown greyed out with the reason rather than hidden.\n"
+        "Non-administrators: You can complete steps 1-3 anywhere and build characters freely, but only an administrator can seat them in a channel. Profiles belong to you rather than to a server, so the fastest way to test your own is to create your own server -- you are its administrator -- and add the bot with `/invite`.\n"
+        "Second track: A 'Using it' section covers talking to characters, `/whisper`, memory commands, images and voice, and what to do when something is wrong. These are not setup steps and have no completion state.\n"
+        "Troubleshooting / Symptoms:\n"
+        "- Symptom: 'I do not know where to begin.' Fix: Run `/start`.\n"
+        "- Symptom: 'The wizard says step 1 cannot be done here.' Fix: API keys are DM-only. Press 'Send me the DM version', then run `/start` in that DM.\n"
+        "- Symptom: 'Step 4 is locked.' Fix: Seating a cast needs server administrator permission. Ask an admin to run `/session config`, or make your own server to test in.\n"
+        "- Symptom: 'I finished a step but the wizard still shows it undone.' Fix: Press Refresh. The wizard reads live state and only re-reads it when asked.\n"
+        "- Symptom: 'The wizard stopped responding to clicks.' Fix: It times out after fifteen minutes. Run `/start` again; it resumes exactly where you were because nothing was stored.\n"
+        "- Symptom: 'The bot says an API key was not found.' Fix: Either no key is set, or a key was saved but never assigned. Run `/start`, which checks assignment rather than just presence.\n"
+        "Greeting on join: when the bot is added to a server it posts one short message pointing at `/start`, and never posts unasked again. It picks the server's System Messages channel, then a channel named like welcome, general, lobby, chat, main or bot, then the topmost channel it has permission to post in -- and stays silent if there is nowhere it may speak. It never sends this in a DM. Being removed and re-invited greets once more; that is the only way it repeats.\n"
+        "- Symptom: 'The bot greeted the wrong channel.' Fix: Set the server's System Messages Channel in Server Settings; that is the first place it looks.\n"
+        "- Symptom: 'The bot joined and said nothing.' Fix: It had no channel it could both see and post in. Give its role Send Messages somewhere, then run `/start` yourself."
+    ),
     # --- PROFILES ---
     "profiles/identifiers_and_pids.txt": (
         "Concept: While users see aesthetic names (e.g., 'Detective'), the system identifies profiles exclusively via 16-character Profile IDs (PIDs).\n"
@@ -452,12 +613,26 @@ DEFAULT_HELP_DOCS = {
     "profiles/personal_vs_borrowed.txt": (
         "Concept: Every profile has a Profile ID (PID) whose first letter is its class. A = Personal Profile, fully editable and owned by you. B = a profile you borrowed through a private share code. C = a profile you borrowed from the Public Library. X = a System Profile provided by the bot operator. Borrowed profiles (B and C) are read-only links pointing back to the creator's master profile.\n"
         "B versus C: the letter records where the borrow came from, not what it is now. A PID never changes, so if the owner later unpublishes a profile your borrow keeps its C. Borrows created before the C class existed are all B regardless of origin, so the letter is a hint for reading IDs rather than something the bot decides behaviour from.\n"
-        "What a borrower may change: local-only settings such as timezone, response mode and generation visual. Persona and instructions stay with the owner, and the Persona tab is hidden entirely on a borrowed profile.\n"
+        "What a borrower may change: everything in the profile's config, which a borrow owns outright -- models, sampling, memory settings, timezone, response mode, the custom error message and the generation visual. Persona, instructions, the image prompt, the critic prompt and the LTM summarisation prompt stay with the owner: they are read live from the original and are not stored on your borrow, so there is nothing local to edit. The Persona tab is hidden entirely on a borrowed profile, and the webhook name and avatar stay the author's.\n"
+        "What arrives changed: a borrow is a copy of the author's config, so their model choices come with it. If those name a provider you hold no key for, the slots are repointed to the bot defaults and you are told which. Anything you set in `/settings` -> Defaults is also applied, except the settings that belong to the character's own performance. See profiles/default_settings.\n"
         "Mechanism: If the original owner deletes or renames their Personal Profile, the Cascade Deletion Protocol instantly severs all borrowed links. The borrowed variant will be automatically deleted from your list to prevent database corruption.\n"
         "Naming: Your own profiles always win a name clash. If you create a personal profile with the same name as a System Profile, yours is the one that runs; the System Profile is only reached when you have no profile of your own by that name.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'A borrowed profile vanished from my list.' Fix: The owner deleted or renamed the original. Borrows are links, not copies; ask them to share it again.\n"
         "- Symptom: 'I cannot edit the persona of a profile I borrowed.' Fix: That is by design. Use Profile Cloning in `/profile hub` instead, which produces an independent Class A copy you own."
+    ),
+    "profiles/default_settings.txt": (
+        "Command: `/settings` -> Defaults (DM only). Sets standing preferences applied to profiles created or borrowed afterwards. Existing profiles are not changed; `/profile bulk manage` changes those.\n"
+        "Scope: All twelve model slots across six categories (Response, Image, TTS, Grounding, Anti-Repetition Critic, LTM Summariser), plus typing cursor, reasoning effort, realistic typing, LTM auto-creation, short-term memory length and timezone.\n"
+        "Platform default: Any setting left on 'Platform default' follows the value the bot ships and keeps following it if that value changes in a later version. Selecting the same model by hand pins it instead.\n"
+        "Saving: Values are written the moment they are chosen. This tab has no Save button, unlike the API Keys tab which requires Save Assignments.\n"
+        "Borrowed profiles: Defaults for models, memory, timezone and toggles apply to borrows. Defaults for temperature, Top P, Top K, advanced OpenRouter sampling, TTS voice, placeholder emoji, custom error message and the Director's Desk apply only to profiles you create, because on a borrow those belong to the author. Persona and instructions can never be defaulted or edited locally at all.\n"
+        "Provider rescue: If a borrowed profile names a provider you hold no key for, its model slots are repointed to the bot defaults at borrow time and you are told which ones. This only happens when you do hold a key for the replacement; if you hold neither, the author's choice is left alone.\n"
+        "Troubleshooting / Symptoms:\n"
+        "- Symptom: 'I set a default but my existing profiles did not change.' Fix: Defaults only apply to profiles made or borrowed afterwards. Use `/profile bulk manage` -> Set Models to change profiles you already have.\n"
+        "- Symptom: 'A profile I borrowed is using a different model than the library showed.' Fix: Either your default replaced it, or it named a provider you have no key for and was repointed. The bot sends a message saying which at borrow time. Change it in `/profile manage`.\n"
+        "- Symptom: 'My default temperature was ignored on a borrowed profile.' Fix: That is deliberate. Sampling is part of how a character was tuned, so a borrow keeps the author's values. Set it on that profile directly.\n"
+        "- Symptom: 'I want to stop using a default.' Fix: Choose 'Platform default' on that row. That is different from selecting the shipped value by hand, which pins it."
     ),
     "profiles/sharing_and_cloning.txt": (
         "Concept: 'Sharing' generates a temporary 5-minute Share Code allowing others to borrow a read-only link. 'Cloning' generates a 5-minute Clone Code to copy the configuration into a brand-new, independent Class A profile.\n"
@@ -520,7 +695,7 @@ DEFAULT_HELP_DOCS = {
     "apis/key_slots_and_assignment.txt": (
         "Command: `/settings` -> API Keys (DM only)\n"
         "Concept: You hold four key slots -- Google Gemini 1 and 2, OpenRouter 1 and 2. Select a slot, click 'Submit Key' to store a key in it, then use the assignment dropdown to choose where that slot applies.\n"
-        "Scopes: 'Personal' applies the key to your DM conversations and your own profiles' background work. A server entry applies it to every session in that server, and only appears for servers where you hold administrator permission.\n"
+        "Scopes: 'Personal' applies the key to your own Global Chat (`/profile global_chat`) wherever you run it -- a server channel or a DM -- and to your own profiles' background work. A server entry applies it to every session in that server, and only appears for servers where you hold administrator permission.\n"
         "Important: An assignment is not saved until 'Save Assignments' is clicked. Selecting scopes in the dropdown alone changes nothing.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I added a key but the bot still will not respond in my server.' Fix: Storing a key and assigning it are two separate steps. Select the slot, tick the server in the assignment dropdown, then click Save Assignments.\n"
@@ -572,18 +747,34 @@ DEFAULT_HELP_DOCS = {
     # --- SESSIONS ---
     "sessions/session_config.txt": (
         "Command: `/session config` (server administrators)\n"
-        "Capabilities: Configures the multi-profile chat session in this channel. The Cast tab adds and removes participants (up to 200, from personal, borrowed and child bot profiles). The Config tab sets execution order, the Master Prompt, TTS and the per-round response limit.\n"
+        "Capabilities: Configures the multi-profile chat session in this channel. The Cast tab adds and removes participants (up to 200). The Source button cycles through four sources: personal, borrowed, System and child bot. The Config tab sets execution order, the Master Prompt, TTS and the per-round response limit.\n"
+        "One profile, one seat: a profile speaks either as a child bot or as a webhook, never both. Seating the same profile the other way is refused, and the dropdown marks it 'Already seated as a webhook' (or as a child bot) so the clash is visible before it is attempted. Remove it and add it back the other way to change how it speaks.\n"
+        "System profiles: profiles published by the bot operator, addressable by everyone. They are seated like any other participant. A personal or borrowed profile of the same name takes precedence and the System one is not offered.\n"
         "Execution Modes: 'Sequential' forces participants to speak in a strict order. 'Random' shuffles the speaker order every round.\n"
         "Master Prompt: A scene prompt shared by every participant in the session -- the setting, the situation, what is happening. Distinct from any individual profile's persona.\n"
         "Response Limit: Caps how many profiles reply in a single round, so a large cast does not answer every message all at once.\n"
+        "Seating versus starting: choosing a profile on the Cast tab seats it immediately -- it appears on the Reactivity tab and can have its chance and wakewords set straight away, with no button press in between. It does not make the channel live. Until 'Start / Update Session' is pressed the session is a draft: the footer reads 'Draft', ordinary messages pass through untouched and the AI Director stays quiet. The button, on every tab, starts it -- saving the configuration, loading the transcript, and telling every child bot in the cast which channel it is in. Pressing it again on a live session re-saves and re-announces.\n"
+        "An empty cast is allowed. A started session with nobody in it keeps its transcript, Master Prompt and settings and simply has no one to answer, which is what 'Clear Cast' leaves behind. `/suspend` is what ends a session outright.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'I configured a session but nothing happens.' Fix: Click 'Start / Update Session' after building the cast. Selecting profiles alone does not start it.\n"
+        "- Symptom: 'I configured a session but nothing happens.' Fix: Press 'Start / Update Session'. Seating a cast does not start it -- check the footer, which reads 'Draft' until you do.\n"
+        "- Symptom: 'A child bot is in the cast but ignores the channel.' Fix: Press 'Start / Update Session'. It re-announces the channel to every child bot in the cast, which a restored session does not do on its own.\n"
+        "- Symptom: 'A profile is missing from the dropdown, or shows Already seated.' Fix: It is already in the cast the other way round -- as a child bot if you are looking at a webhook source, or the reverse. Remove it first.\n"
+        "- Symptom: 'Select All did not clear everything.' Fix: The Select All and Unselect All options only affect the source currently shown; 'Clear Cast' empties all four.\n"
+        "- Symptom: 'My characters post under the bot's own name and avatar.' Fix: The bot needs Manage Webhooks in that channel; without it there is no way to give a character its own name and face. If it has the permission and someone deleted the webhook, it now notices and makes a new one on the next message rather than falling back forever. A character with no Appearance set still speaks under its own name, with one of Discord's default avatars.\n"
         "- Symptom: 'Only some of my cast replies each round.' Fix: That is the Response Limit. Raise it in the Config tab."
     ),
     "sessions/session_swap.txt": (
-        "Command: `/session swap [profile] [use_child_bot] [slot]`\n"
+        "Command: `/session swap [profile_name] [use_child_bot] [slot]`\n"
         "Capabilities: Dynamically inject, remove, or swap characters inside an active session without interrupting the conversation. Users can assign specific slots to override a specific participant.\n"
-        "Delivery Method: The `use_child_bot` parameter forces the profile to reply using a dedicated Discord bot application (Child Bot) instead of a Webhook."
+        "With no options at all: lists the current participants and their slot numbers.\n"
+        "Adding: name a profile that is not in the session. Without a slot it takes the next free seat (or replaces the only participant, if the session has one); with a slot it replaces that seat, or is appended if the slot is past the end.\n"
+        "Removing: two equivalent forms. Name a profile that is already a participant, or give a slot with no profile name. Either drops that participant and stands its child bot down. The last remaining participant can be removed; the session stays as it is with an empty cast, and `/suspend` is what ends it outright.\n"
+        "Starting a session this way seats but does not start: run it in a channel with no session and the profile is seated as a draft, with the reply pointing at `/session config` -> 'Start / Update Session'. Run against a session that is already live and the change applies live, as it always has.\n"
+        "Naming a seated profile *together with* a slot or use_child_bot does not remove it: those say where or how someone sits, not whether they should be there, so the command reports the seat it is already in rather than deleting it. Run the bare form to remove.\n"
+        "Delivery Method: The `use_child_bot` parameter forces the profile to reply using a dedicated Discord bot application (Child Bot) instead of a Webhook. To change it for someone already seated, remove them and add them back with the value you want.\n"
+        "Troubleshooting / Symptoms:\n"
+        "- Symptom: 'I named a profile and it vanished from the session instead of being added.' Fix: That profile was already a participant. Naming a seated profile is the removal form; add a different profile, or re-run the command to bring it back.\n"
+        "- Symptom: 'I added a profile and it still does not reply.' Fix: A session started this way is a draft. Open `/session config` and press 'Start / Update Session'."
     ),
     "sessions/session_controls.txt": (
         "Capabilities: Users can dynamically control the flow of a chat session using specific message reactions.\n"
@@ -634,15 +825,19 @@ DEFAULT_HELP_DOCS = {
     "sessions/global_chat.txt": (
         "Command: `/profile global_chat`\n"
         "Concept: Opens a persistent conversation with a single profile. It has its own history, kept separately from any server session, and follows you across servers and into DMs.\n"
-        "Surface: Not a DM and not a channel of messages -- the entire conversation is rendered into a single embed, posted where the command was run and edited in place. The profile's latest reply is the embed body and your last message is its footer, so the message never scrolls away. Reply opens a modal to write in, Play submits the queue, and the lock button controls access.\n"
-        "Who can join: A session is locked to the host by default. Unlocking it lets anyone who can see the embed press Reply and Play, and the history stays the host's. Replies landing inside the same ten-second window are queued together and delivered as one turn, so a group is answered once rather than once each.\n"
+        "Where it runs: Anywhere the command is available -- a server channel or a DM with the bot. It is not a DM-only command and not a DM feature; 'global' describes the history, which is keyed to you and the profile rather than to a channel, so the same conversation resumes wherever you next open it.\n"
+        "Surface: Not a DM and not a channel of messages -- the entire conversation is rendered into a single embed, posted where the command was run and edited in place. The profile's latest reply is the body of the card, and the messages it answered are listed under it by name, so a round with several people in it shows all of them. The footer says who may reply and who is still writing. Reply opens a pop-up box to write in, Play sends the queue, and the lock button decides who may press either.\n"
+        "Visibility: The embed is an ordinary channel message, not an ephemeral one. In a server, everyone who can read the channel can read the profile's reply and your last line in the footer. The lock governs who may press Reply and Play, not who may see the card. Only the draft is private: Reply opens a pop-up box, and the queue of unplayed messages is shown to its author alone.\n"
+        "Who can join: A session is locked to the host by default; the button reads 'Host only' locked and 'Open to all' unlocked. Unlocking lets anyone who can see the embed press Reply and Play, and the history stays the host's. Replies landing inside the same ten-second window are queued together and delivered as one turn, so a group is answered once rather than once each -- while people are still writing, Play reads how many it is waiting on.\n"
         "Keys: Global chat runs on your Personal key assignment rather than a server's key, so you need a key assigned to 'Personal' in `/settings` -> API Keys.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Global chat says no API key.' Fix: Assign one of your key slots to the 'Personal' scope in `/settings` -> API Keys and click Save Assignments.\n"
-        "- Symptom: 'The profile does not remember our server conversation in global chat.' Fix: Correct, and there is no setting for it. Global chat keeps a separate history of its own, and every long-term memory belongs to the server it formed in, so no server memory is ever recalled there."
+        "- Symptom: 'The profile does not remember our server conversation in global chat.' Fix: Correct, and there is no setting for it. Global chat keeps a separate history of its own, and every long-term memory belongs to the server it formed in, so no server memory is ever recalled there.\n"
+        "- Symptom: 'The card said someone else's message was mine.' Fix: Fixed. The card used to label whatever was said last as 'You:' under the host's avatar, which was wrong for everyone except the host. Every message is now listed under the name of whoever wrote it, and a round answering several people shows all of them.\n"
+        "- Symptom: 'Other people in the channel can see my global chat.' Fix: They can, and that is by design -- the card is a normal message. The lock only stops them pressing the buttons. Run the command in a DM with the bot for a conversation nobody else can read; the history is the same one either way."
     ),
     "sessions/maintenance_commands.txt": (
-        "Commands: `/refresh`, `/cancel`, `/suspend`, `/purge`, `/memorise`, `/clear`, `/session view`, `/session trigger`, `/session audit`\n"
+        "Commands: `/refresh`, `/cancel`, `/suspend`, `/purge`, `/memorise`, `/clear`, `/trigger`, `/session view`, `/session audit`\n"
         "- `/refresh`: Clears the short-term conversation buffer for this channel. Long-term memories and training examples are untouched. Use when a profile has become confused about recent events.\n"
         "- `/cancel`: Stops whatever generation or typing indicator is currently running in this channel.\n"
         "- `/suspend`: Administrators. Ends the session in this channel and stops the bot responding until it is configured again.\n"
@@ -650,7 +845,7 @@ DEFAULT_HELP_DOCS = {
         "- `/memorise`: Administrators (or a participant's owner, for a single named profile). Forces long-term memory summarisation for the session's cast right now, instead of waiting for the automatic creation interval.\n"
         "- `/clear`: Clears the bot's own messages from a DM channel.\n"
         "- `/session view`: Shows the current session configuration and participant status.\n"
-        "- `/session trigger`: Forces a new round immediately without waiting for a user message.\n"
+        "- `/trigger`: Forces a new round immediately without waiting for a user message. Renamed from `/session trigger`.\n"
         "- `/session audit`: Reports token usage and diagnostics for the active session. Use it when you want to know what is actually filling the context window.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'The bot seems stuck typing forever.' Fix: Run `/cancel` in that channel.\n"
@@ -709,8 +904,10 @@ DEFAULT_HELP_DOCS = {
         "Self-portraits: The system automatically injects the profile's 'Appearance' text into the image prompt if the request appears to be for a picture of the character itself, keeping it consistent between generations.\n"
         "Editing: Reply to an existing image with `!image` and a new instruction to iterate on that image.\n"
         "Enabling: `/profile manage` -> Tools -> Image Generation.\n"
-        "Output settings: `/profile manage` -> Tools -> Set Image Output chooses aspect ratio, resolution and thinking level. The options offered are only the ones the profile's chosen image model accepts, so the list changes with the model. Leaving a setting on 'Model default' sends no preference at all.\n"
-        "Resolution: 512, 1K and 2K. 4K is not offered -- a 4K render usually exceeds Discord's attachment limit and would fail to upload after being paid for.\n"
+        "Output settings: `/profile manage` -> Tools -> Set Image Output chooses aspect ratio, resolution, thinking level and search grounding. The options offered are only the ones the profile's chosen image model accepts, so the list changes with the model. Leaving a setting on 'Model default' sends no preference at all.\n"
+        "Resolution: 512, 1K and 2K. 4K is not offered -- a 4K render usually exceeds Discord's attachment limit and would fail to upload after being paid for. Gemini 3.1 Flash Lite Image renders at 1K only and takes no resolution request at all, so the picker hides the row for it.\n"
+        "Search grounding: 'Web search' attaches Google Search so the model can look facts up before drawing; 'Web + image search' additionally returns real photographs off the web for the model to use as visual reference. Gemini 3.1 Flash Image supports both, Gemini 3 Pro Image web search only, and Gemini 3.1 Flash Lite Image and 2.5 Flash Image neither -- a mode the model does not carry is kept on the profile and left out of the request.\n"
+        "Sampling: `/profile manage` -> Tools -> Set Image Sampling sets temperature, Top P and Top K for the image model. These are separate from the text profile's Generation Parameters because they go to a different model on a different request. Blank means the field is not sent at all; type '-' to clear one back to blank. Google recommends leaving the Gemini 3 family at its default temperature, so these exist for the profile that has a reason to move them.\n"
         "Thinking level: Only the Gemini 3 image models take one. HIGH refines the composition before drawing, which is slower and billed for the extra thinking; MINIMAL draws straight away.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Paid Key Required' or image generation fails. Fix: Image models are completely blocked by Google on free-tier API keys. A valid billing account must be active in Google AI Studio.\n"
@@ -748,7 +945,8 @@ DEFAULT_HELP_DOCS = {
     ),
     "features/typing_simulation.txt": (
         "Concept: Realistic Typing splits a reply on sentence boundaries and streams it with human-like delays instead of posting one block.\n"
-        "Configuration: `/profile manage` -> Tools -> Realistic Typing. Set the characters-per-second rate, a maximum delay cap, and the chunking mode.\n"
+        "Configuration: `/profile manage` -> Tools -> Realistic Typing. Set the characters-per-second rate, a maximum delay cap, the chunking mode, and the cursor.\n"
+        "Cursor: While the reply is still being edited in, the profile's placeholder emoji is attached to the message so a partial reply is not mistaken for a finished one. 'below' puts it on its own line underneath (the default -- nothing already on screen moves), 'prefix' puts it in front of the text, and 'off' restores the old behaviour. The final edit removes it. The emoji is the profile's own placeholder (Tools -> Placeholder), falling back to the bot-wide one.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Messages take far too long to arrive.' Fix: Raise the characters-per-second value or lower the maximum delay cap. Long replies multiply the effect."
     ),
@@ -805,3 +1003,22 @@ OLLAMA_GUIDE_TEXT = (
     "5. Click **Set Host URL** and paste that `https://` URL.\n\n"
     "*Note: If the **Set Host URL** appears green, the URL is working. Otherwise, it will appear red. Every time you restart the SSH tunnel, the URL may change.*"
 )
+
+
+# The one unprompted message the bot ever sends. It goes out once per invite, into a
+# server, and nowhere else -- never a DM, and never a second time in a channel it has
+# already greeted. Three lines, because there is a whole wizard behind `/start` and a
+# whole manual behind `/help`; anything longer here is documentation in the wrong place.
+#
+# {start} and {help} are substituted with clickable command mentions where the ids are
+# known, and with plain code spans where they are not -- see MimicCog.command_mention.
+WELCOME_MESSAGE = (
+    "Hey! I run AI characters (profiles) — each with its own persona, memory, name, and face in your channels.\n\n"
+    "**New to this bot? Run {start}.** This will guide you through setting up MimicAI in your server.\n\n"
+    "Activating a character *in a channel* requires a user with **Administrator** permissions — so if you do not have them here, feel free to build yours in a server of your own.\n\n"
+    "{help} is a system profile that can assist with your queries, but only use this after you've set up MimicAI!"
+)
+
+#: Channel names worth trying when a server has no system channel set. Matched as a
+#: substring against the lowercased name, in this order.
+WELCOME_CHANNEL_HINTS = ("welcome", "general", "lobby", "chat", "main", "bot")

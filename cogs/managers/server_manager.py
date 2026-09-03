@@ -6,6 +6,13 @@ import discord
 from .storage_manager import IOManager
 from ..utils.constants import GLOBAL_PROMPTS_FILE_PATH, BLACKLIST_FILE_PATH
 
+#: Discord's "Unknown Webhook". A webhook URL is cached *and persisted*, and
+#: `Webhook.from_url` contacts nobody, so a webhook deleted in the server leaves a URL
+#: that 404s on every send -- forever, and across restarts, because the dead URL is on
+#: disk. Every webhook path must tell this apart from Unknown Message (10008), which is
+#: an ordinary outcome when editing or deleting and belongs to the caller.
+UNKNOWN_WEBHOOK = 10015
+
 try:
     import orjson as json
 except ImportError:
@@ -165,29 +172,69 @@ class ServerManager:
             elif atype in act_classes: return discord.Activity(type=act_classes[atype], name=text)
         return None
 
-    async def _get_or_create_webhook(self, channel: Union[discord.TextChannel, discord.Thread]) -> Optional[discord.Webhook]:
-        parent_channel = channel.parent if isinstance(channel, discord.Thread) else channel
-        
+    @staticmethod
+    def _parent_of(channel: Union[discord.TextChannel, discord.Thread]):
+        """The channel a webhook actually belongs to. A thread posts through its parent's."""
+        return channel.parent if isinstance(channel, discord.Thread) else channel
+
+    def invalidate_webhook(self, channel: Union[discord.TextChannel, discord.Thread]) -> None:
+        """Forget a channel's webhook after Discord said it no longer exists.
+
+        Only the in-memory object is dropped, never the persisted URL: `_save_channel_webhooks`
+        rebuilds the per-server files from the entries that remain, so a server left with no
+        entries is simply not rewritten and its stale file survives to be re-read at boot.
+        Leaving the dead URL in place is safe because the next acquisition re-validates it,
+        fails, creates a replacement and overwrites the entry -- which does rewrite the file.
+        """
+        parent_channel = self._parent_of(channel)
+        if parent_channel is not None:
+            self._webhook_from_cache.pop(parent_channel.id, None)
+
+    async def _get_or_create_webhook(self, channel: Union[discord.TextChannel, discord.Thread],
+                                     *, force_refresh: bool = False) -> Optional[discord.Webhook]:
+        parent_channel = self._parent_of(channel)
+
         # Soft-fail for DMs or environments without guilds
         if not getattr(parent_channel, 'guild', None):
             return None
-            
+
         try:
-            # Rebuild from the cached URL. Both branches used to call parent_channel.webhooks()
-            # — a REST round trip — so the cache never actually saved anything; it stored a URL
-            # nothing read. Webhook.from_url sends no request, which takes that round trip off
-            # the front of every placeholder and every webhook message.
-            cached = self.cog.channel_webhooks.get(parent_channel.id)
-            if cached and cached.get('url'):
-                cached_wh = getattr(self, '_webhook_from_cache', {}).get(parent_channel.id)
-                if cached_wh is None:
-                    try:
-                        cached_wh = discord.Webhook.from_url(cached['url'], client=self.cog.bot)
-                        self._webhook_from_cache.setdefault(parent_channel.id, cached_wh)
-                    except Exception:
-                        cached_wh = None
+            # `_webhook_from_cache` holds only webhooks this process has confirmed exist,
+            # so a hit is free. Both branches below used to call parent_channel.webhooks()
+            # — a REST round trip — so the cache never actually saved anything; it stored a
+            # URL nothing read. Webhook.from_url sends no request, which takes that round
+            # trip off the front of every placeholder and every webhook message.
+            if not force_refresh:
+                cached_wh = self._webhook_from_cache.get(parent_channel.id)
                 if cached_wh is not None:
                     return cached_wh
+
+                cached = self.cog.channel_webhooks.get(parent_channel.id)
+                if cached and cached.get('url'):
+                    try:
+                        cached_wh = discord.Webhook.from_url(cached['url'], client=self.cog.bot)
+                    except Exception:
+                        cached_wh = None
+
+                    if cached_wh is not None:
+                        try:
+                            # One round trip, once per channel per process -- not per send.
+                            # `from_url` validates nothing, so without this a webhook deleted
+                            # in the server poisoned the channel permanently: every profile
+                            # fell back to a plain bot message under the bot's own name, and
+                            # the dead URL was reloaded from disk on the next boot.
+                            # prefer_auth=False authenticates with the webhook's own token,
+                            # so this works without Manage Webhooks.
+                            await cached_wh.fetch(prefer_auth=False)
+                            self._webhook_from_cache[parent_channel.id] = cached_wh
+                            return cached_wh
+                        except discord.NotFound:
+                            print(f"Webhook for #{parent_channel.name} no longer exists; recreating.")
+                        except Exception:
+                            # A rate limit or a 5xx says nothing about whether the webhook
+                            # exists. Hand it over unvalidated -- the old behaviour -- rather
+                            # than creating a second webhook against a transient failure.
+                            return cached_wh
 
             # No usable cache entry: fetch or create, which does cost a round trip.
             webhooks = await parent_channel.webhooks()
@@ -199,7 +246,51 @@ class ServerManager:
             self._webhook_from_cache[parent_channel.id] = bot_webhook
             self._save_channel_webhooks()
             return bot_webhook
+        except discord.Forbidden:
+            # The usual cause of a whole server delivering under the bot's own name.
+            print(f"Missing Manage Webhooks in #{getattr(parent_channel, 'name', '?')}; "
+                  f"profiles will speak as the bot there.")
         except Exception as e:
             print(f"Failed to get/create webhook for {parent_channel.name}: {e}")
         return None
+
+    async def run_webhook(self, channel: Union[discord.TextChannel, discord.Thread],
+                          op: str, *args, **kwargs):
+        """Perform one webhook operation, healing a webhook Discord no longer has.
+
+        Returns None when the channel has no webhook to be had at all (a DM, or missing
+        Manage Webhooks), which is the caller's cue to fall back to a plain message.
+        Unknown Webhook (10015) is the only error retried, and only once, against a
+        freshly created one; Unknown Message (10008) is a normal result of editing or
+        deleting something a child bot owns and must reach the caller unchanged.
+        """
+        for attempt in (0, 1):
+            webhook = await self._get_or_create_webhook(channel, force_refresh=bool(attempt))
+            if webhook is None:
+                return None
+            try:
+                return await getattr(webhook, op)(*args, **kwargs)
+            except discord.HTTPException as e:
+                if attempt or e.code != UNKNOWN_WEBHOOK:
+                    raise
+                self.invalidate_webhook(channel)
+                self._rewind_files(args, kwargs)
+        return None
+
+    @staticmethod
+    def _rewind_files(args, kwargs) -> None:
+        """Seek any file about to be sent a second time back to the start.
+
+        The failed attempt read the whole multipart body, and discord.py only rewinds on
+        its *own* internal retries (`reset(seek=tries)`, and a fresh request starts at
+        tries 0) -- so a retried image would otherwise upload as zero bytes.
+        """
+        for value in list(args) + list(kwargs.values()):
+            items = value if isinstance(value, (list, tuple)) else (value,)
+            for item in items:
+                if isinstance(item, discord.File):
+                    try:
+                        item.reset(seek=True)
+                    except Exception:
+                        pass
 

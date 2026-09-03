@@ -19,6 +19,10 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
+from ..utils.user_defaults import (
+    apply_defaults, model_provider, platform_model_defaults, sanitise_defaults,
+    setting_label)
+from ..utils.helpers import is_real_model
 from ..utils.constants import (
     USERS_DIR, PUBLIC_PROFILES_DIR, defaultConfig,
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS,
@@ -32,8 +36,10 @@ from ..utils.constants import (
     CONTENT_RATING_ADULT, CONTENT_RATING_EXEMPT,
     CONTENT_RATING_CAPABILITIES, CONTENT_CAPABILITY_DENIALS,
     CONTENT_RATING_EMOJI,
-    DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE, )
-from ..utils.helpers import is_real_model, resolve_critic_settings, resolve_image_output_params
+    DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
+    IMAGE_GROUNDING_LABELS, )
+from ..utils.helpers import (is_real_model, resolve_critic_settings,
+                            resolve_image_output_params, resolve_image_tools)
 from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
@@ -544,7 +550,12 @@ class ProfileManager:
         """Scans the user's profile directory to reconstruct a missing or corrupted index.json."""
         user_id_str = str(user_id)
         old_index = IOManager.read_json(os.path.join(USERS_DIR, user_id_str, "index.json")) or {}
-        index = {"personal": {}, "borrowed": {}, "system": old_index.get("system", {})}
+        # "defaults" carried across for the same reason "system" is: this function
+        # reconstructs the profile lists by scanning the directory, and everything it
+        # cannot scan for has to be preserved explicitly or a repair silently deletes
+        # it. There is nothing on disk to rebuild a user's default settings from.
+        index = {"personal": {}, "borrowed": {}, "system": old_index.get("system", {}),
+                 "defaults": old_index.get("defaults", {})}
         profiles_dir = os.path.join(USERS_DIR, user_id_str, "profiles")
 
         if os.path.isdir(profiles_dir):
@@ -674,6 +685,77 @@ class ProfileManager:
         path = os.path.join(USERS_DIR, user_id_str, "index.json")
         IOManager.write_json(data, path)
         self.cog.user_indices[user_id_str] = data
+
+    def _get_user_defaults(self, user_id: int) -> Dict[str, Any]:
+        """The user's standing profile defaults, filtered to what is still defaultable.
+
+        Returned as a copy: `_get_user_index` hands back the cached index by reference,
+        and the settings screen edits what it is given.
+        """
+        index = self._get_user_index(user_id)
+        return dict(sanitise_defaults(index.get("defaults")))
+
+    def _save_user_defaults(self, user_id: int, defaults: Dict[str, Any]):
+        """Replaces the stored defaults. Sparse -- only keys the user actually chose.
+
+        An empty dict removes the key entirely rather than storing `{}`, so "never
+        opened this screen" and "opened it and cleared everything" look the same on
+        disk, which is what they mean.
+        """
+        index = self._get_user_index(user_id)
+        cleaned = sanitise_defaults(defaults)
+        if cleaned:
+            index["defaults"] = cleaned
+        else:
+            index.pop("defaults", None)
+        self._save_user_index(user_id, index)
+
+    def _user_holds_provider_key(self, user_id: int, provider: str) -> bool:
+        """Whether the user has a key of this provider in any of their four slots.
+
+        Deliberately looser than `_get_api_key_for_user`, which also requires the key
+        to be *assigned*. This is used at borrow time to decide whether a profile has
+        any chance of running, and an unassigned key is a step in `/start`, not a
+        reason to rewrite someone's model choice out from under them.
+
+        Ollama needs no key at all -- it is a URL the bot dials -- so it always holds.
+        """
+        if provider == "ollama":
+            return True
+        try:
+            keys_data = self.cog.storage_manager._get_user_keys_data(user_id) or {}
+        except Exception:
+            return False
+        return any(slot.get("provider") == provider and slot.get("key")
+                   for slot in (keys_data.get("slots") or {}).values()
+                   if isinstance(slot, dict))
+
+    def _rescue_unusable_models(self, user_id: int, config: Dict[str, Any]) -> List[str]:
+        """Repoints model slots naming a provider this user has no key for.
+
+        A borrow arrives as a copy of the author's config, model choices included. An
+        author on OpenRouter therefore handed every borrower a profile that could not
+        generate a single word, and the failure surfaced as "OpenRouter API Key not
+        found" to someone who had just finished adding a Google key -- an error about
+        a decision they never made.
+
+        Only ever moves a slot *to* a provider the user does hold, so a user with no
+        Google key is not rescued from OpenRouter onto a Google model they equally
+        cannot run. If neither side is usable the author's value stays: there is no
+        right answer, and churning it would only hide where the problem came from.
+        """
+        rescued = []
+        for slot, platform_value in platform_model_defaults().items():
+            value = config.get(slot)
+            if not is_real_model(value):
+                continue
+            if self._user_holds_provider_key(user_id, model_provider(value)):
+                continue
+            if not self._user_holds_provider_key(user_id, model_provider(platform_value)):
+                continue
+            config[slot] = platform_value
+            rescued.append(slot)
+        return sorted(rescued)
 
     def _get_profile_config(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> Optional[Dict[str, Any]]:
         p_data = self._get_profile(user_id, profile_name, is_borrowed)
@@ -829,6 +911,10 @@ class ProfileManager:
                 # because every image model already has one and ours would only
                 # override it on profiles nobody configured.
                 "image_aspect_ratio": "", "image_size": "", "image_thinking_level": "",
+                # Same "empty means send nothing" rule: no search tool on an image
+                # request, and no sampling overrides, unless the profile asks.
+                "image_grounding_mode": "",
+                "image_temperature": "", "image_top_p": "", "image_top_k": "",
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
                 "thinking_level": "low", "thinking_budget": -1,
                 "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": DEFAULT_SPEECH_VOICE,
@@ -836,6 +922,12 @@ class ProfileManager:
                 "neuro_engine_enabled": False, "neuro_state": {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20},
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }
+
+            # The template above is what the bot ships; anything the user has set as
+            # their own default wins over it. New profiles take every defaultable key,
+            # including the ones a borrow may not have -- there is no author here whose
+            # tuning a standing preference could be overwriting.
+            apply_defaults(config, self._get_user_defaults(user_id), borrowed=False)
 
             prompts = {
                 "persona": {}, "ai_instructions": ["", "", "", ""], "image_generation_prompt": None,
@@ -882,6 +974,10 @@ class ProfileManager:
                 # because every image model already has one and ours would only
                 # override it on profiles nobody configured.
                 "image_aspect_ratio": "", "image_size": "", "image_thinking_level": "",
+                # Same "empty means send nothing" rule: no search tool on an image
+                # request, and no sampling overrides, unless the profile asks.
+                "image_grounding_mode": "",
+                "image_temperature": "", "image_top_p": "", "image_top_k": "",
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
                 "thinking_level": "low", "thinking_budget": -1,
                 "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": DEFAULT_SPEECH_VOICE,
@@ -2679,8 +2775,13 @@ class ProfileManager:
         # user could only catch by inspecting the generated image.
         img_out = resolve_image_output_params(
             config, config.get("image_generation_model") or DEFAULT_IMAGE_MODEL)
-        img_detail = " \u00b7 ".join(v for v in (img_out.get("aspect_ratio"), img_out.get("image_size"),
-                                            img_out.get("thinking_level")) if v)
+        img_ground = resolve_image_tools(
+            config, config.get("image_generation_model") or DEFAULT_IMAGE_MODEL)
+        img_detail = " \u00b7 ".join(v for v in (
+            img_out.get("aspect_ratio"), img_out.get("image_size"),
+            img_out.get("thinking_level"),
+            IMAGE_GROUNDING_LABELS.get(config.get("image_grounding_mode")) if img_ground else None,
+        ) if v)
         if img_detail:
             img_gen += f" `{img_detail}`"
 
@@ -3001,6 +3102,10 @@ class ProfileManager:
             await interaction.followup.send(f"Limit Reached. You have {current_borrowed}/{limit} borrowed profiles.", ephemeral=True)
             return
 
+        # Collected inside the threaded save, read after it: what the borrow arrived
+        # with is not what the library showed, and the user is owed the difference.
+        adjustments: List[Tuple[str, str]] = []
+
         def _sync_save():
             target_original_pid = target_pid or owner_profile_data.get("profile_id", "00000000")
             source_pointer = f"{sharer_id}:{target_original_pid}"
@@ -3023,6 +3128,24 @@ class ProfileManager:
                 "borrowed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "ltm_creation_enabled": False
             })
+
+            # Two passes over the inherited config, in this order.
+            #
+            # First the borrower's own defaults, but only the keys whose action row is
+            # scope="all" -- see user_defaults. A borrow is somebody else's writing,
+            # and a standing preference for, say, temperature 1.1 must not silently
+            # retune a persona built at 0.4.
+            #
+            # Then the rescue, which is not a preference at all: it repoints model
+            # slots naming a provider this user holds no key for. Order matters --
+            # an explicit default is checked by the rescue like any other value, so
+            # choosing an OpenRouter default without an OpenRouter key cannot produce
+            # a profile that is dead on arrival.
+            applied = apply_defaults(snapshot_data, self._get_user_defaults(interaction.user.id),
+                                     borrowed=True)
+            rescued = self._rescue_unusable_models(interaction.user.id, snapshot_data)
+            adjustments.extend(("default", k) for k in applied)
+            adjustments.extend(("rescue", k) for k in rescued)
 
             # The class letter records provenance, not current state: 'C' means the
             # borrow arrived through the Public Library, 'B' through a private share
@@ -3056,6 +3179,46 @@ class ProfileManager:
 
         if not is_public_borrow:
             await self._reject_share_request(interaction, sharer_id, target_pid, fallback_name, notify_sharer=True, accepted=True)
+
+        await self._report_borrow_adjustments(interaction, desired_name, adjustments)
+
+    async def _report_borrow_adjustments(self, interaction: discord.Interaction,
+                                         profile_name: str,
+                                         adjustments: List[Tuple[str, str]]):
+        """Tells the borrower which inherited settings did not survive the borrow.
+
+        Silent on the common case, where nothing was changed. It exists for the two
+        that are not silent-able: a standing default overwrote what the author chose,
+        and a model slot was repointed because its provider is one this user cannot
+        reach. Both leave the profile behaving differently from the one in the
+        library, and a difference nobody announced reads as the borrow being broken.
+        """
+        if not adjustments:
+            return
+
+        lines = []
+        rescued = [k for kind, k in adjustments if kind == "rescue"]
+        applied = [k for kind, k in adjustments if kind == "default"]
+
+        if rescued:
+            lines.append(
+                f"⚠️ `{profile_name}` was built around a provider you have no key for. "
+                f"Repointed to the bot's defaults: "
+                + ", ".join(f"**{setting_label(k)}**" for k in rescued)
+                + ".\nAdd the missing key in `/settings`, then set the models back in "
+                  f"`/profile manage profile_name:{profile_name}`.")
+        if applied:
+            lines.append(
+                f"⚙️ Your defaults were applied to `{profile_name}`: "
+                + ", ".join(f"`{setting_label(k)}`" for k in applied)
+                + ".\n-# Change what these do in `/settings` → Defaults.")
+
+        try:
+            await interaction.followup.send("\n\n".join(lines), ephemeral=True)
+        except Exception:
+            # A borrow that succeeded must not be reported as failed because its
+            # explanatory note could not be delivered.
+            pass
 
     async def _reject_share_request(self, interaction: discord.Interaction, sharer_id: int, target_pid: Optional[str], fallback_name: str, notify_sharer: bool = True, accepted: bool = False):
         recipient_id_str = str(interaction.user.id)

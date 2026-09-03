@@ -150,11 +150,20 @@ IMAGE_SIZES_ALL = ('512', '1K', '2K')
 #: 2.5 Flash Image is the exception: every example Google publishes for it asks for
 #: TEXT and IMAGE together, and the API rejects a combination a model does not list, so
 #: pinning it to IMAGE alone would 400 every request on what is still the default model.
+#:
+#: `grounding` marks the models that accept the native `google_search` tool on an image
+#: request, and `image_search` the one that additionally accepts the imageSearch search
+#: type -- retrieving real photographs off the web and using them as visual reference
+#: rather than only reading text. Both are narrower than the text-model story: 3 Pro
+#: grounds against web search only, and the Lite model takes neither.
 IMAGE_MODEL_CAPS = {
-    'gemini-3.1-flash-image':      {'sizes': ('512', '1K', '2K'), 'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'modalities': ('IMAGE',)},
-    'gemini-3.1-flash-lite-image': {'sizes': ('512', '1K'),       'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'modalities': ('IMAGE',)},
-    'gemini-3-pro-image':          {'sizes': ('1K', '2K'),        'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': True,  'modalities': ('IMAGE',)},
-    'gemini-2.5-flash-image':      {'sizes': (),                  'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': False, 'modalities': ('TEXT', 'IMAGE')},
+    'gemini-3.1-flash-image':      {'sizes': ('512', '1K', '2K'), 'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'modalities': ('IMAGE',),          'grounding': True,  'image_search': True},
+    # 1K and nothing else. It was listed with ('512', '1K') from the 3.1 Flash row; the
+    # published table gives the Lite model one resolution, so an empty tuple is the
+    # honest encoding -- send no imageSize and let the model use the only one it has.
+    'gemini-3.1-flash-lite-image': {'sizes': (),                  'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'modalities': ('IMAGE',),          'grounding': False, 'image_search': False},
+    'gemini-3-pro-image':          {'sizes': ('1K', '2K'),        'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': True,  'modalities': ('IMAGE',),          'grounding': True,  'image_search': False},
+    'gemini-2.5-flash-image':      {'sizes': (),                  'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': False, 'modalities': ('TEXT', 'IMAGE'),   'grounding': False, 'image_search': False},
 }
 
 #: What an unknown image model gets: ratios every listed model shares, no imageSize and
@@ -165,7 +174,7 @@ IMAGE_MODEL_CAPS = {
 #: unrecognised model gets: asking for a combination it does not support is an error,
 #: and we cannot know which combinations a model we have never seen lists.
 IMAGE_MODEL_CAPS_DEFAULT = {'sizes': (), 'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': False,
-                            'modalities': ()}
+                            'modalities': (), 'grounding': False, 'image_search': False}
 
 #: What each ratio is *for*. A dropdown of fourteen bare numbers tells nobody which one
 #: is the phone-shaped one, and the four extreme ratios are easy to pick by accident.
@@ -192,6 +201,45 @@ IMAGE_THINKING_NOTES = {
 #: API's own default on 3.1 Flash; HIGH spends longer refining composition before it
 #: draws, and is billed for the thinking tokens either way.
 IMAGE_THINKING_LEVELS = ('MINIMAL', 'HIGH')
+
+#: Native search grounding on an *image* request. Three states rather than a boolean,
+#: because Google splits the one `google_search` tool into two search types and only
+#: 3.1 Flash Image carries the second:
+#:
+#:   off        -- no tool. The model draws from what it already knows.
+#:   web        -- {"google_search": {}}. Web search only: the model looks facts up and
+#:                 renders from the text it read (today's weather map, a current logo).
+#:   web_images -- adds the imageSearch search type, so the tool returns image *bytes*
+#:                 the model uses as visual reference. The wire shape is nested inside
+#:                 the same tool, not a second one:
+#:                     {"google_search": {"searchTypes": {"webSearch": {},
+#:                                                        "imageSearch": {}}}}
+#:                 Checked against the v1beta discovery document (GoogleSearch.searchTypes
+#:                 -> SearchTypes{webSearch, imageSearch}); the flat
+#:                 `"search_types": ["web_search"]` list belongs to the newer
+#:                 Interactions API, which this client does not post to.
+#:
+#: A mode the chosen model does not carry is dropped exactly as an unsupported
+#: resolution is -- the profile keeps its preference, the request goes without.
+IMAGE_GROUNDING_MODES = ('off', 'web', 'web_images')
+
+IMAGE_GROUNDING_NOTES = {
+    'off': 'No search. The model draws from what it knows.',
+    'web': 'Google Search for facts, then draws. 3.1 Flash and 3 Pro.',
+    'web_images': 'Also pulls reference photos off the web. 3.1 Flash only.',
+}
+
+#: The same three states as a phrase short enough to sit in the /profile manage
+#: summary line beside the ratio and the resolution.
+IMAGE_GROUNDING_LABELS = {'web': 'Web search', 'web_images': 'Web + image search'}
+
+#: Sampling controls for the image slot, kept separate from the text profile's
+#: `temperature`/`top_p`/`top_k` because they are a different model on a different
+#: request and one number cannot serve both. Blank means "send nothing", which is the
+#: only safe default: Google's own guidance for the Gemini 3 family is to leave
+#: temperature at 1.0, so these exist for the profile that has a reason, not as a
+#: setting every profile should be nudged into.
+IMAGE_SAMPLING_KEYS = ('image_temperature', 'image_top_p', 'image_top_k')
 
 #: The 30 prebuilt TTS voices: name, the character Google documents, and the voice's
 #: gender. The character comes from the Gemini API speech docs; the gender is not
@@ -253,7 +301,8 @@ TTS_SYNTHESIS_PREAMBLE = (
 
 #: The three per-profile image output settings, named once so the picker, the bulk row
 #: and the queue payload cannot disagree about which keys travel together.
-IMAGE_OUTPUT_KEYS = ('image_aspect_ratio', 'image_size', 'image_thinking_level')
+IMAGE_OUTPUT_KEYS = ('image_aspect_ratio', 'image_size', 'image_thinking_level',
+                     'image_grounding_mode')
 
 #: Defaults for the two media slots, named rather than repeated as literals across the
 #: profile template, the pickers and four generation call sites -- which had already
@@ -328,6 +377,32 @@ MAX_TRAINING_EXAMPLES_PER_PROFILE = 50
 PERSONA_TEXT_INPUT_MAX_LENGTH = 4000
 AI_INSTRUCTIONS_PART_MAX_LENGTH = 4000
 PLACEHOLDER_EMOJI = defaultConfig.PLACEHOLDER_EMOJI
+
+#: Realistic Typing posts the first chunk and then *edits* the rest in. Between edits
+#: the message just sits there finished-looking, which is the opposite of the effect --
+#: a reader cannot tell "still writing" from "that is the whole reply". The cursor is
+#: the profile's own placeholder emoji parked on the message while more is coming and
+#: removed by the final edit, so the marker a profile already uses for "working on it"
+#: means the same thing mid-reply.
+#:
+#:   off    -- no marker; the pre-existing behaviour.
+#:   prefix -- in front of the text. Reads as a speech-tag, but the whole reply shifts
+#:             right and then jumps back when the last edit drops it.
+#:   below  -- on its own line under the text. Nothing already on screen moves, which
+#:             is why it is the default.
+#:
+#: Defaulted on: an absent `typing_cursor` reads as "below", so profiles that already
+#: had Realistic Typing enabled get the effect without being re-saved. It is only ever
+#: reached from inside the realistic-typing branch, so a profile with typing off is
+#: unaffected either way.
+TYPING_CURSOR_MODES = ('off', 'prefix', 'below')
+DEFAULT_TYPING_CURSOR = 'below'
+
+TYPING_CURSOR_NOTES = {
+    'off': 'No marker. The message looks finished between edits.',
+    'prefix': "In front of the text. Shifts the reply while it's typing.",
+    'below': 'On its own line underneath. Nothing on screen moves.',
+}
 # Thumbnail for the "thinking" state on the hub and settings embeds. One constant
 # rather than the literal repeated per view, so a swap is one edit and the two
 # surfaces cannot drift apart.
@@ -1156,7 +1231,31 @@ PATTERN_REASONING_BLOCKS = re.compile(r'<(think|thought|reasoning)>.*?</\1>', fl
 PATTERN_REASONING_ORPHANS = re.compile(r'</?(think|thought|reasoning)>', flags=re.IGNORECASE)
 PATTERN_SYSTEM_HEADER = re.compile(r'(?i)(?:^|\n)(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[ID:[^\]\r\n]+\](?:\s*\[[^\]\r\n]+\])?:\s*')
 PATTERN_TIMESTAMP_HEADER = re.compile(r'(?i)(?:^|\n)(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\]\r\n]+\]:\s*')
-PATTERN_METADATA = re.compile(r'\(?\s*(?:Thought Initiated:)?\s*[^|\n\r]*?\|?\s*Duration: \d+\.\d+s\s*\)?', flags=re.IGNORECASE)
+#: The turn-telemetry footer, `(Thought Initiated: 12:31 | Duration: 4.21s)`, which
+#: _format_history_entry appends and which must never reach a reader.
+#:
+#: Three literal-anchored alternatives rather than one permissive pattern, and both
+#: reasons are load-bearing.
+#:
+#: Correctness: the previous version opened with an optional `[^|\n\r]*?` before the
+#: required `Duration:` literal, with nothing anchoring it. On a reply written as one
+#: long line -- the common case -- that lazy run happily expanded across the entire
+#: message, so a reply *with* a telemetry footer was deleted in full. That is what the
+#: "[SCRUBBER DIAGNOSTIC] Aggressive scrubbing deleted response text" fallback in
+#: _scrub_response_text was catching; the fallback stays, but it should now never fire
+#: for this reason.
+#:
+#: Cost: that same unanchored run made the match O(n^2) -- the engine re-expanded it
+#: from every offset looking for a literal that was not there. Measured on this
+#: pattern: 180 ms for a 2.8 kB reply, 2.9 s for an 11 kB one, all of it GIL-held on
+#: the event loop, with the Timeout(2) guard around the scrubber the only thing
+#: bounding it. Anchoring each branch on a literal lets the engine prefilter: the same
+#: 2.8 kB reply now costs 0.05 ms.
+PATTERN_METADATA = re.compile(
+    r'\(\s*Thought Initiated:[^|\n\r]{0,120}\|\s*Duration:\s*\d+(?:\.\d+)?s\s*\)'
+    r'|\(\s*Duration:\s*\d+(?:\.\d+)?s\s*\)'
+    r'|\bDuration:\s*\d+(?:\.\d+)?s',
+    flags=re.IGNORECASE)
 #: The `</Alice>` that closes a stored turn. The speaker's display name is dynamic, so
 #: this matches a closing tag alone on its line rather than a known tag -- which is what
 #: `_format_history_entry` emits and what in-character prose essentially never is.

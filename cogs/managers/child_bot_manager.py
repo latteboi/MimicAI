@@ -14,9 +14,10 @@ from discord.ext import commands
 from ..utils.constants import (
     PLACEHOLDER_EMOJI, IMAGE_QUEUE_PRIORITY,
     DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING, DEFAULT_IMAGE_MODEL,
-    IMAGE_OUTPUT_KEYS,
+    IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS,
 )
-from ..utils.helpers import _resolve_safety_settings, _split_into_sentences_with_abbreviations
+from ..utils.helpers import (_resolve_safety_settings, _split_into_sentences_with_abbreviations,
+                             apply_typing_cursor, typing_cursor_cost)
 from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
 
@@ -442,6 +443,10 @@ class ChildBotManager:
         typing_cps = payload.get("typing_cps", 30.0)
         typing_max_delay = payload.get("typing_max_delay", 2.5)
         typing_mode = payload.get("typing_mode", "sentence")
+        # Resolved by the producer, not here: this manager is handed a payload, not a
+        # profile, and the webhook path resolves the same two values off the config.
+        cursor_mode = payload.get("typing_cursor", "off")
+        cursor_emoji = payload.get("typing_cursor_emoji") or ""
         reply_to_id = payload.get("reply_to_id")
         ping = payload.get("ping", False)
 
@@ -495,6 +500,11 @@ class ChildBotManager:
 
             if realistic_typing and content.strip():
                 chunks = _split_into_sentences_with_abbreviations(content)
+                # See DeliveryMixin: the marker rides every chunk but the last, and
+                # the final edit is what removes it.
+                last_chunk_index = max(
+                    (n for n, c in enumerate(chunks) if c.strip()), default=-1)
+                cursor_room = typing_cursor_cost(cursor_mode, cursor_emoji)
                 displayed_text = ""
                 last_edit_time = 0
                 sent_message = None
@@ -519,13 +529,23 @@ class ChildBotManager:
                     await asyncio.sleep(delay)
 
                     separator = "\n" if typing_mode == "line" and displayed_text else (" " if displayed_text else "")
-                    if len(displayed_text) + len(separator) + len(chunk) > 2000:
+                    if len(displayed_text) + len(separator) + len(chunk) > 2000 - cursor_room:
+                        # The message being left behind is finished; strip its marker
+                        # or nothing ever comes back to remove it.
+                        if sent_message is not None and cursor_room and displayed_text:
+                            try:
+                                await sent_message.edit(content=displayed_text)
+                            except Exception:
+                                pass
                         displayed_text = chunk
                         sent_message = None
                     else:
                         displayed_text += separator + chunk
 
-                    kwargs = {"content": displayed_text}
+                    wire_text = displayed_text if i == last_chunk_index else apply_typing_cursor(
+                        displayed_text, cursor_mode, cursor_emoji)
+
+                    kwargs = {"content": wire_text}
                     if not sent_message:
                         if i == 0:
                             if file_to_send:
@@ -547,7 +567,7 @@ class ChildBotManager:
                         if now - last_edit_time < 1.5:
                             await asyncio.sleep(1.5 - (now - last_edit_time))
                         try:
-                            await sent_message.edit(content=displayed_text)
+                            await sent_message.edit(content=wire_text)
                         except Exception:
                             pass
                         last_edit_time = asyncio.get_running_loop().time()
@@ -953,7 +973,8 @@ class ChildBotManager:
                 "grounding_sources": grounding_sources, "grounding_mode": grounding_mode,
                 "image_generation_model": profile_data.get("image_generation_model", DEFAULT_IMAGE_MODEL),
                 "image_generation_fallback_model": profile_data.get("image_generation_fallback_model"),
-                "image_output": {k: profile_data.get(k) for k in IMAGE_OUTPUT_KEYS},
+                "image_output": {k: profile_data.get(k)
+                                 for k in IMAGE_OUTPUT_KEYS + IMAGE_SAMPLING_KEYS},
             }
 
             await self.cog.image_request_queue.put((IMAGE_QUEUE_PRIORITY, time.time(), request_data))

@@ -33,9 +33,13 @@ class HeartbeatMixin:
 
         for attempt in range(max_retries):
             try:
-                webhook = await self.cog.server_manager._get_or_create_webhook(channel)
-                if webhook:
-                    await webhook.delete_message(message_id)
+                # Acquired first because delete_message returns None either way, so its
+                # result cannot say whether the channel simply has no webhook. A message
+                # owned by a child bot raises NotFound (10008) here and falls through to
+                # the client delete below, which is what the outer try is for.
+                if await self.cog.server_manager._get_or_create_webhook(channel):
+                    await self.cog.server_manager.run_webhook(
+                        channel, "delete_message", message_id)
                     return
             except Exception:
                 # If the message was sent by a Child Bot, the webhook will throw an error (usually NotFound).
@@ -155,9 +159,10 @@ class HeartbeatMixin:
                                 except Exception: pass
                             else:
                                 # Webhooks
-                                webhook = await self.cog.server_manager._get_or_create_webhook(channel)
-                                if webhook and msg_a_id:
-                                    await webhook.edit_message(msg_a_id, content=f"{custom_emoji}\n\n{text}")
+                                if msg_a_id:
+                                    await self.cog.server_manager.run_webhook(
+                                        channel, "edit_message", msg_a_id,
+                                        content=f"{custom_emoji}\n\n{text}")
                     except Exception:
                         pass
 
@@ -234,9 +239,8 @@ class HeartbeatMixin:
                                 }
                             })
                         else:
-                            wh = await self.cog.server_manager._get_or_create_webhook(channel)
-                            if wh:
-                                await wh.edit_message(target_msg_id, content=full_text)
+                            await self.cog.server_manager.run_webhook(
+                                channel, "edit_message", target_msg_id, content=full_text)
                     except Exception:
                         pass
 

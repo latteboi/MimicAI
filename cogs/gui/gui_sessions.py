@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, List, Dict, Any, Optional
 from ..utils.helpers import _estimate_text_tokens
 from .base_components import PageJumpModal, build_pagination_controls
 from ..services.generation.compaction import resolve_compaction_settings
+from ..services.generation.global_chat import build_global_chat_embed
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -160,71 +161,44 @@ class GlobalChatPlayView(ui.View):
         active_typers = session_data.get("active_typers", set())
         deadline = session_data.get("lock_deadline", 0)
         now = time.time()
-        
+
         is_typing_locked = len(active_typers) > 0 and now < deadline
         is_session_locked = session_data.get("is_locked", True)
-        
-        reply_btn = ui.Button(label="Reply", style=discord.ButtonStyle.primary, row=0)
+
+        reply_btn = ui.Button(label="Reply", emoji="✍️", style=discord.ButtonStyle.primary, row=0)
         reply_btn.callback = self.reply_callback
         self.add_item(reply_btn)
-        
+
         if queue:
             if is_typing_locked:
-                play_btn = ui.Button(label="Waiting for writers...", style=discord.ButtonStyle.secondary, disabled=True, row=0)
+                # Counted, not just "waiting": in a channel the button was the only sign
+                # anything was happening, and it did not say how many people it was on.
+                writers = len(active_typers)
+                play_btn = ui.Button(
+                    label=f"{writers} still writing…" if writers else "Waiting…",
+                    style=discord.ButtonStyle.secondary, disabled=True, row=0)
             else:
                 play_btn = ui.Button(label=f"Play ({len(queue)})", style=discord.ButtonStyle.success, disabled=False, row=0)
         else:
             play_btn = ui.Button(label="Play", style=discord.ButtonStyle.secondary, disabled=True, row=0)
-            
+
         play_btn.callback = self.play_callback
         self.add_item(play_btn)
 
-        lock_style = discord.ButtonStyle.danger if is_session_locked else discord.ButtonStyle.success
-        lock_emoji = "🔒" if is_session_locked else "🔓"
-        lock_btn = ui.Button(style=lock_style, emoji=lock_emoji, row=0)
+        # Labelled, because the lock decides who may press these buttons and a bare
+        # padlock read as "this conversation is private" -- which the card is not.
+        lock_btn = ui.Button(
+            label="Host only" if is_session_locked else "Open to all",
+            emoji="🔒" if is_session_locked else "🔓",
+            style=discord.ButtonStyle.danger if is_session_locked else discord.ButtonStyle.success,
+            row=0)
         lock_btn.callback = self.lock_callback
         self.add_item(lock_btn)
-        
+
     def get_embed(self):
-        session_data = self.cog.global_chat_sessions.get(self.session_key, {})
-        log = session_data.get('unified_log', [])
-        
-        display_name = self.profile_name
-        avatar_url = self.cog.bot.user.display_avatar.url
-        
-        index = self.cog.profile_manager._get_user_index(self.user_id)
-        is_borrowed = self.profile_name in index.get("borrowed", [])
-        
-        eff_owner, eff_name = self.cog.profile_manager._resolve_effective_profile(self.user_id, self.profile_name)
-            
-        app = self.cog.profile_manager._get_user_appearance(eff_owner, eff_name)
-        if app:
-            display_name = app.get("custom_display_name") or display_name
-            avatar_url = app.get("custom_avatar_url") or avatar_url
-            
-        embed = discord.Embed(color=discord.Color.dark_grey())
-        embed.set_author(name=display_name, icon_url=avatar_url)
-        
-        last_user = None
-        last_model = None
-        
-        for turn in reversed(log):
-            if turn.get('role') == 'model' and not last_model:
-                last_model = turn
-            elif turn.get('role') == 'user' and not last_user:
-                last_user = turn
-                
-            if last_user and last_model: break
-        
-        if not last_model:
-            embed.description = "No conversation history found. Click 'Reply' to start."
-        else:
-            embed.description = last_model.get("content")
-            if last_user:
-                user_input = last_user.get("content", "")
-                embed.set_footer(text=f"You: {user_input}", icon_url=self.original_interaction.user.display_avatar.url)
-                
-        return embed
+        return build_global_chat_embed(
+            self.cog, self.user_id, self.profile_name,
+            self.cog.global_chat_sessions.get(self.session_key, {}))
 
     async def _wait_and_unlock(self, session_key, deadline, time_left):
         await asyncio.sleep(time_left + 0.5)
@@ -426,19 +400,20 @@ class GlobalChatHistoryView(ui.View):
             if session_data:
                 self.cog.global_chat_sessions[self.session_key] = session_data
         
+        # A round is every user turn up to the model turn that answered them, not one
+        # user turn and one model turn: an unlocked session logs a turn per speaker
+        # before the single reply, and the old 1:1 pairing walked straight past all but
+        # the last of them, so everybody else's messages vanished from the browser.
         self.rounds = []
         if session_data and 'unified_log' in session_data:
-            log = session_data['unified_log']
-            i = 0
-            while i < len(log) - 1:
-                curr = log[i]
-                next_t = log[i+1]
-                if curr.get('role') == 'user' and next_t.get('role') == 'model':
-                    self.rounds.append((curr, next_t))
-                    i += 2
-                else:
-                    i += 1
-        
+            pending = []
+            for turn in session_data['unified_log']:
+                if turn.get('role') == 'user':
+                    pending.append(turn)
+                elif turn.get('role') == 'model' and pending:
+                    self.rounds.append((pending, turn))
+                    pending = []
+
         self.current_page = max(0, len(self.rounds) - 1)
 
     def _build_view(self):
@@ -465,13 +440,16 @@ class GlobalChatHistoryView(ui.View):
         options = []
         start_jump = max(0, len(self.rounds) - 25)
         for i in range(start_jump, len(self.rounds)):
-            user_turn, _ = self.rounds[i]
+            user_turns, _ = self.rounds[i]
+            first = user_turns[0]
             ts_str = "Unknown"
-            if user_turn.get("timestamp"):
-                try: ts_str = datetime.datetime.fromisoformat(user_turn.get("timestamp")).strftime('%b %d, %I:%M %p')
+            if first.get("timestamp"):
+                try: ts_str = datetime.datetime.fromisoformat(first.get("timestamp")).strftime('%b %d, %I:%M %p')
                 except: pass
-            
-            content_preview = user_turn.get("content", "")[:50]
+
+            content_preview = first.get("content", "")[:50]
+            if len(user_turns) > 1:
+                content_preview = f"[{len(user_turns)}] {content_preview}"
             label = f"({ts_str}) {content_preview}..."
             options.append(discord.SelectOption(label=label, value=str(i), default=(i == self.current_page)))
         
@@ -488,93 +466,26 @@ class GlobalChatHistoryView(ui.View):
         self.add_item(delete_btn)
 
     def get_embed(self) -> discord.Embed:
-        display_name = self.selected_profile
-        avatar_url = self.cog.bot.user.display_avatar.url
-        
-        effective_owner_id, effective_profile_name = self.cog.profile_manager._resolve_effective_profile(self.user_id, self.selected_profile)
-        
-        appearance_data = self.cog.profile_manager._get_user_appearance(effective_owner_id, effective_profile_name)
-        if appearance_data:
-            display_name = appearance_data.get("custom_display_name") or display_name
-            avatar_url = appearance_data.get("custom_avatar_url") or avatar_url
+        session_data = self.cog.global_chat_sessions.get(self.session_key, {}) if self.session_key else {}
 
         if not self.rounds:
-            embed = discord.Embed(description="No conversation history found. Click 'Reply' to start.", color=discord.Color.dark_grey())
-            embed.set_author(name=display_name, icon_url=avatar_url)
-            return embed
-            
-        user_turn, model_turn = self.rounds[self.current_page]
-        embed = discord.Embed(description=model_turn.get("content"), color=discord.Color.dark_grey())
-        embed.set_author(name=display_name, icon_url=avatar_url)
-        
-        user_input = user_turn.get("content", "")
-        embed.set_footer(text=f"You: {user_input}", icon_url=self.original_interaction.user.display_avatar.url)
-        
-        return embed
+            return build_global_chat_embed(
+                self.cog, self.user_id, self.selected_profile, session_data,
+                description="No conversation history found.", incoming=[],
+                footer="Nothing recorded yet.", colour=discord.Colour.dark_grey())
 
-    async def _wait_and_unlock(self, session_key):
-        await asyncio.sleep(10.5) # Slight buffer over 10s
-        session_data = self.cog.global_chat_sessions.get(session_key)
-        if session_data and time.time() >= session_data.get("lock_expiry", 0):
-            # Enforce the deadline by clearing the active typers
-            session_data.setdefault("active_typers", set()).clear()
-            self._build_view()
-            try:
-                await self.original_interaction.edit_original_response(view=self)
-            except Exception:
-                pass
+        user_turns, model_turn = self.rounds[self.current_page]
+        return build_global_chat_embed(
+            self.cog, self.user_id, self.selected_profile, session_data,
+            description=model_turn.get("content"), incoming=user_turns,
+            footer=f"Round {self.current_page + 1} of {len(self.rounds)}",
+            colour=discord.Colour.dark_grey())
 
-    async def reply_callback(self, interaction: discord.Interaction):
-        session_data = self.cog.global_chat_sessions.setdefault(self.session_key, {})
-        
-        # Timer / Lock Logic
-        lock_resets = session_data.get("lock_resets", 0)
-        now = time.time()
-        
-        if now > session_data.get("lock_expiry", 0):
-            session_data["lock_resets"] = 0
-            lock_resets = 0
-
-        # Allow max 2 resets (30s deadline)
-        if lock_resets <= 2:
-            session_data["lock_expiry"] = now + 10
-            session_data["lock_resets"] = lock_resets + 1
-            
-        session_data.setdefault("active_typers", set()).add(interaction.user.id)
-        
-        self._build_view()
-        try:
-            await self.original_interaction.edit_original_response(view=self)
-        except Exception:
-            pass
-
-        queue = session_data.setdefault("pending_queue", {})
-        existing_text = queue.get(interaction.user.id, {}).get("content", "")
-
-        modal = GlobalChatInputModal(self.cog, self, existing_text)
-        await interaction.response.send_modal(modal)
-        
-        self.cog.bot.loop.create_task(self._wait_and_unlock(self.session_key))
-
-    async def play_callback(self, interaction: discord.Interaction):
-        session_data = self.cog.global_chat_sessions.get(self.session_key)
-        if not session_data: return
-        
-        queue = session_data.get("pending_queue", {})
-        if not queue: return
-
-        queued_turns = sorted(list(queue.values()), key=lambda x: x["timestamp"])
-        session_data["pending_queue"] = {} 
-        
-        self.clear_items()
-        await interaction.response.edit_message(view=self)
-
-        profile_name = self.session_key[2]
-        await self.cog.generation_service._execute_global_chat(interaction, profile_name, queued_turns)
-        
-        await self._load_current_session()
-        self._build_view()
-        await interaction.edit_original_response(embed=self.get_embed(), view=self)
+    # Reply and Play used to live here too, on a second lock implementation
+    # (`lock_expiry`/`lock_resets`) that had drifted from GlobalChatPlayView's
+    # (`lock_deadline`/`timer_extensions`), and whose _execute_global_chat call was a
+    # positional argument short of the signature. `_build_view` never added the buttons,
+    # so none of it was reachable. This view browses history; the card is where you talk.
 
     async def profile_callback(self, interaction: discord.Interaction):
         self.selected_profile = interaction.data['values'][0]
@@ -601,8 +512,10 @@ class GlobalChatHistoryView(ui.View):
         await interaction.response.defer()
         if not self.rounds: return
 
-        user_turn, model_turn = self.rounds[self.current_page]
-        ids_to_delete = {user_turn.get("turn_id"), model_turn.get("turn_id")}
+        user_turns, model_turn = self.rounds[self.current_page]
+        # Every speaker's turn, not just the last: a round can hold several.
+        ids_to_delete = {t.get("turn_id") for t in user_turns}
+        ids_to_delete.add(model_turn.get("turn_id"))
         
         session_data = self.cog.global_chat_sessions.get(self.session_key)
         if not session_data:
@@ -1154,14 +1067,99 @@ class SessionConfigView(ui.View):
         self.selected_reactivity_profiles = set()
         self._load_lists()
 
+    #: Cast sources, in the order the Source button cycles through them.
+    SOURCES = ('personal', 'borrowed', 'system', 'child_bot')
+
     def _load_lists(self):
         user_id = self.original_interaction.user.id
         index = self.cog.profile_manager._get_user_index(user_id)
+        # System profiles are addressable by everyone, so everyone can seat one.
+        # _is_system_name applies the same personal-and-borrowed-shadow-System
+        # precedence as resolution, so a name offered here means the same profile it
+        # will mean when the round runs.
         self.lists = {
             'personal': sorted(list(index.get("personal", []))),
             'borrowed': sorted(list(index.get("borrowed", []))),
+            'system': sorted(n for n in self.cog.profile_manager._system_index()
+                             if self.cog.profile_manager._is_system_name(user_id, n)),
             'child_bot': sorted([b for b in self.cog.child_bots.values() if b['owner_id'] == user_id], key=lambda x: x.get('profile_name', ''))
         }
+
+    @staticmethod
+    def _participant_key(owner_id, profile_name) -> tuple:
+        """Identity of a seated character, deliberately ignoring `method`.
+
+        A child bot and a webhook are two voices for one profile, not two characters.
+        Seating both put the same persona in the cast twice: it read its own lines as
+        someone else's, answered itself every round, and wrote two LTM streams from
+        one memory. The dropdown's old check qualified on method, so the pair was the
+        one duplicate it could not see.
+        """
+        return (int(owner_id), profile_name)
+
+    def _seated(self, owner_id, profile_name) -> Optional[Dict]:
+        """The seated participant matching this profile, whichever way it speaks."""
+        key = self._participant_key(owner_id, profile_name)
+        return next((p for p in self.session.get('profiles', [])
+                     if self._participant_key(p['owner_id'], p['profile_name']) == key), None)
+
+    def _bot_id_for(self, item) -> Optional[str]:
+        return next((k for k, v in self.cog.child_bots.items() if v is item), None)
+
+    def _build_participant(self, item) -> Optional[Dict]:
+        """The participant dict for one entry of the source currently in view."""
+        if self.view_source == 'child_bot':
+            bid = self._bot_id_for(item)
+            bc = self.cog.child_bots.get(bid) if bid else None
+            if not bc:
+                return None
+            return {"owner_id": bc['owner_id'], "profile_name": bc['profile_name'],
+                    "method": "child_bot", "bot_id": bid, "chance": 100, "wakewords": []}
+
+        # A System profile lives in the bot owner's tree and is seated under the
+        # owner's id, matching what /session swap builds for the same name.
+        owner_id = (int(defaultConfig.DISCORD_OWNER_ID) if self.view_source == 'system'
+                    else self.original_interaction.user.id)
+        return {"owner_id": owner_id, "profile_name": item, "method": "webhook",
+                "chance": 100, "wakewords": []}
+
+    def _is_selected(self, item) -> bool:
+        """Whether this source entry is seated *the way this source seats it*.
+
+        Method-qualified on purpose. The same profile seated the other way reads as
+        unselected here, with a description saying so, rather than as a selection
+        Unselect Page would then silently remove.
+        """
+        participant = self._build_participant(item)
+        if not participant:
+            return False
+        existing = self._seated(participant['owner_id'], participant['profile_name'])
+        return existing is not None and existing.get('method') == participant.get('method')
+
+    def _seat_items(self, items) -> List[str]:
+        """Seat each entry that is not already taken. Returns the ones refused.
+
+        One add path for all three selection gestures -- a single name, Select Page and
+        Select All -- so the cast limit and the duplicate rule cannot drift between
+        them.
+        """
+        blocked = []
+        for item in items:
+            if len(self.session['profiles']) >= 200:
+                break
+            participant = self._build_participant(item)
+            if not participant:
+                continue
+            existing = self._seated(participant['owner_id'], participant['profile_name'])
+            if existing is not None:
+                # Re-selecting something already seated the same way is a no-op, and
+                # silent: Select All hits it on every pass. Only the cross-method
+                # collision is worth a word.
+                if existing.get('method') != participant.get('method'):
+                    blocked.append(participant['profile_name'])
+                continue
+            self.session['profiles'].append(participant)
+        return blocked
 
     def _add_nav_buttons(self):
         tabs = ["cast", "config", "reactivity", "proactivity", "memory"]
@@ -1182,34 +1180,13 @@ class SessionConfigView(ui.View):
         embed = discord.Embed(title=f"Chat Session: #{self.original_interaction.channel.name}", color=discord.Color.gold())
 
         if self.current_tab == "cast":
-            embed.description = "Add or remove participants (200 max). This controls who is actively in the channel."
+            embed.description = ("Add or remove participants (200 max). Selecting seats a profile "
+                                 "and saves it; **Start / Update Session** is what makes the channel live.")
             active_list = self.lists[self.view_source]
-            
-            selected_items = []
-            
-            active_map = {}
-            if self.view_source == 'child_bot':
-                for item in active_list:
-                    bid = next((k for k, v in self.cog.child_bots.items() if v is item), None)
-                    if bid:
-                        active_map[str(bid)] = item
-            else:
-                for item in active_list:
-                    active_map[item] = item
-                    
-            for p in self.session.get('profiles', []):
-                p_method = p.get('method')
-                if self.view_source == 'child_bot' and p_method == 'child_bot':
-                    bid_str = str(p.get('bot_id'))
-                    if bid_str in active_map:
-                        selected_items.append(active_map.pop(bid_str))
-                elif self.view_source != 'child_bot' and p_method != 'child_bot':
-                    p_name = p.get('profile_name')
-                    if p_name in active_map:
-                        selected_items.append(active_map.pop(p_name))
-                        
-            unselected_items = [item for item in active_list if item in active_map.values()]
-            
+
+            selected_items = [item for item in active_list if self._is_selected(item)]
+            unselected_items = [item for item in active_list if not self._is_selected(item)]
+
             ordered_list = selected_items + unselected_items
             
             num_pages = max(1, (len(ordered_list) - 1) // 20 + 1)
@@ -1221,18 +1198,7 @@ class SessionConfigView(ui.View):
 
             options = []
             if page_items:
-                page_selected_count = 0
-                for item in page_items:
-                    is_sel = False
-                    if self.view_source == 'child_bot':
-                        bid = next((k for k, v in self.cog.child_bots.items() if v is item), None)
-                        if bid:
-                            is_sel = any(p.get('method') == 'child_bot' and str(p.get('bot_id')) == str(bid) for p in self.session.get('profiles', []))
-                    else:
-                        is_sel = any(p.get('method') != 'child_bot' and p.get('profile_name') == item for p in self.session.get('profiles', []))
-                    
-                    if is_sel:
-                        page_selected_count += 1
+                page_selected_count = sum(1 for item in page_items if self._is_selected(item))
 
                 page_toggle_label = "Unselect Page" if (page_selected_count == len(page_items)) else "Select Page"
                 options.append(discord.SelectOption(label=page_toggle_label, value="toggle_page", description="Toggle selection for all profiles on this page.", emoji="📄"))
@@ -1242,20 +1208,28 @@ class SessionConfigView(ui.View):
                 options.append(discord.SelectOption(label=all_toggle_label, value="toggle_all", description="Toggle selection for all profiles in this source.", emoji="📚"))
 
                 for item in page_items:
+                    participant = self._build_participant(item)
                     if self.view_source == 'child_bot':
-                        p_name = item.get('profile_name')
-                        bid = next((k for k, v in self.cog.child_bots.items() if v is item), None)
+                        bid = self._bot_id_for(item)
                         val = f"child_{bid}"
-                        lbl = p_name
-                        
-                        is_sel = any(p.get('method') == 'child_bot' and str(p.get('bot_id')) == str(bid) for p in self.session.get('profiles', []))
+                        lbl = item.get('profile_name')
                     else:
                         val = item
                         lbl = item
-                        
-                        is_sel = any(p.get('method') != 'child_bot' and p.get('profile_name') == val for p in self.session.get('profiles', []))
-                    
-                    options.append(discord.SelectOption(label=lbl[:100], value=val[:100], default=is_sel))
+
+                    existing = (self._seated(participant['owner_id'], participant['profile_name'])
+                                if participant else None)
+                    is_sel = self._is_selected(item)
+
+                    # Seated the other way round: shown, not hidden, so the clash is
+                    # visible where it is made rather than only after it is refused.
+                    desc = None
+                    if existing is not None and not is_sel:
+                        desc = ("Already seated as a child bot." if existing.get('method') == 'child_bot'
+                                else "Already seated as a webhook.")
+
+                    options.append(discord.SelectOption(label=lbl[:100], value=val[:100],
+                                                        description=desc, default=is_sel))
             else:
                 options.append(discord.SelectOption(label="No profiles found", value="none"))
 
@@ -1266,92 +1240,70 @@ class SessionConfigView(ui.View):
                 curr_vals = set(raw_vals)
                 page_vals = set([o.value for o in options if o.value not in ["toggle_page", "toggle_all"]])
                 
+                def _value_of(item):
+                    return (f"child_{self._bot_id_for(item)}"
+                            if self.view_source == 'child_bot' else item)
+
+                def _unseat(scope_items):
+                    scope_vals = {_value_of(item) for item in scope_items}
+                    self.session['profiles'] = [
+                        p for p in self.session['profiles']
+                        if (f"child_{p.get('bot_id')}" if p.get('method') == 'child_bot'
+                            else p.get('profile_name')) not in scope_vals]
+
+                def _all_seated(scope_items):
+                    return all(self._is_selected(item) for item in scope_items)
+
+                blocked = []
                 if "toggle_page" in curr_vals:
-                    page_val_list = [f"child_{next((k for k, v in self.cog.child_bots.items() if v is item), None)}" if self.view_source == 'child_bot' else item for item in page_items]
-                    page_set_vals = set(page_val_list)
-                    
-                    already_selected = set()
-                    for p in self.session.get('profiles', []):
-                        val_p = f"child_{p.get('bot_id')}" if p.get('method') == 'child_bot' else p.get('profile_name')
-                        if val_p in page_set_vals:
-                            already_selected.add(val_p)
-                            
-                    if len(already_selected) == len(page_items):
-                        self.session['profiles'] = [p for p in self.session['profiles'] if (f"child_{p.get('bot_id')}" if p.get('method') == 'child_bot' else p.get('profile_name')) not in page_set_vals]
+                    if _all_seated(page_items):
+                        _unseat(page_items)
                     else:
-                        for item in page_items:
-                            if self.view_source == 'child_bot':
-                                bid = next((k for k, v in self.cog.child_bots.items() if v is item), None)
-                                if bid and not any(p.get('bot_id') == bid for p in self.session['profiles']):
-                                    if len(self.session['profiles']) >= 200: break
-                                    bc = self.cog.child_bots.get(bid)
-                                    if bc: self.session['profiles'].append({"owner_id": bc['owner_id'], "profile_name": bc['profile_name'], "method": "child_bot", "bot_id": bid, "chance": 100, "wakewords": []})
-                            else:
-                                if not any(p.get('profile_name') == item and p.get('method') != 'child_bot' for p in self.session['profiles']):
-                                    if len(self.session['profiles']) >= 200: break
-                                    self.session['profiles'].append({"owner_id": self.original_interaction.user.id, "profile_name": item, "method": "webhook", "chance": 100, "wakewords": []})
-                
+                        blocked = self._seat_items(page_items)
+
                 elif "toggle_all" in curr_vals:
-                    all_val_list = [f"child_{next((k for k, v in self.cog.child_bots.items() if v is item), None)}" if self.view_source == 'child_bot' else item for item in ordered_list]
-                    all_set_vals = set(all_val_list)
-                    
-                    already_selected_all = set()
-                    for p in self.session.get('profiles', []):
-                        val_p = f"child_{p.get('bot_id')}" if p.get('method') == 'child_bot' else p.get('profile_name')
-                        if val_p in all_set_vals:
-                            already_selected_all.add(val_p)
-                            
-                    if len(already_selected_all) == len(ordered_list):
-                        self.session['profiles'] = [p for p in self.session['profiles'] if (f"child_{p.get('bot_id')}" if p.get('method') == 'child_bot' else p.get('profile_name')) not in all_set_vals]
+                    if _all_seated(ordered_list):
+                        _unseat(ordered_list)
                     else:
-                        for item in ordered_list:
-                            if self.view_source == 'child_bot':
-                                bid = next((k for k, v in self.cog.child_bots.items() if v is item), None)
-                                if bid and not any(p.get('bot_id') == bid for p in self.session['profiles']):
-                                    if len(self.session['profiles']) >= 200: break
-                                    bc = self.cog.child_bots.get(bid)
-                                    if bc: self.session['profiles'].append({"owner_id": bc['owner_id'], "profile_name": bc['profile_name'], "method": "child_bot", "bot_id": bid, "chance": 100, "wakewords": []})
-                            else:
-                                if not any(p.get('profile_name') == item and p.get('method') != 'child_bot' for p in self.session['profiles']):
-                                    if len(self.session['profiles']) >= 200: break
-                                    self.session['profiles'].append({"owner_id": self.original_interaction.user.id, "profile_name": item, "method": "webhook", "chance": 100, "wakewords": []})
-                
+                        blocked = self._seat_items(ordered_list)
+
                 else:
                     self.session['profiles'] = [p for p in self.session['profiles'] if not (
                         (f"child_{p.get('bot_id')}" in page_vals and f"child_{p.get('bot_id')}" not in curr_vals) or
                         (p.get('method') != 'child_bot' and p['profile_name'] in page_vals and p['profile_name'] not in curr_vals)
                     )]
-                    
-                    for val in raw_vals:
-                        if val.startswith("child_"):
-                            bid = val.split("_")[1]
-                            if not any(p.get('bot_id') == bid for p in self.session['profiles']):
-                                if len(self.session['profiles']) >= 200: break
-                                bc = self.cog.child_bots.get(bid)
-                                if bc: self.session['profiles'].append({"owner_id": bc['owner_id'], "profile_name": bc['profile_name'], "method": "child_bot", "bot_id": bid, "chance": 100, "wakewords": []})
-                        else:
-                            if not any(p.get('profile_name') == val and p.get('method') != 'child_bot' for p in self.session['profiles']):
-                                if len(self.session['profiles']) >= 200: break
-                                self.session['profiles'].append({"owner_id": self.original_interaction.user.id, "profile_name": val, "method": "webhook", "chance": 100, "wakewords": []})
-                
+
+                    by_value = {_value_of(item): item for item in page_items}
+                    blocked = self._seat_items([by_value[v] for v in raw_vals if v in by_value])
+
                 self.cog.session_manager._save_multi_profile_sessions()
-                
-                # [NEW] Dispatch child bot presence updates
-                for p_data in self.session.get('profiles', []):
-                    if p_data.get('method') == 'child_bot':
-                        await self.cog.manager_queue.put({
-                            "action": "send_to_child", "bot_id": p_data['bot_id'],
-                            "payload": {"action": "session_update_add", "channel_id": self.original_interaction.channel_id}
-                        })
+
+                # Only a live session needs telling. Seating a cast into a draft
+                # announces nothing -- Start / Update Session does that for the whole
+                # cast at once.
+                if self.cog.session_manager.is_started(self.session):
+                    for p_data in self.session.get('profiles', []):
+                        if p_data.get('method') == 'child_bot':
+                            await self.cog.manager_queue.put({
+                                "action": "send_to_child", "bot_id": p_data['bot_id'],
+                                "payload": {"action": "session_update_add", "channel_id": self.original_interaction.channel_id}
+                            })
 
                 await i.response.defer(); await self.update_display()
+                if blocked:
+                    names = ", ".join(f"`{n}`" for n in blocked[:5])
+                    more = f" (+{len(blocked) - 5})" if len(blocked) > 5 else ""
+                    await i.followup.send(
+                        f"Skipped {names}{more} — already in the cast the other way "
+                        f"(a profile speaks as a child bot **or** a webhook, not both).",
+                        ephemeral=True)
             sel.callback = cast_cb
             self.add_item(sel)
 
             source_btn = ui.Button(label=f"Source: {self.view_source.title().replace('_', ' ')}", style=discord.ButtonStyle.blurple, row=1)
-            async def src_cb(i): 
-                cycle = ['personal', 'borrowed', 'child_bot']
-                self.view_source = cycle[(cycle.index(self.view_source) + 1) % 3]
+            async def src_cb(i):
+                cycle = self.SOURCES
+                self.view_source = cycle[(cycle.index(self.view_source) + 1) % len(cycle)]
                 self.current_page = 0
                 await i.response.defer(); await self.update_display()
             source_btn.callback = src_cb
@@ -1669,10 +1621,84 @@ class SessionConfigView(ui.View):
             c_edit_btn.callback = compaction_edit_cb
             self.add_item(c_edit_btn)
 
+        self._add_commit_button()
+
+        # On every tab, because the button is on every tab: the one thing the editor
+        # must never leave ambiguous is whether the channel is already live.
+        if self.cog.session_manager.is_started(self.session):
+            embed.set_footer(text="● Live in this channel.")
+        else:
+            embed.set_footer(text="○ Draft — nothing runs until you press Start / Update Session.")
+
         try:
             await self.original_interaction.edit_original_response(embed=embed, view=self)
         except Exception as e:
             print(f"Error updating SessionConfigView: {e}")
+
+    def _add_commit_button(self):
+        """The Start / Update Session button, on every tab.
+
+        Seating and starting are two different acts. The cast dropdown applies and
+        saves the moment a name is chosen -- it has to, because reactivity, wakewords
+        and per-participant chance all read `session['profiles']` and would otherwise
+        have nobody to edit -- but a seated cast is a draft. Nothing in the channel
+        runs until this is pressed; `SessionManager.is_started` is the gate every
+        trigger path asks.
+
+        What it does that nothing else does:
+
+        * Marks the session started, which is the whole point.
+        * Persists the blueprint. A session woken as a shell by `_ensure_session_shell`
+          is in memory only until something saves it, and an unstarted empty shell is
+          deliberately never written at all.
+        * Hydrates a dehydrated session, so the transcript is loaded before the first
+          message rather than during it.
+        * Tells **every** child bot in the cast that it is in this channel. The cast
+          dropdown only announces on a live session, so a bot that arrived with a
+          restored blueprint, or through `/session swap`, was never told.
+
+        An empty cast is allowed. A started session with nobody in it is a valid
+        state -- the channel keeps its transcript and its settings, and simply has no
+        one to answer.
+        """
+        started = self.cog.session_manager.is_started(self.session)
+        btn = ui.Button(label="▶️ Update Session" if started else "▶️ Start Session", row=3,
+                        style=discord.ButtonStyle.success)
+
+        async def commit(i: discord.Interaction):
+            await i.response.defer()
+
+            was_started = self.cog.session_manager.is_started(self.session)
+            self.session["started"] = True
+            self.cog.session_manager._save_multi_profile_sessions()
+
+            if not self.session.get("is_hydrated"):
+                hydrated = await self.cog.session_manager._ensure_session_hydrated(
+                    self.original_interaction.channel_id, self.session.get("type", "multi"))
+                if hydrated:
+                    hydrated["started"] = True
+                    self.session = hydrated
+
+            channel_id = self.original_interaction.channel_id
+            for p in self.session.get("profiles", []):
+                if p.get("method") != "child_bot" or not p.get("bot_id"):
+                    continue
+                await self.cog.manager_queue.put({
+                    "action": "send_to_child", "bot_id": p["bot_id"],
+                    "payload": {"action": "session_update_add", "channel_id": channel_id}})
+
+            await self.update_display()
+
+            count = len(self.session.get("profiles", []))
+            if not count:
+                note = "Session is live, but the cast is empty — nobody will answer."
+            else:
+                note = f"Session is live with {count} participant(s)."
+            await i.followup.send(("▶️ " if not was_started else "🔄 ") + note, ephemeral=True)
+
+        btn.callback = commit
+        self.add_item(btn)
+
 
 class WakewordsModal(ui.Modal, title="Manage Wakewords"):
     wakewords_input = ui.TextInput(label="Wakewords (comma-separated)", style=discord.TextStyle.paragraph, required=False, max_length=1000)

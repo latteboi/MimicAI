@@ -632,7 +632,12 @@ class SessionManager:
                     owner_id = session_data.get("owner_id")
                     profiles_data = session_data.get("profiles",[])
 
-                    if not owner_id or not profiles_data:
+                    # An empty cast is a valid session -- the master prompt,
+                    # proactivity and compaction settings are still worth restoring,
+                    # and the user may simply not have seated anyone yet. Only a
+                    # session that is both empty AND unstarted is discarded, and
+                    # _save_multi_profile_sessions never writes one of those.
+                    if not owner_id or not (profiles_data or session_data.get("started")):
                         continue
 
                     self.cog.multi_profile_channels[channel_id] = {
@@ -649,6 +654,7 @@ class SessionManager:
                         "type": "multi",
                         "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 20, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
                         "compaction": session_data.get("compaction", DEFAULT_COMPACTION_CONFIG.copy()),
+                        "started": session_data.get("started", True),
                     }
                 except Exception as e:
                     print(f"Unexpected error reloading multi-profile sessions for server {server_id_str}, channel {ch_id_str}: {e}")
@@ -658,6 +664,12 @@ class SessionManager:
             current_server_sessions = collections.defaultdict(lambda: {"regular": {}})
 
             for channel_id, session_data in self.cog.multi_profile_channels.items():
+                # A shell opened by `/session config` and abandoned before anyone was
+                # seated is not a session, and writing it would put a blueprint in
+                # every server index for every channel the editor was ever opened in.
+                if not session_data.get("profiles") and not session_data.get("started"):
+                    continue
+
                 channel = self.cog.bot.get_channel(channel_id)
                 server_id_str = str(channel.guild.id) if channel and getattr(channel, 'guild', None) else "dm"
 
@@ -685,6 +697,7 @@ class SessionManager:
                     "type": "multi",
                     "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
                     "compaction": session_data.get("compaction", DEFAULT_COMPACTION_CONFIG.copy()),
+                    "started": bool(session_data.get("started", True)),
                 }
 
                 current_server_sessions[server_id_str][category][str(channel_id)] = blueprint
@@ -934,7 +947,8 @@ class SessionManager:
                             "proactivity": session_config.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
                             "compaction": session_config.get("compaction", DEFAULT_COMPACTION_CONFIG.copy()),
                             "task_queue": asyncio.Queue(),
-                            "is_running": False
+                            "is_running": False,
+                            "started": session_config.get("started", True),
                         }
                         self.cog.multi_profile_channels[channel_id] = session
                     else:
@@ -1139,6 +1153,7 @@ class SessionManager:
         for channel_id, session in list(self.cog.multi_profile_channels.items()):
             pro = session.get("proactivity", {})
             if not pro.get("enabled"): continue
+            if not self.is_started(session): continue
 
             # The Director exists to break a silence. A live game means the channel is
             # anything but silent, and with the cast seated the round it queues would
@@ -1336,6 +1351,7 @@ class SessionManager:
                 "pending_whispers": {},
                 "audio_mode": "off",
                 "compaction": DEFAULT_COMPACTION_CONFIG.copy(),
+                "started": True,
             }
             self.cog.multi_profile_channels[interaction.channel_id] = session
 
@@ -1344,6 +1360,7 @@ class SessionManager:
         session["profiles"] = participants
         session["session_mode"] = session_mode
         session["audio_mode"] = audio_mode
+        session["started"] = True
         
         for p_data in participants:
             if p_data.get('method') == 'child_bot':
@@ -1368,6 +1385,22 @@ class SessionManager:
             msg = f"Regular session is now active for all users with profiles: {', '.join(profile_list_str)}."
         
         await interaction.edit_original_response(content=msg, view=None)
+
+    @staticmethod
+    def is_started(session: Optional[Dict]) -> bool:
+        """Whether this channel's session has actually been started.
+
+        Seating a profile is not the same as starting the session it sits in. The cast
+        dropdown applies and saves the moment a name is chosen -- it has to, or the
+        Reactivity tab would have nobody to edit -- so `Start / Update Session` is what
+        makes the channel live. Every path that would run a round asks this first.
+
+        Absent means started, and that is load-bearing: only the two paths that
+        deliberately seat without starting (`_ensure_session_shell` and a `/session
+        swap` that creates the session) write False. A blueprint saved before this flag
+        existed, and every session an older code path built, keeps running untouched.
+        """
+        return bool(session) and bool(session.get("started", True))
 
     @staticmethod
     def register_in_flight(session: Dict, state_container: Dict) -> None:

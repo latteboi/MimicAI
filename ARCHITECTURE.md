@@ -148,7 +148,7 @@ users/<user_id>/
     profile.json.gz                   unified: {name, config, prompts, child_bot}
     ltm.json.gz                       long-term memories + b64 float16 embeddings
     training.json.gz                  few-shot examples + embeddings
-    global_chat.json.gz               per-profile DM session log
+    global_chat.json.gz               `/profile global_chat` log, keyed (host, profile)
 servers/<guild_id>/
   index.json                          active sessions, user profile prefs, key pointers
   api_keys.json.gz

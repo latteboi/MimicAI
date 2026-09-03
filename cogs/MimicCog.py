@@ -152,6 +152,11 @@ class MimicCog(commands.Cog, EventListeners):
 
         self.multi_profile_channels: Dict[int, Dict[str, Any]] = {}
         self.sessions_loaded = False
+
+        # Top-level command name -> application command id, for rendering a clickable
+        # </name:id> mention. Filled once from the registered tree, so it is bounded by
+        # the command count rather than by anything a user can grow.
+        self.command_ids: Dict[str, int] = {}
         self.decrypted_key_cache: LRUCache = LRUCache(max_size=100)
         self.server_key_pointers: LRUCache = LRUCache(max_size=200)
         self.profile_shares: Dict[str, List[Dict[str, Any]]] = {}
@@ -447,6 +452,16 @@ class MimicCog(commands.Cog, EventListeners):
 
         await self._open_profile_manage(interaction, profile_name)
 
+    def command_mention(self, name: str) -> str:
+        """`</name:id>` if the id is known, otherwise a plain `/name` code span.
+
+        Discord only renders the clickable form for an id it recognises, and prints the
+        raw text otherwise -- so the fallback is not cosmetic. `command_ids` is empty
+        until the tree has been fetched, and stays empty if that call fails.
+        """
+        cid = self.command_ids.get(name)
+        return f"</{name}:{cid}>" if cid else f"`/{name}`"
+
     def _owns_profile_name(self, user_id: int, profile_name: str) -> bool:
         """Whether `user_id` can address `profile_name` at all (personal, borrowed, or system)."""
         index = self.profile_manager._get_user_index(user_id)
@@ -643,43 +658,64 @@ class MimicCog(commands.Cog, EventListeners):
             except Exception:
                 pass
 
+        await interaction.response.defer(ephemeral=True)
+        await self._open_session_config(interaction)
+
+    def _ensure_session_shell(self, interaction: discord.Interaction) -> Dict[str, Any]:
+        """The channel's live session, waking a suspended one from its blueprint.
+
+        Extracted from `session_config_slash` so `/start` can open the same editor
+        without a second copy of the wake logic. A blueprint restored by one of them
+        and not the other is a session that loses its cast, its master prompt and its
+        proactivity settings depending on which button was pressed.
+        """
         ch_id = interaction.channel_id
         session = self.multi_profile_channels.get(ch_id)
+        if session:
+            return session
 
-        if not session:
-            # Check for suspended blueprint
-            server_id_str = str(interaction.guild.id)
-            server_index = self.server_manager._get_server_index(server_id_str)
-            session_config = server_index.get("active_sessions", {}).get("regular", {}).get(str(ch_id))
-            
-            DEFAULT_DIRECTOR_PROMPT = "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."
-            proactivity_defaults = {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": DEFAULT_DIRECTOR_PROMPT}
-            
-            if session_config:
-                # Wake it up as a dehydrated shell
-                session = {
-                    "type": "multi", "profiles": session_config.get("profiles", []),
-                    "unified_log": [], "is_hydrated": False,
-                    "owner_id": session_config.get("owner_id", interaction.user.id),
-                    "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
-                    "session_prompt": session_config.get("session_prompt"),
-                    "session_mode": session_config.get("session_mode", "sequential"),
-                    "proactivity": session_config.get("proactivity", proactivity_defaults)
-                }
-                self.multi_profile_channels[ch_id] = session
-            else:
-                # Blank session
-                session = {
-                    "type": "multi", "profiles": [],
-                    "unified_log": [], "is_hydrated": False,
-                    "owner_id": interaction.user.id,
-                    "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
-                    "session_prompt": None, "session_mode": "sequential",
-                    "proactivity": proactivity_defaults
-                }
-                self.multi_profile_channels[ch_id] = session
+        server_index = self.server_manager._get_server_index(str(interaction.guild.id))
+        session_config = server_index.get("active_sessions", {}).get("regular", {}).get(str(ch_id))
 
-        await interaction.response.defer(ephemeral=True)
+        DEFAULT_DIRECTOR_PROMPT = "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."
+        proactivity_defaults = {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": DEFAULT_DIRECTOR_PROMPT}
+
+        if session_config:
+            # Wake it up as a dehydrated shell
+            session = {
+                "type": "multi", "profiles": session_config.get("profiles", []),
+                "unified_log": [], "is_hydrated": False,
+                "owner_id": session_config.get("owner_id", interaction.user.id),
+                "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
+                "session_prompt": session_config.get("session_prompt"),
+                "session_mode": session_config.get("session_mode", "sequential"),
+                "proactivity": session_config.get("proactivity", proactivity_defaults),
+                "started": session_config.get("started", True),
+            }
+        else:
+            # Blank session
+            session = {
+                "type": "multi", "profiles": [],
+                "unified_log": [], "is_hydrated": False,
+                "owner_id": interaction.user.id,
+                "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
+                "session_prompt": None, "session_mode": "sequential",
+                "proactivity": proactivity_defaults,
+                # Opening the editor seats nobody and starts nothing.
+                "started": False,
+            }
+
+        self.multi_profile_channels[ch_id] = session
+        return session
+
+    async def _open_session_config(self, interaction: discord.Interaction):
+        """Renders the cast editor onto whatever message `interaction` has deferred.
+
+        The caller owns the defer, which is what lets `/start` open this as a separate
+        ephemeral message (defer with thinking=True) while the command itself keeps
+        replacing its own (a plain defer on a component or command interaction).
+        """
+        session = self._ensure_session_shell(interaction)
         view = SessionConfigView(self, interaction, session)
         self.active_session_config_views[interaction.user.id] = view
         await view.update_display()
@@ -690,13 +726,47 @@ class MimicCog(commands.Cog, EventListeners):
     @is_admin_or_owner_check()
     @app_commands.autocomplete(profile_name=EventListeners.master_autocomplete)
     @app_commands.describe(
-        profile_name="The profile to swap or add. Leave blank to remove a profile.",
+        profile_name="The profile to swap or add, or a seated one to remove. Blank + slot also removes.",
         use_child_bot="Whether to use the linked Child Bot (if available). Defaults to True.",
         slot="The participant number (1-200) to affect. See '/session swap' with no options for a list."
     )
     async def swap_session_slash(self, interaction: discord.Interaction, profile_name: Optional[str] = None, use_child_bot: Optional[bool] = None, slot: Optional[app_commands.Range[int, 1, 200]] = None):
         await interaction.response.defer(ephemeral=True)
         await self._swap_session_impl(interaction, profile_name, use_child_bot, slot)
+
+    async def _remove_session_participant(self, interaction: discord.Interaction,
+                                          session: Dict[str, Any], index: int) -> None:
+        """Drops one seated participant and tells its child bot to stand down.
+
+        Both removal routes land here -- `/session swap slot:<n>` with no profile, and
+        `/session swap profile_name:<name>` naming someone already seated -- so the
+        last-seat guard and the child-bot teardown cannot drift apart between them.
+        The stop_typing that follows session_update_remove is not optional: a child bot
+        dropped mid-round otherwise keeps its typing indicator alive in a session it is
+        no longer part of.
+
+        Removing the last participant is allowed. An empty cast is a valid session --
+        the channel keeps its transcript, master prompt and proactivity settings, and
+        nobody speaks until someone is seated again. Refusing it here only meant the
+        one way out was `/suspend`, which throws all of that away.
+        """
+        removed_participant = session["profiles"].pop(index)
+
+        if removed_participant.get('method') == 'child_bot':
+            bot_id = removed_participant.get('bot_id')
+            if bot_id:
+                await self.manager_queue.put({
+                    "action": "send_to_child", "bot_id": bot_id,
+                    "payload": {"action": "session_update_remove", "channel_id": interaction.channel_id}
+                })
+                await self.manager_queue.put({
+                    "action": "send_to_child", "bot_id": bot_id,
+                    "payload": {"action": "stop_typing", "channel_id": interaction.channel_id}
+                })
+
+        self.session_manager._save_multi_profile_sessions()
+        await interaction.followup.send(
+            f"Removed `{removed_participant['profile_name']}` from the session.", ephemeral=True)
 
     async def _swap_session_impl(self, interaction: discord.Interaction, profile_name: Optional[str],
                                  use_child_bot: Optional[bool], slot: Optional[int]):
@@ -737,32 +807,12 @@ class MimicCog(commands.Cog, EventListeners):
             await interaction.followup.send("You are not the owner of this session and cannot modify its participants.", ephemeral=True)
             return
 
-        # Logic for removing a participant (Session must exist here)
+        # Logic for removing a participant by seat number (Session must exist here)
         if not profile_name and slot:
-            if len(session["profiles"]) <= 1:
-                await interaction.followup.send("You cannot remove the last participant. Use `/suspend` to end the session instead.", ephemeral=True)
-                return
             if slot > len(session["profiles"]):
                 await interaction.followup.send(f"Invalid slot. There are only {len(session['profiles'])} participants.", ephemeral=True)
                 return
-            
-            removed_participant = session["profiles"].pop(slot - 1)
-            
-            # If removing a child bot, send update
-            if removed_participant.get('method') == 'child_bot':
-                bot_id = removed_participant.get('bot_id')
-                if bot_id:
-                    await self.manager_queue.put({
-                        "action": "send_to_child", "bot_id": bot_id,
-                        "payload": {"action": "session_update_remove", "channel_id": interaction.channel_id}
-                    })
-                    await self.manager_queue.put({
-                        "action": "send_to_child", "bot_id": bot_id,
-                        "payload": {"action": "stop_typing", "channel_id": interaction.channel_id}
-                    })
-
-            self.session_manager._save_multi_profile_sessions()
-            await interaction.followup.send(f"Removed `{removed_participant['profile_name']}` from the session.", ephemeral=True)
+            await self._remove_session_participant(interaction, session, slot - 1)
             return
 
         if profile_name:
@@ -817,11 +867,41 @@ class MimicCog(commands.Cog, EventListeners):
             if bot_id_to_use:
                 new_participant["bot_id"] = bot_id_to_use
 
-            # Duplicate Guard: Check if this identity is already in the session
-            for p in (session["profiles"] if session else []):
-                if p["owner_id"] == new_participant["owner_id"] and p["profile_name"] == new_participant["profile_name"]:
-                    await interaction.followup.send(f"Profile `{profile_name}` is already a participant in this session.", ephemeral=True)
+            # Naming someone already seated removes them. This used to be a flat
+            # refusal, which left `slot:` as the only way out of a session -- so
+            # dropping a profile meant first running the command bare to find out what
+            # number it had been given. Both arguments now address the same participant.
+            #
+            # Deliberately guarded on the *bare* form. `slot:` and `use_child_bot:` are
+            # statements about where or how someone sits, not about whether they should
+            # be there at all, and deleting a participant in response to one would be
+            # the opposite of what was asked. Each keeps an explicit answer instead,
+            # which is also the only thing either could sensibly mean for a seat that
+            # is already taken.
+            existing_index = next(
+                (n for n, p in enumerate(session["profiles"] if session else [])
+                 if p["owner_id"] == new_participant["owner_id"]
+                 and p["profile_name"] == new_participant["profile_name"]),
+                None)
+
+            if existing_index is not None:
+                if slot is not None:
+                    await interaction.followup.send(
+                        f"`{profile_name}` is already in slot {existing_index + 1}. Run "
+                        f"`/session swap profile_name:{profile_name}` on its own to remove it, "
+                        f"or name a different profile to put in slot {slot}.", ephemeral=True)
                     return
+                if use_child_bot is not None:
+                    seated_as = ("its child bot"
+                                 if session["profiles"][existing_index].get("method") == "child_bot"
+                                 else "a webhook")
+                    await interaction.followup.send(
+                        f"`{profile_name}` is already a participant, speaking through {seated_as}. "
+                        f"Remove it with `/session swap profile_name:{profile_name}` on its own, "
+                        f"then add it back with the `use_child_bot` you want.", ephemeral=True)
+                    return
+                await self._remove_session_participant(interaction, session, existing_index)
+                return
 
             # Create new session if none exists
             if not session:
@@ -831,7 +911,9 @@ class MimicCog(commands.Cog, EventListeners):
                     "owner_id": interaction.user.id, "is_running": False,
                     "task_queue": asyncio.Queue(),
                     "worker_task": None, "turns_since_last_ltm": 0, "session_prompt": None,
-                    "session_mode": "sequential", "pending_image_gen_data": None, "pending_whispers": {}
+                    "session_mode": "sequential", "pending_image_gen_data": None, "pending_whispers": {},
+                    # Seated, not started -- same rule the cast dropdown follows.
+                    "started": False,
                 }
                 self.multi_profile_channels[interaction.channel_id] = session
                 session["is_hydrated"] = True
@@ -843,7 +925,9 @@ class MimicCog(commands.Cog, EventListeners):
                     })
 
                 self.session_manager._save_multi_profile_sessions()
-                await interaction.followup.send(f"Started a new regular session with `{profile_name}`.", ephemeral=True)
+                await interaction.followup.send(
+                    f"Seated `{profile_name}`. Start it with `/session config` -> **Start / Update Session**.",
+                    ephemeral=True)
                 return
 
             # Existing Session Logic (Swap/Add)
@@ -925,31 +1009,6 @@ class MimicCog(commands.Cog, EventListeners):
         view = SessionAuditView(self, interaction, session, interaction.channel_id)
         await interaction.followup.send(embed=view._build_embed(), view=view, ephemeral=True)
 
-    @session_group.command(name="trigger", description="Manually triggers a new round of the current regular session.")
-    @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
-    @app_commands.guild_only()
-    async def trigger_session_slash(self, interaction: discord.Interaction):
-        if not self.has_lock: return
-        await interaction.response.defer(ephemeral=True)
-
-        session = self.multi_profile_channels.get(interaction.channel_id)
-        if not session:
-            await interaction.followup.send("No active session found in this channel.", ephemeral=True)
-            return
-
-        if session.get("owner_id") != interaction.user.id and not interaction.user.guild_permissions.administrator:
-            await interaction.followup.send("Only the session owner or a server administrator can trigger a round.", ephemeral=True)
-            return
-
-        # Trigger logic: push a null trigger to simulate automated continuation
-        await session['task_queue'].put(None)
-        if not session.get('worker_task') or session['worker_task'].done():
-            task = self.bot.loop.create_task(self.generation_service._multi_profile_worker(interaction.channel_id))
-            session['worker_task'] = task
-            self.background_tasks.add(task)
-
-        await interaction.followup.send("Round triggered.", ephemeral=True)
-
     @session_group.command(name="view", description="View details of the current session and its participants.")
     @app_commands.checks.cooldown(5, 10.0, key=lambda i: i.user.id)
     async def session_view_slash(self, interaction: discord.Interaction):
@@ -979,7 +1038,9 @@ class MimicCog(commands.Cog, EventListeners):
         profiles_for_display = session_data_idx.get("profiles", [])
         participant_count = len(profiles_for_display)
         
+        started = session_data_idx.get("started", True)
         embed = discord.Embed(title=f"Session Info: #{interaction.channel.name}", color=discord.Color.gold())
+        embed.add_field(name="Status", value="`Live`" if started else "`Draft`", inline=True)
         embed.add_field(name="Session Type", value=type_display, inline=True)
         embed.add_field(name="Session Admin", value=owner_name, inline=True)
         embed.add_field(name="Participants", value=str(participant_count), inline=True)
@@ -997,6 +1058,9 @@ class MimicCog(commands.Cog, EventListeners):
             "owner_id": owner_id,
             "profiles": profiles_for_display
         }
+
+        if not started:
+            embed.set_footer(text="Draft — start it from /session config.")
 
         view = SessionView(self, interaction, session_view_data)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
@@ -1081,6 +1145,44 @@ class MimicCog(commands.Cog, EventListeners):
             await self.game_service.stop_game(interaction.channel_id, reason="stopped early")
         await interaction.followup.send(
             "Game ended." if game else "Table cleared.", ephemeral=True)
+
+    # Top level rather than under /session: forcing a round is something a user does
+    # mid-conversation, alongside /refresh and /cancel, not something they go into a
+    # configuration group to find.
+    @app_commands.command(name="trigger", description="Manually triggers a new round of the session in this channel.")
+    @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
+    @app_commands.guild_only()
+    async def trigger_session_slash(self, interaction: discord.Interaction):
+        if not self.has_lock: return
+        await interaction.response.defer(ephemeral=True)
+
+        session = self.multi_profile_channels.get(interaction.channel_id)
+        if not session:
+            await interaction.followup.send("No active session found in this channel.", ephemeral=True)
+            return
+
+        if session.get("owner_id") != interaction.user.id and not interaction.user.guild_permissions.administrator:
+            await interaction.followup.send("Only the session owner or a server administrator can trigger a round.", ephemeral=True)
+            return
+
+        if not self.session_manager.is_started(session):
+            await interaction.followup.send(
+                "This session has not been started. Run `/session config` -> **Start / Update Session**.",
+                ephemeral=True)
+            return
+
+        if not session.get("profiles"):
+            await interaction.followup.send("There is nobody in the cast to trigger.", ephemeral=True)
+            return
+
+        # Trigger logic: push a null trigger to simulate automated continuation
+        await session['task_queue'].put(None)
+        if not session.get('worker_task') or session['worker_task'].done():
+            task = self.bot.loop.create_task(self.generation_service._multi_profile_worker(interaction.channel_id))
+            session['worker_task'] = task
+            self.background_tasks.add(task)
+
+        await interaction.followup.send("Round triggered.", ephemeral=True)
 
     @app_commands.command(name="refresh", description="Clears the bot's short-term memory for the current context.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -1762,6 +1864,18 @@ class MimicCog(commands.Cog, EventListeners):
             embed.description = "This user does not have a displayable avatar."
             
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="start", description="Guided setup: keys, characters, sessions, and how to talk to them.")
+    @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)
+    async def start_slash(self, interaction: discord.Interaction):
+        # Deliberately not named /setup: a new user typing "/s" is already choosing
+        # between settings, session, speak and suspend, and this is the one command
+        # they have been told to run.
+        from .gui.gui_start import StartWizardView, gather_state
+        await interaction.response.defer(ephemeral=True)
+        state = await gather_state(self, interaction)
+        view = StartWizardView(self, interaction, state)
+        await view.update_display()
 
     @app_commands.command(name="guide", description="Displays detailed documentation about the bot's features and commands.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
