@@ -164,6 +164,35 @@ class ChildBotManager:
         parent_name = self.cog.bot.user.name if self.cog.bot.user else "MimicAI"
         parent_id = self.cog.bot.user.id if self.cog.bot.user else 0
 
+        # Every child bot is its own CommandTree, and a tree with no on_error falls
+        # through to the library default: it logs "Ignoring exception in command" and
+        # never acknowledges the interaction, so a non-admin pressing /toggle waited out
+        # Discord's three-second timeout and was told the bot did not respond. The
+        # parent's cog_app_command_error covers the parent's tree only -- these commands
+        # are registered on `child.tree` and are reached by neither it nor the cog.
+        @child.tree.error
+        async def on_child_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+            if isinstance(error, app_commands.MissingPermissions):
+                msg = "You need the **Server Administrator** permission to use this command."
+            elif isinstance(error, app_commands.CheckFailure):
+                msg = "You do not have the required permissions to use this command."
+            elif isinstance(error, app_commands.CommandOnCooldown):
+                msg = f"This command is on cooldown. Please try again in {int(error.retry_after)} second(s)."
+            else:
+                print(f"[ChildBotManager] Unhandled command error on bot {bot_id}: {error}")
+                traceback.print_exc()
+                msg = "An unexpected error occurred. Please report this to the bot owner."
+
+            # /toggle defers before it can fail, so the reply has to go wherever the
+            # interaction currently is; a dead one is nothing more we can do about.
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
         # --- Register Commands ---
         @child.tree.command(name="whoami", description="Displays information about this bot's identity.")
         async def whoami(interaction: discord.Interaction):
@@ -728,6 +757,40 @@ class ChildBotManager:
         except Exception as e:
             print(f"[ChildBotManager] Regeneration edit error for {bot_id}: {e}")
 
+    def _child_bot_participant(self, bot_id: str, bot_config: Dict, *,
+                               owner_id: Any = None, profile_name: str = None,
+                               ephemeral: bool = False) -> Dict:
+        """One cast entry for a child bot, PID included.
+
+        The three places that seat a child bot each wrote this dict by hand and all
+        three omitted `pid` -- so every child bot that seated itself (which is every
+        one of them outside `/session config`) landed in the cast identified only by
+        its name, and the Current Cast list rendered it with no `[PID]` beside it while
+        every webhook participant had one. `_repair_participant_identity` stamps it on
+        the next load, so the gap closed itself at the following restart, which is why
+        it read as intermittent.
+
+        `owner_id`/`profile_name` override for a borrow: the bot is the author's, but
+        the seat is the borrower's, and the PID has to be resolved in the index that
+        spells that local name. Only when the seat is the author's own is the bot's
+        record authoritative -- it carries the profile folder it was launched from,
+        which *is* the PID, so that path costs no lookup at all.
+        """
+        seat_owner = bot_config["owner_id"] if owner_id is None else owner_id
+        seat_name = bot_config["profile_name"] if profile_name is None else profile_name
+
+        pid = None
+        try:
+            if int(seat_owner) == int(bot_config["owner_id"]):
+                pid = bot_config.get("pid")
+            if not pid:
+                pid = self.cog.profile_manager._get_pid_from_name(int(seat_owner), seat_name)
+        except (TypeError, ValueError):
+            pid = bot_config.get("pid")
+
+        return {"owner_id": seat_owner, "profile_name": seat_name, "pid": pid,
+                "method": "child_bot", "bot_id": bot_id, "ephemeral": ephemeral}
+
     async def handle_child_bot_event(self, event_data: Dict):
         if event_data.get("message", {}).get("author_id") in self.cog.global_blacklist:
             return
@@ -783,13 +846,9 @@ class ChildBotManager:
                         return
 
             session = self.cog.multi_profile_channels.get(channel_id)
-            ephemeral_participant = {
-                "owner_id": effective_owner_id,
-                "profile_name": effective_profile_name,
-                "method": "child_bot",
-                "bot_id": bot_id,
-                "ephemeral": True
-            }
+            ephemeral_participant = self._child_bot_participant(
+                bot_id, bot_config, owner_id=effective_owner_id,
+                profile_name=effective_profile_name, ephemeral=True)
 
             if not session:
                 session = {
@@ -993,10 +1052,7 @@ class ChildBotManager:
         result_msg = ""
 
         if not session:
-            participant = {
-                "owner_id": bot_config['owner_id'], "profile_name": bot_config['profile_name'],
-                "method": "child_bot", "bot_id": bot_id, "ephemeral": False
-            }
+            participant = self._child_bot_participant(bot_id, bot_config)
             session = {
                 "type": "multi", "profiles": [participant],
                 "unified_log": [], "is_hydrated": False, "last_bot_message_id": None,
@@ -1024,10 +1080,7 @@ class ChildBotManager:
                 if len(session['profiles']) >= 200:
                     return "The current Chat Session contains the maximum of 200 participating profiles. Please remove a profile and try again."
 
-                participant = {
-                    "owner_id": bot_config['owner_id'], "profile_name": bot_config['profile_name'],
-                    "method": "child_bot", "bot_id": bot_id, "ephemeral": False
-                }
+                participant = self._child_bot_participant(bot_id, bot_config)
                 session['profiles'].append(participant)
                 result_msg = "Added to the current Chat Session."
 

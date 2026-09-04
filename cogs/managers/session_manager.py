@@ -22,6 +22,7 @@ from ..utils.constants import (
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
     COMPACTION_THRESHOLD_DEFAULT, COMPACTION_CHUNK_DEFAULT,
     COMPACTION_MODEL_DEFAULT, COMPACTION_FALLBACK_MODEL_DEFAULT,
+    DEFAULT_CAST_POLICY,
 )
 from .storage_manager import IOManager, _delete_file_shard, _get_compressor, _get_decompressor
 
@@ -604,8 +605,111 @@ class SessionManager:
             return (session_type, channel_id)
         return None
 
+    def cast_policy_for_channel(self, guild_id: int, channel_id: int) -> str:
+        """This channel's cast policy, without waking or creating a session.
+
+        The `/session config` gate has to answer this *before* `_ensure_session_shell`
+        runs, or the act of checking whether a member may open the editor would create
+        the session that decides it -- and a channel that has never had one would then
+        answer with a freshly minted default instead of "no".
+
+        Live session first, then the saved blueprint, then CLOSED. Absent means closed
+        at every step: a blueprint written before the field existed keeps the
+        admin-only access it was configured under.
+        """
+        session = self.cog.multi_profile_channels.get(channel_id)
+        if session:
+            return session.get("cast_policy") or DEFAULT_CAST_POLICY
+
+        try:
+            server_index = self.cog.server_manager._get_server_index(str(guild_id))
+            active = server_index.get("active_sessions", {})
+            if not isinstance(active, dict):
+                return DEFAULT_CAST_POLICY
+            blueprint = (active.get("regular", {}) or {}).get(str(channel_id))
+            if blueprint:
+                return blueprint.get("cast_policy") or DEFAULT_CAST_POLICY
+        except Exception:
+            # A gate that cannot read its own setting refuses rather than opens.
+            return DEFAULT_CAST_POLICY
+
+        return DEFAULT_CAST_POLICY
+
+    def participant_identity(self, participant: Dict) -> Tuple[int, str]:
+        """Canonical identity of a seated participant: `(owner_id, pid)`.
+
+        One function because there were three comparisons -- the cast editor's
+        `_participant_key`, `/session swap`'s inline `owner_id`/`profile_name` test,
+        and the removal filters -- and a rename made them disagree about whether a
+        character was already seated. `method` is deliberately not part of it: a child
+        bot and a webhook are two voices for one profile, not two characters.
+
+        Falls back to `_get_pid_from_name_any` (the *soft* resolver) for an entry
+        seated before PIDs were stamped, so a legacy participant whose name no longer
+        resolves still gets a token unique to that name and stays individually
+        comparable, where a strict None would collide every unresolvable entry into
+        one identity.
+        """
+        owner_id = int(participant["owner_id"])
+        pid = participant.get("pid") or self.cog.profile_manager._get_pid_from_name_any(
+            owner_id, participant.get("profile_name") or "")
+        return (owner_id, pid)
+
+    def _repair_participant_identity(self, participants: List[Dict]) -> bool:
+        """Stamp a missing PID and re-spell a stale name, in place. True if changed.
+
+        A blueprint has always recorded both the PID and the name for every seated
+        participant, but only the name was ever read back. That made the name the de
+        facto identity of a cast entry, and a name is a label the owner can change:
+        `_rename_profile` hot-swaps `profile_name` across live sessions but never
+        persists the swap, so a restart in that window restored a cast naming a
+        profile that no longer exists -- and `_get_pid_from_name_any` then answered
+        with the dead name itself, which stopped matching the `speaker_pid` on the
+        profile's own logged turns.
+
+        The PID is the half that survives a rename, so it wins: the name is
+        re-derived from it here, on every load, which makes the repair idempotent and
+        self-healing rather than dependent on a save landing. Entries written before
+        PIDs were stamped carry only a name, so they are resolved forward once and
+        stamped -- strictly, because a name-shaped PID is exactly what this exists to
+        stop being written.
+
+        A PID that resolves to nothing is left alone: the profile was deleted, and
+        removing the participant is the hydration sweep's job, not this one's.
+        """
+        pm = self.cog.profile_manager
+        changed = False
+
+        for p in participants:
+            owner_id = p.get("owner_id")
+            if owner_id is None:
+                continue
+            owner_id = int(owner_id)
+
+            pid = p.get("pid")
+            if not pid:
+                resolved = pm._get_pid_from_name(owner_id, p.get("profile_name") or "")
+                if resolved:
+                    p["pid"] = resolved
+                    changed = True
+                continue
+
+            # include_borrowed: a seated borrow's local name is the borrower's own, and
+            # re-spelling it here is not re-sharing anything.
+            current = pm._get_name_from_pid(owner_id, pid, include_borrowed=True)
+            if current and current != p.get("profile_name"):
+                p["profile_name"] = current
+                changed = True
+
+        return changed
+
     async def _load_multi_profile_sessions(self):
         await self.cog.bot.wait_until_ready()
+
+        # Set by the identity repair below. Persisted once, after every server has been
+        # walked, rather than per session -- _save_multi_profile_sessions rewrites all
+        # of them anyway, so calling it inside the loop would be O(servers) full saves.
+        repaired_any = False
 
         servers_dir = SERVERS_DIR
         if not os.path.isdir(servers_dir):
@@ -631,6 +735,8 @@ class SessionManager:
 
                     owner_id = session_data.get("owner_id")
                     profiles_data = session_data.get("profiles",[])
+                    if self._repair_participant_identity(profiles_data):
+                        repaired_any = True
 
                     # An empty cast is a valid session -- the master prompt,
                     # proactivity and compaction settings are still worth restoring,
@@ -654,10 +760,16 @@ class SessionManager:
                         "type": "multi",
                         "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 20, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
                         "compaction": session_data.get("compaction", DEFAULT_COMPACTION_CONFIG.copy()),
+                        # Absent means CLOSED: a blueprint written before this field
+                        # existed keeps the admin-only access it was configured under.
+                        "cast_policy": session_data.get("cast_policy", DEFAULT_CAST_POLICY),
                         "started": session_data.get("started", True),
                     }
                 except Exception as e:
                     print(f"Unexpected error reloading multi-profile sessions for server {server_id_str}, channel {ch_id_str}: {e}")
+
+        if repaired_any:
+            self._save_multi_profile_sessions()
 
     def _save_multi_profile_sessions(self):
         try:
@@ -677,7 +789,11 @@ class SessionManager:
 
                 profiles_to_save =[]
                 for p in session_data.get("profiles",[]):
-                    pid = self.cog.profile_manager._get_pid_from_name_any(p["owner_id"], p["profile_name"])
+                    # The stamped PID wins. Re-resolving from the name would overwrite a
+                    # good PID with a name-shaped one during the window where a rename
+                    # has landed in the index but not yet in this cast entry.
+                    pid = p.get("pid") or self.cog.profile_manager._get_pid_from_name_any(
+                        p["owner_id"], p["profile_name"])
                     profiles_to_save.append({
                         "pid": pid,
                         "profile_name": p["profile_name"],
@@ -697,6 +813,7 @@ class SessionManager:
                     "type": "multi",
                     "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
                     "compaction": session_data.get("compaction", DEFAULT_COMPACTION_CONFIG.copy()),
+                    "cast_policy": session_data.get("cast_policy", DEFAULT_CAST_POLICY),
                     "started": bool(session_data.get("started", True)),
                 }
 
@@ -936,6 +1053,9 @@ class SessionManager:
                 if session_config:
                     profiles = session_config.get("profiles", [])
                     for p in profiles: p.setdefault('ltm_counter', 0)
+                    # Same repair as the boot path: this branch restores a blueprint
+                    # that has been on disk, so its names are exactly as stale.
+                    self._repair_participant_identity(profiles)
 
                     if not session:
                         session = {
@@ -946,6 +1066,7 @@ class SessionManager:
                             "type": "multi",
                             "proactivity": session_config.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
                             "compaction": session_config.get("compaction", DEFAULT_COMPACTION_CONFIG.copy()),
+                            "cast_policy": session_config.get("cast_policy", DEFAULT_CAST_POLICY),
                             "task_queue": asyncio.Queue(),
                             "is_running": False,
                             "started": session_config.get("started", True),
@@ -960,6 +1081,7 @@ class SessionManager:
                         session["type"] = "multi"
                         session["proactivity"] = session_config.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."})
                         session["compaction"] = session_config.get("compaction", DEFAULT_COMPACTION_CONFIG.copy())
+                        session["cast_policy"] = session_config.get("cast_policy", DEFAULT_CAST_POLICY)
 
         if not session: return None
 
@@ -1351,6 +1473,7 @@ class SessionManager:
                 "pending_whispers": {},
                 "audio_mode": "off",
                 "compaction": DEFAULT_COMPACTION_CONFIG.copy(),
+                "cast_policy": DEFAULT_CAST_POLICY,
                 "started": True,
             }
             self.cog.multi_profile_channels[interaction.channel_id] = session

@@ -1805,7 +1805,7 @@ class APIService:
             return None, True, 0.0, 0.0, 0, "Could not find the channel for this interaction.", None
 
         if not self.cog.profile_manager._check_unrestricted_safety_policy(profile_owner_id_for_instructions, profile_name_for_instructions, channel):
-            return None, True, 0.0, 0.0, 0, "Profiles with 'Unrestricted 18+' safety can only be used in age-restricted channels.", None
+            return None, True, 0.0, 0.0, 0, "This character's content rating is Adult 18+, which only runs in age-restricted channels.", None
 
         model_cache_key = (channel_id, profile_owner_id_for_instructions, profile_name_for_instructions)
 

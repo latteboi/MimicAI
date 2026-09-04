@@ -1067,8 +1067,44 @@ class SessionConfigView(ui.View):
         self.selected_reactivity_profiles = set()
         self._load_lists()
 
-    #: Cast sources, in the order the Source button cycles through them.
-    SOURCES = ('personal', 'borrowed', 'system', 'child_bot')
+    #: Cast sources, in the order the Source dropdown lists them. `session` is last
+    #: because it is the only one that cannot add: it lists the characters other people
+    #: already have in this cast, so an admin can drop one without being able to see --
+    #: or seat -- anything else they own.
+    SOURCES = ('personal', 'borrowed', 'system', 'child_bot', 'session')
+
+    SOURCE_LABELS = {
+        'personal':  ("Personal", "Profiles you own."),
+        'borrowed':  ("Borrowed", "Profiles shared with you."),
+        'system':    ("System", "Profiles everyone can seat."),
+        'child_bot': ("Child Bots", "Your profiles that have their own bot account."),
+        'session':   ("In This Session", "Other members' seated characters — removal only."),
+    }
+
+    def _viewer_is_admin(self) -> bool:
+        """Whether whoever opened this editor is an administrator (or the bot owner).
+
+        Read per render rather than cached at construction: a view lives for ten
+        minutes and a role can be taken away inside one. `guild_permissions` is absent
+        on a plain User, which is why this is a getattr rather than an attribute read.
+        """
+        user = self.original_interaction.user
+        if int(getattr(user, "id", 0)) == int(defaultConfig.DISCORD_OWNER_ID):
+            return True
+        perms = getattr(user, "guild_permissions", None)
+        return bool(perms and perms.administrator)
+
+    def _available_sources(self) -> tuple:
+        """The sources this viewer may switch to.
+
+        `session` is administrators only, and deliberately not tied to `cast_policy`:
+        Open Casting says a member may edit the session, not that they may reach into
+        other members' cast entries. A non-admin under Open Casting seats and unseats
+        their own characters from the four sources that read their own indexes.
+        """
+        if self._viewer_is_admin():
+            return self.SOURCES
+        return tuple(s for s in self.SOURCES if s != 'session')
 
     def _load_lists(self):
         user_id = self.original_interaction.user.id
@@ -1082,46 +1118,120 @@ class SessionConfigView(ui.View):
             'borrowed': sorted(list(index.get("borrowed", []))),
             'system': sorted(n for n in self.cog.profile_manager._system_index()
                              if self.cog.profile_manager._is_system_name(user_id, n)),
-            'child_bot': sorted([b for b in self.cog.child_bots.values() if b['owner_id'] == user_id], key=lambda x: x.get('profile_name', ''))
+            'child_bot': sorted([b for b in self.cog.child_bots.values() if b['owner_id'] == user_id], key=lambda x: x.get('profile_name', '')),
+            # Derived per render by _session_source_items, not cached here: it is a view
+            # of the cast, and the cast changes under this editor while it is open.
+            'session': [],
         }
 
-    @staticmethod
-    def _participant_key(owner_id, profile_name) -> tuple:
-        """Identity of a seated character, deliberately ignoring `method`.
+    def _session_source_items(self) -> List[Dict]:
+        """Seated participants belonging to somebody other than the viewing admin.
+
+        The one source that does not read an index, and the only one whose contents do
+        not change when a different admin opens the editor -- it is a view of
+        `session['profiles']`, so it shows the same characters to everyone. That is the
+        point: every other source is scoped to `original_interaction.user.id`, which is
+        why an admin cannot seat, or even see, another member's profiles. This lists
+        only what is already in the cast, so it can remove and never add.
+
+        System profiles are excluded. They sit under DISCORD_OWNER_ID and so read as
+        "somebody else's" to every admin who is not the bot owner, but they have their
+        own source that seats and unseats them properly.
+        """
+        viewer_id = int(self.original_interaction.user.id)
+        system_owner = int(defaultConfig.DISCORD_OWNER_ID)
+        items = []
+        for p in self.session.get('profiles', []):
+            owner_id = int(p.get('owner_id', 0))
+            if owner_id == viewer_id or owner_id == system_owner:
+                continue
+            items.append(p)
+        return sorted(items, key=lambda p: (str(p.get('profile_name') or '').lower(),
+                                            int(p.get('owner_id', 0))))
+
+    def _option_value(self, item) -> str:
+        """The select-option value for one source entry.
+
+        Lifted out of the two places that each had their own copy -- the option build
+        and the callback's deselection test -- because the `session` source made them
+        disagree: its entries are participant dicts rather than name strings, and a
+        dict cannot be a select value. Identity is `(owner_id, pid)` there, matching
+        `participant_identity`, so the value survives a rename like everything else now
+        does.
+        """
+        if self.view_source == 'child_bot':
+            return f"child_{self._bot_id_for(item)}"
+        if self.view_source == 'session':
+            owner_id, pid = self.cog.session_manager.participant_identity(item)
+            return f"{owner_id}:{pid}"
+        return item
+
+    def _participant_key(self, participant) -> tuple:
+        """Identity of a seated character: `(owner_id, pid)`, ignoring `method`.
 
         A child bot and a webhook are two voices for one profile, not two characters.
         Seating both put the same persona in the cast twice: it read its own lines as
         someone else's, answered itself every round, and wrote two LTM streams from
         one memory. The dropdown's old check qualified on method, so the pair was the
         one duplicate it could not see.
-        """
-        return (int(owner_id), profile_name)
 
-    def _seated(self, owner_id, profile_name) -> Optional[Dict]:
-        """The seated participant matching this profile, whichever way it speaks."""
-        key = self._participant_key(owner_id, profile_name)
+        Keyed on the PID rather than the name, because a name is not an identity --
+        it is a label the owner can change. `_rename_profile` hot-swaps `profile_name`
+        across live sessions to paper over that, but it does not persist the swap, so
+        a restart in that window brought back a cast entry naming a profile that no
+        longer exists. The stored PID survives the rename; the name is repaired from
+        it on load.
+
+        Delegates to `SessionManager.participant_identity`, which is the one place
+        that answers this -- `/session swap` compares seats too, and a second copy of
+        the rule is how the two came to disagree about a renamed profile.
+        """
+        return self.cog.session_manager.participant_identity(participant)
+
+    def _seated(self, participant) -> Optional[Dict]:
+        """The seated participant matching this one, whichever way it speaks."""
+        if not participant:
+            return None
+        key = self._participant_key(participant)
         return next((p for p in self.session.get('profiles', [])
-                     if self._participant_key(p['owner_id'], p['profile_name']) == key), None)
+                     if self._participant_key(p) == key), None)
 
     def _bot_id_for(self, item) -> Optional[str]:
         return next((k for k, v in self.cog.child_bots.items() if v is item), None)
 
     def _build_participant(self, item) -> Optional[Dict]:
-        """The participant dict for one entry of the source currently in view."""
+        """The participant dict for one entry of the source currently in view.
+
+        Stamps `pid` here, at the one point that knows which source the entry came
+        from and therefore which owner's index resolves it. Everything downstream --
+        the duplicate rule, removal, the blueprint -- then compares identities instead
+        of spellings, and a participant seated through this editor is shaped like one
+        restored from disk rather than missing the field the listing renders.
+        """
+        if self.view_source == 'session':
+            # Already a seated participant -- this source lists the cast, not an index.
+            return item
+
         if self.view_source == 'child_bot':
             bid = self._bot_id_for(item)
             bc = self.cog.child_bots.get(bid) if bid else None
             if not bc:
                 return None
+            # The child bot's own record carries the profile folder it was launched
+            # from, which is the PID; resolving the name again would only agree.
+            pid = bc.get('pid') or self.cog.profile_manager._get_pid_from_name(
+                int(bc['owner_id']), bc['profile_name'])
             return {"owner_id": bc['owner_id'], "profile_name": bc['profile_name'],
-                    "method": "child_bot", "bot_id": bid, "chance": 100, "wakewords": []}
+                    "pid": pid, "method": "child_bot", "bot_id": bid,
+                    "chance": 100, "wakewords": []}
 
         # A System profile lives in the bot owner's tree and is seated under the
         # owner's id, matching what /session swap builds for the same name.
         owner_id = (int(defaultConfig.DISCORD_OWNER_ID) if self.view_source == 'system'
                     else self.original_interaction.user.id)
-        return {"owner_id": owner_id, "profile_name": item, "method": "webhook",
-                "chance": 100, "wakewords": []}
+        return {"owner_id": owner_id, "profile_name": item,
+                "pid": self.cog.profile_manager._get_pid_from_name(owner_id, item),
+                "method": "webhook", "chance": 100, "wakewords": []}
 
     def _is_selected(self, item) -> bool:
         """Whether this source entry is seated *the way this source seats it*.
@@ -1133,7 +1243,7 @@ class SessionConfigView(ui.View):
         participant = self._build_participant(item)
         if not participant:
             return False
-        existing = self._seated(participant['owner_id'], participant['profile_name'])
+        existing = self._seated(participant)
         return existing is not None and existing.get('method') == participant.get('method')
 
     def _seat_items(self, items) -> List[str]:
@@ -1150,7 +1260,7 @@ class SessionConfigView(ui.View):
             participant = self._build_participant(item)
             if not participant:
                 continue
-            existing = self._seated(participant['owner_id'], participant['profile_name'])
+            existing = self._seated(participant)
             if existing is not None:
                 # Re-selecting something already seated the same way is a no-op, and
                 # silent: Select All hits it on every pass. Only the cross-method
@@ -1161,12 +1271,68 @@ class SessionConfigView(ui.View):
             self.session['profiles'].append(participant)
         return blocked
 
+    def _unseat_items(self, items) -> None:
+        """Unseat each entry that is seated *the way this source seats it*.
+
+        The mirror of `_seat_items`, and it has to share `_is_selected` with it. Both
+        removal paths used to filter the cast on a bare `profile_name` drawn from the
+        values on the page, and the page is built from the *viewing* admin's own lists
+        -- so an entry that merely shared a name with a seated participant removed it.
+        Two admins in one channel is the case that bites: the cast is keyed by
+        `(owner_id, profile_name)`, so another admin's same-named character was a
+        different participant that this filter could not tell apart, and clicking any
+        unrelated name silently deleted it. The same hole dropped a webhook-seated
+        profile while the child bot source was in view.
+
+        `_is_selected` is already owner-aware and method-qualified -- it is the test
+        the labels and option defaults read -- so deselection now means exactly what
+        selection means.
+        """
+        drop = set()
+        for item in items:
+            if not self._is_selected(item):
+                continue
+            participant = self._build_participant(item)
+            drop.add(self._participant_key(participant))
+        if not drop:
+            return
+        self.session['profiles'] = [
+            p for p in self.session['profiles']
+            if self._participant_key(p) not in drop]
+
+    #: Tabs a non-administrator may open when Open casting let them in here. Casting is
+    #: the whole of what Open casting grants: a member seats and unseats characters, and
+    #: everything else on this card -- the master prompt, TTS, reactivity, proactivity,
+    #: the memory and the session's own access policy -- is the channel's configuration
+    #: and stays the administrators'.
+    MEMBER_TABS = ("cast",)
+
     def _add_nav_buttons(self):
+        """The tab bar, greyed rather than hidden for a member under Open casting.
+
+        Greyed and labelled with a lock, not omitted: a member who simply cannot see
+        the Reactivity tab has no way to learn that the silence they are getting is a
+        setting somebody can change for them. It is the same choice `/start` makes for
+        the steps it cannot run.
+        """
         tabs = ["cast", "config", "reactivity", "proactivity", "memory"]
+        is_admin = self._viewer_is_admin()
         for tab in tabs:
-            btn = ui.Button(label=tab.title(), style=discord.ButtonStyle.primary if self.current_tab == tab else discord.ButtonStyle.secondary, row=4, disabled=(self.current_tab == tab))
+            locked = not is_admin and tab not in self.MEMBER_TABS
+            btn = ui.Button(label=f"🔒 {tab.title()}" if locked else tab.title(),
+                            style=discord.ButtonStyle.primary if self.current_tab == tab else discord.ButtonStyle.secondary,
+                            row=4, disabled=locked or (self.current_tab == tab))
             def make_cb(t):
                 async def cb(i: discord.Interaction):
+                    # `disabled` is a client-side hint and this view outlives a role, so
+                    # the gate is re-tested where it is acted on rather than trusted from
+                    # when the bar was drawn.
+                    if t not in self.MEMBER_TABS and not self._viewer_is_admin():
+                        await i.response.send_message(
+                            "Only server administrators can change that. Open casting lets "
+                            "you seat and unseat characters on the **Cast** tab.",
+                            ephemeral=True)
+                        return
                     self.current_tab = t; self.current_page = 0
                     self.selected_reactivity_profiles.clear()
                     await i.response.defer(); await self.update_display()
@@ -1175,13 +1341,44 @@ class SessionConfigView(ui.View):
             self.add_item(btn)
 
     async def update_display(self):
+        # Re-read the channel's live session on every render. Two admins can hold this
+        # editor open at once -- `active_session_config_views` is keyed by user id and
+        # only stops the same user's previous view -- and both mutate the one dict in
+        # `multi_profile_channels`. Without this the card keeps drawing the cast as it
+        # was when its own owner last clicked, and the next press acts on stale indices.
+        live = self.cog.multi_profile_channels.get(self.original_interaction.channel_id)
+        if live is not None:
+            self.session = live
+
+        # An administrator can lose the role with this editor open on a tab a member may
+        # not use, so the tab in hand is re-checked on every render the way `view_source`
+        # is. Falling back to Cast rather than closing the view keeps whatever they were
+        # allowed to do reachable.
+        if self.current_tab not in self.MEMBER_TABS and not self._viewer_is_admin():
+            self.current_tab = "cast"
+            self.current_page = 0
+            self.selected_reactivity_profiles.clear()
+
         self.clear_items()
         self._add_nav_buttons()
         embed = discord.Embed(title=f"Chat Session: #{self.original_interaction.channel.name}", color=discord.Color.gold())
 
         if self.current_tab == "cast":
-            embed.description = ("Add or remove participants (200 max). Selecting seats a profile "
-                                 "and saves it; **Start / Update Session** is what makes the channel live.")
+            # A role can be removed while this view is open, and `view_source` is held
+            # across renders, so the source in hand is re-checked rather than trusted.
+            if self.view_source not in self._available_sources():
+                self.view_source = 'personal'
+                self.current_page = 0
+
+            if self.view_source == 'session':
+                # Derived, not cached: the cast moves under an open editor.
+                self.lists['session'] = self._session_source_items()
+                embed.description = ("Characters **other members** already have in this cast. "
+                                     "Deselecting removes one; nothing here can be added, and no "
+                                     "profile of theirs that is not already seated is listed.")
+            else:
+                embed.description = ("Add or remove participants (200 max). Selecting seats a profile "
+                                     "and saves it; **Start / Update Session** is what makes the channel live.")
             active_list = self.lists[self.view_source]
 
             selected_items = [item for item in active_list if self._is_selected(item)]
@@ -1200,56 +1397,70 @@ class SessionConfigView(ui.View):
             if page_items:
                 page_selected_count = sum(1 for item in page_items if self._is_selected(item))
 
+                # Everything in the `session` source is seated by definition, so these
+                # only ever read as the removing half. Saying so beats a generic
+                # "toggle" on the one source where the toggle has one direction.
+                is_session_src = self.view_source == 'session'
+
                 page_toggle_label = "Unselect Page" if (page_selected_count == len(page_items)) else "Select Page"
-                options.append(discord.SelectOption(label=page_toggle_label, value="toggle_page", description="Toggle selection for all profiles on this page.", emoji="📄"))
+                options.append(discord.SelectOption(label=page_toggle_label, value="toggle_page", description=(
+                    "Remove every character on this page from the cast." if is_session_src
+                    else "Toggle selection for all profiles on this page."), emoji="📄"))
                 
                 total_selected_count = len(selected_items)
                 all_toggle_label = "Unselect All" if (total_selected_count == len(ordered_list)) else "Select All"
-                options.append(discord.SelectOption(label=all_toggle_label, value="toggle_all", description="Toggle selection for all profiles in this source.", emoji="📚"))
+                options.append(discord.SelectOption(label=all_toggle_label, value="toggle_all", description=(
+                    "Remove every other member's character from the cast." if is_session_src
+                    else "Toggle selection for all profiles in this source."), emoji="📚"))
 
                 for item in page_items:
                     participant = self._build_participant(item)
-                    if self.view_source == 'child_bot':
-                        bid = self._bot_id_for(item)
-                        val = f"child_{bid}"
-                        lbl = item.get('profile_name')
-                    else:
-                        val = item
-                        lbl = item
+                    val = self._option_value(item)
+                    name = item.get('profile_name') if isinstance(item, dict) else item
+                    # `Name [PID]`. Two members can seat characters sharing a name, and
+                    # the same name can mean different profiles across sources, so the
+                    # PID is what tells the rows apart -- and it is the identity the
+                    # cast is now keyed on, so what is shown is what is compared.
+                    pid = (participant or {}).get('pid')
+                    lbl = f"{name} [{pid}]" if pid else name
 
-                    existing = (self._seated(participant['owner_id'], participant['profile_name'])
-                                if participant else None)
+                    existing = self._seated(participant)
                     is_sel = self._is_selected(item)
 
                     # Seated the other way round: shown, not hidden, so the clash is
                     # visible where it is made rather than only after it is refused.
                     desc = None
-                    if existing is not None and not is_sel:
+                    if self.view_source == 'session':
+                        # Whose character this is. get_user misses for anyone the
+                        # gateway has not cached, so the id is the fallback -- it is
+                        # still enough to tell two same-named characters apart.
+                        owner = self.cog.bot.get_user(int(item.get('owner_id', 0)))
+                        who = owner.display_name if owner else f"user {item.get('owner_id')}"
+                        method_lbl = ("child bot" if item.get('method') == 'child_bot'
+                                      else "webhook")
+                        desc = f"{who} — speaks as a {method_lbl}. Deselect to remove."
+                    elif existing is not None and not is_sel:
                         desc = ("Already seated as a child bot." if existing.get('method') == 'child_bot'
                                 else "Already seated as a webhook.")
 
                     options.append(discord.SelectOption(label=lbl[:100], value=val[:100],
                                                         description=desc, default=is_sel))
             else:
-                options.append(discord.SelectOption(label="No profiles found", value="none"))
+                options.append(discord.SelectOption(
+                    label=("No other members have characters here"
+                           if self.view_source == 'session' else "No profiles found"),
+                    value="none"))
 
-            sel = ui.Select(placeholder=f"Select {self.view_source.replace('_', ' ')} profiles...", min_values=0, max_values=len(options) if page_items else 1, options=options, row=0, disabled=(not page_items))
+            placeholder = ("Deselect to remove another member's character..."
+                           if self.view_source == 'session'
+                           else f"Select {self.view_source.replace('_', ' ')} profiles...")
+            sel = ui.Select(placeholder=placeholder, min_values=0, max_values=len(options) if page_items else 1, options=options, row=0, disabled=(not page_items))
             async def cast_cb(i: discord.Interaction):
                 if "none" in i.data['values']: await i.response.defer(); return
                 raw_vals = i.data['values']
                 curr_vals = set(raw_vals)
-                page_vals = set([o.value for o in options if o.value not in ["toggle_page", "toggle_all"]])
-                
-                def _value_of(item):
-                    return (f"child_{self._bot_id_for(item)}"
-                            if self.view_source == 'child_bot' else item)
 
-                def _unseat(scope_items):
-                    scope_vals = {_value_of(item) for item in scope_items}
-                    self.session['profiles'] = [
-                        p for p in self.session['profiles']
-                        if (f"child_{p.get('bot_id')}" if p.get('method') == 'child_bot'
-                            else p.get('profile_name')) not in scope_vals]
+                _value_of = self._option_value
 
                 def _all_seated(scope_items):
                     return all(self._is_selected(item) for item in scope_items)
@@ -1257,21 +1468,19 @@ class SessionConfigView(ui.View):
                 blocked = []
                 if "toggle_page" in curr_vals:
                     if _all_seated(page_items):
-                        _unseat(page_items)
+                        self._unseat_items(page_items)
                     else:
                         blocked = self._seat_items(page_items)
 
                 elif "toggle_all" in curr_vals:
                     if _all_seated(ordered_list):
-                        _unseat(ordered_list)
+                        self._unseat_items(ordered_list)
                     else:
                         blocked = self._seat_items(ordered_list)
 
                 else:
-                    self.session['profiles'] = [p for p in self.session['profiles'] if not (
-                        (f"child_{p.get('bot_id')}" in page_vals and f"child_{p.get('bot_id')}" not in curr_vals) or
-                        (p.get('method') != 'child_bot' and p['profile_name'] in page_vals and p['profile_name'] not in curr_vals)
-                    )]
+                    self._unseat_items([item for item in page_items
+                                        if _value_of(item) not in curr_vals])
 
                     by_value = {_value_of(item): item for item in page_items}
                     blocked = self._seat_items([by_value[v] for v in raw_vals if v in by_value])
@@ -1300,30 +1509,61 @@ class SessionConfigView(ui.View):
             sel.callback = cast_cb
             self.add_item(sel)
 
-            source_btn = ui.Button(label=f"Source: {self.view_source.title().replace('_', ' ')}", style=discord.ButtonStyle.blurple, row=1)
-            async def src_cb(i):
-                cycle = self.SOURCES
-                self.view_source = cycle[(cycle.index(self.view_source) + 1) % len(cycle)]
+            # Row 1, directly under the profile dropdown. A select rather than the
+            # button that cycled: five sources meant up to four presses to reach one,
+            # with no way to see what the others were, and `session` has to be able to
+            # disappear for a non-admin rather than be cycled past.
+            source_opts = self._available_sources()
+            src_sel = ui.Select(
+                placeholder=f"Source: {self.SOURCE_LABELS[self.view_source][0]}",
+                min_values=1, max_values=1, row=1,
+                options=[discord.SelectOption(
+                    label=self.SOURCE_LABELS[src][0], value=src,
+                    description=self.SOURCE_LABELS[src][1],
+                    default=(src == self.view_source)) for src in source_opts])
+
+            async def src_cb(i: discord.Interaction):
+                chosen = i.data['values'][0]
+                # Re-tested on submit, not just at render: a view outlives a role.
+                if chosen not in self._available_sources():
+                    await i.response.defer()
+                    await self.update_display()
+                    return
+                self.view_source = chosen
                 self.current_page = 0
                 await i.response.defer(); await self.update_display()
-            source_btn.callback = src_cb
-            self.add_item(source_btn)
+            src_sel.callback = src_cb
+            self.add_item(src_sel)
 
             if num_pages > 1:
                 async def p_cb(i): self.current_page -= 1; await i.response.defer(); await self.update_display()
                 async def n_cb(i): self.current_page += 1; await i.response.defer(); await self.update_display()
-                build_pagination_controls(self, self.current_page, num_pages, 1, p_cb, n_cb)
+                build_pagination_controls(self, self.current_page, num_pages, 2, p_cb, n_cb)
 
-            # Row 1 holds the source toggle plus at most three pagination controls, so
-            # there is exactly one slot left for this. Only rendered when the cast is
-            # non-empty -- the dropdown sentinels can only clear the source currently
-            # in view, so with a mixed cast there is otherwise no single gesture that
-            # empties it.
-            if self.session.get('profiles'):
+            # Row 2 now holds at most three pagination controls, so there is room for
+            # this beside them. Only rendered when the cast is non-empty -- the dropdown
+            # sentinels can only clear the source currently in view, so with a mixed
+            # cast there is otherwise no single gesture that empties it.
+            #
+            # Omitted rather than greyed for a member under Open casting, which is the
+            # opposite of the tab bar's choice and for the opposite reason: the tab bar
+            # advertises something they can ask an administrator for, whereas this is
+            # the one control on the Cast tab that reaches past their own characters and
+            # empties everybody's. There is nothing to learn from seeing it, and the
+            # dropdown still clears what is theirs.
+            if self.session.get('profiles') and self._viewer_is_admin():
                 clear_btn = ui.Button(label=f"Clear Cast ({len(self.session['profiles'])})",
-                                      style=discord.ButtonStyle.secondary, row=1)
+                                      style=discord.ButtonStyle.secondary, row=2)
 
                 async def clear_cast_cb(i: discord.Interaction):
+                    # Not drawn for a member, but this view lives ten minutes and a role
+                    # can go inside one -- so, like the tab bar, it is re-tested here.
+                    if not self._viewer_is_admin():
+                        await i.response.send_message(
+                            "Only server administrators can clear the whole cast. You can "
+                            "still unseat your own characters from the dropdown.",
+                            ephemeral=True)
+                        return
                     removed = list(self.session.get('profiles', []))
                     self.session['profiles'] = []
                     self.cog.session_manager._save_multi_profile_sessions()
@@ -1359,18 +1599,22 @@ class SessionConfigView(ui.View):
             profiles = self.session.get('profiles', [])
             total_active = len(profiles)
             
+            def _cast_line(idx, p):
+                method_lbl = 'Child Bot' if p.get('method') == 'child_bot' else 'Webhook'
+                pid = p.get('pid')
+                pid_str = f" `[{pid}]`" if pid else ""
+                return f"{idx}. `{p['profile_name']}`{pid_str} ({method_lbl})"
+
             if total_active <= 20:
-                cast_list = "\n".join(f"{idx+1}. `{p['profile_name']}` ({'Child Bot' if p.get('method') == 'child_bot' else 'Webhook'})" for idx, p in enumerate(profiles)) or "*No participants*"
+                cast_list = "\n".join(_cast_line(idx + 1, p)
+                                      for idx, p in enumerate(profiles)) or "*No participants*"
             else:
                 start_p = self.current_page * 20
                 end_p = start_p + 20
                 page_profiles_cast = profiles[start_p:end_p]
                 
-                cast_lines = []
-                for idx, p in enumerate(page_profiles_cast, start=start_p + 1):
-                    method_lbl = 'Child Bot' if p.get('method') == 'child_bot' else 'Webhook'
-                    cast_lines.append(f"{idx}. `{p['profile_name']}` ({method_lbl})")
-                cast_list = "\n".join(cast_lines) or "*No participants*"
+                cast_list = "\n".join(_cast_line(idx, p) for idx, p in
+                                      enumerate(page_profiles_cast, start=start_p + 1)) or "*No participants*"
                 
             embed.add_field(name="Current Cast", value=cast_list, inline=False)
 
@@ -1380,11 +1624,12 @@ class SessionConfigView(ui.View):
             audio_val = self.session.get("audio_mode", "off")
             tts_status = "**`ON`**" if audio_val == "on" else "`OFF`"
             response_limit = self.session.get("max_responses", 10)
-            
+            policy = self.session.get("cast_policy", DEFAULT_CAST_POLICY)
+
             embed.add_field(name="Execution Mode", value=f"`{self.session.get('session_mode', 'sequential').title()}`", inline=True)
             embed.add_field(name="Master Prompt", value=f"`{'Set' if mp else 'Not Set'}`", inline=True)
-            embed.add_field(name="\u200b", value="\u200b", inline=True)
-            
+            embed.add_field(name="Cast Access", value=f"`{CAST_POLICY_LABELS.get(policy, policy)}`", inline=True)
+
             embed.add_field(name="Text-to-Speech", value=f"{tts_status}", inline=True)
             embed.add_field(name="Response Limit", value=f"`{response_limit}`", inline=True)
             embed.add_field(name="\u200b", value="\u200b", inline=True)
@@ -1404,7 +1649,7 @@ class SessionConfigView(ui.View):
             prompt_btn.callback = pr_cb
             self.add_item(prompt_btn)
 
-            audio_btn = ui.Button(label="Toggle TTS", style=discord.ButtonStyle.secondary, row=1)
+            audio_btn = ui.Button(label="Toggle TTS", style=discord.ButtonStyle.secondary, row=0)
             async def audio_cb(i):
                 self.session["audio_mode"] = "off" if self.session.get("audio_mode", "off") == "on" else "on"
                 self.cog.session_manager._save_multi_profile_sessions()
@@ -1412,10 +1657,42 @@ class SessionConfigView(ui.View):
             audio_btn.callback = audio_cb
             self.add_item(audio_btn)
 
-            limit_btn = ui.Button(label="Set Response Limit", style=discord.ButtonStyle.primary, row=1)
+            limit_btn = ui.Button(label="Set Response Limit", style=discord.ButtonStyle.primary, row=0)
             async def limit_cb(i): await i.response.send_modal(ResponseLimitModal(self))
             limit_btn.callback = limit_cb
             self.add_item(limit_btn)
+
+            # Row 1, vacated by the two buttons above. A select needs a row to itself,
+            # and the four config buttons fit one row with a slot to spare.
+            #
+            # Administrators only, and rendered disabled rather than hidden for everyone
+            # else so a member under Open Casting can see the terms they are editing
+            # under. It is the control that grants the access: a member who could set it
+            # could lock the administrators' own setting back out from under them, and
+            # could keep a channel open that an admin had closed.
+            viewer_is_admin = self._viewer_is_admin()
+            policy_sel = ui.Select(
+                placeholder=f"Cast access: {CAST_POLICY_LABELS.get(policy, policy)}"
+                            + ("" if viewer_is_admin else " (administrators only)"),
+                min_values=1, max_values=1, row=1, disabled=not viewer_is_admin,
+                options=[discord.SelectOption(label=lbl, value=val, description=desc,
+                                              emoji=emoji, default=(val == policy))
+                         for val, lbl, desc, emoji in CAST_POLICIES])
+
+            async def policy_cb(i: discord.Interaction):
+                # Re-tested on submit: `disabled` is a client-side hint, and this view
+                # outlives the role that rendered it.
+                if not self._viewer_is_admin():
+                    await i.response.send_message(
+                        "Only a server administrator can change who may edit this session.",
+                        ephemeral=True)
+                    return
+                self.session["cast_policy"] = i.data['values'][0]
+                self.cog.session_manager._save_multi_profile_sessions()
+                await i.response.defer()
+                await self.update_display()
+            policy_sel.callback = policy_cb
+            self.add_item(policy_sel)
 
         elif self.current_tab == "reactivity":
             embed.description = "Manage how likely participants are to respond to messages."
@@ -1625,10 +1902,12 @@ class SessionConfigView(ui.View):
 
         # On every tab, because the button is on every tab: the one thing the editor
         # must never leave ambiguous is whether the channel is already live.
-        if self.cog.session_manager.is_started(self.session):
-            embed.set_footer(text="● Live in this channel.")
-        else:
-            embed.set_footer(text="○ Draft — nothing runs until you press Start / Update Session.")
+        state_note = ("● Live in this channel."
+                      if self.cog.session_manager.is_started(self.session)
+                      else "○ Draft — nothing runs until you press Start / Update Session.")
+        if not self._viewer_is_admin():
+            state_note += "  ·  Open casting."
+        embed.set_footer(text=state_note)
 
         try:
             await self.original_interaction.edit_original_response(embed=embed, view=self)

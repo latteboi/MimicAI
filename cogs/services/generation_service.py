@@ -20,6 +20,7 @@ from ..utils.constants import (
     DEFAULT_IMAGE_GROUNDING, DEFAULT_NEGATIVE_CONSTRAINTS, DEFAULT_IMAGE_PRESENT,
     DEFAULT_IMAGE_PRESENT_OTHER, DEFAULT_IMAGE_FAILED,
     DEFAULT_SPEECH_VOICE, TTS_SYNTHESIS_PREAMBLE, CRITIC_AUDIT_TEXT_MAX,
+    CONTENT_RATING_ADULT, CONTENT_RATING_EMOJI, CONTENT_RATING_LABELS,
 )
 from ..utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt,
@@ -133,6 +134,59 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             surviving.sort(key=lambda t: 0 if (isinstance(t, tuple)
                                                and t[0] == 'game_beat') else 1)
         return surviving, beat_participant, beat_cast
+
+    #: Sent to the channel and logged verbatim. Names the rating the way the dashboard
+    #: does -- "Adult 18+", the content rating -- rather than the retired
+    #: "Unrestricted 18+ safety", which was the old per-profile safety toggle and has
+    #: not been the thing this gate reads for some time. It also says what to do about
+    #: it, because the previous wording stated a rule and left the reader with no next
+    #: step.
+    AGE_RESTRICTION_NOTICE = (
+        "**{name}** can't respond in this channel. Its content rating is "
+        "{emoji} **{rating}**, which only runs in age-restricted channels.\n"
+        "Mark this channel age-restricted in its settings (Edit Channel -> Age-Restricted "
+        "Channel), or seat the character somewhere that already is."
+    )
+
+    async def _refuse_age_restricted(self, session, channel, profile_name: str) -> None:
+        """Post the age-restriction refusal and record it as a real turn of the session.
+
+        It used to be a bare channel message that nothing wrote down. Everything that
+        reads a session back -- `/session view`, `/session audit`, the history browser,
+        the synopsis -- derives from `unified_log`, so the transcript showed the
+        character being addressed and simply saying nothing, and the one explanation
+        for the silence lived in Discord's scrollback until somebody scrolled past it.
+
+        A SYSTEM turn, shaped like the ones `triggers.py` writes: no `profile_name`, so
+        it can never be mistaken for the character speaking or be picked up as one of
+        its turns, and `speaker_pid` "SYSTEM" so the whisper and compaction walks treat
+        it the way they treat every other note. It carries the `message_ids` it was
+        delivered under, which is what lets 🔇 and a delete reach it like anything else.
+
+        Flushed rather than marked dirty: this is the end of the operation for that
+        participant -- there is no later write in this round guaranteed to supersede it,
+        and for a round where *every* participant was blocked there is no later write
+        at all.
+        """
+        rating = CONTENT_RATING_LABELS.get(CONTENT_RATING_ADULT, "Adult 18+")
+        text = self.AGE_RESTRICTION_NOTICE.format(
+            name=profile_name, rating=rating,
+            emoji=CONTENT_RATING_EMOJI.get(CONTENT_RATING_ADULT, "🔞"))
+
+        sent = await self._send_channel_message(channel, text) or []
+
+        if session is None:
+            return
+        turn = {
+            "turn_id": str(uuid.uuid4()),
+            "is_user": False,
+            "speaker_pid": "SYSTEM",
+            "message_ids": [m.id for m in sent if m],
+            "content": f"<system_note>\n{text}\n</system_note>",
+        }
+        session.setdefault("unified_log", []).append(intern_turn(turn))
+        await self.cog.session_manager.flush_session(
+            (channel.id, None, None), session.get("type", "multi"))
 
     async def _multi_profile_worker(self, channel_id: int):
         session = self.cog.multi_profile_channels.get(channel_id)
@@ -500,10 +554,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         if key in seen_blocked:
                             continue
                         seen_blocked.add(key)
-                        await self._send_channel_message(
-                            channel,
-                            f"[System Notice: '{p['profile_name']}' cannot respond. Profiles with "
-                            "'Unrestricted 18+' safety are only permitted in age-restricted channels.]")
+                        await self._refuse_age_restricted(session, channel, p['profile_name'])
 
                 if not profile_order:
                     for trigger in all_triggers_for_round:
@@ -861,8 +912,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     # Backstop only. profile_order was filtered before the feedback step, so
                     # this fires only if the channel's age-restricted flag is flipped mid-round.
                     if not self.cog.profile_manager._check_unrestricted_safety_policy(owner_id, profile_name, channel):
-                        error_message = f"[System Notice: '{profile_name}' cannot respond. Profiles with 'Unrestricted 18+' safety are only permitted in age-restricted channels.]"
-                        await self._send_channel_message(channel, error_message)
+                        await self._refuse_age_restricted(session, channel, profile_name)
                         continue
 
                     user_index = self.cog.profile_manager._get_user_index(owner_id)

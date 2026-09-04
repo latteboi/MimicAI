@@ -340,6 +340,44 @@ class EventListeners:
                 self.background_tasks.add(task)
             return
 
+    def _reaction_user_is_admin(self, payload: discord.RawReactionActionEvent) -> bool:
+        """Administrator (or bot owner) test for a raw reaction.
+
+        `payload.member` is populated on adds in a guild, which is the only place these
+        controls exist, so this normally costs nothing; the guild walk is the fallback
+        for a member the cache does not hold. No member and no cache means no
+        permission, because a control that fails open is not a control.
+        """
+        try:
+            if payload.user_id == int(defaultConfig.DISCORD_OWNER_ID):
+                return True
+        except (TypeError, ValueError):
+            pass
+        member = payload.member
+        if member is None and payload.guild_id:
+            guild = self.bot.get_guild(payload.guild_id)
+            member = guild.get_member(payload.user_id) if guild else None
+        perms = getattr(member, "guild_permissions", None)
+        return bool(perms and perms.administrator)
+
+    async def _pull_back_reaction(self, payload: discord.RawReactionActionEvent):
+        """Take a denied reaction back off, so the refusal is visible.
+
+        There is no interaction behind a reaction and therefore no ephemeral message to
+        answer with, and a reaction that sits there while nothing happens reads as the
+        bot being broken -- the same complaint an unanswered slash command draws. This
+        needs Manage Messages and is best-effort: without it the deny is simply silent,
+        which is no worse than doing nothing at all.
+        """
+        try:
+            channel = self.bot.get_channel(payload.channel_id)
+            if channel is None:
+                return
+            message = await channel.fetch_message(payload.message_id)
+            await message.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
+        except Exception:
+            pass
+
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         if payload.user_id in self.global_blacklist:
@@ -363,6 +401,18 @@ class EventListeners:
         is_skip = (emoji_str in SKIP_PARTICIPANT_EMOJI)
 
         if not any([is_regen, is_next, is_continue, is_mute, is_skip]):
+            return
+
+        # Muting is deliberately open: it hides one turn from the transcript, which is
+        # the ordinary repair anyone in a scene needs when a reply lands badly, and it
+        # is reversible from the same place it was done.
+        if is_skip and not self._reaction_user_is_admin(payload):
+            # Skipping is not turn-local. It suspends a participant from every round
+            # until somebody unskips it, so one press can silence another member's
+            # character indefinitely, and nothing in the channel says who did it or
+            # that it happened. Checked here rather than where the skip is applied so a
+            # denied press never wakes a dehydrated session.
+            asyncio.create_task(self._pull_back_reaction(payload))
             return
 
         channel_id = payload.channel_id
@@ -553,8 +603,8 @@ class EventListeners:
         emoji_str = str(payload.emoji)
 
         if emoji_str in (TRAIN_INPUT_EMOJI, TRAIN_OUTPUT_EMOJI):
-            entry = self.armed_training_channels.get(payload.channel_id)
-            if entry and payload.user_id == entry["armed_by"]:
+            entry = self.armed_training_channels.get((payload.channel_id, payload.user_id))
+            if entry:
                 slot_key = "slot1" if emoji_str == TRAIN_INPUT_EMOJI else "slot2"
                 slot = entry.get(slot_key)
                 if slot and slot["message_id"] == payload.message_id:
@@ -566,6 +616,16 @@ class EventListeners:
         is_regen = (emoji_str == REGENERATE_EMOJI)
         is_next = (emoji_str == NEXT_SPEAKER_EMOJI)
         is_continue = (emoji_str == CONTINUE_ROUND_EMOJI)
+
+        # Unskipping lives on the removal, so gating only the add would have left the
+        # half of the control that *undoes* an administrator's skip open to everyone --
+        # and pulling a denied ❌ back off raises this very event for the member who was
+        # just refused, handing them the unskip on the way out. `payload.member` is not
+        # populated on removals, so this leans on the member cache the members intent
+        # fills; an uncached member is refused, which leaves the participant skipped
+        # rather than silenced-then-freed by a stranger.
+        if is_skip and not self._reaction_user_is_admin(payload):
+            return
 
         if not any([is_mute, is_skip, is_regen, is_next, is_continue]): return
 
@@ -637,18 +697,18 @@ class EventListeners:
         by design, per /train, neither the reacted messages' session membership nor their
         authorship matters.
         """
-        entry = self.armed_training_channels.get(payload.channel_id)
+        # (channel, reactor). Only the user who ran /train counts -- authorship of the
+        # reacted messages is irrelevant, so anyone else's reaction would otherwise let
+        # them write training data onto someone else's profile. That used to be a
+        # separate `armed_by` comparison against the channel's single entry; the key
+        # carries it now, which is also what lets two people arm the same channel.
+        arm_key = (payload.channel_id, payload.user_id)
+        entry = self.armed_training_channels.get(arm_key)
         if not entry:
             return False
 
         if time.time() - entry["last_activity"] > TRAIN_ARM_TIMEOUT_SECONDS:
-            self.armed_training_channels.pop(payload.channel_id, None)
-            return False
-
-        # Only the user who ran /train counts -- authorship of the reacted messages is
-        # irrelevant, so anyone else's reaction would otherwise let them write training
-        # data onto someone else's profile.
-        if payload.user_id != entry["armed_by"]:
+            self.armed_training_channels.pop(arm_key, None)
             return False
 
         text, is_user = await self._resolve_reacted_message_text(payload)
@@ -680,7 +740,7 @@ class EventListeners:
         asyncio.create_task(_ack())
 
         if entry.get("slot1") and entry.get("slot2"):
-            await self._commit_training_pair(payload.channel_id, entry)
+            await self._commit_training_pair(arm_key, entry)
         return True
 
     async def _resolve_reacted_message_text(self, payload: discord.RawReactionActionEvent):
@@ -706,7 +766,8 @@ class EventListeners:
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None, None
 
-    async def _commit_training_pair(self, channel_id: int, entry: Dict[str, Any]):
+    async def _commit_training_pair(self, arm_key: Tuple[int, int], entry: Dict[str, Any]):
+        channel_id = arm_key[0]
         s1, s2 = entry["slot1"], entry["slot2"]
         warn = ""
         if s1["is_user"] is not None and s2["is_user"] is not None and s1["is_user"] == s2["is_user"]:
@@ -720,8 +781,8 @@ class EventListeners:
 
         disarmed = False
         if not success and "Limit Reached" in msg:
-            self.armed_training_channels.pop(channel_id, None)
-            msg += " Disarming `/train` for this channel."
+            self.armed_training_channels.pop(arm_key, None)
+            msg += " Disarming your `/train` in this channel."
             disarmed = True
 
         interaction = entry.get("interaction")

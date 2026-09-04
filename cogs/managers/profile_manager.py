@@ -157,7 +157,19 @@ class ProfileManager:
     def _get_pid_from_name(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> str:
         return self._resolve_owner_and_pid(user_id, profile_name, is_borrowed)[1]
 
-    def _get_pid_from_name_any(self, user_id: int, profile_name: str) -> str:
+    def _get_pid_from_name(self, user_id: int, profile_name: str) -> Optional[str]:
+        """The PID this name resolves to for this user, or None if it resolves to none.
+
+        The strict half of the pair. `_get_pid_from_name_any` answers the same
+        question but substitutes the name itself on a miss, which is right for the
+        display and comparison sites that only need *a* stable token -- and wrong
+        anywhere the answer is stored or compared against a real PID, because a
+        name-shaped PID is indistinguishable from a real one downstream and turns a
+        renamed or deleted profile into silently mismatched data instead of an error.
+
+        Personal, then borrowed, then System -- the same precedence
+        `_resolve_effective_profile` applies, so discovery and resolution agree.
+        """
         index = self._get_user_index(user_id)
         if isinstance(index.get("personal"), dict) and profile_name in index["personal"]:
             return index["personal"][profile_name]
@@ -166,9 +178,19 @@ class ProfileManager:
         system = self._system_index()
         if profile_name in system:
             return system[profile_name]
-        return profile_name
+        return None
 
-    def _get_name_from_pid(self, user_id: int, target_pid: str) -> Optional[str]:
+    def _get_pid_from_name_any(self, user_id: int, profile_name: str) -> str:
+        """As `_get_pid_from_name`, but falls back to the name itself on a miss.
+
+        Deliberately soft, and kept that way: the turn path compares this against
+        `speaker_pid` and a session whose name no longer resolves should degrade
+        rather than raise. Use `_get_pid_from_name` wherever a miss must be visible.
+        """
+        return self._get_pid_from_name(user_id, profile_name) or profile_name
+
+    def _get_name_from_pid(self, user_id: int, target_pid: str,
+                           include_borrowed: bool = False) -> Optional[str]:
         """The local name a PID maps to, across the classes the owner can share.
 
         System profiles are included because _accept_share_request resolves the
@@ -176,9 +198,15 @@ class ProfileManager:
         a shared System profile fell through to the requester's cached name, which
         is stale the moment the bot owner renames it. Borrowed profiles are
         deliberately excluded -- a borrow is not the borrower's to re-share.
+
+        `include_borrowed` is for the one caller that is not re-sharing anything:
+        repairing a seated participant's cached name from its PID. A borrow's local
+        name is the borrower's own, and a session that seats one has exactly as much
+        right to the current spelling as it does for a personal profile.
         """
         index = self._get_user_index(user_id)
-        for category in ("personal", "system"):
+        categories = ("personal", "borrowed", "system") if include_borrowed else ("personal", "system")
+        for category in categories:
             mapping = index.get(category, {})
             if isinstance(mapping, dict):
                 for name, pid in mapping.items():

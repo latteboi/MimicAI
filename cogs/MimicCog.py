@@ -1,5 +1,6 @@
 from .utils.constants import (
     ALLOWED_MODELS, CHANNEL_MODEL_CACHE_MAX_SIZE, COG_LOCK_FILE_PATH, DATA_DIR,
+    CAST_POLICY_OPEN, DEFAULT_CAST_POLICY,
     DEFAULT_PROFILE_GENERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS, DEFAULT_SYSTEM_INSTRUCTION,
     FALLBACK_MODEL_NAME, LOCK_REFRESH_INTERVAL_SECONDS, LOCK_STALE_THRESHOLD_SECONDS,
     MAX_MULTI_PROFILES, MOD_DATA_DIR, PRIMARY_MODEL_NAME, PUBLIC_PROFILES_DIR,
@@ -75,7 +76,16 @@ class LRUCache(OrderedDict):
             oldest = next(iter(self))
             del self[oldest]
 
-class MimicCog(commands.Cog, EventListeners):
+# EventListeners first, and it has to stay first. discord.py marks Cog's own
+# cog_app_command_error / interaction_check / cog_unload with __cog_special_method__,
+# and _get_overridden_method returns None for whichever one the MRO resolves to -- so
+# with commands.Cog ahead of the mixin, all three of ours were shadowed by the base
+# no-ops and never ran. A CheckFailure from is_admin_or_owner_check then reached the
+# tree's default on_error, which logs and never acknowledges the interaction, and
+# Discord showed its three-second "did not respond" notice in place of the deny
+# message. Listener registration is unaffected either way: it scans members for
+# __cog_listener__ rather than resolving by name.
+class MimicCog(EventListeners, commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.manager_queue = bot.manager_queue
@@ -646,10 +656,25 @@ class MimicCog(commands.Cog, EventListeners):
     async def session_config_slash(self, interaction: discord.Interaction):
         if not self.has_lock: return
         
-        # [NEW] Global Admin Check for all session config modes
-        if not (interaction.user.guild_permissions.administrator or interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)):
-            await interaction.response.send_message("You must be a server administrator to configure sessions.", ephemeral=True)
-            return
+        # Administrators always, plus every member when this channel's session is set
+        # to Open Casting. The policy is read through cast_policy_for_channel because
+        # it must not wake or create a session: _ensure_session_shell below does that,
+        # and asking it first would let the check invent the session that answers it.
+        #
+        # `/session swap` is deliberately not widened by this, and neither is the
+        # `session` cast source inside the editor -- Open Casting lets a member seat
+        # their own characters, not reach into anybody else's.
+        is_admin = (interaction.user.guild_permissions.administrator
+                    or interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID))
+        if not is_admin:
+            policy = self.session_manager.cast_policy_for_channel(
+                interaction.guild_id, interaction.channel_id)
+            if policy != CAST_POLICY_OPEN:
+                await interaction.response.send_message(
+                    "You must be a server administrator to configure sessions. An "
+                    "administrator can set this channel's session to **Open casting** "
+                    "to let anyone edit it.", ephemeral=True)
+                return
 
         # Invalidate previous session configuration view for this user
         if interaction.user.id in self.active_session_config_views:
@@ -690,6 +715,7 @@ class MimicCog(commands.Cog, EventListeners):
                 "session_prompt": session_config.get("session_prompt"),
                 "session_mode": session_config.get("session_mode", "sequential"),
                 "proactivity": session_config.get("proactivity", proactivity_defaults),
+                "cast_policy": session_config.get("cast_policy", DEFAULT_CAST_POLICY),
                 "started": session_config.get("started", True),
             }
         else:
@@ -701,6 +727,7 @@ class MimicCog(commands.Cog, EventListeners):
                 "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
                 "session_prompt": None, "session_mode": "sequential",
                 "proactivity": proactivity_defaults,
+                "cast_policy": DEFAULT_CAST_POLICY,
                 # Opening the editor seats nobody and starts nothing.
                 "started": False,
             }
@@ -859,9 +886,13 @@ class MimicCog(commands.Cog, EventListeners):
             
             participant_owner = owner_id if is_system else interaction.user.id
 
-            # Create new participant object for comparison
+            # Create new participant object for comparison. The PID is stamped at
+            # seat time here for the same reason the cast editor stamps it: it is what
+            # the duplicate test below and the blueprint both key on, and resolving it
+            # later from a name the owner may since have changed is what this replaces.
             new_participant = {
                 "owner_id": participant_owner, "profile_name": profile_name,
+                "pid": self.profile_manager._get_pid_from_name(participant_owner, profile_name),
                 "method": method, "ephemeral": False
             }
             if bot_id_to_use:
@@ -878,10 +909,14 @@ class MimicCog(commands.Cog, EventListeners):
             # the opposite of what was asked. Each keeps an explicit answer instead,
             # which is also the only thing either could sensibly mean for a seat that
             # is already taken.
+            # Identity, not spelling. This used to compare owner_id + profile_name
+            # inline -- a third copy of a rule the cast editor already owned -- so a
+            # renamed profile read as unseated here while the editor still saw it in
+            # the cast, and `/session swap` would seat a second copy of it.
+            new_identity = self.session_manager.participant_identity(new_participant)
             existing_index = next(
                 (n for n, p in enumerate(session["profiles"] if session else [])
-                 if p["owner_id"] == new_participant["owner_id"]
-                 and p["profile_name"] == new_participant["profile_name"]),
+                 if self.session_manager.participant_identity(p) == new_identity),
                 None)
 
             if existing_index is not None:
@@ -912,6 +947,7 @@ class MimicCog(commands.Cog, EventListeners):
                     "task_queue": asyncio.Queue(),
                     "worker_task": None, "turns_since_last_ltm": 0, "session_prompt": None,
                     "session_mode": "sequential", "pending_image_gen_data": None, "pending_whispers": {},
+                    "cast_policy": DEFAULT_CAST_POLICY,
                     # Seated, not started -- same rule the cast dropdown follows.
                     "started": False,
                 }
@@ -990,7 +1026,6 @@ class MimicCog(commands.Cog, EventListeners):
     @session_group.command(name="audit", description="Run a diagnostic and token telemetry audit on the active session.")
     @app_commands.checks.cooldown(2, 60.0, key=lambda i: i.user.id)
     @app_commands.guild_only()
-    @is_admin_or_owner_check()
     async def session_audit_slash(self, interaction: discord.Interaction):
         if not self.has_lock: return
         
@@ -1108,8 +1143,9 @@ class MimicCog(commands.Cog, EventListeners):
             "down, then **Start** when everyone is seated. Nothing is on a clock.",
             ephemeral=True)
 
-    @play_group.command(name="stop", description="End the game running in this channel.")
+    @play_group.command(name="stop", description="End the game running in this channel (Admin Only).")
     @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.channel_id)
+    @is_admin_or_owner_check()
     async def play_stop_slash(self, interaction: discord.Interaction):
         if not self.has_lock: return
 
@@ -1118,19 +1154,6 @@ class MimicCog(commands.Cog, EventListeners):
         if not game and not lobby:
             await interaction.response.send_message(
                 "There is no game running in this channel.", ephemeral=True)
-            return
-
-        # The person who dealt it, or anyone who could have suspended the session. A
-        # lobby answers to its host on the same terms -- it is the same claim on the
-        # channel, just one that has not been dealt yet.
-        owner_id = game.started_by if game else lobby.host_id
-        is_admin = bool(getattr(interaction.user, "guild_permissions", None)
-                        and interaction.user.guild_permissions.administrator)
-        if interaction.user.id != owner_id and not is_admin and \
-                interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
-            await interaction.response.send_message(
-                "Only whoever dealt the game, or a server administrator, can end it.",
-                ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -1161,10 +1184,10 @@ class MimicCog(commands.Cog, EventListeners):
             await interaction.followup.send("No active session found in this channel.", ephemeral=True)
             return
 
-        if session.get("owner_id") != interaction.user.id and not interaction.user.guild_permissions.administrator:
-            await interaction.followup.send("Only the session owner or a server administrator can trigger a round.", ephemeral=True)
-            return
-
+        # Ungated on purpose. Anyone who can post in the channel already starts a
+        # round by typing in it, so gating the button that does the same thing only
+        # made the two disagree. Permissions here are none / admin / bot owner, and
+        # there is no session-owner tier for this to fall into.
         if not self.session_manager.is_started(session):
             await interaction.followup.send(
                 "This session has not been started. Run `/session config` -> **Start / Update Session**.",
@@ -1184,9 +1207,10 @@ class MimicCog(commands.Cog, EventListeners):
 
         await interaction.followup.send("Round triggered.", ephemeral=True)
 
-    @app_commands.command(name="refresh", description="Clears the bot's short-term memory for the current context.")
+    @app_commands.command(name="refresh", description="Clears the bot's short-term memory for the current context (Admin Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     @app_commands.guild_only()
+    @is_admin_or_owner_check()
     async def refresh_slash(self, interaction: discord.Interaction):
         if not self.has_lock: return
         await interaction.response.defer(ephemeral=True)
@@ -1198,10 +1222,6 @@ class MimicCog(commands.Cog, EventListeners):
             await interaction.followup.send("There is no active session in this channel to refresh.", ephemeral=True)
             return
 
-        if session.get("owner_id") != interaction.user.id and not interaction.user.guild_permissions.administrator:
-            await interaction.followup.send("You must be the session owner or a server administrator to refresh the memory.", ephemeral=True)
-            return
-        
         for participant in session.get("profiles", []):
             if participant.get("method") == "child_bot":
                 bot_id = participant.get("bot_id")
@@ -1243,9 +1263,10 @@ class MimicCog(commands.Cog, EventListeners):
         
         await interaction.followup.send("The session memory for this channel has been cleared. The conversation will start from scratch.", ephemeral=True)
 
-    @app_commands.command(name="cancel", description="Stops the bot's current generation or typing in this channel.")
+    @app_commands.command(name="cancel", description="Stops the bot's current generation or typing in this channel (Admin Only).")
     @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
     @app_commands.guild_only()
+    @is_admin_or_owner_check()
     async def cancel_slash(self, interaction: discord.Interaction):
         """Stops what this channel is generating, if it is still safe to stop it.
 
@@ -1281,10 +1302,11 @@ class MimicCog(commands.Cog, EventListeners):
             await interaction.response.send_message("Nothing is currently being generated in this channel.", ephemeral=True)
             return
 
-        if session.get("owner_id") != interaction.user.id and not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only the session owner or a server administrator can cancel generation.", ephemeral=True)
-            return
-
+        # Administrators only. A cancel is not private: it aborts the round everybody
+        # in the channel is waiting on, and in a busy session anyone could hold it
+        # permanently silent by cancelling each round as it started. The delivery guard
+        # below is a separate question -- it is about the round's state, not the
+        # caller's rank, and it refuses administrators too.
         if self.session_manager.is_delivering(session):
             await interaction.response.send_message(
                 "That response has already been generated and is being sent — cancelling now "
@@ -1480,9 +1502,10 @@ class MimicCog(commands.Cog, EventListeners):
             if session_lock:
                 session_lock['is_purging'] = False
 
-    @app_commands.command(name="memorise", description="Forces long-term memory summarisation for this session's cast, right now.")
+    @app_commands.command(name="memorise", description="Forces long-term memory summarisation for this session's cast, right now (Admin Only).")
     @app_commands.checks.cooldown(2, 60.0, key=lambda i: i.user.id)
     @app_commands.guild_only()
+    @is_admin_or_owner_check()
     @app_commands.describe(profile="Optional: summarise only this participant. Leave blank for the whole cast.")
     @app_commands.autocomplete(profile=EventListeners.master_autocomplete)
     async def memorise_slash(self, interaction: discord.Interaction, profile: Optional[str] = None):
@@ -1512,18 +1535,6 @@ class MimicCog(commands.Cog, EventListeners):
                 await interaction.followup.send(f"Could not find participant '{p_name}' in this session.", ephemeral=True)
                 return
 
-        is_admin = interaction.user.guild_permissions.administrator
-        if target_participant:
-            if not (is_admin or interaction.user.id == target_participant['owner_id']):
-                await interaction.followup.send(
-                    "You can only force memory summarisation for a profile you own (or be an administrator).",
-                    ephemeral=True)
-                return
-        elif not is_admin:
-            await interaction.followup.send(
-                "Summarising the whole cast requires administrator permission. Name a single profile you own instead.",
-                ephemeral=True)
-            return
 
         session_type = session.get("type", "multi")
         if not session.get("is_hydrated"):
@@ -1607,10 +1618,14 @@ class MimicCog(commands.Cog, EventListeners):
                 await suggest_profile(self, interaction, profile, candidates, on_pick)
                 return
 
-        self.armed_training_channels[interaction.channel_id] = {
+        # Keyed by (channel, armer) rather than by channel. One entry per channel meant
+        # the second person to run /train in a busy channel silently evicted the first,
+        # who then reacted into nothing -- the reaction handler still rejected them,
+        # because it checked the entry's armer, so the capture just stopped working with
+        # no message. The key now carries that identity, so the check is the lookup.
+        self.armed_training_channels[(interaction.channel_id, interaction.user.id)] = {
             "owner_id": interaction.user.id,
             "profile_name": profile,
-            "armed_by": interaction.user.id,
             "guild_id": interaction.guild.id,
             "last_activity": time.time(),
             "slot1": None,
@@ -1620,7 +1635,8 @@ class MimicCog(commands.Cog, EventListeners):
         await interaction.followup.send(
             f"Armed to train **{profile}**. React {TRAIN_INPUT_EMOJI} on the input message and {TRAIN_OUTPUT_EMOJI} on "
             "the output message (any two messages, from anyone, in any order). Stays armed for more pairs -- only your "
-            "reactions count, and arming expires after 15 minutes of inactivity.",
+            "reactions count, and arming expires after 15 minutes of inactivity. Your arming is your own: someone else "
+            "running `/train` in this channel does not disturb it.",
             ephemeral=True)
 
     @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
@@ -2023,6 +2039,7 @@ class MimicCog(commands.Cog, EventListeners):
             participant = {
                 "owner_id": owner_id,
                 "profile_name": "mimicguide",
+                "pid": self.profile_manager._get_pid_from_name(owner_id, "mimicguide"),
                 "method": "webhook",
                 "ephemeral": False
             }

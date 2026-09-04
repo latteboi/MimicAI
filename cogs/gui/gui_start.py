@@ -2,7 +2,8 @@
 
 Setup crosses two contexts and cannot complete in one message: API keys are entered in
 a DM (`/settings` is dm_only), and a channel's cast is configured by a server
-administrator (`/session config` is guild_only + admin). So this is context-aware
+administrator (`/session config` is guild_only, and admin unless the channel is on Open
+casting). So this is context-aware
 rather than linear. Steps that cannot run where you are stay **visible and greyed**,
 because a member who cannot see step 4 has no way to learn why the bot is silent.
 
@@ -29,7 +30,7 @@ import discord
 from discord import ui
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from ..utils.constants import defaultConfig
+from ..utils.constants import CAST_POLICY_OPEN, DEFAULT_CAST_POLICY, defaultConfig
 from ..utils.content import HELP_CATEGORIES, WIZARD_COPY, WIZARD_TOUR
 from .base_components import DropdownContentView, TimeoutCleanupMixin
 
@@ -43,26 +44,28 @@ class _Step:
     `probe` reads the state dict assembled once per repaint rather than touching disk
     itself, so adding a step costs no extra reads unless it needs something new.
 
-    `context` is "dm", "guild" or "any", and `requires_admin` gates on the invoker's
-    permissions in the guild they ran it in. Both describe where the step's *action*
-    can run; a step that cannot run here is still drawn, with the reason.
+    `context` is "dm", "guild" or "any". `requires` names a boolean key in the same
+    state dict, so a gate that is not a fixed property of the user -- seating is open
+    to administrators *or* to anyone in an Open casting channel -- is probed at repaint
+    like every other fact here rather than baked into the table. Both describe where the
+    step's *action* can run; a step that cannot run here is still drawn, with the reason.
 
     `actions` names methods on the view. Kept as names so this table stays readable as
     data, and so a step with no action -- the last one, which is just "talk" -- simply
     declares none.
     """
 
-    __slots__ = ("key", "title", "help_ref", "context", "requires_admin", "probe",
+    __slots__ = ("key", "title", "help_ref", "context", "requires", "probe",
                  "actions", "done_detail")
 
     def __init__(self, key, title, help_ref, probe, *, context="any",
-                 requires_admin=False, actions=(), done_detail=None):
+                 requires=None, actions=(), done_detail=None):
         self.key = key
         self.title = title
         self.help_ref = help_ref
         self.probe = probe
         self.context = context
-        self.requires_admin = requires_admin
+        self.requires = requires
         self.actions = actions
         self.done_detail = done_detail
 
@@ -76,7 +79,7 @@ class _Step:
             return False
         if self.context == "guild" and not state["in_guild"]:
             return False
-        if self.requires_admin and not state["is_admin"]:
+        if self.requires and not state.get(self.requires):
             return False
         return True
 
@@ -86,9 +89,17 @@ class _Step:
             return "in a DM with me"
         if self.context == "guild" and not state["in_guild"]:
             return "in a server channel"
-        if self.requires_admin:
-            return "needs administrator"
+        if self.requires:
+            return _GATE_REASONS.get(self.requires, "not available here")
         return "not available here"
+
+
+# Why each `requires` gate is shut, in the checklist's own voice. Kept beside the
+# step table rather than inside `_Step` so a new gate is one line in each of two
+# places that sit together, and never a message assembled in the renderer.
+_GATE_REASONS = {
+    "can_cast": "needs administrator, or Open casting",
+}
 
 
 WIZARD_STEPS = (
@@ -110,7 +121,7 @@ WIZARD_STEPS = (
                                  if s["written_name"] else "ready")),
     _Step("seat", "Seat it in this channel",
           ("5. Sessions", "Starting and Shaping a Session"),
-          lambda s: s["seated"], context="guild", requires_admin=True,
+          lambda s: s["seated"], context="guild", requires="can_cast",
           actions=("_act_cast",),
           done_detail=lambda s: f"{s['seated_count']} in the cast"),
     _Step("speak", "Say something to it",
@@ -193,9 +204,16 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
             # the flag existed, and those were live under the old rules.
             seated_disk = bool(saved.get("profiles")) and saved.get("started", True)
 
+        # Read through the manager rather than off the blueprint above: it is the same
+        # answer `/session config` gates on, live session first, and asking it here
+        # keeps the wizard from greying out a step the command would have allowed.
+        cast_policy = (cog.session_manager.cast_policy_for_channel(guild.id, channel_id)
+                       if guild is not None else DEFAULT_CAST_POLICY)
+
         return {"personal": personal, "borrowed": borrowed, "written_name": written_name,
                 "key_detail": key_detail, "server_has_key": server_has_key,
-                "admin_guilds": admin_guilds, "seated_disk": seated_disk}
+                "admin_guilds": admin_guilds, "seated_disk": seated_disk,
+                "cast_policy": cast_policy}
 
     state = await asyncio.to_thread(_sync)
 
@@ -214,6 +232,11 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
         "in_guild": guild is not None,
         "is_admin": is_admin,
         "is_owner": is_owner,
+        # The `/session config` gate, mirrored: administrators always, everyone else
+        # only where the channel's cast policy says Open casting. `/session swap` is
+        # not reachable from here and stays admin-only regardless.
+        "can_cast": bool(guild is not None
+                         and (is_admin or state["cast_policy"] == CAST_POLICY_OPEN)),
         "guild": guild,
         "channel": interaction.channel,
         "has_written": bool(state["written_name"]),
@@ -286,8 +309,12 @@ class StartWizardView(TimeoutCleanupMixin, ui.View):
                     "Discord makes you do in a DM.")
         else:
             role = "👤 **Your role** Member (not an administrator)\n"
-            note = ("You can build characters here, but only admins can seat them in a "
-                    "channel.\n\n💡 **Want somewhere to test freely?** Make your own server — "
+            note = (("You can build characters here, and this channel is on **Open "
+                     "casting** — you can seat them yourself."
+                     if s["can_cast"] else
+                     "You can build characters here, but only admins can seat them in a "
+                     "channel.")
+                    + "\n\n💡 **Want somewhere to test freely?** Make your own server — "
                     "it's free and takes about thirty seconds (**+** in your server list → "
                     "*Create My Own*). You'll be its admin, and `/invite` adds me to it. "
                     "Your profiles come with you: they belong to you, not to a server.")
@@ -301,7 +328,7 @@ class StartWizardView(TimeoutCleanupMixin, ui.View):
             if done:
                 mark, detail = "✅", (step.done_detail(self.state) if step.done_detail else "")
             elif not available:
-                mark = "🔒" if step.requires_admin and self.state["in_guild"] else "↗️"
+                mark = "🔒" if step.requires and self.state["in_guild"] else "↗️"
                 detail = step.blocker(self.state)
             else:
                 mark = "⬜"
@@ -527,13 +554,19 @@ class StartWizardView(TimeoutCleanupMixin, ui.View):
         await view.update_display()
 
     async def _act_cast(self, interaction: discord.Interaction):
-        # The step's own gate already required administrator, but this is a destructive
-        # surface reached by a button, and a view can outlive the permissions of the
-        # person holding it -- so it is checked again at the point of use rather than
-        # trusted from when the message was drawn.
-        if not self.state["is_admin"]:
+        # The step's own gate already tested this, but it is a shared surface reached
+        # by a button, and a view can outlive both the permissions of the person holding
+        # it and the channel's policy -- so it is re-probed at the point of use rather
+        # than trusted from when the message was drawn.
+        if not self.state["in_guild"] or not (
+                self.state["is_admin"]
+                or self.cog.session_manager.cast_policy_for_channel(
+                    self.state["guild"].id, self.original_interaction.channel_id
+                ) == CAST_POLICY_OPEN):
             await interaction.response.send_message(
-                "You must be a server administrator to configure sessions.", ephemeral=True)
+                "You must be a server administrator to configure sessions. An "
+                "administrator can set this channel's session to **Open casting** to let "
+                "anyone edit it.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
         await self.cog._open_session_config(interaction)

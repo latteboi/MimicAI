@@ -467,12 +467,40 @@ MUTE_TURN_EMOJI = ["🔇", "🔕"]
 SKIP_PARTICIPANT_EMOJI = ["❌", "✖️"]
 TRAIN_INPUT_EMOJI = "1️⃣"
 TRAIN_OUTPUT_EMOJI = "2️⃣"
+# Who may open a channel's session editor. Admin-only is the shipped behaviour and the
+# default, and absent means CLOSED -- every blueprint written before this field existed
+# keeps the access it was configured under rather than silently opening.
+#
+# OPEN widens exactly one door: `/session config` becomes usable by any member of the
+# guild, and inside it only the **Cast** tab. Casting is the whole of the grant. It does
+# NOT widen `/session swap`, which stays admin-only whatever this says; it does not open
+# the Config, Reactivity, Proactivity or Memory tabs, which are the channel's
+# configuration; and it does not make the `session` cast source visible -- that lists
+# other members' seated characters for removal and is an administrator's control
+# regardless of policy.
+CAST_POLICY_CLOSED = "closed"
+CAST_POLICY_OPEN = "open"
+DEFAULT_CAST_POLICY = CAST_POLICY_CLOSED
+
+CAST_POLICIES = (
+    (CAST_POLICY_CLOSED, "Admins only",
+     "Only server administrators can open the session editor.", "🔒"),
+    (CAST_POLICY_OPEN,   "Open casting",
+     "Any member can seat characters here. The other tabs stay admin-only.", "🔓"),
+)
+
+CAST_POLICY_LABELS = {value: label for value, label, _desc, _emoji in CAST_POLICIES}
+
+
 # /train arms a channel rather than capturing immediately, so a forgotten arm must not
 # silently harvest reactions indefinitely. Checked lazily on the next reaction rather
 # than via a background sweep.
 TRAIN_ARM_TIMEOUT_SECONDS = 900
-# Bound for armed_training_channels, keyed by channel_id -- realistically only a
-# handful of channels are ever armed at once, but per policy this must still be bounded.
+# Bound for armed_training_channels, keyed by (channel_id, armer_id) so two people can
+# arm the same channel without evicting each other. Realistically only a handful of arms
+# are ever live at once, but per policy this must still be bounded -- and the cap is what
+# bounds the discord.Interaction each entry holds for its reply, which the per-user key
+# would otherwise let grow with the number of armers rather than of channels.
 TRAIN_ARMED_CACHE_MAX_SIZE = 100
 
 # --- Table games -------------------------------------------------------------------

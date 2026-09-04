@@ -226,9 +226,10 @@ HELP_CATEGORIES = {
             "• **⏯️ Next Speaker** -- make the next participant respond.\n"
             "• **🍿 Continue Round** -- run a fresh round for the whole cast.\n"
             "• **🔇 Mute Turn** -- hide that message from the transcript. It stays in the channel but becomes invisible to the profiles.\n"
-            "• **❌ Skip Participant** -- suspend one profile from responding until you unskip it.\n\n"
+            "• **❌ Skip Participant** *(administrators)* -- suspend one profile from responding until you unskip it.\n\n"
             "Mute is the useful one for repair work: if a reply took the scene somewhere you did not want, mute it and the characters will "
-            "carry on as though it never happened."
+            "carry on as though it never happened. Skip is the one that is administrators only: it is not turn-local, it silences that "
+            "character in every round until somebody unskips it, and if your reaction comes straight back off, that is why."
         ),
         "Reactivity and Proactivity": (
             "**Reactivity** decides whether a profile interjects when it is not its turn. Each participant has a **Chance** percentage rolled "
@@ -462,7 +463,9 @@ HELP_CATEGORIES = {
             "**Setup and data:** `/settings`, `/export`, `/import`, `/privacy`, `/terms`, `/invite`, `/whoami`, `/viewavatar`\n\n"
             "**Documentation:** `/start` (guided setup), `/guide` (this browser), `/help`\n\n"
             "**Operator:** `/mod`, `/shutdown`\n\n"
-            "`/suspend` and `/purge` require administrator permission; `/mod` and `/shutdown` are bot-owner only."
+            "`/refresh`, `/cancel`, `/suspend`, `/purge`, `/memorise`, `/play stop`, `/session config` and `/session swap` require "
+            "administrator permission — though an admin can set a channel to **Open casting**, which opens `/session config` "
+            "(Cast tab only) to everyone. `/mod` and `/shutdown` are bot-owner only."
         ),
     },
 }
@@ -513,8 +516,9 @@ WIZARD_COPY = {
         "A **session** is bound to one channel and holds a cast of characters sharing a single transcript, "
         "each seeing it from their own point of view.\n\n"
         "Pick your character on the **Cast** tab — it is seated the moment you choose it, so you can set its "
-        "reactivity straight away — then press **Start / Update Session**. Only server administrators can do "
-        "this: profiles are yours, but a channel is the server's."
+        "reactivity straight away — then press **Start / Update Session**. This is normally an administrator's "
+        "job — profiles are yours, but a channel is the server's — unless an admin has set the channel to "
+        "**Open casting**, which lets any member edit the cast here."
     ),
     "speak": (
         "Nothing else to configure. Send a message in the channel and the cast will answer.\n\n"
@@ -782,10 +786,10 @@ DEFAULT_HELP_DOCS = {
         "- Next Speaker (⏯️): Triggers the next participant in the cast list to respond.\n"
         "- Continue Round (🍿): Triggers a fresh round for every participant.\n"
         "- Mute Turn (🔇): Hides the targeted message from the bot's memory transcript, making it invisible to the AI while leaving it in the channel.\n"
-        "- Skip Participant (❌): Suspends a specific profile from responding in the session until unskipped.\n"
+        "- Skip Participant (❌): Administrators. Suspends a specific profile from responding in the session until unskipped. A non-administrator's reaction is removed again rather than applied.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'A reply took the scene in a direction I did not want.' Fix: React with 🔇 to mute that turn. The characters carry on as though it never happened, without deleting the message.\n"
-        "- Symptom: 'One character keeps dominating the round.' Fix: React with ❌ on one of its messages to skip it for a while."
+        "- Symptom: 'One character keeps dominating the round.' Fix: React with ❌ on one of its messages to skip it for a while. Administrators only -- if the reaction disappears again, ask one."
     ),
     "sessions/response_modes.txt": (
         "Setup: Configured via `/profile manage` -> Tools -> Response Mode.\n"
@@ -839,7 +843,7 @@ DEFAULT_HELP_DOCS = {
     "sessions/maintenance_commands.txt": (
         "Commands: `/refresh`, `/cancel`, `/suspend`, `/purge`, `/memorise`, `/clear`, `/trigger`, `/session view`, `/session audit`\n"
         "- `/refresh`: Clears the short-term conversation buffer for this channel. Long-term memories and training examples are untouched. Use when a profile has become confused about recent events.\n"
-        "- `/cancel`: Stops whatever generation or typing indicator is currently running in this channel.\n"
+        "- `/cancel`: Administrators. Stops whatever generation or typing indicator is currently running in this channel. It aborts the round the whole channel is waiting on, which is why it is not open to everyone.\n"
         "- `/suspend`: Administrators. Ends the session in this channel and stops the bot responding until it is configured again.\n"
         "- `/purge`: Administrators. Deletes messages and the associated session memory.\n"
         "- `/memorise`: Administrators (or a participant's owner, for a single named profile). Forces long-term memory summarisation for the session's cast right now, instead of waiting for the automatic creation interval.\n"
