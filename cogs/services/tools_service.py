@@ -12,6 +12,7 @@ from ..utils.constants import (
     PATTERN_HTML_BLANKLINES, DEFAULT_GROUNDING_RAG_PAYLOAD,
 )
 from ..utils.helpers import _format_api_error, _truncate_text_by_char, is_real_model
+from ..utils.net_guard import UnsafeURL, safe_stream
 from .api_service import GoogleGenAIModel
 
 
@@ -39,7 +40,7 @@ _url_fetch_client: Optional[httpx.AsyncClient] = None
 def get_url_fetch_client() -> httpx.AsyncClient:
     global _url_fetch_client
     if _url_fetch_client is None or _url_fetch_client.is_closed:
-        _url_fetch_client = httpx.AsyncClient(headers=_URL_FETCH_HEADERS, follow_redirects=True)
+        _url_fetch_client = httpx.AsyncClient(headers=_URL_FETCH_HEADERS, follow_redirects=False)
     return _url_fetch_client
 
 
@@ -190,7 +191,7 @@ class ToolsService:
                 if not url.startswith(('http://', 'https://')):
                     url = 'http://' + url
 
-                async with client.stream("HEAD", url, timeout=5.0) as head_response:
+                async with safe_stream(client, "HEAD", url, timeout=5.0) as head_response:
                     head_response.raise_for_status()
                     content_type = head_response.headers.get('content-type', '').lower()
 
@@ -202,7 +203,7 @@ class ToolsService:
                     # Streamed with a hard byte cap. Reading .text on an unbounded body
                     # made peak RSS a function of whatever page the user linked.
                     chunks, total = [], 0
-                    async with client.stream("GET", url, timeout=10.0) as get_response:
+                    async with safe_stream(client, "GET", url, timeout=10.0) as get_response:
                         get_response.raise_for_status()
                         async for chunk in get_response.aiter_bytes(65536):
                             chunks.append(chunk)
@@ -237,6 +238,11 @@ class ToolsService:
                         warnings.append(WARN_URL_FETCHING_FAILED.format(reason="HTML parsing timed out"))
                         continue
 
+            except UnsafeURL:
+                # Deliberately unspecific: the reason reaches the channel, and
+                # distinguishing "refused" from "timed out" would tell whoever
+                # posted the link which internal hosts exist.
+                warnings.append(WARN_URL_FETCHING_FAILED.format(reason="destination not permitted"))
             except Exception as e:
                 warnings.append(WARN_URL_FETCHING_FAILED.format(reason=_format_api_error(e)))
 

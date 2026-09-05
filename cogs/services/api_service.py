@@ -17,6 +17,7 @@ from ..utils.constants import (
 from ..utils.blob_stream import InlineBlobExtractor, is_blob_sentinel, sentinel_path
 from ..utils.helpers import _resolve_safety_settings, is_real_model
 from ..utils.http_client import get_shared_client
+from ..utils.net_guard import safe_stream
 from ..utils.memory_tuning import maybe_trim_malloc
 from ..utils import mem_probe
 
@@ -775,7 +776,9 @@ async def _stream_to_tempfile(url: str, client, timeout: float = 15.0) -> str:
 
     fd, path = tempfile.mkstemp(suffix=".tmp")
     try:
-        async with client.stream("GET", url, follow_redirects=True, timeout=timeout) as resp:
+        # Both callers pass a URL a Discord user supplied, so the destination is
+        # validated on every redirect hop rather than trusted once.
+        async with safe_stream(client, "GET", url, timeout=timeout) as resp:
             resp.raise_for_status()
             with os.fdopen(fd, 'wb') as f:
                 async for chunk in resp.aiter_bytes(chunk_size=_DOWNLOAD_CHUNK_BYTES):
