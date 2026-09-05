@@ -342,6 +342,158 @@ UTILITY_FALLBACK_KEYS = {
     'ltm_model': 'ltm_fallback_model',
 }
 
+#: The reasoning-effort values the pickers offer, most to least. Every slot shares one
+#: vocabulary; what a given *model* does with it is a separate question, answered by
+#: `helpers.google_thinking_caps`.
+#:
+#: `max` is OpenRouter's own top step -- it and `xhigh` both allocate roughly 95% of
+#: max_tokens there, so the two are near-synonyms on that provider and `max` is the
+#: name OpenRouter's newer documentation leads with. Nothing else has a step above
+#: HIGH, so both collapse onto it on Google and onto "high" on Ollama.
+THINKING_LEVELS = ('max', 'xhigh', 'high', 'medium', 'low', 'minimal', 'none')
+
+#: slot -> role -> (level key, budget key). One table so the resolver, the picker and
+#: the bulk row cannot disagree about where a slot's thinking lives.
+#:
+#: **Two roles per slot, not one.** A fallback is a different model with different
+#: economics -- the usual shape is an expensive primary and a cheap standby -- so
+#: pinning both to one reasoning effort meant the standby either wasted money it was
+#: chosen to save or under-thought a request the primary was configured for. The
+#: fallback's keys are sparse in their own right: unset means "whatever the primary
+#: resolved to", which is what makes it a drop-in replacement by default.
+#:
+#: Response keeps the bare, unprefixed keys it has always used -- renaming them would
+#: strand every profile on disk for no gain. The rest are new and prefixed.
+#:
+#: Image is absent on purpose: it already owns `image_thinking_level`, edited beside
+#: aspect ratio and size in Media Options, because on an image request the thinking
+#: level is an *output* control that belongs with the other two. TTS is absent because
+#: a speech model accepts no thinking config at all.
+THINKING_SLOT_KEYS = {
+    'response':  {'primary':  ('thinking_level', 'thinking_budget'),
+                  'fallback': ('fallback_thinking_level', 'fallback_thinking_budget')},
+    'grounding': {'primary':  ('grounding_thinking_level', 'grounding_thinking_budget'),
+                  'fallback': ('grounding_fallback_thinking_level',
+                               'grounding_fallback_thinking_budget')},
+    'critic':    {'primary':  ('critic_thinking_level', 'critic_thinking_budget'),
+                  'fallback': ('critic_fallback_thinking_level',
+                               'critic_fallback_thinking_budget')},
+    'ltm':       {'primary':  ('ltm_thinking_level', 'ltm_thinking_budget'),
+                  'fallback': ('ltm_fallback_thinking_level',
+                               'ltm_fallback_thinking_budget')},
+}
+
+#: What a slot does when its keys are unset. Sparse storage is load-bearing here for
+#: the same reason it is in `index.json["defaults"]`: "unset" has to stay
+#: distinguishable from "set to today's shipped value", or changing a default strands
+#: everyone who ever opened the screen.
+#:
+#: The three utility slots default low and cheap. That is not a new opinion -- the
+#: critic and the grounding summariser already hardcoded exactly this pair at their
+#: call sites. LTM is the one that was wrong: it passed `{}`, which is not "no
+#: thinking" but "whatever the adapter defaults to", and the adapters default to high.
+#: Every long-term memory ever written was billed a full reasoning pass to summarise a
+#: transcript.
+#:
+#: Response stays high, matching the adapter default it is replacing, so no existing
+#: profile changes behaviour.
+#: `utility` has no keys in THINKING_SLOT_KEYS and so cannot be configured. It is the
+#: answer for the one-shot internal generations that have no profile slot to hang a
+#: setting off: the rolling session synopsis, the Director's Note, and the profile
+#: generator. All three used to pass `{}` -- which is not "no thinking" but "whatever
+#: the adapter defaults to", and the adapters default to high. Naming the default here
+#: is what stops them silently inheriting it again.
+THINKING_SLOT_DEFAULTS = {
+    'response':  {'level': 'high', 'budget': -1},
+    'grounding': {'level': 'low',  'budget': 512},
+    'critic':    {'level': 'low',  'budget': 512},
+    'ltm':       {'level': 'low',  'budget': 512},
+    'utility':   {'level': 'low',  'budget': 512},
+}
+
+#: How each slot reads in the pickers and on the dashboard, and the order they are
+#: offered in. Matches `ModelPickerMixin._CATEGORY_LABELS` where the two overlap, so a
+#: user meets one taxonomy rather than two.
+THINKING_SLOT_LABELS = (
+    ('response',  'Response', "The profile's own replies."),
+    ('grounding', 'Grounding Summariser', 'Summarises web search results in RAG mode.'),
+    ('critic',    'Anti-Repetition Critic', 'Screens replies for semantic repetition.'),
+    ('ltm',       'LTM Summariser', 'Turns conversations into long-term memories.'),
+)
+
+#: Every thinking key the profile-wide picker writes, flattened. Used by the bulk row
+#: and, through it, by `user_defaults.defaultable_keys()`.
+THINKING_ALL_KEYS = tuple(
+    key
+    for roles in THINKING_SLOT_KEYS.values()
+    for pair in roles.values()
+    for key in pair
+) + ('thinking_summary_visible',)
+
+#: How the shared vocabulary lands on each provider, named once rather than inlined at
+#: three adapters.
+#:
+#: Google has no step above HIGH, so `max` and `xhigh` both collapse onto it. Ollama
+#: publishes low/medium/high and, on newer builds only, "max" -- sending "max" to an
+#: older server is an error, and the coarse mapping costs nothing since Ollama's "high"
+#: is already its top documented step on every build. OpenRouter accepts the whole
+#: vocabulary verbatim, `max` included, so it needs no table.
+THINKING_LEVELS_TO_GOOGLE = {
+    'max': 'HIGH', 'xhigh': 'HIGH', 'high': 'HIGH', 'medium': 'MEDIUM',
+    'low': 'LOW', 'minimal': 'MINIMAL', 'none': 'MINIMAL',
+}
+
+#: Gemini 3 Pro publishes LOW and HIGH and nothing between.
+THINKING_LEVELS_TO_GOOGLE_BINARY = {
+    'max': 'HIGH', 'xhigh': 'HIGH', 'high': 'HIGH', 'medium': 'HIGH',
+    'low': 'LOW', 'minimal': 'LOW', 'none': 'LOW',
+}
+
+#: False means "think: false"; a string is Ollama's own level. None is unreachable
+#: here because every THINKING_LEVELS member is listed.
+THINKING_LEVELS_TO_OLLAMA = {
+    'max': 'high', 'xhigh': 'high', 'high': 'high', 'medium': 'medium',
+    'low': 'low', 'minimal': False, 'none': False,
+}
+
+
+#: Google's media-resolution enum: how many tokens an *input* image, PDF or video frame
+#: is worth. This is the opposite direction from `image_size`, which is about what an
+#: image model produces -- hence `media_input_resolution` as the config key, so the two
+#: cannot be read as the same knob.
+#:
+#: Gemini 3 token costs per image: LOW 280, MEDIUM 560, HIGH 1120, ULTRA_HIGH 2240.
+#: PDFs match except that ULTRA_HIGH is not offered; video is 70 tokens per frame for
+#: both LOW and MEDIUM, 280 at HIGH, and has no ULTRA_HIGH. UNSPECIFIED is the default
+#: and means 1120 for images on Gemini 3, far less on older models.
+#:
+#: Sent as `mediaResolution` in generationConfig, which every multimodal Gemini model
+#: accepts. (Gemini 3 additionally allows a per-Part override on v1beta; not used here
+#: -- MimicAI has no per-attachment interface to hang it off, and the request-level
+#: field is what a profile setting maps onto.)
+MEDIA_RESOLUTIONS = (
+    ('', 'Model default', 'Send nothing and let the model choose.'),
+    ('MEDIA_RESOLUTION_LOW', 'Low', 'Cheapest: 280 tokens per image on Gemini 3.'),
+    ('MEDIA_RESOLUTION_MEDIUM', 'Medium', '560 tokens per image.'),
+    ('MEDIA_RESOLUTION_HIGH', 'High', '1120 tokens per image -- the Gemini 3 default.'),
+    ('MEDIA_RESOLUTION_ULTRA_HIGH', 'Ultra High', '2240 tokens per image. Images only.'),
+)
+
+#: The stored values, for validating what a modal or an import hands us.
+MEDIA_RESOLUTION_VALUES = frozenset(v for v, _l, _d in MEDIA_RESOLUTIONS if v)
+
+#: OpenRouter has no equivalent request field. What it does forward is the
+#: OpenAI-compatible per-part `detail` hint, which is coarser -- two useful settings
+#: rather than four -- and whose meaning depends on the model underneath. Mapped rather
+#: than ignored so the one setting means something on both providers; Ollama has
+#: nothing at all and drops it.
+MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL = {
+    'MEDIA_RESOLUTION_LOW': 'low',
+    'MEDIA_RESOLUTION_MEDIUM': 'low',
+    'MEDIA_RESOLUTION_HIGH': 'high',
+    'MEDIA_RESOLUTION_ULTRA_HIGH': 'high',
+}
+
 COGS_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 DATA_DIR = os.path.join(COGS_BASE, "data")

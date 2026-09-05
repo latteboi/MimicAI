@@ -11,8 +11,10 @@ from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional, Union
 from ..utils.content import OLLAMA_GUIDE_TEXT
 from ..utils.helpers import (
     _pf, _pi, _ps, _pb, is_real_model, image_model_caps, resolve_critic_settings,
+    google_thinking_caps, resolve_thinking_params,
 )
 from ..utils.http_client import get_shared_client
+from ..utils.user_defaults import setting_label
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -535,12 +537,30 @@ def _url_mode(config) -> str:
 
 def _render_thinking(ctx):
     config = ctx["config"]
-    budget = config.get("thinking_budget", -1)
-    return "Thinking / Reasoning", (
-        f"Summary: {_flag(str(config.get('thinking_summary_visible', 'off')).lower() == 'on')}\n"
-        f"Effort: `{str(config.get('thinking_level', 'high')).title()}`\n"
-        f"Budget: `{'Dynamic (-1)' if budget == -1 else budget}`"
-    ), True
+    # Resolved per slot and per role rather than read raw, so this reports what a round
+    # will actually run at: an unset utility slot is low/512 rather than the response
+    # slot's high, and an unset fallback is whatever its primary came out as.
+    lines = [f"Summary: {_flag(str(config.get('thinking_summary_visible', 'off')).lower() == 'on')}"]
+    for value, label, _desc in THINKING_SLOT_LABELS:
+        parts = []
+        for role in ("primary", "fallback"):
+            resolved = resolve_thinking_params(config, value, role)
+            budget = resolved["thinking_budget"]
+            parts.append(f"`{resolved['thinking_level'].title()}`"
+                         f"/`{'Dyn' if budget == -1 else budget}`")
+        lines.append(f"{label}: " + " \u2192 ".join(parts))
+    return "Thinking / Reasoning", "\n".join(lines), True
+
+
+#: Stands in for "send no mediaResolution at all" wherever a Discord select needs a
+#: non-empty option value. Never stored: `to_payload` maps it back to "".
+_MEDIA_RES_DEFAULT = "__model_default__"
+
+
+def _render_media_resolution(ctx):
+    stored = str(ctx["config"].get("media_input_resolution") or "")
+    label = next((l for v, l, _d in MEDIA_RESOLUTIONS if v == stored), "Model default")
+    return "Media Input Resolution", f"Resolution: `{label}`", True
 
 
 def _render_speech(ctx):
@@ -779,20 +799,46 @@ PROFILE_ACTIONS = (
             bulk=_Bulk(_bulk_modal("ProfileAdvancedParamsModal"), scope="all",
                        keys=("frequency_penalty", "presence_penalty", "repetition_penalty",
                              "min_p", "top_a"))),
-    _Action("thinking_params", "params", "Set Thinking Parameters", "Set thinking persistence, level, and budget.",
-            _open_screen("thinking_params"), render=_render_thinking,
+    # A purpose-built picker rather than a `_Screen`, for the reason the model, voice
+    # and image-output rows already are: the controls change with the slot, and a
+    # screen's controls are declared once. The screen it replaces could only ever edit
+    # the response slot, which was the whole problem.
+    _Action("thinking_params", "params", "Set Thinking Parameters",
+            "Set reasoning effort and budget, per model slot.",
+            _method("_act_thinking", wants_profile=True), render=_render_thinking,
+            bulk=_Bulk(_bulk_sub("ThinkingApplyView"), scope="all",
+                       description="Stage reasoning effort and budget per slot.",
+                       keys=THINKING_ALL_KEYS)),
+    _Action("media_resolution", "params", "Set Media Input Resolution",
+            "How many tokens an image or PDF you send is worth.",
+            _open_screen("media_resolution"), render=_render_media_resolution,
             screen=_Screen(
-                _Choice("thinking_level", "Reasoning Effort",
-                        (("Extra High", "xhigh"), ("High", "high"), ("Medium", "medium"),
-                         ("Low", "low"), ("Minimal", "minimal"), ("None", "none")),
-                        read=lambda c: str(c.get("thinking_level", "high")).lower(),
-                        placeholder="Reasoning effort..."),
-                _Toggle("thinking_summary_visible", "Show Summary",
-                        read=lambda c: str(c.get("thinking_summary_visible", "off")).lower() == "on",
-                        to_payload=lambda on: {"thinking_summary_visible": "on" if on else "off"}),
-                modal="ProfileThinkingParamsModal", modal_label="Edit budget…"),
-            bulk=_Bulk(_bulk_modal("ProfileThinkingParamsModal"), scope="all",
-                       keys=("thinking_level", "thinking_budget", "thinking_summary_visible"))),
+                # Discord rejects an empty option value, so "send nothing" travels as a
+                # sentinel and `to_payload` maps it back to the empty string the
+                # resolver reads. Same shape as MediaOptionsMixin.AUTO, for the same
+                # platform reason.
+                _Choice("media_input_resolution", "Input Resolution",
+                        tuple((label, value or _MEDIA_RES_DEFAULT, desc)
+                              for value, label, desc in MEDIA_RESOLUTIONS),
+                        read=lambda c: (str(c.get("media_input_resolution") or "")
+                                        or _MEDIA_RES_DEFAULT),
+                        to_payload=lambda v: {
+                            "media_input_resolution": "" if v == _MEDIA_RES_DEFAULT else v},
+                        placeholder="Input media resolution..."),
+                note="This is what the model spends reading media **you send it** -- the "
+                     "opposite direction from the image size under Media Options, which is "
+                     "about what an image model draws. Google honours it exactly; "
+                     "OpenRouter gets the nearest of its two `detail` steps; Ollama has no "
+                     "equivalent and ignores it."),
+            bulk=_Bulk(_bulk_choice(
+                           "Select input media resolution...",
+                           [(label, value or _MEDIA_RES_DEFAULT, desc)
+                            for value, label, desc in MEDIA_RESOLUTIONS],
+                           to_payload=lambda v: {
+                               "media_input_resolution": "" if v == _MEDIA_RES_DEFAULT else v}),
+                       scope="all", label="Set Media Input Resolution",
+                       description="Stage the input media resolution.",
+                       keys=("media_input_resolution",))),
     _Action("speech_settings", "params", "Set Speech Settings", "Turn TTS on or off and set its temperature.",
             _open_screen("speech_settings"), render=_render_speech,
             screen=_Screen(_Toggle("speech_tts_enabled", "TTS"),
@@ -1192,7 +1238,12 @@ class ProfileManageView(ui.View):
     async def _act_models(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         view = SingleProfileModelView(self.cog, self.original_interaction, self.profile_name,
                                       is_borrowed=self.is_borrowed, user_id=self.user_id)
-        await interaction.response.send_message(view._get_selection_feedback_message(), view=view, ephemeral=True)
+        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+
+    async def _act_thinking(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        view = SingleProfileThinkingView(self.cog, self.original_interaction, self.profile_name,
+                                         is_borrowed=self.is_borrowed, user_id=self.user_id)
+        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
     async def _act_image_output(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         await self._open_media_options(interaction, "image")
@@ -1203,7 +1254,7 @@ class ProfileManageView(ui.View):
     async def _open_media_options(self, interaction: discord.Interaction, mode: str):
         view = SingleProfileMediaOptionsView(self.cog, self.original_interaction, self.profile_name,
                                              mode, is_borrowed=self.is_borrowed, user_id=self.user_id)
-        await interaction.response.send_message(view._feedback(), view=view, ephemeral=True)
+        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
     async def _act_manage_ltm(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         view = DataManageView(self.cog, interaction, self.profile_name, self.is_borrowed,
@@ -2077,11 +2128,26 @@ class SingleProfileMediaOptionsView(MediaOptionsMixin, ui.View):
             self.user_id, self.profile_name, data, self.is_borrowed)
 
     def _render(self) -> Dict[str, Any]:
-        return {"content": self._feedback(), "view": self}
+        return {"content": None, "embed": self.embed(), "view": self}
+
+    def embed(self) -> discord.Embed:
+        """The same copy `_feedback` built, in the frame every other screen uses.
+
+        This view, the model picker and the thinking picker were the three settings
+        screens still rendering as a wall of bold plain text while the function screens
+        and every bulk step rendered embeds -- an accident of age, not a decision: each
+        was purpose-built before `ProfileFunctionView` existed and nothing went back.
+        The body is unchanged; only the frame is.
+        """
+        e = discord.Embed(
+            title="Image Output" if self.mode == "image" else "TTS Voice",
+            description=self._feedback(), colour=discord.Colour.blurple())
+        e.set_footer(text=f"{self.profile_name} \u00b7 changes save as you make them")
+        return e
 
     def _feedback(self) -> str:
         data = self._profile()
-        lines = [f"**Profile:** `{self.profile_name}`"]
+        lines = []
 
         if self.mode == "image":
             raw = data.get("image_generation_model") or DEFAULT_IMAGE_MODEL
@@ -2255,13 +2321,13 @@ class ModelPickerMixin:
     def _picker_render(self) -> Dict[str, Any]:
         """Edit kwargs for this picker's own message.
 
-        A hook because the two adopters render differently: the single-profile picker
-        is a plain-text message, and the bulk picker is a step of the embed-rendered
-        wizard. Every rebuild in this mixin -- and in CustomModelModal and
-        OllamaHostModal, which reach back into the view -- goes through here, so
-        neither one can overwrite the other's message body with the wrong shape.
+        Still a hook though both adopters now render embeds: the bulk picker is a step
+        of the wizard and has its own footer and staging field, and CustomModelModal and
+        OllamaHostModal reach back into whichever view opened them. Routing every
+        rebuild through here is what stops one overwriting the other's message body
+        with the wrong shape.
         """
-        return {"content": self._get_selection_feedback_message(), "view": self}
+        return {"content": None, "embed": self.embed(), "view": self}
 
     class GenericModelSelect(ui.Select):
         def __init__(self, placeholder: str, options: list, row: int, target_config_key: str):
@@ -2437,21 +2503,51 @@ class SingleProfileModelView(ModelPickerMixin, ui.View):
                 self.cog.channel_model_last_profile_key.pop(k, None)
 
     def _get_selection_feedback_message(self) -> str:
-        data = self._get_current_profile_data()
-        lines = [f"**Profile:** `{self.profile_name}`"]
+        """Kept as the embed's description, and as the fallback for any caller that
+        still wants a plain string."""
+        lines = []
         if self.view_mode == 'openrouter':
-            lines.append("⚠️ **Note:** OpenRouter / Custom models require **RAG Mode** for "
-                         "Grounding and URL Context.\n")
+            lines.append("-# OpenRouter and custom models require **RAG mode** for "
+                         "Grounding and URL Context.")
         elif self.view_mode == 'ollama':
-            lines.append("⚠️ **Note:** Localhost models run on your machine's hardware. "
-                         "Processing speed depends on your GPU/CPU.\n")
-
-        for key, wording, default in self._CATEGORY_KEYS[self.category]:
-            lines.append(f"**{wording}:** `{self.display_model(data.get(key, default))}`")
-        if self.category == 'response':
-            state = "ON" if data.get("show_fallback_indicator", True) else "OFF"
-            lines.append(f"**Fallback Indicator:** `{state}`")
+            lines.append("-# Localhost models run on your own hardware; speed depends "
+                         "on your GPU/CPU.")
         return "\n".join(lines)
+
+    def embed(self) -> discord.Embed:
+        """The single-profile picker's own embed, shaped like the bulk one.
+
+        It rendered as bold plain text purely because it predates
+        `ProfileFunctionView`; its bulk twin three hundred lines down has always drawn
+        an embed from the same table. Same fields, same order, so the two screens are
+        recognisably the same screen.
+        """
+        data = self._get_current_profile_data()
+        wording = next((lbl for value, lbl, _ in self._CATEGORY_LABELS if value == self.category),
+                       self.category.title())
+        e = discord.Embed(title="Set Models", colour=discord.Colour.blurple())
+        note = self._get_selection_feedback_message()
+        e.description = f"**{wording}**" + (f"\n{note}" if note else "")
+
+        for key, wording_slot, default in self._CATEGORY_KEYS[self.category]:
+            e.add_field(name=wording_slot,
+                        value=f"`{self.display_model(data.get(key, default))}`", inline=True)
+        if self.category == 'response':
+            state = data.get("show_fallback_indicator", True)
+            e.add_field(name="Fallback Indicator",
+                        value="**`ON`**" if state else "`OFF`", inline=True)
+
+        if self.category in THINKING_SLOT_KEYS:
+            parts = []
+            for role, role_label in (("primary", "Primary"), ("fallback", "Fallback")):
+                r = resolve_thinking_params(data, self.category, role)
+                budget = r["thinking_budget"]
+                parts.append(f"{role_label} `{r['thinking_level'].title()}`"
+                             f"/`{'Dyn' if budget == -1 else budget}`")
+            e.add_field(name="Thinking", value=" \u2192 ".join(parts), inline=False)
+
+        e.set_footer(text=f"{self.profile_name} \u00b7 changes save as you make them")
+        return e
 
     def _build_view(self):
         self.clear_items()
@@ -2483,6 +2579,357 @@ class SingleProfileModelView(ModelPickerMixin, ui.View):
 
             btn_fallback.callback = fallback_cb
             self.add_item(btn_fallback)
+
+        # Choosing a model and choosing how hard it thinks are one decision, and the
+        # thinking picker is keyed on the same four slots this dropdown names -- so it
+        # opens from here, onto this message, with a Back that returns to it. Image
+        # thinking lives with the other image *output* controls in Media Options, and a
+        # speech model accepts none, so neither category offers the button.
+        if self.category in THINKING_SLOT_KEYS:
+            btn_think = ui.Button(label="Thinking\u2026", style=discord.ButtonStyle.secondary, row=4)
+
+            async def think_cb(i: discord.Interaction):
+                view = SingleProfileThinkingView(
+                    self.cog, self.original_interaction, self.profile_name,
+                    slot=self.category, is_borrowed=self.is_borrowed,
+                    user_id=self.user_id, parent_model_view=self)
+                await i.response.edit_message(**view._render())
+
+            btn_think.callback = think_cb
+            self.add_item(btn_think)
+
+
+class ThinkingPickerMixin:
+    """Reasoning effort and budget, per model slot and per role, shared by both pickers.
+
+    Thinking used to be one profile-wide triple that only the response model read. The
+    other slots each answered the question somewhere else and differently: image has its
+    own `image_thinking_level` beside aspect ratio and size, the critic and the
+    grounding summariser hardcoded the same literal at two call sites, and the LTM
+    summariser, the session compactor, the Director's Note and the profile generator
+    all passed an empty dict -- which the adapters read as "high", so every one of them
+    paid for a full reasoning pass to do a mechanical job.
+
+    Three dropdowns, because a slot holds two models: the slot, the primary's effort,
+    and the fallback's. The fallback is usually the cheap standby, so tying it to the
+    primary's effort made it waste the money it was chosen to save.
+
+    The slot vocabulary is deliberately the model picker's: a user who has learned what
+    "Grounding Summariser" means in Set Models does not have to learn it twice.
+
+    Adopters provide `_current(key)`, `_write(key, value)`, `_render()` and
+    `_slot_model(slot, role)`.
+    """
+
+    #: (slot, role) -> the config key naming the model it runs on. Used only to report
+    #: what that model honours; nothing here writes it.
+    _SLOT_MODEL_KEYS = {
+        ('response', 'primary'): 'primary_model',
+        ('response', 'fallback'): 'fallback_model',
+        ('grounding', 'primary'): 'grounding_rag_model',
+        ('grounding', 'fallback'): 'grounding_rag_fallback_model',
+        ('critic', 'primary'): 'critic_model',
+        ('critic', 'fallback'): 'critic_fallback_model',
+        ('ltm', 'primary'): 'ltm_model',
+        ('ltm', 'fallback'): 'ltm_fallback_model',
+    }
+
+    _LEVEL_LABELS = (
+        ('max', 'Max'), ('xhigh', 'Extra High'), ('high', 'High'), ('medium', 'Medium'),
+        ('low', 'Low'), ('minimal', 'Minimal'), ('none', 'None'),
+    )
+
+    _ROLE_LABELS = (('primary', 'Primary'), ('fallback', 'Fallback'))
+
+    def _slot_keys(self, role: str = "primary"):
+        return THINKING_SLOT_KEYS[self.slot][role]
+
+    def _caps_note(self, role: str) -> str:
+        """What one model of the current slot does with these two controls.
+
+        A note rather than a disabled control: a stored preference has to survive its
+        owner switching models for an afternoon, the same reason
+        `resolve_image_output_params` filters at request time instead of rewriting the
+        profile. Non-Google providers are named separately because their mapping is
+        real but different.
+        """
+        raw = str(self._slot_model(self.slot, role) or "")
+        upper = raw.upper()
+        if upper.startswith("OPENROUTER/") or ("/" in raw and not upper.startswith(("GOOGLE/", "OLLAMA/"))):
+            return ("takes both -- effort as `reasoning.effort` (Max and Extra High are "
+                    "the same ~95% allocation there) and the budget as "
+                    "`reasoning.max_tokens`, budget winning where both are set")
+        if upper.startswith("OLLAMA/"):
+            return ("takes effort only, coarsely (low/medium/high); a model not built "
+                    "for thinking refuses it and the bot retries once without")
+        caps = google_thinking_caps(raw)
+        if caps["mode"] == "level":
+            if caps["levels"] == "binary":
+                return "takes **effort** only, in two steps -- Low/Minimal/None read as LOW, the rest as HIGH"
+            return "takes **effort** only; the budget is stored, not sent"
+        if caps["mode"] == "budget":
+            floor = caps["budget_floor"]
+            return ("takes **budget** only; the effort is stored, not sent"
+                    + (f", and a budget under {floor} is raised to it" if floor else ""))
+        return "accepts no thinking configuration; both values are stored, not sent"
+
+    def _add_slot_select(self, row: int = 0):
+        options = [discord.SelectOption(label=f"Slot: {label}", value=value, description=desc,
+                                        default=(self.slot == value))
+                   for value, label, desc in THINKING_SLOT_LABELS]
+        select = ui.Select(placeholder="Choose a model slot...", options=options, row=row)
+
+        async def callback(interaction: discord.Interaction):
+            self.slot = select.values[0]
+            self._build_view()
+            await interaction.response.edit_message(**self._render())
+
+        select.callback = callback
+        self.add_item(select)
+
+    def _add_level_select(self, role: str, row: int):
+        level_key, _budget_key = self._slot_keys(role)
+        current = self._current(level_key)
+        wording = dict(self._ROLE_LABELS)[role]
+        options = []
+        if self._OFFERS_UNCHANGED:
+            options.append(discord.SelectOption(
+                label="Unchanged", value="__unchanged__",
+                description="Leave this as each selected profile has it.",
+                default=current is None))
+        elif role == "fallback":
+            # The single-profile picker's "unset" is not "unchanged" but "follow the
+            # primary", which is what the resolver actually does -- and the only way to
+            # say it, since a select always has a value.
+            options.append(discord.SelectOption(
+                label="Same as Primary", value="__inherit__",
+                description="Follow whatever the primary is set to.",
+                default=current is None))
+        for value, label in self._LEVEL_LABELS:
+            options.append(discord.SelectOption(
+                label=label, value=value,
+                default=(str(current or "").lower() == value)))
+        select = ui.Select(placeholder=f"{wording} effort...", options=options, row=row)
+
+        async def callback(interaction: discord.Interaction):
+            chosen = select.values[0]
+            self._write(level_key,
+                        None if chosen in ("__unchanged__", "__inherit__") else chosen)
+            self._build_view()
+            await interaction.response.edit_message(**self._render())
+
+        select.callback = callback
+        self.add_item(select)
+
+    def _add_budget_button(self, row: int = 3):
+        btn = ui.Button(label="Token budgets\u2026", style=discord.ButtonStyle.secondary, row=row)
+
+        async def callback(interaction: discord.Interaction):
+            await interaction.response.send_modal(_SlotThinkingBudgetModal(self))
+
+        btn.callback = callback
+        self.add_item(btn)
+
+    def _slot_rows(self, config_reader) -> List[str]:
+        """One line per slot, resolved rather than read raw.
+
+        Resolved so the screen reports what a round will actually run at: an unset
+        utility slot is low/512, not the response slot's high, and an unset fallback is
+        whatever the primary came out as.
+        """
+        rows = []
+        for value, label, _desc in THINKING_SLOT_LABELS:
+            parts = []
+            for role, role_label in self._ROLE_LABELS:
+                r = resolve_thinking_params(config_reader, value, role)
+                budget = r["thinking_budget"]
+                parts.append(f"{role_label} `{r['thinking_level'].title()}`"
+                             f"/`{'Dyn' if budget == -1 else budget}`")
+            marker = "**" if value == self.slot else ""
+            rows.append(f"{marker}{label}{marker}: " + " \u2192 ".join(parts))
+        return rows
+
+
+class _SlotThinkingBudgetModal(ui.Modal):
+    """Both token budgets for whichever slot the picker is showing.
+
+    A modal because Discord has no numeric control outside one -- the same platform
+    constraint that put every other free value behind an Edit button. Two fields rather
+    than two visits, since the pair is one decision.
+    """
+
+    def __init__(self, picker):
+        super().__init__(title="Reasoning Token Budgets")
+        self.picker = picker
+        self.inputs = {}
+        for role, label in picker._ROLE_LABELS:
+            _level_key, budget_key = picker._slot_keys(role)
+            current = picker._current(budget_key)
+            placeholder = ("-1 dynamic \u00b7 0 disables \u00b7 128-32768 a token limit"
+                           if role == "primary"
+                           else "blank follows the primary \u00b7 -1 dynamic \u00b7 0 disables")
+            field = ui.TextInput(
+                label=f"{label} budget",
+                default="" if current is None else str(current),
+                placeholder=placeholder, required=False, max_length=6)
+            self.inputs[budget_key] = field
+            self.add_item(field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        pending = {}
+        for budget_key, field in self.inputs.items():
+            raw = (field.value or "").strip()
+            if not raw:
+                # Cleared, not zeroed: an empty field puts the role back on what it
+                # inherits, which is the only way to un-set a value from a modal.
+                pending[budget_key] = None
+                continue
+            value = _pi(raw)
+            if value is None or value < -1:
+                await interaction.response.send_message(
+                    "Enter -1 for dynamic, 0 to disable thinking, or a token count. "
+                    "Leave a field blank to inherit.", ephemeral=True)
+                return
+            pending[budget_key] = min(value, 32768)
+
+        for key, value in pending.items():
+            self.picker._write(key, value)
+        self.picker._build_view()
+        await interaction.response.edit_message(**self.picker._render())
+
+
+class SingleProfileThinkingView(ThinkingPickerMixin, ui.View):
+    """Per-slot, per-role thinking for one profile, written as it is chosen.
+
+    Reachable from two places on purpose: `Set Thinking Parameters` on the Params tab,
+    where it has always lived, and a button inside Set Models, which is where the slot
+    vocabulary comes from. One implementation, two entrances -- the second exists
+    because choosing a model and choosing how hard it thinks are the same decision.
+    """
+
+    _OFFERS_UNCHANGED = False
+
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str,
+                 slot: str = "response", is_borrowed: bool = False,
+                 user_id: Optional[int] = None, parent_model_view=None):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.original_interaction = interaction
+        self.user_id = user_id or interaction.user.id
+        self.profile_name = profile_name
+        self.is_borrowed = is_borrowed
+        self.slot = slot if slot in THINKING_SLOT_KEYS else "response"
+        #: Set when opened from Set Models, so Back returns to the picker that opened
+        #: this rather than dead-ending on an ephemeral message.
+        self.parent_model_view = parent_model_view
+        self._build_view()
+
+    def _profile(self) -> Dict[str, Any]:
+        return self.cog.profile_manager._get_profile_config(
+            self.user_id, self.profile_name, self.is_borrowed) or {}
+
+    def _slot_model(self, slot: str, role: str = "primary"):
+        return self._profile().get(self._SLOT_MODEL_KEYS[(slot, role)])
+
+    def _current(self, key: str):
+        return self._profile().get(key)
+
+    def _write(self, key: str, value: Any):
+        data = self._profile()
+        if value is None:
+            data.pop(key, None)
+        else:
+            data[key] = value
+        self.cog.profile_manager._save_profile_config(
+            self.user_id, self.profile_name, data, self.is_borrowed)
+        # Same invalidation every other in-place profile write does: a cached model
+        # carries the thinking params it was built with.
+        stale = [k for k in self.cog.channel_models
+                 if isinstance(k, tuple) and len(k) >= 2 and k[1] == self.user_id]
+        for k in stale:
+            self.cog.channel_models.pop(k, None)
+            self.cog.channel_model_last_profile_key.pop(k, None)
+
+    def _render(self) -> Dict[str, Any]:
+        return {"content": None, "embed": self.embed(), "view": self}
+
+    def display_slot_model(self, role: str) -> str:
+        raw = self._slot_model(self.slot, role)
+        if not is_real_model(raw):
+            return "none set"
+        text = str(raw)
+        for prefix in ("GOOGLE/", "OPENROUTER/", "OLLAMA/"):
+            if text.startswith(prefix):
+                return text[len(prefix):]
+        return text
+
+    def embed(self) -> discord.Embed:
+        data = self._profile()
+        wording = next((lbl for value, lbl, _ in THINKING_SLOT_LABELS if value == self.slot),
+                       self.slot.title())
+        e = discord.Embed(title="Thinking / Reasoning", colour=discord.Colour.blurple())
+        e.description = (f"**{wording}** \u2014 switch slots to set another. "
+                         f"Effort and budget are stored per model, so a cheap fallback "
+                         f"need not think as hard as the primary it stands in for.")
+
+        for role, role_label in self._ROLE_LABELS:
+            resolved = resolve_thinking_params(data, self.slot, role)
+            level_key, budget_key = self._slot_keys(role)
+            budget = resolved["thinking_budget"]
+            # "inherited" wherever the value came from somewhere other than this role's
+            # own keys -- the whole point of the sparse storage is that the screen can
+            # say so rather than showing a number nobody typed.
+            level_src = "" if data.get(level_key) else " *(inherited)*"
+            budget_src = "" if data.get(budget_key) is not None else " *(inherited)*"
+            e.add_field(
+                name=f"{role_label} \u2014 {self.display_slot_model(role)}",
+                value=(f"Effort: `{resolved['thinking_level'].title()}`{level_src}\n"
+                       f"Budget: `{'Dynamic' if budget == -1 else budget}`{budget_src}\n"
+                       f"-# This model {self._caps_note(role)}."),
+                inline=False)
+
+        if self.slot == "response":
+            on = str(data.get("thinking_summary_visible") or "off").lower() == "on"
+            e.add_field(name="Thought Summary", value="**`ON`**" if on else "`OFF`", inline=True)
+        else:
+            e.add_field(name="Thought Summary", value="`Response only`", inline=True)
+
+        e.add_field(name="\u200b", value="**Every slot**\n" + "\n".join(self._slot_rows(data)),
+                    inline=False)
+        e.set_footer(text=f"{self.profile_name} \u00b7 changes save as you make them")
+        return e
+
+    def _build_view(self):
+        self.clear_items()
+        self._add_slot_select(0)
+        self._add_level_select("primary", 1)
+        self._add_level_select("fallback", 2)
+        self._add_budget_button(3)
+
+        if self.slot == "response":
+            on = str(self._current("thinking_summary_visible") or "off").lower() == "on"
+            btn = ui.Button(label=f"Show Summary: {'ON' if on else 'OFF'}",
+                            style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary,
+                            row=3)
+
+            async def summary_cb(i: discord.Interaction):
+                self._write("thinking_summary_visible", "off" if on else "on")
+                self._build_view()
+                await i.response.edit_message(**self._render())
+
+            btn.callback = summary_cb
+            self.add_item(btn)
+
+        if self.parent_model_view is not None:
+            back = ui.Button(label="\u2190 Back to Models", style=discord.ButtonStyle.secondary, row=4)
+
+            async def back_cb(i: discord.Interaction):
+                parent = self.parent_model_view
+                parent._build_view()
+                await i.response.edit_message(**parent._picker_render())
+
+            back.callback = back_cb
+            self.add_item(back)
 
 
 #: Shared by the wizard and every sub-view. Deliberately under fifteen minutes: after a
@@ -2710,6 +3157,120 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
                 "Choose at least one model first.", ephemeral=True)
             return
         self.wizard._stage_change("models", config=pending)
+        await self.wizard.refresh(interaction)
+
+
+class ThinkingApplyView(ThinkingPickerMixin, _BulkSubView):
+    """The bulk counterpart: the same three dropdowns, staged rather than written.
+
+    Offers an explicit **Unchanged** on both effort selects, which the single-profile
+    picker has no use for: a selection can hold profiles with different answers, and
+    "leave them as they are" is a real choice no value can express. It replaces the
+    single-profile picker's "Same as Primary" for the same reason -- across a selection
+    that is a per-profile outcome, not something this screen can promise.
+    """
+
+    _OFFERS_UNCHANGED = True
+
+    def __init__(self, wizard):
+        super().__init__(wizard)
+        self.slot = "response"
+        self.staged: Dict[str, Any] = {}
+        self._build_view()
+
+    def _slot_model(self, slot: str, role: str = "primary"):
+        # A bulk selection has no single model per slot, so the caps note has nothing to
+        # read. Reported as such rather than guessed from the first profile.
+        return None
+
+    def _caps_note(self, role: str) -> str:
+        return ("resolves per profile at request time -- across a selection the slots "
+                "hold different models")
+
+    def _current(self, key: str):
+        return self.staged.get(key)
+
+    def _write(self, key: str, value: Any):
+        if value is None:
+            self.staged.pop(key, None)
+        else:
+            self.staged[key] = value
+
+    def _render(self) -> Dict[str, Any]:
+        return {"content": None, "embed": self.embed(), "view": self}
+
+    def embed(self) -> discord.Embed:
+        e = discord.Embed(title="Thinking / Reasoning", colour=discord.Colour.blurple())
+        wording = next((lbl for value, lbl, _ in THINKING_SLOT_LABELS if value == self.slot),
+                       self.slot.title())
+        e.description = (f"**{wording}** \u2014 switch slots to stage more than one in the "
+                         f"same pass.\n-# Effort and budget are staged per model, so a "
+                         f"cheap fallback need not think as hard as its primary. What "
+                         f"each model honours {self._caps_note('primary')}.")
+
+        for role, role_label in self._ROLE_LABELS:
+            level_key, budget_key = self._slot_keys(role)
+            budget = self.staged.get(budget_key)
+            e.add_field(
+                name=role_label,
+                value=(f"Effort: `{str(self.staged.get(level_key) or 'Unchanged').title()}`\n"
+                       f"Budget: `{'Unchanged' if budget is None else ('Dynamic' if budget == -1 else budget)}`"),
+                inline=True)
+
+        if self.slot == "response":
+            summary = self.staged.get("thinking_summary_visible")
+            e.add_field(name="Show Summary",
+                        value=f"`{'Unchanged' if summary is None else summary.upper()}`",
+                        inline=True)
+
+        if self.staged:
+            body = "\n".join(f"\u2022 {setting_label(k)}: `{v}`"
+                             for k, v in self.staged.items())
+            e.add_field(name=f"Staged from this picker ({len(self.staged)})",
+                        value=body[:1024], inline=False)
+
+        e.set_footer(text=f"{len(self.wizard.selected_profiles)} profile(s) selected \u00b7 "
+                          f"nothing is written until Apply")
+        return e
+
+    def _build_view(self):
+        self.clear_items()
+        self._add_slot_select(0)
+        self._add_level_select("primary", 1)
+        self._add_level_select("fallback", 2)
+        self._add_budget_button(3)
+
+        if self.slot == "response":
+            state = self.staged.get("thinking_summary_visible")
+            label = ("Show Summary: Unchanged" if state is None
+                     else f"Show Summary: {state.upper()}")
+            style = (discord.ButtonStyle.secondary if state is None
+                     else (discord.ButtonStyle.success if state == "on" else discord.ButtonStyle.danger))
+            btn = ui.Button(label=label, style=style, row=3)
+
+            async def summary_cb(i: discord.Interaction):
+                # Tri-state, as the fallback indicator is: the setting can be taken back
+                # out of the changeset without abandoning the efforts beside it.
+                self._write("thinking_summary_visible",
+                            "on" if state is None else ("off" if state == "on" else None))
+                self._build_view()
+                await i.response.edit_message(**self._render())
+
+            btn.callback = summary_cb
+            self.add_item(btn)
+
+        self._add_back(4)
+        stage = ui.Button(label="Stage Thinking", style=discord.ButtonStyle.success, row=4,
+                          disabled=not self.staged)
+        stage.callback = self._stage_callback
+        self.add_item(stage)
+
+    async def _stage_callback(self, interaction: discord.Interaction):
+        if not self.staged:
+            await interaction.response.send_message(
+                "Choose an effort or a budget first.", ephemeral=True)
+            return
+        self.wizard._stage_change("thinking_params", config=dict(self.staged))
         await self.wizard.refresh(interaction)
 
 

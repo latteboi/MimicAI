@@ -56,7 +56,7 @@ import platform
 from collections import OrderedDict
 import re
 import pathlib
-from .utils.helpers import _resolve_safety_settings, _scrub_response_text
+from .utils.helpers import _resolve_safety_settings, _scrub_response_text, resolve_thinking_params
 
 class LRUCache(OrderedDict):
     def __init__(self, max_size, *args, **kwargs):
@@ -376,7 +376,10 @@ class MimicCog(EventListeners, commands.Cog):
         try:
             if is_or:
                 model_name = 'google/gemini-2.5-flash-lite'
-                model = OpenRouterModel(api_key=api_key, model_name=model_name, system_instruction=None, thinking_params={})
+                # `{}` reads as "high" in every adapter, and this is a single
+                # form-filling pass on a Lite model. Shared `utility` default.
+                model = OpenRouterModel(api_key=api_key, model_name=model_name, system_instruction=None,
+                                        thinking_params=resolve_thinking_params(None, "utility"))
             else:
                 model_name = 'gemini-2.5-flash-lite'
                 model = GoogleGenAIModel(api_key=api_key, model_name=model_name, safety_settings=DEFAULT_SAFETY_SETTINGS)
@@ -1982,11 +1985,13 @@ class MimicCog(EventListeners, commands.Cog):
             adv_params = {k: v for k, v in adv_params.items() if v is not None}
             gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "_advanced_params": adv_params}
             
-            t_params_worker = {
-                "thinking_summary_visible": p_config.get("thinking_summary_visible", "off"),
-                "thinking_level": p_config.get("thinking_level", "none"),
-                "thinking_budget": p_config.get("thinking_budget", -1)
-            }
+            t_params_worker = resolve_thinking_params(p_config, "response")
+            if not p_config.get("thinking_level"):
+                # MimicGuide answers documentation questions off retrieved shards. The
+                # shared default for the response slot is "high"; this path has always
+                # picked cheap over deliberative, and that is still the right trade for
+                # a lookup, so it keeps its own default rather than the slot's.
+                t_params_worker["thinking_level"] = "none"
             
             d_safe = _resolve_safety_settings(interaction.channel, p_config)
             
@@ -2077,7 +2082,19 @@ class MimicCog(EventListeners, commands.Cog):
     @app_commands.command(name="terms", description="View the MimicAI Terms of Service and Privacy Policy.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     async def terms_slash(self, interaction: discord.Interaction):
-        await interaction.response.send_message("View the Terms of Service and Privacy Policy here: https://mimic-ai.org/", ephemeral=True)
+        # The full text, not a link to it. Someone asking what the bot does with their
+        # API key should be able to read the answer without leaving Discord, and a
+        # self-hosted instance has no business pointing its users at the official
+        # site's copy. The link stays as a button so the canonical version is one
+        # click away and any drift between the two is visible.
+        await interaction.response.defer(ephemeral=True)
+        from .utils.content import LEGAL_DOCUMENTS, LEGAL_EFFECTIVE_DATE
+        view = DropdownContentView(
+            LEGAL_DOCUMENTS,
+            f"MimicAI Terms of Service & Privacy Policy · Effective {LEGAL_EFFECTIVE_DATE}",
+            link_button_label="View on mimic-ai.org",
+            link_button_url="https://mimic-ai.org/")
+        await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="invite", description="Get the invite link to add MimicAI to your server.")
     @app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)

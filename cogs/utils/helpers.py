@@ -24,6 +24,9 @@ from .constants import (
     DEFAULT_CRITIC_LOOKBACK, DEFAULT_CRITIC_PERSISTENCE,
     CRITIC_LOOKBACK_MIN, CRITIC_LOOKBACK_MAX,
     CRITIC_PERSISTENCE_MIN, CRITIC_PERSISTENCE_MAX,
+    THINKING_LEVELS, THINKING_SLOT_KEYS, THINKING_SLOT_DEFAULTS,
+    THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
+    MEDIA_RESOLUTION_VALUES, MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL,
 )
 
 
@@ -74,8 +77,20 @@ def _resolve_safety_settings(channel: Any, profile_config: Optional[Dict[str, An
     that prompt_builder injects for non-age-restricted channels.
 
     An age-restricted channel only ever receives profiles the gate has already
-    cleared for it, so BLOCK_NONE re-litigates nothing. Everything else keeps
-    BLOCK_ONLY_HIGH, which is what the old 'low' default resolved to.
+    cleared for it, so standing the filter down re-litigates nothing. Everything else
+    keeps BLOCK_ONLY_HIGH, which is what the old 'low' default resolved to.
+
+    The permissive branch sends OFF rather than BLOCK_NONE. Google documents them as
+    different states -- OFF disables the filter, BLOCK_NONE leaves the classifier
+    running and never blocks on it -- and on Gemini 2.5 and 3 the *unset* default is
+    already OFF, so BLOCK_NONE was quietly asking for a filter this branch exists to
+    stand down. Note that community reports disagree with the documentation about
+    which of the two is looser in practice; if an age-restricted session starts
+    returning empty candidates where it did not before, this constant is the first
+    thing to put back. The strict branch is unaffected either way.
+
+    Neither value reaches Google's non-configurable protections -- core harms such as
+    child safety are always blocked -- so no setting here makes a model unfiltered.
 
     `profile_config` carries the one carve-out: a profile the bot owner marked
     exempt runs unfiltered wherever it runs. Callers holding a borrowed
@@ -87,7 +102,7 @@ def _resolve_safety_settings(channel: Any, profile_config: Optional[Dict[str, An
     exempt = rating.get("verdict") == "exempt"
 
     threshold = (
-        HarmBlockThreshold.BLOCK_NONE
+        HarmBlockThreshold.OFF
         if exempt or _channel_is_age_restricted(channel)
         else HarmBlockThreshold.BLOCK_ONLY_HIGH
     )
@@ -645,6 +660,142 @@ def resolve_image_output_params(image_config, raw_name: Optional[str]) -> dict:
             continue
 
     return out
+
+
+def google_thinking_caps(model_name: Optional[str]) -> Dict[str, Any]:
+    """What a Google model will actually honour on the thinking config.
+
+    Three families, three answers, and this is the only place that decides which:
+
+    * Gemini 3 takes `thinkingLevel`. 3 Pro collapses the six levels to two -- it
+      publishes LOW and HIGH and nothing between -- so `levels` says which mapping the
+      caller should use.
+    * Gemini 2.5 takes `thinkingBudget`, except Flash Lite, which takes neither. 2.5
+      Pro refuses a budget under 128 while still allowing -1 (dynamic), hence
+      `budget_floor` rather than a plain clamp.
+    * Image, TTS and embedding models take nothing. An image model does accept a
+      thinking level, but as an *output* control resolved by
+      `resolve_image_output_params` -- not from the text profile's keys, which is why
+      it is `None` here.
+
+    The name arrives bare or prefixed depending on the call site, so both are handled.
+    An unrecognised model gets `None`: sending a field a model has never heard of is a
+    400, and a custom id is likelier to be a new model than a typo.
+    """
+    lowered = (model_name or "").lower()
+    for prefix in ("google/", "openrouter/", "ollama/"):
+        if lowered.startswith(prefix):
+            lowered = lowered[len(prefix):]
+            break
+
+    if any(suffix in lowered for suffix in ("-image", "-tts", "-embedding")):
+        return {"mode": None, "levels": "full", "budget_floor": 0}
+    if "gemini-3" in lowered:
+        return {"mode": "level",
+                "levels": "binary" if "pro" in lowered else "full",
+                "budget_floor": 0}
+    if "gemini-2.5" in lowered:
+        if "lite" in lowered:
+            return {"mode": None, "levels": "full", "budget_floor": 0}
+        return {"mode": "budget", "levels": "full",
+                "budget_floor": 128 if "pro" in lowered else 0}
+    return {"mode": None, "levels": "full", "budget_floor": 0}
+
+
+def resolve_thinking_params(config: Optional[Dict[str, Any]],
+                            slot: str = "response",
+                            role: str = "primary") -> Dict[str, Any]:
+    """The thinking parameters one model of one slot of one profile runs at.
+
+    Every generation path builds its `thinking_params` through here, which is what
+    stops the slots drifting into separate opinions -- they already had. The response
+    slot read the profile; the critic and the grounding summariser hardcoded the same
+    literal at two call sites; the LTM summariser and the session-synopsis compactor
+    passed `{}` and so inherited the adapters' own `"high"` default, paying for a full
+    reasoning pass to compress a transcript.
+
+    `role` is "primary" or "fallback", and they are genuinely different questions. The
+    usual fallback is a cheap standby behind an expensive primary, so one shared effort
+    either wasted the money the standby was chosen to save or under-thought a request
+    the primary was configured for.
+
+    **An unset fallback inherits the primary's resolved values**, not the slot default.
+    That is what keeps a fallback a drop-in replacement for anyone who never opens the
+    third dropdown: raise the response primary to Max and the standby follows, until
+    the moment you say otherwise.
+
+    Storage is sparse and must stay sparse: an absent key means "inherit", not "high".
+    Writing defaults out at profile-creation time would freeze today's value onto every
+    profile ever made, which is the trap `index.json["defaults"]` avoids.
+
+    `thinking_summary_visible` is response-only by construction. A utility slot's
+    thoughts reach no user -- the critic's verdict is parsed, the summariser's output is
+    stored -- so asking for them buys billed tokens nobody reads.
+    """
+    config = config or {}
+    if slot not in THINKING_SLOT_DEFAULTS:
+        slot = "response"
+    defaults = THINKING_SLOT_DEFAULTS[slot]
+    # A slot with no entry here is one nothing can configure -- `compaction` -- and
+    # resolves to its default alone.
+    roles = THINKING_SLOT_KEYS.get(slot, {})
+
+    def _read(keys) -> Dict[str, Any]:
+        """The level and budget stored under one (level, budget) pair, or None each."""
+        if not keys:
+            return {"level": None, "budget": None}
+        level_key, budget_key = keys
+        level = str(config.get(level_key) or "").lower()
+        if level not in THINKING_LEVELS:
+            level = None
+        raw = config.get(budget_key)
+        try:
+            budget = int(raw)
+        except (TypeError, ValueError):
+            budget = None
+        if budget is not None and budget < -1:
+            budget = None
+        return {"level": level, "budget": budget}
+
+    primary = _read(roles.get("primary"))
+    level = primary["level"] or defaults["level"]
+    budget = primary["budget"] if primary["budget"] is not None else defaults["budget"]
+
+    if role == "fallback":
+        # Resolved against the primary rather than the slot default, so "unset" reads
+        # as "same as the model in front of me".
+        secondary = _read(roles.get("fallback"))
+        level = secondary["level"] or level
+        budget = secondary["budget"] if secondary["budget"] is not None else budget
+
+    summary = "off"
+    if slot == "response":
+        summary = "on" if str(config.get("thinking_summary_visible", "off")).lower() == "on" else "off"
+
+    return {"thinking_level": level, "thinking_budget": budget,
+            "thinking_summary_visible": summary}
+
+
+def resolve_media_resolution(config: Optional[Dict[str, Any]]) -> str:
+    """The stored `media_input_resolution`, or "" for "send nothing".
+
+    Validated rather than trusted: the value reaches the wire as a protobuf enum name,
+    and an imported profile or an older shard can carry anything at all.
+    """
+    value = str((config or {}).get("media_input_resolution") or "").upper()
+    return value if value in MEDIA_RESOLUTION_VALUES else ""
+
+
+def resolve_openrouter_image_detail(config: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The same setting as OpenRouter's per-part `detail` hint, or None.
+
+    OpenRouter carries no request-level media-resolution field; what it forwards is the
+    OpenAI-compatible `detail` on an `image_url` part, which has two useful values
+    against Google's four. Folding four onto two loses precision, but the alternative
+    is a setting that silently does nothing on one of the two providers that can
+    actually read images.
+    """
+    return MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL.get(resolve_media_resolution(config))
 
 
 def resolve_typing_cursor(config: Optional[Dict[str, Any]], fallback_emoji: str) -> Tuple[str, str]:

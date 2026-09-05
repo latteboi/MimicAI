@@ -2745,8 +2745,13 @@ class ProfileManager:
             ("LTM", "ltm_model", FALLBACK_MODEL_NAME),
         )
 
-        model_lines = [f"Primary: `{clean_m(prim_model)}`",
-                       f"Fallback: `{clean_m(fall_model)}`"]
+        # The response slot reads like the five utility rows: one line, the retry after
+        # an arrow. It had its own two-line "Primary/Fallback" shape, which named the
+        # same pairing twice over in a different vocabulary from every row beneath it.
+        if is_real_model(fall_model) and fall_model != prim_model:
+            model_lines = [f"Response: `{clean_m(prim_model)}` \u2192 `{clean_m(fall_model)}`"]
+        else:
+            model_lines = [f"Response: `{clean_m(prim_model)}`"]
         for label, key, default in utility_slots:
             primary = config.get(key) or default
             fallback = config.get(UTILITY_FALLBACK_KEYS[key])

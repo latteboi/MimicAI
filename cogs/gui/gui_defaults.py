@@ -53,6 +53,11 @@ _BEHAVIOUR_CHOICES = (
       ("Low", "low", "Fast."),
       ("Minimal", "minimal", "Barely deliberates."),
       ("None", "none", "No reasoning pass at all."))),
+    # Nothing else fits. Each entry here takes a whole action row (`row=offset + 1`),
+    # the toggles are pinned to row 3 and Discord allows five rows in total -- so a
+    # third select would land on top of them. Media input resolution and the three
+    # utility slots' reasoning effort are per-profile and bulk-appliable settings
+    # instead; adding either here needs this screen paginated first.
 )
 
 #: Behaviour rows presented as tri-state buttons: unset -> On -> Off -> unset.

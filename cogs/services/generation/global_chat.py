@@ -14,6 +14,7 @@ from ...utils.constants import (
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_history_entry,
     _get_user_hash, _resolve_safety_settings, _scrub_response_text, default_profile_avatar_url,
+    resolve_thinking_params,
 )
 from ._shared import _strip_neuro_update_and_scrub
 
@@ -346,6 +347,12 @@ class GlobalChatMixin:
                     api_error_reason = main_api_error
                 else:
                     try:
+                        # channel_id 0 resolves to no channel, so the builder takes the
+                        # not-age-restricted branch and always injects <content_policy>.
+                        # That is the intended answer, not an accident of the sentinel: a
+                        # Global Chat card can be opened in any channel and none is
+                        # guaranteed age-restricted, which is the same reason
+                        # content_capability refuses an Adult profile here.
                         sys_instr, _, _, _, _, _, _, _ = await asyncio.to_thread(self._construct_system_instructions, host_user_id, profile_name, 0)
 
                         user_index_f = self.cog.profile_manager._get_user_index(host_user_id)
@@ -361,11 +368,9 @@ class GlobalChatMixin:
 
                         d_safe = _resolve_safety_settings(None, p_data_f)
 
-                        t_params_f = {
-                            "thinking_summary_visible": p_data_f.get("thinking_summary_visible", "off"),
-                            "thinking_level": p_data_f.get("thinking_level", "high"),
-                            "thinking_budget": p_data_f.get("thinking_budget", -1)
-                        }
+                        # Only ever handed to the fallback instance below, so it
+                        # resolves as the fallback role.
+                        t_params_f = resolve_thinking_params(p_data_f, "response", "fallback")
 
                         grounding_mode_native = p_data_f.get("grounding_mode", "off")
                         if isinstance(grounding_mode_native, bool): grounding_mode_native = "rag" if grounding_mode_native else "off"

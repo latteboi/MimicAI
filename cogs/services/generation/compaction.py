@@ -9,6 +9,7 @@ from ...utils.constants import (
     DEFAULT_SESSION_SYNOPSIS_PROMPT, DEFAULT_SESSION_SYNOPSIS_USER_PROMPT,
     SESSION_BUSY_FLAGS,
 )
+from ...utils.helpers import resolve_thinking_params
 from ...managers.session_manager import intern_turn
 
 
@@ -198,10 +199,15 @@ class SessionCompactionMixin:
             "SESSION_SYNOPSIS_USER", DEFAULT_SESSION_SYNOPSIS_USER_PROMPT
         ).format(previous_synopsis=previous_block, transcript=transcript)
 
-        async def _attempt(model_name, _is_fallback):
+        async def _attempt(model_name, is_fallback):
+            # `{}` here was the same defect the LTM summariser had: not "no thinking"
+            # but "whatever the adapter defaults to", which is high. Compaction is a
+            # session setting rather than a profile one, so it has no configurable slot
+            # and takes the shared `utility` default.
             model = self.cog.api_service._instantiate_model(
                 model_name, guild_id, session.get("owner_id"),
-                system_instruction=system_instruction, thinking_params={})
+                system_instruction=system_instruction,
+                thinking_params=resolve_thinking_params(None, "utility"))
             return await model.generate_content_async(
                 [user_prompt], generation_config={"temperature": 0.2, "top_p": 0.95})
 

@@ -26,7 +26,7 @@ from ..utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt,
     _format_history_entry, _get_user_hash, _resolve_safety_settings, _scrub_response_text,
     _split_into_sentences_with_abbreviations, is_real_model, resolve_critic_settings,
-    resolve_typing_cursor,
+    resolve_thinking_params, resolve_typing_cursor,
 )
 from ..utils import mem_probe
 from ..managers.session_manager import intern_turn
@@ -294,9 +294,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     # deliberately does not: OpenRouter namespaces its models as
                                     # 'google/gemini-2.5-flash', so an upper()-ed match read that as a
                                     # GOOGLE/ prefix and sent an OpenRouter model id to Google.
+                                    # `{}` reads as "high" in every adapter. A Director's
+                                    # Note is one short instruction off ten lines of
+                                    # history; it takes the shared `utility` default.
                                     m = self.cog.api_service._instantiate_model(
                                         model_raw, guild_id, session.get("owner_id"),
-                                        system_instruction=sys_instr, thinking_params={})
+                                        system_instruction=sys_instr,
+                                        thinking_params=resolve_thinking_params(None, "utility"))
                                     hist_text = ""
                                     for ht in session.get("unified_log", [])[-10:]:
                                         hist_text += f"{ht.get('content', '')}\n"
@@ -1120,12 +1124,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         warning_message = None
 
                         # Pass thinking parameters to the model instance in the worker
-                        t_params_worker = {
-                            "thinking_persistence": p_settings.get("thinking_persistence", 10),
-                            "thinking_summary_visible": p_settings.get("thinking_summary_visible", "off"),
-                            "thinking_level": p_settings.get("thinking_level", "high"),
-                            "thinking_budget": p_settings.get("thinking_budget", -1)
-                        }
+                        t_params_worker = resolve_thinking_params(p_settings, "response")
+                        # Carried across because this dict has always held it. Nothing
+                        # in any adapter reads it; removing it is a separate question
+                        # from routing the three that are read through one resolver.
+                        t_params_worker["thinking_persistence"] = p_settings.get("thinking_persistence", 10)
                         
                         # [NEW] Re-evaluate Tools for internal model reconstruction
                         model_tools = self._resolve_native_tools(p_settings)
@@ -1354,7 +1357,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             else:
                                 try:
                                     fb_name = fallback_model_name
-                                    fallback_instance = self.cog.api_service._instantiate_model(fb_name, channel.guild.id, triggering_user_id, full_system_instruction, dynamic_safety_settings, t_params_worker, model_tools, p_settings)
+                                    # The fallback slot's own effort, not the primary's.
+                                    # Unset still inherits the primary, so this changes
+                                    # nothing for a profile that never set one.
+                                    t_params_fb = resolve_thinking_params(p_settings, "response", "fallback")
+                                    t_params_fb["thinking_persistence"] = t_params_worker.get("thinking_persistence", 10)
+                                    fallback_instance = self.cog.api_service._instantiate_model(fb_name, channel.guild.id, triggering_user_id, full_system_instruction, dynamic_safety_settings, t_params_fb, model_tools, p_settings)
                                     
                                     response, state_container = await self._generate_with_heartbeat(
                                         fallback_instance, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container

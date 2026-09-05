@@ -11,7 +11,8 @@ from ..utils.constants import (
     DEFAULT_WEB_GROUNDING_TEXT, PATTERN_HTML_CONTAINERS, PATTERN_HTML_TAGS,
     PATTERN_HTML_BLANKLINES, DEFAULT_GROUNDING_RAG_PAYLOAD,
 )
-from ..utils.helpers import _format_api_error, _truncate_text_by_char, is_real_model
+from ..utils.helpers import (_format_api_error, _truncate_text_by_char, is_real_model,
+                            resolve_thinking_params)
 from ..utils.net_guard import UnsafeURL, safe_stream
 from .api_service import GoogleGenAIModel
 
@@ -153,10 +154,13 @@ class ToolsService:
         critic_model_raw = p_config.get("critic_model") or FALLBACK_MODEL_NAME
 
         try:
-            t_params = {"thinking_budget": 512, "thinking_summary_visible": "off", "thinking_level": "low"}
             critic_cfg = {"temperature": 0.1, "top_p": 0.95}
 
-            async def _attempt(model_name, _is_fallback):
+            async def _attempt(model_name, is_fallback):
+                # Resolved inside the attempt so the retry gets the fallback slot's own
+                # effort rather than the primary's.
+                t_params = resolve_thinking_params(
+                    p_config, "critic", "fallback" if is_fallback else "primary")
                 model = self.cog.api_service._instantiate_model(
                     model_name, guild_id, None, system_instruction, None, t_params, None, p_config)
                 return await model.generate_content_async(
@@ -323,6 +327,10 @@ class ToolsService:
             # [NEW] Utility Routing Logic for Grounding RAG
             rag_model_raw = FALLBACK_MODEL_NAME
             rag_fallback_raw = None
+            # Bound up front rather than only inside the session branch: the grounding
+            # phase runs without a resolvable session often enough, and an empty config
+            # is exactly the "use the slot default" case the resolver is built for.
+            p_cfg: Dict[str, Any] = {}
             session_id = mapping_key[1] if isinstance(mapping_key, tuple) else None
             if session_id:
                 session = self.cog.multi_profile_channels.get(session_id)
@@ -336,7 +344,6 @@ class ToolsService:
                         rag_model_raw = p_cfg.get("grounding_rag_model", FALLBACK_MODEL_NAME)
                         rag_fallback_raw = p_cfg.get("grounding_rag_fallback_model")
 
-            t_params = {"thinking_budget": 512, "thinking_summary_visible": "off", "thinking_level": "low"}
             gen_config = {"temperature": 0.1, "top_p": 0.95}
 
             def _is_rerouted(raw: str) -> bool:
@@ -376,15 +383,19 @@ class ToolsService:
             model_name = rag_primary
             model = None
 
-            async def _attempt(name, _is_fallback):
+            async def _attempt(name, is_fallback):
                 nonlocal model_name, model
                 model_name = name
+                # Was a hardcoded low/512 literal, duplicated at the critic call site.
+                # Same default, now a per-profile, per-role setting resolved inside the
+                # attempt so the retry gets the fallback's own effort.
                 model = GoogleGenAIModel(
                     api_key=api_key,
                     model_name=model_name,
                     system_instruction=system_instruction,
                     safety_settings=safety_settings,
-                    thinking_params=t_params,
+                    thinking_params=resolve_thinking_params(
+                        p_cfg, "grounding", "fallback" if is_fallback else "primary"),
                     tools=[grounding_tool]
                 )
                 return await model.generate_content_async([user_prompt], generation_config=gen_config)

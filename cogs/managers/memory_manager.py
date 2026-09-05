@@ -51,7 +51,8 @@ from ..utils.constants import (
     MIN_HISTORY_FOR_LTM_CREATION,
     DEFAULT_TRAINING_ANALYST_PROMPT,
 )
-from ..utils.helpers import Timeout, _format_api_error, _get_sanitized_history_and_author
+from ..utils.helpers import (Timeout, _format_api_error, _get_sanitized_history_and_author,
+                            resolve_thinking_params)
 from .storage_manager import IOManager
 from ..services.api_service import get_embedding_vector
 
@@ -766,10 +767,18 @@ class MemoryManager:
 
         status = "api_error"
         try:
-            async def _attempt(model_name, _is_fallback):
+            async def _attempt(model_name, is_fallback):
+                # `{}` used to sit in the thinking slot, which is not "no thinking":
+                # the adapters default an absent thinking_level to "high", so every
+                # long-term memory ever written was billed a full reasoning pass to
+                # compress a transcript. The resolver's ltm default is low/512, and a
+                # profile can now raise it deliberately.
                 m = self.cog.api_service._instantiate_model(
                     model_name, effective_guild_id if effective_guild_id else None,
-                    profile_owner_id, instructions, DEFAULT_SAFETY_SETTINGS, {}, None, params_source)
+                    profile_owner_id, instructions, DEFAULT_SAFETY_SETTINGS,
+                    resolve_thinking_params(
+                        params_source, "ltm", "fallback" if is_fallback else "primary"),
+                    None, params_source)
                 return await m.generate_content_async(
                     [f"<target_transcript>\n{convo}\n</target_transcript>"], generation_config=cfg)
 

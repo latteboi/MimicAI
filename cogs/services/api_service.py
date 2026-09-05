@@ -13,9 +13,13 @@ from ..utils.constants import (
     OLLAMA_LOCAL_URL, MODELS_DATA_DIR, PRICING_CACHE_FILE, IMAGE_MODELS, AUDIO_MODELS,
     ALLOWED_MODELS, defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
     IMAGE_MODEL_KEYS, AUDIO_MODEL_KEYS, DEFAULT_SPEECH_VOICE,
+    THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
+    THINKING_LEVELS_TO_OLLAMA,
 )
 from ..utils.blob_stream import InlineBlobExtractor, is_blob_sentinel, sentinel_path
-from ..utils.helpers import _resolve_safety_settings, is_real_model
+from ..utils.helpers import (_resolve_safety_settings, is_real_model,
+                            google_thinking_caps, resolve_media_resolution,
+                            resolve_openrouter_image_detail, resolve_thinking_params)
 from ..utils.http_client import get_shared_client
 from ..utils.net_guard import safe_stream
 from ..utils.memory_tuning import maybe_trim_malloc
@@ -56,12 +60,50 @@ def _with_key_cooldown_tracking(cog, model, api_key: str):
     return model
 
 
+#: Ollama model names that answered a `think` field with an error. Ollama accepts
+#: `think` as a bool or one of "low"/"medium"/"high"/"max", but only on models built
+#: for it -- everything else 400s with a message naming thinking. The adapter retries
+#: once without the field and records the name here so the next round does not pay for
+#: the same discovery. Bounded because CLAUDE.md forbids an unbounded dict keyed by
+#: model; a local Ollama install holds a handful of models, and the cap is a backstop
+#: rather than a working limit.
+_OLLAMA_NO_THINK: set = set()
+_OLLAMA_NO_THINK_CAP = 64
+
+
+class _OllamaRetryWithoutThink(Exception):
+    """Internal signal: this call must be redone with no `think` field.
+
+    An exception rather than a return because the decision is made inside an
+    `async with client.stream(...)` inside the global Ollama lock, and the retry has to
+    happen outside both.
+    """
+
+
+def _ollama_think_value(thinking_params: dict):
+    """The `think` field for one set of resolved thinking parameters, or None.
+
+    None means "send nothing", which is what this adapter did for every request before
+    it learned the field existed -- so an unrecognised level still gets the model's own
+    default. `THINKING_LEVELS_TO_OLLAMA` carries the coarsening, including why neither
+    Max nor Extra High sends Ollama's own "max": only newer builds accept it, and an
+    older server answers an unknown value with an error.
+    """
+    level = str((thinking_params or {}).get("thinking_level") or "").lower()
+    return THINKING_LEVELS_TO_OLLAMA.get(level)
+
+
 class OpenRouterModel:
-    def __init__(self, model_name, api_key, system_instruction=None, thinking_params=None, **kwargs):
+    def __init__(self, model_name, api_key, system_instruction=None, thinking_params=None,
+                 image_detail=None, **kwargs):
         self.model_name = model_name.replace("OPENROUTER/", "").replace("GOOGLE/", "")
         self.api_key = api_key
         self.system_instruction = system_instruction
         self.thinking_params = thinking_params or {} # [NEW]
+        #: OpenRouter's answer to Google's mediaResolution, and a coarser one: the
+        #: OpenAI-compatible per-part `detail` hint, "low" or "high". None means send
+        #: nothing and let the route decide, which is what this adapter always did.
+        self.image_detail = image_detail
 
     async def generate_content_async(self, contents, generation_config=None, safety_settings=None, stream_state=None):
         messages = []
@@ -128,6 +170,15 @@ class OpenRouterModel:
                     messages.append({"role": role, "content": message_parts[0]["text"]})
                 else:
                     messages.append({"role": role, "content": message_parts})
+
+        if self.image_detail:
+            for message in messages:
+                body = message.get("content")
+                if not isinstance(body, list):
+                    continue
+                for part in body:
+                    if part.get("type") == "image_url":
+                        part["image_url"]["detail"] = self.image_detail
 
         temp = 1.0
         top_p = 1.0
@@ -363,6 +414,13 @@ class OllamaModel:
             "stream": True
         }
 
+        # The adapter has always *read* `message.thinking` off the stream and never
+        # asked for it, so every Ollama slot ran at whatever the model defaulted to.
+        think = _ollama_think_value(self.thinking_params)
+        sent_think = think is not None and self.model_name not in _OLLAMA_NO_THINK
+        if sent_think:
+            payload["think"] = think
+
         if advanced:
             if "frequency_penalty" in advanced: payload["options"]["frequency_penalty"] = advanced["frequency_penalty"]
             if "presence_penalty" in advanced: payload["options"]["presence_penalty"] = advanced["presence_penalty"]
@@ -372,6 +430,7 @@ class OllamaModel:
             "Connection": "keep-alive"
         }
 
+        needs_retry = False
         global _ollama_global_lock
         async with _ollama_global_lock:
             try:
@@ -379,6 +438,7 @@ class OllamaModel:
                 full_content = ""
                 reasoning_content = ""
                 finish_reason = "STOP"
+                retry_without_think = False
 
                 if blob_files:
                     segments, content_length = _plan_streamed_body(payload, blob_files)
@@ -393,7 +453,24 @@ class OllamaModel:
                 async with client.stream("POST", f"{self.api_url}/api/chat", timeout=120.0, **request_kwargs) as response:
                     if response.status_code != 200:
                         err_text = await response.aread()
-                        raise Exception(f"Ollama API Error {response.status_code}: {err_text.decode('utf-8', errors='ignore')}")
+                        detail = err_text.decode('utf-8', errors='ignore')
+                        # A model not built for thinking rejects the field outright.
+                        # There is no capability table to consult -- Ollama serves
+                        # whatever the user pulled -- so the refusal *is* the probe.
+                        # Recorded, then the whole call is redone without it; the set
+                        # membership makes this reachable at most once per model, so
+                        # there is no recursion to bound beyond that.
+                        if (sent_think and "think" in detail.lower()
+                                and len(_OLLAMA_NO_THINK) < _OLLAMA_NO_THINK_CAP):
+                            _OLLAMA_NO_THINK.add(self.model_name)
+                            print(f"Ollama model {self.model_name} refused a `think` "
+                                  f"field; retrying without it and remembering.")
+                            retry_without_think = True
+                        else:
+                            raise Exception(f"Ollama API Error {response.status_code}: {detail}")
+
+                    if retry_without_think:
+                        raise _OllamaRetryWithoutThink()
 
                     async for line in response.aiter_lines():
                         if not line.strip(): continue
@@ -452,6 +529,8 @@ class OllamaModel:
                 eval_count = chunk.get("eval_count", 0) if 'chunk' in locals() else 0
 
                 return OllamaResponseWrapper(msg_obj, (finish_reason or 'STOP').upper(), p_eval_count, eval_count)
+            except _OllamaRetryWithoutThink:
+                needs_retry = True
             except httpx.RequestError as e:
                 raise Exception(f"Ollama Network Error: {str(e)}")
             except asyncio.CancelledError:
@@ -465,6 +544,15 @@ class OllamaModel:
                         os.remove(path)
                     except OSError:
                         pass
+
+        # Outside the global lock, because the retry takes it again. Rebuilt from
+        # `contents` rather than resent, since the streamed-body planner consumes the
+        # payload it was given -- and a message list carrying blob tokens cannot be
+        # replayed without it.
+        if needs_retry:
+            return await self.generate_content_async(
+                contents, generation_config=generation_config,
+                safety_settings=safety_settings, stream_state=stream_state)
 
 
 # --- Google REST adapter -------------------------------------------------------
@@ -1007,7 +1095,7 @@ class GoogleRESTModel:
     .prompt_feedback and token counts.
     """
 
-    def __init__(self, api_key, model_name, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, image_params=None):
+    def __init__(self, api_key, model_name, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, image_params=None, media_resolution=None):
         self.api_key = api_key
         self.model_name = model_name.replace("OPENROUTER/", "").replace("GOOGLE/", "")
         self.system_instruction = system_instruction
@@ -1021,6 +1109,11 @@ class GoogleRESTModel:
         #: Already validated against IMAGE_MODEL_CAPS by the time it arrives -- this
         #: class only maps it onto the wire shape.
         self.image_params = image_params or {}
+        #: Google's `mediaResolution`: how many tokens an *input* image or PDF is worth.
+        #: Empty means send nothing, which is not the same as sending UNSPECIFIED --
+        #: the absent field lets the model apply its own default, and on Gemini 3 that
+        #: default is not the cheapest option.
+        self.media_resolution = media_resolution or ""
 
     # -- media ------------------------------------------------------------------
 
@@ -1262,10 +1355,11 @@ class GoogleRESTModel:
         return formatted
 
     def _build_generation_config(self, generation_config) -> dict:
-        model_lower = self.model_name.lower()
-
-        # Utility models do not accept a thinking config at all.
-        is_utility_model = any(suffix in model_lower for suffix in ["-image", "-tts", "-embedding"])
+        # Which fields this model takes at all. `google_thinking_caps` answers the
+        # thinking half; this flag is what gates mediaResolution, which an image, TTS
+        # or embedding model is handed no media to resolve and rejects.
+        is_utility_model = any(suffix in self.model_name.lower()
+                               for suffix in ["-image", "-tts", "-embedding"])
         include_thoughts = self.thinking_params.get("thinking_summary_visible") == "on"
 
         if isinstance(generation_config, dict):
@@ -1289,29 +1383,37 @@ class GoogleRESTModel:
         if top_k is not None:
             cfg["topK"] = top_k
 
-        if not is_utility_model:
-            if "gemini-3" in model_lower:
-                lvl = self.thinking_params.get("thinking_level", "high").lower()
-                if "pro" in model_lower:
-                    mapped_lvl = "LOW" if lvl in ["low", "minimal", "none"] else "HIGH"
-                else:
-                    mapped_lvl = {
-                        "xhigh": "HIGH", "high": "HIGH", "medium": "MEDIUM",
-                        "low": "LOW", "minimal": "MINIMAL", "none": "MINIMAL"
-                    }.get(lvl, "HIGH")
-                cfg["thinkingConfig"] = {"includeThoughts": include_thoughts, "thinkingLevel": mapped_lvl}
-            elif "gemini-2.5" in model_lower:
-                budget = int(self.thinking_params.get("thinking_budget", -1))
-                if "lite" not in model_lower:
-                    if "pro" in model_lower and 0 <= budget < 128:
-                        budget = 128
-                    cfg["thinkingConfig"] = {"includeThoughts": include_thoughts, "thinkingBudget": budget}
+        # Which of the two thinking fields this model takes -- or neither -- is
+        # `google_thinking_caps`' single answer rather than three families of substring
+        # test inlined here. The picker asks the same function so it can grey out a
+        # control the chosen model will not honour, which is the whole reason it moved.
+        caps = google_thinking_caps(self.model_name)
+        if caps["mode"] == "level":
+            lvl = self.thinking_params.get("thinking_level", "high").lower()
+            table = (THINKING_LEVELS_TO_GOOGLE_BINARY if caps["levels"] == "binary"
+                     else THINKING_LEVELS_TO_GOOGLE)
+            mapped_lvl = table.get(lvl, "HIGH")
+            cfg["thinkingConfig"] = {"includeThoughts": include_thoughts, "thinkingLevel": mapped_lvl}
+        elif caps["mode"] == "budget":
+            budget = int(self.thinking_params.get("thinking_budget", -1))
+            # -1 is dynamic and always legal; a floor only bites a real token count.
+            if 0 <= budget < caps["budget_floor"]:
+                budget = caps["budget_floor"]
+            cfg["thinkingConfig"] = {"includeThoughts": include_thoughts, "thinkingBudget": budget}
 
-        # Image output controls. Sits outside the is_utility_model branch above on
-        # purpose: an image model rejects the *text* thinking config, but the 3.x image
-        # models do take a thinkingLevel of their own, and only when one was explicitly
-        # chosen -- an absent key means "let the model use its own default", which is
-        # not the same as sending MINIMAL.
+        # How many tokens an input image or PDF is worth. Gated on the same utility
+        # check as the thinking config: a TTS or embedding model is handed no media to
+        # resolve and rejects the field. Sent at request level rather than per Part --
+        # Gemini 3 allows the per-Part override, but a profile setting has no
+        # per-attachment interface to hang off.
+        if self.media_resolution and not is_utility_model:
+            cfg["mediaResolution"] = self.media_resolution
+
+        # Image output controls. Reached by an image model on purpose: such a model
+        # rejects the *text* thinking config -- google_thinking_caps returns no mode for
+        # it -- but the 3.x image models do take a thinkingLevel of their own, and only
+        # when one was explicitly chosen. An absent key means "let the model use its own
+        # default", which is not the same as sending MINIMAL.
         if self.image_params:
             # Sampling for the image slot, from the profile's own image_* keys rather
             # than the text profile's. Every image path calls generate_content_async
@@ -1720,11 +1822,18 @@ class APIService:
 
         t_params = thinking_params or {}
         p_settings = profile_settings or {}
+        # One setting, two wire shapes: Google takes a request-level mediaResolution
+        # enum, OpenRouter the coarser per-part `detail` hint. Ollama has neither and
+        # is handed nothing. Resolved here rather than at each call site because this
+        # is the one constructor every provider goes through, and the profile config
+        # it needs is already in hand.
+        media_res = resolve_media_resolution(p_settings)
+        image_detail = resolve_openrouter_image_detail(p_settings)
 
         if is_openrouter:
             api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id, "openrouter") if guild_id else self.cog.storage_manager._get_api_key_for_user(user_id, "openrouter")
             if not api_key: raise ValueError(openrouter_key_error or "OpenRouter API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
-            model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params)
+            model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params, image_detail=image_detail)
             return _with_key_cooldown_tracking(self.cog, model, api_key)
         elif is_ollama:
             ollama_host = p_settings.get("ollama_host_url", OLLAMA_LOCAL_URL)
@@ -1732,7 +1841,7 @@ class APIService:
         else:
             api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id) if guild_id else self.cog.storage_manager._get_api_key_for_user(user_id)
             if not api_key: raise ValueError(google_key_error or "Google API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
-            model = GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instruction, safety_settings=safety_settings, thinking_params=t_params, tools=tools)
+            model = GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instruction, safety_settings=safety_settings, thinking_params=t_params, tools=tools, media_resolution=media_res)
             return _with_key_cooldown_tracking(self.cog, model, api_key)
 
     async def run_with_fallback(self, primary: str, fallback: Optional[str], attempt,
@@ -1863,11 +1972,7 @@ class APIService:
         
         # Extract parameters once for either provider
         p_sett_thinking = self.cog.profile_manager._get_profile_config(profile_owner_id_for_instructions, profile_name_for_instructions, is_borrowed) or {}
-        t_params = {
-            "thinking_summary_visible": p_sett_thinking.get("thinking_summary_visible", "off"),
-            "thinking_level": p_sett_thinking.get("thinking_level", "high"),
-            "thinking_budget": p_sett_thinking.get("thinking_budget", -1)
-        }
+        t_params = resolve_thinking_params(p_sett_thinking, "response")
 
         # [NEW] Native Tool Construction
         grounding_mode = p_sett_thinking.get("grounding_mode", "off")
@@ -1892,8 +1997,13 @@ class APIService:
         except Exception as e1:
             print(f"Err '{model_to_create}' key {model_cache_key}: {e1}. Fallback.")
             model_to_create = fallback_model
+            # Its own resolution, not the primary's: a cheap standby behind an
+            # expensive primary is the usual shape, and one shared effort made the
+            # standby either waste what it was chosen to save or under-think a request
+            # the primary was tuned for. Unset still inherits the primary.
+            t_params_fb = resolve_thinking_params(p_sett_thinking, "response", "fallback")
             try:
-                model_instance = self._instantiate_model(model_to_create, guild_id, profile_owner_id_for_instructions, current_instructions, dynamic_safety_settings, t_params, model_tools, p_sett_thinking)
+                model_instance = self._instantiate_model(model_to_create, guild_id, profile_owner_id_for_instructions, current_instructions, dynamic_safety_settings, t_params_fb, model_tools, p_sett_thinking)
                 model_init_error = False
             except Exception as e2:
                 return None, True, temperature, top_p, top_k, f"Model Initialization Error: Failed to load Primary ('{primary_model}') and Fallback ('{fallback_model}') models. Check your API key.", fallback_model
@@ -1932,11 +2042,7 @@ class APIService:
         safety_settings = _resolve_safety_settings(None, profile_data)
 
         try:
-            t_params = {
-                "thinking_summary_visible": profile_data.get("thinking_summary_visible", "off"),
-                "thinking_level": profile_data.get("thinking_level", "high"),
-                "thinking_budget": profile_data.get("thinking_budget", -1)
-            }
+            t_params = resolve_thinking_params(profile_data, "response")
             
             model_tools = None
             if not primary_model.upper().startswith(("OPENROUTER/", "OLLAMA/")) and "/" not in primary_model:

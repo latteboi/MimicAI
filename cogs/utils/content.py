@@ -116,7 +116,47 @@ HELP_CATEGORIES = {
             "• **Ollama** -- models running on your own machine, free to run. Set the host URL from the same menu.\n\n"
             "**Fallback** is not optional infrastructure you can ignore. If the primary request fails -- rate limit, timeout, safety block -- "
             "the payload is immediately re-sent to the fallback. Choose something cheap and fast; a profile with a good fallback stays alive "
-            "through an outage that would otherwise silence it."
+            "through an outage that would otherwise silence it.\n\n"
+            "**Thinking** opens from the same screen, on whichever slot the category dropdown is showing -- choosing a model and choosing "
+            "how hard it thinks are one decision. See *Thinking and Reasoning* below."
+        ),
+        "Thinking and Reasoning": (
+            "`/profile manage` -> **Params** -> Set Thinking Parameters, or the **Thinking** button inside Set Models. "
+            "Reasoning effort and token budget are set **per model slot and per model**, not once for the whole profile.\n\n"
+            "**Three dropdowns.** The first picks the slot; the second sets the **primary** model's effort; the third sets the "
+            "**fallback** model's. The token budget button holds both budgets in one modal. A fallback is usually the cheap standby "
+            "behind an expensive primary, so tying the two together made the standby waste exactly what it was chosen to save.\n\n"
+            "**The four slots:** Response (the profile's own replies), Grounding Summariser, Anti-Repetition Critic and LTM Summariser. "
+            "The three utility slots default to Low effort with a 512-token budget, which is what a summarising or screening pass needs; "
+            "Response defaults to High. Raise a utility slot only if its output is visibly poor -- it is billed on every round it runs.\n\n"
+            "**Unset means inherit.** An untouched slot follows the shipped default, so it tracks the bot when that default changes. "
+            "An untouched **fallback** follows its own primary -- set the Response primary to Max and the standby follows until you say "
+            "otherwise. Clear a budget by submitting the field empty; that is different from setting it to 0, which disables thinking "
+            "outright.\n\n"
+            "**Max** is the top step, above Extra High. It is OpenRouter's own name for roughly 95% of max_tokens spent on reasoning, "
+            "where it and Extra High are the same allocation. Nothing else has a step above High, so both collapse onto it elsewhere.\n\n"
+            "**What each model honours differs.** Gemini 3 takes effort and ignores the budget (3 Pro collapses the six steps to two); "
+            "Gemini 2.5 takes the budget and ignores effort, except Flash Lite which takes neither; image and speech models take neither. "
+            "OpenRouter takes both, budget winning where you set both. Ollama takes effort only, coarsely -- and a local model not built "
+            "for thinking refuses it outright, in which case the bot retries once without and remembers. The picker names which applies to "
+            "the slot's current model. A value a model ignores is still stored, so switching models back restores it.\n\n"
+            "**Thought summaries are Response-only.** A utility slot's reasoning reaches nobody -- the critic's verdict is parsed, the "
+            "summariser's output is filed -- so asking for it would only bill tokens. Where a provider supports thought signatures they "
+            "are preserved between turns, so a multi-turn chain of reasoning stays coherent.\n\n"
+            "Reasoning is usually the single largest contributor to latency. Lowering the Response slot's effort is the first thing to try "
+            "on a sluggish profile.\n\n"
+            "Image thinking is not here: it is an output control and lives with aspect ratio and resolution under Set Image Output."
+        ),
+        "Media Input Resolution": (
+            "`/profile manage` -> **Params** -> Set Media Input Resolution. How many tokens the model spends **reading an image or PDF "
+            "you send it**. This is the opposite direction from the image size under Set Image Output, which is about what an image model "
+            "draws.\n\n"
+            "On Gemini 3 the levels cost roughly 280 (Low), 560 (Medium), 1120 (High) and 2240 (Ultra High) tokens per image, and the "
+            "model default is High. In an image-heavy session that is charged per attachment, per participant, per round -- so Low is "
+            "often the single largest saving available without changing models.\n\n"
+            "**Provider support differs.** Google honours it exactly. OpenRouter has no equivalent request field, so the setting is mapped "
+            "onto the nearest of its two `detail` steps (Low and Medium both send `low`; High and Ultra High both send `high`). Ollama has "
+            "nothing at all -- local vision models resize to their own fixed resolution -- and ignores it."
         ),
         "Default Settings for New Profiles": (
             "`/settings` -> **Defaults** (DM only). Standing preferences applied to profiles you create or borrow "
@@ -153,15 +193,6 @@ HELP_CATEGORIES = {
             "• **Frequency Penalty (-2.0 - 2.0):** scales with how often a token has already appeared. Pushes vocabulary diversity.\n"
             "• **Presence Penalty (-2.0 - 2.0):** a flat penalty for any token used at all. Pushes topic change.\n"
             "• **Repetition Penalty:** a multiplicative penalty on recent tokens. The blunt instrument for breaking a stuttering loop."
-        ),
-        "Reasoning and Thinking Budget": (
-            "At `/profile manage` -> **Params** -> Set Thinking Parameters. Applies to models with an explicit reasoning phase.\n\n"
-            "• **Reasoning Level:** how much effort to spend deliberating (None through XHigh).\n"
-            "• **Token Budget:** a hard cap on internal thought, for models that accept one.\n"
-            "• **Thinking Summary:** whether the reasoning trace is delivered alongside the reply.\n"
-            "• **Signatures:** preserves the provider's thought-signature between turns where supported, so a multi-turn chain of reasoning "
-            "stays coherent.\n\n"
-            "Reasoning is usually the single largest contributor to latency. Lowering the level is the first thing to try on a sluggish profile."
         ),
         "Making a Profile Faster": (
             "In rough order of effect:\n\n"
@@ -684,7 +715,8 @@ DEFAULT_HELP_DOCS = {
         "Disputing a verdict: Only the bot operator can clear a classifier Adult verdict, from the mod view of the profile. An Adult rating you declared yourself is different -- you can always withdraw that. A clearance is tied to the exact content that was flagged, so it lapses if the persona is edited afterwards.\n"
         "NSFW Gating: A profile rated Adult 18+ is checked against the destination channel before the prompt is sent. For a borrowed profile the rating is taken from the original owner's profile, so a borrower cannot downgrade it.\n"
         "Channel Content Policy: In any channel that is NOT age-restricted, a content policy note is appended to the system instruction asking the model to keep the response suitable for a general audience. This applies to every provider, including OpenRouter and Ollama, and is editable by the bot operator via `/mod`.\n"
-        "Provider Filters: On Google models the harm thresholds follow the destination channel, not the profile: an age-restricted channel sends BLOCK_NONE, every other channel sends BLOCK_ONLY_HIGH. An operator-set Exempt profile sends BLOCK_NONE everywhere. Non-Google providers ignore these thresholds entirely, which is why the content policy note exists.\n"
+        "Provider Filters: On Google models the harm thresholds follow the destination channel, not the profile: an age-restricted channel sends OFF (the filter stood down), every other channel sends BLOCK_ONLY_HIGH. An operator-set Exempt profile sends OFF everywhere. Google also keeps non-configurable protections against core harms such as child safety, which no threshold reaches. Non-Google providers ignore these thresholds entirely, which is why the content policy note exists.\n"
+        "Same model, different filtering on OpenRouter: Harm thresholds are only sent on the Google branch. Routing the same Gemini model through OpenRouter sends no safety configuration at all, so it runs at whatever the upstream route defaults to. In an age-restricted channel that makes OpenRouter measurably MORE filtered than the same model called directly, because the Google branch explicitly stands the filter down and the OpenRouter branch cannot. OpenRouter also applies its own moderation on some routes, which no request parameter disables. If an adult session is refusing on OpenRouter, the Google branch is the fix.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I cannot share or publish my profile.' Fix: It is Unrated. Open `/profile manage` -> Home -> Content Safety and choose Submit for Rating.\n"
         "- Symptom: 'Global Chat says my profile cannot be used.' Fix: Global Chat needs a rating of General, or an operator Exemption; publishing to the Public Library is not required and is not a substitute. Unrated profiles must be submitted first; Adult profiles cannot be used there at all, because a Global Chat can be opened in any channel and none of them is guaranteed age-restricted.\n"
@@ -970,9 +1002,27 @@ DEFAULT_HELP_DOCS = {
         "Vision Processing: Models with native vision support can analyse image attachments. Replying to a message containing an image pulls that image into the profile's context.\n"
         "Audio & Video: Capable models can process direct audio and video files.\n"
         "Limitations & Errors: If you attach media to a profile powered by a text-only model -- which many OpenRouter and Ollama models are -- the API call fails and the bot reports 'Unsupported File Format (Model lacks Vision/Audio support)'.\n"
+        "Media Input Resolution: `/profile manage` -> Params -> Set Media Input Resolution controls how many tokens the model spends reading an image or PDF you send. On Gemini 3 that is roughly 280 (Low), 560 (Medium), 1120 (High, the model default) and 2240 (Ultra High) tokens per image, charged per attachment per participant per round. This is the opposite direction from the image size under Set Image Output, which is what an image model draws. Google honours it exactly; OpenRouter maps it onto the nearest of its two `detail` steps; Ollama has no equivalent and ignores it.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Unsupported File Format.' Fix: The profile's model cannot read that media type. Switch to a vision-capable model, or omit the attachment.\n"
-        "- Symptom: 'File Too Large' or 413. Fix: The attachment exceeds what the provider accepts. Send a smaller file."
+        "- Symptom: 'File Too Large' or 413. Fix: The attachment exceeds what the provider accepts. Send a smaller file.\n"
+        "- Symptom: 'Image-heavy sessions cost far more than I expected.' Fix: Set Media Input Resolution to Low. Each attachment is otherwise read at the model's default resolution, which on Gemini 3 is 1120 tokens per image, every round it stays in the short-term memory window."
+    ),
+    "models/thinking_and_reasoning.txt": (
+        "Concept: Reasoning effort and token budget are set per model slot AND per model within that slot. The four slots are Response (the profile's own replies), Grounding Summariser, Anti-Repetition Critic and LTM Summariser, and each holds a primary and a fallback with independent settings.\n"
+        "Where: `/profile manage` -> Params -> Set Thinking Parameters, or the Thinking button inside Set Models, which opens on whichever slot the category dropdown is showing. Three dropdowns: slot, primary effort, fallback effort. The budget button holds both budgets.\n"
+        "Defaults: The three utility slots default to Low effort with a 512-token budget. Response defaults to High. Unset means inherit -- a slot you never touch follows the shipped default, and a fallback you never touch follows its own primary rather than the shipped default.\n"
+        "Levels: Max, Extra High, High, Medium, Low, Minimal, None. Max is OpenRouter's own top step (~95% of max_tokens), where it and Extra High are the same allocation; nothing else has a step above High, so both collapse onto it on Google and onto Ollama's high.\n"
+        "Clearing a value: Submit the budget field empty to put the slot back on its default. That is not the same as 0, which disables thinking outright.\n"
+        "Provider and model differences: Gemini 3 takes effort and ignores the budget, and 3 Pro collapses the six steps to two. Gemini 2.5 takes the budget and ignores effort, except Flash Lite which takes neither. Image and speech models take neither. OpenRouter takes both, budget winning where both are set. Ollama takes effort only and coarsely; a local model not built for thinking refuses the field, and the bot retries once without it and remembers.\n"
+        "Thought summaries: Response-only. A utility slot's reasoning reaches no user, so requesting it would only bill tokens.\n"
+        "Image thinking: Not here. It is an output control alongside aspect ratio and resolution under Set Image Output.\n"
+        "Troubleshooting / Symptoms:\n"
+        "- Symptom: 'Long-term memory creation costs far more than it should.' Fix: The LTM Summariser slot used to inherit a high reasoning default. It now defaults to Low with a 512-token budget; check it has not been raised by hand at `/profile manage` -> Params -> Set Thinking Parameters -> Slot: LTM Summariser.\n"
+        "- Symptom: 'I set a reasoning effort and nothing changed.' Fix: The slot's model probably takes the other control. Gemini 2.5 reads the budget and ignores effort; Gemini 3 reads effort and ignores the budget. The picker names which one applies to the model that slot is on.\n"
+        "- Symptom: 'My replies are slow.' Fix: Lower the Response slot's primary effort. Reasoning is usually the single largest contributor to latency.\n"
+        "- Symptom: 'My fallback model costs as much as the primary.' Fix: The fallback inherits the primary's effort until you set its own. Open Set Thinking Parameters and set the third dropdown -- the fallback effort -- to Low.\n"
+        "- Symptom: 'Ollama returns an error mentioning thinking.' Fix: That model is not built for it. The bot retries once without the field and does not send it to that model again."
     ),
     "features/help_mode.txt": (
         "Commands: `/help`, `/help ask:<question>`, `/guide`\n"
@@ -1026,3 +1076,139 @@ WELCOME_MESSAGE = (
 #: Channel names worth trying when a server has no system channel set. Matched as a
 #: substring against the lowercased name, in this order.
 WELCOME_CHANNEL_HINTS = ("welcome", "general", "lobby", "chat", "main", "bot")
+
+
+#: The Terms of Service and Privacy Policy, verbatim from https://mimic-ai.org/.
+#: `/terms` used to be a one-line link, which is the one answer a user cannot read
+#: when they are asking whether to trust the bot with an API key -- and a self-hosted
+#: instance has no reason to send its users to someone else's website to find out what
+#: it does with their data. The shape is `DropdownContentView`'s: category -> page ->
+#: body, so the same browser that backs `/guide` renders it with no new view class.
+#:
+#: Keep this in step with the site. It is the same document, not a summary of one:
+#: shortening a clause here would leave the bot and the website disagreeing about what
+#: the operator has undertaken.
+LEGAL_EFFECTIVE_DATE = "25 May, 2026 (UTC)"
+
+LEGAL_DOCUMENTS = {
+    "Terms of Service": {
+        "1. Scope of Agreement": (
+            "These terms govern the use of the MimicAI Software (the \"Software\") and the "
+            "Official MimicAI Discord Instance (the \"Service\"). By inviting the bot, or "
+            "interacting with the software, you agree to be bound by these Terms. You must "
+            "meet the minimum age of digital consent in your country as required by Discord's "
+            "Terms of Service."
+        ),
+        "2. Software License (Self-Hosted)": (
+            "The Software is provided under the Prosperity Public License 3.0.0. You are "
+            "granted the right to use, modify, and distribute the Software for non-commercial "
+            "purposes. Commercial use requires a separate agreement from the contributor."
+        ),
+        "3. User Responsibility & Content": (
+            "You are solely responsible for the content generated by your profiles. MimicAI is "
+            "a tool for creative expression; the user (or the administrator of a self-hosted "
+            "instance) bears all liability for generated output. While the official Service "
+            "applies safety checks to the Public Library, private profiles may be governed by "
+            "the safety policies of the underlying API providers (Google or OpenRouter)."
+        ),
+        "4. API Costs & Liability": (
+            "By providing a personal API key, you acknowledge that you are solely responsible "
+            "for all financial charges incurred on that key. MimicAI and its developers are "
+            "not responsible for your API spend, including costs resulting from bugs, loops, "
+            "high-volume usage, or expensive model selection. This applies universally to both "
+            "the official Service and self-hosted instances."
+        ),
+        "5. Operational Token Overhead": (
+            "To provide advanced features such as Persona Injection, Long-Term Memory "
+            "retrieval, and Training Example matching, MimicAI automatically appends context "
+            "and metadata to every request sent to the AI. This increases the input token "
+            "count of your requests. By using the service, you agree to this overhead."
+        ),
+        "6. Security & Data Architecture": (
+            "**Official Instance:** Utilises Google Cloud Secret Manager to securely store "
+            "master encryption keys.\n"
+            "**Self-Hosted:** Utilises a local encryption key generated during setup.\n\n"
+            "Never enter sensitive personal data, real-world passwords, or financial secrets "
+            "into the bot. You use the service at your own risk."
+        ),
+        "7. Public Library Conduct": (
+            "Profiles published to the global \"Public Library\" must pass an automated AI "
+            "safety check. Content flagged as explicitly violating Discord's Community "
+            "Guidelines will be rejected.\n\n"
+            "**Official Instance:** We reserve the right to remove any public content at our "
+            "discretion."
+        ),
+        "8. Compatibility & Modifications": (
+            "While MimicAI allows for Software modification under the Prosperity Public "
+            "License, data portability and the \"Import/Export\" features are only guaranteed "
+            "between standard, un-modified instances. Significant alterations to the "
+            "Software’s underlying data structures, encryption logic, or shard formatting "
+            "may result in permanent incompatibility with the Official Instance or other "
+            "standard self-hosted versions. The developers bear no responsibility for data "
+            "loss or the inability to migrate profiles and memories resulting from such "
+            "user-end modifications."
+        ),
+        "9. Child Bot Architecture Restrictions": (
+            "To strictly comply with Discord's Developer Terms of Service and "
+            "credential-sharing policies, the creation, token submission, and management of "
+            "\"Child Bots\" are restricted exclusively to the administrator/owner of the "
+            "instance. End-users are strictly prohibited from submitting Discord Developer "
+            "Tokens to the Software. Users may still interact with and borrow profiles linked "
+            "to owner-created Child Bots via the unified Chat Sessions architecture."
+        ),
+        "10. Termination": (
+            "We reserve the right to terminate or suspend your access to the Official Instance "
+            "(including blacklisting your Discord ID) without notice for violations of these "
+            "terms, attempting to exploit the service, or actions that threaten platform "
+            "stability."
+        ),
+    },
+    "Privacy Policy": {
+        "1. Data Controllership": (
+            "**Official Instance:** MimicAI developers act as the data controller for "
+            "information stored on the official infrastructure.\n"
+            "**Self-Hosted:** The individual or entity hosting the instance is the data "
+            "controller. MimicAI developers have zero access to data stored on self-hosted "
+            "instances."
+        ),
+        "2. Data Storage Architecture": (
+            "MimicAI utilises a sharded and encrypted data architecture. Your data is "
+            "physically isolated into separate files. In the Official Instance, Master "
+            "Encryption Keys are managed via Google Cloud Secret Manager. In Self-Hosted "
+            "instances, keys are stored locally in environment variables. Raw data remains "
+            "unreadable without access to these specific keys."
+        ),
+        "3. Data We Collect & Store": (
+            "The Software stores the following categories:\n\n"
+            "• **Profile Identity:** Personas, traits, and AI instructions.\n"
+            "• **Memory & Training:** AI-generated LTM and Training Examples.\n"
+            "• **Conversation Context:** Unified Chat Session logs, which are retained "
+            "temporarily to maintain conversation history.\n"
+            "• **Profile Customisation:** Custom display names and avatar URLs.\n"
+            "• **Technical Credentials:** API keys (Google/OpenRouter). Discord Bot Tokens "
+            "are strictly collected and stored only for the instance owner."
+        ),
+        "4. Third-Party Data Processing": (
+            "**AI Providers:** Your inputs are sent to Google (Gemini) or OpenRouter in "
+            "accordance with their data processing terms."
+        ),
+        "5. Data Retention & Control": (
+            "You retain full ownership and control over your data. You can permanently delete "
+            "profiles, memories, or training examples at any time. To minimise our data "
+            "footprint, inactive Chat Session logs are automatically purged from our servers "
+            "after 30 days of inactivity. Users may also export and import data shards between "
+            "instances, allowing full migration from the managed Service to self-hosted "
+            "hardware."
+        ),
+        "6. No Sale of Data": (
+            "We do not sell, trade, or rent your personal identification information or "
+            "conversation logs to others. Your data is used strictly to provide the chatbot "
+            "service and maintain your personalised experience."
+        ),
+        "7. Changes to Policy": (
+            "We may update this privacy policy to reflect changes in our practices or Software "
+            "offerings. Continued use of the Software or Service after such changes "
+            "constitutes acceptance of the new policy."
+        ),
+    },
+}
