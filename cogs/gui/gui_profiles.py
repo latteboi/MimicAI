@@ -3606,6 +3606,117 @@ PARTITION_NAMES = [
     "Asia, Middle East & Australasia"
 ]
 
+TIMEZONES_PER_PAGE = 20
+TIMEZONE_TOTAL_PAGES = (len(EXTENSIVE_TIMEZONES) - 1) // TIMEZONES_PER_PAGE + 1
+
+
+def build_timezone_options(page: int, current: Optional[str]) -> List[discord.SelectOption]:
+    """The select options for one page of the timezone picker.
+
+    Manual entry, then a jump to each region that is not the current page, then that
+    page's twenty zones. Three pickers draw this list -- a single profile, the bulk
+    wizard step and About Me -- and they had already grown three copies of it.
+    """
+    start = page * TIMEZONES_PER_PAGE
+    options = [discord.SelectOption(
+        label="⚙️ Custom / Manual Timezone ID...", value="custom",
+        description="Enter any custom IANA timezone ID manually.", emoji="✏️")]
+
+    for page_idx, p_name in enumerate(PARTITION_NAMES):
+        if page_idx != page:
+            options.append(discord.SelectOption(
+                label=f"🌍 Jump: {p_name}", value=f"jump_{page_idx}",
+                description=f"Switch to page {page_idx + 1} ({p_name})", emoji="📑"))
+
+    for label, tz_val, desc in EXTENSIVE_TIMEZONES[start:start + TIMEZONES_PER_PAGE]:
+        options.append(discord.SelectOption(
+            label=label[:100], value=tz_val, description=desc[:100],
+            default=(tz_val == current)))
+    return options
+
+
+class UserTimezoneView(ui.View):
+    """Timezone picker for the user themselves, not for a character.
+
+    Writes `index.json["about"]["timezone"]` and sets nothing else: the profile-side
+    picker also force-sets `time_tracking_enabled`, because a zone on a profile that
+    never reads the clock does nothing. A user's zone has no such switch -- it is
+    always used, to timestamp their own messages in history.
+    """
+
+    def __init__(self, cog: 'MimicCog', parent_about_view):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.parent_about_view = parent_about_view
+        self.user_id = parent_about_view.user_id
+        self.current_page = 0
+        self._build_view()
+
+    def _current_tz(self) -> str:
+        return self.cog.profile_manager.user_timezone(self.user_id)
+
+    def _get_header_content(self) -> str:
+        current_tz = self._current_tz()
+        try:
+            tz_obj, _ = _resolve_zoneinfo(current_tz)
+            now_str = datetime.datetime.now(tz_obj).strftime("%I:%M %p (%Z)")
+        except Exception:
+            now_str = "Unknown"
+        return (f"**Your Timezone**\n**Active Setting:** `{current_tz}` "
+                f"(Local Time: `{now_str}`)\n"
+                f"Select a timezone below or jump between regional partitions:")
+
+    def _build_view(self):
+        self.clear_items()
+        select = ui.Select(
+            placeholder=f"Timezones: {PARTITION_NAMES[self.current_page]} "
+                        f"({self.current_page + 1}/{TIMEZONE_TOTAL_PAGES})...",
+            options=build_timezone_options(self.current_page, self._current_tz()), row=0)
+        select.callback = self.select_callback
+        self.add_item(select)
+
+        async def prev_cb(i: discord.Interaction):
+            self.current_page = max(0, self.current_page - 1)
+            self._build_view()
+            await i.response.edit_message(content=self._get_header_content(), view=self)
+
+        async def next_cb(i: discord.Interaction):
+            self.current_page = min(TIMEZONE_TOTAL_PAGES - 1, self.current_page + 1)
+            self._build_view()
+            await i.response.edit_message(content=self._get_header_content(), view=self)
+
+        build_pagination_controls(self, self.current_page, TIMEZONE_TOTAL_PAGES, 1,
+                                  prev_cb, next_cb)
+
+    async def apply(self, interaction: discord.Interaction, canonical_tz: str):
+        """Persist the choice, refresh the About Me panel behind this pop-up, close it."""
+        about = self.cog.profile_manager.get_user_about(self.user_id)
+        about["timezone"] = canonical_tz
+        self.cog.profile_manager.save_user_about(self.user_id, about)
+
+        self.parent_about_view._build_view()
+        await self.parent_about_view.update_display()
+        await interaction.response.edit_message(
+            content=f"✅ Your timezone is now **{canonical_tz}**.", view=None)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        choice = interaction.data['values'][0]
+
+        if choice == "custom":
+            await interaction.response.send_modal(CustomTimezoneModal(self))
+            return
+
+        if choice.startswith("jump_"):
+            self.current_page = int(choice.split("_")[1])
+            self._build_view()
+            await interaction.response.edit_message(
+                content=self._get_header_content(), view=self)
+            return
+
+        _, canonical_tz = _resolve_zoneinfo(choice)
+        await self.apply(interaction, canonical_tz)
+
+
 class SingleProfileTimezoneView(ui.View):
     def __init__(self, cog: 'MimicCog', parent_manage_view: ProfileManageView, profile_config: Dict[str, Any], is_borrowed: bool):
         super().__init__(timeout=300)
@@ -3628,33 +3739,8 @@ class SingleProfileTimezoneView(ui.View):
 
     def _build_view(self):
         self.clear_items()
-        per_page = 20
-        start = self.current_page * per_page
-        page_tzs = EXTENSIVE_TIMEZONES[start:start + per_page]
-
-        options = [
-            discord.SelectOption(label="⚙️ Custom / Manual Timezone ID...", value="custom", description="Enter any custom IANA timezone ID manually.", emoji="✏️")
-        ]
-
-        # Add 3 Partition Jump options (excluding current page)
-        for page_idx, p_name in enumerate(PARTITION_NAMES):
-            if page_idx != self.current_page:
-                options.append(discord.SelectOption(
-                    label=f"🌍 Jump: {p_name}",
-                    value=f"jump_{page_idx}",
-                    description=f"Switch to page {page_idx + 1} ({p_name})",
-                    emoji="📑"
-                ))
-
-        # Add 20 Timezone options for the active page
-        current_setting = self.profile_config.get("timezone", "UTC")
-        for label, tz_val, desc in page_tzs:
-            options.append(discord.SelectOption(
-                label=label[:100],
-                value=tz_val,
-                description=desc[:100],
-                default=(tz_val == current_setting)
-            ))
+        options = build_timezone_options(
+            self.current_page, self.profile_config.get("timezone", "UTC"))
 
         select = ui.Select(placeholder=f"Timezones: {PARTITION_NAMES[self.current_page]} ({self.current_page + 1}/{self.total_pages})...", options=options, row=0)
         select.callback = self.select_callback
@@ -3708,13 +3794,17 @@ class SingleProfileTimezoneView(ui.View):
 class CustomTimezoneModal(ui.Modal, title="Enter Custom Timezone"):
     tz_input = ui.TextInput(label="Timezone ID / Acronym", placeholder="e.g. Australia/Sydney, AEST, America/New_York", required=True)
 
-    def __init__(self, parent_view: Union[SingleProfileTimezoneView, 'BulkTimezoneView']):
+    def __init__(self, parent_view: Union[SingleProfileTimezoneView, UserTimezoneView, 'BulkTimezoneView']):
         super().__init__()
         self.parent_view = parent_view
 
     async def on_submit(self, interaction: discord.Interaction):
         raw_val = self.tz_input.value.strip()
         tz_obj, canonical_tz = _resolve_zoneinfo(raw_val)
+
+        if isinstance(self.parent_view, UserTimezoneView):
+            await self.parent_view.apply(interaction, canonical_tz)
+            return
 
         if isinstance(self.parent_view, SingleProfileTimezoneView):
             self.parent_view.profile_config["timezone"] = canonical_tz
@@ -3769,21 +3859,7 @@ class BulkTimezoneView(_BulkSubView):
 
     def _build_view(self):
         self.clear_items()
-        per_page = 20
-        start = self.tz_page * per_page
-
-        options = [discord.SelectOption(
-            label="⚙️ Custom / Manual Timezone ID...", value="custom",
-            description="Enter any custom IANA timezone ID manually.", emoji="✏️")]
-        for page_idx, p_name in enumerate(PARTITION_NAMES):
-            if page_idx != self.tz_page:
-                options.append(discord.SelectOption(
-                    label=f"🌍 Jump: {p_name}", value=f"jump_{page_idx}",
-                    description=f"Switch to page {page_idx + 1} ({p_name})", emoji="📑"))
-        for label, tz_val, desc in EXTENSIVE_TIMEZONES[start:start + per_page]:
-            options.append(discord.SelectOption(
-                label=label[:100], value=tz_val, description=desc[:100],
-                default=(tz_val == self.selected_tz)))
+        options = build_timezone_options(self.tz_page, self.selected_tz)
 
         select = ui.Select(placeholder=f"Choose a timezone ({PARTITION_NAMES[self.tz_page]})...",
                            options=options, row=0)

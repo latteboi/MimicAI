@@ -827,8 +827,31 @@ class SessionManager:
 
             for server_id_str, sessions_for_server in current_server_sessions.items():
                 server_index = self.cog.server_manager._get_server_index(server_id_str)
-                server_index["active_sessions"] = sessions_for_server
-                self.cog.server_manager._save_server_index(server_id_str, server_index)
+
+                # Only write the servers whose blueprints actually moved.
+                #
+                # This function rebuilds every server's session map from
+                # multi_profile_channels, and it used to write every one of them --
+                # so a single dropdown press in `/session config` cost one
+                # serialise-and-replace per guild the bot is in, from any of the ~29
+                # call sites. Almost all of those writes are byte-identical to what
+                # is already there.
+                #
+                # The comparison ignores an empty legacy `freewill` key, which
+                # _get_server_index adds on load and this function has never written
+                # back: without that, every server would differ on every call and
+                # nothing would ever be skipped. A freewill map with anything in it
+                # still counts as a difference, so it is written away exactly as
+                # before rather than being preserved by the skip.
+                existing = server_index.get("active_sessions")
+                comparable = None
+                if isinstance(existing, dict):
+                    comparable = {k: v for k, v in existing.items()
+                                  if v or k in sessions_for_server}
+
+                if comparable != sessions_for_server:
+                    server_index["active_sessions"] = sessions_for_server
+                    self.cog.server_manager._save_server_index(server_id_str, server_index)
 
                 # Housekeeping: Delete legacy file if it exists
                 old_file = os.path.join(servers_dir, server_id_str, "sessions.json.gz")

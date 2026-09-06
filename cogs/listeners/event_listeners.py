@@ -1041,11 +1041,9 @@ class EventListeners:
                 return
             
             author_id = msg.author.id
-            u_index = self.profile_manager._get_user_index(author_id)
-            u_prof = self.session_manager._get_active_user_profile_name_for_channel(author_id, channel_id)
-            u_is_b = u_prof in u_index.get("borrowed", [])
-            u_sett = self.profile_manager._get_profile_config(author_id, u_prof, u_is_b) or {}
-            user_tz = u_sett.get("timezone", "UTC")
+            # Must match what triggers.py stamped when the turn was first written,
+            # or an edit re-renders the line in a different timezone from the original.
+            user_tz = self.profile_manager.user_timezone(author_id)
             
             # Format the new content
             new_content = msg.clean_content

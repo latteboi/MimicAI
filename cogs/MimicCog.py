@@ -173,6 +173,13 @@ class MimicCog(EventListeners, commands.Cog):
         self.profile_manager._load_profile_shares()
         self.public_profiles: Dict[str, Dict[str, Any]] = {}
         self.profile_manager._load_public_profiles()
+        # Reverse index: "<owner_id>:<pid>" -> {borrower_id: [local names]}, with the
+        # borrower-side inverse derived in memory. Bounded by the number of borrows
+        # that exist, which LIMIT_BORROWED already caps per user. See the block above
+        # ProfileManager._borrow_pid_key for why it is not a scan.
+        self.borrow_index: Dict[str, Dict[str, List[str]]] = {}
+        self.borrow_index_inverse: Dict[str, Dict[str, str]] = {}
+        self.profile_manager._load_borrow_index()
         # Sweep tombstones once at boot. Deletion normally cascades, so a survivor
         # here came from a crash mid-delete or an older build; left alone it renders
         # in the hub as an unborrowable "Unknown" entry forever.

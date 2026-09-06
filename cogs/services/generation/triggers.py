@@ -183,12 +183,13 @@ class TriggerIntakeMixin:
                         "turn_data_index": len(new_round_turn_data)
                     })
 
-                # [NEW] Localized User Timestamp Logic
-                u_index_author = self.cog.profile_manager._get_user_index(triggering_user_id)
-                u_prof_author = self.cog.session_manager._get_active_user_profile_name_for_channel(triggering_user_id, channel_id)
-                u_is_b_author = u_prof_author in u_index_author.get("borrowed", [])
-                u_sett_author = self.cog.profile_manager._get_profile_config(triggering_user_id, u_prof_author, u_is_b_author) or {}
-                author_tz = u_sett_author.get("timezone", "UTC")
+                # The user's own clock, from `/settings` -> About Me. This used to
+                # resolve the user's active profile in the channel and read the
+                # timezone off that character's config -- so your timestamps followed
+                # whoever you last activated here, and a user with no active profile
+                # silently got UTC. _get_profile_config caches nothing, so it also
+                # cost a decrypt per message to read one string.
+                author_tz = self.cog.profile_manager.user_timezone(triggering_user_id)
                 user_hash = _get_user_hash(triggering_user_id)
 
                 created_at = datetime.datetime.now(datetime.timezone.utc) if is_child_mention else trigger_obj.created_at

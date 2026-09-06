@@ -1,6 +1,6 @@
 import os
 import traceback
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, Optional, Set, Union
 import discord
 
 from .storage_manager import IOManager
@@ -107,7 +107,20 @@ class ServerManager:
                             except ValueError:
                                 print(f"Warning: Found non-integer channel ID '{ch_id_str}' in webhook file for server {server_id_str}")
 
-    def _save_channel_webhooks(self):
+    def _save_channel_webhooks(self, only_servers: Optional[Set[int]] = None):
+        """Persist the webhook URL map, one file per server.
+
+        `only_servers` scopes the write to the servers that actually changed.
+        Acquiring a webhook touches exactly one channel in one server, but this used
+        to rewrite every server's file -- each one a separate zstd compress and
+        Fernet encrypt -- so the first message in a fresh channel cost one of those
+        per guild the bot is in. Pass None only when the change really is global
+        (the daily cleanup, which drops orphans across every server at once).
+
+        A server with no webhooks left is still not written, scoped or not: that is
+        what leaves its stale file to be re-validated and overwritten on the next
+        acquisition, rather than deleting an entry that a transient failure produced.
+        """
         try:
             # Group webhooks by server_id
             server_grouped_webhooks = {}
@@ -115,6 +128,8 @@ class ServerManager:
                 channel = self.cog.bot.get_channel(channel_id)
                 if channel and hasattr(channel, 'guild'):
                     server_id = channel.guild.id
+                    if only_servers is not None and server_id not in only_servers:
+                        continue
                     if server_id not in server_grouped_webhooks:
                         server_grouped_webhooks[server_id] = {}
                     # Store channel_id as string for JSON compatibility
@@ -244,7 +259,8 @@ class ServerManager:
             
             self.cog.channel_webhooks[parent_channel.id] = {'url': bot_webhook.url}
             self._webhook_from_cache[parent_channel.id] = bot_webhook
-            self._save_channel_webhooks()
+            # One channel changed, so only its server's file is rewritten.
+            self._save_channel_webhooks(only_servers={parent_channel.guild.id})
             return bot_webhook
         except discord.Forbidden:
             # The usual cause of a whole server delivering under the bot's own name.

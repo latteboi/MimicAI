@@ -155,8 +155,26 @@ servers/<guild_id>/
   webhooks.json.gz
   sessions/<channel_id>/multi/session_log.json.gz
 public_profiles/                      the shared library index
+borrows.json                          plaintext reverse index: source profile -> borrowers
 mod/                                  blacklist, global prompt overrides, docs
 ```
+
+`index.json` also carries `key_file_stamp`, the `[mtime_ns, size]` of `keys.json.gz` that
+`has_personal_key` was computed from, so the boot-and-hourly consistency check verifies the
+flag with a stat rather than a decrypt.
+
+### The store answers lookups, not queries
+
+Every read is "give me this path": `user_id -> pid -> shard`. There are no joins and no
+ad-hoc queries, which is why a filesystem is the right shape for it and why SQL would buy
+a query planner nothing uses while costing per-shard encryption, `rmtree` deletion and the
+blast radius of a single corrupt file.
+
+The exception is the question a key-value store cannot answer: *who points at this?*
+`is_profile_distributed` and `_cascade_delete_borrowed_profiles` both ask it, and both used
+to walk every user directory and decrypt every borrowed profile config. `borrows.json` is
+the index built for that one question -- see CLAUDE.md for the invariants that keep it
+honest. A new question of that shape gets its own derived index; it does not get a scan.
 
 ### Every `.json.gz` is Fernet-encrypted zstd
 

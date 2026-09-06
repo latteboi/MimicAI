@@ -786,7 +786,9 @@ class HubShareManagerView(HubBaseView):
 
         code = f"SHR-{uuid.uuid4().hex[:8].upper()}"
         pids =[self.cog.profile_manager._get_pid_from_name_any(self.user_id, p) for p in shareable]
-        self.cog.share_codes[code] = {"owner_id": str(self.user_id), "pids": pids, "profile_names": shareable, "expires_at": time.time() + 300}
+        self.cog.profile_manager.register_share_code(
+            code, {"owner_id": str(self.user_id), "pids": pids,
+                   "profile_names": shareable, "expires_at": time.time() + 300})
 
         msg = f"Share Code: `{code}`\nExpires in 5 minutes.\nIncludes: {', '.join(shareable)}"
         if refused:

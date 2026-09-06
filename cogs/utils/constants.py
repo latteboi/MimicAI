@@ -509,6 +509,10 @@ SERVERS_DIR = os.path.join(DATA_DIR, "servers")
 DOCS_DIR = os.path.join(MOD_DATA_DIR, "docs")
 
 PUBLIC_PROFILES_DIR = os.path.join(DATA_DIR, "public_profiles")
+# Reverse index: source profile -> the users currently borrowing it. Plaintext,
+# for the same reason index.json is -- it holds ids and profile names, nothing a
+# borrow's own config does not already expose to its borrower.
+BORROW_INDEX_FILE = os.path.join(DATA_DIR, "borrows.json")
 CHILD_BOTS_DIR = os.path.join(DATA_DIR, "child_bots")
 COG_LOCK_FILE_PATH = os.path.join(os.path.dirname(__file__), "gemini_agent.lock")  
 USERS_DIR = os.path.join(DATA_DIR, "users")

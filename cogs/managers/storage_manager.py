@@ -251,6 +251,20 @@ class StorageManager:
         path = os.path.join(self.cog.USERS_DIR, str(user_id), "keys.json.gz")
         IOManager.write_json_gzip(data, path, self.fernet, encrypted=True)
 
+        # Every key add, reassignment and deletion lands here, so this is where the
+        # user index's has_personal_key flag is kept true -- and, with it, the stat
+        # stamp _index_is_consistent verifies the flag against. Without the stamp
+        # being refreshed alongside the file, the hourly self-repair would see a
+        # changed key file, assume the index was stale and rebuild it from a full
+        # directory scan. Deleting a key never updated the flag at all before this.
+        try:
+            pm = self.cog.profile_manager
+            index = pm._get_user_index(user_id)
+            pm._refresh_key_flag(str(user_id), index)
+            pm._save_user_index(user_id, index)
+        except Exception as e:
+            print(f"Could not refresh key flag for user {user_id}: {e}")
+
     def _get_api_key_for_guild(self, guild_id: int, provider: str = "gemini") -> Optional[str]:
         if not self.fernet: return None
         guild_id_str = str(guild_id)
@@ -446,6 +460,9 @@ class StorageManager:
                     self.cog.user_appearances.pop(user_id_str, None)
                     self.cog.profile_shares.pop(user_id_str, None)
                     self.cog.user_indices.pop(user_id_str, None)
+                    # Their index.json went with the tree, so the reconcile hooked
+                    # into _save_user_index can never fire for them again.
+                    self.cog.profile_manager._borrow_index_drop_user(int(user_id_str))
                     cleaned_users_count += 1
         
         if cleaned_users_count > 0:

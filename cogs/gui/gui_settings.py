@@ -3,9 +3,11 @@ from ..utils.constants import *
 import discord
 from discord import ui
 import asyncio
+import datetime
 from typing import TYPE_CHECKING, List, Optional
 
 from .base_components import TimeoutCleanupMixin, build_tab_nav_bar
+from ..utils.helpers import _get_user_hash, _resolve_zoneinfo
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -77,11 +79,12 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
         self.cog.storage_manager._save_user_keys_data(interaction.user.id, user_data)
         
         self.cog.decrypted_key_cache[(interaction.user.id, self.slot_id)] = raw_key
-        
-        idx = self.cog.profile_manager._get_user_index(interaction.user.id)
-        idx["has_personal_key"] = True
-        self.cog.profile_manager._save_user_index(interaction.user.id, idx)
-        
+
+        # has_personal_key is set by _save_user_keys_data above, together with the
+        # stat stamp _index_is_consistent checks it against. Setting the flag here
+        # without the stamp is what this used to do, and it bought a full index
+        # repair on the next hourly pass.
+
         msg = f"✅ {self.provider.title()} key saved to slot `{self.slot_id}` ({tier.title()} Tier)."
 
         if self.view:
@@ -150,10 +153,16 @@ class SettingsBaseView(TimeoutCleanupMixin, ui.View):
     def _add_nav_buttons(self):
         build_tab_nav_bar(self, self.current_tab, [
             ("Home", "home", self.nav_home),
+            ("About Me", "about", self.nav_about),
             ("API Keys", "api", self.nav_api),
             ("Defaults", "defaults", self.nav_defaults),
             ("Child Bots", "bots", self.nav_bots),
         ])
+
+    async def nav_about(self, i: discord.Interaction):
+        await i.response.defer()
+        view = SettingsAboutView(self.cog, self.original_interaction)
+        await view.update_display()
 
     async def nav_home(self, i: discord.Interaction):
         await i.response.defer()
@@ -215,6 +224,92 @@ class SettingsHomeView(SettingsBaseView):
         embed.add_field(name="Server Contributions", value=f"Active Assignments: `{primary_count} servers`", inline=False)
         
         await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
+
+class SettingsAboutView(SettingsBaseView):
+    """The user's own settings, as opposed to any character's.
+
+    Everything here is stored sparsely in `index.json["about"]` -- plaintext, already
+    cached in `cog.user_indices`, and read on the turn path. See the block above
+    ProfileManager.get_user_about for why it is not an encrypted shard and not a key
+    inside "defaults".
+    """
+
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):
+        super().__init__(cog, interaction, "about")
+        self._build_view()
+
+    def _build_view(self):
+        self.clear_items()
+        tz_btn = ui.Button(label="Set Timezone", style=discord.ButtonStyle.primary,
+                           emoji="\N{GLOBE WITH MERIDIANS}", row=0)
+        tz_btn.callback = self._act_timezone
+        self.add_item(tz_btn)
+
+        if self.cog.profile_manager.get_user_about(self.user_id).get("timezone"):
+            clear_btn = ui.Button(label="Clear Timezone", style=discord.ButtonStyle.secondary, row=0)
+            clear_btn.callback = self._act_clear_timezone
+            self.add_item(clear_btn)
+
+        self._add_nav_buttons()
+
+    async def update_display(self):
+        about = self.cog.profile_manager.get_user_about(self.user_id)
+        stored_tz = about.get("timezone")
+
+        # The resolved value is what actually gets used, so it is what is shown --
+        # "unset" is reported as the fallback it resolves to, not as a blank.
+        tz_name = stored_tz or "UTC"
+        try:
+            tz_obj, _ = _resolve_zoneinfo(tz_name)
+            now_str = datetime.datetime.now(tz_obj).strftime("%I:%M %p (%Z)")
+        except Exception:
+            now_str = "Unknown"
+
+        tz_value = (f"`{tz_name}` -- local time `{now_str}`" if stored_tz
+                    else f"`Not set` -- using `UTC`, local time `{now_str}`")
+
+        embed = discord.Embed(
+            title="About Me",
+            description=("Your own settings, separate from any character's. These follow "
+                         "you into every server."),
+            color=discord.Color.dark_teal())
+        embed.set_thumbnail(url=THINKING_THUMBNAIL_URL)
+
+        embed.add_field(
+            name="\N{GLOBE WITH MERIDIANS} Your Timezone",
+            value=(f"{tz_value}\n"
+                   "Timestamps your messages carry into a character's history. A "
+                   "character's *own* clock is set per profile, under "
+                   "`/profile manage` -> Timezone."),
+            inline=False)
+
+        embed.add_field(
+            name="\N{BUST IN SILHOUETTE} Your Identifiers",
+            value=(f"**Discord ID:** `{self.user_id}`\n"
+                   f"**Handle characters see:** `{_get_user_hash(self.user_id)}`"),
+            inline=False)
+        embed.set_footer(text="Only you can see this panel. /data exports or erases "
+                              "everything stored about you.")
+
+        await self.original_interaction.edit_original_response(
+            content=None, embed=embed, view=self)
+
+    async def _act_timezone(self, i: discord.Interaction):
+        # Deferred, not module scope: gui_profiles imports OllamaHostModal from this
+        # module, so a top-level import would close the cycle. Same reason
+        # nav_defaults defers gui_defaults.
+        from .gui_profiles import UserTimezoneView
+        view = UserTimezoneView(self.cog, self)
+        await i.response.send_message(content=view._get_header_content(),
+                                      view=view, ephemeral=True)
+
+    async def _act_clear_timezone(self, i: discord.Interaction):
+        await i.response.defer()
+        about = self.cog.profile_manager.get_user_about(self.user_id)
+        about.pop("timezone", None)
+        self.cog.profile_manager.save_user_about(self.user_id, about)
+        self._build_view()
+        await self.update_display()
 
 class SettingsAPIView(SettingsBaseView):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):

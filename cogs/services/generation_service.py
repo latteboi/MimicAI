@@ -1974,12 +1974,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                         if url_text_list: url_text_batch = "\n".join(url_text_list)
                                         url_media_batch = url_media
 
-                                    # [NEW] Localized User Timestamp Logic (Batch)
-                                    u_index_batch2 = self.cog.profile_manager._get_user_index(trigger.author.id)
-                                    u_prof_batch = self.cog.session_manager._get_active_user_profile_name_for_channel(trigger.author.id, channel_id)
-                                    u_is_b_batch = u_prof_batch in u_index_batch2.get("borrowed", [])
-                                    u_sett_batch = self.cog.profile_manager._get_profile_config(trigger.author.id, u_prof_batch, u_is_b_batch) or {}
-                                    batch_tz = u_sett_batch.get("timezone", "UTC")
+                                    # The batched turn's author, same source as the
+                                    # single-turn path in triggers.py.
+                                    batch_tz = self.cog.profile_manager.user_timezone(trigger.author.id)
                                     batch_hash = _get_user_hash(trigger.author.id)
 
                                     user_line = _format_history_entry(author_name, trigger.created_at, content, batch_tz, entity_id=batch_hash)
