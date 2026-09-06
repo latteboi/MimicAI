@@ -176,6 +176,12 @@ async def main():
         ThreadPoolExecutor(max_workers=2, thread_name_prefix="mimic-io")
     )
 
+    # Off unless MIMIC_LOOP_PROBE is set. CPU percentage cannot see a 300 ms block
+    # on the loop thread, which is the only kind of slowness that actually costs
+    # this bot anything -- see cogs/utils/loop_probe.py.
+    from cogs.utils.loop_probe import start_loop_probe
+    loop_probe_task = start_loop_probe()
+
     # Attach manager queue to bot object for cog access
     bot.manager_queue = manager_queue
 
@@ -201,6 +207,8 @@ async def main():
     finally:
         # Graceful shutdown
         print("Shutting down bot instance...")
+        if loop_probe_task:
+            loop_probe_task.cancel()
         mimic_cog = bot.get_cog("MimicCog")
         if mimic_cog and hasattr(mimic_cog, "session_manager"):
             # Mid-round appends are coalesced rather than written per turn, so the last

@@ -13,7 +13,7 @@ from ...utils.constants import (
 )
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _format_history_entry, _resolve_safety_settings,
-    _scrub_response_text, is_real_model,
+    _scrub_response_text, is_citation_subtext, is_real_model,
 )
 from ._shared import _strip_neuro_update_and_scrub
 
@@ -35,19 +35,35 @@ class RegenerationMixin:
         """
         if not content:
             return
+
+        async def _restore():
+            try:
+                if participant.get('method') == 'child_bot':
+                    await self.cog.manager_queue.put({
+                        "action": "send_to_child", "bot_id": participant['bot_id'],
+                        "payload": {
+                            "action": "regenerate_message", "channel_id": channel.id,
+                            "message_id": message_id, "content": content
+                        }
+                    })
+                    return
+                await self.cog.server_manager.run_webhook(
+                    channel, "edit_message", message_id, content=content,
+                    attachments=attachments or [])
+            except Exception:
+                pass
+
+        # Detached, then shielded. Every caller is already unwinding a cancellation, and
+        # a second one is ordinary -- /cancel allows two in ten seconds, and /suspend and
+        # /purge reach the same task. Interrupted here, the restore never lands and the
+        # turn keeps the placeholder emoji with no path back but another regeneration.
+        task = asyncio.ensure_future(_restore())
+        self.cog.background_tasks.add(task)
+        task.add_done_callback(self.cog.background_tasks.discard)
         try:
-            if participant.get('method') == 'child_bot':
-                await self.cog.manager_queue.put({
-                    "action": "send_to_child", "bot_id": participant['bot_id'],
-                    "payload": {
-                        "action": "regenerate_message", "channel_id": channel.id,
-                        "message_id": message_id, "content": content
-                    }
-                })
-                return
-            await self.cog.server_manager.run_webhook(
-                channel, "edit_message", message_id, content=content,
-                attachments=attachments or [])
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
 
@@ -130,17 +146,29 @@ class RegenerationMixin:
             message_ids_to_check = target_turn.get("message_ids", [])
 
             # 2. Cleanup follow-up messages
+            #
+            # Source lines and image follow-ups are kept -- the regenerated text is
+            # edited onto the turn's own message and these still belong to it. What
+            # survives here has to keep its id too, or the rebind below orphans it:
+            # the message stays in the channel with nothing left able to address it.
+            surviving_message_ids = []
             for msg_id in message_ids_to_check:
-                if msg_id == payload.message_id: continue
+                if msg_id == payload.message_id:
+                    surviving_message_ids.append(msg_id)
+                    continue
                 try:
                     msg = await channel.fetch_message(msg_id)
                     if not msg: continue
-                    is_sources = "Sources:" in msg.content
                     has_image = any(a.content_type and a.content_type.startswith("image/") for a in msg.attachments)
-                    if not is_sources and not has_image:
-                        self.cog.purged_message_ids[msg_id] = True
-                        await msg.delete()
+                    if is_citation_subtext(msg.content) or has_image:
+                        surviving_message_ids.append(msg_id)
+                        continue
+                    self.cog.purged_message_ids[msg_id] = True
+                    await msg.delete()
                 except Exception: pass
+
+            if payload.message_id not in surviving_message_ids:
+                surviving_message_ids.insert(0, payload.message_id)
 
             # 3. History Slicing (Time Travel)
             sliced_unified_log = session["unified_log"][:actual_turn_index]
@@ -326,6 +354,11 @@ class RegenerationMixin:
                 'app_avatar': app_avatar,
                 'message_type': "text",
                 'custom_emoji': custom_emoji,
+                'bot_id': participant.get('bot_id'),
+                # msg_a_id here is the turn's own message, not a placeholder.
+                # _abandon_state_container must never delete it -- this path puts the
+                # original text back instead, through _restore_regenerated_message.
+                'placeholder_owned': False,
             }
             # Published so /cancel can tell "still generating, safe to undo" from
             # "applying, too late". Released in the finally.
@@ -513,7 +546,7 @@ class RegenerationMixin:
 
             final_target_turn["content"] = new_history_line
             final_target_turn["timestamp"] = sent_timestamp.isoformat()
-            final_target_turn["message_ids"] = [payload.message_id]
+            final_target_turn["message_ids"] = list(surviving_message_ids)
 
             regen_grounding_sources = []
             if response and hasattr(response, 'raw') and response.raw.candidates:
@@ -601,6 +634,10 @@ class RegenerationMixin:
                     original_message_content, original_attachments)
         finally:
             if 'state_container' in locals():
-                await self._stop_sending_heartbeat(state_container)
-                self.cog.session_manager.release_in_flight(session, state_container)
+                # The same teardown the round worker uses. It stops the heartbeat and
+                # releases the in-flight entry, and leaves msg_a_id alone because this
+                # container is not placeholder_owned.
+                await self._abandon_state_container(
+                    channel, state_container, session=session,
+                    bot_id=participant.get('bot_id'))
             session['is_regenerating'] = False

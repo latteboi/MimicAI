@@ -1341,6 +1341,22 @@ class MimicCog(EventListeners, commands.Cog):
             # path waits on while a regeneration was still rewriting the log under it.
             session['is_regenerating'] = False
 
+        # Drained, not just stopped. The worker batches the whole queue at the start of
+        # a round, so triggers that arrived while the cancelled round was running would
+        # otherwise be picked up by the next one -- people spam messages while waiting,
+        # cancel, and watch the reply they cancelled arrive a message later. This is what
+        # cancel_channel_operations has always done; /cancel used to stop half way.
+        dropped = 0
+        q = session.get('task_queue')
+        if q:
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                    q.task_done()
+                    dropped += 1
+                except (asyncio.QueueEmpty, ValueError):
+                    break
+
         for p in session.get('profiles', []):
             if p.get('method') == 'child_bot' and p.get('bot_id'):
                 await self.manager_queue.put({
@@ -1349,7 +1365,11 @@ class MimicCog(EventListeners, commands.Cog):
                 })
 
         summary = " and ".join(cancelled) if cancelled else "typing"
-        note = " The original messages have been restored." if live_regens else ""
+        # "are being": the regeneration tasks were cancelled, not awaited, and each one
+        # restores its own message as it unwinds.
+        note = " The original messages are being restored." if live_regens else ""
+        if dropped:
+            note += f" {dropped} queued trigger{'s' if dropped != 1 else ''} dropped."
         await interaction.response.send_message(
             f"Cancelled {summary} for this channel.{note}", ephemeral=True)
 

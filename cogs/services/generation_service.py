@@ -1021,7 +1021,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             'app_name': app_name,
                             'app_avatar': app_avatar,
                             'message_type': "text",
-                            'custom_emoji': custom_emoji
+                            'custom_emoji': custom_emoji,
+                            # Carried on the container so the round teardown can delete a
+                            # child bot's placeholder without the participant dict, which
+                            # it no longer has by the time it sweeps.
+                            'bot_id': participant.get('bot_id'),
+                            'placeholder_owned': True,
                         }
 
                         image_gen_error_msg = None
@@ -1257,7 +1262,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 'app_name': app_name,
                                 'app_avatar': app_avatar,
                                 'message_type': "text",
-                                'custom_emoji': custom_emoji
+                                'custom_emoji': custom_emoji,
+                                'bot_id': participant.get('bot_id'),
+                                'placeholder_owned': True,
                             }
 
                         # Published so /cancel can tell generation from delivery. Released
@@ -1332,10 +1339,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                             status = "success"
                         except asyncio.CancelledError:
-                            if state_container and state_container.get('sending_task'):
-                                state_container['sending_task'].cancel()
-                            await self._safe_delete_placeholder(channel, state_container.get('msg_a_id') if state_container else msg_a_id, bot_id=participant.get('bot_id'))
-                            await self._safe_delete_placeholder(channel, state_container.get('msg_b_id') if state_container else None, bot_id=participant.get('bot_id'))
+                            await self._abandon_state_container(
+                                channel, state_container, session=session,
+                                bot_id=participant.get('bot_id'))
                             if 'contents_for_api_call' in locals():
                                 contents_for_api_call.clear()
                                 del contents_for_api_call
@@ -1380,10 +1386,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     fallback_used = True
                                     self.cog._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile_fallback", model_used=fb_name, status="success")
                                 except asyncio.CancelledError:
-                                    if state_container and state_container.get('sending_task'):
-                                        state_container['sending_task'].cancel()
-                                    await self._safe_delete_placeholder(channel, state_container.get('msg_a_id') if state_container else msg_a_id, bot_id=participant.get('bot_id'))
-                                    await self._safe_delete_placeholder(channel, state_container.get('msg_b_id') if state_container else None, bot_id=participant.get('bot_id'))
+                                    await self._abandon_state_container(
+                                        channel, state_container, session=session,
+                                        bot_id=participant.get('bot_id'))
                                     if 'contents_for_api_call' in locals():
                                         contents_for_api_call.clear()
                                         del contents_for_api_call
@@ -1729,8 +1734,14 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         await self._stop_sending_heartbeat(state_container)
                         msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
                         msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
-                        await self._safe_delete_placeholder(channel, msg_a_to_delete)
-                        await self._safe_delete_placeholder(channel, msg_b_to_delete)
+                        # bot_id, because a child bot participant reaches this branch too.
+                        # Without it the webhook delete 10008s and the client delete needs
+                        # Manage Messages -- and the ids are cleared either way, so the
+                        # bot_id-aware delete a dozen lines below never got a second go at
+                        # them. That left the placeholder in the channel for good.
+                        p_bot_id = participant.get('bot_id')
+                        await self._safe_delete_placeholder(channel, msg_a_to_delete, bot_id=p_bot_id)
+                        await self._safe_delete_placeholder(channel, msg_b_to_delete, bot_id=p_bot_id)
                         if state_container:
                             state_container['msg_a_id'] = None
                             state_container['msg_b_id'] = None
@@ -2134,10 +2145,36 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 session['is_running'] = False
                 # Nothing this round published is in flight any more. The per-participant
                 # release below the delivery step handles the normal path; this catches
-                # the cancelled and errored ones, which leave the loop without reaching
-                # it and would otherwise grow this list by one per abandoned round.
-                session['in_flight'] = [c for c in session.get('in_flight', ())
-                                        if c.get('sending_task')]
+                # the cancelled and errored ones, which leave the loop without reaching it.
+                #
+                # This used to *keep* the containers holding a sending_task and drop the
+                # rest, which was exactly backwards: a container still holding one here is
+                # a round that died mid-delivery, so the filter preserved the broken ones.
+                # Their heartbeat went on editing a placeholder every ten seconds for the
+                # life of the process, and is_delivering -- which reads this list -- then
+                # refused every /cancel in the channel for good.
+                #
+                # Only this task's own containers: a regeneration registers here too, and
+                # tearing down a live one would cancel its heartbeat and delete its
+                # placeholder out from under it.
+                me = asyncio.current_task()
+                abandoned = [c for c in session.get('in_flight', ())
+                             if c.get('owner_task') is me]
+                if abandoned:
+                    ch = self.cog.bot.get_channel(channel_id)
+                    cancelled_here = False
+                    for c in abandoned:
+                        try:
+                            await self._abandon_state_container(ch, c, session=session)
+                        except asyncio.CancelledError:
+                            # Noted, not propagated yet: each teardown is launched before
+                            # its await, so it completes on its own, but re-raising here
+                            # would skip every container after this one in the list.
+                            cancelled_here = True
+                        except Exception as e:
+                            print(f"Placeholder teardown failed for channel {channel_id}: {e}")
+                    if cancelled_here:
+                        raise asyncio.CancelledError()
         
         # [NEW] Lifecycle protection: Remove from background set and clear reference
         ctask = asyncio.current_task()

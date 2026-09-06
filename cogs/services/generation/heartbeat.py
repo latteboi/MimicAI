@@ -4,7 +4,7 @@ import asyncio
 import discord
 from typing import Optional
 
-from ...utils.constants import PLACEHOLDER_EMOJI
+from ...utils.constants import PLACEHOLDER_EMOJI, DELIVERY_HARD_TIMEOUT_SECONDS
 
 
 class HeartbeatMixin:
@@ -202,6 +202,12 @@ class HeartbeatMixin:
         if not has_target and spawn_after is None:
             return
 
+        sending_started = time.monotonic()
+        # The watchdog below cancels this task if delivery never finishes. register_in_flight
+        # stamps the same thing, but global chat has no in-flight entry to stamp it from, so
+        # claim it here for anything that reaches this without one.
+        state_container.setdefault('owner_task', asyncio.current_task())
+
         async def heartbeat_loop():
             try:
                 # Immediate initial update
@@ -262,6 +268,20 @@ class HeartbeatMixin:
 
                     await do_update(sending_text)
 
+                    # Watchdog. Generation has its own hard timeout; delivery had none,
+                    # so an upload or a TTS round trip that never returns left this loop
+                    # ticking a placeholder for the life of the process with the round
+                    # parked behind it. Cancelling the owning round is what runs the
+                    # teardown -- see _abandon_state_container -- and the worker is
+                    # respawned by the next trigger.
+                    if time.monotonic() - sending_started >= DELIVERY_HARD_TIMEOUT_SECONDS:
+                        owner = state_container.get('owner_task')
+                        print(f"Delivery watchdog: no progress in {DELIVERY_HARD_TIMEOUT_SECONDS:.0f}s, "
+                              f"cancelling the round in channel {channel.id}")
+                        if owner and not owner.done():
+                            owner.cancel()
+                        return
+
             except asyncio.CancelledError:
                 pass
 
@@ -291,6 +311,10 @@ class HeartbeatMixin:
             if new_id:
                 state_container['msg_a_id'] = new_id
 
+        # When the sending phase began, not when the turn did. is_delivering opens its
+        # refusal once this is old enough, so it has to measure the phase /cancel is
+        # actually being refused for.
+        state_container['sending_started'] = sending_started
         state_container['sending_task'] = asyncio.create_task(heartbeat_loop())
 
     async def _stop_sending_heartbeat(self, state_container):
@@ -325,3 +349,70 @@ class HeartbeatMixin:
             except (Exception, asyncio.CancelledError):
                 pass
             state_container['spawn_task'] = None
+
+    async def _abandon_state_container(self, channel, state_container, session=None, bot_id=None):
+        """Tears a turn's placeholder state down on any exit that is not the happy path.
+
+        The happy path clears these one at a time as it goes. Every other exit -- a
+        cancellation, an exception anywhere in delivery, a round that breaks out of the
+        loop -- used to leave whichever step it had reached still standing: a heartbeat
+        editing a placeholder every ten seconds for the life of the process, the
+        placeholder itself, and an `in_flight` entry that made is_delivering answer True
+        for ever after, so /cancel refused the channel permanently.
+
+        Cleanup written per exception site cannot cover the exits nobody thought of.
+        This is the one teardown; call it from every abnormal exit.
+
+        `placeholder_owned` is False for a regeneration, whose msg_a_id is the turn's own
+        message and not a placeholder. Deleting that is the one thing this must never do
+        -- regeneration puts the original text back instead.
+        """
+        if not state_container:
+            return
+
+        # Released first and synchronously. is_delivering reads this list, and a /cancel
+        # arriving while the deletes below are still in flight has to see a turn that has
+        # finished rather than one it must refuse.
+        if session is not None:
+            self.cog.session_manager.release_in_flight(session, state_container)
+
+        if bot_id is None:
+            bot_id = state_container.get('bot_id')
+
+        async def _teardown():
+            await self._stop_sending_heartbeat(state_container)
+            if channel is None:
+                # The channel is gone (deleted, or the bot was removed). Nothing to
+                # delete from, and _safe_delete_placeholder would spend its retry
+                # backoff finding that out once per placeholder.
+                return
+            keys = ['msg_b_id']
+            if state_container.get('placeholder_owned', True):
+                keys.insert(0, 'msg_a_id')
+            for key in keys:
+                msg_id = state_container.get(key)
+                if not msg_id:
+                    continue
+                # Cleared before the await, not after: a second caller reaching this
+                # container must not queue the same delete again.
+                state_container[key] = None
+                try:
+                    await self._safe_delete_placeholder(channel, msg_id, bot_id=bot_id)
+                except Exception:
+                    pass
+
+        # Detached, then shielded. Most callers are already unwinding a CancelledError,
+        # and a second cancel is ordinary -- /cancel allows two in ten seconds, and
+        # /suspend and /purge reach the same task. An unshielded await here would be
+        # interrupted part-way through the deletes and strand the placeholder it was
+        # removing. The task runs to completion either way; the shield only decides
+        # whether this caller waits for it.
+        task = asyncio.ensure_future(_teardown())
+        self.cog.background_tasks.add(task)
+        task.add_done_callback(self.cog.background_tasks.discard)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass

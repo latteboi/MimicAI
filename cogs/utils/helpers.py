@@ -487,6 +487,21 @@ def _format_citation_subtext(grounding_sources: List[Dict]) -> List[str]:
 
     return messages
 
+# Only the first line _format_citation_subtext emits carries the "Sources:" label;
+# every line after it opens straight on a numbered link. Anchored, so the numbered
+# form cannot match a model's own text further into a message.
+_CITATION_SUBTEXT_RE = re.compile(r'^>\s*-#\s+(?:Sources:|\*\*\[\d+\]\*\*)')
+
+def is_citation_subtext(content: str) -> bool:
+    """True for any message _format_citation_subtext produced.
+
+    Regeneration keeps a turn's source lines and deletes its other follow-ups. It
+    used to decide with `"Sources:" in content`, which is false for every
+    continuation line, so a turn citing more than five sources lost all but the
+    first line of them each time it was regenerated.
+    """
+    return bool(content) and bool(_CITATION_SUBTEXT_RE.match(content))
+
 def _get_sanitized_history_and_author(history: List[str], user_id_map: Dict[int, str], primary_author_id: int) -> Tuple[List[str], str]:
     primary_author_name = user_id_map.get(primary_author_id, "A user")
     return history, primary_author_name

@@ -52,6 +52,20 @@ sites that churn the allocator hardest — media transfers especially. It is rat
 precisely so that a four-participant round sharing one attachment trims once rather than
 four times.
 
+`cogs/utils/loop_probe.py` measures the thing CPU percentage cannot see: how long the loop
+thread is actually held. The bot averages a fraction of a percent of a CPU and can still
+block for hundreds of milliseconds inside one synchronous step, and it is the block that
+drops a gateway heartbeat. The probe sleeps a fixed interval and reports the overshoot,
+with RSS sampled alongside. Off unless `MIMIC_LOOP_PROBE` is set — see the module docstring
+for the four environment variables.
+
+Secrets are read once. `constants._get_gcp_client()` builds the Secret Manager client on
+first use and `_release_gcp_client()` drops it the moment `defaultConfig` is built, because
+its gRPC channel holds roughly ten threads — timers, four `event_engine` workers, a
+lifeguard — for the life of the process, in a bot that caps its own executor at two. The
+client is lazy rather than eager so that a later caller rebuilds it instead of silently
+receiving the default.
+
 `max_messages=None` disables discord.py's 1,000-`Message` cache. Nothing reads it — every
 delete and edit listener uses the `on_raw_*` variants, which consult the gateway payload
 rather than the cache. Left on, that deque is the one baseline term that grows forever.
@@ -97,7 +111,8 @@ cogs/
     help_service.py        RAG over bundled documentation
   listeners/               gateway events; inherited by MimicCog
   gui/                     Discord UI views and modals
-  utils/                   constants, helpers, content, fuzzy, http_client, memory_tuning
+  utils/                   constants, helpers, content, fuzzy, http_client, memory_tuning,
+                           loop_probe
 ```
 
 **Managers own persisted state. Services own operations.** Both take a back-reference to

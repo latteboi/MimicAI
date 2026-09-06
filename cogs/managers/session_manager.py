@@ -22,7 +22,7 @@ from ..utils.constants import (
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
     COMPACTION_THRESHOLD_DEFAULT, COMPACTION_CHUNK_DEFAULT,
     COMPACTION_MODEL_DEFAULT, COMPACTION_FALLBACK_MODEL_DEFAULT,
-    DEFAULT_CAST_POLICY,
+    DEFAULT_CAST_POLICY, DELIVERY_GUARD_SECONDS,
 )
 from .storage_manager import IOManager, _delete_file_shard, _get_compressor, _get_decompressor
 
@@ -1555,7 +1555,16 @@ class SessionManager:
         The container is what knows whether generation has returned: `sending_task` is
         set by _update_sending_placeholder and cleared by _stop_sending_heartbeat, so
         its presence is exactly the window the placeholder reads "Sending...".
+
+        The registering task is stamped on the container. A round's teardown sweeps the
+        containers it abandoned, and a regeneration can be registered here at the same
+        time -- without the stamp the sweep would tear down a live operation belonging
+        to somebody else.
         """
+        try:
+            state_container["owner_task"] = asyncio.current_task()
+        except RuntimeError:
+            state_container["owner_task"] = None
         session.setdefault("in_flight", []).append(state_container)
 
     @staticmethod
@@ -1575,8 +1584,23 @@ class SessionManager:
         the placeholder is mid-edit, TTS may be part-way through a synthesis, and for a
         regeneration the original message has already been overwritten. Everything
         before this point either has nothing to undo or can be put back.
+
+        Two things stop this becoming a permanent refusal, which is what it used to be.
+        A `sending_task` that has finished is not a delivery, and neither is one still
+        running DELIVERY_GUARD_SECONDS later -- by then it is wedged, and refusing the
+        one command that could clear it is the worse answer. `/cancel` tears the
+        container down, so opening the guard is what lets the channel recover.
         """
-        return any(c.get("sending_task") for c in session.get("in_flight", ()))
+        now = time.monotonic()
+        for c in session.get("in_flight", ()):
+            task = c.get("sending_task")
+            if not task or task.done():
+                continue
+            started = c.get("sending_started")
+            if started is not None and (now - started) >= DELIVERY_GUARD_SECONDS:
+                continue
+            return True
+        return False
 
     def _safe_cancel_task(self, task: asyncio.Task):
         if task and not task.done():

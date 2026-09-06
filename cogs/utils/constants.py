@@ -11,22 +11,60 @@ load_dotenv()
 # Global GCP Client caching
 _gcp_client = None
 _gcp_project_id = os.getenv('GCP_PROJECT_ID')
-if _gcp_project_id:
+_gcp_unavailable = False
+
+
+def _get_gcp_client():
+    """The Secret Manager client, built on first use rather than at import.
+
+    Lazy so that _release_gcp_client below can drop it again without the next
+    caller silently falling through to the default: asked for a secret after the
+    release, this rebuilds and answers correctly. Nothing does, today.
+    """
+    global _gcp_client, _gcp_unavailable
+    if _gcp_client is not None or _gcp_unavailable or not _gcp_project_id:
+        return _gcp_client
     try:
         from google.cloud import secretmanager
         _gcp_client = secretmanager.SecretManagerServiceClient()
     except ImportError:
+        _gcp_unavailable = True
+    return _gcp_client
+
+
+def _release_gcp_client():
+    """Drops the Secret Manager client once the configuration has been read.
+
+    The client owns a gRPC channel, and gRPC keeps its own threads alive for as
+    long as the channel exists -- two timer threads, four event_engine workers, a
+    lifeguard, and a few more on the Python side. That was ten threads, in a
+    process that deliberately caps its own executor at two, held for the lifetime
+    of the bot to serve four reads in the first second of boot. Each one also
+    takes a glibc arena, which is what MALLOC_ARENA_MAX=2 exists to bound.
+    """
+    global _gcp_client
+    client, _gcp_client = _gcp_client, None
+    if client is None:
+        return
+    try:
+        if hasattr(client, "close"):
+            client.close()
+        else:
+            client.transport.close()
+    except Exception:
         pass
+
 
 def get_config_value(key_name: str, default: str = None) -> str | None:
     val = os.getenv(key_name)
     if val: return val
-    if _gcp_client and _gcp_project_id:
+    client = _get_gcp_client()
+    if client and _gcp_project_id:
         from google.api_core.exceptions import NotFound, GoogleAPICallError
         for name in [key_name.lower(), key_name.upper()]:
             resource_name = f"projects/{_gcp_project_id}/secrets/{name}/versions/latest"
             try:
-                response = _gcp_client.access_secret_version(request={"name": resource_name}, timeout=3.0)
+                response = client.access_secret_version(request={"name": resource_name}, timeout=3.0)
                 return response.payload.data.decode("UTF-8")
             except (NotFound, GoogleAPICallError): continue
     return default
@@ -89,6 +127,9 @@ class DefaultConfigNamespace:
         self.MIMIC_NEWS = ""
 
 defaultConfig = DefaultConfigNamespace()
+# Every secret this process reads has now been read, so the gRPC channel behind it
+# -- and the ten threads gRPC keeps alive for one -- can go. See _release_gcp_client.
+_release_gcp_client()
 
 PRIMARY_MODEL_NAME = 'GOOGLE/gemini-3.5-flash-lite'
 FALLBACK_MODEL_NAME = 'GOOGLE/gemini-3.1-flash-lite'
@@ -590,6 +631,16 @@ PURGE_BUSY_WAIT_TIMEOUT_SECONDS = 30.0
 # multi-profile round runs several 240 s participant turns back to back, and it still sits
 # well inside Discord's 15-minute interaction token lifetime.
 WHISPER_BUSY_WAIT_TIMEOUT_SECONDS = 300.0
+# /cancel refuses a turn that has finished generating and is being delivered, because
+# that is the one point where stopping leaves the channel worse off -- see
+# SessionManager.is_delivering. Bounded for the same reason as the two waits above: a
+# delivery that wedges (an upload that never returns, a TTS round trip that hangs) would
+# otherwise refuse every cancel in that channel for the life of the process.
+DELIVERY_GUARD_SECONDS = 180.0
+# The sending heartbeat's own watchdog: past this the turn is presumed wedged and the
+# round it belongs to is cancelled, which is what runs the placeholder teardown. Well
+# beyond DELIVERY_GUARD_SECONDS, so an admin's /cancel always gets the first move.
+DELIVERY_HARD_TIMEOUT_SECONDS = 420.0
 # Every flag that means "this channel is mid-operation". A whisper claims the channel only
 # once all of them are clear; the check and the claim must be in the same synchronous step.
 SESSION_BUSY_FLAGS = ('is_running', 'is_regenerating', 'is_purging', 'is_whispering', 'is_memorising')

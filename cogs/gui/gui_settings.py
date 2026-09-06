@@ -288,8 +288,6 @@ class SettingsAboutView(SettingsBaseView):
             value=(f"**Discord ID:** `{self.user_id}`\n"
                    f"**Handle characters see:** `{_get_user_hash(self.user_id)}`"),
             inline=False)
-        embed.set_footer(text="Only you can see this panel. /data exports or erases "
-                              "everything stored about you.")
 
         await self.original_interaction.edit_original_response(
             content=None, embed=embed, view=self)
