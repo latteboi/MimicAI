@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 from ...utils.constants import (
     DEFAULT_SPEAK_REWRITE_STRICT, DEFAULT_SPEAK_REWRITE_LOOSE,
     SPEAK_REWRITE_HISTORY_TURNS, SPEAK_REWRITE_MAX_INPUT_CHARS,
+    PLACEHOLDER_EMOJI,
 )
 from ...utils.helpers import (
     _format_history_entry, _resolve_safety_settings, _scrub_response_text,
@@ -38,20 +39,29 @@ class SpeakAsMixin:
                 ephemeral=True)
             return
 
-        rewritten, error = await self._rewrite_in_character(ctx, message, fidelity)
+        from ...gui.gui_sessions import SpeakPreviewView, build_speak_placeholder_embed
+
+        # The card goes up before the wait, not after it. A rewrite is a full model call
+        # against the character's own prompt, and until it lands the author has an
+        # ephemeral that says nothing and a channel where nothing is happening -- the
+        # same dead-command problem WHISPER_WAITING_NOTICE solves. It is then edited into
+        # the preview rather than replaced, so this costs no extra message.
+        placeholder = await interaction_to_respond.followup.send(
+            embed=build_speak_placeholder_embed(self.cog, ctx, message, fidelity),
+            ephemeral=True, wait=True)
+
+        rewritten, error = await self._rewrite_in_character(ctx, message, fidelity, placeholder)
         if not rewritten:
             # Never silently fall back to posting the raw text: the author asked for the
             # character's voice, and delivering their own words under the character's
             # face is a different message than the one they approved.
-            await interaction_to_respond.followup.send(
-                f"{ctx['speaker_display_name']} could not deliver that line.\n-# {error}",
-                ephemeral=True)
+            await placeholder.edit(
+                content=f"{ctx['speaker_display_name']} could not deliver that line.\n-# {error}",
+                embed=None)
             return
 
-        from ...gui.gui_sessions import SpeakPreviewView
         view = SpeakPreviewView(self.cog, interaction_to_respond, ctx, message, rewritten, fidelity)
-        await interaction_to_respond.followup.send(
-            embed=view.build_embed(), view=view, ephemeral=True)
+        await placeholder.edit(embed=view.build_embed(), view=view)
 
     # --- Resolution -----------------------------------------------------------
 
@@ -86,8 +96,10 @@ class SpeakAsMixin:
             effective_owner_id = int(borrowed_data.get("original_owner_id", user_id))
             effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
             profile_data_source = self.cog.profile_manager._get_profile_config(effective_owner_id, effective_profile_name, False) or {}
+            own_config = borrowed_data
         else:
             profile_data_source = self.cog.profile_manager._get_profile_config(user_id, profile_name, False) or {}
+            own_config = profile_data_source
 
         if not self.cog.profile_manager._check_unrestricted_safety_policy(effective_owner_id, effective_profile_name, channel):
             await interaction_to_respond.followup.send("This profile is rated 'Adult 18+' and cannot speak in this channel because it is not marked as Age-Restricted.", ephemeral=True)
@@ -156,12 +168,19 @@ class SpeakAsMixin:
             "child_bot_id": child_bot_id,
             "speaker_display_name": speaker_display_name,
             "profile_id": self.cog.profile_manager._get_profile_id(effective_owner_id, effective_profile_name),
+            # Read off the invoker's handle, like every other config value here: a borrow
+            # owns its own placeholder emoji. Carried in ctx so the preview and the
+            # waiting card it grows out of are built from one resolution.
+            "placeholder_emoji": own_config.get("placeholder_emoji") or PLACEHOLDER_EMOJI,
         }
 
     # --- In-character rewrite -------------------------------------------------
 
-    async def _rewrite_in_character(self, ctx: Dict[str, Any], source_text: str, fidelity: str):
+    async def _rewrite_in_character(self, ctx: Dict[str, Any], source_text: str, fidelity: str, placeholder_msg: Optional[discord.Message] = None):
         """Re-voice `source_text` as the character. Returns (text, error_message).
+
+        `placeholder_msg` is the ephemeral card to tick while the model works. Absent,
+        the generation runs exactly as before and nothing is edited.
 
         The prompt is the one the profile would get for an ordinary turn --
         _construct_system_instructions unchanged, history from
@@ -218,6 +237,14 @@ class SpeakAsMixin:
         safety_settings = _resolve_safety_settings(channel, p_settings)
         tools = self._resolve_native_tools(p_settings)
 
+        gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
+        # Mutated in place by every attempt, so a fallback keeps ticking the card the
+        # primary was already ticking rather than opening a second one beside it.
+        state_container = {
+            "custom_emoji": ctx.get("placeholder_emoji") or PLACEHOLDER_EMOJI,
+            "placeholder_msg": placeholder_msg,
+        }
+
         async def _attempt(model_name, is_fallback):
             # The response slot, not `utility`: this is a visible in-character line and
             # gets what a real one gets. `utility` is for internal passes with no
@@ -228,13 +255,16 @@ class SpeakAsMixin:
                                         "fallback" if is_fallback else "primary"),
                 tools, p_settings,
             )
-            return await model.generate_content_async(
-                contents, generation_config={"temperature": temp, "top_p": top_p, "top_k": top_k})
+            return await self._generate_with_heartbeat(
+                model, contents, gen_config, channel, None, None,
+                is_fallback=is_fallback, message_type="embed",
+                existing_state=state_container)
 
         status = "api_error"
         try:
-            response, model_used, _was_fallback = await self.cog.api_service.run_with_fallback(
+            result, model_used, _was_fallback = await self.cog.api_service.run_with_fallback(
                 primary_model, fallback_model, _attempt, label="Speak rewrite")
+            response, _state = result
         except asyncio.CancelledError:
             raise
         except Exception as e:

@@ -2322,9 +2322,13 @@ class MimicCog(EventListeners, commands.Cog):
             )
         else:
             async def modal_callback(modal_interaction: discord.Interaction, message_text: str):
+                # The modal submit, not the slash interaction that opened it. Replying on
+                # the original left the submit deferred and never answered -- Discord sits
+                # on "thinking" until it times out, which is what a working command looks
+                # like when it has failed. /whisper's modal already does it this way.
                 await modal_interaction.response.defer(ephemeral=True)
                 await self.generation_service._execute_speak_as(
-                    interaction_to_respond=interaction,
+                    interaction_to_respond=modal_interaction,
                     channel=interaction.channel,
                     author=interaction.user,
                     profile_name=p_name,

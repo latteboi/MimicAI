@@ -723,7 +723,30 @@ class SpeakRewriteEditModal(ui.Modal, title="Edit the line"):
 
     async def on_submit(self, interaction: discord.Interaction):
         self.parent_view.source_text = self.input_field.value
+        # Every stored take answered the line that was just replaced, so switching
+        # fidelity must not be able to bring one of them back.
+        self.parent_view.by_fidelity.clear()
         await self.parent_view.regenerate(interaction)
+
+
+def build_speak_placeholder_embed(cog: 'MimicCog', ctx: Dict[str, Any], source_text: str,
+                                 fidelity: str, take: int = 1) -> discord.Embed:
+    """The waiting state of the preview card, built here so it is the same card.
+
+    `_generate_with_heartbeat` rewrites `description` in place every ten seconds, so
+    the emoji is the whole description and everything else is the frame the finished
+    take will keep: the author watches one embed fill in rather than a spinner that
+    says nothing about whether the model is still alive.
+    """
+    name, avatar = cog.generation_service._resolve_appearance_data(
+        ctx["effective_owner_id"], ctx["effective_profile_name"])
+    embed = discord.Embed(
+        description=ctx.get("placeholder_emoji") or PLACEHOLDER_EMOJI,
+        color=discord.Color.dark_grey())
+    embed.set_author(name=name, icon_url=avatar)
+    embed.add_field(name="Your line", value=source_text[:1024], inline=False)
+    embed.set_footer(text=f"{fidelity.title()} \u00b7 take {take} \u00b7 finding the words")
+    return embed
 
 
 class SpeakPreviewView(ui.View):
@@ -737,6 +760,11 @@ class SpeakPreviewView(ui.View):
     uninterrupted step at Send, exactly as the verbatim path always has, and
     `_deliver_speak_as` re-reads the session rather than trusting the one resolved
     before the preview.
+
+    Reroll is the only button that spends a generation. Switch fidelity keeps the last
+    take of each, so the two can be compared and returned to; without that, swapping
+    back cost a call and answered with a different line than the one it was swapped
+    away from, which made the comparison it exists for impossible.
     """
 
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, ctx: Dict[str, Any],
@@ -748,7 +776,14 @@ class SpeakPreviewView(ui.View):
         self.source_text = source_text
         self.rewritten = rewritten
         self.fidelity = fidelity
+        # `takes` is what has been generated, `shown_take` is which of them is on the
+        # card -- they part company the moment a stored take is restored, and only the
+        # first is a count of what the model was actually asked for.
         self.takes = 1
+        self.shown_take = 1
+        # Keyed by fidelity, holding (text, take number). Emptied by the edit modal:
+        # every entry is a take on a source line that no longer exists.
+        self.by_fidelity = {fidelity: (rewritten, 1)}
 
     def build_embed(self) -> discord.Embed:
         name, avatar = self.cog.generation_service._resolve_appearance_data(
@@ -756,30 +791,46 @@ class SpeakPreviewView(ui.View):
         embed = discord.Embed(description=self.rewritten, color=discord.Color.blurple())
         embed.set_author(name=name, icon_url=avatar)
         embed.add_field(name="Your line", value=self.source_text[:1024], inline=False)
-        embed.set_footer(text=f"{self.fidelity.title()} · take {self.takes} · nobody has seen this yet")
+        # "of N" only once a stored take is showing, so the card says which one you are
+        # looking at rather than implying the newest is the only one there is.
+        counter = f"take {self.shown_take}"
+        if self.takes > self.shown_take:
+            counter += f" of {self.takes}"
+        embed.set_footer(text=f"{self.fidelity.title()} · {counter} · nobody has seen this yet")
         return embed
+
+    def build_placeholder_embed(self) -> discord.Embed:
+        return build_speak_placeholder_embed(
+            self.cog, self.ctx, self.source_text, self.fidelity, self.takes + 1)
 
     def _disable(self):
         for child in self.children:
             child.disabled = True
 
     async def regenerate(self, interaction: discord.Interaction):
+        # Swapped to the waiting card, not just greyed out: a reroll is the same model
+        # call the first take was, and disabled buttons alone leave the previous take
+        # sitting there looking like the answer.
         self._disable()
-        await interaction.response.edit_message(view=self)
+        await interaction.response.edit_message(
+            content=None, embed=self.build_placeholder_embed(), view=self)
+        placeholder = await interaction.original_response()
 
         rewritten, error = await self.cog.generation_service._rewrite_in_character(
-            self.ctx, self.source_text, self.fidelity)
+            self.ctx, self.source_text, self.fidelity, placeholder)
 
         for child in self.children:
             child.disabled = False
 
         if not rewritten:
             await interaction.edit_original_response(
-                content=f"That take failed.\n-# {error}", view=self)
+                content=f"That take failed.\n-# {error}", embed=self.build_embed(), view=self)
             return
 
         self.rewritten = rewritten
         self.takes += 1
+        self.shown_take = self.takes
+        self.by_fidelity[self.fidelity] = (rewritten, self.takes)
         await interaction.edit_original_response(content=None, embed=self.build_embed(), view=self)
 
     @ui.button(label="Send", style=discord.ButtonStyle.success)
@@ -812,6 +863,16 @@ class SpeakPreviewView(ui.View):
     @ui.button(label="Switch fidelity", style=discord.ButtonStyle.secondary)
     async def fidelity_button(self, interaction: discord.Interaction, button: ui.Button):
         self.fidelity = 'loose' if self.fidelity == 'strict' else 'strict'
+
+        stored = self.by_fidelity.get(self.fidelity)
+        if stored:
+            # A comparison, not a re-roll: the other reading is already paid for, and
+            # generating a third one here would throw away the one being compared to.
+            self.rewritten, self.shown_take = stored
+            await interaction.response.edit_message(
+                content=None, embed=self.build_embed(), view=self)
+            return
+
         await self.regenerate(interaction)
 
     @ui.button(label="Cancel", style=discord.ButtonStyle.danger)
