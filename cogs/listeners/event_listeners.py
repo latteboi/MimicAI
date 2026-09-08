@@ -57,7 +57,15 @@ class EventListeners:
             await self.bot.change_presence(status=status_map.get(status_val, discord.Status.online), activity=activity)
             
             self.storage_manager._purge_legacy_default_profile()
-            
+
+            # Before the repair, not after: the repair reads names through the sidecar,
+            # so backfilling first is what makes this boot's repair -- and every one
+            # after it -- a plaintext read instead of a decrypt per profile.
+            written = await asyncio.to_thread(self.profile_manager.backfill_name_sidecars)
+            if written:
+                print(f"Name sidecars: backfilled {written} profile"
+                      f"{'' if written == 1 else 's'}.")
+
             print("Running initial index.json self-repair on boot...")
             await asyncio.to_thread(self.profile_manager._repair_all_user_indices)
             print("Initial index.json self-repair complete.")

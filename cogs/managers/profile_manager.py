@@ -24,7 +24,8 @@ from ..utils.user_defaults import (
     setting_label)
 from ..utils.helpers import is_real_model
 from ..utils.constants import (
-    USERS_DIR, PUBLIC_PROFILES_DIR, BORROW_INDEX_FILE, defaultConfig,
+    USERS_DIR, PUBLIC_PROFILES_DIR, BORROW_INDEX_FILE, PROFILE_NAME_SIDECAR,
+    PID_CLASS_PREFIXES, defaultConfig,
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS,
     DEFAULT_ANTI_REPETITION_PROMPT, UTILITY_FALLBACK_KEYS,
     TTS_VOICE_GENDER, TTS_VOICE_CHARACTER,
@@ -49,6 +50,14 @@ try:
 except ImportError:
     import json
 
+
+#: What _accept_share_request used to write as a borrow's source PID when it could
+#: not determine one. It is not a PID: every borrow that landed on it keys the same
+#: "<owner>:00000000" entry in borrows.json, so _borrowers_of returns the borrowers
+#: of unrelated profiles and a cascade delete reaches borrows of a profile that was
+#: never deleted. Recognised here only so the migration and _borrow_key_for_config
+#: can refuse it; nothing writes it any more.
+_UNKNOWN_SOURCE_PID = "00000000"
 
 #: Hard ceiling on live share codes across the whole instance. Not a user-facing
 #: limit -- codes expire in five minutes and pruning on insert holds the dict to
@@ -261,85 +270,179 @@ class ProfileManager:
     # --- Borrow reverse index --------------------------------------------------
     #
     # "Who borrows this profile?" used to be answered by walking every user
-    # directory and Fernet-decrypting every borrowed profile config -- once per
+    # directory and decrypting every borrowed profile config -- once per
     # is_profile_distributed() call, and again per profile deletion. Both are
     # O(all users x their borrows) with a decrypt each, and both reached
-    # _get_user_index per user against an LRU capped at 20, so past twenty users
-    # every iteration was also a fresh disk read plus a consistency check.
+    # _get_user_index per user against an LRU, so past its capacity every
+    # iteration was also a fresh disk read plus a consistency check.
     #
     # borrows.json is the mapping in the other direction:
     #
-    #   {"version": 1,
-    #    "sources": {"<owner_id>:<pid>": {"<borrower_id>": ["local name", ...]}}}
+    #   {"version": 2,
+    #    "sources": {"<owner_id>:<source_pid>": {"<borrower_id>": ["<borrow_pid>", ...]}}}
     #
-    # Legacy borrows carry no `original_pid`, only `original_profile_name`, so a
-    # source is keyed by PID where one is known and by "<owner_id>:name:<name>"
-    # where it is not. Every reader looks up both forms and unions the results:
-    # missing a borrower is the direction that skips a needed content
-    # reclassification, which is the one this index must never do.
+    # **PIDs on both ends.** Version 1 keyed the borrower side by the borrower's
+    # local name for the borrow, which made a rename -- an operation that moves no
+    # file and changes no relationship -- look like a delete plus a create: the
+    # reconcile below had to decrypt the "new" borrow's shard to re-derive a source
+    # it already knew, _cascade_delete_borrowed_profiles resolved a name back to a
+    # PID to find the directory to remove (falling back to the name itself, so a
+    # miss rmtree'd a name-shaped path), and a removal keyed by a name the borrower
+    # had since changed silently did nothing and leaked the entry.
     #
-    # The inverse map (borrower -> {local name: source key}) is rebuilt in memory
+    # A borrow's PID is minted once and never moves. Keyed by it, the reconcile is
+    # a set comparison over immutable values that reads no files at all, and renames
+    # are free because there is nothing about a rename for this index to record. The
+    # local name is display, and is read from the borrower's own index when a screen
+    # needs to show it.
+    #
+    # Source keys are PIDs for the same reason. Version 1 also admitted a
+    # "<owner_id>:name:<name>" form for borrows predating `original_pid`, and every
+    # reader had to look up both and union them; _migrate_borrow_pointers resolves
+    # those to real PIDs once at boot, which is what lets there be a single key form.
+    #
+    # The inverse map (borrower -> {borrow PID: source key}) is rebuilt in memory
     # on load rather than persisted, so there is one invariant on disk, not two.
+
+    #: Bumped when the on-disk shape changes. A file older than this is rebuilt from
+    #: a scan, which is also the migration -- see _load_borrow_index.
+    BORROW_INDEX_VERSION = 2
 
     @staticmethod
     def _borrow_pid_key(owner_id: Any, pid: str) -> str:
         return f"{owner_id}:{pid}"
 
-    @staticmethod
-    def _borrow_name_key(owner_id: Any, profile_name: str) -> str:
-        return f"{owner_id}:name:{profile_name}"
-
     def _borrow_key_for_config(self, config: Dict[str, Any]) -> Optional[str]:
         """The source key a borrow's own config points at, or None if it points nowhere.
 
-        A borrow with neither a source PID nor a source name is unresolvable and is
-        deleted by _validate_and_clean_borrowed_profiles; there is nothing to index.
+        PID only. A borrow whose source PID is unknown is not indexable, and after
+        _migrate_borrow_pointers there should be none -- the migration resolves the
+        pre-PID population through their owners' indexes and stamps `original_pid`.
+        One that survives both is unresolvable and is deleted by
+        _validate_and_clean_borrowed_profiles; there is nothing to index.
         """
         owner = config.get("original_owner_id")
         if not owner:
             return None
         pid = config.get("original_pid") or config.get("original_profile_id")
-        if pid:
+        if pid and pid != _UNKNOWN_SOURCE_PID:
             return self._borrow_pid_key(owner, pid)
-        name = config.get("original_profile_name")
-        if name:
-            return self._borrow_name_key(owner, name)
         return None
 
     def _load_borrow_index(self):
-        """Read borrows.json, or build it from a full scan the first time.
+        """Read borrows.json, or build it from a full scan when it is missing or stale.
 
-        The one-off scan is the migration: every install predating this index has
-        borrows on disk and no file describing them, and an empty index would
-        report every distributed profile as private.
+        The one-off scan is the migration, in both directions it has ever been needed:
+        an install predating the index has borrows on disk and no file describing them,
+        and an install on version 1 has a file keyed by local name that this build
+        cannot read. An empty index would report every distributed profile as private,
+        so neither may be treated as "no borrows".
         """
         data = IOManager.read_json(BORROW_INDEX_FILE)
-        if isinstance(data, dict) and isinstance(data.get("sources"), dict):
+        if (isinstance(data, dict) and isinstance(data.get("sources"), dict)
+                and data.get("version") == self.BORROW_INDEX_VERSION):
             self.cog.borrow_index = data["sources"]
             self._rebuild_borrow_inverse()
             return
 
+        stamped = self._migrate_borrow_pointers()
         count = self._rebuild_borrow_index()
+        if stamped:
+            print(f"Borrow index: stamped {stamped} legacy borrow"
+                  f"{'' if stamped == 1 else 's'} with a source PID.")
         print(f"Borrow index: built from scan ({count} borrow"
               f"{'' if count == 1 else 's'} across "
               f"{len(self.cog.borrow_index)} source profile"
               f"{'' if len(self.cog.borrow_index) == 1 else 's'}).")
 
+    def _migrate_borrow_pointers(self) -> int:
+        """Give every borrow a source PID, resolving the ones that only have a name.
+
+        Run once, before the index is rebuilt, and proactive on purpose: the
+        alternative is carrying the "<owner>:name:<name>" key form and its
+        union-both-lookups tax in every reader forever, on the chance that some borrow
+        somewhere still has no PID. Resolving them all up front is a bounded one-time
+        cost that lets the second key form be deleted outright.
+
+        A name is resolved through the owner's *current* index, personal and system
+        both, since either can be shared. A borrow whose name resolves to nothing --
+        the source was renamed or deleted before this ran -- is left alone: it is
+        unresolvable either way, and _validate_and_clean_borrowed_profiles is what
+        reaps it. Blocking; boot only.
+        """
+        if not os.path.isdir(USERS_DIR):
+            return 0
+
+        stamped = 0
+        owner_maps: Dict[str, Dict[str, str]] = {}
+
+        for user_id_str in os.listdir(USERS_DIR):
+            if not user_id_str.isdigit():
+                continue
+            try:
+                index = IOManager.read_json(
+                    os.path.join(USERS_DIR, user_id_str, "index.json")) or {}
+                borrowed = index.get("borrowed") or {}
+                if not isinstance(borrowed, dict):
+                    borrowed = {name: name for name in borrowed}
+
+                for local_name, pid in borrowed.items():
+                    data = self._get_profile_by_pid(int(user_id_str), pid)
+                    if not isinstance(data, dict):
+                        continue
+                    config = data.get("config") or {}
+                    owner = config.get("original_owner_id")
+                    existing = config.get("original_pid") or config.get("original_profile_id")
+                    if not owner or (existing and existing != _UNKNOWN_SOURCE_PID):
+                        continue
+
+                    owner_str = str(owner)
+                    if owner_str not in owner_maps:
+                        owner_index = IOManager.read_json(
+                            os.path.join(USERS_DIR, owner_str, "index.json")) or {}
+                        merged: Dict[str, str] = {}
+                        for key in ("personal", "system"):
+                            mapping = owner_index.get(key)
+                            if isinstance(mapping, dict):
+                                merged.update(mapping)
+                        owner_maps[owner_str] = merged
+
+                    source_name = config.get("original_profile_name")
+                    source_pid = owner_maps[owner_str].get(source_name) if source_name else None
+                    if not source_pid:
+                        continue
+
+                    config["original_pid"] = source_pid
+                    # Kept in step rather than dropped: several readers still reach for
+                    # original_profile_id first, and leaving it naming the old sentinel
+                    # would hand them the value this migration exists to remove.
+                    config["original_profile_id"] = source_pid
+                    config["pointer"] = config.get("pointer") or self._borrow_pid_key(
+                        owner_str, source_pid)
+                    data["config"] = config
+                    self._save_profile_by_pid(int(user_id_str), pid, data)
+                    stamped += 1
+            except Exception as e:
+                print(f"Borrow migration: skipped user {user_id_str} ({e})")
+
+        return stamped
+
     def _rebuild_borrow_inverse(self):
-        """Derive borrower -> {local name: source key} from the persisted sources map."""
+        """Derive borrower -> {borrow PID: source key} from the persisted sources map."""
         inverse: Dict[str, Dict[str, str]] = {}
         for source_key, borrowers in self.cog.borrow_index.items():
             if not isinstance(borrowers, dict):
                 continue
-            for borrower_str, names in borrowers.items():
+            for borrower_str, borrow_pids in borrowers.items():
                 slot = inverse.setdefault(str(borrower_str), {})
-                for local_name in (names or []):
-                    slot[local_name] = source_key
+                for borrow_pid in (borrow_pids or []):
+                    slot[borrow_pid] = source_key
         self.cog.borrow_index_inverse = inverse
 
     def _save_borrow_index(self):
         try:
-            IOManager.write_json({"version": 1, "sources": self.cog.borrow_index},
+            IOManager.write_json({"version": self.BORROW_INDEX_VERSION,
+                                  "sources": self.cog.borrow_index},
                                  BORROW_INDEX_FILE)
         except Exception as e:
             print(f"Error saving borrow index: {e}")
@@ -364,14 +467,15 @@ class ProfileManager:
                     borrowed = index.get("borrowed") or {}
                     if not isinstance(borrowed, dict):
                         borrowed = {name: name for name in borrowed}
-                    for local_name, pid in borrowed.items():
-                        data = self._get_profile_by_pid(int(user_id_str), pid) or {}
+
+                    for borrow_pid in borrowed.values():
+                        data = self._get_profile_by_pid(int(user_id_str), borrow_pid) or {}
                         key = self._borrow_key_for_config(data.get("config") or {})
                         if not key:
                             continue
                         sources.setdefault(key, {}).setdefault(user_id_str, [])
-                        if local_name not in sources[key][user_id_str]:
-                            sources[key][user_id_str].append(local_name)
+                        if borrow_pid not in sources[key][user_id_str]:
+                            sources[key][user_id_str].append(borrow_pid)
                             total += 1
                 except Exception as e:
                     print(f"Borrow index: skipped user {user_id_str} ({e})")
@@ -381,27 +485,28 @@ class ProfileManager:
         self._save_borrow_index()
         return total
 
-    def _borrow_index_add(self, borrower_str: str, local_name: str, config: Dict[str, Any]) -> bool:
+    def _borrow_index_add(self, borrower_str: str, borrow_pid: str,
+                          config: Dict[str, Any]) -> bool:
         key = self._borrow_key_for_config(config)
         if not key:
             return False
-        names = self.cog.borrow_index.setdefault(key, {}).setdefault(borrower_str, [])
-        if local_name not in names:
-            names.append(local_name)
-        self.cog.borrow_index_inverse.setdefault(borrower_str, {})[local_name] = key
+        pids = self.cog.borrow_index.setdefault(key, {}).setdefault(borrower_str, [])
+        if borrow_pid not in pids:
+            pids.append(borrow_pid)
+        self.cog.borrow_index_inverse.setdefault(borrower_str, {})[borrow_pid] = key
         return True
 
-    def _borrow_index_remove(self, borrower_str: str, local_name: str) -> bool:
-        key = self.cog.borrow_index_inverse.get(borrower_str, {}).pop(local_name, None)
+    def _borrow_index_remove(self, borrower_str: str, borrow_pid: str) -> bool:
+        key = self.cog.borrow_index_inverse.get(borrower_str, {}).pop(borrow_pid, None)
         if not self.cog.borrow_index_inverse.get(borrower_str):
             self.cog.borrow_index_inverse.pop(borrower_str, None)
         if not key:
             return False
         borrowers = self.cog.borrow_index.get(key) or {}
-        names = borrowers.get(borrower_str) or []
-        if local_name in names:
-            names.remove(local_name)
-        if not names:
+        pids = borrowers.get(borrower_str) or []
+        if borrow_pid in pids:
+            pids.remove(borrow_pid)
+        if not pids:
             borrowers.pop(borrower_str, None)
         if not borrowers:
             self.cog.borrow_index.pop(key, None)
@@ -419,11 +524,11 @@ class ProfileManager:
         """
         user_str = str(user_id)
         changed = False
-        for local_name in list(self.cog.borrow_index_inverse.get(user_str, {})):
-            changed = self._borrow_index_remove(user_str, local_name) or changed
+        for borrow_pid in list(self.cog.borrow_index_inverse.get(user_str, {})):
+            changed = self._borrow_index_remove(user_str, borrow_pid) or changed
 
-        prefixes = (f"{user_str}:",)
-        for key in [k for k in self.cog.borrow_index if k.startswith(prefixes)]:
+        prefix = f"{user_str}:"
+        for key in [k for k in self.cog.borrow_index if k.startswith(prefix)]:
             self.cog.borrow_index.pop(key, None)
             changed = True
         if changed:
@@ -437,10 +542,16 @@ class ProfileManager:
         borrow is what makes this maintenance-free: every one of them saves the index
         afterwards, so none can be forgotten.
 
-        The common case is a personal-profile save with no borrows touched at all,
-        which costs one set comparison. Only a genuinely new local name reads a file,
-        and it reads the shard directly by PID -- _get_profile_config would resolve
-        through _get_user_index, which is what called us during a repair.
+        Compares PIDs, so it sees exactly the two events that concern it -- a borrow
+        gained and a borrow lost. A rename changes only the key it is filed under in
+        the user's own index and does not reach here at all; keyed by name this was a
+        remove plus an add, and the add decrypted the shard to re-derive a source that
+        had not changed.
+
+        The common case is a personal-profile save with no borrows touched, which
+        costs one set comparison. Only a genuinely new borrow reads a file, and it
+        reads the shard directly by PID -- _get_profile_config would resolve through
+        _get_user_index, which is what called us during a repair.
         """
         user_str = str(user_id)
         borrowed = index.get("borrowed") or {}
@@ -448,47 +559,39 @@ class ProfileManager:
             borrowed = {name: name for name in borrowed}
 
         known = set(self.cog.borrow_index_inverse.get(user_str, {}))
-        current = set(borrowed)
+        current = set(borrowed.values())
         if known == current:
             return
 
         changed = False
-        for local_name in known - current:
-            changed = self._borrow_index_remove(user_str, local_name) or changed
-        for local_name in current - known:
-            data = self._get_profile_by_pid(user_id, borrowed[local_name]) or {}
+        for borrow_pid in known - current:
+            changed = self._borrow_index_remove(user_str, borrow_pid) or changed
+        for borrow_pid in current - known:
+            data = self._get_profile_by_pid(user_id, borrow_pid) or {}
             changed = self._borrow_index_add(
-                user_str, local_name, data.get("config") or {}) or changed
+                user_str, borrow_pid, data.get("config") or {}) or changed
 
         if changed:
             self._save_borrow_index()
 
-    def _borrowers_of(self, owner_id: int, pid: Optional[str],
-                      profile_name: Optional[str]) -> List[Tuple[int, str]]:
-        """Every (borrower_id, their local name) currently holding this source profile.
+    def _borrowers_of(self, owner_id: int, pid: Optional[str]) -> List[Tuple[int, str]]:
+        """Every (borrower_id, their borrow's PID) currently holding this source profile.
 
-        Both key forms are unioned -- see the note above _borrow_pid_key. The owner
-        is excluded: a profile the owner also holds a borrow of is not distributed
-        to anybody.
+        One key form, one lookup -- see the note above _borrow_pid_key for why the
+        name-keyed form no longer exists. The owner is excluded: a profile the owner
+        also holds a borrow of is not distributed to anybody.
         """
-        keys = []
-        if pid:
-            keys.append(self._borrow_pid_key(owner_id, pid))
-        if profile_name:
-            keys.append(self._borrow_name_key(owner_id, profile_name))
+        if not pid:
+            return []
 
         owner_str = str(owner_id)
         found: List[Tuple[int, str]] = []
-        seen = set()
-        for key in keys:
-            for borrower_str, names in (self.cog.borrow_index.get(key) or {}).items():
-                if borrower_str == owner_str or not borrower_str.isdigit():
-                    continue
-                for local_name in (names or []):
-                    pair = (int(borrower_str), local_name)
-                    if pair not in seen:
-                        seen.add(pair)
-                        found.append(pair)
+        for borrower_str, borrow_pids in (
+                self.cog.borrow_index.get(self._borrow_pid_key(owner_id, pid)) or {}).items():
+            if borrower_str == owner_str or not borrower_str.isdigit():
+                continue
+            for borrow_pid in (borrow_pids or []):
+                found.append((int(borrower_str), borrow_pid))
         return found
 
     def register_share_code(self, code: str, data: Dict[str, Any]):
@@ -753,6 +856,106 @@ class ProfileManager:
         os.makedirs(p_dir, exist_ok=True)
         path = os.path.join(p_dir, "profile.json.gz")
         IOManager.write_json_gzip(data, path, self.cog.fernet)
+        # After the shard, never before: the sidecar exists to describe a shard that
+        # is already on disk, and a crash between the two must leave the name file
+        # trailing the profile rather than announcing one that was never written.
+        self._write_name_sidecar(user_id, pid, data.get("name"),
+                                 self._pid_class(pid, data.get("config")))
+
+    # --- The name sidecar ----------------------------------------------------------
+    #
+    # index.json is derived state: every name -> PID entry in it can be reconstructed
+    # from the profiles directory. What made a reconstruction expensive was that the
+    # name lived only inside profile.json.gz, so _repair_user_index had to decrypt and
+    # zstd-inflate every shard a user owned just to read one string out of each.
+    # That cost is the reason repair was something to be avoided rather than simply
+    # done, and the reason _index_is_consistent exists at all.
+    #
+    # The class no longer needs reading either -- it is the PID's first letter, see
+    # PID_CLASS_PREFIXES -- so the name is the only irreducible fact, and a few hundred
+    # plaintext bytes beside the shard makes rebuilding it cheap enough to stop
+    # tiptoeing around.
+
+    @staticmethod
+    def _name_sidecar_path(user_id: Any, pid: str) -> str:
+        return os.path.join(USERS_DIR, str(user_id), "profiles", pid, PROFILE_NAME_SIDECAR)
+
+    def _write_name_sidecar(self, user_id: int, pid: str, name: Optional[str],
+                            category: Optional[str] = None):
+        """Record a profile's name and class beside its shard. Best-effort.
+
+        A failure here is not worth failing a save over: the sidecar is a speed-up,
+        and the readers fall back to opening the shard whenever it is missing or
+        unreadable -- then write it, so a gap heals on the next rebuild.
+        """
+        if not name:
+            return
+        payload = {"name": name}
+        if category:
+            payload["class"] = category
+        try:
+            IOManager.write_json(payload, self._name_sidecar_path(user_id, pid))
+        except Exception as e:
+            print(f"Name sidecar: write failed for {user_id}/{pid} ({e})")
+
+    def _describe_shard(self, user_id: int, pid: str,
+                        backfill: bool = True) -> Optional[Tuple[str, str]]:
+        """(display name, index class) for one PID, without opening the shard if possible.
+
+        The two facts index.json holds about a profile. The sidecar answers both; a
+        well-formed PID answers the class on its own. Only a profile with neither --
+        one written before the sidecar existed -- costs a decrypt, and `backfill`
+        then writes the sidecar so it is the last time that profile costs one.
+
+        Returns None when there is no readable profile at this PID at all, which is
+        how a caller tells an orphaned directory from a real one.
+        """
+        sidecar = IOManager.read_json(self._name_sidecar_path(user_id, pid))
+        if isinstance(sidecar, dict) and sidecar.get("name"):
+            category = sidecar.get("class") or self._pid_class(pid)
+            if category:
+                return sidecar["name"], category
+
+        profile_data = self._get_profile_by_pid(user_id, pid)
+        if not isinstance(profile_data, dict):
+            return None
+        name = profile_data.get("name") or pid
+        category = self._pid_class(pid, profile_data.get("config")) or "personal"
+        if backfill:
+            self._write_name_sidecar(user_id, pid, name, category)
+        return name, category
+
+    #: A minted PID is a class letter plus uuid4().hex[:15].upper() -- 16 characters,
+    #: uppercase hex after the first.
+    _PID_BODY = frozenset("0123456789ABCDEF")
+
+    @classmethod
+    def _is_pid(cls, pid: str) -> bool:
+        """Whether this folder name is a minted PID rather than a pre-PID profile name.
+
+        The check has to be the full shape, not the first letter. Profile names are
+        also legal folder names in the pre-PID population, and a user with a profile
+        called "Bob" would otherwise be read as a borrow and one called "Xavier" as a
+        System profile.
+        """
+        return (isinstance(pid, str) and len(pid) == 16
+                and pid[0] in PID_CLASS_PREFIXES
+                and all(c in cls._PID_BODY for c in pid[1:]))
+
+    @classmethod
+    def _pid_class(cls, pid: str, config: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Which index.json map owns this PID: "personal", "borrowed" or "system".
+
+        The letter is the answer for everything minted since PIDs were introduced.
+        `config` is the fallback for the pre-PID population, where a source pointer is
+        what makes a borrow a borrow. None means "unknown, and there was no config to
+        ask" -- the caller has to open the shard.
+        """
+        if cls._is_pid(pid):
+            return PID_CLASS_PREFIXES[pid[0]]
+        if config is None:
+            return None
+        return "borrowed" if config.get("original_owner_id") else "personal"
 
     def _set_child_bot_config(self, user_id: int, profile_name: str, bot_config: Dict[str, Any]):
         p_data = self._get_profile(user_id, profile_name, is_borrowed=False)
@@ -787,12 +990,21 @@ class ProfileManager:
             
         pid = user_index[list_key].pop(old_name)
         user_index[list_key][new_name] = pid
-        self._save_user_index(user_id, user_index)
-        
+
+        # Shard first, index second, as everywhere else. The shard's name -- and the
+        # sidecar beside it -- is what a rebuild believes, so writing the index first
+        # meant a crash in between left a rebuild able to undo the rename.
+        #
+        # Nothing else moves: the PID is the directory name, so memories, training
+        # examples and the borrow index all stay put. Keyed by local name, the borrow
+        # index used to see this as a borrow lost and a borrow gained, and decrypt the
+        # shard to re-derive a source that had not changed.
         p_data = self._get_profile_by_pid(user_id, pid)
         if p_data:
             p_data["name"] = new_name
             self._save_profile_by_pid(user_id, pid, p_data)
+
+        self._save_user_index(user_id, user_index)
 
         # The name is part of the classified surface, and the cache is keyed by it,
         # so both entries must go -- the stale key would otherwise linger until the
@@ -841,18 +1053,35 @@ class ProfileManager:
         self.cog.memory_manager._copy_training_shard(str(user_id), source_name, target_name)
         return True, f"Duplicated to '{target_name}'."
 
+    #: The keys of index.json a rebuild reconstructs from the profiles directory.
+    #: Everything else in the file is carried through untouched -- see
+    #: _repair_user_index for why the list is of what is derived rather than of what
+    #: is preserved.
+    _DERIVED_INDEX_KEYS = ("personal", "borrowed", "system")
+
     def _repair_user_index(self, user_id: int) -> Dict[str, Any]:
-        """Scans the user's profile directory to reconstruct a missing or corrupted index.json."""
+        """Rebuild the name -> PID maps in a user's index.json from their profiles directory.
+
+        Rebuilds *only* `_DERIVED_INDEX_KEYS` and leaves the rest of the file alone.
+        This used to be the other way round -- a fresh dict naming the keys worth
+        keeping -- so every non-derivable key added later ("defaults", "about", and
+        whatever comes next) had to be remembered here or a repair silently deleted a
+        user's settings. Preserving by default makes that impossible to get wrong.
+
+        The three maps are cleared before the scan refills them. "system" used to be
+        seeded from the old index and only added to, so a System profile whose folder
+        was gone stayed named in the map forever -- and since _index_is_consistent
+        counts it, that one stale entry failed the check on every pass and bought a
+        full repair every hour, for good.
+
+        Cheap now: _describe_shard answers from the plaintext sidecar, so this touches
+        an encrypted shard only for profiles written before the sidecar existed, and
+        backfills those as it goes.
+        """
         user_id_str = str(user_id)
-        old_index = IOManager.read_json(os.path.join(USERS_DIR, user_id_str, "index.json")) or {}
-        # "defaults" and "about" are carried across for the same reason "system" is:
-        # this function reconstructs the profile lists by scanning the directory, and
-        # everything it cannot scan for has to be preserved explicitly or a repair
-        # silently deletes it. There is nothing on disk to rebuild a user's default
-        # settings or their timezone from.
-        index = {"personal": {}, "borrowed": {}, "system": old_index.get("system", {}),
-                 "defaults": old_index.get("defaults", {}),
-                 "about": old_index.get("about", {})}
+        index = IOManager.read_json(os.path.join(USERS_DIR, user_id_str, "index.json")) or {}
+        for key in self._DERIVED_INDEX_KEYS:
+            index[key] = {}
         profiles_dir = os.path.join(USERS_DIR, user_id_str, "profiles")
 
         if os.path.isdir(profiles_dir):
@@ -861,24 +1090,17 @@ class ProfileManager:
                 if not os.path.isdir(p_dir):
                     continue
 
-                profile_path = os.path.join(p_dir, "profile.json.gz")
-                if not os.path.exists(profile_path):
+                # The shard, not the sidecar, is what makes a directory a profile. A
+                # directory holding only memories -- see the note on _get_shard_path --
+                # is an orphan, and naming it in the index would make it resolvable.
+                if not os.path.exists(os.path.join(p_dir, "profile.json.gz")):
                     continue
 
-                profile_data = IOManager.read_json_gzip(profile_path, self.cog.fernet) or {}
-                p_name = profile_data.get("name") or pid_folder
-                config_data = profile_data.get("config", {})
-
-                is_borrowed = bool(config_data.get("original_owner_id"))
-
-                if is_borrowed:
-                    index["borrowed"][p_name] = pid_folder
-                elif pid_folder.startswith("X"):
-                    if "system" not in index:
-                        index["system"] = {}
-                    index["system"][p_name] = pid_folder
-                else:
-                    index["personal"][p_name] = pid_folder
+                described = self._describe_shard(user_id, pid_folder)
+                if described is None:
+                    continue
+                p_name, category = described
+                index.setdefault(category, {})[p_name] = pid_folder
 
         # Runs whether or not there was a profiles directory to scan: a user with no
         # profiles still has a key flag, and the branches that used to bracket this
@@ -887,6 +1109,25 @@ class ProfileManager:
         self._save_user_index(user_id, index)
 
         return index
+
+    @staticmethod
+    def _profiles_dir_stamp(user_id_str: str) -> Optional[int]:
+        """mtime_ns of the user's profiles/ directory, or None when there is none.
+
+        A directory's own mtime moves when an entry is created or removed in it, and
+        not when a file inside one of its children is rewritten -- which is exactly
+        the granularity index.json cares about. Creating or deleting a profile bumps
+        it; editing one does not.
+
+        A rename does not bump it either, but a rename writes index.json through
+        _rename_profile, and _save_user_index re-stamps. So the stamp only has to
+        catch what happens *outside* this process: a restore from backup, a hand-
+        edited directory, another instance.
+        """
+        try:
+            return os.stat(os.path.join(USERS_DIR, user_id_str, "profiles")).st_mtime_ns
+        except OSError:
+            return None
 
     @staticmethod
     def _key_file_stamp(user_id_str: str) -> Optional[List[int]]:
@@ -919,7 +1160,7 @@ class ProfileManager:
     def _index_is_consistent(self, user_id_str: str) -> bool:
         """Cheap pre-check for _repair_all_user_indices.
 
-        A repair opens, Fernet-decrypts and zstd-decompresses every profile shard the
+        A repair opens, decrypts and zstd-decompresses every profile shard the
         user owns. That is the right cost when the index is actually wrong, and pure
         waste when it is not -- and this runs on every boot AND hourly, so the common
         case is "nothing has changed since the last one".
@@ -938,17 +1179,36 @@ class ProfileManager:
             if not index or not isinstance(index.get("personal"), dict) or not isinstance(index.get("borrowed"), dict):
                 return False
 
+            # The cheapest test first: if profiles/ has not gained or lost an entry
+            # since the index was written, no profile was created or deleted, and the
+            # set comparison below cannot fail. One stat instead of a listdir.
+            #
+            # Presence is the test, not truth -- as with key_file_stamp, None is the
+            # honest stamp of a user with no profiles directory. An index written
+            # before this existed carries no stamp at all, fails once, and is stamped
+            # by the repair.
+            if "profiles_stamp" not in index:
+                return False
+            if index["profiles_stamp"] != self._profiles_dir_stamp(user_id_str):
+                return False
+
             profiles_dir = os.path.join(USERS_DIR, user_id_str, "profiles")
-            shards_on_disk = 0
+            pids_on_disk = set()
             if os.path.isdir(profiles_dir):
                 for pid_folder in os.listdir(profiles_dir):
                     if os.path.exists(os.path.join(profiles_dir, pid_folder, "profile.json.gz")):
-                        shards_on_disk += 1
+                        pids_on_disk.add(pid_folder)
 
-            named_in_index = (len(index.get("personal", {}))
-                              + len(index.get("borrowed", {}))
-                              + len(index.get("system", {})))
-            if named_in_index != shards_on_disk:
+            # Sets, not counts. The folder names on disk *are* the index's values, so
+            # comparing them costs the same listdir and catches what a count cannot:
+            # one profile created and another deleted between passes, a folder renamed
+            # by hand, or the same PID named under two entries.
+            pids_in_index = set()
+            for key in self._DERIVED_INDEX_KEYS:
+                mapping = index.get(key)
+                if isinstance(mapping, dict):
+                    pids_in_index.update(mapping.values())
+            if pids_in_index != pids_on_disk:
                 return False
 
             # Nothing clears has_personal_key when a key is deleted -- only a repair
@@ -956,7 +1216,7 @@ class ProfileManager:
             #
             # Verified against a stat rather than the file's contents. This ran per
             # user on every boot and then hourly, and opening keys.json.gz means a
-            # Fernet decrypt, a zstd decompress and a parse -- for a flag that only
+            # decrypt, a zstd decompress and a parse -- for a flag that only
             # changes when the file does. The stamp is written beside the flag by
             # _refresh_key_flag; if it still matches the file, the flag was computed
             # from these exact bytes and needs no re-reading.
@@ -1000,6 +1260,45 @@ class ProfileManager:
         if force:
             self._rebuild_borrow_index()
 
+    def backfill_name_sidecars(self) -> int:
+        """Write the plaintext name sidecar for every profile that has not got one.
+
+        Proactive, once at boot, rather than left to heal profile-by-profile on the
+        next rebuild. The point of the sidecar is that a rebuild never has to decrypt
+        anything; a population that is half migrated still pays the old cost for the
+        half that has not been touched, and the profiles least likely to be written
+        again are exactly the ones a rebuild would otherwise keep opening.
+
+        Blocking, and proportional to the profiles missing a sidecar -- zero after the
+        first run. Returns how many it wrote.
+        """
+        if not os.path.isdir(USERS_DIR):
+            return 0
+
+        written = 0
+        for user_id_str in os.listdir(USERS_DIR):
+            if not user_id_str.isdigit():
+                continue
+            profiles_dir = os.path.join(USERS_DIR, user_id_str, "profiles")
+            if not os.path.isdir(profiles_dir):
+                continue
+            for pid_folder in os.listdir(profiles_dir):
+                p_dir = os.path.join(profiles_dir, pid_folder)
+                if not os.path.isdir(p_dir):
+                    continue
+                if not os.path.exists(os.path.join(p_dir, "profile.json.gz")):
+                    continue
+                if os.path.exists(os.path.join(p_dir, PROFILE_NAME_SIDECAR)):
+                    continue
+                try:
+                    # _describe_shard writes the sidecar itself on the fallback path,
+                    # which is the path every profile takes here by definition.
+                    if self._describe_shard(int(user_id_str), pid_folder) is not None:
+                        written += 1
+                except Exception as e:
+                    print(f"Name sidecar: backfill failed for {user_id_str}/{pid_folder} ({e})")
+        return written
+
     def _get_user_index(self, user_id: int) -> Dict[str, Any]:
         user_id_str = str(user_id)
         if user_id_str in self.cog.user_indices: return self.cog.user_indices[user_id_str]
@@ -1026,6 +1325,12 @@ class ProfileManager:
     def _save_user_index(self, user_id: int, data: Dict[str, Any]):
         user_id_str = str(user_id)
         path = os.path.join(USERS_DIR, user_id_str, "index.json")
+        # Stamped here because this is the only writer, and stamped *before* the write
+        # so the value describes the directory this index was built against. Every
+        # caller that creates or deletes a profile now writes the shard first (see the
+        # ordering note on _get_or_create_user_profile), so by the time we get here
+        # profiles/ already holds what the index is about to claim.
+        data["profiles_stamp"] = self._profiles_dir_stamp(user_id_str)
         IOManager.write_json(data, path)
         self.cog.user_indices[user_id_str] = data
         # Every path that adds or removes a borrow ends here, which is why the
@@ -1071,7 +1376,7 @@ class ProfileManager:
     # the timezone is read on the turn path -- once per user message, to format that
     # message's history line. It used to be read off whichever profile the user
     # happened to have active in the channel, through _get_profile_config, which
-    # caches nothing and so paid a Fernet decrypt, a zstd decompress and a parse for
+    # caches nothing and so paid a decrypt, a zstd decompress and a parse for
     # one string. Worse, it was the wrong string: a user's clock is the user's, and
     # a user with no active profile silently got UTC.
     #
@@ -1292,9 +1597,10 @@ class ProfileManager:
                 pid = f"A{uuid.uuid4().hex[:15].upper()}"
                 index["personal"][profile_name] = pid
             else:
+                # Pre-PID index: the folder name is the profile name, which is what
+                # _resolve_owner_and_pid returns for a list-shaped "personal".
+                pid = profile_name
                 index.setdefault("personal", []).append(profile_name)
-
-            self._save_user_index(user_id, index)
 
             config = {
                 "grounding_enabled": False, "stm_length": defaultConfig.CHATBOT_MEMORY_LENGTH,
@@ -1341,7 +1647,12 @@ class ProfileManager:
                 "prompts": prompts,
                 "child_bot": None
             }
-            self._save_profile(user_id, profile_name, unified_profile, False)
+            # Shard first, index second. See the ordering rule on _save_user_index:
+            # a crash between the two must leave a profile the index has not named
+            # yet -- which a rebuild adopts -- rather than a name pointing at a
+            # directory that was never created, which a rebuild would delete.
+            self._save_profile_by_pid(user_id, pid, unified_profile)
+            self._save_user_index(user_id, index)
             return {"config": config, "prompts": prompts}
 
         return {"config": self._get_profile_config(user_id, profile_name), "prompts": self._get_profile_prompts(user_id, profile_name)}
@@ -1357,7 +1668,6 @@ class ProfileManager:
         if profile_name not in index["system"]:
             pid = f"X{uuid.uuid4().hex[:15].upper()}"
             index["system"][profile_name] = pid
-            self._save_user_index(user_id, index)
 
             config = {
                 "grounding_enabled": False, "stm_length": defaultConfig.CHATBOT_MEMORY_LENGTH,
@@ -1405,7 +1715,9 @@ class ProfileManager:
                 "prompts": prompts,
                 "child_bot": None
             }
+            # Shard first, index second -- see the ordering rule on _save_user_index.
             self._save_profile_by_pid(user_id, pid, unified_profile)
+            self._save_user_index(user_id, index)
 
         return {"config": self._get_profile_config(user_id, profile_name), "prompts": self._get_profile_prompts(user_id, profile_name)}
 
@@ -1699,30 +2011,32 @@ class ProfileManager:
                 continue
 
             o_id = b_config.get("original_owner_id")
-            o_pid = b_config.get("original_pid")
-            o_name = b_config.get("original_profile_name")
-            if o_id and (o_pid or o_name):
-                profiles_by_owner.setdefault(str(o_id),[]).append((local_name, o_pid, o_name))
+            o_pid = b_config.get("original_pid") or b_config.get("original_profile_id")
+            if o_id and o_pid and o_pid != _UNKNOWN_SOURCE_PID:
+                profiles_by_owner.setdefault(str(o_id), []).append((local_name, o_pid))
             else:
-                # A borrowed profile with no pointer back to a source cannot be
-                # resolved or refreshed; nothing can ever validate it again.
+                # A borrowed profile with no source PID cannot be resolved or
+                # refreshed; nothing can ever validate it again. The source *name* is
+                # not a substitute -- it is a snapshot taken at borrow time, so an
+                # owner's rename makes it name nothing, and _migrate_borrow_pointers
+                # has already had its one chance to turn it into a PID.
                 ids_to_remove.append(local_name)
 
         removed_count = 0
 
         for owner_id_str, items in profiles_by_owner.items():
             owner_index = self._get_user_index(int(owner_id_str))
-            owner_personal = owner_index.get("personal", {})
-            valid_pids = list(owner_personal.values()) if isinstance(owner_personal, dict) else[]
-            valid_names = list(owner_personal.keys()) if isinstance(owner_personal, dict) else owner_personal
+            # Personal and System both: a System profile can be shared, and validating
+            # a borrow of one against the personal map alone condemned it.
+            valid_pids = set()
+            for category in ("personal", "system"):
+                mapping = owner_index.get(category)
+                if isinstance(mapping, dict):
+                    valid_pids.update(mapping.values())
 
-            for local_name, o_pid, o_name in items:
-                if o_pid:
-                    if o_pid not in valid_pids:
-                        ids_to_remove.append(local_name)
-                else:
-                    if o_name not in valid_names:
-                        ids_to_remove.append(local_name)
+            for local_name, o_pid in items:
+                if o_pid not in valid_pids:
+                    ids_to_remove.append(local_name)
 
         if ids_to_remove:
             if isinstance(borrowed, dict):
@@ -1764,14 +2078,13 @@ class ProfileManager:
 
         # The reverse index names the borrowers outright, so only they are touched --
         # this used to open and decrypt every borrow config every user owned. A stale
-        # entry is tolerated rather than verified: a name the borrower no longer holds
+        # entry is tolerated rather than verified: a PID the borrower no longer holds
         # is skipped below, and a borrow the index has somehow missed is caught by
         # _validate_and_clean_borrowed_profiles and the daily integrity sweep, both of
         # which already exist to reap borrows whose source is gone.
         by_user: Dict[int, List[str]] = {}
-        for borrower_id, local_name in self._borrowers_of(
-                original_owner_id, deleted_pid, original_profile_name):
-            by_user.setdefault(borrower_id, []).append(local_name)
+        for borrower_id, borrow_pid in self._borrowers_of(original_owner_id, deleted_pid):
+            by_user.setdefault(borrower_id, []).append(borrow_pid)
 
         for uid, to_delete in by_user.items():
             user_id_str = str(uid)
@@ -1780,15 +2093,22 @@ class ProfileManager:
                 borrowed = index.get("borrowed", {})
                 removed = False
 
-                for b_name in to_delete:
-                    if b_name not in borrowed:
+                # The index is keyed by the borrower's local name; the reverse index
+                # hands us PIDs. Inverting once is cheaper than a scan per PID, and the
+                # PID is what identifies the directory to remove -- a name lookup that
+                # missed used to fall through to rmtree'ing a name-shaped path.
+                by_pid = ({pid: name for name, pid in borrowed.items()}
+                          if isinstance(borrowed, dict) else {n: n for n in borrowed})
+
+                for borrow_pid in to_delete:
+                    local_name = by_pid.get(borrow_pid)
+                    if local_name is None:
                         continue
                     if isinstance(borrowed, dict):
-                        pid = index["borrowed"].pop(b_name, b_name)
+                        index["borrowed"].pop(local_name, None)
                     else:
-                        index["borrowed"].remove(b_name)
-                        pid = b_name
-                    shutil.rmtree(os.path.join(USERS_DIR, user_id_str, "profiles", pid),
+                        index["borrowed"].remove(local_name)
+                    shutil.rmtree(os.path.join(USERS_DIR, user_id_str, "profiles", borrow_pid),
                                   ignore_errors=True)
                     removed = True
 
@@ -1797,8 +2117,8 @@ class ProfileManager:
                 else:
                     # Nothing to save, so the reconcile in _save_user_index will not
                     # run and the dead entries would survive in the index.
-                    for b_name in to_delete:
-                        self._borrow_index_remove(user_id_str, b_name)
+                    for borrow_pid in to_delete:
+                        self._borrow_index_remove(user_id_str, borrow_pid)
                     self._save_borrow_index()
             except Exception as e:
                 print(f"Error in cascade delete for user {user_id_str}: {e}")
@@ -2270,8 +2590,10 @@ class ProfileManager:
             return True
 
         eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
-        pid = self._get_pid_from_name_any(eff_owner, eff_name)
-        return bool(self._borrowers_of(eff_owner, pid, eff_name))
+        # Strict: a name that resolves to no PID has no borrowers to find, and the
+        # soft resolver's name-shaped answer would be looked up as though it were one.
+        pid = self._get_pid_from_name(eff_owner, eff_name)
+        return bool(self._borrowers_of(eff_owner, pid))
 
     async def submit_for_rating(self, owner_id: int, profile_name: str) -> Tuple[bool, str]:
         """Owner-initiated: move a profile to Pending and queue the classifier.
@@ -2525,6 +2847,10 @@ class ProfileManager:
             raw_export_data["profiles"][name] = p_entry
 
         raw_json_bytes = json.dumps(raw_export_data)
+        # Fernet, deliberately, where every file on disk is AES-GCM: the payload below
+        # is stored as a *string* inside a plaintext JSON container that travels between
+        # installs, so base64 is the point rather than the overhead it is on disk, and
+        # any build that can import a .mimic must keep being able to import this one.
         compressed_payload = zstd.ZstdCompressor(level=1).compress(raw_json_bytes)
         export_container = {
             "mimic_version": "3.0",
@@ -3507,8 +3833,17 @@ class ProfileManager:
         adjustments: List[Tuple[str, str]] = []
 
         def _sync_save():
-            target_original_pid = target_pid or owner_profile_data.get("profile_id", "00000000")
-            source_pointer = f"{sharer_id}:{target_original_pid}"
+            # The source PID, resolved rather than defaulted. This used to fall back to
+            # the literal "00000000" -- see _UNKNOWN_SOURCE_PID for what that did to the
+            # reverse index. A borrow whose source cannot be named is not a borrow that
+            # should be created: it can never be cascade-deleted, never counts towards
+            # the source being distributed, and can never be refreshed.
+            target_original_pid = (target_pid
+                                   or self._get_pid_from_name(sharer_id, current_name)
+                                   or owner_profile_data.get("profile_id"))
+            if not target_original_pid or target_original_pid == _UNKNOWN_SOURCE_PID:
+                return False
+            source_pointer = self._borrow_pid_key(sharer_id, target_original_pid)
             if is_public_borrow:
                 # Was an equality test against the raw value, which only ever matched
                 # the "owner:pid" string form -- a dict entry fell through to the raw
@@ -3565,7 +3900,6 @@ class ProfileManager:
                 index["borrowed"] = {}
 
             index["borrowed"][desired_name] = pid
-            self._save_user_index(interaction.user.id, index)
 
             unified_borrowed = {
                 "name": desired_name,
@@ -3573,9 +3907,22 @@ class ProfileManager:
                 "prompts": {},
                 "child_bot": None
             }
+            # Shard first, index second, and here the ordering is load-bearing beyond
+            # crash safety: _save_user_index runs _reconcile_borrow_index, which reads
+            # the new borrow's shard to learn what it points at. Saving the index first
+            # meant that read found no file, _borrow_key_for_config got an empty config
+            # and returned None, and the borrow was never written to borrows.json at
+            # all -- so is_profile_distributed reported a freshly borrowed profile as
+            # private until the borrower's index happened to fall out of the LRU.
             self._save_profile_by_pid(interaction.user.id, pid, unified_borrowed)
+            self._save_user_index(interaction.user.id, index)
+            return True
 
-        await asyncio.to_thread(_sync_save)
+        if not await asyncio.to_thread(_sync_save):
+            await interaction.followup.send(
+                "That profile could not be traced back to its owner, so it cannot be "
+                "borrowed. Ask them to re-share it.", ephemeral=True)
+            return
 
         if not is_public_borrow:
             await self._reject_share_request(interaction, sharer_id, target_pid, fallback_name, notify_sharer=True, accepted=True)

@@ -117,11 +117,13 @@ class RegenerationMixin:
 
         # Pre-emptive visual feedback before disk I/O and context gathering
         if participant.get('method') == 'child_bot':
+            child_emoji = await self.cog.child_bot_manager.resolve_emoji_for_child(
+                participant['bot_id'], custom_emoji)
             await self.cog.manager_queue.put({
                 "action": "send_to_child", "bot_id": participant['bot_id'],
                 "payload": {
                     "action": "regenerate_message", "channel_id": channel.id,
-                    "message_id": payload.message_id, "content": custom_emoji
+                    "message_id": payload.message_id, "content": child_emoji
                 }
             })
         else:

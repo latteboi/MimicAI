@@ -5,7 +5,8 @@ from discord import ui
 import datetime
 import traceback
 from typing import TYPE_CHECKING, List, Dict, Tuple, Optional
-from ..managers.memory_manager import encode_embedding_b64
+from ..managers.memory_manager import (EMBEDDING_FAILED_MSG, NO_EMBEDDING_KEY_MSG,
+                                       encode_embedding_b64)
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -29,21 +30,18 @@ class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
         await i.response.defer(ephemeral=True, thinking=True)
         new_summary = self.summary_field.value
         
-        guild_id = i.guild_id
-        if not guild_id:
-            user = self.cog.bot.get_user(i.user.id)
-            if user:
-                for guild in self.cog.bot.guilds:
-                    if guild.get_member(user.id):
-                        guild_id = guild.id
-                        break
-        if not guild_id:
-            await i.followup.send("Could not determine a valid context to get an API key. Please try editing from a server.", ephemeral=True)
+        # No guild hunt. This used to walk bot.guilds for any server the *invoker*
+        # shares with the bot, which says nothing about whether that server has a key
+        # assigned -- so in a DM it reliably picked a keyless guild and reported the
+        # miss as a broken embedding. The owner's own key is the answer instead.
+        if not self.cog.storage_manager._embedding_api_key(i.guild_id, self.profile_owner_id):
+            await i.followup.send(NO_EMBEDDING_KEY_MSG, ephemeral=True)
             return
 
-        new_embedding = await self.cog.memory_manager._get_embedding(new_summary, guild_id, task_type="RETRIEVAL_DOCUMENT")
+        new_embedding = await self.cog.memory_manager._get_embedding(
+            new_summary, i.guild_id, task_type="RETRIEVAL_DOCUMENT", owner_id=self.profile_owner_id)
         if not new_embedding:
-            await i.followup.send("Failed to generate embedding for the new summary. The memory was not updated.", ephemeral=True)
+            await i.followup.send(EMBEDDING_FAILED_MSG, ephemeral=True)
             return
 
         b64_emb = encode_embedding_b64(new_embedding)
@@ -60,7 +58,7 @@ class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
 class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
     summary_field = ui.TextInput(label="Memory Summary", style=discord.TextStyle.paragraph, required=True, max_length=2000)
 
-    def __init__(self, cog, profile_owner_id: int, profile_name: str, guild_id: int):
+    def __init__(self, cog, profile_owner_id: int, profile_name: str, guild_id: Optional[int]):
         super().__init__()
         self.cog: MimicCog = cog
         self.profile_owner_id = profile_owner_id
@@ -69,7 +67,19 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
 
     async def on_submit(self, i: discord.Interaction):
         await i.response.defer(ephemeral=True, thinking=True)
-        
+
+        # A memory is filed under the guild it formed in, and retrieval only ever looks
+        # in the current guild's bucket -- so _add_ltm drops one with no guild rather
+        # than store something nothing can recall. That drop was silent, and this modal
+        # reported "LTM entry added" on top of it. Refuse up front instead: the work
+        # below (a limit check, an embedding, a shard write) all leads nowhere here.
+        if not self.guild_id:
+            await i.followup.send(
+                "A memory has to be filed under a server, because that is where it can "
+                "be recalled. Run `/profile manage` in the server this memory belongs to "
+                "and add it there.", ephemeral=True)
+            return
+
         # [NEW] Manual Hard Block Check
         user_id_str = str(self.profile_owner_id)
         ltm_shard = self.cog.memory_manager._load_ltm_shard(user_id_str, self.profile_name)
@@ -86,9 +96,14 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
 
         summary = self.summary_field.value
         
-        embedding = await self.cog.memory_manager._get_embedding(summary, self.guild_id, task_type="RETRIEVAL_DOCUMENT")
+        if not self.cog.storage_manager._embedding_api_key(self.guild_id, self.profile_owner_id):
+            await i.followup.send(NO_EMBEDDING_KEY_MSG, ephemeral=True)
+            return
+
+        embedding = await self.cog.memory_manager._get_embedding(
+            summary, self.guild_id, task_type="RETRIEVAL_DOCUMENT", owner_id=self.profile_owner_id)
         if not embedding:
-            await i.followup.send("Failed to generate embedding for the summary. The memory was not added.", ephemeral=True)
+            await i.followup.send(EMBEDDING_FAILED_MSG, ephemeral=True)
             return
 
         b64_emb = encode_embedding_b64(embedding)
@@ -114,7 +129,7 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
 class AddTrainingExampleModal(ui.Modal, title="Add Profile Training Example"): 
     user_input_field=ui.TextInput(label="User Input Example",style=discord.TextStyle.paragraph,required=True,max_length=1000)
     chatbot_response_field=ui.TextInput(label="Desired Chatbot Response",style=discord.TextStyle.paragraph,required=True,max_length=2000)
-    def __init__(self, cog, profile_owner_id: int, profile_name: str, guild_id: int):
+    def __init__(self, cog, profile_owner_id: int, profile_name: str, guild_id: Optional[int]):
         super().__init__()
         self.cog:MimicCog=cog
         self.profile_owner_id = profile_owner_id
@@ -147,7 +162,7 @@ class EditTrainingExampleModal(ui.Modal, title="Edit Profile Training Example"):
     user_input_field = ui.TextInput(label="User Input Example", style=discord.TextStyle.paragraph, required=True, max_length=1000)
     chatbot_response_field = ui.TextInput(label="Desired Chatbot Response", style=discord.TextStyle.paragraph, required=True, max_length=2000)
 
-    def __init__(self, cog, profile_owner_id: int, profile_name: str, example_id: str, current_user_input: str, current_bot_response: str, guild_id: int):
+    def __init__(self, cog, profile_owner_id: int, profile_name: str, example_id: str, current_user_input: str, current_bot_response: str, guild_id: Optional[int]):
         super().__init__()
         self.cog: MimicCog = cog
         self.profile_owner_id = profile_owner_id

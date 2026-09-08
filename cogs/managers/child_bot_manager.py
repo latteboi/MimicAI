@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import time
 import uuid
 import base64
@@ -22,6 +23,11 @@ from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
 
 MAX_AVATAR_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_EMOJI_SIZE_BYTES = 256 * 1024  # Discord's limit on an uploaded emoji, app or guild.
+# The placeholder to fall back to when a custom one cannot be made to render on a child.
+# Not PLACEHOLDER_EMOJI: that is the value this whole path exists to translate, and it is
+# itself a custom mention whenever the deployment has set one.
+UNRESOLVABLE_EMOJI_FALLBACK = "\u23f3"
 
 
 class ChildBotManager:
@@ -36,6 +42,10 @@ class ChildBotManager:
         self.typing_tasks: Dict[Tuple[str, int], asyncio.Task] = {}
         self.pending_toggles: Dict[str, Dict[str, Any]] = {}
         self.queue_worker_task: Optional[asyncio.Task] = None
+        # bot_id -> {source emoji as the parent writes it: what that child can render}.
+        # One or two entries per child -- a profile has one placeholder -- and dropped
+        # with the client in shutdown_bot.
+        self.child_emoji_map: Dict[str, Dict[str, str]] = {}
         # Signature of the profile shards the last _load_child_bots() scan was built
         # from. See _profiles_scan_signature for why this is safe to trust.
         self._child_bot_scan_signature: Optional[Tuple] = None
@@ -52,7 +62,7 @@ class ChildBotManager:
     def _profiles_scan_signature(self) -> Tuple:
         """A cheap fingerprint of every profile shard on disk.
 
-        _load_child_bots has to open, Fernet-decrypt, zstd-decompress and parse every
+        _load_child_bots has to open, decrypt, zstd-decompress and parse every
         profile.json.gz just to find the handful that carry a child_bot key. Boot calls
         it three times within milliseconds (cog __init__, on_ready, then
         start_all_child_bots), and every child-bot create/delete calls it again.
@@ -98,7 +108,11 @@ class ChildBotManager:
         by_owner_profile: Dict[Tuple[int, str], str] = {}
 
         for path, user_id_str, pid_folder, _mtime, _size in signature:
-            profile_data = IOManager.read_json_gzip(path, self.cog.fernet)
+            # Cached, and these are the same entries _get_profile_by_pid wants: the
+            # signature changing means *one* profile moved, but the rescan re-reads
+            # every profile on disk, so without this a single edit costs a full
+            # decrypt of the lot. With it, one cold read and the rest warm.
+            profile_data = IOManager.read_json_gzip_cached(path, self.cog.fernet)
             if not profile_data or not profile_data.get("child_bot"):
                 continue
             bot_data = profile_data["child_bot"]
@@ -371,6 +385,95 @@ class ChildBotManager:
 
         self.bot_tasks[bot_id] = asyncio.create_task(runner())
 
+    # --- Emoji identity -------------------------------------------------------
+
+    async def resolve_emoji_for_child(self, bot_id: str, emoji: str) -> str:
+        """`emoji` in the form this child application can actually render.
+
+        A custom emoji is an id, and an id belongs to one guild or to one application.
+        Every child bot is a *separate* application with its own token, in none of the
+        parent's guilds and owning none of the parent's application emojis -- so posting
+        the parent's `<a:name:id>` verbatim puts that literal text in the channel, which
+        is the whole quirk. There is no shared id to reach for: the same picture has to
+        exist under each application's own id.
+
+        So: unicode passes through untouched, an emoji from a guild the child is also in
+        passes through untouched, and anything left is mirrored once onto the child's own
+        application. Discord keeps application emojis, so a restart finds the mirror by
+        name instead of uploading it again.
+
+        Whatever cannot be mirrored resolves to a plain hourglass. A placeholder that is
+        the wrong picture still reads as "working on it"; raw `<a:name:123>` markup in
+        the channel reads as a bug, which is what it is.
+        """
+        if not emoji or not (emoji.startswith("<") and emoji.endswith(">")):
+            return emoji
+
+        bot_id = str(bot_id)
+        cached = self.child_emoji_map.get(bot_id, {}).get(emoji)
+        if cached is not None:
+            return cached
+
+        child = self.clients.get(bot_id)
+        if not child or not child.is_ready():
+            # Nothing will be sent through this client anyway -- execute_send returns
+            # early on exactly this test -- and a not-yet-ready client's guild cache
+            # cannot answer the question below, so this must not be remembered.
+            return emoji
+
+        try:
+            partial = discord.PartialEmoji.from_str(emoji)
+        except Exception:
+            return emoji
+        if partial.id is None:
+            return emoji
+
+        # get_emoji reads this client's own guild caches: a hit means the child shares a
+        # server with the emoji and may use it as it stands. Children run with
+        # Intents.guilds, so those caches are populated.
+        if child.get_emoji(partial.id) is not None:
+            resolved = emoji
+        else:
+            resolved = await self._mirror_emoji_to_child(child, partial) or UNRESOLVABLE_EMOJI_FALLBACK
+
+        # Failures are cached too. The causes -- the application's emoji list is full,
+        # the image is gone, the token cannot upload -- do not clear on their own, and
+        # retrying per placeholder edit means one upload attempt every ten seconds for
+        # the life of the round. A restart is the retry.
+        self.child_emoji_map.setdefault(bot_id, {})[emoji] = resolved
+        return resolved
+
+    async def _mirror_emoji_to_child(self, child: commands.Bot, partial: discord.PartialEmoji) -> Optional[str]:
+        """Copies one emoji onto `child`'s own application. Returns its new mention.
+
+        The name is derived from the source id rather than copied, so it is stable across
+        restarts (this is how the mirror is found again) and cannot collide with a
+        different emoji that happens to share a name.
+        """
+        stem = re.sub(r"[^A-Za-z0-9_]", "", partial.name or "")[:23] or "mimic"
+        name = f"{stem}_{str(partial.id)[-8:]}"
+
+        try:
+            for existing in await child.fetch_application_emojis():
+                if existing.name == name:
+                    return str(existing)
+        except Exception as e:
+            print(f"[ChildBotManager] Could not list application emojis for {child.user}: {e}")
+            return None
+
+        try:
+            # size=96 is what a message renders at, and it keeps an animated source
+            # inside the 256 KB upload limit that the full-size original can exceed.
+            resp = await get_shared_client().get(
+                f"{partial.url}?size=96", follow_redirects=True, timeout=15.0)
+            if resp.status_code != 200 or len(resp.content) > MAX_EMOJI_SIZE_BYTES:
+                return None
+            created = await child.create_application_emoji(name=name, image=resp.content)
+            return str(created)
+        except Exception as e:
+            print(f"[ChildBotManager] Could not mirror emoji {partial} to {child.user}: {e}")
+            return None
+
     async def shutdown_bot(self, bot_id: str):
         """Gracefully disconnects and terminates an in-process child bot client."""
         bot_id_str = str(bot_id)
@@ -382,6 +485,7 @@ class ChildBotManager:
             except Exception:
                 pass
             self.clients.pop(bot_id_str, None)
+        self.child_emoji_map.pop(bot_id_str, None)
 
         task = self.bot_tasks.get(bot_id_str)
         if task and not task.done():
@@ -475,7 +579,11 @@ class ChildBotManager:
         # Resolved by the producer, not here: this manager is handed a payload, not a
         # profile, and the webhook path resolves the same two values off the config.
         cursor_mode = payload.get("typing_cursor", "off")
-        cursor_emoji = payload.get("typing_cursor_emoji") or ""
+        # The identity is the exception -- the producer cannot know it. The cursor is the
+        # same custom emoji as the placeholder, and a child bot cannot render the
+        # parent's copy of it.
+        cursor_emoji = await self.resolve_emoji_for_child(
+            bot_id, payload.get("typing_cursor_emoji") or "")
         reply_to_id = payload.get("reply_to_id")
         ping = payload.get("ping", False)
 

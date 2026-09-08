@@ -112,6 +112,19 @@ def calculate_similarities(prompt_emb: List[float], b64_embs: List[str]) -> np.n
 # three orders of magnitude: 20000 rows at 256 float32 dims is ~20 MB, which is the
 # ceiling this is allowed to occupy on the 1 GB target.
 
+#: The two ways an embedding can fail, kept apart because they need different
+#: actions from the user. They used to share one "embedding failed" line, which is
+#: why a missing key read as a broken feature: the commonest cause by far is running
+#: /profile in a DM, where there is no guild whose key could be billed.
+NO_EMBEDDING_KEY_MSG = (
+    "No usable API key for this action. Add a personal Gemini key in "
+    "`/settings` -> API Keys, or run this from a server that has one assigned."
+)
+EMBEDDING_FAILED_MSG = (
+    "The embedding request did not come back (the API may be busy or the key "
+    "rejected). Nothing was changed -- try again in a moment."
+)
+
 _LTM_VEC_CACHE_MAX_ROWS = 20000
 _ltm_vec_cache: "OrderedDict[Any, Any]" = OrderedDict()
 
@@ -289,6 +302,10 @@ class MemoryManager:
     def _copy_ltm_shard(self, user_id: str, source_profile_name: str, new_profile_name: str):
         src_path = self.cog.storage_manager._get_shard_path("ltm", user_id, source_profile_name)
         new_path = self.cog.storage_manager._get_shard_path("ltm", user_id, new_profile_name)
+        # Either name may resolve to no profile -- nothing to copy, and nowhere to
+        # put it. See _get_shard_path for why a miss is None rather than a path.
+        if not src_path or not new_path:
+            return
         if os.path.exists(src_path):
             os.makedirs(os.path.dirname(new_path), exist_ok=True)
             import shutil
@@ -309,7 +326,7 @@ class MemoryManager:
     async def _add_ltm(self, profile_owner_id: int, profile_name: str, summary: str, summary_embedding_b64: str, guild_id: Optional[int], triggering_user_id: int, user_dn: Optional[str] = None):
         """Appends one memory to a profile's LTM shard.
 
-        Async because the two shard calls below are a Fernet decrypt plus zstd
+        Async because the two shard calls below are a decrypt plus zstd
         decompress plus orjson parse of up to LIMIT_LTM entries, and the same again in
         reverse to write -- tens of milliseconds of blocking work that ran directly on
         the event loop from every caller. The session and profile lookups stay on the
@@ -408,6 +425,10 @@ class MemoryManager:
     def _copy_training_shard(self, user_id: str, source_profile_name: str, new_profile_name: str):
         src_path = self.cog.storage_manager._get_shard_path("training", user_id, source_profile_name)
         new_path = self.cog.storage_manager._get_shard_path("training", user_id, new_profile_name)
+        # Either name may resolve to no profile -- nothing to copy, and nowhere to
+        # put it. See _get_shard_path for why a miss is None rather than a path.
+        if not src_path or not new_path:
+            return
         if os.path.exists(src_path):
             os.makedirs(os.path.dirname(new_path), exist_ok=True)
             import shutil
@@ -462,9 +483,10 @@ class MemoryManager:
         owner_id_str = str(ltm_user_id)
         context_type = "guild"
 
-        # Loaded once, in a thread. This shard read is a file open plus Fernet decrypt plus
-        # zstd decompress plus orjson parse; it previously ran here on the event loop and
-        # then a second time inside _thread_search_ltm, with the first result discarded.
+        # Loaded once, in a thread. This shard read is a file open plus decrypt plus zstd
+        # decompress plus orjson parse; it previously ran here on the event loop and then a
+        # second time inside _thread_search_ltm, with the first result discarded. The read
+        # itself is cached per path now, but the parse still happens on every call.
         # The early exit is kept so an empty shard still skips the embedding round trip.
         ltm_data = await asyncio.to_thread(self._load_ltm_shard, owner_id_str, ltm_profile_name)
         if not ltm_data:
@@ -482,8 +504,9 @@ class MemoryManager:
 
         ltm_shard_path = self.cog.storage_manager._get_shard_path("ltm", owner_id_str, ltm_profile_name)
         try:
-            st = os.stat(ltm_shard_path)
-            ltm_cache_key = (owner_id_str, ltm_profile_name, st.st_mtime_ns, st.st_size)
+            st = os.stat(ltm_shard_path) if ltm_shard_path else None
+            ltm_cache_key = ((owner_id_str, ltm_profile_name, st.st_mtime_ns, st.st_size)
+                             if st else None)
         except OSError:
             # No file to stamp (an in-memory or just-deleted shard). Skip the cache
             # rather than risk serving vectors for content that is no longer on disk.
@@ -622,9 +645,10 @@ class MemoryManager:
             "training", str(effective_owner_id_for_training), effective_profile_name_for_training
         )
         try:
-            st = os.stat(training_shard_path)
-            train_cache_key = (str(effective_owner_id_for_training), effective_profile_name_for_training,
-                               st.st_mtime_ns, st.st_size)
+            st = os.stat(training_shard_path) if training_shard_path else None
+            train_cache_key = ((str(effective_owner_id_for_training),
+                                effective_profile_name_for_training,
+                                st.st_mtime_ns, st.st_size) if st else None)
         except OSError:
             train_cache_key = None
 
@@ -661,11 +685,18 @@ class MemoryManager:
 
         return await asyncio.to_thread(_thread_search_training)
 
-    async def _get_embedding(self, text: str, guild_id: int, task_type: str = "RETRIEVAL_QUERY") -> Optional[List[float]]:
+    async def _get_embedding(self, text: str, guild_id: Optional[int], task_type: str = "RETRIEVAL_QUERY",
+                             owner_id: Optional[int] = None) -> Optional[List[float]]:
+        """The vector for `text`, or None if there is no key or the request failed.
+
+        Pass `owner_id` from anything a user drives directly against a profile's own
+        data -- it is what lets the profile owner's personal key stand in when there
+        is no guild key, which is every DM. See `_embedding_api_key`.
+        """
         if not text or not text.strip():
             return None
 
-        api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id)
+        api_key = self.cog.storage_manager._embedding_api_key(guild_id, owner_id)
         if not api_key:
             return None
 
@@ -874,7 +905,7 @@ class MemoryManager:
                     b64_emb = encode_embedding_b64(summary_embedding)
                     await self._add_ltm(profile_owner_id, profile_name, summary, b64_emb, guild.id if guild else None, triggering_user_id, sanitized_author)
 
-    async def add_new_training_example(self, profile_owner_id: int, profile_name: str, usr_in:str, bot_out:str, guild_id: int)->Tuple[bool,str]:
+    async def add_new_training_example(self, profile_owner_id: int, profile_name: str, usr_in:str, bot_out:str, guild_id: Optional[int])->Tuple[bool,str]:
         if not usr_in.strip() or not bot_out.strip(): return False,"Inputs empty."
 
         # [NEW] Training Limit Check
@@ -886,8 +917,12 @@ class MemoryManager:
         if len(training_shard) >= limit:
             return False, f"**Limit Reached.**\n\nYou have reached the maximum of **{limit}** training examples."
 
-        emb=await self._get_embedding(usr_in, guild_id, task_type="RETRIEVAL_DOCUMENT")
-        if not emb: return False,"Embedding failed. Ensure the server API key is valid."
+        if not self.cog.storage_manager._embedding_api_key(guild_id, profile_owner_id):
+            return False, NO_EMBEDDING_KEY_MSG
+        emb = await self._get_embedding(usr_in, guild_id, task_type="RETRIEVAL_DOCUMENT",
+                                        owner_id=profile_owner_id)
+        if not emb:
+            return False, EMBEDDING_FAILED_MSG
 
         b64_emb = encode_embedding_b64(emb)
         now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -897,9 +932,14 @@ class MemoryManager:
         await asyncio.to_thread(self._save_training_shard, owner_id_str, profile_name, training_shard)
         return True,f"Example added for profile '{profile_name}'. Total: {len(training_shard)}/{limit}"
 
-    async def update_training_example(self, profile_owner_id: int, profile_name: str, example_id: str, new_user_input: str, new_bot_response: str, guild_id: int) -> Tuple[bool, str]:
+    async def update_training_example(self, profile_owner_id: int, profile_name: str, example_id: str, new_user_input: str, new_bot_response: str, guild_id: Optional[int]) -> Tuple[bool, str]:
         if not new_user_input.strip() or not new_bot_response.strip():
             return False, "Inputs cannot be empty."
+
+        # Checked before the shard is even loaded: a missing key is the likeliest
+        # failure here and has nothing to do with whether the example exists.
+        if not self.cog.storage_manager._embedding_api_key(guild_id, profile_owner_id):
+            return False, NO_EMBEDDING_KEY_MSG
 
         owner_id_str = str(profile_owner_id)
         example_list = await asyncio.to_thread(self._load_training_shard, owner_id_str, profile_name)
@@ -909,9 +949,11 @@ class MemoryManager:
         example_found = False
         for i, example in enumerate(example_list):
             if example.get("id") == example_id:
-                new_embedding = await self._get_embedding(new_user_input, guild_id, task_type="RETRIEVAL_DOCUMENT")
+                new_embedding = await self._get_embedding(new_user_input, guild_id,
+                                                          task_type="RETRIEVAL_DOCUMENT",
+                                                          owner_id=profile_owner_id)
                 if not new_embedding:
-                    return False, "Failed to generate embedding for the new input. The example was not updated."
+                    return False, EMBEDDING_FAILED_MSG
 
                 b64_emb = encode_embedding_b64(new_embedding)
 

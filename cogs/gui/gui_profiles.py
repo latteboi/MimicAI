@@ -1438,11 +1438,17 @@ class ProfileManageView(ui.View):
                 if not self.is_borrowed:
                     self.cog.profile_manager._cascade_delete_borrowed_profiles(self.user_id, pid, self.profile_name)
 
-                self.cog.profile_manager._save_user_index(self.user_id, user_index)
-
+                # Shard first, index second -- the same rule creation follows, and for
+                # the same reason. Writing the index first meant a crash before the
+                # rmtree left a shard nothing named, which the next rebuild adopts:
+                # the deleted profile came back. Removing the directory first makes the
+                # worst case an index entry pointing at nothing, which a rebuild drops
+                # -- the delete completes either way.
                 import shutil
                 p_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", pid)
                 shutil.rmtree(p_dir, ignore_errors=True)
+
+                self.cog.profile_manager._save_user_index(self.user_id, user_index)
                 return True
 
             if await asyncio.to_thread(_sync_delete):
@@ -3398,7 +3404,7 @@ class _BulkSession:
     all reduce to merging into one of two dicts, so several actions staged together cost
     one read-modify-write per profile instead of one per action per profile. On the
     deployment target that is the difference between forty and a hundred and twenty
-    Fernet+zstd round trips for three settings across forty profiles.
+    encrypt+zstd round trips for three settings across forty profiles.
 
     `scope` is fixed at step one and is what lets the action list be filtered rather
     than the write silently skipping: a personal-only row is never offered against a
@@ -3489,7 +3495,7 @@ async def _apply_bulk_session(cog, user_id: int, session: _BulkSession) -> Dict[
             # One profile counts once, however many files it took.
             counts["changed"] += 1
 
-        # Each profile is a Fernet decrypt, a zstd round trip and an atomic write, and
+        # Each profile is a decrypt, a zstd round trip and an atomic write, and
         # a hundred of them back to back holds the loop long enough to miss a Discord
         # heartbeat. Yielding periodically costs nothing and keeps the gateway alive.
         if position % 10 == 9:

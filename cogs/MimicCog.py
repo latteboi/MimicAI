@@ -25,9 +25,9 @@ from .gui.gui_resolve import (
     suggest_profile,
 )
 from .gui.gui_mod import ModStatsView
-from .managers.storage_manager import StorageManager
+from .managers.storage_manager import MasterCipher, StorageManager
 from .managers.profile_manager import ProfileManager
-from .managers.session_manager import SessionManager
+from .managers.session_manager import DEFAULT_COMPACTION_CONFIG, SessionManager
 from .managers.memory_manager import MemoryManager
 from .managers.server_manager import ServerManager
 from .managers.child_bot_manager import ChildBotManager
@@ -43,7 +43,6 @@ from discord.ext import commands, tasks
 import discord
 from discord import app_commands, ui
 
-from cryptography.fernet import Fernet
 import asyncio
 import os
 import orjson as json
@@ -126,7 +125,10 @@ class MimicCog(EventListeners, commands.Cog):
         self.global_prompts: Dict[str, str] = {}
 
         try:
-            self.fernet = Fernet(defaultConfig.ENCRYPTION_KEY)
+            # A MasterCipher, not a Fernet: same ENCRYPTION_KEY, but it also carries the
+            # AES-GCM key the on-disk blob format uses. It delegates .encrypt/.decrypt to
+            # Fernet, so the text sites (bot tokens, export payloads) are unchanged.
+            self.fernet = MasterCipher(defaultConfig.ENCRYPTION_KEY)
         except Exception as e:
             print(f"CRITICAL: Failed to initialize encryption. Ensure ENCRYPTION_KEY is set in defaultConfig.py. Error: {e}")
             self.fernet = None
@@ -954,8 +956,20 @@ class MimicCog(EventListeners, commands.Cog):
                 await self._remove_session_participant(interaction, session, existing_index)
                 return
 
-            # Create new session if none exists
+            # Create new session if none exists -- and start it.
+            #
+            # This used to seat a draft and tell the user to go and press Start /
+            # Update Session, which was friction with nothing behind it: `/session
+            # swap` is admin-or-owner gated, *stricter* than `/session config`, so
+            # everyone who can reach this line could already press that button. Naming
+            # the first profile for an empty channel is an unambiguous "start talking
+            # to this character", and the draft state exists for the cast editor,
+            # where a half-built cast genuinely should not be live.
+            #
+            # Every field the full start path sets is set here, because this session
+            # now goes live without ever passing through the config view.
             if not session:
+                new_participant["ltm_counter"] = 0
                 session = {
                     "type": "multi", "profiles": [new_participant],
                     "unified_log": [], "is_hydrated": False, "last_bot_message_id": None,
@@ -963,9 +977,10 @@ class MimicCog(EventListeners, commands.Cog):
                     "task_queue": asyncio.Queue(),
                     "worker_task": None, "turns_since_last_ltm": 0, "session_prompt": None,
                     "session_mode": "sequential", "pending_image_gen_data": None, "pending_whispers": {},
+                    "audio_mode": "off",
+                    "compaction": DEFAULT_COMPACTION_CONFIG.copy(),
                     "cast_policy": DEFAULT_CAST_POLICY,
-                    # Seated, not started -- same rule the cast dropdown follows.
-                    "started": False,
+                    "started": True,
                 }
                 self.multi_profile_channels[interaction.channel_id] = session
                 session["is_hydrated"] = True
@@ -978,7 +993,9 @@ class MimicCog(EventListeners, commands.Cog):
 
                 self.session_manager._save_multi_profile_sessions()
                 await interaction.followup.send(
-                    f"Seated `{profile_name}`. Start it with `/session config` -> **Start / Update Session**.",
+                    f"Session started with `{profile_name}`. Send a message in this channel to talk to it.\n"
+                    f"Add more with `/session swap`, or open `/session config` to tune reactivity, "
+                    f"mode and prompts.",
                     ephemeral=True)
                 return
 

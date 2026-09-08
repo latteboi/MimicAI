@@ -60,10 +60,20 @@ class HeartbeatMixin:
             await asyncio.sleep(backoff)
             backoff *= 2.0
 
-    async def _send_child_bot_placeholder(self, bot_id: str, channel_id: int, custom_emoji: str) -> Optional[int]:
+    async def _send_child_bot_placeholder(self, bot_id: str, channel_id: int, custom_emoji: str,
+                                          text: Optional[str] = None) -> Optional[int]:
+        """Posts a placeholder as `bot_id`, in the only emoji that child can render.
+
+        The emoji and the status line are separate arguments so that every placeholder a
+        child bot sends is composed here, after resolution. Composing first and resolving
+        the finished string would mean parsing markup back out of it, and skipping
+        resolution is how the parent's placeholder GIF reached a channel as literal
+        `<a:name:id>` text.
+        """
+        custom_emoji = await self.cog.child_bot_manager.resolve_emoji_for_child(bot_id, custom_emoji)
         sent = await self.cog.child_bot_manager.execute_send(bot_id, {
             "channel_id": channel_id,
-            "content": custom_emoji,
+            "content": f"{custom_emoji}\n\n{text}" if text else custom_emoji,
             "realistic_typing": False
         })
         if sent:
@@ -130,17 +140,19 @@ class HeartbeatMixin:
                         if participant and participant.get('method') == 'child_bot':
                             bot_id = participant.get('bot_id')
                             if msg_a_id:
+                                child_emoji = await self.cog.child_bot_manager.resolve_emoji_for_child(
+                                    bot_id, custom_emoji)
                                 await self.cog.manager_queue.put({
                                     "action": "send_to_child", "bot_id": bot_id,
                                     "payload": {
                                         "action": "regenerate_message", "channel_id": channel.id,
-                                        "message_id": msg_a_id, "content": f"{custom_emoji}\n\n{text}"
+                                        "message_id": msg_a_id, "content": f"{child_emoji}\n\n{text}"
                                     }
                                 })
                             else:
                                 # Only spawn a placeholder if generation is actively still running
                                 if not gen_task.done():
-                                    new_msg_id = await self._send_child_bot_placeholder(bot_id, channel.id, f"{custom_emoji}\n\n{text}")
+                                    new_msg_id = await self._send_child_bot_placeholder(bot_id, channel.id, custom_emoji, text)
                                     if new_msg_id:
                                         if gen_task.done():
                                             # If generation completed while awaiting placeholder creation, delete immediately
@@ -219,12 +231,14 @@ class HeartbeatMixin:
                 sending_text = f"-# {label}... ({time_str})"
 
                 async def do_update(text):
+                    emoji = state_container.get('custom_emoji', PLACEHOLDER_EMOJI)
+
                     if state_container.get('message_type') == 'embed' and state_container.get('placeholder_msg'):
                         try:
                             msg_obj = state_container['placeholder_msg']
                             if msg_obj and msg_obj.embeds:
                                 embed = msg_obj.embeds[0]
-                                embed.description = f"{state_container.get('custom_emoji', PLACEHOLDER_EMOJI)}\n\n{text}"
+                                embed.description = f"{emoji}\n\n{text}"
                                 await msg_obj.edit(embed=embed)
                         except Exception: pass
                         return
@@ -233,20 +247,24 @@ class HeartbeatMixin:
                     if not target_msg_id:
                         return
 
-                    full_text = f"{state_container.get('custom_emoji', PLACEHOLDER_EMOJI)}\n\n{text}"
-
                     try:
                         if participant_method == 'child_bot' and bot_id:
+                            # Resolved per edit rather than once into the container: the
+                            # webhook branch below and the child branch here are two
+                            # identities, and the container is shared with a round that
+                            # may still deliver through the parent.
+                            emoji = await self.cog.child_bot_manager.resolve_emoji_for_child(
+                                bot_id, emoji)
                             await self.cog.manager_queue.put({
                                 "action": "send_to_child", "bot_id": bot_id,
                                 "payload": {
                                     "action": "regenerate_message", "channel_id": channel.id,
-                                    "message_id": target_msg_id, "content": full_text
+                                    "message_id": target_msg_id, "content": f"{emoji}\n\n{text}"
                                 }
                             })
                         else:
                             await self.cog.server_manager.run_webhook(
-                                channel, "edit_message", target_msg_id, content=full_text)
+                                channel, "edit_message", target_msg_id, content=f"{emoji}\n\n{text}")
                     except Exception:
                         pass
 
@@ -264,7 +282,7 @@ class HeartbeatMixin:
                     sending_text = f"-# {label}... ({time_str})"
 
                     if spawn_after is not None and elapsed >= spawn_after:
-                        await maybe_spawn(f"{state_container.get('custom_emoji', PLACEHOLDER_EMOJI)}\n\n{sending_text}")
+                        await maybe_spawn(sending_text)
 
                     await do_update(sending_text)
 
@@ -285,7 +303,7 @@ class HeartbeatMixin:
             except asyncio.CancelledError:
                 pass
 
-        async def maybe_spawn(content):
+        async def maybe_spawn(text):
             """Creates the placeholder this phase is trying to edit, if there is none.
 
             Only child bots reach this: a webhook turn always has one by now, and
@@ -302,7 +320,8 @@ class HeartbeatMixin:
                 return
             if state_container.get('spawn_task'):
                 return
-            task = asyncio.create_task(self._send_child_bot_placeholder(bot_id, channel.id, content))
+            task = asyncio.create_task(self._send_child_bot_placeholder(
+                bot_id, channel.id, state_container.get('custom_emoji', PLACEHOLDER_EMOJI), text))
             state_container['spawn_task'] = task
             try:
                 new_id = await asyncio.shield(task)

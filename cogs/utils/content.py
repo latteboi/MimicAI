@@ -246,7 +246,7 @@ HELP_CATEGORIES = {
             "session -- it simply has nobody to answer.\n\n"
             "**Config** sets how the round runs: **Toggle Execution** switches between sequential and random turn order, **Edit Master Prompt** "
             "sets the scene every participant sees, **Set Response Limit** caps replies per round, and **Toggle TTS** turns on audio.\n\n"
-            "`/session swap` changes the cast live without interrupting the conversation, including into a specific slot. Naming a profile "
+            "`/session swap` changes the cast live without interrupting the conversation, including into a specific slot. In an empty channel it also starts the session outright -- naming the first profile is the fastest way in. Naming a profile "
             "that is already in the session removes it, which is the same thing giving a slot with no profile name does. "
             "`/session view` dumps the current configuration and participant status. `/trigger` forces a round. "
             "`/session audit` reports token usage and diagnostics for the active session."
@@ -810,12 +810,12 @@ DEFAULT_HELP_DOCS = {
         "With no options at all: lists the current participants and their slot numbers.\n"
         "Adding: name a profile that is not in the session. Without a slot it takes the next free seat (or replaces the only participant, if the session has one); with a slot it replaces that seat, or is appended if the slot is past the end.\n"
         "Removing: two equivalent forms. Name a profile that is already a participant, or give a slot with no profile name. Either drops that participant and stands its child bot down. The last remaining participant can be removed; the session stays as it is with an empty cast, and `/suspend` is what ends it outright.\n"
-        "Starting a session this way seats but does not start: run it in a channel with no session and the profile is seated as a draft, with the reply pointing at `/session config` -> 'Start / Update Session'. Run against a session that is already live and the change applies live, as it always has.\n"
+        "Starting a session this way starts it: run it in a channel with no session and the profile is seated and the session goes live at once, with no button press in between -- send a message and it answers. Run against a session that is already live and the change applies live, as it always has. (The cast editor still seats a draft, because a half-built cast should not be live.)\n"
         "Naming a seated profile *together with* a slot or use_child_bot does not remove it: those say where or how someone sits, not whether they should be there, so the command reports the seat it is already in rather than deleting it. Run the bare form to remove.\n"
         "Delivery Method: The `use_child_bot` parameter forces the profile to reply using a dedicated Discord bot application (Child Bot) instead of a Webhook. To change it for someone already seated, remove them and add them back with the value you want.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I named a profile and it vanished from the session instead of being added.' Fix: That profile was already a participant. Naming a seated profile is the removal form; add a different profile, or re-run the command to bring it back.\n"
-        "- Symptom: 'I added a profile and it still does not reply.' Fix: A session started this way is a draft. Open `/session config` and press 'Start / Update Session'."
+        "- Symptom: 'I added a profile and it still does not reply.' Fix: If the session was built on the Cast tab it is a draft until 'Start / Update Session' is pressed -- the dashboard footer says which. A session created by `/session swap` is live immediately, so check the profile's reactivity and chance instead."
     ),
     "sessions/session_controls.txt": (
         "Capabilities: Users can dynamically control the flow of a chat session using specific message reactions.\n"

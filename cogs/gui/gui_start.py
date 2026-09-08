@@ -136,7 +136,7 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
 
     One `to_thread` for the whole sweep. The individual reads are small -- the profile
     index is plaintext and already cached, the session is in memory -- but `keys.json.gz`
-    is a Fernet+zstd decrypt, and doing any of it inline on a repaint is the kind of
+    is an AES-GCM+zstd decrypt, and doing any of it inline on a repaint is the kind of
     thing that adds up on a shared event loop.
     """
     user_id = interaction.user.id

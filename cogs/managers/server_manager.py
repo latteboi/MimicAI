@@ -113,7 +113,7 @@ class ServerManager:
         `only_servers` scopes the write to the servers that actually changed.
         Acquiring a webhook touches exactly one channel in one server, but this used
         to rewrite every server's file -- each one a separate zstd compress and
-        Fernet encrypt -- so the first message in a fresh channel cost one of those
+        encrypt -- so the first message in a fresh channel cost one of those
         per guild the bot is in. Pass None only when the change really is global
         (the daily cleanup, which drops orphans across every server at once).
 

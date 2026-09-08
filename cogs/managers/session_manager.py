@@ -24,7 +24,8 @@ from ..utils.constants import (
     COMPACTION_MODEL_DEFAULT, COMPACTION_FALLBACK_MODEL_DEFAULT,
     DEFAULT_CAST_POLICY, DELIVERY_GUARD_SECONDS,
 )
-from .storage_manager import IOManager, _delete_file_shard, _get_compressor, _get_decompressor
+from .storage_manager import (IOManager, _delete_file_shard, _get_compressor,
+                              _get_decompressor, seal_blob, unseal_blob)
 
 # Turns allowed to accumulate in the tail sidecar before the next flush re-seals the
 # whole log into the cold segment. Sized so the common case -- a round appending a
@@ -110,14 +111,16 @@ class SessionManager:
         return self._get_session_dir_path(session_key, session_type) / "session_log.hot.json.gz"
 
     def _encode_session_bytes(self, payload: Any) -> bytes:
-        """orjson -> zstd -> Fernet, the on-disk format for every session file.
+        """orjson -> zstd -> AES-GCM, the on-disk format for every session file.
 
         Only ever called from inside asyncio.to_thread, so it goes through
         _get_compressor() rather than building a ZstdCompressor per call -- see the
-        thread-safety note at the top of storage_manager.
+        thread-safety note at the top of storage_manager. seal_blob is the same
+        encryption IOManager writes, and the same reason: a 250-turn log is the
+        largest thing written on the hot path and base64 was a fifth of the cost.
         """
         serialized_bytes = json.dumps(payload, option=json.OPT_SERIALIZE_NUMPY | json.OPT_NON_STR_KEYS)
-        return self.cog.fernet.encrypt(_get_compressor().compress(serialized_bytes))
+        return seal_blob(_get_compressor().compress(serialized_bytes), self.cog.fernet)
 
     @staticmethod
     def _atomic_write(path: pathlib.Path, blob: bytes) -> None:
@@ -158,7 +161,7 @@ class SessionManager:
         """Persist only the turns appended since the last full flush.
 
         A channel session's log is append-mostly, but every writer used to rewrite the
-        whole file: a 1000-turn log is 264 KiB on disk and ~1.6 ms of orjson/zstd/Fernet
+        whole file: a 1000-turn log is 264 KiB on disk and ~1.6 ms of orjson/zstd/encrypt
         per save, and a four-participant round did that six or more times. This writes a
         second file holding just unified_log[_log_cold_len:], so a round's flush is
         proportional to the turns it actually added.
@@ -264,7 +267,7 @@ class SessionManager:
         """Read one session file. Runs inside asyncio.to_thread."""
         with open(path, 'rb') as f:
             encrypted_compressed_bytes = f.read()
-        decrypted_compressed_bytes = self.cog.fernet.decrypt(encrypted_compressed_bytes)
+        decrypted_compressed_bytes = unseal_blob(encrypted_compressed_bytes, self.cog.fernet)
         try:
             json_bytes = _get_decompressor().decompress(decrypted_compressed_bytes)
         except zstd.ZstdError:
@@ -1545,10 +1548,12 @@ class SessionManager:
         Reactivity tab would have nobody to edit -- so `Start / Update Session` is what
         makes the channel live. Every path that would run a round asks this first.
 
-        Absent means started, and that is load-bearing: only the two paths that
-        deliberately seat without starting (`_ensure_session_shell` and a `/session
-        swap` that creates the session) write False. A blueprint saved before this flag
-        existed, and every session an older code path built, keeps running untouched.
+        Absent means started, and that is load-bearing: `_ensure_session_shell` is now
+        the only path that deliberately seats without starting, and the only writer of
+        False. (`/session swap` used to be the second: creating a session that way
+        starts it, because naming the first profile for an empty channel says what it
+        means.) A blueprint saved before this flag existed, and every session an older
+        code path built, keeps running untouched.
         """
         return bool(session) and bool(session.get("started", True))
 

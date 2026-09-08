@@ -95,7 +95,7 @@ directory. This is what makes a restart-during-shutdown survivable.
 cogs/
   MimicCog.py              god-cog: all caches, all slash commands, LRUCache definition
   managers/
-    storage_manager.py     IOManager: Fernet + zstd + orjson persistence primitives
+    storage_manager.py     IOManager: AES-GCM + zstd + orjson persistence primitives
     profile_manager.py     profile CRUD, personal/borrowed/system resolution, sharing
     session_manager.py     hydration/dehydration, eviction, history derivation
     memory_manager.py      LTM, embeddings, cosine/MMR retrieval, training examples
@@ -150,6 +150,27 @@ Sessions have their own eviction: `session_last_accessed` plus an `eviction_heap
 `SessionManager.evict_inactive_sessions_task`. An evicted session is *dehydrated* to disk,
 not lost — `_ensure_session_hydrated` reloads it on the next trigger.
 
+### The shard cache is opt-in, and the question is frequency
+
+`read_json_gzip_cached` keeps *decrypted plaintext* per path, stamped with
+`(mtime_ns, size, inode)`. Because every write is a temp file plus `os.replace`, a changed
+file has a new inode, so invalidation is exact rather than a bet on mtime granularity. It
+caches bytes and re-parses per call, which is what makes it safe to add under callers that
+mutate what they are handed.
+
+A path opts in when it **re-reads the same file** — profile shards (several times a turn),
+`keys.json.gz` (every key resolution and `/settings` screen), LTM and training shards
+(every retrieval), and the child-bot rescan, which re-reads every profile whenever any one
+of them changes and shares its entries with the turn path. A one-shot sweep of every shard
+must not: the daily orphan pass, the boot share scan and the content-rating reset each
+touch a file once and never again, so caching them evicts the working set to hold data
+nobody will read.
+
+Size is not the caller's problem. `_SHARD_CACHE_MAX_ENTRY_BYTES` caps any single entry at
+an eighth of the budget, so an outlier — an LTM shard at `LIMIT_LTM` carries 5000
+embeddings — is read straight from disk and evicts nothing, while the ordinary small one
+is kept. That is why opting in is a judgement about frequency alone.
+
 ---
 
 ## Storage
@@ -161,6 +182,7 @@ users/<user_id>/
   shares.json.gz                      incoming profile shares
   profiles/<pid>/
     profile.json.gz                   unified: {name, config, prompts, child_bot}
+    name.json                         plaintext sidecar: {name, class} -- see below
     ltm.json.gz                       long-term memories + b64 float16 embeddings
     training.json.gz                  few-shot examples + embeddings
     global_chat.json.gz               `/profile global_chat` log, keyed (host, profile)
@@ -170,13 +192,36 @@ servers/<guild_id>/
   webhooks.json.gz
   sessions/<channel_id>/multi/session_log.json.gz
 public_profiles/                      the shared library index
-borrows.json                          plaintext reverse index: source profile -> borrowers
+borrows.json                          plaintext reverse index: source PID -> borrow PIDs
 mod/                                  blacklist, global prompt overrides, docs
 ```
 
-`index.json` also carries `key_file_stamp`, the `[mtime_ns, size]` of `keys.json.gz` that
-`has_personal_key` was computed from, so the boot-and-hourly consistency check verifies the
-flag with a stat rather than a decrypt.
+`index.json` also carries two stat stamps, so the boot-and-hourly consistency check can
+verify with a `stat` what would otherwise cost a decrypt: `key_file_stamp`, the
+`[mtime_ns, size]` of the `keys.json.gz` that `has_personal_key` was computed from, and
+`profiles_stamp`, the `mtime_ns` of `profiles/` — a directory's mtime moves when an entry is
+created or removed in it and not when a file inside a child is rewritten, which is exactly
+when the name maps can go stale.
+
+### index.json is a cache, and rebuilding it is cheap
+
+Every name -> PID entry is reconstructible from the `profiles/` directory, so a repair is
+cache regeneration rather than data recovery. What made it expensive was that the two facts
+the index holds about a profile — its name and its class — lived only inside the encrypted
+shard, so `_repair_user_index` decrypted every profile a user owned to read one string out
+of each. That cost is why repair was something to be tiptoed around.
+
+Both facts now sit outside the blob. The class is the PID's first letter (`A` personal, `X`
+System, `B`/`C` borrowed — `PID_CLASS_PREFIXES`), tested through `_is_pid` on the full
+16-character shape, because a pre-PID install's folders are named after profiles and one
+called `Bob` is not a borrow. The name is in `name.json` beside the shard, plaintext for the
+same reason `index.json` is. Rebuilding a 100-profile tree measures ~3.7 ms against ~39 ms
+of decrypts.
+
+The other half is write ordering: **the shard is written before the index, everywhere.** A
+crash then leaves a profile nothing names, which the next rebuild adopts — rather than a
+name pointing at a directory that was never created, which a rebuild deletes. Reversed, the
+same crash undid a create and, on the delete path, resurrected a deleted profile.
 
 ### The store answers lookups, not queries
 
@@ -191,16 +236,62 @@ to walk every user directory and decrypt every borrowed profile config. `borrows
 the index built for that one question -- see CLAUDE.md for the invariants that keep it
 honest. A new question of that shape gets its own derived index; it does not get a scan.
 
-### Every `.json.gz` is Fernet-encrypted zstd
+It is keyed `"<owner_id>:<source_pid>" -> {borrower_id: [borrow_pid, ...]}`: **PIDs on both
+ends.** A profile name is mutable and a PID is not, and keying either end by name made a
+rename -- which moves no file and changes no relationship -- look like a delete plus a
+create. Keyed by PID, `_reconcile_borrow_index` is a set comparison over immutable values
+that reads no files, and a rename is not an event it has to hear about at all.
+
+A borrow's own pointer back to its source is `original_pid`, never `original_profile_name`:
+that field is a snapshot taken at borrow time and goes stale the moment the owner renames.
+`_migrate_borrow_pointers` resolves the pre-PID population's names to real PIDs once at
+boot, which is what allows a single key form rather than two unioned lookups.
+
+### Every `.json.gz` is AES-256-GCM over zstd
 
 Not gzip. The extension is historical and nothing depends on it. `index.json` files are
 plaintext orjson, since they hold only name-to-PID mappings.
 
-The reader detects the format rather than trusting the name: `read_json_gzip` decrypts
-first, attempts `zstd.decompress`, and falls back to `gzip.decompress` on `ZstdError` — so
-archives written by older builds still load.
+Nothing about the *shape* is detected from the name. `read_json_gzip` decrypts, attempts
+`zstd.decompress`, and falls back to `gzip.decompress` on `ZstdError`, so archives from
+older builds still load. Writes are atomic: temp file, then `os.replace`.
 
-Writes are atomic: temp file, then `os.replace`.
+The encryption was Fernet until it was measured. Fernet is a *token* format — it base64s
+its output so a token can be a URL-safe string — and for a binary file that is 33% wasted
+bytes and, on a 9 KB payload, more time than the AES and the HMAC put together (17 µs of
+38, since `urlsafe_b64encode` is an encode pass and then a `translate()` pass). It also
+runs AES-CBC, which is serial, then a separate HMAC pass, where GCM authenticates in the
+same parallelisable pass. Through the real `IOManager`, including the disk:
+
+| | on disk | read | write |
+|---|---|---|---|
+| 17 KB profile shard | 25% smaller | 1.40× | 1.05× |
+| ~1 KB `keys.json.gz` | 41% smaller | 1.47× | 1.08× |
+| 400-entry LTM shard | 25% smaller | 1.81× | 1.38× |
+
+Writes gain least because the atomic temp-file-and-`os.replace` dominates them, which is
+correct and is not worth changing. The 25% is the base64 inflation going away, and on a
+1 GB box it is page cache as much as it is disk.
+
+**Both formats are read; only the new one is written.** A file converts the next time it
+is saved, so there is no migration pass, no flag day, and no window where a half-migrated
+tree is unreadable. Detection is exact rather than heuristic: `seal_blob` writes a `MAI1`
+magic, and a Fernet token is base64 of a leading `0x80` version byte, so it always starts
+`gAAAAA` — a prefix base64 cannot produce for the magic and vice versa.
+
+`cog.fernet` holds a `MasterCipher`, not a `Fernet`. It carries both ciphers derived from
+the one `ENCRYPTION_KEY` — HKDF gives the AEAD an independent key rather than borrowing
+one of Fernet's two halves — and delegates `.encrypt` / `.decrypt` to Fernet so that every
+*text* site is untouched: API keys and bot tokens stored as strings inside JSON, and the
+`.mimic` export container, which travels between installs and must stay interoperable.
+`decrypt_dump.py` is standalone by design and duplicates the derivation; the two must move
+together or a dump silently stops reading current files.
+
+GCM brings one rule Fernet did not: **a nonce may never repeat under a key.** `seal_blob`
+takes 12 bytes from `os.urandom` per write. The birthday bound on a random 96-bit nonce is
+about 2³² writes per key, which a bot writing once a second reaches in 136 years; a
+counter would be faster and would need somewhere durable to live across restarts, which is
+not a trade worth making. `tests/test_blob_format.py` holds the format contract.
 
 ### zstd contexts are thread-local, and must stay that way
 

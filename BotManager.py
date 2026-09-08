@@ -153,7 +153,7 @@ async def main():
         return
 
     # Child bot configs are NOT preloaded here any more. This block used to open,
-    # Fernet-decrypt and zstd-decompress every profile.json.gz on disk to build
+    # decrypt and zstd-decompress every profile.json.gz on disk to build
     # bot.child_bot_config -- a full scan of every profile, before the cog even loads.
     # ChildBotManager._load_child_bots() already derives the same mapping into
     # cog.child_bots, and that was the only mapping anything actually launched from;
@@ -166,7 +166,7 @@ async def main():
 
     # Cap the executor that backs every asyncio.to_thread call. The default is
     # min(32, cpu_count + 4), which is 5 here and buys nothing on a 0.25 vCPU
-    # baseline -- the work sent there is IOManager's Fernet+zstd pipeline, which
+    # baseline -- the work sent there is IOManager's AES-GCM+zstd pipeline, which
     # is GIL-bound anyway. Each worker thread costs an 8 MB stack reservation, its
     # own glibc arena (so its own fragmentation high-water mark), and its own
     # thread-local ZstdCompressor/ZstdDecompressor pair, which are never released.

@@ -10,7 +10,12 @@ import asyncio
 from collections import OrderedDict
 from discord.ext import tasks
 from typing import Any, Dict, Optional
+from cryptography.exceptions import InvalidTag
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+import base64
 import orjson as json
 
 from ..utils.constants import SERVERS_DIR, CLEANUP_STATE_FILE
@@ -36,6 +41,101 @@ _CLEANUP_MEMBER_FLOOR_RATIO = 0.5
 # Thread-local rather than per-call: one context per worker thread, built once and
 # reused, so the hot path keeps its allocation-free property on the e2-micro while
 # no context is ever touched by two threads.
+# --- Blob encryption -------------------------------------------------------------
+#
+# Files on disk are AES-256-GCM. Fernet is a *token* format: it base64s its output so
+# the result can be a URL-safe string, and for a binary file that is 33% wasted bytes
+# plus -- measured on a 9 KB payload -- more time than the AES and the HMAC together
+# (17 us of 38, because urlsafe_b64encode is an encode pass and then a translate()
+# pass). It also runs AES-CBC, which is serial by construction, followed by a separate
+# HMAC pass; GCM authenticates in the same pass and parallelises. End to end, including
+# the disk:
+#
+#     17 KB profile    read 1.8x   write 1.3x   file 25% smaller
+#     250-turn log     read 2.1x   write 1.5x   file 25% smaller
+#
+# Both formats are read; only the new one is written, so a file converts the next time
+# it is saved and there is no migration pass and no flag day. Telling them apart is
+# exact, not heuristic: a Fernet token is base64 of a leading 0x80 version byte, so it
+# always begins 'gAAAAA', and BLOB_MAGIC is not something base64 can emit.
+BLOB_MAGIC = b"MAI1"
+
+# GCM's one hard rule: a nonce must never repeat under a given key. 12 random bytes is
+# what the mode wants, and os.urandom is the whole story at this scale -- the birthday
+# bound on a 96-bit random nonce is ~2**32 writes per key, which a bot writing once a
+# second reaches in 136 years. Nothing here may switch to a counter without also
+# solving where the counter is persisted across restarts.
+_NONCE_BYTES = 12
+
+
+class MasterCipher:
+    """The bot's key material, in both of the forms it gets used in.
+
+    `cog.fernet` holds one of these rather than a bare Fernet. Every caller that
+    reaches for `.encrypt` / `.decrypt` directly is a *text* site -- an API key or a
+    bot token stored as a string inside JSON, an export payload that travels between
+    installs -- where base64 is exactly what is wanted, so those keep Fernet
+    behaviour byte for byte. `aead` is the binary-file path and nothing else uses it.
+
+    Both come from the one ENCRYPTION_KEY, so no deployment changes: HKDF gives the
+    AEAD its own independent key from the same 32 bytes rather than borrowing one of
+    Fernet's two halves for a second purpose.
+    """
+
+    __slots__ = ("fernet", "aead")
+
+    def __init__(self, key):
+        if isinstance(key, str):
+            key = key.encode()
+        self.fernet = Fernet(key)
+        self.aead = AESGCM(HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"mimicai:blob:aes256gcm:v1",
+        ).derive(base64.urlsafe_b64decode(key)))
+
+    def encrypt(self, data: bytes) -> bytes:
+        return self.fernet.encrypt(data)
+
+    def decrypt(self, token: bytes) -> bytes:
+        return self.fernet.decrypt(token)
+
+
+def seal_blob(payload: bytes, cipher) -> bytes:
+    """Encrypt one already-compressed blob for disk.
+
+    A bare Fernet (tests, and any construction site not yet passing a MasterCipher)
+    is still correct here -- it just writes the old format, which every reader
+    handles. That fallback is deliberate: an unbound key can cost speed, never data.
+    """
+    aead = getattr(cipher, "aead", None)
+    if aead is None:
+        return cipher.encrypt(payload)
+    nonce = os.urandom(_NONCE_BYTES)
+    return BLOB_MAGIC + nonce + aead.encrypt(nonce, payload, None)
+
+
+def unseal_blob(blob: bytes, cipher) -> bytes:
+    """Decrypt one blob, in whichever of the two formats it was written.
+
+    Raises InvalidToken for a failed GCM tag as well as a failed Fernet HMAC. The
+    translation is what lets every existing `except InvalidToken` handler keep
+    working -- a corrupt file has to read as None the same way it always did, and
+    InvalidTag reaching those call sites would surface as an unhandled exception.
+    """
+    if blob.startswith(BLOB_MAGIC):
+        aead = getattr(cipher, "aead", None)
+        if aead is None:
+            raise InvalidToken("AES-GCM blob, but the cipher has no AEAD key bound")
+        body = memoryview(blob)[len(BLOB_MAGIC):]
+        try:
+            return aead.decrypt(bytes(body[:_NONCE_BYTES]), bytes(body[_NONCE_BYTES:]), None)
+        except InvalidTag as e:
+            raise InvalidToken("AES-GCM authentication failed") from e
+    return cipher.decrypt(blob)
+
+
 _ZSTD_LOCAL = threading.local()
 
 
@@ -55,10 +155,10 @@ def _get_decompressor() -> "zstd.ZstdDecompressor":
 
 # --- Decrypted shard cache -----------------------------------------------------
 #
-# Reading a profile shard is 77 us for a 17 KB profile, and only 9 us of that is
-# parsing: 41 us is Fernet, 15 us the read, 12 us zstd. _get_profile_config has no
-# cache of its own and a single turn reaches it several times, so the same file was
-# decrypted from scratch over and over.
+# Reading a profile shard is 43 us for a 17 KB profile (79 us before the move off
+# Fernet), and only 10 us of that is parsing. _get_profile_config has no cache of its
+# own and a single turn reaches it several times, so the same file was decrypted from
+# scratch over and over. Cheaper crypto shortens that read; it does not remove it.
 #
 # What is cached is the *plaintext bytes*, never the parsed object. Every caller
 # still parses its own dict, which is the property that makes this safe to add:
@@ -72,7 +172,24 @@ def _get_decompressor() -> "zstd.ZstdDecompressor":
 #
 # Budgeted in bytes rather than entries because callers opt in per path -- this is
 # for the small shards a turn re-reads, not for session logs.
+#
+# What must NOT opt in: one-shot passes over every profile on disk. The daily orphan
+# sweep, the boot share scan and the content-rating reset each touch every shard once
+# and never look again, so caching them would evict the working set the turn path
+# depends on in order to hold data nobody will read again. Opting in is for a path
+# that re-reads the same file; everything else is scan pollution.
+#
+# Size is handled separately, by the per-entry ceiling below, so no caller has to
+# guess how big its shard will turn out to be.
 _SHARD_CACHE_MAX_BYTES = 8 * 1024 * 1024
+
+# No single file may take more than an eighth of the budget. Without this, one large
+# shard is allowed to be the entire cache and evicts everything the turn path wants:
+# an LTM shard at LIMIT_LTM is 5000 entries carrying an embedding each, which is most
+# of the budget on its own. With it, the common small shard is cached and the outlier
+# is simply read from disk every time, which is what it would have done anyway. This
+# is why opting a path in is a question about *frequency* only -- size answers itself.
+_SHARD_CACHE_MAX_ENTRY_BYTES = _SHARD_CACHE_MAX_BYTES // 8
 _shard_cache: "OrderedDict[str, tuple]" = OrderedDict()
 _shard_cache_bytes = 0
 _shard_cache_lock = threading.Lock()
@@ -90,7 +207,7 @@ def _shard_stamp(file_path: str):
 def _shard_cache_store(file_path: str, stamp, plaintext: bytes):
     global _shard_cache_bytes
     size = len(plaintext)
-    if size > _SHARD_CACHE_MAX_BYTES:
+    if size > _SHARD_CACHE_MAX_ENTRY_BYTES:
         return
     with _shard_cache_lock:
         previous = _shard_cache.pop(file_path, None)
@@ -145,7 +262,7 @@ class IOManager:
                 file_bytes = f.read()
 
             if encrypted and fernet:
-                file_bytes = fernet.decrypt(file_bytes)
+                file_bytes = unseal_blob(file_bytes, fernet)
 
             try:
                 decompressed_bytes = _get_decompressor().decompress(file_bytes)
@@ -183,7 +300,7 @@ class IOManager:
                     file_bytes = f.read()
 
                 if encrypted and fernet:
-                    file_bytes = fernet.decrypt(file_bytes)
+                    file_bytes = unseal_blob(file_bytes, fernet)
 
                 try:
                     plaintext = _get_decompressor().decompress(file_bytes)
@@ -215,7 +332,7 @@ class IOManager:
 
             bytes_to_write = compressed_bytes
             if encrypted and fernet:
-                bytes_to_write = fernet.encrypt(compressed_bytes)
+                bytes_to_write = seal_blob(compressed_bytes, fernet)
 
             with open(temp_file_path, 'wb') as f:
                 f.write(bytes_to_write)
@@ -228,7 +345,7 @@ class IOManager:
             raise
 
 class StorageManager:
-    """Owns Fernet-keyed encryption, atomic .json/.json.gz persistence primitives, generic entity
+    """Owns key-derived encryption, atomic .json/.json.gz persistence primitives, generic entity
     shard IO, API key persistence, and legacy filesystem migration utilities.
 
     Holds a back-reference to the parent cog for shared instance caches and cross-manager lookups,
@@ -241,7 +358,7 @@ class StorageManager:
 
     def _encrypt_data(self, plaintext: str) -> str:
         # Value-level encryption is deprecated to prevent CPU overhead.
-        # Files are already Fernet-encrypted natively at the shard-level.
+        # Files are already encrypted natively at the shard-level.
         return plaintext
 
     def _decrypt_data(self, encrypted_text: str) -> str:
@@ -261,25 +378,52 @@ class StorageManager:
     def _load_json_gzip(self, file_path: str, encrypted: bool = True) -> Optional[Any]:
         return IOManager.read_json_gzip(file_path, self.fernet, encrypted)
 
-    def _get_shard_path(self, shard_type: str, entity_id: str, sub_key: Optional[str] = None) -> str:
+    def _get_shard_path(self, shard_type: str, entity_id: str, sub_key: Optional[str] = None,
+                        strict: bool = False) -> Optional[str]:
+        """Where a per-profile side shard lives, resolved through the owner's index.
+
+        `strict` picks which resolver answers the name. The soft one substitutes the
+        name itself on a miss, which is survivable for a read -- the file will not be
+        there and the caller gets None -- but not for a write: write_json_gzip creates
+        the directory, so a stale name mints `profiles/<Name>/ltm.json.gz`, a folder
+        with no profile.json.gz in it. Nothing can ever find that again. Rebuilds skip
+        directories without a shard, the consistency check does not count them, and the
+        orphan sweeps require one, so it sits there holding a user's memories forever.
+
+        Returns None under `strict` when the name resolves to no PID, and the write
+        callers below turn that into a no-op rather than a phantom directory.
+        """
         if shard_type in ["ltm", "training"]:
-            pid = self.cog.profile_manager._get_pid_from_name_any(int(entity_id), sub_key)
+            pm = self.cog.profile_manager
+            pid = (pm._get_pid_from_name(int(entity_id), sub_key) if strict
+                   else pm._get_pid_from_name_any(int(entity_id), sub_key))
+            if not pid:
+                return None
             return os.path.join(self.cog.USERS_DIR, str(entity_id), "profiles", pid, f"{shard_type}.json.gz")
         elif shard_type == "profile_shares":
             return os.path.join(self.cog.USERS_DIR, str(entity_id), "shares.json.gz")
         raise ValueError(f"Unknown shard type: {shard_type}")
 
     def _load_shard(self, shard_type: str, entity_id: str, sub_key: Optional[str] = None) -> Optional[Any]:
+        # Cached: an LTM shard is read in full on every retrieval turn -- the vector
+        # cache above it holds the built matrix, not the file -- and a training shard
+        # on every generation that uses examples. Both re-read the same path over and
+        # over, which is the whole test for opting in; the per-entry ceiling decides
+        # what actually gets kept, so a huge LTM shard falls back to a plain read.
         path = self._get_shard_path(shard_type, entity_id, sub_key)
-        return IOManager.read_json_gzip(path, self.fernet)
+        return IOManager.read_json_gzip_cached(path, self.fernet) if path else None
 
     def _save_shard(self, shard_type: str, entity_id: str, data: Any, sub_key: Optional[str] = None):
-        path = self._get_shard_path(shard_type, entity_id, sub_key)
+        path = self._get_shard_path(shard_type, entity_id, sub_key, strict=True)
+        if not path:
+            print(f"Shard save skipped: '{sub_key}' resolves to no profile for {entity_id} ({shard_type}).")
+            return
         IOManager.write_json_gzip(data, path, self.fernet)
 
     def _delete_shard(self, shard_type: str, entity_id: str, sub_key: Optional[str] = None):
         path = self._get_shard_path(shard_type, entity_id, sub_key)
-        _delete_file_shard(path)
+        if path:
+            _delete_file_shard(path)
 
     def _purge_legacy_default_profile(self):
         users_path = pathlib.Path(self.cog.USERS_DIR)
@@ -339,7 +483,10 @@ class StorageManager:
         if not os.path.exists(path):
             return {"slots": {}, "personal_assignments": {}}
 
-        data = IOManager.read_json_gzip(path, self.fernet, encrypted=True)
+        # Cached: every key resolution and every /settings screen lands here, several
+        # times per interaction across the nine call sites, for a file measured in
+        # hundreds of bytes.
+        data = IOManager.read_json_gzip_cached(path, self.fernet, encrypted=True)
 
         # Auto-purge legacy/corrupted files (e.g., the old b'gA' format)
         if not data or "slots" not in data:
@@ -427,6 +574,30 @@ class StorageManager:
                 if raw_key not in self.cog.api_key_cooldowns or now > self.cog.api_key_cooldowns[raw_key]:
                     return raw_key
 
+        return None
+
+    def _embedding_api_key(self, guild_id: Optional[int], owner_id: Optional[int] = None) -> Optional[str]:
+        """The key an embedding should be billed to: the guild's, else the owner's own.
+
+        `_get_api_key_for_guild` alone was the whole resolver, which made every
+        embedding fail wherever there is no guild -- and `/profile` is not
+        `guild_only`, so managing a profile's LTM or training examples from a DM
+        passed guild_id=None, looked up a server index named "None", found nothing
+        and reported it as "failed to generate embedding". In a server it failed the
+        same way whenever no key was assigned there, or the key's donor had left.
+
+        `owner_id` is opt-in, and only the profile-management paths pass it: turn-time
+        retrieval stays guild-billed, because a server pays for its own conversations.
+        There is deliberately no instance-owner fallback here -- unlike
+        `_classifier_api_key`, this runs because a user asked for it, so "add a key"
+        is an answerable error rather than a silent bill to whoever hosts the bot.
+        """
+        if guild_id:
+            key = self._get_api_key_for_guild(guild_id)
+            if key:
+                return key
+        if owner_id:
+            return self._get_api_key_for_user(owner_id)
         return None
 
     async def _perform_data_cleanup(self):
@@ -617,23 +788,41 @@ class StorageManager:
             all_valid_profiles = user_profiles | borrowed_profiles
             data_changed = False
 
-            # Borrowed profile cleanup
+            # Borrowed profile cleanup.
+            #
+            # By source PID, not source name. Keyed by name, an owner renaming a
+            # profile deleted every borrow of it on the next run -- the borrow stores
+            # the name it was taken under, and that snapshot goes stale the moment the
+            # owner edits it. The PID never moves.
+            #
+            # "system" is checked alongside "personal" because System profiles are
+            # shareable (see _get_name_from_pid), so a borrow of one was validated
+            # against a map it could never appear in and was deleted daily.
             for borrowed_name in list(borrowed_profiles):
                 b_config = self.cog.profile_manager._get_profile_config(uid, borrowed_name, True)
-                if b_config:
-                    owner_id = b_config.get("original_owner_id")
-                    original_name = b_config.get("original_profile_name")
-                    if owner_id and original_name:
-                        owner_index = self.cog.profile_manager._get_user_index(int(owner_id))
-                        if original_name not in owner_index.get("personal", []):
-                            if isinstance(index["borrowed"], dict):
-                                pid = index["borrowed"].pop(borrowed_name, borrowed_name)
-                            else:
-                                index["borrowed"].remove(borrowed_name)
-                                pid = borrowed_name
-                            shutil.rmtree(str(users_path / user_id_str / "profiles" / pid), ignore_errors=True)
-                            cleaned_borrows += 1
-                            data_changed = True
+                if not b_config:
+                    continue
+                owner_id = b_config.get("original_owner_id")
+                source_pid = b_config.get("original_pid") or b_config.get("original_profile_id")
+                if not (owner_id and source_pid):
+                    continue
+
+                owner_index = self.cog.profile_manager._get_user_index(int(owner_id))
+                live_pids = set()
+                for category in ("personal", "system"):
+                    mapping = owner_index.get(category)
+                    if isinstance(mapping, dict):
+                        live_pids.update(mapping.values())
+
+                if source_pid not in live_pids:
+                    if isinstance(index["borrowed"], dict):
+                        pid = index["borrowed"].pop(borrowed_name, borrowed_name)
+                    else:
+                        index["borrowed"].remove(borrowed_name)
+                        pid = borrowed_name
+                    shutil.rmtree(str(users_path / user_id_str / "profiles" / pid), ignore_errors=True)
+                    cleaned_borrows += 1
+                    data_changed = True
             
             # Session file cleanup
             global_session_dir = pathlib.Path(self.cog.SESSIONS_GLOBAL_DIR) / user_id_str
@@ -654,12 +843,17 @@ class StorageManager:
             if not os.path.isdir(profiles_dir): continue
             index = self.cog.profile_manager._get_user_index(int(user_id_str))
             
+            # Every class, not just "personal". A System profile's X-prefixed PID is
+            # never in the personal map, so the owner's System profiles all looked
+            # orphaned here and had their child bot silently unconfigured on every
+            # daily run. Borrowed is included for the same reason.
             valid_pids = set()
-            personal_entry = index.get("personal", {})
-            if isinstance(personal_entry, dict):
-                valid_pids.update(personal_entry.values())
-            else:
-                valid_pids.update(personal_entry)
+            for category in ("personal", "borrowed", "system"):
+                entry = index.get(category, {})
+                if isinstance(entry, dict):
+                    valid_pids.update(entry.values())
+                else:
+                    valid_pids.update(entry)
             
             for pid_folder in os.listdir(profiles_dir):
                 profile_file = os.path.join(profiles_dir, pid_folder, "profile.json.gz")
@@ -750,8 +944,30 @@ class StorageManager:
                     for session_type in ["multi", "freewill"]:
                         type_dir = channel_dir / session_type
                         log_file = type_dir / "session_log.json.gz"
-                        if log_file.exists() and log_file.stat().st_mtime < thirty_days_ago:
+                        hot_file = type_dir / "session_log.hot.json.gz"
+                        if not log_file.exists():
+                            continue
+
+                        # Both halves, and the newer of the two mtimes.
+                        #
+                        # A live session appends only to the tail and reseals into the
+                        # cold segment once every SESSION_HOT_TAIL_MAX turns, so the
+                        # cold file's mtime says nothing about whether the session is
+                        # in use -- a quiet channel could pass thirty days between
+                        # reseals and have its sealed history deleted underneath it.
+                        #
+                        # And deleting the cold file alone stranded the tail: the
+                        # loader returns early when the cold path is missing, so it was
+                        # never read and never deleted, and its presence kept the whole
+                        # channel directory alive past the emptiness check above.
+                        last_touched = log_file.stat().st_mtime
+                        if hot_file.exists():
+                            last_touched = max(last_touched, hot_file.stat().st_mtime)
+
+                        if last_touched < thirty_days_ago:
                             _delete_file_shard(str(log_file))
+                            if hot_file.exists():
+                                _delete_file_shard(str(hot_file))
                             cleaned_session_files_ttl += 1
         
         # Check Global Sessions

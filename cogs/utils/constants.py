@@ -551,9 +551,26 @@ DOCS_DIR = os.path.join(MOD_DATA_DIR, "docs")
 
 PUBLIC_PROFILES_DIR = os.path.join(DATA_DIR, "public_profiles")
 # Reverse index: source profile -> the users currently borrowing it. Plaintext,
-# for the same reason index.json is -- it holds ids and profile names, nothing a
-# borrow's own config does not already expose to its borrower.
+# for the same reason index.json is -- it holds ids and PIDs, nothing a borrow's
+# own config does not already expose to its borrower.
 BORROW_INDEX_FILE = os.path.join(DATA_DIR, "borrows.json")
+#: Plaintext sidecar beside each profile.json.gz, holding the one fact a rebuild of
+#: index.json cannot derive from the path: the profile's display name. Everything
+#: else the index holds is in the PID itself (see PID_CLASS_PREFIXES), so with this
+#: file present a rebuild is a listdir plus a few hundred bytes per profile instead
+#: of a decrypt and a zstd inflate of every shard the user owns.
+#:
+#: Plaintext costs nothing: the same names are already in index.json, and are what
+#: the profile answers to in chat.
+PROFILE_NAME_SIDECAR = "name.json"
+#: The first character of a PID records which map in index.json owns it. Minted in
+#: _get_or_create_user_profile ('A'), _get_or_create_system_profile ('X') and
+#: _accept_share_request ('B' private share / 'C' public library).
+#:
+#: This is what lets a rebuild classify a profile without opening it. 'B' and 'C'
+#: both mean borrowed -- the letter records how the borrow arrived, and nothing may
+#: branch on which (see the note at the mint site).
+PID_CLASS_PREFIXES = {"A": "personal", "X": "system", "B": "borrowed", "C": "borrowed"}
 # High-water mark of the member cache, so the daily cleanup can tell "everyone left"
 # from "chunking has not finished". Plaintext, tiny, and safe to delete: a missing
 # file only costs one cleanup run.
