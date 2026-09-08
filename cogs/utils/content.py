@@ -287,8 +287,11 @@ HELP_CATEGORIES = {
             "**`/whisper`** sends a private message to one participant in an active session. Its reply is ephemeral -- only you see it -- and both "
             "sides stay hidden from the other profiles' view of the transcript. Useful for directing a character without the rest of the cast "
             "reacting to your instruction.\n\n"
-            "**`/speak`** (administrators) posts a message as one of your profiles with no generation at all. You supply the text; the profile "
-            "delivers it in its own name and avatar.\n\n"
+            "**`/speak`** (administrators) posts a message as one of your profiles. `style:verbatim` (the default) generates nothing at all -- "
+            "you supply the text and the profile delivers it in its own name and avatar. `style:in_character` instead has the profile re-voice "
+            "your line as itself, and shows you the result privately first, with Send, Reroll, Edit and Cancel. `fidelity:strict` keeps your "
+            "meaning and roughly your length; `fidelity:loose` treats your line as a beat to play and improvises around it. Either way the "
+            "posted message carries a spoiler-tagged note naming you as its author.\n\n"
             "**`/profile global_chat`** opens a persistent conversation with one profile, kept separately from any server session and "
             "carried with you across servers. The profile needs a rating of **General**, or an operator **Exemption** -- it does not "
             "have to be published to the Public Library, and never did have to be listed to be talked to one-to-one.\n\n"
@@ -577,7 +580,9 @@ WIZARD_TOUR = {
         "feature. The whole thing is one embed you write into with a button, not a stream of messages, and in a "
         "channel that embed is an ordinary visible message: 🔒 controls who may press the buttons, not who can read "
         "it.\n\n"
-        "`/speak` posts as one of your profiles without generating anything — you write the line yourself."
+        "`/speak` posts as one of your profiles. By default you write the line yourself and nothing is generated; "
+        "`style:in_character` has the character re-voice it instead, previewed privately before it goes out. Either "
+        "way the message says who authored it."
     ),
     "Memory": (
         "**Short-term** is the recent transcript, a fixed number of turns. `/refresh` clears it when a character "
@@ -853,7 +858,8 @@ DEFAULT_HELP_DOCS = {
     "sessions/whisper_and_speak.txt": (
         "Commands: `/whisper` and `/speak`\n"
         "Whisper: Sends a private message to one participant in an active multi-profile session. The reply is ephemeral -- only you see it -- and neither your whisper nor the reply appears in the other profiles' view of the transcript. Use it to direct a character without the rest of the cast reacting to your instruction.\n"
-        "Speak: Posts a message as one of your profiles with no generation at all. You supply the text and the profile delivers it under its own name and avatar. Requires administrator permission, and webhook or child bot delivery.\n"
+        "Speak: Posts a message as one of your profiles under its own name and avatar. Requires administrator permission, and webhook or child bot delivery.\n"
+        "Speak styles: `verbatim` (default) sends your text exactly as written, with no generation. `in_character` has the profile rewrite your line in its own voice first and shows it to you privately, with Send, Reroll, Edit, Switch fidelity and Cancel -- nothing is posted until you press Send. `fidelity:strict` preserves your meaning and length; `fidelity:loose` plays your line as a beat and improvises. Both styles append a spoiler-tagged authorship note to the posted message.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Whisper says there is no active session.' Fix: Whisper targets a participant in a running multi-profile session. Start one with `/session config` first.\n"
         "- Symptom: 'Other characters reacted to something I whispered.' Fix: They should not. Whisper turns are filtered out of every other participant's history; if the content also appeared as a normal message, that is what they saw."
@@ -926,7 +932,7 @@ DEFAULT_HELP_DOCS = {
     ),
     "memory/context_metadata_and_xml.txt": (
         "Concept: MimicAI uses an XML partitioning protocol to keep background technical context isolated from conversational chat. Models separate tagged system data from user speech far more reliably than they separate prose from prose.\n"
-        "Common tags: `<archive_context>` recalled long-term memories; `<external_context>` web search summaries; `<document_context>` text fetched from URLs; `<time_context>` the profile's local time; `<whisper_context>` and `<private_response>` hidden exchanges; `<internal_note>` system prompts that steer a round; `<scene_prompt>` the session master prompt; `<training_data>` matched style examples; `<content_policy>` the general-audience note.\n"
+        "Common tags: `<persona_profile>` and `<character_instructions>` the character itself; `<archive_context>` recalled long-term memories; `<external_context>` web search summaries; `<document_context>` text fetched from URLs; `<time_context>` the profile's local time; `<whisper_context>` and `<private_response>` hidden exchanges; `<internal_note>` system prompts that steer a round; `<scene_prompt>` the session master prompt; `<training_data>` matched style examples; `<content_policy>` the general-audience note.\n"
         "Identity Headers: Every message in history is prefixed `<Name> [ID: PID] [Timestamp]:`. The PID guarantees two characters with the same name are never conflated, and the timestamp gives the model real chronological awareness.\n"
         "Scrubbing: These tags are stripped from model output before delivery, so they never appear in chat.\n"
         "Troubleshooting / Symptoms:\n"

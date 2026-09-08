@@ -740,7 +740,11 @@ class ProfileManager:
         if not pid:
             return None
         path = os.path.join(USERS_DIR, str(user_id), "profiles", pid, "profile.json.gz")
-        return IOManager.read_json_gzip(path, self.cog.fernet)
+        # Cached: this is the hot read of the whole system -- _get_profile_config lands
+        # here several times per turn and had no cache of its own. The cache holds
+        # decrypted bytes and re-parses per call, so the dict returned here is still
+        # this caller's own to mutate.
+        return IOManager.read_json_gzip_cached(path, self.cog.fernet)
 
     def _save_profile_by_pid(self, user_id: int, pid: str, data: Dict[str, Any]):
         if not pid:

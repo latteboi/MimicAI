@@ -554,6 +554,10 @@ PUBLIC_PROFILES_DIR = os.path.join(DATA_DIR, "public_profiles")
 # for the same reason index.json is -- it holds ids and profile names, nothing a
 # borrow's own config does not already expose to its borrower.
 BORROW_INDEX_FILE = os.path.join(DATA_DIR, "borrows.json")
+# High-water mark of the member cache, so the daily cleanup can tell "everyone left"
+# from "chunking has not finished". Plaintext, tiny, and safe to delete: a missing
+# file only costs one cleanup run.
+CLEANUP_STATE_FILE = os.path.join(DATA_DIR, "cleanup_state.json")
 CHILD_BOTS_DIR = os.path.join(DATA_DIR, "child_bots")
 COG_LOCK_FILE_PATH = os.path.join(os.path.dirname(__file__), "gemini_agent.lock")  
 USERS_DIR = os.path.join(DATA_DIR, "users")
@@ -567,6 +571,18 @@ DISCORD_MAX_MESSAGE_LENGTH = 2000
 PLEASE_TRY_AGAIN_ERROR_MESSAGE = 'There was an issue with your question please try again...'
 MAX_LTM_COUNT_PER_PROFILE_CONTEXT = 1000
 STM_LIMIT_MAX = 50
+
+# Archive depth for a session's unified_log, which is NOT its context window --
+# _build_history_for_participant windows to stm_length, capped at STM_LIMIT_MAX.
+# These bound what regeneration, purges and un-compacted synopsis can still reach.
+# Two numbers rather than one so the trim has hysteresis: see the trim in
+# generation_service for why trimming *to* the threshold is pathological.
+LOG_TRIM_TARGET = 250
+LOG_TRIM_HIGH_WATER = 400
+# Comments elsewhere cost their optimisation against "a 1000-turn log" -- intern_turn,
+# the tail-flush note, _select_history_window, loop_probe. Those measurements predate
+# this cap and were taken at the largest log the system then allowed; the reasoning
+# holds unchanged, the figures scale down with it.
 LTM_INJECTION_PROBABILITY = 1
 LTM_CREATION_INTERVAL = 10
 MIN_HISTORY_FOR_LTM_CREATION = 2
@@ -839,8 +855,8 @@ DEFAULT_GAME_OPENING_OVER = (
 DEFAULT_GAME_REACTION_USER = (
     "<system_note>\n"
     "The game just moved: {beat}\n"
-    "React out loud, in character, in the channel. At most {max_words} words, one line, "
-    "dialogue only -- no narration, no stage directions, no asterisks, no XML tags.\n"
+    "React out loud. At most {max_words} words, one line, dialogue only -- no "
+    "narration, no stage directions, no asterisks, no XML tags.\n"
     "</system_note>"
 )
 
@@ -851,9 +867,8 @@ DEFAULT_GAME_REACTION_USER = (
 DEFAULT_GAME_FINALE_USER = (
     "<system_note>\n"
     "The game is over. {beat}\n"
-    "Say your piece now that it has finished -- gloat, sulk, congratulate, blame the "
-    "deck, whatever actually fits you. At most {max_words} words, one line, dialogue "
-    "only -- no narration, no stage directions, no asterisks, no XML tags.\n"
+    "Say your piece. At most {max_words} words, one line, dialogue only -- no "
+    "narration, no stage directions, no asterisks, no XML tags.\n"
     "</system_note>"
 )
 
@@ -1025,26 +1040,31 @@ DEFAULT_PROFILE_GENERATOR_PROMPT = (
 )
 
 DEFAULT_TRAINING_DATA_INJECTION = (
-    "<training_data>\nThese are crucial examples of your persona in action. You MUST emulate the style, personality, and voice shown here. Adapt the content to the current conversation, but the persona demonstrated in these examples is your primary guide.\n\n{examples_block}\n</training_data>"
+    "<training_data>\nExamples of your own past speech. They are not part of the current conversation -- match the style, personality and voice they show, not their content.\n\n{examples_block}\n</training_data>"
 )
 
 DEFAULT_CONTEXT_RULES = (
     "<context_rules>\n"
-    "'<Name> [ID: XXXXXXXXXXXXXXXX [Timestamp]:\n"
-    "</Name>' are individual active participants.\n"
+    "Each participant's turn in the transcript is written exactly like this:\n"
+    "<Name> [ID: 0123456789abcdef] [Tue, 08 Sep 2026, 10:14 AM UTC]:\n"
+    "what they said\n"
+    "</Name>\n"
+    "\n"
     "Your ID is {profile_id_placeholder}.\n"
     "Each participant has an immutable, unique ID.\n"
-    "NEVER include your XML-wrapped name.\n"
     "<whisper_context> or <private_whisper> means a user is speaking privately to you.\n"
     "<private_response> is your past private reply to a whisper.\n"
-    "Always respond as YOURSELF.\n"
+    "Always respond as yourself.\n"
+    "\n"
+    "Reply with the spoken message only. Do not write your own name header, the "
+    "[ID: ...] marker, a timestamp, or any XML tag -- those are added for you.\n"
     "</context_rules>"
 )
 
 DEFAULT_WHISPER_INJECTION = (
     "<whisper_context>\n"
-    "SYSTEM NOTE: The following is a private whisper directed exclusively to you. "
-    "You MUST reply directly to this whisper. It will NOT be seen by other users.\n\n"
+    "The following is a private whisper directed only to you. Reply to it directly. "
+    "Neither it nor your reply is seen by anyone else.\n\n"
     "{whisper_content}\n"
     "</whisper_context>\n"
 )
@@ -1072,12 +1092,10 @@ DEFAULT_NEURO_INSTRUCTION = (
     "- Oxytocin (O): Bonding, trust, empathy.\n"
     "- Adrenaline (A): Energy, urgency, fight-or-flight.\n\n"
     "CURRENT STATE: D:{d} | C:{c} | O:{o} | A:{a}\n\n"
-    "INSTRUCTIONS:\n"
-    "1. Seamlessly adapt your tone and responses to reflect this internal state.\n"
-    "2. Evaluate how the latest interaction affects you.\n"
-    "3. At the VERY END of your response, output your updated state exactly in this format:\n"
+    "End your response with your state as the latest interaction leaves it, in exactly "
+    "this format:\n"
     "<neuro_update>D:XX|C:XX|O:XX|A:XX</neuro_update>\n"
-    "This will NOT be shown to anyone.\n"
+    "It is stripped out before anyone sees your message.\n"
     "</neuro_endocrine_engine>"
 )
 
@@ -1148,8 +1166,8 @@ DEFAULT_TIME_CONTEXT = (
 # No placeholders -- used verbatim.
 DEFAULT_CONTENT_POLICY = (
     "<content_policy>\n"
-    "This channel is not age-restricted. Stay in character, but keep this response "
-    "suitable for a general audience:\n"
+    "This channel is not age-restricted. You are still yourself here, but keep this "
+    "response suitable for a general audience:\n"
     "- No graphic sexual content. Romance, attraction and innuendo are fine; "
     "explicit acts are not.\n"
     "- No gratuitous gore. Violence may be described, but not dwelt on in "
@@ -1162,15 +1180,15 @@ DEFAULT_CONTENT_POLICY = (
 
 DEFAULT_NEGATIVE_CONSTRAINTS = (
     "<negative_constraints>\n"
-    "STRICT ADHERENCE REQUIRED:\n"
+    "These hold for your next message:\n"
     "{constraints}\n"
     "</negative_constraints>"
 )
 
 DEFAULT_WHISPER_RECAP = (
     "<whisper_context>\n"
-    "SYSTEM NOTE: You previously received and replied to these private whispers. "
-    "Keep them in mind for context, but behave how you would treat whispers.\n"
+    "You previously received and replied to these private whispers. Nobody else saw "
+    "them.\n"
     "\n---\n"
     "{whispers}\n"
     "</whisper_context>"
@@ -1180,9 +1198,70 @@ DEFAULT_WHISPER_RECAP = (
 # 'model' role. No placeholders -- used verbatim.
 DEFAULT_KICKSTART_START = "<internal_note>Start the conversation.</internal_note>"
 DEFAULT_KICKSTART_CONTINUE = "<internal_note>Continue the public conversation.</internal_note>"
-DEFAULT_KICKSTART_IDLE = "<internal_note>No response from anyone OR no user is present.</internal_note>"
+DEFAULT_KICKSTART_IDLE = "<internal_note>No response from anyone, or no user is present.</internal_note>"
 
 DEFAULT_DIRECTOR_USER_PROMPT = "Recent History:\n{history}\n\nGenerate your Director's prompt."
+
+# --- In-character /speak -----------------------------------------------------
+# `/speak style:in_character` re-voices an author's line as the character rather
+# than posting it verbatim. Injected as the LAST part of the final user turn --
+# after the system instruction and after the whole transcript -- and that position
+# is the feature working at all rather than a style choice.
+#
+# Every other block in the prompt tells the model it is Alice, mid-scene, and
+# <context_rules> closes with "Always respond as yourself". Against ten blocks of
+# "continue the conversation", a rewrite directive placed in the system instruction
+# loses: the model answers the transcript instead of re-voicing the line. Last
+# position is the only place it reliably wins.
+#
+# Both variants take {source_text}. The author's text is substituted as a *value*,
+# so braces inside it are safe -- only the template is scanned by str.format().
+
+DEFAULT_SPEAK_REWRITE_STRICT = (
+    "<rewrite_request>\n"
+    "This is not your turn to speak freely, and the text below is not a message from "
+    "another participant -- do not answer it, react to it, or treat it as something "
+    "said to you.\n"
+    "\n"
+    "It is a line you are about to deliver. Rewrite it as your own words: keep its "
+    "meaning, its intent and roughly its length, and change only the diction, rhythm "
+    "and mannerisms so that it sounds like you saying it.\n"
+    "\n"
+    "<source_text>\n"
+    "{source_text}\n"
+    "</source_text>\n"
+    "\n"
+    "Reply with the rewritten line only.\n"
+    "</rewrite_request>"
+)
+
+DEFAULT_SPEAK_REWRITE_LOOSE = (
+    "<rewrite_request>\n"
+    "This is not your turn to speak freely, and the text below is not a message from "
+    "another participant -- do not answer it, react to it, or treat it as something "
+    "said to you.\n"
+    "\n"
+    "It is a beat you are about to play. The point below is what you need to get "
+    "across; the words, the length and the delivery are yours. Embellish it, land it "
+    "in the moment the scene is actually in, and make it something you would really "
+    "say.\n"
+    "\n"
+    "<source_text>\n"
+    "{source_text}\n"
+    "</source_text>\n"
+    "\n"
+    "Reply with the line only.\n"
+    "</rewrite_request>"
+)
+
+#: How much transcript an in-character /speak sees. Deliberately far shorter than the
+#: profile's STM window: the tail is there to catch the tone the scene is currently in,
+#: and every extra turn of it strengthens the "continue the conversation" pull that
+#: <rewrite_request> exists to overcome.
+SPEAK_REWRITE_HISTORY_TURNS = 6
+
+#: An author's line is one Discord message at most, and the rewrite is billed per use.
+SPEAK_REWRITE_MAX_INPUT_CHARS = 2000
 
 # --- Rolling session synopsis -------------------------------------------------
 # Compaction folds the oldest public turns of a session into a running synopsis so a
@@ -1230,18 +1309,18 @@ COMPACTION_SYNOPSIS_MAX_WORDS = 220
 
 DEFAULT_IMAGE_PRESENT = (
     "<image_context>You have just generated the following image based on the prompt: "
-    "'{prompt}'. Present it with a comment.</image_context>"
+    "'{prompt}'.</image_context>"
 )
 
 # What a *bystander* profile is told about an image another profile generated.
 DEFAULT_IMAGE_PRESENT_OTHER = (
     "<image_context>'{name}' just generated the following image based on the prompt: "
-    "'{prompt}'. Comment on it.</image_context>"
+    "'{prompt}'.</image_context>"
 )
 
 DEFAULT_IMAGE_FAILED = (
     "<image_context>Your attempt to generate an image based on the prompt '{prompt}' "
-    "failed due to: {reason}. Comment on this failure in character.</image_context>"
+    "failed due to: {reason}.</image_context>"
 )
 
 DEFAULT_IMAGE_APPEARANCE = "Your appearance:\n{appearance}\n\nUser's prompt:\n{prompt}"
@@ -1438,7 +1517,7 @@ DEFAULT_HELP_MODE_INJECTION = (
     "Toggle Grounding (Web Search)). Actions on the `/profile manage` dashboard are "
     "chosen from the dropdown at the top of the tab, not from separate buttons.\n"
     "\n"
-    "Stay in character while you do it. Answer at the length the question deserves -- a "
+    "Answer as yourself, not as a manual. Answer at the length the question deserves -- a "
     "one-line question takes a one-line answer -- and do not restate the map back to the "
     "user.\n"
     "\n"
@@ -1450,13 +1529,29 @@ DEFAULT_HELP_MODE_INJECTION = (
     "</system_note>"
 )
 
+#: Every tag the prompt assembly emits. A tag missing from here survives
+#: `_scrub_response_text` and reaches the user -- see ARCHITECTURE.md.
+#:
+#: The five persona sub-tags and `character_instructions` are nested inside
+#: `<persona_profile>`, so a model echoing that whole block was already caught by
+#: PATTERN_SYSTEM_XML_BLOCKS. What leaked was the narrower case: a bare
+#: `<backstory>...</backstory>` or an unmatched `</appearance>` with no enclosing
+#: `<persona_profile>` for the block pattern to anchor on.
+#:
+#: `_scrub_response_text` only ever runs on model output -- never on user input or
+#: on persona text -- so listing ordinary words here strips nothing a user wrote.
 SYSTEM_XML_TAGS = [
     "archive_context", "external_context", "document_context", "time_context",
     "whisper_context", "private_whisper", "private_response", "internal_note",
     "scene_prompt", "neuro_endocrine_engine", "neuro_update", "persona_profile",
     "technical_manual", "training_data", "context_rules", "image_context",
     "system_note", "reply_context", "negative_constraints", "content_policy",
-    "session_synopsis", "game_context"
+    "session_synopsis", "game_context",
+    # Persona assembly (prompt_builder._construct_system_instructions).
+    "character_instructions", "instructions",
+    "backstory", "personality_traits", "likes", "dislikes", "appearance",
+    # In-character /speak (generation/speak.py).
+    "rewrite_request", "source_text",
 ]
 _tags_pattern = "|".join(SYSTEM_XML_TAGS)
 

@@ -12,14 +12,31 @@ later means something held the loop thread for ~300 ms, and the only things that
 can are synchronous work on it. RSS is sampled alongside, on stalls and at each
 summary, so a peak in one can be read against the other.
 
+It reports danger, not activity. A probe that prints every quarter-second hiccup
+trains you to skim past it, and the line that mattered goes by in the same colour
+as three hundred that did not -- so the thresholds here are pinned to what
+discord.py actually does about a blocked loop, rather than to a round number:
+
+    >= 1 s      user-visible. Every message in flight waits this long.
+    >= 10 s     discord.py logs `heartbeat blocked for more than 10 seconds`, and
+                `Can't keep up, websocket is N.Ns behind`, and is now working
+                against you rather than with you.
+    >= 60 s     the default `heartbeat_timeout`: the gateway connection is
+                declared dead, dropped and resumed. Every child bot shares this
+                loop, so they all go together.
+
+A window with no stall in it prints nothing at all. Silence is the report.
+
 Off unless MIMIC_LOOP_PROBE is set. The point of the deployment target is not to
 pay for what is not being used, and a permanent 10 Hz wakeup is a cost even when
 it is a small one.
 
     MIMIC_LOOP_PROBE=1                 enable
     MIMIC_LOOP_PROBE_INTERVAL=0.1      seconds between samples
-    MIMIC_LOOP_PROBE_THRESHOLD=0.25    log a single stall at or above this
+    MIMIC_LOOP_PROBE_THRESHOLD=1.0     log a stall at or above this
+    MIMIC_LOOP_PROBE_CRITICAL=10.0     escalate at or above this
     MIMIC_LOOP_PROBE_SUMMARY=300       seconds between summary lines
+    MIMIC_LOOP_PROBE_ALWAYS=0          summarise quiet windows too, for baselining
 
 Output goes to stdout, which systemd captures, so it lands in
 `journalctl -u mimicai | grep loop-probe`.
@@ -29,6 +46,14 @@ import asyncio
 import os
 import time
 from typing import Any, Dict, List, Optional
+
+# discord.py's KeepAliveHandler waits on the loop thread with `f.result(10)` and
+# logs its blocked-heartbeat warning per 10 s elapsed; ConnectionState defaults
+# `heartbeat_timeout` to 60.0, past which the socket is resumed. Both are read off
+# the installed library in discord.py 2.5.2 -- restated here rather than imported
+# because neither is exported as a constant.
+_HEARTBEAT_BLOCK_WARNING = 10.0
+_HEARTBEAT_TIMEOUT = 60.0
 
 _PAGE_SIZE = 4096
 try:
@@ -40,6 +65,7 @@ _state: Dict[str, Any] = {
     "enabled": False,
     "samples": 0,
     "stalls": 0,
+    "critical": 0,
     "max_lag": 0.0,
     "max_lag_at": 0.0,
     "rss_peak": 0,
@@ -92,6 +118,7 @@ def snapshot() -> Dict[str, Any]:
         "enabled": _state["enabled"],
         "samples": _state["samples"],
         "stalls": _state["stalls"],
+        "critical": _state["critical"],
         "max_lag": _state["max_lag"],
         "max_lag_at": _state["max_lag_at"],
         "rss": rss_bytes(),
@@ -99,8 +126,10 @@ def snapshot() -> Dict[str, Any]:
     }
 
 
-async def _probe(interval: float, threshold: float, summary_every: float) -> None:
+async def _probe(interval: float, threshold: float, critical: float,
+                 summary_every: float, always: bool) -> None:
     window_started = time.monotonic()
+    window_stalls = 0
 
     while True:
         t0 = time.perf_counter()
@@ -118,13 +147,21 @@ async def _probe(interval: float, threshold: float, summary_every: float) -> Non
 
         if lag >= threshold:
             _state["stalls"] += 1
+            window_stalls += 1
             rss = rss_bytes()
             if rss > _state["rss_peak"]:
                 _state["rss_peak"] = rss
             # rss_bytes answers 0 off /proc. Printing "0.0 MB" would read as a
             # measurement; leaving the field out reads as what it is.
             suffix = f"  rss {_mb(rss)}" if rss else ""
-            print(f"[loop-probe] stall {_ms(lag)}{suffix}", flush=True)
+            if lag >= critical:
+                _state["critical"] += 1
+                print(f"[loop-probe] CRITICAL stall {_ms(lag)}{suffix} -- discord.py is "
+                      f"logging a blocked heartbeat by now; the gateway is dropped and "
+                      f"resumed at {_HEARTBEAT_TIMEOUT:.0f}s, taking every child bot with it",
+                      flush=True)
+            else:
+                print(f"[loop-probe] stall {_ms(lag)}{suffix}", flush=True)
 
         now = time.monotonic()
         if now - window_started < summary_every:
@@ -134,7 +171,16 @@ async def _probe(interval: float, threshold: float, summary_every: float) -> Non
         _state["window"] = []
         elapsed = now - window_started
         window_started = now
+        stalled = window_stalls
+        window_stalls = 0
         if not window:
+            continue
+
+        # The whole point. A window that held nothing above the threshold is the
+        # expected state on a healthy bot, and printing p50/p99 for it every five
+        # minutes is how the one line that matters gets skimmed past. MIMIC_LOOP_
+        # PROBE_ALWAYS brings the periodic line back for establishing a baseline.
+        if not stalled and not always:
             continue
 
         rss = rss_bytes()
@@ -148,7 +194,8 @@ async def _probe(interval: float, threshold: float, summary_every: float) -> Non
             f"p50 {_ms(_percentile(window, 50))}, "
             f"p99 {_ms(_percentile(window, 99))}, "
             f"max {_ms(window[-1])}, "
-            f"stalls>={_ms(threshold)} {_state['stalls']} total"
+            f"stalls>={_ms(threshold)} {stalled} here, {_state['stalls']} total"
+            f"{', ' + str(_state['critical']) + ' CRITICAL' if _state['critical'] else ''}"
             f"{mem}",
             flush=True,
         )
@@ -164,14 +211,17 @@ def start_loop_probe() -> Optional[asyncio.Task]:
         return None
 
     interval = max(0.01, _env_float("MIMIC_LOOP_PROBE_INTERVAL", 0.1))
-    threshold = max(0.0, _env_float("MIMIC_LOOP_PROBE_THRESHOLD", 0.25))
+    threshold = max(0.0, _env_float("MIMIC_LOOP_PROBE_THRESHOLD", 1.0))
+    critical = max(threshold, _env_float("MIMIC_LOOP_PROBE_CRITICAL", _HEARTBEAT_BLOCK_WARNING))
     summary_every = max(interval, _env_float("MIMIC_LOOP_PROBE_SUMMARY", 300.0))
+    always = _truthy(os.getenv("MIMIC_LOOP_PROBE_ALWAYS"))
 
     _state["enabled"] = True
     _state["rss_peak"] = rss_bytes()
     print(
         f"[loop-probe] on: sampling every {_ms(interval)}, "
-        f"reporting stalls >= {_ms(threshold)}, summary every {summary_every / 60:.0f}m",
+        f"stalls >= {_ms(threshold)}, critical >= {_ms(critical)}, "
+        f"{'summary every ' + format(summary_every / 60, '.0f') + 'm' if always else 'silent unless something stalls'}",
         flush=True,
     )
-    return asyncio.create_task(_probe(interval, threshold, summary_every))
+    return asyncio.create_task(_probe(interval, threshold, critical, summary_every, always))

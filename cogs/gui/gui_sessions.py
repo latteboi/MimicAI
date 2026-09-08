@@ -701,6 +701,125 @@ class WhisperHistoryView(ui.View):
         # After deletion, refresh the history view
         await self.cog._show_whisper_history(self.original_interaction)
 
+class SpeakRewriteEditModal(ui.Modal, title="Edit the line"):
+    """Edits the *source* line, not the rewrite -- then re-runs it.
+
+    Handing back the generated text to be corrected by hand would quietly turn the
+    feature into `/speak` with extra steps: whatever the author typed over would be
+    delivered verbatim under the character's face. The thing worth another pass is
+    the input.
+    """
+
+    def __init__(self, view: 'SpeakPreviewView'):
+        super().__init__()
+        self.parent_view = view
+        self.input_field = ui.TextInput(
+            label="What should they get across?",
+            style=discord.TextStyle.paragraph,
+            default=view.source_text,
+            max_length=SPEAK_REWRITE_MAX_INPUT_CHARS,
+        )
+        self.add_item(self.input_field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.parent_view.source_text = self.input_field.value
+        await self.parent_view.regenerate(interaction)
+
+
+class SpeakPreviewView(ui.View):
+    """The approve-before-posting step for `/speak style:in_character`.
+
+    A re-voiced line is a roll of the dice, and without a preview every miss is a
+    public miss the author then has to delete. The message this view lives on is
+    ephemeral, so only the author ever sees a rejected take.
+
+    Nothing is claimed or held while it is open: the log append still happens in one
+    uninterrupted step at Send, exactly as the verbatim path always has, and
+    `_deliver_speak_as` re-reads the session rather than trusting the one resolved
+    before the preview.
+    """
+
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, ctx: Dict[str, Any],
+                 source_text: str, rewritten: str, fidelity: str):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.original_interaction = interaction
+        self.ctx = ctx
+        self.source_text = source_text
+        self.rewritten = rewritten
+        self.fidelity = fidelity
+        self.takes = 1
+
+    def build_embed(self) -> discord.Embed:
+        name, avatar = self.cog.generation_service._resolve_appearance_data(
+            self.ctx["effective_owner_id"], self.ctx["effective_profile_name"])
+        embed = discord.Embed(description=self.rewritten, color=discord.Color.blurple())
+        embed.set_author(name=name, icon_url=avatar)
+        embed.add_field(name="Your line", value=self.source_text[:1024], inline=False)
+        embed.set_footer(text=f"{self.fidelity.title()} · take {self.takes} · nobody has seen this yet")
+        return embed
+
+    def _disable(self):
+        for child in self.children:
+            child.disabled = True
+
+    async def regenerate(self, interaction: discord.Interaction):
+        self._disable()
+        await interaction.response.edit_message(view=self)
+
+        rewritten, error = await self.cog.generation_service._rewrite_in_character(
+            self.ctx, self.source_text, self.fidelity)
+
+        for child in self.children:
+            child.disabled = False
+
+        if not rewritten:
+            await interaction.edit_original_response(
+                content=f"That take failed.\n-# {error}", view=self)
+            return
+
+        self.rewritten = rewritten
+        self.takes += 1
+        await interaction.edit_original_response(content=None, embed=self.build_embed(), view=self)
+
+    @ui.button(label="Send", style=discord.ButtonStyle.success)
+    async def send_button(self, interaction: discord.Interaction, button: ui.Button):
+        self._disable()
+        await interaction.response.edit_message(view=self)
+
+        # The button press, not the original /speak: _deliver_speak_as stamps the log
+        # turn with `created_at`, and the command may have been sent minutes ago.
+        delivered = await self.cog.generation_service._deliver_speak_as(
+            interaction, self.ctx, self.rewritten, style='in_character')
+
+        if delivered:
+            await interaction.edit_original_response(
+                content=f"Sent, after {self.takes} take(s).", embed=None, view=None)
+        else:
+            await interaction.edit_original_response(
+                content="That profile is no longer seated in this channel's session, so nothing was sent.",
+                embed=None, view=None)
+        self.stop()
+
+    @ui.button(label="Reroll", style=discord.ButtonStyle.primary)
+    async def reroll_button(self, interaction: discord.Interaction, button: ui.Button):
+        await self.regenerate(interaction)
+
+    @ui.button(label="Edit", style=discord.ButtonStyle.secondary)
+    async def edit_button(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(SpeakRewriteEditModal(self))
+
+    @ui.button(label="Switch fidelity", style=discord.ButtonStyle.secondary)
+    async def fidelity_button(self, interaction: discord.Interaction, button: ui.Button):
+        self.fidelity = 'loose' if self.fidelity == 'strict' else 'strict'
+        await self.regenerate(interaction)
+
+    @ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel_button(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.edit_message(content="Discarded.", embed=None, view=None)
+        self.stop()
+
+
 class WhisperActionView(ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, whisper_turn_id: str, response_turn_id: str, target_participant: Optional[Dict] = None, whisper_message: Optional[str] = None):
         super().__init__(timeout=300)

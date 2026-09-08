@@ -17,9 +17,10 @@ from ..utils.constants import (
     WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED, WARN_VOICE_SYNTHESIS_FAILED,
     DEFAULT_KICKSTART_START, DEFAULT_KICKSTART_CONTINUE, DEFAULT_KICKSTART_IDLE,
     DEFAULT_WHISPER_RECAP, DEFAULT_DIRECTOR_USER_PROMPT,
-    DEFAULT_IMAGE_GROUNDING, DEFAULT_NEGATIVE_CONSTRAINTS, DEFAULT_IMAGE_PRESENT,
+    DEFAULT_IMAGE_GROUNDING, DEFAULT_IMAGE_PRESENT,
     DEFAULT_IMAGE_PRESENT_OTHER, DEFAULT_IMAGE_FAILED,
     DEFAULT_SPEECH_VOICE, TTS_SYNTHESIS_PREAMBLE, CRITIC_AUDIT_TEXT_MAX,
+    LOG_TRIM_TARGET, LOG_TRIM_HIGH_WATER,
     CONTENT_RATING_ADULT, CONTENT_RATING_EMOJI, CONTENT_RATING_LABELS,
 )
 from ..utils.helpers import (
@@ -1069,11 +1070,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         training_examples_list = gathered_results[1]
                         help_context_text = gathered_results[2] if help_task else None
 
-                        full_system_instruction, _, grounding_enabled, temp, top_p, top_k, primary_model, fallback_model_name = await asyncio.to_thread(
-                            self._construct_system_instructions,
-                            owner_id, profile_name, channel.id, is_multi_profile=True, training_examples_list=training_examples_list, recalled_ltm=ltm_recall_text
-                        )
-                        
                         # Critic persistence: how many further rounds a generated
                         # constraint stays in force is the profile's to set now, where it
                         # was fixed at one.
@@ -1119,9 +1115,16 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                         "rounds": critic_settings["persistence"],
                                     }
 
-                        if critic_constraints:
-                            constraints_block = self.cog.global_prompts.get("NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS)
-                            full_system_instruction += "\n\n" + constraints_block.format(constraints=critic_constraints)
+                        # _construct_system_instructions places <negative_constraints>
+                        # itself, so the critic has to have run by now. It reads only
+                        # contents_for_api_call and the log tail, both of which are built
+                        # above, so moving it ahead of this call costs nothing.
+                        full_system_instruction, _, grounding_enabled, temp, top_p, top_k, primary_model, fallback_model_name = await asyncio.to_thread(
+                            self._construct_system_instructions,
+                            owner_id, profile_name, channel.id, is_multi_profile=True,
+                            training_examples_list=training_examples_list, recalled_ltm=ltm_recall_text,
+                            critic_constraints=critic_constraints,
+                        )
 
                         dynamic_safety_settings = _resolve_safety_settings(channel, p_settings)
 
@@ -2108,8 +2111,16 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 if 'all_triggers_for_round' in locals(): del all_triggers_for_round
 
                 # Trim the unified log to be the single source of truth for the session's history window.
-                if len(session.get("unified_log", [])) > 1000:
-                    session["unified_log"] = session["unified_log"][-1000:]
+                #
+                # Hysteresis, not a hard cap. Trimming *to* the threshold left the log
+                # sitting exactly on it, so the next append crossed it again and every
+                # round from then on zeroed the boundary and rewrote the whole log
+                # instead of appending a tail -- an O(log length) write per round,
+                # forever, on precisely the sessions long enough for it to hurt.
+                # Trimming to LOG_TRIM_TARGET only once the log reaches
+                # LOG_TRIM_HIGH_WATER pays that rewrite once per 150 rounds instead.
+                if len(session.get("unified_log", [])) > LOG_TRIM_HIGH_WATER:
+                    session["unified_log"] = session["unified_log"][-LOG_TRIM_TARGET:]
                     # A new list object whose head no longer matches the cold segment.
                     # Zeroing the boundary makes the round-end flush a full rewrite,
                     # which re-seals the trimmed log.

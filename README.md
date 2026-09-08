@@ -64,8 +64,9 @@ hands a timer to an **AI Director** model that decides when the cast should star
 on its own.
 
 Alongside the main session loop: `/whisper` for a private, ephemeral exchange with one
-participant, `/speak` to post anonymously as one of your profiles, `/trigger` to
-force a round, and `/session audit` for token telemetry and diagnostics.
+participant, `/speak` to post as one of your profiles — either verbatim, or re-voiced
+in character with a private preview before it goes out — `/trigger` to force a round,
+and `/session audit` for token telemetry and diagnostics.
 
 ### Memory
 

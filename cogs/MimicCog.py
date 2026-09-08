@@ -148,8 +148,14 @@ class MimicCog(EventListeners, commands.Cog):
 
         self.persona_modal_sections_order = ['backstory', 'personality_traits', 'likes', 'dislikes', 'appearance'] 
         
-        self.user_indices: LRUCache = LRUCache(max_size=20)
-        self.server_indices: LRUCache = LRUCache(max_size=50)
+        # Sized for the number of *distinct users and servers active at once*, not for
+        # a single-server install. Every miss here is a synchronous read on the event
+        # loop -- _validate_active_profile reaches _get_user_index on every human guild
+        # message -- so at 20 entries a hundred concurrent users missed on essentially
+        # every message. Both files are small plaintext orjson (a heavy user's
+        # index.json measures ~2.7 KB), so 200 entries costs well under a megabyte.
+        self.user_indices: LRUCache = LRUCache(max_size=200)
+        self.server_indices: LRUCache = LRUCache(max_size=200)
         
         # Memory-bounded caches to prevent RAM growth on long uptime
         self.user_appearances: LRUCache = LRUCache(max_size=50)
@@ -2253,9 +2259,11 @@ class MimicCog(EventListeners, commands.Cog):
     @app_commands.describe(
         profile_name="Your active session profile to speak as.",
         message="The message to send. If omitted, a multi-line input box will appear.",
-        method="The method to send the message with. Defaults to 'auto'."
+        method="The method to send the message with. Defaults to 'auto'.",
+        style="'verbatim' posts your text as written. 'in_character' has them re-voice it, with a preview first.",
+        fidelity="In-character only. 'strict' keeps your meaning and length; 'loose' plays it as a beat."
     )
-    async def speak_slash(self, interaction: discord.Interaction, profile_name: str, method: Literal['auto', 'webhook', 'child_bot'] = 'auto', message: Optional[str] = None):
+    async def speak_slash(self, interaction: discord.Interaction, profile_name: str, method: Literal['auto', 'webhook', 'child_bot'] = 'auto', message: Optional[str] = None, style: Literal['verbatim', 'in_character'] = 'verbatim', fidelity: Literal['strict', 'loose'] = 'strict'):
         session = self.multi_profile_channels.get(interaction.channel_id)
         if not session:
             await interaction.response.send_message("There is no active session in this channel. The profile must be active in a session.", ephemeral=True)
@@ -2283,7 +2291,7 @@ class MimicCog(EventListeners, commands.Cog):
             async def on_pick(pick_interaction: discord.Interaction, picked: str):
                 await self.speak_slash.callback(
                     self, pick_interaction, profile_name=picked,
-                    method=method, message=message)
+                    method=method, message=message, style=style, fidelity=fidelity)
 
             await suggest_profile(
                 self, interaction, p_name,
@@ -2308,7 +2316,9 @@ class MimicCog(EventListeners, commands.Cog):
                 author=interaction.user,
                 profile_name=p_name,
                 message=message,
-                method=method
+                method=method,
+                style=style,
+                fidelity=fidelity
             )
         else:
             async def modal_callback(modal_interaction: discord.Interaction, message_text: str):
@@ -2319,7 +2329,9 @@ class MimicCog(EventListeners, commands.Cog):
                     author=interaction.user,
                     profile_name=p_name,
                     message=message_text,
-                    method=method
+                    method=method,
+                    style=style,
+                    fidelity=fidelity
                 )
             
             modal = ActionTextInputModal(

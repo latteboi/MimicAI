@@ -7,12 +7,19 @@ import time
 import datetime
 import shutil
 import asyncio
+from collections import OrderedDict
 from discord.ext import tasks
 from typing import Any, Dict, Optional
 from cryptography.fernet import Fernet, InvalidToken
 import orjson as json
 
-from ..utils.constants import SERVERS_DIR
+from ..utils.constants import SERVERS_DIR, CLEANUP_STATE_FILE
+
+# The member cache may legitimately shrink between runs -- people do leave servers --
+# so the guard has to allow a real decline while refusing a collapse. A run that sees
+# less than this fraction of the highest count ever recorded is treated as a cache
+# problem, not as an exodus.
+_CLEANUP_MEMBER_FLOOR_RATIO = 0.5
 
 # zstandard's ZstdCompressor / ZstdDecompressor are NOT thread-safe: each owns a
 # native ZSTD_CCtx / ZSTD_DCtx, and the C backend releases the GIL while working on
@@ -44,6 +51,56 @@ def _get_decompressor() -> "zstd.ZstdDecompressor":
     if decompressor is None:
         decompressor = _ZSTD_LOCAL.decompressor = zstd.ZstdDecompressor()
     return decompressor
+
+
+# --- Decrypted shard cache -----------------------------------------------------
+#
+# Reading a profile shard is 77 us for a 17 KB profile, and only 9 us of that is
+# parsing: 41 us is Fernet, 15 us the read, 12 us zstd. _get_profile_config has no
+# cache of its own and a single turn reaches it several times, so the same file was
+# decrypted from scratch over and over.
+#
+# What is cached is the *plaintext bytes*, never the parsed object. Every caller
+# still parses its own dict, which is the property that makes this safe to add:
+# profile configs are handed out by reference and mutated in place (see the
+# profile_id reconciliation in _get_profile_config), so caching the object would
+# alias the cache into whatever the caller did to it next.
+#
+# The stat stamp is the entire invalidation story, and it is exact rather than
+# probabilistic: write_json_gzip builds a temp file and os.replace()s it into
+# position, so a changed file has a new inode, not merely a new mtime.
+#
+# Budgeted in bytes rather than entries because callers opt in per path -- this is
+# for the small shards a turn re-reads, not for session logs.
+_SHARD_CACHE_MAX_BYTES = 8 * 1024 * 1024
+_shard_cache: "OrderedDict[str, tuple]" = OrderedDict()
+_shard_cache_bytes = 0
+_shard_cache_lock = threading.Lock()
+
+
+def _shard_stamp(file_path: str):
+    """(mtime_ns, size, inode), or None if the file is not there."""
+    try:
+        st = os.stat(file_path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+def _shard_cache_store(file_path: str, stamp, plaintext: bytes):
+    global _shard_cache_bytes
+    size = len(plaintext)
+    if size > _SHARD_CACHE_MAX_BYTES:
+        return
+    with _shard_cache_lock:
+        previous = _shard_cache.pop(file_path, None)
+        if previous is not None:
+            _shard_cache_bytes -= len(previous[1])
+        _shard_cache[file_path] = (stamp, plaintext)
+        _shard_cache_bytes += size
+        while _shard_cache_bytes > _SHARD_CACHE_MAX_BYTES and _shard_cache:
+            _, evicted = _shard_cache.popitem(last=False)
+            _shard_cache_bytes -= len(evicted[1])
 
 
 def _delete_file_shard(file_path: str):
@@ -98,6 +155,53 @@ class IOManager:
 
             return json.loads(decompressed_bytes)
         except (IOError, json.JSONDecodeError, gzip.BadGzipFile, InvalidToken, zstd.ZstdError) as e:
+            print(f"IOManager Read Error ({file_path}): {e}")
+            return None
+
+    @staticmethod
+    def read_json_gzip_cached(file_path: str, fernet: Optional[Fernet] = None, encrypted: bool = True) -> Optional[Any]:
+        """read_json_gzip with the decrypted plaintext cached per path.
+
+        Opt-in: see the shard cache notes above for what belongs here and what does
+        not. Returns a freshly parsed object every call, never a shared one.
+        """
+        stamp = _shard_stamp(file_path)
+        if stamp is None:
+            return None
+
+        with _shard_cache_lock:
+            entry = _shard_cache.get(file_path)
+            if entry is not None and entry[0] == stamp:
+                _shard_cache.move_to_end(file_path)
+                plaintext = entry[1]
+            else:
+                plaintext = None
+
+        if plaintext is None:
+            try:
+                with open(file_path, 'rb') as f:
+                    file_bytes = f.read()
+
+                if encrypted and fernet:
+                    file_bytes = fernet.decrypt(file_bytes)
+
+                try:
+                    plaintext = _get_decompressor().decompress(file_bytes)
+                except zstd.ZstdError:
+                    plaintext = gzip.decompress(file_bytes)
+            except (IOError, OSError, gzip.BadGzipFile, InvalidToken, zstd.ZstdError) as e:
+                print(f"IOManager Read Error ({file_path}): {e}")
+                return None
+
+            # Stamped from before the read on purpose. A write landing mid-read leaves
+            # this entry carrying new bytes under the old stamp, so the next call stats
+            # a different inode and misses -- the failure mode is one wasted read, and
+            # never a stale hit.
+            _shard_cache_store(file_path, stamp, plaintext)
+
+        try:
+            return json.loads(plaintext)
+        except json.JSONDecodeError as e:
             print(f"IOManager Read Error ({file_path}): {e}")
             return None
 
@@ -353,6 +457,34 @@ class StorageManager:
                 "that the members intent is enabled and guild chunking completed."
             )
             return
+
+        # An empty cache is the obvious failure and the check above catches it. The
+        # dangerous one is a cache that is merely *short* -- chunking still in flight,
+        # a partial reconnect, or member caching turned down -- because then this set
+        # is non-empty, every check below passes, and every user who happens to be
+        # missing from it has their entire directory deleted: profiles, LTM, training
+        # and keys. Nothing above can tell that apart from a genuine departure.
+        #
+        # So compare against the largest count ever recorded rather than against zero.
+        # A collapse skips the run and leaves the high-water mark intact, so a bot that
+        # comes up under-chunked never cleans until it is properly populated again.
+        member_count = len(all_bot_member_ids)
+        cleanup_state = IOManager.read_json(CLEANUP_STATE_FILE) or {}
+        high_water = int(cleanup_state.get("member_high_water", 0))
+        if high_water and member_count < high_water * _CLEANUP_MEMBER_FLOOR_RATIO:
+            print(
+                f"[Cleanup] Aborted: member cache holds {member_count} across "
+                f"{len(self.cog.bot.guilds)} guild(s), against a high-water mark of "
+                f"{high_water}. Too steep a drop to be departures -- refusing to treat "
+                "the difference as departed users. Check that guild chunking completed."
+            )
+            return
+
+        if member_count > high_water:
+            try:
+                IOManager.write_json({"member_high_water": member_count}, CLEANUP_STATE_FILE)
+            except Exception as e:
+                print(f"[Cleanup] Could not record member high-water mark: {e}")
 
         # --- 1. Expired Share Codes ---
         cleaned_codes = 0

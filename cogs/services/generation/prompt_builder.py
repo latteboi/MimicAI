@@ -110,53 +110,24 @@ class PromptBuilderMixin:
             neuro_enabled = profile_data.get("neuro_engine_enabled", False)
             neuro_state = profile_data.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
 
-        final_instr_parts =[]
+        # Assembled most-stable-first, and that is a cost decision rather than a
+        # stylistic one. Providers cache on a shared prefix, so the first block that
+        # changes invalidates every token after it -- and <time_context> is formatted to
+        # the minute. With the persona and the character instructions sitting *behind*
+        # it, as they used to, the largest and most stable part of every prompt was
+        # re-billed uncached on every turn that crossed a minute boundary.
+        #
+        # <context_rules> and <content_policy> stay at the very end despite being stable
+        # themselves: they are the output-format and hard-content rules and they want
+        # recency, and by that point a volatile block already sits in front of them --
+        # so nothing past `stable_parts` was ever going to cache anyway.
+        stable_parts = []
+        volatile_parts = []
 
         if is_multi_profile:
             session = self.cog.multi_profile_channels.get(channel_id)
             if session and session.get("session_prompt"):
-                final_instr_parts.append(f"<scene_prompt>\n{session['session_prompt']}\n</scene_prompt>")
-
-            # Standing context, not a history turn: the synopsis summarises turns that
-            # have already left the STM window, so competing for a slot inside that
-            # window would hide it from exactly the long sessions it exists for. Shared
-            # by the whole cast -- only public turns are ever compacted, so it can carry
-            # nothing a participant was not already entitled to see.
-            synopsis = self.cog.session_manager.get_latest_synopsis(session)
-            if synopsis:
-                final_instr_parts.append(f"<session_synopsis>\n{synopsis}\n</session_synopsis>")
-
-            # Standing context for the same reason, and injected here rather than into
-            # the game's own call so that *every* generation in the channel sees it --
-            # a seated character answering ordinary chatter mid-hand knows what it just
-            # played, which is what removed the need to bench the cast during a game.
-            # Returns None on the overwhelmingly common no-game path, for one dict get.
-            game_block = self.cog.game_service.context_block(channel_id)
-            if game_block:
-                final_instr_parts.append(f"<game_context>\n{game_block}\n</game_context>")
-
-        if neuro_enabled:
-            neuro_block = self.cog.global_prompts.get("NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION).format(
-                d=neuro_state.get('dopamine', 50),
-                c=neuro_state.get('cortisol', 20),
-                o=neuro_state.get('oxytocin', 50),
-                a=neuro_state.get('adrenaline', 20)
-            )
-            final_instr_parts.append(neuro_block)
-
-        if time_tracking_enabled:
-            time_template = self.cog.global_prompts.get("TIME_CONTEXT", DEFAULT_TIME_CONTEXT)
-            try:
-                from ...utils.helpers import _resolve_zoneinfo
-                tz, _ = _resolve_zoneinfo(timezone_str)
-                now = datetime.datetime.now(tz)
-                time_str = now.strftime("%A, %d %B %Y, %I:%M %p (%Z)")
-                final_instr_parts.append(time_template.format(time_str=time_str))
-            except Exception as e:
-                print(f"Error processing timezone '{timezone_str}': {e}. Defaulting to UTC.")
-                now_utc = datetime.datetime.now(datetime.timezone.utc)
-                time_str_utc = now_utc.strftime("%A, %d %B %Y, %I:%M %p (UTC)")
-                final_instr_parts.append(time_template.format(time_str=time_str_utc))
+                stable_parts.append(f"<scene_prompt>\n{session['session_prompt']}\n</scene_prompt>")
 
         if persona_data and any(persona_data.values()):
             persona_blocks = []
@@ -169,9 +140,7 @@ class PromptBuilderMixin:
 
             if persona_blocks:
                 persona_str = "<persona_profile>\n" + "\n\n".join(persona_blocks) + "\n</persona_profile>"
-                final_instr_parts.append(persona_str)
-
-        current_instructions_str = "\n\n".join(final_instr_parts).strip()
+                stable_parts.append(persona_str)
 
         decrypted_parts = []
         if isinstance(ai_instr_str, list):
@@ -187,30 +156,80 @@ class PromptBuilderMixin:
                 decrypted_parts.append(cleaned_part)
 
         if decrypted_parts:
-            if current_instructions_str: current_instructions_str += "\n\n"
-            current_instructions_str += "<instructions>\n"
-            current_instructions_str += "\n\n".join(decrypted_parts).strip()
-            current_instructions_str += "\n</instructions>"
+            # Renamed from the bare <instructions>: it was the one generically-named tag
+            # in the set and it carries the most important user-authored content, which
+            # made it both the least informative name for the model and the one tag that
+            # could not safely be added to the orphan scrub pattern. Both spellings are
+            # in SYSTEM_XML_TAGS, so a model echoing either is still caught.
+            stable_parts.append("<character_instructions>\n"
+                                + "\n\n".join(decrypted_parts).strip()
+                                + "\n</character_instructions>")
+
+        if is_multi_profile:
+            # Standing context, not a history turn: the synopsis summarises turns that
+            # have already left the STM window, so competing for a slot inside that
+            # window would hide it from exactly the long sessions it exists for. Shared
+            # by the whole cast -- only public turns are ever compacted, so it can carry
+            # nothing a participant was not already entitled to see.
+            synopsis = self.cog.session_manager.get_latest_synopsis(session)
+            if synopsis:
+                volatile_parts.append(f"<session_synopsis>\n{synopsis}\n</session_synopsis>")
+
+            # Standing context for the same reason, and injected here rather than into
+            # the game's own call so that *every* generation in the channel sees it --
+            # a seated character answering ordinary chatter mid-hand knows what it just
+            # played, which is what removed the need to bench the cast during a game.
+            # Returns None on the overwhelmingly common no-game path, for one dict get.
+            game_block = self.cog.game_service.context_block(channel_id)
+            if game_block:
+                volatile_parts.append(f"<game_context>\n{game_block}\n</game_context>")
+
+        if neuro_enabled:
+            neuro_block = self.cog.global_prompts.get("NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION).format(
+                d=neuro_state.get('dopamine', 50),
+                c=neuro_state.get('cortisol', 20),
+                o=neuro_state.get('oxytocin', 50),
+                a=neuro_state.get('adrenaline', 20)
+            )
+            volatile_parts.append(neuro_block)
+
+        if time_tracking_enabled:
+            time_template = self.cog.global_prompts.get("TIME_CONTEXT", DEFAULT_TIME_CONTEXT)
+            try:
+                from ...utils.helpers import _resolve_zoneinfo
+                tz, _ = _resolve_zoneinfo(timezone_str)
+                now = datetime.datetime.now(tz)
+                time_str = now.strftime("%A, %d %B %Y, %I:%M %p (%Z)")
+                volatile_parts.append(time_template.format(time_str=time_str))
+            except Exception as e:
+                print(f"Error processing timezone '{timezone_str}': {e}. Defaulting to UTC.")
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+                time_str_utc = now_utc.strftime("%A, %d %B %Y, %I:%M %p (UTC)")
+                volatile_parts.append(time_template.format(time_str=time_str_utc))
 
         if training_examples_list:
             examples_block = "\n---\n".join(training_examples_list)
-            training_prompt = self.cog.global_prompts.get("TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION).format(examples_block=examples_block)
-            current_instructions_str += "\n\n" + training_prompt
+            volatile_parts.append(
+                self.cog.global_prompts.get("TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION)
+                .format(examples_block=examples_block))
 
         if recalled_ltm:
-            current_instructions_str += f"\n\n{recalled_ltm}"
+            volatile_parts.append(recalled_ltm)
 
+        # The critic's constraints, placed here rather than appended by the caller after
+        # <content_policy>. This parameter existed and no caller passed it: the worker
+        # built the same block itself once the critic had run, which put a style rule
+        # after the hard content rule and left two placements for one block, one of them
+        # fiction. The worker now runs its critic before this call and passes the result.
         if critic_constraints:
             constraints_block = self.cog.global_prompts.get("NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS)
-            current_instructions_str += "\n\n" + constraints_block.format(constraints=critic_constraints)
+            volatile_parts.append(constraints_block.format(constraints=critic_constraints))
 
         rule_block = self.cog.global_prompts.get("CONTEXT_RULES", DEFAULT_CONTEXT_RULES)
 
         # [NEW] Dynamically inject the profile's ID into the context rules
         profile_id_val = self.cog.profile_manager._get_profile_id(profile_owner_id, profile_name_to_use)
-        rule_block = rule_block.format(profile_id_placeholder=profile_id_val)
-
-        current_instructions_str += "\n\n" + rule_block.strip()
+        trailing_parts = [rule_block.format(profile_id_placeholder=profile_id_val).strip()]
 
         # Channel-level content shaping, gated on the destination rather than the
         # profile: an Adult-rated profile is already confined to age-restricted
@@ -223,7 +242,12 @@ class PromptBuilderMixin:
         if not self._channel_allows_adult_content(channel_id):
             policy_block = self.cog.global_prompts.get("CONTENT_POLICY", DEFAULT_CONTENT_POLICY).strip()
             if policy_block:
-                current_instructions_str += "\n\n" + policy_block
+                trailing_parts.append(policy_block)
+
+        current_instructions_str = "\n\n".join(
+            p for p in (stable_parts + volatile_parts + trailing_parts) if p and p.strip()
+        ).strip()
+
 
         final_system_instruction = current_instructions_str if current_instructions_str.strip() else DEFAULT_SYSTEM_INSTRUCTION
         return final_system_instruction, False, grounding_enabled, temperature, top_p, top_k, primary_model, fallback_model

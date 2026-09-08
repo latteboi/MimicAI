@@ -326,6 +326,73 @@ from that same list.
 **A new tag must be registered in `SYSTEM_XML_TAGS`, or it leaks into user-visible
 messages.** This is the most common way to ship a visible bug here.
 
+### Where a block goes
+
+Two destinations, and the choice is not stylistic.
+
+**The system instruction** (`_construct_system_instructions`) carries standing context —
+what is true for the whole scene. It is assembled in three bands:
+
+| Band | Blocks | Why there |
+|---|---|---|
+| stable | `scene_prompt`, `persona_profile`, `character_instructions` | changes rarely, so it is the cacheable prefix |
+| volatile | `session_synopsis`, `game_context`, `neuro_endocrine_engine`, `time_context`, `training_data`, `archive_context`, `negative_constraints` | changes per turn or per minute |
+| trailing | `context_rules`, `content_policy` | output-format and hard-content rules, last for recency |
+
+Providers cache on a shared prefix, so **the first block that changes invalidates every
+token after it**. `<time_context>` is formatted to the minute; with the persona behind it
+the largest stable part of every prompt was re-billed uncached every time the clock ticked.
+A new block goes in `volatile_parts` unless it is genuinely per-profile-stable.
+
+**The final user turn** carries per-turn context — what is true for *this* round:
+`whisper_context` recaps, `external_context`, `document_context`, help context, media, and
+image notes. Retrieval that serves the turn sits next to the turn.
+
+Recency is real. `<content_policy>` is last deliberately, and `<rewrite_request>` — the
+in-character `/speak` directive — goes in the **final user turn, after the whole
+transcript**, because every other block tells the model to continue the conversation as
+itself. Moved anywhere earlier it loses, and the character answers the transcript instead
+of re-voicing the author's line. No error, correct-looking output, wrong message.
+
+### What goes *in* a block
+
+State facts; do not give stage directions. A block is read by a character who already has
+a persona, training examples, an emotional state and the whole transcript — so a sentence
+telling it *how to behave* is competing with all of that, from the highest-attention
+position in the prompt, and it wins by flattening the character.
+
+`<image_context>` is the worked example. "You have just generated the following image
+based on the prompt 'X'" is a fact the model cannot derive. The sentence that used to
+follow it — "Present it with a comment." — could not be what causes a turn (the round is
+already generating one); what it supplied was a *register*, and *present* and *comment*
+are gallery-attendant words. Every profile answered its own image in the same obliging
+voice, which is the assistant voice the rest of the stack exists to suppress.
+
+Three sentences survive the test:
+
+- **A fact the model cannot derive** — that it made the image, that a whisper is private,
+  that training examples are not conversation history.
+- **A protocol constraint** — word caps, "dialogue only, no XML tags", the
+  `<neuro_update>` format spec. These are parser contracts, not personality; deleting one
+  breaks something quietly.
+- **A directive fighting a structural attractor** — `<rewrite_request>`, and "reply
+  directly to this whisper" when the whisper competes with a whole public transcript.
+
+Everything else is flab, and three shapes of it recur. A **menu** ("gloat, sulk,
+congratulate, blame the deck") is worse than a bare directive: it anchors on its examples
+however it is hedged afterwards. **Shouted compliance** (`You MUST`, `CRITICAL:`, `STRICT
+ADHERENCE REQUIRED:`) pulls a persona toward assistant-compliance, and when six blocks are
+critical none are. And **"in character"** only parses if the model conceives of itself as
+an actor who could also *not* be in character — it posits the out-of-character default and
+then asks politely for the other one.
+
+When a directive still feels necessary, look for the missing fact instead.
+
+This applies to the character-facing blocks. Utility prompts — the classifier, the
+summariser, the critic, the grounding researchers — are talking to a model acting as a
+tool, where there is no character to distort and the shouting is holding a parsed output
+format in place.
+
 ---
 
 ## The optional native core

@@ -1204,7 +1204,11 @@ class SessionManager:
 
     async def _evict_inactive_sessions(self):
         now = time.time()
-        inactive_threshold = 600  # 10 minute strict dehydration policy
+        # 5 minutes. A hydrated session holds its whole unified_log as live Python
+        # objects (~0.28 MB at LOG_TRIM_TARGET, ~1.1 MB at the old 1000-turn cap), and
+        # on a 1 GB box the hydrated set is the largest thing that scales with
+        # concurrent users. Rehydration is one shard read; idling on RAM is not free.
+        inactive_threshold = 300
 
         keys_to_evict = set()
 
