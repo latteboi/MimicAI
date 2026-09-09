@@ -27,7 +27,7 @@ from ..utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt,
     _format_history_entry, _get_user_hash, _resolve_safety_settings, _scrub_response_text,
     _split_into_sentences_with_abbreviations, is_real_model, resolve_critic_settings,
-    resolve_thinking_params, resolve_typing_cursor,
+    record_billed_usage, resolve_thinking_params, resolve_typing_cursor,
 )
 from ..utils import mem_probe
 from ..managers.session_manager import intern_turn
@@ -1592,6 +1592,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         "grounding_sources":[s.get('uri') for s in turn_grounding_sources if isinstance(s, dict) and s.get('uri')] if 'turn_grounding_sources' in locals() and turn_grounding_sources else [],
                         "ltms_recalled":[]
                     }
+                    record_billed_usage(meta, response)
                     if 'ltm_recall_text' in locals() and ltm_recall_text:
                         lines = ltm_recall_text.split('\n')
                         clean_lines = [l.strip() for l in lines if l.strip() and not l.startswith("<")]

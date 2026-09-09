@@ -6,7 +6,7 @@ import asyncio
 import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from .base_components import TimeoutCleanupMixin, build_tab_nav_bar
+from .base_components import TabbedView, add_button, add_select
 from ..utils.helpers import _get_user_hash, _resolve_zoneinfo
 
 if TYPE_CHECKING:
@@ -141,52 +141,22 @@ class OverrideConfirmView(ui.View):
     async def cancel_override(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.edit_message(content="❌ Assignment update cancelled.", view=None)
 
-class SettingsBaseView(TimeoutCleanupMixin, ui.View):
-    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, current_tab: str):
-        super().__init__(timeout=600)
-        self.cog = cog
-        self.original_interaction = interaction
-        self.user_id = interaction.user.id
-        self.current_tab = current_tab
-        self._add_nav_buttons()
+def _defaults_view(v):
+    # Imported here, not at module scope: gui_defaults adopts ModelPickerMixin from
+    # gui_profiles, and gui_profiles imports OllamaHostModal from this module. A
+    # top-level import would close that cycle.
+    from .gui_defaults import SettingsDefaultsView
+    return SettingsDefaultsView(v.cog, v.original_interaction)
 
-    def _add_nav_buttons(self):
-        build_tab_nav_bar(self, self.current_tab, [
-            ("Home", "home", self.nav_home),
-            ("About Me", "about", self.nav_about),
-            ("API Keys", "api", self.nav_api),
-            ("Defaults", "defaults", self.nav_defaults),
-            ("Child Bots", "bots", self.nav_bots),
-        ])
 
-    async def nav_about(self, i: discord.Interaction):
-        await i.response.defer()
-        view = SettingsAboutView(self.cog, self.original_interaction)
-        await view.update_display()
-
-    async def nav_home(self, i: discord.Interaction):
-        await i.response.defer()
-        view = SettingsHomeView(self.cog, self.original_interaction)
-        await view.update_display()
-
-    async def nav_api(self, i: discord.Interaction):
-        await i.response.defer()
-        view = SettingsAPIView(self.cog, self.original_interaction)
-        await view.update_display()
-
-    async def nav_defaults(self, i: discord.Interaction):
-        # Imported here, not at module scope: gui_defaults adopts ModelPickerMixin from
-        # gui_profiles, and gui_profiles imports OllamaHostModal from this module. A
-        # top-level import would close that cycle.
-        from .gui_defaults import SettingsDefaultsView
-        await i.response.defer()
-        view = SettingsDefaultsView(self.cog, self.original_interaction)
-        await view.update_display()
-
-    async def nav_bots(self, i: discord.Interaction):
-        await i.response.defer()
-        view = SettingsChildBotView(self.cog, self.original_interaction)
-        await view.update_display()
+class SettingsBaseView(TabbedView):
+    TABS = (
+        ("Home", "home", lambda v: SettingsHomeView(v.cog, v.original_interaction)),
+        ("About Me", "about", lambda v: SettingsAboutView(v.cog, v.original_interaction)),
+        ("API Keys", "api", lambda v: SettingsAPIView(v.cog, v.original_interaction)),
+        ("Defaults", "defaults", _defaults_view),
+        ("Child Bots", "bots", lambda v: SettingsChildBotView(v.cog, v.original_interaction)),
+    )
 
 class SettingsHomeView(SettingsBaseView):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):
@@ -199,8 +169,8 @@ class SettingsHomeView(SettingsBaseView):
         has_gem = any(s.get("provider") == "gemini" for s in slots.values())
         has_or = any(s.get("provider") == "openrouter" for s in slots.values())
         
-        stat_gemini = f"✅ **`Set`**" if has_gem else "❌ `Not Set`"
-        stat_or = f"✅ **`Set`**" if has_or else "❌ `Not Set`"
+        stat_gemini = "✅ **`Set`**" if has_gem else "❌ `Not Set`"
+        stat_or = "✅ **`Set`**" if has_or else "❌ `Not Set`"
         
         if self.user_id == int(defaultConfig.DISCORD_OWNER_ID):
             child_bots = [b for b in self.cog.child_bots.values() if b['owner_id'] == self.user_id]
@@ -240,15 +210,12 @@ class SettingsAboutView(SettingsBaseView):
 
     def _build_view(self):
         self.clear_items()
-        tz_btn = ui.Button(label="Set Timezone", style=discord.ButtonStyle.primary,
-                           emoji="\N{GLOBE WITH MERIDIANS}", row=0)
-        tz_btn.callback = self._act_timezone
-        self.add_item(tz_btn)
+        add_button(self, "Set Timezone", self._act_timezone, style=discord.ButtonStyle.primary,
+                   row=0, emoji="\N{GLOBE WITH MERIDIANS}")
 
         if self.cog.profile_manager.get_user_about(self.user_id).get("timezone"):
-            clear_btn = ui.Button(label="Clear Timezone", style=discord.ButtonStyle.secondary, row=0)
-            clear_btn.callback = self._act_clear_timezone
-            self.add_item(clear_btn)
+            add_button(self, "Clear Timezone", self._act_clear_timezone,
+                       style=discord.ButtonStyle.secondary, row=0)
 
         self._add_nav_buttons()
 
@@ -347,9 +314,8 @@ class SettingsAPIView(SettingsBaseView):
                 emoji = "⚪"
             slot_options.append(discord.SelectOption(label=label, value=slot_id, description=desc, emoji=emoji, default=(self.selected_slot == slot_id)))
 
-        slot_select = ui.Select(placeholder="Select an API Key Slot...", options=slot_options, row=0)
-        slot_select.callback = self.slot_select_callback
-        self.add_item(slot_select)
+        add_select(self, slot_options, self.slot_select_callback,
+                   placeholder="Select an API Key Slot...", row=0)
 
         # Row 1: Scope Multi-Select
         if self.selected_slot and self.selected_slot in slots_data:
@@ -377,26 +343,22 @@ class SettingsAPIView(SettingsBaseView):
                 scope_options.append(discord.SelectOption(label=f"Server: {g.name}"[:100], value=str(g.id), default=(str(g.id) in self.selected_scopes)))
                 
             if scope_options:
-                scope_select = ui.Select(placeholder="Assign this key to...", options=scope_options, min_values=0, max_values=len(scope_options), row=1)
-                scope_select.callback = self.scope_select_callback
-                self.add_item(scope_select)
+                add_select(self, scope_options, self.scope_select_callback,
+                           placeholder="Assign this key to...", min_values=0,
+                           max_values=len(scope_options), row=1)
 
             # Row 2: Actions
-            btn_edit = ui.Button(label="Edit Key", style=discord.ButtonStyle.primary, row=2)
-            btn_edit.callback = self.edit_key_callback
-            self.add_item(btn_edit)
+            add_button(self, "Edit Key", self.edit_key_callback,
+                       style=discord.ButtonStyle.primary, row=2)
             
-            btn_del = ui.Button(label="Delete Key", style=discord.ButtonStyle.danger, row=2)
-            btn_del.callback = self.delete_key_callback
-            self.add_item(btn_del)
+            add_button(self, "Delete Key", self.delete_key_callback,
+                       style=discord.ButtonStyle.danger, row=2)
             
-            btn_save = ui.Button(label="Save Assignments", style=discord.ButtonStyle.success, row=2)
-            btn_save.callback = self.save_assignments_callback
-            self.add_item(btn_save)
+            add_button(self, "Save Assignments", self.save_assignments_callback,
+                       style=discord.ButtonStyle.success, row=2)
         elif self.selected_slot:
-            btn_add = ui.Button(label="Submit Key", style=discord.ButtonStyle.success, row=2)
-            btn_add.callback = self.edit_key_callback
-            self.add_item(btn_add)
+            add_button(self, "Submit Key", self.edit_key_callback,
+                       style=discord.ButtonStyle.success, row=2)
 
     async def update_display(self):
         embed = discord.Embed(title="API Key Management", description="Manage your 4 API key slots and assign them to your Personal account or Servers you administrate.", color=discord.Color.blue())
@@ -552,21 +514,18 @@ class SettingsChildBotView(SettingsBaseView):
             options.append(discord.SelectOption(label=f"{name} ({b_data.get('profile_name')})", value=bid, default=(bid == self.selected_bot_id)))
 
         if options:
-            select = ui.Select(placeholder="Select a child bot...", options=options[:25], row=0)
-            select.callback = self.select_bot
-            self.add_item(select)
+            add_select(self, options[:25], self.select_bot, placeholder="Select a child bot...",
+                       row=0)
 
         # Row 1: Actions
-        btn_create = ui.Button(label="Create New Child Bot", style=discord.ButtonStyle.green, row=1)
-        btn_create.callback = self.create_bot
-        self.add_item(btn_create)
+        add_button(self, "Create New Child Bot", self.create_bot, style=discord.ButtonStyle.green,
+                   row=1)
 
         if self.selected_bot_id:
             # [REMOVED] Manage Approved Servers button
             
-            btn_del = ui.Button(label="Unlink & Delete", style=discord.ButtonStyle.danger, row=1)
-            btn_del.callback = self.delete_bot
-            self.add_item(btn_del)
+            add_button(self, "Unlink & Delete", self.delete_bot, style=discord.ButtonStyle.danger,
+                       row=1)
 
     async def update_display(self):
         if self.user_id != int(defaultConfig.DISCORD_OWNER_ID):
@@ -761,9 +720,8 @@ class ParentPresenceView(ui.View):
         self.activity_select.callback = self.activity_callback
         self.add_item(self.activity_select)
 
-        clear_btn = ui.Button(label="Clear Activity", style=discord.ButtonStyle.danger, row=2)
-        clear_btn.callback = self.clear_callback
-        self.add_item(clear_btn)
+        add_button(self, "Clear Activity", self.clear_callback, style=discord.ButtonStyle.danger,
+                   row=2)
 
     async def status_callback(self, interaction: discord.Interaction):
         status_map = {

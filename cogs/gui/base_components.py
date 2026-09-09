@@ -1,10 +1,8 @@
+import traceback
+
 import discord
 from discord import ui
-from typing import TYPE_CHECKING, Awaitable, Callable, Optional
-
-if TYPE_CHECKING:
-    # This only runs during "hinting" and prevents the circular crash
-    from ..MimicCog import MimicCog
+from typing import Awaitable, Callable, Optional
 
 def build_tab_nav_bar(target_view: ui.View, current_tab: str, tabs, row: int = 4):
     """Attaches a row of tab-navigation buttons to target_view.
@@ -13,22 +11,68 @@ def build_tab_nav_bar(target_view: ui.View, current_tab: str, tabs, row: int = 4
     currently active tab is styled primary and disabled; all others are secondary.
     """
     for label, tab_key, callback in tabs:
-        btn = ui.Button(
-            label=label,
-            style=discord.ButtonStyle.primary if current_tab == tab_key else discord.ButtonStyle.secondary,
-            row=row,
-            disabled=(current_tab == tab_key),
-        )
-        btn.callback = callback
-        target_view.add_item(btn)
+        add_button(target_view, label, callback, row=row,
+                   style=(discord.ButtonStyle.primary if current_tab == tab_key
+                          else discord.ButtonStyle.secondary),
+                   disabled=(current_tab == tab_key))
+
+def add_button(view: ui.View, label: str, callback, *, row: int = 0,
+               style: discord.ButtonStyle = discord.ButtonStyle.secondary,
+               disabled: bool = False, emoji=None, custom_id: Optional[str] = None):
+    """Construct a button, wire its callback and add it, in one call.
+
+    The `btn = ui.Button(...)` / `btn.callback = cb` / `add_item(btn)` triple was
+    written out roughly 140 times across this package. Returns the button for the few
+    callers that keep a reference to it.
+    """
+    btn = ui.Button(label=label, style=style, row=row, disabled=disabled,
+                    emoji=emoji, custom_id=custom_id)
+    btn.callback = callback
+    view.add_item(btn)
+    return btn
+
+
+def add_select(view: ui.View, options, callback, *, row: int = 0,
+               placeholder: Optional[str] = None, min_values: int = 1,
+               max_values: int = 1, disabled: bool = False,
+               custom_id: Optional[str] = None):
+    """`add_button`'s counterpart for a string select."""
+    # Not passed as custom_id=None: ui.Select type-checks it and rejects None, where
+    # ui.Button quietly generates one.
+    extra = {"custom_id": custom_id} if custom_id else {}
+    select = ui.Select(options=options, row=row, placeholder=placeholder,
+                       min_values=min_values, max_values=max_values,
+                       disabled=disabled, **extra)
+    select.callback = callback
+    view.add_item(select)
+    return select
+
 
 def build_confirm_view(button_label: str, on_confirm) -> ui.View:
     """Builds a single-button (danger-styled) confirmation view wired to on_confirm, timeout=60."""
     view = ui.View(timeout=60)
-    btn = ui.Button(label=button_label, style=discord.ButtonStyle.danger)
-    btn.callback = on_confirm
-    view.add_item(btn)
+    add_button(view, button_label, on_confirm, style=discord.ButtonStyle.danger)
     return view
+
+def invalidate_model_cache(cog, user_id: int, profile_name: Optional[str] = None):
+    """Drop cached model instances so the next turn rebuilds them from the edited config.
+
+    A cached model carries the system instruction and sampling parameters it was built
+    with, so every in-place profile write has to evict it or the setting only takes
+    effect once the LRU forgets it.
+
+    Eight call sites had grown four different key predicates: two dropped
+    `channel_models` and left `channel_model_last_profile_key` behind, and two widened
+    to every profile the user owns in order to change one character's timezone. Keys are
+    `(channel_id, owner_id, profile_name)`, with older two-element entries still in the
+    cache -- naming a profile narrows to that character, omitting it clears the user.
+    """
+    stale = [k for k in cog.channel_models
+             if isinstance(k, tuple) and len(k) >= 2 and k[1] == user_id
+             and (profile_name is None or (len(k) >= 3 and k[2] == profile_name))]
+    for k in stale:
+        cog.channel_models.pop(k, None)
+        cog.channel_model_last_profile_key.pop(k, None)
 
 def compute_window_slice(center_index: int, total_items: int, window_size: int = 25):
     """Computes a [start, end) slice of window_size items centered on center_index (a 0-based
@@ -73,6 +117,164 @@ class TimeoutCleanupMixin:
             # longer edit is exactly the case this is cleaning up after, so there is
             # nothing to report.
             pass
+
+
+#: The two bulk sentinels a paginated multi-select carries above its real options.
+SELECT_PAGE = "toggle_page"
+SELECT_ALL = "toggle_all"
+
+
+def bulk_select_options(page_items, all_items, is_selected, *,
+                        page_description="Toggle selection for all profiles on this page.",
+                        all_description="Toggle selection for all profiles in this source."):
+    """The two "Select Page" / "Select All" sentinels, labelled for the current state.
+
+    `is_selected` is called per item. Each label reads as the *undoing* half once its
+    scope is fully selected, which is what makes one click reversible by the same click.
+    """
+    page_selected = bool(page_items) and all(is_selected(i) for i in page_items)
+    all_selected = bool(all_items) and all(is_selected(i) for i in all_items)
+    return [
+        discord.SelectOption(
+            label="Unselect Page" if page_selected else "Select Page",
+            value=SELECT_PAGE, description=page_description, emoji="\U0001F4C4"),
+        discord.SelectOption(
+            label="Unselect All" if all_selected else "Select All",
+            value=SELECT_ALL, description=all_description, emoji="\U0001F4DA"),
+    ]
+
+
+def resolve_bulk_select(values, page_values, all_values, selected):
+    """Apply one multi-select submission to `selected`, returning the new set.
+
+    Four copies of this rule had grown across the package -- the bulk profile picker,
+    the share manager and both of the session editor's pickers -- and each had to
+    rediscover the part that is not obvious: **a submission only restates the page it
+    was made on**. Discord sends the values of the visible options and nothing else, so
+    a selection made on page 1 is absent from page 2's payload and must survive it. A
+    copy that forgets drops every off-page choice on the next click.
+
+    The sentinels short-circuit and never combine with names: picking "Select All"
+    alongside three entries is one gesture with one meaning.
+    """
+    values, page_values = set(values), set(page_values)
+    selected = set(selected)
+
+    if SELECT_PAGE in values:
+        return selected - page_values if page_values <= selected else selected | page_values
+    if SELECT_ALL in values:
+        everything = set(all_values)
+        return selected - everything if everything <= selected else selected | everything
+
+    # Only this page's membership is being restated; other pages are not in the payload.
+    return (selected - page_values) | (values - {"none"})
+
+
+class ReportErrorMixin:
+    """Tells the user when a control raised, instead of the interaction just dying.
+
+    discord.py's default `on_error` logs and returns, so a failed button looks exactly
+    like a button that does nothing. Two views carried a byte-identical copy of this;
+    the message is deliberately generic because it is reached from every control.
+    """
+
+    error_message = "An unexpected error occurred with this view."
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: ui.Item):
+        print(f"Error in {type(self).__name__}: {error}")
+        traceback.print_exc()
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(self.error_message, ephemeral=True)
+            else:
+                await interaction.response.send_message(self.error_message, ephemeral=True)
+        except Exception:
+            # The interaction token can be dead by the time we get here; there is
+            # nowhere left to report to, and raising out of an error handler is worse.
+            pass
+
+
+class TabbedView(TimeoutCleanupMixin, ui.View):
+    """Base for a screen whose tabs are sibling views: /hub, /settings, /mod.
+
+    Each of the three carried its own copy of this constructor and a nav method per
+    tab whose body -- defer, construct the sibling, repaint -- differed only in the
+    class it named. Subclasses declare `TABS` instead:
+
+        TABS = (("Home", "home", lambda v: HubHomeView(v.cog, v.original_interaction)),)
+
+    The factory is handed the view it is navigating away from, so a screen that
+    ferries state between its tabs (the moderated user id, say) reads it off there.
+    """
+
+    #: ((label, tab_key, factory), ...) in the order the nav bar renders them.
+    TABS: tuple = ()
+
+    #: The method that re-renders this screen's controls. Named two ways across the
+    #: adopters, and probing for it would silently pick the wrong one on a screen
+    #: that grew both.
+    REBUILD = "setup_items"
+
+    def __init__(self, cog, interaction: discord.Interaction, current_tab: str):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.original_interaction = interaction
+        self.user_id = interaction.user.id
+        self.current_tab = current_tab
+        self._add_nav_buttons()
+
+    def _add_nav_buttons(self):
+        self.attach_nav(self, self.current_tab, source=self)
+
+    @classmethod
+    def attach_nav(cls, target_view: ui.View, current_tab: str, *, source):
+        """Render this screen's nav bar onto `target_view`.
+
+        `source` is what the tab factories read. Normally the view itself, but
+        ProfileManageView passes a stand-in so the /mod nav bar can be grafted onto a
+        screen that is not one of the mod tabs.
+        """
+        def nav(factory):
+            async def callback(i: discord.Interaction):
+                await i.response.defer()
+                await factory(source).update_display()
+            return callback
+
+        build_tab_nav_bar(target_view, current_tab,
+                          [(label, key, nav(factory)) for label, key, factory in cls.TABS])
+
+    def _add_page_controls(self, num_pages: int, row: int, *, repaint: bool = True):
+        """Attach prev/next page buttons.
+
+        `repaint=True` edits the message in place off the click; `repaint=False`
+        defers and repaints through `update_display`.
+        """
+        async def p_cb(i: discord.Interaction):
+            await self._turn_page(i, -1, repaint)
+
+        async def n_cb(i: discord.Interaction):
+            await self._turn_page(i, 1, repaint)
+
+        build_pagination_controls(self, self.current_page, num_pages, row, p_cb, n_cb)
+
+    async def _turn_page(self, i: discord.Interaction, delta: int, repaint: bool = False):
+        self.current_page += delta
+        getattr(self, self.REBUILD)()
+        if repaint:
+            await i.response.edit_message(embed=self._get_embed(), view=self)
+        else:
+            await i.response.defer()
+            await self.update_display()
+
+    async def prev_page(self, i: discord.Interaction):
+        await self._turn_page(i, -1)
+
+    async def next_page(self, i: discord.Interaction):
+        await self._turn_page(i, 1)
+
+    # HubPublicLibraryView wires its buttons to the *_cb spelling.
+    prev_page_cb = prev_page
+    next_page_cb = next_page
 
 
 class PageJumpModal(ui.Modal):
@@ -173,10 +375,7 @@ class ConfigModal(ui.Modal):
             if target:
                 target.update(config_updates)
                 self.cog.profile_manager._save_profile_config(uid, self.profile_name, target, self.is_borrowed)
-                keys_to_clear = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and len(k) == 3 and k[1] == uid and k[2] == self.profile_name]
-                for k in keys_to_clear:
-                    self.cog.channel_models.pop(k, None)
-                    self.cog.channel_model_last_profile_key.pop(k, None)
+                invalidate_model_cache(self.cog, uid, self.profile_name)
 
         if prompt_updates and not self.is_borrowed:
             prompts = self.cog.profile_manager._get_profile_prompts(uid, self.profile_name)
@@ -228,27 +427,19 @@ class DropdownContentView(ui.View):
         self.clear_items()
         
         cat_options = [discord.SelectOption(label=cat[:100], value=cat[:100], default=(cat == self.selected_category)) for cat in self.content_dict.keys()]
-        cat_select = ui.Select(placeholder="Select Category...", options=cat_options, row=0)
-        
         async def cat_callback(interaction: discord.Interaction):
             self.selected_category = interaction.data['values'][0]
             self.selected_page = list(self.content_dict[self.selected_category].keys())[0]
             self._build_view()
             await interaction.response.edit_message(embed=self.get_embed(), view=self)
-            
-        cat_select.callback = cat_callback
-        self.add_item(cat_select)
+        add_select(self, cat_options, cat_callback, placeholder="Select Category...", row=0)
         
         page_options = [discord.SelectOption(label=page[:100], value=page[:100], default=(page == self.selected_page)) for page in self.content_dict[self.selected_category].keys()]
-        page_select = ui.Select(placeholder="Select Page...", options=page_options, row=1)
-        
         async def page_callback(interaction: discord.Interaction):
             self.selected_page = interaction.data['values'][0]
             self._build_view()
             await interaction.response.edit_message(embed=self.get_embed(), view=self)
-            
-        page_select.callback = page_callback
-        self.add_item(page_select)
+        add_select(self, page_options, page_callback, placeholder="Select Page...", row=1)
 
         if self.link_button_label and self.link_button_url:
             btn = ui.Button(label=self.link_button_label, url=self.link_button_url, row=2)
@@ -336,17 +527,9 @@ class BaseBulkProfileView(ui.View):
         
         options = []
         if page_items:
-            page_set = set(page_items)
-            page_selected = page_set.issubset(self.selected_profiles)
-            page_label = "Unselect Page" if page_selected else "Select Page"
-            options.append(discord.SelectOption(label=page_label, value="toggle_page", description="Toggle selection for all profiles on this page.", emoji="📄"))
-            
-            all_set = set(active_list)
-            all_selected = all_set.issubset(self.selected_profiles)
-            all_label = "Unselect All" if all_selected else "Select All"
-            options.append(discord.SelectOption(label=all_label, value="toggle_all", description="Toggle selection for all profiles in this source.", emoji="📚"))
-
-            # Update default state directly on the cached objects
+            options = bulk_select_options(page_items, active_list,
+                                          lambda p: p in self.selected_profiles)
+            # Default state set directly on the cached objects
             for opt in page_opts:
                 opt.default = (opt.value in self.selected_profiles)
                 options.append(opt)
@@ -354,9 +537,9 @@ class BaseBulkProfileView(ui.View):
             options = [discord.SelectOption(label="No profiles found", value="none", default=False)]
 
         placeholder = f"Select {self.view_source} profiles..."
-        select = ui.Select(placeholder=placeholder, min_values=0, max_values=len(options) if page_items else 1, options=options, custom_id="profile_select", row=row, disabled=(not page_items))
-        select.callback = self.profile_select_callback
-        self.add_item(select)
+        add_select(self, options, self.profile_select_callback, placeholder=placeholder,
+                   min_values=0, max_values=len(options) if page_items else 1, row=row,
+                   disabled=not page_items, custom_id="profile_select")
 
         btn_row = row + 1
         
@@ -366,10 +549,8 @@ class BaseBulkProfileView(ui.View):
         # also frees the slot that used to take this row to its five-button cap.
         if self.include_borrowed:
             style = discord.ButtonStyle.blurple if self.view_source == 'personal' else discord.ButtonStyle.green
-            mode_btn = ui.Button(label=f"Source: {self.view_source.title()}", style=style,
-                                 custom_id="toggle_source", row=btn_row)
-            mode_btn.callback = self.toggle_source_callback
-            self.add_item(mode_btn)
+            add_button(self, f"Source: {self.view_source.title()}", self.toggle_source_callback,
+                       style=style, row=btn_row, custom_id="toggle_source")
 
         async def p_cb(i: discord.Interaction):
             self.current_page -= 1
@@ -387,10 +568,9 @@ class BaseBulkProfileView(ui.View):
         # one click, and undoing it by paging through every page to unselect is not;
         # the dropdown sentinels only ever toggle the source currently in view.
         if self.selected_profiles:
-            clear_btn = ui.Button(label="Clear", style=discord.ButtonStyle.secondary,
-                                  custom_id="clear_selection", row=btn_row)
-            clear_btn.callback = self.clear_selection_callback
-            self.add_item(clear_btn)
+            add_button(self, "Clear", self.clear_selection_callback,
+                       style=discord.ButtonStyle.secondary, row=btn_row,
+                       custom_id="clear_selection")
 
     async def clear_selection_callback(self, interaction: discord.Interaction):
         """Drops the whole selection, both sources, every page."""
@@ -405,25 +585,13 @@ class BaseBulkProfileView(ui.View):
         await self._edit(interaction)
 
     async def profile_select_callback(self, interaction: discord.Interaction):
-        vals = interaction.data.get('values', [])
-        if "none" in vals: vals = []
-        
         per_page = 23
         active_list = self._get_active_list()
         start = self.current_page * per_page
-        page_items = set(active_list[start : start + per_page])
-        
-        if "toggle_page" in vals:
-            if page_items.issubset(self.selected_profiles): self.selected_profiles.difference_update(page_items)
-            else: self.selected_profiles.update(page_items)
-        elif "toggle_all" in vals:
-            all_set = set(active_list)
-            if all_set.issubset(self.selected_profiles): self.selected_profiles.difference_update(all_set)
-            else: self.selected_profiles.update(all_set)
-        else:
-            self.selected_profiles.difference_update(page_items)
-            self.selected_profiles.update(vals)
-            
+        self.selected_profiles = resolve_bulk_select(
+            interaction.data.get('values', []),
+            active_list[start : start + per_page], active_list, self.selected_profiles)
+
         self._build_view()
         await self._edit(interaction)
 

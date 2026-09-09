@@ -28,11 +28,11 @@ Prose lives in `content.WIZARD_COPY`, and depth is not repeated: each step names
 import asyncio
 import discord
 from discord import ui
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from ..utils.constants import CAST_POLICY_OPEN, DEFAULT_CAST_POLICY, defaultConfig
 from ..utils.content import HELP_CATEGORIES, WIZARD_COPY, WIZARD_TOUR
-from .base_components import DropdownContentView, TimeoutCleanupMixin
+from .base_components import DropdownContentView, TimeoutCleanupMixin, add_button
 
 if TYPE_CHECKING:
     from ..MimicCog import MimicCog
@@ -422,21 +422,15 @@ class StartWizardView(TimeoutCleanupMixin, ui.View):
                 self.add_item(self._make_action_button(target, "_act_dm_me"))
 
         if self.screen == "step" and self.step is not None:
-            more = ui.Button(label="📖 Read more", style=discord.ButtonStyle.secondary, row=2)
-            more.callback = self._act_read_more
-            self.add_item(more)
+            add_button(self, "📖 Read more", self._act_read_more,
+                       style=discord.ButtonStyle.secondary, row=2)
 
-        refresh = ui.Button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=2)
-        refresh.callback = self._act_refresh
-        self.add_item(refresh)
+        add_button(self, "🔄 Refresh", self._act_refresh, style=discord.ButtonStyle.secondary,
+                   row=2)
 
-        guide = ui.Button(label="Full guide", style=discord.ButtonStyle.secondary, row=2)
-        guide.callback = self._act_guide
-        self.add_item(guide)
+        add_button(self, "Full guide", self._act_guide, style=discord.ButtonStyle.secondary, row=2)
 
-        tour = ui.Button(label="Using it ▸", style=discord.ButtonStyle.primary, row=3)
-        tour.callback = self._act_tour
-        self.add_item(tour)
+        add_button(self, "Using it ▸", self._act_tour, style=discord.ButtonStyle.primary, row=3)
 
     def _build_tour(self):
         options = [discord.SelectOption(label=page, value=page,
@@ -452,19 +446,13 @@ class StartWizardView(TimeoutCleanupMixin, ui.View):
         select.callback = pick
         self.add_item(select)
 
-        back = ui.Button(label="◂ Setup", style=discord.ButtonStyle.primary, row=1)
-
         async def go_back(interaction: discord.Interaction):
             self.screen, self.step_key = "overview", None
             self._build_view()
             await interaction.response.edit_message(**self.render())
+        add_button(self, "◂ Setup", go_back, style=discord.ButtonStyle.primary, row=1)
 
-        back.callback = go_back
-        self.add_item(back)
-
-        guide = ui.Button(label="Full guide", style=discord.ButtonStyle.secondary, row=1)
-        guide.callback = self._act_guide
-        self.add_item(guide)
+        add_button(self, "Full guide", self._act_guide, style=discord.ButtonStyle.secondary, row=1)
 
     _ACTION_LABELS = {
         "_act_open_keys": ("Open API Keys", discord.ButtonStyle.success),

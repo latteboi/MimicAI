@@ -15,6 +15,7 @@ import discord
 from discord import ui
 from typing import TYPE_CHECKING, Awaitable, Callable, List, Optional, Sequence
 
+from .base_components import add_button, add_select
 from ..utils.fuzzy import MAX_CHOICES, best_match, rank_keyed
 
 if TYPE_CHECKING:
@@ -110,16 +111,9 @@ class ProfileSuggestionView(ui.View):
         rest = self.candidates[BUTTON_SUGGESTIONS:]
 
         for position, candidate in enumerate(top):
-            btn = ui.Button(
-                label=candidate.label,
-                emoji=candidate.emoji,
-                # The strongest match is highlighted, so the common case -- a single
-                # transposed letter -- is one obvious click rather than a read.
-                style=discord.ButtonStyle.success if position == 0 else discord.ButtonStyle.secondary,
-                row=0,
-            )
-            btn.callback = self._make_pick_callback(candidate.value)
-            self.add_item(btn)
+            add_button(self, candidate.label, self._make_pick_callback(candidate.value),
+                       style=discord.ButtonStyle.success if position == 0 else discord.ButtonStyle.secondary,
+                       row=0, emoji=candidate.emoji)
 
         if rest:
             options = [
@@ -131,13 +125,10 @@ class ProfileSuggestionView(ui.View):
                 )
                 for candidate in rest
             ]
-            select = ui.Select(placeholder="More profiles...", options=options, row=1)
-            select.callback = self._select_callback
-            self.add_item(select)
+            add_select(self, options, self._select_callback, placeholder="More profiles...", row=1)
 
-        cancel = ui.Button(label="Cancel", style=discord.ButtonStyle.secondary, row=2)
-        cancel.callback = self._cancel_callback
-        self.add_item(cancel)
+        add_button(self, "Cancel", self._cancel_callback, style=discord.ButtonStyle.secondary,
+                   row=2)
 
     def _make_pick_callback(self, value: str):
         async def callback(interaction: discord.Interaction):
@@ -220,8 +211,8 @@ class ProfileSuggestionView(ui.View):
         else:
             title = f"❌ No {noun} named '{self.typed[:60]}'"
             description = (
-                f"Nothing close enough to suggest. Use `/profile list` to see everything "
-                f"you own, or `/profile create` to make a new one."
+                "Nothing close enough to suggest. Use `/profile list` to see everything "
+                "you own, or `/profile create` to make a new one."
             )
 
         embed = discord.Embed(

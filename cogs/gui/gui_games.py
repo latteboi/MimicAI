@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import discord
 from discord import ui
 
+from .base_components import add_button, add_select
 from ..services.games import eights
 from ..services.games.eights import COLOURS, Card, Move
 
@@ -115,7 +116,7 @@ def build_hand_embed(game: "Game", seat_id: str) -> discord.Embed:
         cards.sort(key=lambda c: (len(c[1]), c[1]))
         line = " · ".join(_LABEL.get(c[1], c[1]) for c in cards)
         if len(line) > MAX_HAND_FIELD_CHARS:
-            line = line[:MAX_HAND_FIELD_CHARS].rsplit(" · ", 1)[0] + f" · …(+more)"
+            line = line[:MAX_HAND_FIELD_CHARS].rsplit(" · ", 1)[0] + " · …(+more)"
         embed.add_field(
             name=f"{_SWATCH.get(colour, '')} {_COLOUR_NAME.get(colour, colour)}"
                  f" ({len(cards)})",
@@ -323,16 +324,9 @@ class ColourChoiceView(ui.View):
         self.hand_view = hand_view
         self.card = card
         for colour in COLOURS:
-            button = ui.Button(
-                label=_COLOUR_NAME[colour],
-                emoji=_SWATCH[colour],
-                style=discord.ButtonStyle.secondary,
-            )
-            button.callback = self._make_callback(colour)
-            self.add_item(button)
-        back = ui.Button(label="Back", style=discord.ButtonStyle.secondary, row=1)
-        back.callback = self._on_back
-        self.add_item(back)
+            add_button(self, _COLOUR_NAME[colour], self._make_callback(colour),
+                       style=discord.ButtonStyle.secondary, emoji=_SWATCH[colour])
+        add_button(self, "Back", self._on_back, style=discord.ButtonStyle.secondary, row=1)
 
     def _make_callback(self, colour: str):
         async def callback(interaction: discord.Interaction):
@@ -373,23 +367,15 @@ class HandView(ui.View):
         if my_turn:
             self._add_play_control(plays)
 
-        draw = ui.Button(
-            label=("Take the stack" if state.pending_draw else "Draw"),
-            emoji="🫳", style=discord.ButtonStyle.primary, row=1,
-            disabled=not my_turn or "draw" not in kinds,
-        )
-        draw.callback = self._on_draw
-        self.add_item(draw)
+        add_button(self, "Take the stack" if state.pending_draw else "Draw", self._on_draw,
+                   style=discord.ButtonStyle.primary, row=1,
+                   disabled=not my_turn or "draw" not in kinds, emoji="🫳")
 
-        skip = ui.Button(label="Pass", style=discord.ButtonStyle.secondary, row=1,
-                         disabled=not my_turn or "pass" not in kinds)
-        skip.callback = self._on_pass
-        self.add_item(skip)
+        add_button(self, "Pass", self._on_pass, style=discord.ButtonStyle.secondary, row=1,
+                   disabled=not my_turn or "pass" not in kinds)
 
-        refresh = ui.Button(label="Refresh", emoji="🔄",
-                            style=discord.ButtonStyle.secondary, row=1)
-        refresh.callback = self._on_refresh
-        self.add_item(refresh)
+        add_button(self, "Refresh", self._on_refresh, style=discord.ButtonStyle.secondary, row=1,
+                   emoji="🔄")
 
     def _add_play_control(self, plays: List[Move]) -> None:
         """One select of legal plays, or a colour step first when there are many.
@@ -453,15 +439,11 @@ class HandView(ui.View):
             return
         placeholder = ("Play a card" if not self.colour_filter
                        else f"Play a {_COLOUR_NAME.get(self.colour_filter, '')} card")
-        select = ui.Select(placeholder=placeholder, row=0, options=options)
-        select.callback = self._on_pick_card
-        self.add_item(select)
+        add_select(self, options, self._on_pick_card, placeholder=placeholder, row=0)
 
         if self.colour_filter:
-            back = ui.Button(label="Other colours", style=discord.ButtonStyle.secondary,
-                             row=2)
-            back.callback = self._on_clear_filter
-            self.add_item(back)
+            add_button(self, "Other colours", self._on_clear_filter,
+                       style=discord.ButtonStyle.secondary, row=2)
 
     # -- helpers -------------------------------------------------------------------
 

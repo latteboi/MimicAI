@@ -7,8 +7,10 @@ import pathlib
 import time
 import asyncio
 from typing import TYPE_CHECKING, List, Dict, Any, Optional
-from ..utils.helpers import _estimate_text_tokens
-from .base_components import PageJumpModal, build_pagination_controls
+from ..utils.helpers import _estimate_text_tokens, resolve_openrouter_service_tier
+from .base_components import (PageJumpModal, SELECT_ALL, SELECT_PAGE, add_button,
+                              add_select, build_pagination_controls,
+                              bulk_select_options, resolve_bulk_select)
 from ..services.generation.compaction import resolve_compaction_settings
 from ..services.generation.global_chat import build_global_chat_embed
 
@@ -165,9 +167,8 @@ class GlobalChatPlayView(ui.View):
         is_typing_locked = len(active_typers) > 0 and now < deadline
         is_session_locked = session_data.get("is_locked", True)
 
-        reply_btn = ui.Button(label="Reply", emoji="✍️", style=discord.ButtonStyle.primary, row=0)
-        reply_btn.callback = self.reply_callback
-        self.add_item(reply_btn)
+        add_button(self, "Reply", self.reply_callback, style=discord.ButtonStyle.primary, row=0,
+                   emoji="✍️")
 
         if queue:
             if is_typing_locked:
@@ -187,13 +188,9 @@ class GlobalChatPlayView(ui.View):
 
         # Labelled, because the lock decides who may press these buttons and a bare
         # padlock read as "this conversation is private" -- which the card is not.
-        lock_btn = ui.Button(
-            label="Host only" if is_session_locked else "Open to all",
-            emoji="🔒" if is_session_locked else "🔓",
-            style=discord.ButtonStyle.danger if is_session_locked else discord.ButtonStyle.success,
-            row=0)
-        lock_btn.callback = self.lock_callback
-        self.add_item(lock_btn)
+        add_button(self, "Host only" if is_session_locked else "Open to all", self.lock_callback,
+                   style=discord.ButtonStyle.danger if is_session_locked else discord.ButtonStyle.success,
+                   row=0, emoji="🔒" if is_session_locked else "🔓")
 
     def get_embed(self):
         return build_global_chat_embed(
@@ -427,9 +424,8 @@ class GlobalChatHistoryView(ui.View):
         for p in self.available_profiles[:25]: 
             profile_options.append(discord.SelectOption(label=p, value=p, default=(p == self.selected_profile)))
         
-        profile_select = ui.Select(placeholder="Select a conversation history...", options=profile_options, row=0)
-        profile_select.callback = self.profile_callback
-        self.add_item(profile_select)
+        add_select(self, profile_options, self.profile_callback,
+                   placeholder="Select a conversation history...", row=0)
 
         if not self.rounds:
             return
@@ -454,16 +450,11 @@ class GlobalChatHistoryView(ui.View):
             options.append(discord.SelectOption(label=label, value=str(i), default=(i == self.current_page)))
         
         if options:
-            jump_select = ui.Select(placeholder="Jump to a round...", options=options, row=1)
-            jump_select.callback = self.jump_callback
-            self.add_item(jump_select)
+            add_select(self, options, self.jump_callback, placeholder="Jump to a round...", row=1)
 
         # Row 2: Buttons
         build_pagination_controls(self, self.current_page, len(self.rounds), 2, self.prev_callback, self.next_callback)
-        delete_btn = ui.Button(label="Delete", style=discord.ButtonStyle.danger, row=2)
-        delete_btn.callback = self.delete_callback
-        
-        self.add_item(delete_btn)
+        add_button(self, "Delete", self.delete_callback, style=discord.ButtonStyle.danger, row=2)
 
     def get_embed(self) -> discord.Embed:
         session_data = self.cog.global_chat_sessions.get(self.session_key, {}) if self.session_key else {}
@@ -586,9 +577,8 @@ class WhisperHistoryView(ui.View):
         for pid, p_name in sorted(list(profile_keys), key=lambda x: x[1]):
             profile_options.append(discord.SelectOption(label=p_name, value=pid, default=(self.selected_profile_key == pid)))
         
-        profile_select = ui.Select(placeholder="Filter by profile...", options=profile_options, row=0)
-        profile_select.callback = self.profile_filter_callback
-        self.add_item(profile_select)
+        add_select(self, profile_options, self.profile_filter_callback,
+                   placeholder="Filter by profile...", row=0)
 
         # --- Filter whispers based on selection ---
         if self.selected_profile_key:
@@ -614,9 +604,8 @@ class WhisperHistoryView(ui.View):
                 
                 whisper_options.append(discord.SelectOption(label=f"({ts_str}) {content_preview}...", value=str(i), default=(i == self.current_page)))
             
-            whisper_select = ui.Select(placeholder="Jump to a whisper...", options=whisper_options[:DROPDOWN_MAX_OPTIONS], row=1)
-            whisper_select.callback = self.whisper_jump_callback
-            self.add_item(whisper_select)
+            add_select(self, whisper_options[:DROPDOWN_MAX_OPTIONS], self.whisper_jump_callback,
+                       placeholder="Jump to a whisper...", row=1)
 
         # --- Build Buttons ---
         async def _prev(i):
@@ -631,9 +620,8 @@ class WhisperHistoryView(ui.View):
 
         build_pagination_controls(self, self.current_page, len(self.filtered_whispers), 2, _prev, _next)
 
-        delete_button = ui.Button(label="Delete", style=discord.ButtonStyle.danger, disabled=(not self.filtered_whispers), row=2)
-        delete_button.callback = self.delete_callback
-        self.add_item(delete_button)
+        add_button(self, "Delete", self.delete_callback, style=discord.ButtonStyle.danger, row=2,
+                   disabled=not self.filtered_whispers)
 
     def _get_current_embed(self) -> discord.Embed:
         if not self.filtered_whispers:
@@ -1211,21 +1199,19 @@ class SessionView(ui.View):
             self.add_item(self.select)
 
         if num_pages > 1:
-            prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page == 0), row=1)
             async def prev_cb(i):
                 self.current_page -= 1
                 self.update_view()
                 await i.response.edit_message(view=self)
-            prev_btn.callback = prev_cb
-            self.add_item(prev_btn)
+            add_button(self, "◀", prev_cb, style=discord.ButtonStyle.secondary, row=1,
+                       disabled=self.current_page == 0)
             
-            next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page == num_pages - 1), row=1)
             async def next_cb(i):
                 self.current_page += 1
                 self.update_view()
                 await i.response.edit_message(view=self)
-            next_btn.callback = next_cb
-            self.add_item(next_btn)
+            add_button(self, "▶", next_cb, style=discord.ButtonStyle.secondary, row=1,
+                       disabled=self.current_page == num_pages - 1)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -1245,6 +1231,7 @@ class SessionConfigView(ui.View):
         self.view_source = 'personal'
         self.current_page = 0
         self.selected_reactivity_profiles = set()
+        self._seated_cache = None
         self._load_lists()
 
     #: Cast sources, in the order the Source dropdown lists them. `session` is last
@@ -1368,13 +1355,58 @@ class SessionConfigView(ui.View):
         """
         return self.cog.session_manager.participant_identity(participant)
 
+    async def _save_and_repaint(self, i: discord.Interaction):
+        self.cog.session_manager._save_multi_profile_sessions()
+        await i.response.defer()
+        await self.update_display()
+
+    def _add_toggle(self, label: str, enabled: bool, setter, row: int = 0, *,
+                    on_off_style: bool = False):
+        """A button that flips one session setting and repaints.
+
+        `setter` is handed the new value. `on_off_style` colours the button by the
+        state it is in rather than leaving it neutral -- the two standing switches
+        (proactivity, the rolling synopsis) read that way; the momentary ones do not.
+        """
+        async def callback(i: discord.Interaction):
+            setter(not enabled)
+            await self._save_and_repaint(i)
+
+        style = discord.ButtonStyle.secondary
+        if on_off_style:
+            style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger
+        add_button(self, label, callback, style=style, row=row)
+
+    def _add_modal_button(self, label: str, modal_cls, row: int = 0,
+                          style: discord.ButtonStyle = discord.ButtonStyle.primary):
+        async def callback(i: discord.Interaction):
+            await i.response.send_modal(modal_cls(self))
+        add_button(self, label, callback, style=style, row=row)
+
+    def _seated_index(self) -> Dict[tuple, Dict]:
+        """`_participant_key` -> the seated participant, built once per render.
+
+        `_seated` was a linear scan of the cast, and the cast tab asked it once per
+        source entry: two partition passes over a 200-profile list against a 200-seat
+        cast came to tens of thousands of `participant_identity` calls before a single
+        option was built, on a quarter of a vCPU.
+
+        Held only across one render. `_seat_items` keeps it in step as it appends --
+        it has to, because it consults the index to spot duplicates inside its own
+        batch -- and `_unseat_items` drops it. Anything else that writes
+        `session['profiles']` must drop it too, which is why `update_display` clears
+        it after re-reading the live session another admin may have moved.
+        """
+        if self._seated_cache is None:
+            self._seated_cache = {self._participant_key(p): p
+                                  for p in self.session.get('profiles', [])}
+        return self._seated_cache
+
     def _seated(self, participant) -> Optional[Dict]:
         """The seated participant matching this one, whichever way it speaks."""
         if not participant:
             return None
-        key = self._participant_key(participant)
-        return next((p for p in self.session.get('profiles', [])
-                     if self._participant_key(p) == key), None)
+        return self._seated_index().get(self._participant_key(participant))
 
     def _bot_id_for(self, item) -> Optional[str]:
         return next((k for k, v in self.cog.child_bots.items() if v is item), None)
@@ -1420,7 +1452,10 @@ class SessionConfigView(ui.View):
         unselected here, with a description saying so, rather than as a selection
         Unselect Page would then silently remove.
         """
-        participant = self._build_participant(item)
+        return self._is_seated_as(self._build_participant(item))
+
+    def _is_seated_as(self, participant) -> bool:
+        """`_is_selected` for a caller that has already built the participant."""
         if not participant:
             return False
         existing = self._seated(participant)
@@ -1434,13 +1469,15 @@ class SessionConfigView(ui.View):
         them.
         """
         blocked = []
+        index = self._seated_index()
         for item in items:
             if len(self.session['profiles']) >= 200:
                 break
             participant = self._build_participant(item)
             if not participant:
                 continue
-            existing = self._seated(participant)
+            key = self._participant_key(participant)
+            existing = index.get(key)
             if existing is not None:
                 # Re-selecting something already seated the same way is a no-op, and
                 # silent: Select All hits it on every pass. Only the cross-method
@@ -1449,6 +1486,7 @@ class SessionConfigView(ui.View):
                     blocked.append(participant['profile_name'])
                 continue
             self.session['profiles'].append(participant)
+            index[key] = participant
         return blocked
 
     def _unseat_items(self, items) -> None:
@@ -1479,6 +1517,7 @@ class SessionConfigView(ui.View):
         self.session['profiles'] = [
             p for p in self.session['profiles']
             if self._participant_key(p) not in drop]
+        self._seated_cache = None
 
     #: Tabs a non-administrator may open when Open casting let them in here. Casting is
     #: the whole of what Open casting grants: a member seats and unseats characters, and
@@ -1529,6 +1568,7 @@ class SessionConfigView(ui.View):
         live = self.cog.multi_profile_channels.get(self.original_interaction.channel_id)
         if live is not None:
             self.session = live
+        self._seated_cache = None
 
         # An administrator can lose the role with this editor open on a tab a member may
         # not use, so the tab in hand is re-checked on every render the way `view_source`
@@ -1543,540 +1583,18 @@ class SessionConfigView(ui.View):
         self._add_nav_buttons()
         embed = discord.Embed(title=f"Chat Session: #{self.original_interaction.channel.name}", color=discord.Color.gold())
 
-        if self.current_tab == "cast":
-            # A role can be removed while this view is open, and `view_source` is held
-            # across renders, so the source in hand is re-checked rather than trusted.
-            if self.view_source not in self._available_sources():
-                self.view_source = 'personal'
-                self.current_page = 0
-
-            if self.view_source == 'session':
-                # Derived, not cached: the cast moves under an open editor.
-                self.lists['session'] = self._session_source_items()
-                embed.description = ("Characters **other members** already have in this cast. "
-                                     "Deselecting removes one; nothing here can be added, and no "
-                                     "profile of theirs that is not already seated is listed.")
-            else:
-                embed.description = ("Add or remove participants (200 max). Selecting seats a profile "
-                                     "and saves it; **Start / Update Session** is what makes the channel live.")
-            active_list = self.lists[self.view_source]
-
-            selected_items = [item for item in active_list if self._is_selected(item)]
-            unselected_items = [item for item in active_list if not self._is_selected(item)]
-
-            ordered_list = selected_items + unselected_items
-            
-            num_pages = max(1, (len(ordered_list) - 1) // 20 + 1)
-            if self.current_page >= num_pages:
-                self.current_page = num_pages - 1
-                
-            start = self.current_page * 20
-            page_items = ordered_list[start : start + 20]
-
-            options = []
-            if page_items:
-                page_selected_count = sum(1 for item in page_items if self._is_selected(item))
-
-                # Everything in the `session` source is seated by definition, so these
-                # only ever read as the removing half. Saying so beats a generic
-                # "toggle" on the one source where the toggle has one direction.
-                is_session_src = self.view_source == 'session'
-
-                page_toggle_label = "Unselect Page" if (page_selected_count == len(page_items)) else "Select Page"
-                options.append(discord.SelectOption(label=page_toggle_label, value="toggle_page", description=(
-                    "Remove every character on this page from the cast." if is_session_src
-                    else "Toggle selection for all profiles on this page."), emoji="📄"))
-                
-                total_selected_count = len(selected_items)
-                all_toggle_label = "Unselect All" if (total_selected_count == len(ordered_list)) else "Select All"
-                options.append(discord.SelectOption(label=all_toggle_label, value="toggle_all", description=(
-                    "Remove every other member's character from the cast." if is_session_src
-                    else "Toggle selection for all profiles in this source."), emoji="📚"))
-
-                for item in page_items:
-                    participant = self._build_participant(item)
-                    val = self._option_value(item)
-                    name = item.get('profile_name') if isinstance(item, dict) else item
-                    # `Name [PID]`. Two members can seat characters sharing a name, and
-                    # the same name can mean different profiles across sources, so the
-                    # PID is what tells the rows apart -- and it is the identity the
-                    # cast is now keyed on, so what is shown is what is compared.
-                    pid = (participant or {}).get('pid')
-                    lbl = f"{name} [{pid}]" if pid else name
-
-                    existing = self._seated(participant)
-                    is_sel = self._is_selected(item)
-
-                    # Seated the other way round: shown, not hidden, so the clash is
-                    # visible where it is made rather than only after it is refused.
-                    desc = None
-                    if self.view_source == 'session':
-                        # Whose character this is. get_user misses for anyone the
-                        # gateway has not cached, so the id is the fallback -- it is
-                        # still enough to tell two same-named characters apart.
-                        owner = self.cog.bot.get_user(int(item.get('owner_id', 0)))
-                        who = owner.display_name if owner else f"user {item.get('owner_id')}"
-                        method_lbl = ("child bot" if item.get('method') == 'child_bot'
-                                      else "webhook")
-                        desc = f"{who} — speaks as a {method_lbl}. Deselect to remove."
-                    elif existing is not None and not is_sel:
-                        desc = ("Already seated as a child bot." if existing.get('method') == 'child_bot'
-                                else "Already seated as a webhook.")
-
-                    options.append(discord.SelectOption(label=lbl[:100], value=val[:100],
-                                                        description=desc, default=is_sel))
-            else:
-                options.append(discord.SelectOption(
-                    label=("No other members have characters here"
-                           if self.view_source == 'session' else "No profiles found"),
-                    value="none"))
-
-            placeholder = ("Deselect to remove another member's character..."
-                           if self.view_source == 'session'
-                           else f"Select {self.view_source.replace('_', ' ')} profiles...")
-            sel = ui.Select(placeholder=placeholder, min_values=0, max_values=len(options) if page_items else 1, options=options, row=0, disabled=(not page_items))
-            async def cast_cb(i: discord.Interaction):
-                if "none" in i.data['values']: await i.response.defer(); return
-                raw_vals = i.data['values']
-                curr_vals = set(raw_vals)
-
-                _value_of = self._option_value
-
-                def _all_seated(scope_items):
-                    return all(self._is_selected(item) for item in scope_items)
-
-                blocked = []
-                if "toggle_page" in curr_vals:
-                    if _all_seated(page_items):
-                        self._unseat_items(page_items)
-                    else:
-                        blocked = self._seat_items(page_items)
-
-                elif "toggle_all" in curr_vals:
-                    if _all_seated(ordered_list):
-                        self._unseat_items(ordered_list)
-                    else:
-                        blocked = self._seat_items(ordered_list)
-
-                else:
-                    self._unseat_items([item for item in page_items
-                                        if _value_of(item) not in curr_vals])
-
-                    by_value = {_value_of(item): item for item in page_items}
-                    blocked = self._seat_items([by_value[v] for v in raw_vals if v in by_value])
-
-                self.cog.session_manager._save_multi_profile_sessions()
-
-                # Only a live session needs telling. Seating a cast into a draft
-                # announces nothing -- Start / Update Session does that for the whole
-                # cast at once.
-                if self.cog.session_manager.is_started(self.session):
-                    for p_data in self.session.get('profiles', []):
-                        if p_data.get('method') == 'child_bot':
-                            await self.cog.manager_queue.put({
-                                "action": "send_to_child", "bot_id": p_data['bot_id'],
-                                "payload": {"action": "session_update_add", "channel_id": self.original_interaction.channel_id}
-                            })
-
-                await i.response.defer(); await self.update_display()
-                if blocked:
-                    names = ", ".join(f"`{n}`" for n in blocked[:5])
-                    more = f" (+{len(blocked) - 5})" if len(blocked) > 5 else ""
-                    await i.followup.send(
-                        f"Skipped {names}{more} — already in the cast the other way "
-                        f"(a profile speaks as a child bot **or** a webhook, not both).",
-                        ephemeral=True)
-            sel.callback = cast_cb
-            self.add_item(sel)
-
-            # Row 1, directly under the profile dropdown. A select rather than the
-            # button that cycled: five sources meant up to four presses to reach one,
-            # with no way to see what the others were, and `session` has to be able to
-            # disappear for a non-admin rather than be cycled past.
-            source_opts = self._available_sources()
-            src_sel = ui.Select(
-                placeholder=f"Source: {self.SOURCE_LABELS[self.view_source][0]}",
-                min_values=1, max_values=1, row=1,
-                options=[discord.SelectOption(
-                    label=self.SOURCE_LABELS[src][0], value=src,
-                    description=self.SOURCE_LABELS[src][1],
-                    default=(src == self.view_source)) for src in source_opts])
-
-            async def src_cb(i: discord.Interaction):
-                chosen = i.data['values'][0]
-                # Re-tested on submit, not just at render: a view outlives a role.
-                if chosen not in self._available_sources():
-                    await i.response.defer()
-                    await self.update_display()
-                    return
-                self.view_source = chosen
-                self.current_page = 0
-                await i.response.defer(); await self.update_display()
-            src_sel.callback = src_cb
-            self.add_item(src_sel)
-
-            if num_pages > 1:
-                async def p_cb(i): self.current_page -= 1; await i.response.defer(); await self.update_display()
-                async def n_cb(i): self.current_page += 1; await i.response.defer(); await self.update_display()
-                build_pagination_controls(self, self.current_page, num_pages, 2, p_cb, n_cb)
-
-            # Row 2 now holds at most three pagination controls, so there is room for
-            # this beside them. Only rendered when the cast is non-empty -- the dropdown
-            # sentinels can only clear the source currently in view, so with a mixed
-            # cast there is otherwise no single gesture that empties it.
-            #
-            # Omitted rather than greyed for a member under Open casting, which is the
-            # opposite of the tab bar's choice and for the opposite reason: the tab bar
-            # advertises something they can ask an administrator for, whereas this is
-            # the one control on the Cast tab that reaches past their own characters and
-            # empties everybody's. There is nothing to learn from seeing it, and the
-            # dropdown still clears what is theirs.
-            if self.session.get('profiles') and self._viewer_is_admin():
-                clear_btn = ui.Button(label=f"Clear Cast ({len(self.session['profiles'])})",
-                                      style=discord.ButtonStyle.secondary, row=2)
-
-                async def clear_cast_cb(i: discord.Interaction):
-                    # Not drawn for a member, but this view lives ten minutes and a role
-                    # can go inside one -- so, like the tab bar, it is re-tested here.
-                    if not self._viewer_is_admin():
-                        await i.response.send_message(
-                            "Only server administrators can clear the whole cast. You can "
-                            "still unseat your own characters from the dropdown.",
-                            ephemeral=True)
-                        return
-                    removed = list(self.session.get('profiles', []))
-                    self.session['profiles'] = []
-                    self.cog.session_manager._save_multi_profile_sessions()
-
-                    # Child bots hold their own per-channel session state, so dropping
-                    # them from the list is not enough -- without this they keep the
-                    # channel registered and go on showing a typing indicator for a
-                    # session they are no longer part of.
-                    for p_data in removed:
-                        if p_data.get('method') != 'child_bot':
-                            continue
-                        bot_id = p_data.get('bot_id')
-                        if not bot_id:
-                            continue
-                        await self.cog.manager_queue.put({
-                            "action": "send_to_child", "bot_id": bot_id,
-                            "payload": {"action": "session_update_remove",
-                                        "channel_id": self.original_interaction.channel_id}
-                        })
-                        await self.cog.manager_queue.put({
-                            "action": "send_to_child", "bot_id": bot_id,
-                            "payload": {"action": "stop_typing",
-                                        "channel_id": self.original_interaction.channel_id}
-                        })
-
-                    self.current_page = 0
-                    await i.response.defer()
-                    await self.update_display()
-
-                clear_btn.callback = clear_cast_cb
-                self.add_item(clear_btn)
-
-            profiles = self.session.get('profiles', [])
-            total_active = len(profiles)
-            
-            def _cast_line(idx, p):
-                method_lbl = 'Child Bot' if p.get('method') == 'child_bot' else 'Webhook'
-                pid = p.get('pid')
-                pid_str = f" `[{pid}]`" if pid else ""
-                return f"{idx}. `{p['profile_name']}`{pid_str} ({method_lbl})"
-
-            if total_active <= 20:
-                cast_list = "\n".join(_cast_line(idx + 1, p)
-                                      for idx, p in enumerate(profiles)) or "*No participants*"
-            else:
-                start_p = self.current_page * 20
-                end_p = start_p + 20
-                page_profiles_cast = profiles[start_p:end_p]
-                
-                cast_list = "\n".join(_cast_line(idx, p) for idx, p in
-                                      enumerate(page_profiles_cast, start=start_p + 1)) or "*No participants*"
-                
-            embed.add_field(name="Current Cast", value=cast_list, inline=False)
-
-        elif self.current_tab == "config":
-            embed.description = "Configure session-wide behavior."
-            mp = self.session.get("session_prompt")
-            audio_val = self.session.get("audio_mode", "off")
-            tts_status = "**`ON`**" if audio_val == "on" else "`OFF`"
-            response_limit = self.session.get("max_responses", 10)
-            policy = self.session.get("cast_policy", DEFAULT_CAST_POLICY)
-
-            embed.add_field(name="Execution Mode", value=f"`{self.session.get('session_mode', 'sequential').title()}`", inline=True)
-            embed.add_field(name="Master Prompt", value=f"`{'Set' if mp else 'Not Set'}`", inline=True)
-            embed.add_field(name="Cast Access", value=f"`{CAST_POLICY_LABELS.get(policy, policy)}`", inline=True)
-
-            embed.add_field(name="Text-to-Speech", value=f"{tts_status}", inline=True)
-            embed.add_field(name="Response Limit", value=f"`{response_limit}`", inline=True)
-            embed.add_field(name="\u200b", value="\u200b", inline=True)
-            
-            embed.add_field(name="Master Prompt Content", value=f"```{mp[:500]}```" if mp else "`None`", inline=False)
-
-            mode_btn = ui.Button(label="Toggle Execution", style=discord.ButtonStyle.secondary, row=0)
-            async def mode_cb(i):
-                self.session["session_mode"] = "random" if self.session.get("session_mode", "sequential") == "sequential" else "sequential"
-                self.cog.session_manager._save_multi_profile_sessions()
-                await i.response.defer(); await self.update_display()
-            mode_btn.callback = mode_cb
-            self.add_item(mode_btn)
-
-            prompt_btn = ui.Button(label="Edit Master Prompt", style=discord.ButtonStyle.primary, row=0)
-            async def pr_cb(i): await i.response.send_modal(SessionPromptModal(self))
-            prompt_btn.callback = pr_cb
-            self.add_item(prompt_btn)
-
-            audio_btn = ui.Button(label="Toggle TTS", style=discord.ButtonStyle.secondary, row=0)
-            async def audio_cb(i):
-                self.session["audio_mode"] = "off" if self.session.get("audio_mode", "off") == "on" else "on"
-                self.cog.session_manager._save_multi_profile_sessions()
-                await i.response.defer(); await self.update_display()
-            audio_btn.callback = audio_cb
-            self.add_item(audio_btn)
-
-            limit_btn = ui.Button(label="Set Response Limit", style=discord.ButtonStyle.primary, row=0)
-            async def limit_cb(i): await i.response.send_modal(ResponseLimitModal(self))
-            limit_btn.callback = limit_cb
-            self.add_item(limit_btn)
-
-            # Row 1, vacated by the two buttons above. A select needs a row to itself,
-            # and the four config buttons fit one row with a slot to spare.
-            #
-            # Administrators only, and rendered disabled rather than hidden for everyone
-            # else so a member under Open Casting can see the terms they are editing
-            # under. It is the control that grants the access: a member who could set it
-            # could lock the administrators' own setting back out from under them, and
-            # could keep a channel open that an admin had closed.
-            viewer_is_admin = self._viewer_is_admin()
-            policy_sel = ui.Select(
-                placeholder=f"Cast access: {CAST_POLICY_LABELS.get(policy, policy)}"
-                            + ("" if viewer_is_admin else " (administrators only)"),
-                min_values=1, max_values=1, row=1, disabled=not viewer_is_admin,
-                options=[discord.SelectOption(label=lbl, value=val, description=desc,
-                                              emoji=emoji, default=(val == policy))
-                         for val, lbl, desc, emoji in CAST_POLICIES])
-
-            async def policy_cb(i: discord.Interaction):
-                # Re-tested on submit: `disabled` is a client-side hint, and this view
-                # outlives the role that rendered it.
-                if not self._viewer_is_admin():
-                    await i.response.send_message(
-                        "Only a server administrator can change who may edit this session.",
-                        ephemeral=True)
-                    return
-                self.session["cast_policy"] = i.data['values'][0]
-                self.cog.session_manager._save_multi_profile_sessions()
-                await i.response.defer()
-                await self.update_display()
-            policy_sel.callback = policy_cb
-            self.add_item(policy_sel)
-
-        elif self.current_tab == "reactivity":
-            embed.description = "Manage how likely participants are to respond to messages."
-            profiles = self.session.get('profiles', [])
-            total_items = len(profiles)
-            num_pages = max(1, (total_items - 1) // 20 + 1)
-            
-            if self.current_page >= num_pages:
-                self.current_page = max(0, num_pages - 1)
-                
-            start = self.current_page * 20
-            page_profiles = profiles[start : start + 20]
-            
-            page_keys = {(p['owner_id'], p['profile_name']) for p in page_profiles}
-            
-            options = []
-            if page_profiles:
-                page_selected = page_keys.issubset(self.selected_reactivity_profiles)
-                page_label = "Unselect Page" if page_selected else "Select Page"
-                options.append(discord.SelectOption(label=page_label, value="toggle_page", description="Toggle selection for all profiles on this page.", emoji="📄"))
-                
-                all_set = {(p['owner_id'], p['profile_name']) for p in profiles}
-                all_selected = all_set.issubset(self.selected_reactivity_profiles)
-                all_label = "Unselect All" if all_selected else "Select All"
-                options.append(discord.SelectOption(label=all_label, value="toggle_all", description="Toggle selection for all profiles.", emoji="📚"))
-
-                for p in page_profiles:
-                    p_key = (p['owner_id'], p['profile_name'])
-                    is_checked = p_key in self.selected_reactivity_profiles
-                    options.append(discord.SelectOption(
-                        label=f"{p['profile_name']} (Chance: {p.get('chance', 100)}%)",
-                        value=f"{p['owner_id']}:{p['profile_name']}",
-                        default=is_checked
-                    ))
-            else:
-                options.append(discord.SelectOption(label="No profiles found", value="none"))
-
-            sel = ui.Select(
-                placeholder="Select participant(s) to edit...", 
-                min_values=0, 
-                max_values=len(options) if page_profiles else 1, 
-                options=options, 
-                row=0,
-                disabled=(not page_profiles)
-            )
-            
-            async def react_select_cb(i: discord.Interaction):
-                if "none" in i.data['values']: await i.response.defer(); return
-                vals = i.data['values']
-                curr_vals = set(vals)
-                
-                page_vals_set = {f"{p['owner_id']}:{p['profile_name']}" for p in page_profiles}
-                
-                if "toggle_page" in curr_vals:
-                    if page_keys.issubset(self.selected_reactivity_profiles):
-                        self.selected_reactivity_profiles.difference_update(page_keys)
-                    else:
-                        self.selected_reactivity_profiles.update(page_keys)
-                elif "toggle_all" in curr_vals:
-                    all_keys = {(p['owner_id'], p['profile_name']) for p in profiles}
-                    if all_keys.issubset(self.selected_reactivity_profiles):
-                        self.selected_reactivity_profiles.difference_update(all_keys)
-                    else:
-                        self.selected_reactivity_profiles.update(all_keys)
-                else:
-                    self.selected_reactivity_profiles.difference_update(page_keys)
-                    for val in vals:
-                        try:
-                            o_id_str, p_name = val.split(":", 1)
-                            self.selected_reactivity_profiles.add((int(o_id_str), p_name))
-                        except ValueError:
-                            pass
-                
-                await i.response.defer()
-                await self.update_display()
-                
-            sel.callback = react_select_cb
-            self.add_item(sel)
-
-            react_lines = []
-            for idx, p in enumerate(page_profiles, start=start + 1):
-                p_key = (p['owner_id'], p['profile_name'])
-                marker = "✅ " if p_key in self.selected_reactivity_profiles else ""
-                react_lines.append(f"{idx}. {marker}**{p['profile_name']}**: {p.get('chance', 100)}% (Wakewords: {', '.join(p.get('wakewords', [])) or 'None'})")
-            react_list = "\n".join(react_lines)
-            embed.add_field(name="Reactivity Stats", value=react_list or "*No participants*", inline=False)
-
-            if num_pages > 1:
-                async def p_cb(i: discord.Interaction):
-                    self.current_page -= 1
-                    await i.response.defer()
-                    await self.update_display()
-                async def n_cb(i: discord.Interaction):
-                    self.current_page += 1
-                    await i.response.defer()
-                    await self.update_display()
-                build_pagination_controls(self, self.current_page, num_pages, 1, p_cb, n_cb)
-
-            selected_count = len(self.selected_reactivity_profiles)
-            btn_label = "Bulk Edit" if selected_count > 1 else "Edit"
-            btn_style = discord.ButtonStyle.primary if selected_count > 0 else discord.ButtonStyle.secondary
-            btn_disabled = (selected_count == 0)
-            
-            edit_btn = ui.Button(label=btn_label, style=btn_style, disabled=btn_disabled, row=2)
-            
-            async def edit_callback(i: discord.Interaction):
-                targets = []
-                for p in profiles:
-                    p_key = (p['owner_id'], p['profile_name'])
-                    if p_key in self.selected_reactivity_profiles:
-                        targets.append(p)
-                
-                if not targets:
-                    await i.response.send_message("❌ No profiles selected.", ephemeral=True)
-                    return
-                    
-                modal = ReactivitySettingsModal(self, targets)
-                await i.response.send_modal(modal)
-                
-            edit_btn.callback = edit_callback
-            self.add_item(edit_btn)
-
-        elif self.current_tab == "proactivity":
-            pro = self.session.get("proactivity", {})
-            enabled = pro.get("enabled", False)
-            embed.description = "Allow the session to start conversations autonomously based on a timer."
-            embed.add_field(name="Status", value="**`ON`**" if enabled else "`OFF`", inline=True)
-            embed.add_field(name="Chance & Cooldown", value=f"`{pro.get('chance', 10)}%` every `{pro.get('cooldown', 300)}s`", inline=True)
-            
-            dir_mod = pro.get("director_model", "GOOGLE/gemini-2.5-flash-lite")
-            dir_ins = pro.get("director_instructions", "(Default)") or "(Default)"
-            embed.add_field(name="AI Director", value=f"Model: `{dir_mod}`\nInstructions: ```{dir_ins[:200]}```", inline=False)
-
-            tgl_btn = ui.Button(label="Toggle Proactivity", style=discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger, row=0)
-            async def tgl_cb(i):
-                self.session.setdefault("proactivity", {})["enabled"] = not enabled
-                self.cog.session_manager._save_multi_profile_sessions()
-                await i.response.defer(); await self.update_display()
-            tgl_btn.callback = tgl_cb
-            self.add_item(tgl_btn)
-
-            edit_btn = ui.Button(label="Edit Settings & AI Director", style=discord.ButtonStyle.primary, row=0)
-            async def edit_cb(i): await i.response.send_modal(ProactivitySettingsModal(self))
-            edit_btn.callback = edit_cb
-            self.add_item(edit_btn)
-
-        elif self.current_tab == "memory":
-            cfg = resolve_compaction_settings(self.session)
-            enabled = cfg["enabled"]
-            embed.description = (
-                "Fold the oldest part of a long conversation into a running synopsis, so the "
-                "cast keeps the thread of a scene after it scrolls past their Short-Term Memory.\n\n"
-                "Folded turns are hidden from prompts, not deleted \u2014 the transcript, "
-                "regeneration and the audit view are unaffected, and turning this off brings "
-                "them back. Private whispers are never summarised."
-            )
-            embed.add_field(name="Status", value="**`ON`**" if enabled else "`OFF`", inline=True)
-            embed.add_field(name="Trigger", value=f"Every `{cfg['threshold']}` turns", inline=True)
-            embed.add_field(name="Fold Size", value=f"`{cfg['chunk']}` turns", inline=True)
-            embed.add_field(
-                name="Summariser",
-                value=f"`{cfg['model']}`\nFallback: `{cfg['fallback_model']}`",
-                inline=False,
-            )
-
-            log = self.session.get("unified_log") or []
-            visible = sum(
-                1 for t in log
-                if not t.get("type") and not t.get("compacted") and not t.get("is_hidden")
-            )
-            folded = sum(1 for t in log if t.get("compacted"))
-            synopses = sum(1 for t in log if t.get("type") == "synopsis")
-            embed.add_field(
-                name="This Session",
-                value=(
-                    f"`{visible}` live turn(s) \u2022 `{folded}` folded \u2022 "
-                    f"`{synopses}` synopsis block(s)"
-                ),
-                inline=False,
-            )
-            if synopses:
-                latest = next(
-                    (t.get("content", "") for t in reversed(log) if t.get("type") == "synopsis"), ""
-                )
-                if latest:
-                    embed.add_field(name="Latest Synopsis", value=f"```{latest[:900]}```", inline=False)
-
-            tgl_btn = ui.Button(
-                label="Toggle Rolling Synopsis",
-                style=discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger,
-                row=0,
-            )
-            async def compaction_tgl_cb(i):
-                self.session.setdefault("compaction", {})["enabled"] = not enabled
-                self.cog.session_manager._save_multi_profile_sessions()
-                await i.response.defer()
-                await self.update_display()
-            tgl_btn.callback = compaction_tgl_cb
-            self.add_item(tgl_btn)
-
-            c_edit_btn = ui.Button(label="Edit Settings", style=discord.ButtonStyle.primary, row=0)
-            async def compaction_edit_cb(i): await i.response.send_modal(CompactionSettingsModal(self))
-            c_edit_btn.callback = compaction_edit_cb
-            self.add_item(c_edit_btn)
+        # One method per tab. This was a 573-line `update_display` with the five
+        # bodies inline; the shared prologue and epilogue below are the whole reason
+        # they were ever in one method.
+        renderer = {
+            "cast": self._render_cast,
+            "config": self._render_config,
+            "reactivity": self._render_reactivity,
+            "proactivity": self._render_proactivity,
+            "memory": self._render_memory,
+        }.get(self.current_tab)
+        if renderer:
+            renderer(embed)
 
         self._add_commit_button()
 
@@ -2093,6 +1611,487 @@ class SessionConfigView(ui.View):
             await self.original_interaction.edit_original_response(embed=embed, view=self)
         except Exception as e:
             print(f"Error updating SessionConfigView: {e}")
+
+    def _render_cast(self, embed: discord.Embed):
+        """The cast dropdown: who is seated, and the three gestures that seat them."""
+        # A role can be removed while this view is open, and `view_source` is held
+        # across renders, so the source in hand is re-checked rather than trusted.
+        if self.view_source not in self._available_sources():
+            self.view_source = 'personal'
+            self.current_page = 0
+
+        if self.view_source == 'session':
+            # Derived, not cached: the cast moves under an open editor.
+            self.lists['session'] = self._session_source_items()
+            embed.description = ("Characters **other members** already have in this cast. "
+                                 "Deselecting removes one; nothing here can be added, and no "
+                                 "profile of theirs that is not already seated is listed.")
+        else:
+            embed.description = ("Add or remove participants (200 max). Selecting seats a profile "
+                                 "and saves it; **Start / Update Session** is what makes the channel live.")
+        active_list = self.lists[self.view_source]
+
+        # `(item, participant)` pairs, built once and carried through to the option
+        # loop. Seated entries first, so a long source list opens on the cast.
+        selected_pairs, unselected_pairs = [], []
+        for item in active_list:
+            participant = self._build_participant(item)
+            (selected_pairs if self._is_seated_as(participant)
+             else unselected_pairs).append((item, participant))
+
+        ordered_pairs = selected_pairs + unselected_pairs
+        ordered_list = [item for item, _ in ordered_pairs]
+
+        num_pages = max(1, (len(ordered_list) - 1) // 20 + 1)
+        if self.current_page >= num_pages:
+            self.current_page = num_pages - 1
+
+        start = self.current_page * 20
+        page_pairs = ordered_pairs[start : start + 20]
+        page_items = [item for item, _ in page_pairs]
+
+        options = []
+        if page_items:
+            # Everything in the `session` source is seated by definition, so these
+            # only ever read as the removing half. Saying so beats a generic
+            # "toggle" on the one source where the toggle has one direction.
+            is_session_src = self.view_source == 'session'
+
+            options = bulk_select_options(
+                page_pairs, ordered_pairs, lambda pair: self._is_seated_as(pair[1]),
+                page_description=("Remove every character on this page from the cast."
+                                  if is_session_src
+                                  else "Toggle selection for all profiles on this page."),
+                all_description=("Remove every other member's character from the cast."
+                                 if is_session_src
+                                 else "Toggle selection for all profiles in this source."))
+
+            for item, participant in page_pairs:
+                val = self._option_value(item)
+                name = item.get('profile_name') if isinstance(item, dict) else item
+                # `Name [PID]`. Two members can seat characters sharing a name, and
+                # the same name can mean different profiles across sources, so the
+                # PID is what tells the rows apart -- and it is the identity the
+                # cast is now keyed on, so what is shown is what is compared.
+                pid = (participant or {}).get('pid')
+                lbl = f"{name} [{pid}]" if pid else name
+
+                existing = self._seated(participant)
+                is_sel = self._is_seated_as(participant)
+
+                # Seated the other way round: shown, not hidden, so the clash is
+                # visible where it is made rather than only after it is refused.
+                desc = None
+                if self.view_source == 'session':
+                    # Whose character this is. get_user misses for anyone the
+                    # gateway has not cached, so the id is the fallback -- it is
+                    # still enough to tell two same-named characters apart.
+                    owner = self.cog.bot.get_user(int(item.get('owner_id', 0)))
+                    who = owner.display_name if owner else f"user {item.get('owner_id')}"
+                    method_lbl = ("child bot" if item.get('method') == 'child_bot'
+                                  else "webhook")
+                    desc = f"{who} — speaks as a {method_lbl}. Deselect to remove."
+                elif existing is not None and not is_sel:
+                    desc = ("Already seated as a child bot." if existing.get('method') == 'child_bot'
+                            else "Already seated as a webhook.")
+
+                options.append(discord.SelectOption(label=lbl[:100], value=val[:100],
+                                                    description=desc, default=is_sel))
+        else:
+            options.append(discord.SelectOption(
+                label=("No other members have characters here"
+                       if self.view_source == 'session' else "No profiles found"),
+                value="none"))
+
+        placeholder = ("Deselect to remove another member's character..."
+                       if self.view_source == 'session'
+                       else f"Select {self.view_source.replace('_', ' ')} profiles...")
+        async def cast_cb(i: discord.Interaction):
+            if "none" in i.data['values']: await i.response.defer(); return
+            # Built during the render this click came from, and another admin may
+            # have seated something since. The index is only ever valid for one
+            # synchronous stretch.
+            self._seated_cache = None
+            raw_vals = i.data['values']
+            curr_vals = set(raw_vals)
+
+            _value_of = self._option_value
+
+            def _all_seated(scope_items):
+                return all(self._is_selected(item) for item in scope_items)
+
+            blocked = []
+            if SELECT_PAGE in curr_vals:
+                if _all_seated(page_items):
+                    self._unseat_items(page_items)
+                else:
+                    blocked = self._seat_items(page_items)
+
+            elif SELECT_ALL in curr_vals:
+                if _all_seated(ordered_list):
+                    self._unseat_items(ordered_list)
+                else:
+                    blocked = self._seat_items(ordered_list)
+
+            else:
+                self._unseat_items([item for item in page_items
+                                    if _value_of(item) not in curr_vals])
+
+                by_value = {_value_of(item): item for item in page_items}
+                blocked = self._seat_items([by_value[v] for v in raw_vals if v in by_value])
+
+            self.cog.session_manager._save_multi_profile_sessions()
+
+            # Only a live session needs telling. Seating a cast into a draft
+            # announces nothing -- Start / Update Session does that for the whole
+            # cast at once.
+            if self.cog.session_manager.is_started(self.session):
+                for p_data in self.session.get('profiles', []):
+                    if p_data.get('method') == 'child_bot':
+                        await self.cog.manager_queue.put({
+                            "action": "send_to_child", "bot_id": p_data['bot_id'],
+                            "payload": {"action": "session_update_add", "channel_id": self.original_interaction.channel_id}
+                        })
+
+            await i.response.defer(); await self.update_display()
+            if blocked:
+                names = ", ".join(f"`{n}`" for n in blocked[:5])
+                more = f" (+{len(blocked) - 5})" if len(blocked) > 5 else ""
+                await i.followup.send(
+                    f"Skipped {names}{more} — already in the cast the other way "
+                    f"(a profile speaks as a child bot **or** a webhook, not both).",
+                    ephemeral=True)
+        add_select(self, options, cast_cb, placeholder=placeholder, min_values=0,
+                   max_values=len(options) if page_items else 1, row=0,
+                   disabled=not page_items)
+
+        # Row 1, directly under the profile dropdown. A select rather than the
+        # button that cycled: five sources meant up to four presses to reach one,
+        # with no way to see what the others were, and `session` has to be able to
+        # disappear for a non-admin rather than be cycled past.
+        source_opts = self._available_sources()
+        src_sel = ui.Select(
+            placeholder=f"Source: {self.SOURCE_LABELS[self.view_source][0]}",
+            min_values=1, max_values=1, row=1,
+            options=[discord.SelectOption(
+                label=self.SOURCE_LABELS[src][0], value=src,
+                description=self.SOURCE_LABELS[src][1],
+                default=(src == self.view_source)) for src in source_opts])
+
+        async def src_cb(i: discord.Interaction):
+            chosen = i.data['values'][0]
+            # Re-tested on submit, not just at render: a view outlives a role.
+            if chosen not in self._available_sources():
+                await i.response.defer()
+                await self.update_display()
+                return
+            self.view_source = chosen
+            self.current_page = 0
+            await i.response.defer(); await self.update_display()
+        src_sel.callback = src_cb
+        self.add_item(src_sel)
+
+        if num_pages > 1:
+            async def p_cb(i): self.current_page -= 1; await i.response.defer(); await self.update_display()
+            async def n_cb(i): self.current_page += 1; await i.response.defer(); await self.update_display()
+            build_pagination_controls(self, self.current_page, num_pages, 2, p_cb, n_cb)
+
+        # Row 2 now holds at most three pagination controls, so there is room for
+        # this beside them. Only rendered when the cast is non-empty -- the dropdown
+        # sentinels can only clear the source currently in view, so with a mixed
+        # cast there is otherwise no single gesture that empties it.
+        #
+        # Omitted rather than greyed for a member under Open casting, which is the
+        # opposite of the tab bar's choice and for the opposite reason: the tab bar
+        # advertises something they can ask an administrator for, whereas this is
+        # the one control on the Cast tab that reaches past their own characters and
+        # empties everybody's. There is nothing to learn from seeing it, and the
+        # dropdown still clears what is theirs.
+        if self.session.get('profiles') and self._viewer_is_admin():
+            async def clear_cast_cb(i: discord.Interaction):
+                # Not drawn for a member, but this view lives ten minutes and a role
+                # can go inside one -- so, like the tab bar, it is re-tested here.
+                if not self._viewer_is_admin():
+                    await i.response.send_message(
+                        "Only server administrators can clear the whole cast. You can "
+                        "still unseat your own characters from the dropdown.",
+                        ephemeral=True)
+                    return
+                removed = list(self.session.get('profiles', []))
+                self.session['profiles'] = []
+                self.cog.session_manager._save_multi_profile_sessions()
+
+                # Child bots hold their own per-channel session state, so dropping
+                # them from the list is not enough -- without this they keep the
+                # channel registered and go on showing a typing indicator for a
+                # session they are no longer part of.
+                for p_data in removed:
+                    if p_data.get('method') != 'child_bot':
+                        continue
+                    bot_id = p_data.get('bot_id')
+                    if not bot_id:
+                        continue
+                    await self.cog.manager_queue.put({
+                        "action": "send_to_child", "bot_id": bot_id,
+                        "payload": {"action": "session_update_remove",
+                                    "channel_id": self.original_interaction.channel_id}
+                    })
+                    await self.cog.manager_queue.put({
+                        "action": "send_to_child", "bot_id": bot_id,
+                        "payload": {"action": "stop_typing",
+                                    "channel_id": self.original_interaction.channel_id}
+                    })
+
+                self.current_page = 0
+                await i.response.defer()
+                await self.update_display()
+            add_button(self, f"Clear Cast ({len(self.session['profiles'])})", clear_cast_cb,
+                       style=discord.ButtonStyle.secondary, row=2)
+
+        profiles = self.session.get('profiles', [])
+        total_active = len(profiles)
+        
+        def _cast_line(idx, p):
+            method_lbl = 'Child Bot' if p.get('method') == 'child_bot' else 'Webhook'
+            pid = p.get('pid')
+            pid_str = f" `[{pid}]`" if pid else ""
+            return f"{idx}. `{p['profile_name']}`{pid_str} ({method_lbl})"
+
+        if total_active <= 20:
+            cast_list = "\n".join(_cast_line(idx + 1, p)
+                                  for idx, p in enumerate(profiles)) or "*No participants*"
+        else:
+            start_p = self.current_page * 20
+            end_p = start_p + 20
+            page_profiles_cast = profiles[start_p:end_p]
+            
+            cast_list = "\n".join(_cast_line(idx, p) for idx, p in
+                                  enumerate(page_profiles_cast, start=start_p + 1)) or "*No participants*"
+            
+        embed.add_field(name="Current Cast", value=cast_list, inline=False)
+
+    def _render_config(self, embed: discord.Embed):
+        """Session-wide behaviour: execution mode, master prompt, TTS, response limit, cast access."""
+        embed.description = "Configure session-wide behavior."
+        mp = self.session.get("session_prompt")
+        audio_val = self.session.get("audio_mode", "off")
+        tts_status = "**`ON`**" if audio_val == "on" else "`OFF`"
+        response_limit = self.session.get("max_responses", 10)
+        policy = self.session.get("cast_policy", DEFAULT_CAST_POLICY)
+
+        embed.add_field(name="Execution Mode", value=f"`{self.session.get('session_mode', 'sequential').title()}`", inline=True)
+        embed.add_field(name="Master Prompt", value=f"`{'Set' if mp else 'Not Set'}`", inline=True)
+        embed.add_field(name="Cast Access", value=f"`{CAST_POLICY_LABELS.get(policy, policy)}`", inline=True)
+
+        embed.add_field(name="Text-to-Speech", value=f"{tts_status}", inline=True)
+        embed.add_field(name="Response Limit", value=f"`{response_limit}`", inline=True)
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
+        
+        embed.add_field(name="Master Prompt Content", value=f"```{mp[:500]}```" if mp else "`None`", inline=False)
+
+        self._add_toggle(
+            "Toggle Execution",
+            self.session.get("session_mode", "sequential") == "random",
+            lambda on: self.session.__setitem__("session_mode",
+                                                "random" if on else "sequential"))
+        self._add_modal_button("Edit Master Prompt", SessionPromptModal)
+        self._add_toggle(
+            "Toggle TTS", audio_val == "on",
+            lambda on: self.session.__setitem__("audio_mode", "on" if on else "off"))
+        self._add_modal_button("Set Response Limit", ResponseLimitModal)
+
+        # Row 1, vacated by the two buttons above. A select needs a row to itself,
+        # and the four config buttons fit one row with a slot to spare.
+        #
+        # Administrators only, and rendered disabled rather than hidden for everyone
+        # else so a member under Open Casting can see the terms they are editing
+        # under. It is the control that grants the access: a member who could set it
+        # could lock the administrators' own setting back out from under them, and
+        # could keep a channel open that an admin had closed.
+        viewer_is_admin = self._viewer_is_admin()
+        policy_sel = ui.Select(
+            placeholder=f"Cast access: {CAST_POLICY_LABELS.get(policy, policy)}"
+                        + ("" if viewer_is_admin else " (administrators only)"),
+            min_values=1, max_values=1, row=1, disabled=not viewer_is_admin,
+            options=[discord.SelectOption(label=lbl, value=val, description=desc,
+                                          emoji=emoji, default=(val == policy))
+                     for val, lbl, desc, emoji in CAST_POLICIES])
+
+        async def policy_cb(i: discord.Interaction):
+            # Re-tested on submit: `disabled` is a client-side hint, and this view
+            # outlives the role that rendered it.
+            if not self._viewer_is_admin():
+                await i.response.send_message(
+                    "Only a server administrator can change who may edit this session.",
+                    ephemeral=True)
+                return
+            self.session["cast_policy"] = i.data['values'][0]
+            await self._save_and_repaint(i)
+        policy_sel.callback = policy_cb
+        self.add_item(policy_sel)
+
+    def _render_reactivity(self, embed: discord.Embed):
+        """Per-participant response chance and wakewords."""
+        embed.description = "Manage how likely participants are to respond to messages."
+        profiles = self.session.get('profiles', [])
+        total_items = len(profiles)
+        num_pages = max(1, (total_items - 1) // 20 + 1)
+        
+        if self.current_page >= num_pages:
+            self.current_page = max(0, num_pages - 1)
+            
+        start = self.current_page * 20
+        page_profiles = profiles[start : start + 20]
+        
+        # `owner:name` is the option value; `(owner_id, profile_name)` is what the
+        # selection is held as. Mapped rather than parsed back, so a name is never
+        # split on a colon it happens to contain.
+        def _value_of(p):
+            return f"{p['owner_id']}:{p['profile_name']}"
+
+        by_value = {_value_of(p): (p['owner_id'], p['profile_name']) for p in profiles}
+        page_values = [_value_of(p) for p in page_profiles]
+
+        options = []
+        if page_profiles:
+            options = bulk_select_options(
+                page_profiles, profiles,
+                lambda p: (p['owner_id'], p['profile_name']) in self.selected_reactivity_profiles,
+                all_description="Toggle selection for all profiles.")
+
+            for p in page_profiles:
+                p_key = (p['owner_id'], p['profile_name'])
+                is_checked = p_key in self.selected_reactivity_profiles
+                options.append(discord.SelectOption(
+                    label=f"{p['profile_name']} (Chance: {p.get('chance', 100)}%)",
+                    value=_value_of(p),
+                    default=is_checked
+                ))
+        else:
+            options.append(discord.SelectOption(label="No profiles found", value="none"))
+
+        async def react_select_cb(i: discord.Interaction):
+            if "none" in i.data['values']: await i.response.defer(); return
+            chosen = resolve_bulk_select(
+                i.data['values'], page_values, list(by_value),
+                {v for v, k in by_value.items()
+                 if k in self.selected_reactivity_profiles})
+            self.selected_reactivity_profiles = {by_value[v] for v in chosen
+                                                 if v in by_value}
+
+            await i.response.defer()
+            await self.update_display()
+        add_select(self, options, react_select_cb,
+                   placeholder="Select participant(s) to edit...", min_values=0,
+                   max_values=len(options) if page_profiles else 1, row=0,
+                   disabled=not page_profiles)
+
+        react_lines = []
+        for idx, p in enumerate(page_profiles, start=start + 1):
+            p_key = (p['owner_id'], p['profile_name'])
+            marker = "✅ " if p_key in self.selected_reactivity_profiles else ""
+            react_lines.append(f"{idx}. {marker}**{p['profile_name']}**: {p.get('chance', 100)}% (Wakewords: {', '.join(p.get('wakewords', [])) or 'None'})")
+        react_list = "\n".join(react_lines)
+        embed.add_field(name="Reactivity Stats", value=react_list or "*No participants*", inline=False)
+
+        if num_pages > 1:
+            async def p_cb(i: discord.Interaction):
+                self.current_page -= 1
+                await i.response.defer()
+                await self.update_display()
+            async def n_cb(i: discord.Interaction):
+                self.current_page += 1
+                await i.response.defer()
+                await self.update_display()
+            build_pagination_controls(self, self.current_page, num_pages, 1, p_cb, n_cb)
+
+        selected_count = len(self.selected_reactivity_profiles)
+        btn_label = "Bulk Edit" if selected_count > 1 else "Edit"
+        btn_style = discord.ButtonStyle.primary if selected_count > 0 else discord.ButtonStyle.secondary
+        btn_disabled = (selected_count == 0)
+        
+        async def edit_callback(i: discord.Interaction):
+            targets = []
+            for p in profiles:
+                p_key = (p['owner_id'], p['profile_name'])
+                if p_key in self.selected_reactivity_profiles:
+                    targets.append(p)
+            
+            if not targets:
+                await i.response.send_message("❌ No profiles selected.", ephemeral=True)
+                return
+                
+            modal = ReactivitySettingsModal(self, targets)
+            await i.response.send_modal(modal)
+        add_button(self, btn_label, edit_callback, style=btn_style, row=2,
+                   disabled=btn_disabled)
+
+    def _render_proactivity(self, embed: discord.Embed):
+        """The timer that lets the cast open a conversation unprompted."""
+        pro = self.session.get("proactivity", {})
+        enabled = pro.get("enabled", False)
+        embed.description = "Allow the session to start conversations autonomously based on a timer."
+        embed.add_field(name="Status", value="**`ON`**" if enabled else "`OFF`", inline=True)
+        embed.add_field(name="Chance & Cooldown", value=f"`{pro.get('chance', 10)}%` every `{pro.get('cooldown', 300)}s`", inline=True)
+        
+        dir_mod = pro.get("director_model", "GOOGLE/gemini-2.5-flash-lite")
+        dir_ins = pro.get("director_instructions", "(Default)") or "(Default)"
+        embed.add_field(name="AI Director", value=f"Model: `{dir_mod}`\nInstructions: ```{dir_ins[:200]}```", inline=False)
+
+        self._add_toggle(
+            "Toggle Proactivity", enabled,
+            lambda on: self.session.setdefault("proactivity", {}).__setitem__("enabled", on),
+            on_off_style=True)
+        self._add_modal_button("Edit Settings & AI Director", ProactivitySettingsModal)
+
+    def _render_memory(self, embed: discord.Embed):
+        """The rolling synopsis: how a long scene is folded down."""
+        cfg = resolve_compaction_settings(self.session)
+        enabled = cfg["enabled"]
+        embed.description = (
+            "Fold the oldest part of a long conversation into a running synopsis, so the "
+            "cast keeps the thread of a scene after it scrolls past their Short-Term Memory.\n\n"
+            "Folded turns are hidden from prompts, not deleted \u2014 the transcript, "
+            "regeneration and the audit view are unaffected, and turning this off brings "
+            "them back. Private whispers are never summarised."
+        )
+        embed.add_field(name="Status", value="**`ON`**" if enabled else "`OFF`", inline=True)
+        embed.add_field(name="Trigger", value=f"Every `{cfg['threshold']}` turns", inline=True)
+        embed.add_field(name="Fold Size", value=f"`{cfg['chunk']}` turns", inline=True)
+        embed.add_field(
+            name="Summariser",
+            value=f"`{cfg['model']}`\nFallback: `{cfg['fallback_model']}`",
+            inline=False,
+        )
+
+        log = self.session.get("unified_log") or []
+        visible = sum(
+            1 for t in log
+            if not t.get("type") and not t.get("compacted") and not t.get("is_hidden")
+        )
+        folded = sum(1 for t in log if t.get("compacted"))
+        synopses = sum(1 for t in log if t.get("type") == "synopsis")
+        embed.add_field(
+            name="This Session",
+            value=(
+                f"`{visible}` live turn(s) \u2022 `{folded}` folded \u2022 "
+                f"`{synopses}` synopsis block(s)"
+            ),
+            inline=False,
+        )
+        if synopses:
+            latest = next(
+                (t.get("content", "") for t in reversed(log) if t.get("type") == "synopsis"), ""
+            )
+            if latest:
+                embed.add_field(name="Latest Synopsis", value=f"```{latest[:900]}```", inline=False)
+
+        self._add_toggle(
+            "Toggle Rolling Synopsis", enabled,
+            lambda on: self.session.setdefault("compaction", {}).__setitem__("enabled", on),
+            on_off_style=True)
+        self._add_modal_button("Edit Settings", CompactionSettingsModal)
+
 
     def _add_commit_button(self):
         """The Start / Update Session button, on every tab.
@@ -2121,9 +2120,6 @@ class SessionConfigView(ui.View):
         one to answer.
         """
         started = self.cog.session_manager.is_started(self.session)
-        btn = ui.Button(label="▶️ Update Session" if started else "▶️ Start Session", row=3,
-                        style=discord.ButtonStyle.success)
-
         async def commit(i: discord.Interaction):
             await i.response.defer()
 
@@ -2154,17 +2150,9 @@ class SessionConfigView(ui.View):
             else:
                 note = f"Session is live with {count} participant(s)."
             await i.followup.send(("▶️ " if not was_started else "🔄 ") + note, ephemeral=True)
+        add_button(self, "▶️ Update Session" if started else "▶️ Start Session", commit,
+                   style=discord.ButtonStyle.success, row=3)
 
-        btn.callback = commit
-        self.add_item(btn)
-
-
-class WakewordsModal(ui.Modal, title="Manage Wakewords"):
-    wakewords_input = ui.TextInput(label="Wakewords (comma-separated)", style=discord.TextStyle.paragraph, required=False, max_length=1000)
-
-    def __init__(self, current_wakewords: List[str]):
-        super().__init__()
-        self.wakewords_input.default = ", ".join(current_wakewords)
 
 class SessionAuditView(ui.View):
     def __init__(self, cog, interaction: discord.Interaction, session: dict, channel_id: int):
@@ -2317,8 +2305,6 @@ class SessionAuditView(ui.View):
         if not opts:
             return
 
-        sel = ui.Select(placeholder=placeholder, options=opts, row=row)
-
         async def sel_cb(i: discord.Interaction):
             val = i.data['values'][0]
             if val == "jump_page":
@@ -2332,9 +2318,7 @@ class SessionAuditView(ui.View):
                 setattr(self, attr, val)
             self._build_view()
             await i.response.edit_message(embed=self._build_embed(), view=self)
-
-        sel.callback = sel_cb
-        self.add_item(sel)
+        add_select(self, opts, sel_cb, placeholder=placeholder, row=row)
     def _page_jump_modal(self) -> PageJumpModal:
         """Built here rather than at each of the four buttons that send it."""
         async def _jump(i: discord.Interaction, page: int):
@@ -2397,6 +2381,7 @@ class SessionAuditView(ui.View):
                 total_in = 0
                 total_out = 0
                 total_cost = 0.0
+                estimated = False
                 durations = []
                 
                 for t in log:
@@ -2406,12 +2391,16 @@ class SessionAuditView(ui.View):
                         o_toks = meta.get("output_tokens", 0)
                         total_in += i_toks
                         total_out += o_toks
-                        total_cost += self.cog.api_service._calculate_turn_cost(meta.get("model", ""), i_toks, o_toks)
+                        cost, billed = self.cog.api_service.turn_cost(meta)
+                        total_cost += cost
+                        estimated = estimated or not billed
                         dur = meta.get("duration")
                         if dur: durations.append(dur)
                 
                 embed.description = "Session Overview"
-                embed.add_field(name="1. Overall Session Telemetry", value=f"├── Active Participants: `{len(self.session.get('profiles', []))}` Profiles\n├── Total Session Turns: `{len(log)}`\n├── Total Input Tokens Processed: `{total_in:,}`\n├── Total Output Tokens Generated: `{total_out:,}`\n└── Estimated Session API Cost: `~${total_cost:.4f} USD`", inline=False)
+                cost_line = (f"Estimated Session API Cost: `~${total_cost:.4f} USD`" if estimated
+                             else f"Session API Cost (billed): `${total_cost:.4f} USD`")
+                embed.add_field(name="1. Overall Session Telemetry", value=f"├── Active Participants: `{len(self.session.get('profiles', []))}` Profiles\n├── Total Session Turns: `{len(log)}`\n├── Total Input Tokens Processed: `{total_in:,}`\n├── Total Output Tokens Generated: `{total_out:,}`\n└── {cost_line}", inline=False)
                 
                 avg_lat = sum(durations) / len(durations) if durations else 0.0
                 embed.add_field(name="2. System Health Checks", value=f"└── Model Latency Average: `{avg_lat:.2f}s`", inline=False)
@@ -2438,9 +2427,16 @@ class SessionAuditView(ui.View):
                     i_tok = meta.get("input_tokens", 0)
                     o_tok = meta.get("output_tokens", 0)
                     r_tok = meta.get("reasoning_tokens", 0)
-                    cost = self.cog.api_service._calculate_turn_cost(mod, i_tok, o_tok)
+                    cost, billed = self.cog.api_service.turn_cost(meta)
+                    # The served tier, not the requested one: OpenRouter routes a model
+                    # with no endpoint at the asked-for tier normally, so the request is
+                    # not evidence of what ran.
+                    tier = meta.get("service_tier")
+                    tier_line = f"├── Service Tier: `{tier}`\n" if tier else ""
+                    cost_line = (f"Turn Cost: `~${cost:.6f} USD` (estimated)" if not billed
+                                 else f"Turn Cost: `${cost:.6f} USD` (billed)")
                     
-                    embed.add_field(name="Turn Telemetry", value=f"├── Speaker: `{target.get('profile_name')}`\n├── Model Used: `{mod}`\n├── Duration: `{meta.get('duration', 0.0)}s`\n├── Input Tokens: `{i_tok:,}`\n├── Output Tokens: `{o_tok:,}` (Reasoning: `{r_tok:,}`)\n└── Turn Cost: `~${cost:.6f} USD`", inline=False)
+                    embed.add_field(name="Turn Telemetry", value=f"├── Speaker: `{target.get('profile_name')}`\n├── Model Used: `{mod}`\n{tier_line}├── Duration: `{meta.get('duration', 0.0)}s`\n├── Input Tokens: `{i_tok:,}`\n├── Output Tokens: `{o_tok:,}` (Reasoning: `{r_tok:,}`)\n└── {cost_line}", inline=False)
                     
                     recalled = len(meta.get("ltms_recalled", []))
                     trained = meta.get("training_recalled", 0)
@@ -2477,7 +2473,13 @@ class SessionAuditView(ui.View):
                         est_cost = self.cog.api_service._calculate_turn_cost(prim_mod, total_est, 300)
                         
                         embed.add_field(name="Pre-Inference Budget Estimate (Per Turn)", value=f"├── Target: `{p_name}`\n├── Expected Model: `{prim_mod}`\n├── System & Instructions: `~{sys_toks:,} tokens`\n├── STM History Buffer: `~{hist_toks:,} tokens`\n└── **ESTIMATED INPUT TOTAL**: `~{total_est:,} tokens`", inline=False)
-                        embed.add_field(name="Financial Projection", value=f"Projected cost for next generation: `~${est_cost:.6f} USD`\n*(Assuming ~300 output tokens)*", inline=False)
+                        # The projection is the rate table, which only knows standard
+                        # rates for a listed model id. Say so when the profile has asked
+                        # for a tier, rather than quoting a number the turn will not cost.
+                        tier = resolve_openrouter_service_tier(p_cfg)
+                        tier_note = (f"\n*(Priced at standard rates; this profile requests the "
+                                     f"`{tier}` tier, so the billed figure will differ.)*") if tier else ""
+                        embed.add_field(name="Financial Projection", value=f"Projected cost for next generation: `~${est_cost:.6f} USD`\n*(Assuming ~300 output tokens)*{tier_note}", inline=False)
                     except Exception as e:
                         embed.description = f"Simulation failed: {e}"
 
@@ -2496,6 +2498,7 @@ class SessionAuditView(ui.View):
                         total_in = 0
                         total_out = 0
                         total_cost = 0.0
+                        estimated = False
                         models_used = {}
                         bot_turns = 0
                         
@@ -2508,7 +2511,9 @@ class SessionAuditView(ui.View):
                                 
                                 total_in += i_toks
                                 total_out += o_toks
-                                total_cost += self.cog.api_service._calculate_turn_cost(m, i_toks, o_toks)
+                                cost, billed = self.cog.api_service.turn_cost(meta)
+                                total_cost += cost
+                                estimated = estimated or not billed
                                 
                                 models_used[m] = models_used.get(m, 0) + 1
                                 bot_turns += 1
@@ -2516,7 +2521,9 @@ class SessionAuditView(ui.View):
                         dist_str = "\n".join([f"├── {m}: `{c}/{bot_turns} turns`" for m, c in models_used.items()])
                         if not dist_str: dist_str = "├── No bot generations in range."
                         
-                        embed.add_field(name="Batch Execution Totals", value=f"├── Turns Evaluated: `{len(batch_turns)}`\n├── Cumulative Input Tokens: `{total_in:,}`\n├── Cumulative Output Tokens: `{total_out:,}`\n└── Combined Range Cost: `~${total_cost:.6f} USD`", inline=False)
+                        range_cost = (f"Combined Range Cost: `~${total_cost:.6f} USD`" if estimated
+                                      else f"Combined Range Cost (billed): `${total_cost:.6f} USD`")
+                        embed.add_field(name="Batch Execution Totals", value=f"├── Turns Evaluated: `{len(batch_turns)}`\n├── Cumulative Input Tokens: `{total_in:,}`\n├── Cumulative Output Tokens: `{total_out:,}`\n└── {range_cost}", inline=False)
                         embed.add_field(name="Model Distribution", value=dist_str, inline=False)
 
             return embed

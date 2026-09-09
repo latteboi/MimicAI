@@ -6,8 +6,8 @@ import asyncio
 import datetime
 import traceback
 import time
-from zoneinfo import ZoneInfo
-from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional, Union
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional
 from ..utils.content import OLLAMA_GUIDE_TEXT
 from ..utils.helpers import (
     _pf, _pi, _ps, _pb, is_real_model, image_model_caps, resolve_critic_settings,
@@ -22,12 +22,29 @@ if TYPE_CHECKING:
 
 from .base_components import (
     BaseBulkProfileView, ConfigModal, ActionTextInputModal, TimeoutCleanupMixin,
-    build_pagination_controls, build_confirm_view,
+    ReportErrorMixin, add_button, add_select, build_pagination_controls,
+    build_confirm_view, invalidate_model_cache,
 )
 from .gui_data import DataManageView
 from .gui_hub import HubShareManagerView
 from .gui_sessions import CustomModelModal
 from .gui_settings import OllamaHostModal
+
+def _ranged(values, key, lo, hi, label, cast=_pf):
+    """`{key: n}` for a numeric field inside its range, `{}` when the box was left blank.
+
+    Sixteen parsers below wrote this out by hand -- cast, skip if blank, bounds-check,
+    assign -- and drifted on the half that matters: some named the range in the error
+    and some did not, so the same mistake got a message that says how to fix it in one
+    modal and "out of range" in the next.
+    """
+    n = cast(values[key])
+    if n is None:
+        return {}
+    if not (lo <= n <= hi):
+        raise ValueError(f"{label} out of range ({lo}-{hi})")
+    return {key: n}
+
 
 def ProfileAdvancedParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     def gv(k):
@@ -43,12 +60,9 @@ def ProfileAdvancedParamsModal(cog, profile_name: str, current_params: Dict[str,
     def parser(v):
         c = {}
         for k, (min_v, max_v) in [("frequency_penalty", (-2.0, 2.0)), ("presence_penalty", (-2.0, 2.0)), ("repetition_penalty", (0.0, 2.0)), ("min_p", (0.0, 1.0)), ("top_a", (0.0, 1.0))]:
-            val = _pf(v[k])
-            if val is not None:
-                if not (min_v <= val <= max_v): raise ValueError(f"{k} out of range")
-                c[k] = val
-            else:
-                c[k] = None
+            # A cleared box writes None, which is what disables the parameter -- so the
+            # blank case is a value here rather than an omission.
+            c[k] = _ranged(v, k, min_v, max_v, k.replace("_", " ").title()).get(k)
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Advanced Parameters (OpenRouter)", fields, parser, callback, target_user_id)
 
@@ -81,10 +95,7 @@ def ProfileSpeechSettingsModal(cog, profile_name: str, current_params: Dict[str,
         c = {}
         if "speech_tts_enabled" in v:
             c["speech_tts_enabled"] = _pb(v["speech_tts_enabled"])
-        t = _pf(v["speech_temperature"])
-        if t is not None:
-            if not (0.0 <= t <= 2.0): raise ValueError("Temperature out of range")
-            c["speech_temperature"] = t
+        c.update(_ranged(v, "speech_temperature", 0.0, 2.0, "Temperature"))
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Speech Settings", fields, parser, callback, target_user_id)
 
@@ -240,11 +251,7 @@ def _write_profile_config(cog, user_id: str, profile_name: str, is_borrowed: boo
     target.update(updates)
     cog.profile_manager._save_profile_config(user_id, profile_name, target, is_borrowed)
 
-    stale = [k for k in cog.channel_models
-             if isinstance(k, tuple) and len(k) == 3 and k[1] == user_id and k[2] == profile_name]
-    for k in stale:
-        cog.channel_models.pop(k, None)
-        cog.channel_model_last_profile_key.pop(k, None)
+    invalidate_model_cache(cog, user_id, profile_name)
     return True
 
 
@@ -789,7 +796,7 @@ PROFILE_ACTIONS = (
                              "grounding_rag_model", "grounding_rag_fallback_model",
                              "critic_model", "critic_fallback_model",
                              "ltm_model", "ltm_fallback_model",
-                             "ollama_host_url"))),
+                             "ollama_host_url", "openrouter_service_tier"))),
     _Action("gen_params", "params", "Set Generation Parameters & STM", "Set Temp, Top P, Top K, and STM Length.",
             _modal("ProfileParamsModal"),
             bulk=_Bulk(_bulk_modal("ProfileParamsModal"), scope="all",
@@ -1111,9 +1118,8 @@ class ProfileManageView(ui.View):
                    if a.tab == self.current_tab and a.visible(self)]
 
         if options:
-            select = ui.Select(placeholder=f"Select an action for {self.current_tab.title()}...", options=options, row=0)
-            select.callback = self.dropdown_callback
-            self.add_item(select)
+            add_select(self, options, self.dropdown_callback,
+                       placeholder=f"Select an action for {self.current_tab.title()}...", row=0)
 
         # --- 2. Navigation Buttons (Rows 1-2) ---
         # Discord fits five components to an action row, and there are six tabs. They
@@ -1134,8 +1140,11 @@ class ProfileManageView(ui.View):
 
         if is_mod:
             self._add_mod_back_button()
-            ModBaseView.add_nav_to_other_view(
-                self, self.cog, self.original_interaction, "profiles", self.mod_return_user_id)
+            ModBaseView.attach_nav(
+                self, "profiles",
+                source=SimpleNamespace(cog=self.cog,
+                                       original_interaction=self.original_interaction,
+                                       target_user_id=self.mod_return_user_id))
 
     def _add_mod_back_button(self):
         """Back to the moderated user's profile list.
@@ -1147,16 +1156,13 @@ class ProfileManageView(ui.View):
         """
         from .gui_mod import ModProfilesView
 
-        btn = ui.Button(label="← Back to Profile List", style=discord.ButtonStyle.secondary, row=2)
-
         async def back_cb(interaction: discord.Interaction):
             await interaction.response.defer()
             view = ModProfilesView(self.cog, self.original_interaction,
                                    target_user_id=self.mod_return_user_id)
             await view.update_display()
-
-        btn.callback = back_cb
-        self.add_item(btn)
+        add_button(self, "← Back to Profile List", back_cb, style=discord.ButtonStyle.secondary,
+                   row=2)
 
     def create_nav_callback(self, tab_name):
         async def callback(interaction: discord.Interaction):
@@ -1291,13 +1297,7 @@ class ProfileManageView(ui.View):
         
         # [NEW] Hot-Swap: Invalidate model and session caches for this profile immediately
         # This ensures settings take effect even if a multi-profile session is active.
-        keys_to_clear = [
-            k for k in self.cog.channel_models.keys() 
-            if isinstance(k, tuple) and len(k) == 3 and k[1] == self.user_id and k[2] == self.profile_name
-        ]
-        for k in keys_to_clear:
-            self.cog.channel_models.pop(k, None)
-            self.cog.channel_model_last_profile_key.pop(k, None)
+        invalidate_model_cache(self.cog, self.user_id, self.profile_name)
 
         new_embed = await self.cog.profile_manager._build_profile_manage_embed(
             interaction, profile_name, target_user_id=self.user_id)
@@ -1343,10 +1343,7 @@ class ProfileManageView(ui.View):
                             p["profile_name"] = new_name
                     
 
-                keys_to_clear = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.user_id and k[2] == old_name]
-                for k in keys_to_clear:
-                    self.cog.channel_models.pop(k, None)
-                    self.cog.channel_model_last_profile_key.pop(k, None)
+                invalidate_model_cache(self.cog, self.user_id, old_name)
                 
                 await self.original_interaction.edit_original_response(content=f"Profile '{old_name}' renamed to '{new_name}'.", view=None, embed=None)
         modal.on_submit = rename_submit
@@ -1520,38 +1517,29 @@ class ProfileFunctionView(TimeoutCleanupMixin, ui.View):
                     label=label[:100], value=value,
                     description=description[:100] if description else None,
                     default=(value == current)))
-            select = ui.Select(placeholder=choice.placeholder, options=options, row=row)
-            select.callback = self._choice_callback(choice)
-            self.add_item(select)
+            add_select(self, options, self._choice_callback(choice),
+                       placeholder=choice.placeholder, row=row)
             row += 1
 
         for toggle in self.screen.toggles:
             on = toggle.read(config)
-            btn = ui.Button(
-                label=f"{toggle.label}: {'On' if on else 'Off'}",
-                style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary,
-                row=row)
-            btn.callback = self._toggle_callback(toggle, on)
-            self.add_item(btn)
+            add_button(self, f"{toggle.label}: {'On' if on else 'Off'}",
+                       self._toggle_callback(toggle, on),
+                       style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary,
+                       row=row)
 
         if self.screen.modal:
-            btn = ui.Button(label=self.screen.modal_label, style=discord.ButtonStyle.primary, row=row)
-            btn.callback = self._modal_callback
-            self.add_item(btn)
+            add_button(self, self.screen.modal_label, self._modal_callback,
+                       style=discord.ButtonStyle.primary, row=row)
 
         if self.screen.sub_view:
             label, handler = self.screen.sub_view
-            btn = ui.Button(label=label, style=discord.ButtonStyle.primary, row=row)
-
             async def sub_callback(interaction: discord.Interaction, _handler=handler):
                 await _handler(self.parent, interaction, self._config)
+            add_button(self, label, sub_callback, style=discord.ButtonStyle.primary, row=row)
 
-            btn.callback = sub_callback
-            self.add_item(btn)
-
-        back = ui.Button(label="◀ Back", style=discord.ButtonStyle.secondary, row=row)
-        back.callback = self._back_callback
-        self.add_item(back)
+        add_button(self, "◀ Back", self._back_callback, style=discord.ButtonStyle.secondary,
+                   row=row)
 
     def _choice_callback(self, choice: '_Choice'):
         async def callback(interaction: discord.Interaction):
@@ -1720,19 +1708,10 @@ def ProfileParamsModal(cog, profile_name: str, current_params: Dict[str, Any], i
     ]
     def parser(v):
         c = {}
-        t = _pf(v["temperature"]); p = _pf(v["top_p"]); k = _pi(v["top_k"]); s = _pi(v["stm_length"])
-        if t is not None:
-            if not (0.0 <= t <= 2.0): raise ValueError("Temperature out of range")
-            c["temperature"] = t
-        if p is not None:
-            if not (0.0 <= p <= 1.0): raise ValueError("Top P out of range")
-            c["top_p"] = p
-        if k is not None:
-            if not (0 <= k <= 100): raise ValueError("Top K out of range")
-            c["top_k"] = k
-        if s is not None:
-            if not (0 <= s <= STM_LIMIT_MAX): raise ValueError(f"STM Length out of range (0-{STM_LIMIT_MAX})")
-            c["stm_length"] = s
+        c.update(_ranged(v, "temperature", 0.0, 2.0, "Temperature"))
+        c.update(_ranged(v, "top_p", 0.0, 1.0, "Top P"))
+        c.update(_ranged(v, "top_k", 0, 100, "Top K", _pi))
+        c.update(_ranged(v, "stm_length", 0, STM_LIMIT_MAX, "STM Length", _pi))
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Set Profile Generation Parameters", fields, parser, callback, target_user_id)
 
@@ -1743,39 +1722,10 @@ def ProfileTrainingParamsModal(cog, profile_name: str, current_params: Dict[str,
     ]
     def parser(v):
         c = {}
-        cs = _pi(v["training_context_size"]); rt = _pf(v["training_relevance_threshold"])
-        if cs is not None:
-            if not (0 <= cs <= 10): raise ValueError("Context Size out of range")
-            c["training_context_size"] = cs
-        if rt is not None:
-            if not (0.0 <= rt <= 1.0): raise ValueError("Relevance Threshold out of range")
-            c["training_relevance_threshold"] = rt
+        c.update(_ranged(v, "training_context_size", 0, 10, "Context Size", _pi))
+        c.update(_ranged(v, "training_relevance_threshold", 0.0, 1.0, "Relevance Threshold"))
         return {"config": c}
     return ConfigModal(cog, profile_name, False, "Set Profile Training Parameters", fields, parser, callback, target_user_id)
-
-def ProfileThinkingParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
-    fields = [] if values_only else [
-        {"label": "Thinking Summary (on/off)", "custom_id": "thinking_summary_visible", "default": current_params.get("thinking_summary_visible", "off"), "required": False, "placeholder": "Display reasoning tokens below your message."},
-        {"label": "Reasoning Effort / Level", "custom_id": "thinking_level", "default": current_params.get("thinking_level", "low"), "required": False, "placeholder": "xhigh, high, medium, low, minimal, none"},
-    ]
-    fields.append(
-        {"label": "Reasoning Token Budget (-1=dyn)", "custom_id": "thinking_budget", "default": str(current_params.get("thinking_budget", -1)), "required": False, "placeholder": "-1 = dynamic, 128+ = token limit"}
-    )
-    def parser(v):
-        c = {}
-        if "thinking_summary_visible" in v:
-            sv = _ps(v["thinking_summary_visible"])
-            c["thinking_summary_visible"] = "on" if sv and sv.lower() == "on" else "off"
-
-        if "thinking_level" in v:
-            lv = _ps(v["thinking_level"])
-            c["thinking_level"] = lv.lower() if lv and lv.lower() in ["xhigh", "high", "medium", "low", "minimal", "none"] else "high"
-
-        bv = _pi(v["thinking_budget"])
-        c["thinking_budget"] = min(bv if bv is not None and bv >= -1 else -1, 32768)
-        
-        return {"config": c}
-    return ConfigModal(cog, profile_name, is_borrowed, "Thinking & Reasoning Parameters", fields, parser, callback, target_user_id)
 
 def ProfileLTMParamsModal(cog, profile_name: str, current_params: Dict[str, Any], values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     fields = [
@@ -1786,20 +1736,10 @@ def ProfileLTMParamsModal(cog, profile_name: str, current_params: Dict[str, Any]
     ]
     def parser(v):
         c = {}
-        inv = _pi(v["ltm_creation_interval"]); ctx = _pi(v["ltm_summarization_context"])
-        rs = _pi(v["ltm_context_size"]); rt = _pf(v["ltm_relevance_threshold"])
-        if inv is not None:
-            if not (5 <= inv <= 100): raise ValueError("Interval out of range")
-            c["ltm_creation_interval"] = inv
-        if ctx is not None:
-            if not (5 <= ctx <= 50): raise ValueError("Context out of range")
-            c["ltm_summarization_context"] = ctx
-        if rs is not None:
-            if not (0 <= rs <= 10): raise ValueError("Context Size out of range")
-            c["ltm_context_size"] = rs
-        if rt is not None:
-            if not (0.0 <= rt <= 1.0): raise ValueError("Relevance Threshold out of range")
-            c["ltm_relevance_threshold"] = rt
+        c.update(_ranged(v, "ltm_creation_interval", 5, 100, "Interval", _pi))
+        c.update(_ranged(v, "ltm_summarization_context", 5, 50, "Context", _pi))
+        c.update(_ranged(v, "ltm_context_size", 0, 10, "Context Size", _pi))
+        c.update(_ranged(v, "ltm_relevance_threshold", 0.0, 1.0, "Relevance Threshold"))
         return {"config": c}
     return ConfigModal(cog, profile_name, False, "LTM Parameters", fields, parser, callback, target_user_id)
 
@@ -1873,18 +1813,10 @@ def ProfileCriticSettingsModal(cog, profile_name: str, current_params: Dict[str,
                 raise ValueError(f"Strictness must be one of: {', '.join(CRITIC_STRICTNESS_LEVELS)}")
             c["critic_strictness"] = strictness
 
-        lb = _pi(v["critic_lookback"])
-        if lb is not None:
-            if not (CRITIC_LOOKBACK_MIN <= lb <= CRITIC_LOOKBACK_MAX):
-                raise ValueError(f"Lookback out of range ({CRITIC_LOOKBACK_MIN}-{CRITIC_LOOKBACK_MAX})")
-            c["critic_lookback"] = lb
-
-        pr = _pi(v["critic_persistence"])
-        if pr is not None:
-            if not (CRITIC_PERSISTENCE_MIN <= pr <= CRITIC_PERSISTENCE_MAX):
-                raise ValueError(f"Persistence out of range ({CRITIC_PERSISTENCE_MIN}-{CRITIC_PERSISTENCE_MAX})")
-            c["critic_persistence"] = pr
-
+        c.update(_ranged(v, "critic_lookback", CRITIC_LOOKBACK_MIN, CRITIC_LOOKBACK_MAX,
+                         "Lookback", _pi))
+        c.update(_ranged(v, "critic_persistence", CRITIC_PERSISTENCE_MIN,
+                         CRITIC_PERSISTENCE_MAX, "Persistence", _pi))
         return {"config": c}
 
     return ConfigModal(cog, profile_name, is_borrowed, "Anti-Repetition Critic", fields, parser, callback, target_user_id)
@@ -2226,7 +2158,7 @@ class SingleProfileMediaOptionsView(MediaOptionsMixin, ui.View):
             self._add_voice_select("speech_voice", 0)
 
 
-class ModelPickerMixin:
+class ModelPickerMixin(ReportErrorMixin):
     """The model-selection machinery shared by the single-profile and bulk pickers.
 
     SingleProfileModelView and ModelApplyView present the same picker over different
@@ -2415,8 +2347,6 @@ class ModelPickerMixin:
         api_modes = ['google', 'openrouter', 'ollama']
         api_labels = {'google': 'API: Google', 'openrouter': 'API: OpenRouter', 'ollama': 'API: Ollama (Local)'}
         
-        btn_api = ui.Button(label=api_labels[self.view_mode], style=discord.ButtonStyle.primary, row=row,
-                            disabled=(self.category in self._GOOGLE_ONLY_CATEGORIES))
         async def api_cb(i: discord.Interaction):
             next_idx = (api_modes.index(self.view_mode) + 1) % len(api_modes)
             self.view_mode = api_modes[next_idx]
@@ -2429,8 +2359,8 @@ class ModelPickerMixin:
             else:
                 self._build_view()
                 await i.response.edit_message(**self._picker_render())
-        btn_api.callback = api_cb
-        self.add_item(btn_api)
+        add_button(self, api_labels[self.view_mode], api_cb, style=discord.ButtonStyle.primary,
+                   row=row, disabled=self.category in self._GOOGLE_ONLY_CATEGORIES)
         
         if self.view_mode == 'ollama':
             host_style = discord.ButtonStyle.secondary
@@ -2441,25 +2371,91 @@ class ModelPickerMixin:
             elif getattr(self, 'ollama_working', None) is False:
                 host_style = discord.ButtonStyle.danger
                 
-            btn_host = ui.Button(label="Set Host URL", style=host_style, row=row)
             async def host_cb(i: discord.Interaction):
                 await i.response.send_modal(OllamaHostModal(self))
-            btn_host.callback = host_cb
-            self.add_item(btn_host)
+            add_button(self, "Set Host URL", host_cb, style=host_style, row=row)
             
-            btn_guide = ui.Button(label="Guide", style=discord.ButtonStyle.secondary, row=row)
             async def guide_cb(i: discord.Interaction):
                 await i.response.send_message(OLLAMA_GUIDE_TEXT, ephemeral=True)
-            btn_guide.callback = guide_cb
-            self.add_item(btn_guide)
+            add_button(self, "Guide", guide_cb, style=discord.ButtonStyle.secondary, row=row)
 
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item: ui.Item):
-        print(f"Error in {type(self).__name__}: {error}")
-        traceback.print_exc()
-        if not interaction.response.is_done():
-            await interaction.response.send_message("An unexpected error occurred with this view.", ephemeral=True)
-        else:
-            await interaction.followup.send("An unexpected error occurred with this view.", ephemeral=True)
+        if self.view_mode == 'openrouter':
+            self._add_service_tier_button(row=row)
+
+    #: Button colour per tier. The *wording* is not repeated here -- it comes off
+    #: OPENROUTER_SERVICE_TIERS, so the three screens and the constant cannot drift
+    #: about what "flex" is called. `None` is in neither: it means "this screen is not
+    #: writing the key at all", which the three adopters word differently.
+    _TIER_BUTTON_STYLES = {
+        "": discord.ButtonStyle.secondary,
+        "flex": discord.ButtonStyle.success,
+        "priority": discord.ButtonStyle.blurple,
+    }
+    _TIER_WORDING = {value: label for value, label, _desc in OPENROUTER_SERVICE_TIERS}
+
+    #: How `None` reads on a screen whose cycle includes it.
+    _TIER_UNSET_WORDING = "Unchanged"
+
+    def _add_service_tier_button(self, *, row: int):
+        """The OpenRouter service tier, as a cycling button beside the API switch.
+
+        A button rather than a dropdown because all five rows are already spoken for --
+        the category select, two model selects, and two rows of buttons -- and because
+        it cycles through three states, which is what the API switch beside it already
+        does.
+
+        Profile-wide, not per slot, which is only safe because a model whose pool holds
+        no endpoint at the requested tier routes normally at standard rates rather than
+        failing: a profile on Flex with a critic nobody offers Flex for still gets its
+        critic. A provider *pin* would not be safe this way and is deliberately not
+        offered here.
+        """
+        cycle = self._tier_cycle()
+        current = self._current_service_tier()
+        style, wording = self.tier_wording(current)
+
+        async def tier_cb(i: discord.Interaction):
+            nxt = cycle[(cycle.index(current) + 1) % len(cycle)] if current in cycle else cycle[0]
+            self._set_service_tier(nxt)
+            self._build_view()
+            await i.response.edit_message(**self._picker_render())
+
+        add_button(self, f"Tier: {wording}", tier_cb, style=style, row=row)
+
+    @classmethod
+    def tier_wording(cls, value):
+        """(button style, wording) for a stored tier.
+
+        Falls through to Auto rather than raising: an imported profile or a shard
+        written by a later build can carry a tier this one has never heard of, and the
+        picker has to render it. `resolve_openrouter_service_tier` refuses the same
+        value at the wire, so nothing unknown is ever actually sent.
+        """
+        if value is None:
+            return discord.ButtonStyle.secondary, cls._TIER_UNSET_WORDING
+        if value not in cls._TIER_WORDING:
+            value = ""
+        return cls._TIER_BUTTON_STYLES[value], cls._TIER_WORDING[value]
+
+    def _set_service_tier(self, value):
+        """Overridden where "not set" is an absence rather than a stored value."""
+        self._save_changes("openrouter_service_tier", value)
+
+    def _tier_cycle(self) -> tuple:
+        """The states the tier button steps through.
+
+        Three here, because the single-profile picker writes on every press and so has
+        nothing to represent with a fourth. The two screens that do not write straight
+        through -- the bulk staging picker and My Defaults -- prepend `None` for their
+        own kind of "not set".
+        """
+        return ("", "flex", "priority")
+
+    def _current_service_tier(self):
+        """The single-profile shape. Both staging adopters override this, as they do
+        `_ollama_host_url`, because neither has a profile to read."""
+        return self._get_current_profile_data().get("openrouter_service_tier") or ""
+
 
 
 class SingleProfileModelView(ModelPickerMixin, ui.View):
@@ -2493,20 +2489,7 @@ class SingleProfileModelView(ModelPickerMixin, ui.View):
             self.cog.profile_manager._save_profile_config(self.user_id, self.profile_name, target_dict, self.is_borrowed)
             
             # Clear model cache for this user
-            keys_to_delete = []
-            for k in list(self.cog.channel_models.keys()):
-                key_user_id = None
-                if isinstance(k, tuple) and len(k) == 3:
-                    key_user_id = k[1]
-                elif isinstance(k, tuple) and len(k) == 2:
-                    key_user_id = k[1]
-                
-                if key_user_id == self.user_id:
-                    keys_to_delete.append(k)
-
-            for k in keys_to_delete:
-                self.cog.channel_models.pop(k, None)
-                self.cog.channel_model_last_profile_key.pop(k, None)
+            invalidate_model_cache(self.cog, self.user_id)
 
     def _get_selection_feedback_message(self) -> str:
         """Kept as the embed's description, and as the fallback for any caller that
@@ -2542,6 +2525,10 @@ class SingleProfileModelView(ModelPickerMixin, ui.View):
             state = data.get("show_fallback_indicator", True)
             e.add_field(name="Fallback Indicator",
                         value="**`ON`**" if state else "`OFF`", inline=True)
+        if self.view_mode == 'openrouter':
+            e.add_field(name="Service Tier",
+                        value=f"`{self.tier_wording(self._current_service_tier())[1]}`",
+                        inline=True)
 
         if self.category in THINKING_SLOT_KEYS:
             parts = []
@@ -2573,18 +2560,13 @@ class SingleProfileModelView(ModelPickerMixin, ui.View):
 
         if self.category == 'response':
             show_fb = data.get("show_fallback_indicator", True)
-            btn_fallback = ui.Button(
-                label=f"Fallback Indicator: {'ON' if show_fb else 'OFF'}",
-                style=discord.ButtonStyle.success if show_fb else discord.ButtonStyle.secondary,
-                row=3)
-
             async def fallback_cb(i: discord.Interaction):
                 self._save_changes("show_fallback_indicator", not show_fb)
                 self._build_view()
                 await i.response.edit_message(**self._picker_render())
-
-            btn_fallback.callback = fallback_cb
-            self.add_item(btn_fallback)
+            add_button(self, f"Fallback Indicator: {'ON' if show_fb else 'OFF'}", fallback_cb,
+                       style=discord.ButtonStyle.success if show_fb else discord.ButtonStyle.secondary,
+                       row=3)
 
         # Choosing a model and choosing how hard it thinks are one decision, and the
         # thinking picker is keyed on the same four slots this dropdown names -- so it
@@ -2592,17 +2574,14 @@ class SingleProfileModelView(ModelPickerMixin, ui.View):
         # thinking lives with the other image *output* controls in Media Options, and a
         # speech model accepts none, so neither category offers the button.
         if self.category in THINKING_SLOT_KEYS:
-            btn_think = ui.Button(label="Thinking\u2026", style=discord.ButtonStyle.secondary, row=4)
-
             async def think_cb(i: discord.Interaction):
                 view = SingleProfileThinkingView(
                     self.cog, self.original_interaction, self.profile_name,
                     slot=self.category, is_borrowed=self.is_borrowed,
                     user_id=self.user_id, parent_model_view=self)
                 await i.response.edit_message(**view._render())
-
-            btn_think.callback = think_cb
-            self.add_item(btn_think)
+            add_button(self, "Thinking\u2026", think_cb, style=discord.ButtonStyle.secondary,
+                       row=4)
 
 
 class ThinkingPickerMixin:
@@ -2728,13 +2707,10 @@ class ThinkingPickerMixin:
         self.add_item(select)
 
     def _add_budget_button(self, row: int = 3):
-        btn = ui.Button(label="Token budgets\u2026", style=discord.ButtonStyle.secondary, row=row)
-
         async def callback(interaction: discord.Interaction):
             await interaction.response.send_modal(_SlotThinkingBudgetModal(self))
-
-        btn.callback = callback
-        self.add_item(btn)
+        add_button(self, "Token budgets\u2026", callback, style=discord.ButtonStyle.secondary,
+                   row=row)
 
     def _slot_rows(self, config_reader) -> List[str]:
         """One line per slot, resolved rather than read raw.
@@ -2850,11 +2826,7 @@ class SingleProfileThinkingView(ThinkingPickerMixin, ui.View):
             self.user_id, self.profile_name, data, self.is_borrowed)
         # Same invalidation every other in-place profile write does: a cached model
         # carries the thinking params it was built with.
-        stale = [k for k in self.cog.channel_models
-                 if isinstance(k, tuple) and len(k) >= 2 and k[1] == self.user_id]
-        for k in stale:
-            self.cog.channel_models.pop(k, None)
-            self.cog.channel_model_last_profile_key.pop(k, None)
+        invalidate_model_cache(self.cog, self.user_id)
 
     def _render(self) -> Dict[str, Any]:
         return {"content": None, "embed": self.embed(), "view": self}
@@ -2914,28 +2886,21 @@ class SingleProfileThinkingView(ThinkingPickerMixin, ui.View):
 
         if self.slot == "response":
             on = str(self._current("thinking_summary_visible") or "off").lower() == "on"
-            btn = ui.Button(label=f"Show Summary: {'ON' if on else 'OFF'}",
-                            style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary,
-                            row=3)
-
             async def summary_cb(i: discord.Interaction):
                 self._write("thinking_summary_visible", "off" if on else "on")
                 self._build_view()
                 await i.response.edit_message(**self._render())
-
-            btn.callback = summary_cb
-            self.add_item(btn)
+            add_button(self, f"Show Summary: {'ON' if on else 'OFF'}", summary_cb,
+                       style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary,
+                       row=3)
 
         if self.parent_model_view is not None:
-            back = ui.Button(label="\u2190 Back to Models", style=discord.ButtonStyle.secondary, row=4)
-
             async def back_cb(i: discord.Interaction):
                 parent = self.parent_model_view
                 parent._build_view()
                 await i.response.edit_message(**parent._picker_render())
-
-            back.callback = back_cb
-            self.add_item(back)
+            add_button(self, "\u2190 Back to Models", back_cb,
+                       style=discord.ButtonStyle.secondary, row=4)
 
 
 #: Shared by the wizard and every sub-view. Deliberately under fifteen minutes: after a
@@ -2944,7 +2909,7 @@ class SingleProfileThinkingView(ThinkingPickerMixin, ui.View):
 _BULK_TIMEOUT = 840
 
 
-class _BulkSubView(ui.View):
+class _BulkSubView(ReportErrorMixin, ui.View):
     """A wizard step that borrows the wizard's message instead of opening its own.
 
     Every step of the bulk flow used to be a fresh `followup.send(ephemeral=True)`,
@@ -2980,13 +2945,9 @@ class _BulkSubView(ui.View):
         return True
 
     def _add_back(self, row: int, label: str = "◀ Back"):
-        btn = ui.Button(label=label, style=discord.ButtonStyle.secondary, row=row)
-
         async def cb(interaction: discord.Interaction):
             await self.wizard.refresh(interaction)
-
-        btn.callback = cb
-        self.add_item(btn)
+        add_button(self, label, cb, style=discord.ButtonStyle.secondary, row=row)
 
     def embed(self) -> discord.Embed:
         raise NotImplementedError
@@ -2998,13 +2959,6 @@ class _BulkSubView(ui.View):
         self._build_view()
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-    async def on_error(self, interaction: discord.Interaction, error: Exception, item: ui.Item):
-        print(f"Error in {type(self).__name__}: {error}")
-        traceback.print_exc()
-        if not interaction.response.is_done():
-            await interaction.response.send_message("An unexpected error occurred with this view.", ephemeral=True)
-        else:
-            await interaction.followup.send("An unexpected error occurred with this view.", ephemeral=True)
 
 
 class ModelApplyView(ModelPickerMixin, _BulkSubView):
@@ -3033,7 +2987,7 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
             'grounding_rag_model', 'grounding_rag_fallback_model',
             'critic_model', 'critic_fallback_model',
             'ltm_model', 'ltm_fallback_model',
-            'ollama_host_url')}
+            'ollama_host_url', 'openrouter_service_tier')}
         self.show_fallback_indicator = None
 
         # Seeded from whatever an earlier visit already staged, so reopening the picker
@@ -3048,6 +3002,15 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
 
     def _ollama_host_url(self) -> str:
         return self.models_state.get("ollama_host_url")
+
+    def _tier_cycle(self) -> tuple:
+        """The mixin's three states plus `None`, so a tier chosen by mistake can be
+        taken back out of the changeset without abandoning the model choices -- the
+        same escape the fallback indicator's tri-state button offers."""
+        return (None, "", "flex", "priority")
+
+    def _current_service_tier(self):
+        return self.models_state.get("openrouter_service_tier")
 
     def _save_changes(self, key: str, value: Any):
         if key == "show_fallback_indicator":
@@ -3070,6 +3033,10 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
             return "Unchanged"
         if isinstance(val, bool):
             return "On" if val else "Off"
+        if val == "":
+            # The default service tier. Only this key stages an empty string, and it
+            # means "let OpenRouter route", not "no model".
+            return "Auto"
         return cls.display_model(val)
 
     def _pending(self) -> Dict[str, Any]:
@@ -3106,6 +3073,10 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
             e.add_field(name="Fallback Indicator",
                         value=f"`{'Unchanged' if state is None else self._clean(state)}`",
                         inline=True)
+        if self.view_mode == 'openrouter':
+            e.add_field(name="Service Tier",
+                        value=f"`{self._clean(self.models_state['openrouter_service_tier'])}`",
+                        inline=True)
 
         pending = self._pending()
         if pending:
@@ -3138,23 +3109,17 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
                      else f"Fallback Indicator: {'ON' if state else 'OFF'}")
             style = (discord.ButtonStyle.secondary if state is None
                      else (discord.ButtonStyle.success if state else discord.ButtonStyle.danger))
-            btn = ui.Button(label=label, style=style, row=3)
-
             async def fallback_cb(i: discord.Interaction):
                 # Tri-state: unchanged -> on -> off -> unchanged, so the indicator can be
                 # taken back out of the changeset without abandoning the model choices.
                 self.show_fallback_indicator = True if state is None else (False if state else None)
                 self._build_view()
                 await i.response.edit_message(**self._picker_render())
-
-            btn.callback = fallback_cb
-            self.add_item(btn)
+            add_button(self, label, fallback_cb, style=style, row=3)
 
         self._add_back(4)
-        stage = ui.Button(label="Stage Models", style=discord.ButtonStyle.success, row=4,
-                          disabled=not self._pending())
-        stage.callback = self._stage_callback
-        self.add_item(stage)
+        add_button(self, "Stage Models", self._stage_callback, style=discord.ButtonStyle.success,
+                   row=4, disabled=not self._pending())
 
     async def _stage_callback(self, interaction: discord.Interaction):
         pending = self._pending()
@@ -3252,8 +3217,6 @@ class ThinkingApplyView(ThinkingPickerMixin, _BulkSubView):
                      else f"Show Summary: {state.upper()}")
             style = (discord.ButtonStyle.secondary if state is None
                      else (discord.ButtonStyle.success if state == "on" else discord.ButtonStyle.danger))
-            btn = ui.Button(label=label, style=style, row=3)
-
             async def summary_cb(i: discord.Interaction):
                 # Tri-state, as the fallback indicator is: the setting can be taken back
                 # out of the changeset without abandoning the efforts beside it.
@@ -3261,15 +3224,11 @@ class ThinkingApplyView(ThinkingPickerMixin, _BulkSubView):
                             "on" if state is None else ("off" if state == "on" else None))
                 self._build_view()
                 await i.response.edit_message(**self._render())
-
-            btn.callback = summary_cb
-            self.add_item(btn)
+            add_button(self, label, summary_cb, style=style, row=3)
 
         self._add_back(4)
-        stage = ui.Button(label="Stage Thinking", style=discord.ButtonStyle.success, row=4,
-                          disabled=not self.staged)
-        stage.callback = self._stage_callback
-        self.add_item(stage)
+        add_button(self, "Stage Thinking", self._stage_callback,
+                   style=discord.ButtonStyle.success, row=4, disabled=not self.staged)
 
     async def _stage_callback(self, interaction: discord.Interaction):
         if not self.staged:
@@ -3311,10 +3270,8 @@ class _MediaOptionsApplyView(MediaOptionsMixin, _BulkSubView):
 
     def _stage_row(self, row: int, label: str):
         self._add_back(row)
-        stage = ui.Button(label=label, style=discord.ButtonStyle.success, row=row,
-                          disabled=not self.staged)
-        stage.callback = self._stage_callback
-        self.add_item(stage)
+        add_button(self, label, self._stage_callback, style=discord.ButtonStyle.success, row=row,
+                   disabled=not self.staged)
 
     async def _stage_callback(self, interaction: discord.Interaction):
         if not self.staged:
@@ -3504,11 +3461,7 @@ async def _apply_bulk_session(cog, user_id: int, session: _BulkSession) -> Dict[
     if counts["changed"]:
         # Hot-swap: a live session holding a cached model for any of this user's
         # profiles would otherwise keep the pre-edit settings until eviction.
-        keys = [k for k in cog.channel_models.keys()
-                if isinstance(k, tuple) and len(k) >= 2 and k[1] == user_id]
-        for k in keys:
-            cog.channel_models.pop(k, None)
-            cog.channel_model_last_profile_key.pop(k, None)
+        invalidate_model_cache(cog, user_id)
 
     return counts
 
@@ -3641,35 +3594,38 @@ def build_timezone_options(page: int, current: Optional[str]) -> List[discord.Se
     return options
 
 
-class UserTimezoneView(ui.View):
-    """Timezone picker for the user themselves, not for a character.
+class _TimezonePickerView(ui.View):
+    """Shared body of the timezone pickers: the paged select, the jump, the modal.
 
-    Writes `index.json["about"]["timezone"]` and sets nothing else: the profile-side
-    picker also force-sets `time_tracking_enabled`, because a zone on a profile that
-    never reads the clock does nothing. A user's zone has no such switch -- it is
-    always used, to timestamp their own messages in history.
+    Three of these existed as separate views that differed only in where the current
+    zone is read from, what the header says, and what `apply` writes -- and the modal
+    behind "Custom / Manual" carried an isinstance ladder re-implementing one of those
+    save paths a second time. Subclasses answer those three questions; the browsing is
+    here, once.
     """
 
-    def __init__(self, cog: 'MimicCog', parent_about_view):
-        super().__init__(timeout=300)
+    def __init__(self, cog: 'MimicCog', timeout: int = 300):
+        super().__init__(timeout=timeout)
         self.cog = cog
-        self.parent_about_view = parent_about_view
-        self.user_id = parent_about_view.user_id
         self.current_page = 0
         self._build_view()
 
-    def _current_tz(self) -> str:
-        return self.cog.profile_manager.user_timezone(self.user_id)
+    def _current_tz(self) -> Optional[str]:
+        raise NotImplementedError
 
     def _get_header_content(self) -> str:
-        current_tz = self._current_tz()
+        raise NotImplementedError
+
+    async def apply(self, interaction: discord.Interaction, canonical_tz: str):
+        raise NotImplementedError
+
+    def _clock_line(self, current_tz: str) -> str:
         try:
             tz_obj, _ = _resolve_zoneinfo(current_tz)
             now_str = datetime.datetime.now(tz_obj).strftime("%I:%M %p (%Z)")
         except Exception:
             now_str = "Unknown"
-        return (f"**Your Timezone**\n**Active Setting:** `{current_tz}` "
-                f"(Local Time: `{now_str}`)\n"
+        return (f"**Active Setting:** `{current_tz}` (Local Time: `{now_str}`)\n"
                 f"Select a timezone below or jump between regional partitions:")
 
     def _build_view(self):
@@ -3681,29 +3637,15 @@ class UserTimezoneView(ui.View):
         select.callback = self.select_callback
         self.add_item(select)
 
-        async def prev_cb(i: discord.Interaction):
-            self.current_page = max(0, self.current_page - 1)
-            self._build_view()
-            await i.response.edit_message(content=self._get_header_content(), view=self)
-
-        async def next_cb(i: discord.Interaction):
-            self.current_page = min(TIMEZONE_TOTAL_PAGES - 1, self.current_page + 1)
-            self._build_view()
-            await i.response.edit_message(content=self._get_header_content(), view=self)
-
         build_pagination_controls(self, self.current_page, TIMEZONE_TOTAL_PAGES, 1,
-                                  prev_cb, next_cb)
+                                  self._turn_page(-1), self._turn_page(1))
 
-    async def apply(self, interaction: discord.Interaction, canonical_tz: str):
-        """Persist the choice, refresh the About Me panel behind this pop-up, close it."""
-        about = self.cog.profile_manager.get_user_about(self.user_id)
-        about["timezone"] = canonical_tz
-        self.cog.profile_manager.save_user_about(self.user_id, about)
-
-        self.parent_about_view._build_view()
-        await self.parent_about_view.update_display()
-        await interaction.response.edit_message(
-            content=f"✅ Your timezone is now **{canonical_tz}**.", view=None)
+    def _turn_page(self, delta: int):
+        async def cb(i: discord.Interaction):
+            self.current_page = min(TIMEZONE_TOTAL_PAGES - 1, max(0, self.current_page + delta))
+            self._build_view()
+            await i.response.edit_message(content=self._get_header_content(), view=self)
+        return cb
 
     async def select_callback(self, interaction: discord.Interaction):
         choice = interaction.data['values'][0]
@@ -3723,115 +3665,82 @@ class UserTimezoneView(ui.View):
         await self.apply(interaction, canonical_tz)
 
 
-class SingleProfileTimezoneView(ui.View):
-    def __init__(self, cog: 'MimicCog', parent_manage_view: ProfileManageView, profile_config: Dict[str, Any], is_borrowed: bool):
-        super().__init__(timeout=300)
-        self.cog = cog
+class UserTimezoneView(_TimezonePickerView):
+    """Timezone picker for the user themselves, not for a character.
+
+    Writes `index.json["about"]["timezone"]` and sets nothing else: the profile-side
+    picker also force-sets `time_tracking_enabled`, because a zone on a profile that
+    never reads the clock does nothing. A user's zone has no such switch -- it is
+    always used, to timestamp their own messages in history.
+    """
+
+    def __init__(self, cog: 'MimicCog', parent_about_view):
+        self.parent_about_view = parent_about_view
+        self.user_id = parent_about_view.user_id
+        super().__init__(cog)
+
+    def _current_tz(self) -> str:
+        return self.cog.profile_manager.user_timezone(self.user_id)
+
+    def _get_header_content(self) -> str:
+        return "**Your Timezone**\n" + self._clock_line(self._current_tz())
+
+    async def apply(self, interaction: discord.Interaction, canonical_tz: str):
+        """Persist the choice, refresh the About Me panel behind this pop-up, close it."""
+        about = self.cog.profile_manager.get_user_about(self.user_id)
+        about["timezone"] = canonical_tz
+        self.cog.profile_manager.save_user_about(self.user_id, about)
+
+        self.parent_about_view._build_view()
+        await self.parent_about_view.update_display()
+        await interaction.response.edit_message(
+            content=f"✅ Your timezone is now **{canonical_tz}**.", view=None)
+
+
+class SingleProfileTimezoneView(_TimezonePickerView):
+    def __init__(self, cog: 'MimicCog', parent_manage_view: ProfileManageView,
+                 profile_config: Dict[str, Any], is_borrowed: bool):
         self.parent_manage_view = parent_manage_view
         self.profile_config = profile_config
         self.is_borrowed = is_borrowed
-        self.current_page = 0
-        self.total_pages = (len(EXTENSIVE_TIMEZONES) - 1) // 20 + 1
-        self._build_view()
+        super().__init__(cog)
+
+    def _current_tz(self) -> str:
+        return self.profile_config.get("timezone", "UTC")
 
     def _get_header_content(self) -> str:
-        current_tz = self.profile_config.get("timezone", "UTC")
-        try:
-            tz_obj, _ = _resolve_zoneinfo(current_tz)
-            now_str = datetime.datetime.now(tz_obj).strftime("%I:%M %p (%Z)")
-        except Exception:
-            now_str = "Unknown"
-        return f"**Timezone Selector for '{self.parent_manage_view.profile_name}'**\n**Active Setting:** `{current_tz}` (Local Time: `{now_str}`)\nSelect a timezone below or jump between regional partitions:"
+        return (f"**Timezone Selector for '{self.parent_manage_view.profile_name}'**\n"
+                + self._clock_line(self._current_tz()))
 
-    def _build_view(self):
-        self.clear_items()
-        options = build_timezone_options(
-            self.current_page, self.profile_config.get("timezone", "UTC"))
-
-        select = ui.Select(placeholder=f"Timezones: {PARTITION_NAMES[self.current_page]} ({self.current_page + 1}/{self.total_pages})...", options=options, row=0)
-        select.callback = self.select_callback
-        self.add_item(select)
-
-        # Pagination controls on Row 1
-        async def prev_cb(i: discord.Interaction):
-            self.current_page = max(0, self.current_page - 1)
-            self._build_view()
-            await i.response.edit_message(content=self._get_header_content(), view=self)
-
-        async def next_cb(i: discord.Interaction):
-            self.current_page = min(self.total_pages - 1, self.current_page + 1)
-            self._build_view()
-            await i.response.edit_message(content=self._get_header_content(), view=self)
-
-        build_pagination_controls(self, self.current_page, self.total_pages, 1, prev_cb, next_cb)
-
-    async def select_callback(self, interaction: discord.Interaction):
-        choice = interaction.data['values'][0]
-
-        if choice == "custom":
-            modal = CustomTimezoneModal(self)
-            await interaction.response.send_modal(modal)
-            return
-
-        if choice.startswith("jump_"):
-            target_page = int(choice.split("_")[1])
-            self.current_page = target_page
-            self._build_view()
-            await interaction.response.edit_message(content=self._get_header_content(), view=self)
-            return
-
-        # Direct timezone selection
-        _, canonical_tz = _resolve_zoneinfo(choice)
+    async def apply(self, interaction: discord.Interaction, canonical_tz: str):
+        # Time awareness comes on with the zone: a clock nothing reads is not a setting.
         self.profile_config["timezone"] = canonical_tz
         self.profile_config["time_tracking_enabled"] = True
-        self.cog.profile_manager._save_profile_config(self.parent_manage_view.user_id, self.parent_manage_view.profile_name, self.profile_config, self.is_borrowed)
-
-        # Flush model cache for this profile
-        keys = [k for k in self.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.parent_manage_view.user_id]
-        for k in keys:
-            self.cog.channel_models.pop(k, None)
+        owner_id = self.parent_manage_view.user_id
+        name = self.parent_manage_view.profile_name
+        self.cog.profile_manager._save_profile_config(
+            owner_id, name, self.profile_config, self.is_borrowed)
+        invalidate_model_cache(self.cog, owner_id, name)
 
         new_embed = await self.cog.profile_manager._build_profile_manage_embed(
-            interaction, self.parent_manage_view.profile_name,
-            target_user_id=self.parent_manage_view.user_id)
-        await self.parent_manage_view.original_interaction.edit_original_response(embed=new_embed, view=self.parent_manage_view)
-        await interaction.response.edit_message(content=f"✅ Timezone set to **{canonical_tz}**.", view=None)
+            interaction, name, target_user_id=owner_id)
+        await self.parent_manage_view.original_interaction.edit_original_response(
+            embed=new_embed, view=self.parent_manage_view)
+        await interaction.response.edit_message(
+            content=f"✅ Timezone set to **{canonical_tz}**.", view=None)
+
 
 class CustomTimezoneModal(ui.Modal, title="Enter Custom Timezone"):
     tz_input = ui.TextInput(label="Timezone ID / Acronym", placeholder="e.g. Australia/Sydney, AEST, America/New_York", required=True)
 
-    def __init__(self, parent_view: Union[SingleProfileTimezoneView, UserTimezoneView, 'BulkTimezoneView']):
+    def __init__(self, parent_view):
         super().__init__()
         self.parent_view = parent_view
 
     async def on_submit(self, interaction: discord.Interaction):
-        raw_val = self.tz_input.value.strip()
-        tz_obj, canonical_tz = _resolve_zoneinfo(raw_val)
+        _, canonical_tz = _resolve_zoneinfo(self.tz_input.value.strip())
+        await self.parent_view.apply(interaction, canonical_tz)
 
-        if isinstance(self.parent_view, UserTimezoneView):
-            await self.parent_view.apply(interaction, canonical_tz)
-            return
-
-        if isinstance(self.parent_view, SingleProfileTimezoneView):
-            self.parent_view.profile_config["timezone"] = canonical_tz
-            self.parent_view.profile_config["time_tracking_enabled"] = True
-            self.parent_view.cog.profile_manager._save_profile_config(self.parent_view.parent_manage_view.user_id, self.parent_view.parent_manage_view.profile_name, self.parent_view.profile_config, self.parent_view.is_borrowed)
-
-            keys = [k for k in self.parent_view.cog.channel_models.keys() if isinstance(k, tuple) and k[1] == self.parent_view.parent_manage_view.user_id]
-            for k in keys:
-                self.parent_view.cog.channel_models.pop(k, None)
-
-            new_embed = await self.parent_view.cog.profile_manager._build_profile_manage_embed(
-                interaction, self.parent_view.parent_manage_view.profile_name,
-                target_user_id=self.parent_view.parent_manage_view.user_id)
-            await self.parent_view.parent_manage_view.original_interaction.edit_original_response(embed=new_embed, view=self.parent_view.parent_manage_view)
-            await interaction.response.edit_message(content=f"✅ Timezone set to **{canonical_tz}**.", view=None)
-        else:
-            self.parent_view.selected_tz = canonical_tz
-            await self.parent_view.refresh(interaction)
-
-# Alias for backward compatibility
-BulkTimezoneModal = CustomTimezoneModal
 
 class BulkTimezoneView(_BulkSubView):
     """Timezone picker, as a staging step.
@@ -3846,7 +3755,6 @@ class BulkTimezoneView(_BulkSubView):
         super().__init__(wizard)
         self.selected_tz = self.session.config.get("timezone")
         self.tz_page = 0
-        self.tz_total_pages = (len(EXTENSIVE_TIMEZONES) - 1) // 20 + 1
         self._build_view()
 
     def embed(self) -> discord.Embed:
@@ -3867,16 +3775,17 @@ class BulkTimezoneView(_BulkSubView):
         self.clear_items()
         options = build_timezone_options(self.tz_page, self.selected_tz)
 
-        select = ui.Select(placeholder=f"Choose a timezone ({PARTITION_NAMES[self.tz_page]})...",
-                           options=options, row=0)
-        select.callback = self.tz_callback
-        self.add_item(select)
+        add_select(self, options, self.tz_callback,
+                   placeholder=f"Choose a timezone ({PARTITION_NAMES[self.tz_page]})...", row=0)
 
         self._add_back(1)
-        stage = ui.Button(label="Stage Timezone", style=discord.ButtonStyle.success, row=1,
-                          disabled=not self.selected_tz)
-        stage.callback = self._stage_callback
-        self.add_item(stage)
+        add_button(self, "Stage Timezone", self._stage_callback,
+                   style=discord.ButtonStyle.success, row=1, disabled=not self.selected_tz)
+
+    async def apply(self, interaction: discord.Interaction, canonical_tz: str):
+        """Stages rather than writes -- the wizard's Apply is what commits."""
+        self.selected_tz = canonical_tz
+        await self.refresh(interaction)
 
     async def tz_callback(self, interaction: discord.Interaction):
         val = interaction.data['values'][0]
@@ -3888,8 +3797,7 @@ class BulkTimezoneView(_BulkSubView):
             await self.refresh(interaction)
             return
         _, canonical = _resolve_zoneinfo(val)
-        self.selected_tz = canonical
-        await self.refresh(interaction)
+        await self.apply(interaction, canonical)
 
     async def _stage_callback(self, interaction: discord.Interaction):
         if not self.selected_tz:
@@ -4043,15 +3951,13 @@ class BulkResetView(_BulkSubView):
                                  description="Applies to every selected profile.",
                                  default=(self.reset_choice == "reset_ltm")),
         ]
-        select = ui.Select(placeholder="Choose what to reset...", options=options, row=0)
-        select.callback = self.reset_type_callback
-        self.add_item(select)
+        add_select(self, options, self.reset_type_callback, placeholder="Choose what to reset...",
+                   row=0)
 
         self._add_back(1)
-        confirm = ui.Button(label="Confirm & Reset Data", style=discord.ButtonStyle.danger,
-                            row=1, disabled=(not self.reset_choice or not self._targets()))
-        confirm.callback = self.apply_action
-        self.add_item(confirm)
+        add_button(self, "Confirm & Reset Data", self.apply_action,
+                   style=discord.ButtonStyle.danger, row=1,
+                   disabled=not self.reset_choice or not self._targets())
 
     async def reset_type_callback(self, interaction: discord.Interaction):
         self.reset_choice = interaction.data['values'][0]
@@ -4103,10 +4009,9 @@ class BulkDeleteView(_BulkSubView):
     def _build_view(self):
         self.clear_items()
         self._add_back(0)
-        confirm = ui.Button(label="Confirm & Delete", style=discord.ButtonStyle.danger, row=0,
-                            disabled=not self.wizard.selected_profiles)
-        confirm.callback = self.confirm_delete_callback
-        self.add_item(confirm)
+        add_button(self, "Confirm & Delete", self.confirm_delete_callback,
+                   style=discord.ButtonStyle.danger, row=0,
+                   disabled=not self.wizard.selected_profiles)
 
     async def confirm_delete_callback(self, interaction: discord.Interaction):
         await interaction.response.defer()
@@ -4232,9 +4137,8 @@ def ProfileNeuroModal(cog, profile_name: str, current_params: Dict[str, Any], is
         
         nstate = {}
         for k in ["dopamine", "cortisol", "oxytocin", "adrenaline"]:
-            val = _pi(v[k])
+            val = _ranged(v, k, 0, 100, k.title(), _pi).get(k)
             if val is not None:
-                if not (0 <= val <= 100): raise ValueError(f"{k} out of range")
                 nstate[k] = val
         if nstate: c["neuro_state"] = nstate
         return {"config": c}
@@ -4665,17 +4569,13 @@ class BulkManageView(BaseBulkProfileView):
 
     def _build_targets_step(self):
         self._build_profile_select_ui(row=0)  # occupies rows 0 and 1
-        back = ui.Button(label="◀ Scope", style=discord.ButtonStyle.secondary, row=2)
-        back.callback = self._nav("scope", clear_changes=True)
-        self.add_item(back)
-        copy = ui.Button(label="Copy From Profile ▶", style=discord.ButtonStyle.secondary,
-                         row=2, disabled=len(self.selected_profiles) < 2)
-        copy.callback = self._nav("anchor")
-        self.add_item(copy)
-        nxt = ui.Button(label="Choose Actions ▶", style=discord.ButtonStyle.primary, row=2,
-                        disabled=not self.selected_profiles)
-        nxt.callback = self._nav("actions")
-        self.add_item(nxt)
+        add_button(self, "◀ Scope", self._nav("scope", clear_changes=True),
+                   style=discord.ButtonStyle.secondary, row=2)
+        add_button(self, "Copy From Profile ▶", self._nav("anchor"),
+                   style=discord.ButtonStyle.secondary, row=2,
+                   disabled=len(self.selected_profiles) < 2)
+        add_button(self, "Choose Actions ▶", self._nav("actions"),
+                   style=discord.ButtonStyle.primary, row=2, disabled=not self.selected_profiles)
         self._add_cancel(2)
 
     def _build_anchor_step(self):
@@ -4687,9 +4587,8 @@ class BulkManageView(BaseBulkProfileView):
 
         options = [discord.SelectOption(label=n[:100], value=n, default=(n == self._anchor))
                    for n in names[start:start + per_page]]
-        select = ui.Select(placeholder="Choose the profile to copy from…", options=options, row=0)
-        select.callback = self._anchor_callback
-        self.add_item(select)
+        add_select(self, options, self._anchor_callback,
+                   placeholder="Choose the profile to copy from…", row=0)
 
         async def prev_cb(i: discord.Interaction):
             self._anchor_page -= 1
@@ -4701,10 +4600,17 @@ class BulkManageView(BaseBulkProfileView):
 
         build_pagination_controls(self, self._anchor_page, pages, 1, prev_cb, next_cb)
 
-        back = ui.Button(label="◀ Profiles", style=discord.ButtonStyle.secondary, row=2)
-        back.callback = self._nav("targets")
-        self.add_item(back)
+        add_button(self, "◀ Profiles", self._nav("targets"), style=discord.ButtonStyle.secondary,
+                   row=2)
         self._add_cancel(2)
+
+    def _add_tab_row(self, tabs, row: int = 1):
+        """The wizard's own tab strip: Inherit and Actions both draw it."""
+        for tab in tabs:
+            add_button(self, tab.title(), self._pick_tab(tab), row=row,
+                       disabled=(tab == self.current_tab),
+                       style=(discord.ButtonStyle.primary if tab == self.current_tab
+                              else discord.ButtonStyle.secondary))
 
     def _build_inherit_step(self):
         tabs = self._inherit_tabs()
@@ -4723,28 +4629,16 @@ class BulkManageView(BaseBulkProfileView):
                     label=label[:100], value=action.value,
                     description=f"{found} setting{'' if found == 1 else 's'} to copy",
                     default=(action.value in self._inherit_picks)))
-            select = ui.Select(
-                placeholder=f"Choose {self.current_tab.title()} settings to inherit…",
-                options=options, row=0, min_values=0, max_values=len(options))
-            select.callback = self._inherit_callback
-            self.add_item(select)
+            add_select(self, options, self._inherit_callback,
+                       placeholder=f"Choose {self.current_tab.title()} settings to inherit…",
+                       min_values=0, max_values=len(options), row=0)
 
-        for tab in tabs:
-            btn = ui.Button(
-                label=tab.title(), row=1, disabled=(tab == self.current_tab),
-                style=(discord.ButtonStyle.primary if tab == self.current_tab
-                       else discord.ButtonStyle.secondary))
-            btn.callback = self._pick_tab(tab)
-            self.add_item(btn)
+        self._add_tab_row(tabs)
 
-        back = ui.Button(label="◀ Anchor", style=discord.ButtonStyle.secondary, row=2)
-        back.callback = self._nav("anchor")
-        self.add_item(back)
-        copy = ui.Button(label=f"Copy Selected ({len(self._inherit_picks)}) ▶",
-                         style=discord.ButtonStyle.primary, row=2,
-                         disabled=not self._inherit_picks)
-        copy.callback = self._copy_callback
-        self.add_item(copy)
+        add_button(self, "◀ Anchor", self._nav("anchor"), style=discord.ButtonStyle.secondary,
+                   row=2)
+        add_button(self, f"Copy Selected ({len(self._inherit_picks)}) ▶", self._copy_callback,
+                   style=discord.ButtonStyle.primary, row=2, disabled=not self._inherit_picks)
         self._add_cancel(2)
 
     def _build_actions_step(self):
@@ -4765,69 +4659,45 @@ class BulkManageView(BaseBulkProfileView):
                 label=label[:100], value=action.value,
                 description=(desc[:100] if desc else None)))
         if options:
-            select = ui.Select(placeholder=f"Choose a {self.current_tab.title()} action…",
-                               options=options, row=0)
-            select.callback = self._action_callback
-            self.add_item(select)
+            add_select(self, options, self._action_callback,
+                       placeholder=f"Choose a {self.current_tab.title()} action…", row=0)
 
-        for tab in tabs:
-            btn = ui.Button(
-                label=tab.title(), row=1, disabled=(tab == self.current_tab),
-                style=(discord.ButtonStyle.primary if tab == self.current_tab
-                       else discord.ButtonStyle.secondary))
-            btn.callback = self._pick_tab(tab)
-            self.add_item(btn)
+        self._add_tab_row(tabs)
 
-        back = ui.Button(label="◀ Profiles", style=discord.ButtonStyle.secondary, row=2)
-        back.callback = self._nav("targets")
-        self.add_item(back)
+        add_button(self, "◀ Profiles", self._nav("targets"), style=discord.ButtonStyle.secondary,
+                   row=2)
         if self.session.has_changes:
-            clear = ui.Button(label="Clear Staged", style=discord.ButtonStyle.secondary, row=2)
-            clear.callback = self._nav("actions", clear_changes=True)
-            self.add_item(clear)
-        review = ui.Button(label=f"Review & Apply ({len(self.session.staged)})",
-                           style=discord.ButtonStyle.success, row=2,
-                           disabled=not self.session.has_changes)
-        review.callback = self._nav("review")
-        self.add_item(review)
+            add_button(self, "Clear Staged", self._nav("actions", clear_changes=True),
+                       style=discord.ButtonStyle.secondary, row=2)
+        add_button(self, f"Review & Apply ({len(self.session.staged)})", self._nav("review"),
+                   style=discord.ButtonStyle.success, row=2, disabled=not self.session.has_changes)
         self._add_cancel(2)
 
     def _build_choice_step(self):
         for option in self._choice["options"]:
             option.default = (option.value == self._choice["chosen"])
-        select = ui.Select(placeholder=self._choice["placeholder"],
-                           options=self._choice["options"], row=0)
-        select.callback = self._choice_callback
-        self.add_item(select)
-        back = ui.Button(label="◀ Back", style=discord.ButtonStyle.secondary, row=1)
-        back.callback = self._nav("actions")
-        self.add_item(back)
+        add_select(self, self._choice["options"], self._choice_callback,
+                   placeholder=self._choice["placeholder"], row=0)
+        add_button(self, "◀ Back", self._nav("actions"), style=discord.ButtonStyle.secondary,
+                   row=1)
         self._add_cancel(1)
 
     def _build_review_step(self):
         destructive = bool(self._warnings())
-        apply_btn = ui.Button(
-            label="Overwrite & Apply" if destructive else "Apply",
-            style=discord.ButtonStyle.danger if destructive else discord.ButtonStyle.success,
-            row=0, disabled=not (self.session.has_changes and self.selected_profiles))
-        apply_btn.callback = self._apply_callback
-        self.add_item(apply_btn)
-        back = ui.Button(label="◀ Back", style=discord.ButtonStyle.secondary, row=0)
-        back.callback = self._nav("actions")
-        self.add_item(back)
+        add_button(self, "Overwrite & Apply" if destructive else "Apply", self._apply_callback,
+                   style=discord.ButtonStyle.danger if destructive else discord.ButtonStyle.success,
+                   row=0, disabled=not (self.session.has_changes and self.selected_profiles))
+        add_button(self, "◀ Back", self._nav("actions"), style=discord.ButtonStyle.secondary,
+                   row=0)
         self._add_cancel(0)
 
     def _add_cancel(self, row: int):
-        btn = ui.Button(label="Cancel", style=discord.ButtonStyle.secondary, row=row)
-
         async def callback(interaction: discord.Interaction):
             self.stop()
             await interaction.response.edit_message(
                 embed=discord.Embed(description="Cancelled. Nothing was changed.",
                                     colour=discord.Colour.greyple()), view=None)
-
-        btn.callback = callback
-        self.add_item(btn)
+        add_button(self, "Cancel", callback, style=discord.ButtonStyle.secondary, row=row)
 
     # --- Navigation --------------------------------------------------------
 
@@ -5077,9 +4947,8 @@ class ContentSafetyView(ui.View):
         verdict, rating = self._rating()
         pm = self.cog.profile_manager
 
-        back = ui.Button(label="← Back to Profile", style=discord.ButtonStyle.secondary, row=2)
-        back.callback = self.back_cb
-        self.add_item(back)
+        add_button(self, "← Back to Profile", self.back_cb, style=discord.ButtonStyle.secondary,
+                   row=2)
 
         # A borrowed profile is rated by whoever owns it. Showing the rating is
         # useful -- it explains the borrower's own gates -- but nothing here is
@@ -5095,15 +4964,12 @@ class ContentSafetyView(ui.View):
 
         if verdict == CONTENT_RATING_UNRATED or stalled or (
                 verdict == CONTENT_RATING_GENERAL and self.stale):
-            submit = ui.Button(label="Try Again" if stalled else "Submit for Rating",
-                               style=discord.ButtonStyle.success, row=0)
-            submit.callback = self.submit_cb
-            self.add_item(submit)
+            add_button(self, "Try Again" if stalled else "Submit for Rating", self.submit_cb,
+                       style=discord.ButtonStyle.success, row=0)
 
         if verdict == CONTENT_RATING_PENDING and not stalled:
-            recheck = ui.Button(label="Check for a Verdict", style=discord.ButtonStyle.primary, row=0)
-            recheck.callback = self.recheck_cb
-            self.add_item(recheck)
+            add_button(self, "Check for a Verdict", self.recheck_cb,
+                       style=discord.ButtonStyle.primary, row=0)
 
         # The declaration is withheld exactly where it has nothing to move: on a
         # published profile, while a classifier verdict stands, and on an exemption.
@@ -5115,27 +4981,21 @@ class ContentSafetyView(ui.View):
         if can_declare:
             label = "Withdraw 18+ Declaration" if declared else "Declare Adult 18+"
             style = discord.ButtonStyle.secondary if declared else discord.ButtonStyle.danger
-            btn = ui.Button(label=label, style=style, row=0)
-            btn.callback = self.declare_cb
-            self.add_item(btn)
+            add_button(self, label, self.declare_cb, style=style, row=0)
 
         if self.is_mod_view and self.is_bot_owner:
             exempt = verdict == CONTENT_RATING_EXEMPT
-            ex_btn = ui.Button(
-                label="Remove Exemption" if exempt else "Exempt From Classification",
-                style=discord.ButtonStyle.secondary if exempt else discord.ButtonStyle.primary,
-                row=1)
-            ex_btn.callback = self.exempt_cb
-            self.add_item(ex_btn)
+            add_button(self, "Remove Exemption" if exempt else "Exempt From Classification",
+                       self.exempt_cb,
+                       style=discord.ButtonStyle.secondary if exempt else discord.ButtonStyle.primary,
+                       row=1)
 
             if verdict == CONTENT_RATING_ADULT and not declared:
-                clear = ui.Button(label="Clear Adult Verdict", style=discord.ButtonStyle.danger, row=1)
-                clear.callback = self.clear_cb
-                self.add_item(clear)
+                add_button(self, "Clear Adult Verdict", self.clear_cb,
+                           style=discord.ButtonStyle.danger, row=1)
 
-            force = ui.Button(label="Force Re-classify", style=discord.ButtonStyle.secondary, row=1)
-            force.callback = self.force_cb
-            self.add_item(force)
+            add_button(self, "Force Re-classify", self.force_cb,
+                       style=discord.ButtonStyle.secondary, row=1)
 
     def get_embed(self) -> discord.Embed:
         pm = self.cog.profile_manager

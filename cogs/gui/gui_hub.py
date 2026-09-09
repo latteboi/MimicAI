@@ -5,10 +5,11 @@ from discord import ui
 import datetime
 import uuid
 import time
-import asyncio
 from typing import TYPE_CHECKING, Optional
 
-from .base_components import PageJumpModal, TimeoutCleanupMixin, build_pagination_controls, build_tab_nav_bar, compute_window_slice
+from .base_components import (PageJumpModal, TabbedView, add_button, add_select,
+                              build_pagination_controls, bulk_select_options,
+                              compute_window_slice, resolve_bulk_select)
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -101,73 +102,18 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
         if accepted_profiles:
             message += f"✅ **Successfully redeemed code!**\nBorrowed: {', '.join(accepted_profiles)}"
         if failed_profiles:
-            message += f"\n\n⚠️ **Issues:**\n" + "\n".join([f"`{p}`: {r}" for p, r in failed_profiles.items()])
+            message += "\n\n⚠️ **Issues:**\n" + "\n".join([f"`{p}`: {r}" for p, r in failed_profiles.items()])
         
         await interaction.followup.send(message, ephemeral=True)
 
-class HubBaseView(TimeoutCleanupMixin, ui.View):
-    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, current_tab: str):
-        super().__init__(timeout=600)
-        self.cog = cog
-        self.original_interaction = interaction
-        self.user_id = interaction.user.id
-        self.current_tab = current_tab
-        self._add_nav_buttons()
-
-    async def _turn_page(self, i: discord.Interaction, delta: int):
-        """Move the page cursor and repaint.
-
-        Four of this class's subclasses each carried a byte-identical copy of this pair,
-        differing only in the method names their buttons happened to be wired to.
-        """
-        self.current_page += delta
-        self.setup_items()
-        await i.response.defer()
-        await self.update_display()
-
-    async def prev_page(self, i: discord.Interaction):
-        await self._turn_page(i, -1)
-
-    async def next_page(self, i: discord.Interaction):
-        await self._turn_page(i, 1)
-
-    # HubPublicLibraryView wires its buttons to the *_cb spelling.
-    prev_page_cb = prev_page
-    next_page_cb = next_page
-
-    def _add_nav_buttons(self):
-        build_tab_nav_bar(self, self.current_tab, [
-            ("Home", "home", self.nav_home),
-            ("Public Library", "library", self.nav_library),
-            ("Incoming Shares", "incoming", self.nav_incoming),
-            ("Manage My Shares", "manage", self.nav_manage),
-            ("Profile Cloning", "cloning", self.nav_cloning),
-        ])
-
-    async def nav_home(self, i: discord.Interaction):
-        await i.response.defer()
-        view = HubHomeView(self.cog, self.original_interaction)
-        await view.update_display()
-
-    async def nav_library(self, i: discord.Interaction):
-        await i.response.defer()
-        view = HubPublicLibraryView(self.cog, self.original_interaction)
-        await view.update_display()
-
-    async def nav_incoming(self, i: discord.Interaction):
-        await i.response.defer()
-        view = HubIncomingView(self.cog, self.original_interaction)
-        await view.update_display()
-
-    async def nav_manage(self, i: discord.Interaction):
-        await i.response.defer()
-        view = HubShareManagerView(self.cog, self.original_interaction)
-        await view.update_display()
-
-    async def nav_cloning(self, i: discord.Interaction):
-        await i.response.defer()
-        view = HubCloningView(self.cog, self.original_interaction)
-        await view.update_display()
+class HubBaseView(TabbedView):
+    TABS = (
+        ("Home", "home", lambda v: HubHomeView(v.cog, v.original_interaction)),
+        ("Public Library", "library", lambda v: HubPublicLibraryView(v.cog, v.original_interaction)),
+        ("Incoming Shares", "incoming", lambda v: HubIncomingView(v.cog, v.original_interaction)),
+        ("Manage My Shares", "manage", lambda v: HubShareManagerView(v.cog, v.original_interaction)),
+        ("Profile Cloning", "cloning", lambda v: HubCloningView(v.cog, v.original_interaction)),
+    )
 
 class HubHomeView(HubBaseView):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):
@@ -222,9 +168,8 @@ class HubPublicLibraryView(HubBaseView):
             if item.row != 4: self.remove_item(item)
 
         if not self.filtered_list:
-            search_btn = ui.Button(label="Search / Sort", style=discord.ButtonStyle.secondary, row=1)
-            search_btn.callback = self.search_cb
-            self.add_item(search_btn)
+            add_button(self, "Search / Sort", self.search_cb, style=discord.ButtonStyle.secondary,
+                       row=1)
             return
 
         num_profiles = len(self.filtered_list)
@@ -246,9 +191,9 @@ class HubPublicLibraryView(HubBaseView):
             options.append(option)
 
         if options:
-            select = ui.Select(placeholder="Select a profile to view...", options=options, min_values=1, max_values=1, row=0)
-            select.callback = self.select_callback
-            self.add_item(select)
+            add_select(self, options, self.select_callback,
+                       placeholder="Select a profile to view...", min_values=1, max_values=1,
+                       row=0)
 
         build_pagination_controls(self, self.current_page, num_profiles, 1, self.prev_page_cb, self.next_page_cb, self.page_jump_cb)
         
@@ -406,9 +351,9 @@ class HubIncomingView(HubBaseView):
                 count = len(sharers[sid])
                 options.append(discord.SelectOption(label=f"{name} ({count} profiles)", value=str(sid), default=(sid == self.selected_sharer_id)))
 
-            select = ui.Select(placeholder="Select a user to review shares...", options=options, min_values=1, max_values=1, row=0)
-            select.callback = self.select_sharer
-            self.add_item(select)
+            add_select(self, options, self.select_sharer,
+                       placeholder="Select a user to review shares...", min_values=1,
+                       max_values=1, row=0)
 
         # Row 1: Pagination (if needed)
         build_pagination_controls(self, self.current_page, num_pages, 1, self.prev_page, self.next_page)
@@ -429,9 +374,8 @@ class HubIncomingView(HubBaseView):
             self.add_item(rej_btn)
             self.add_item(back_btn)
         else:
-            redeem_btn = ui.Button(label="Redeem Share Code", style=discord.ButtonStyle.secondary, row=action_row, emoji="🔑")
-            redeem_btn.callback = self.redeem_code_callback
-            self.add_item(redeem_btn)
+            add_button(self, "Redeem Share Code", self.redeem_code_callback,
+                       style=discord.ButtonStyle.secondary, row=action_row, emoji="🔑")
 
     async def update_display(self):
         shares = self.cog.profile_shares.get(str(self.user_id), [])
@@ -512,7 +456,7 @@ class HubIncomingView(HubBaseView):
         shares =[s for s in self.cog.profile_shares.get(str(self.user_id), []) if s['sharer_id'] == sharer_id]
         for s in shares:
             await self.cog.profile_manager._reject_share_request(self.original_interaction, sharer_id, s.get('original_pid'), s['profile_name'], notify_sharer=False)
-        await i.followup.send(f"Rejected shares.", ephemeral=True)
+        await i.followup.send("Rejected shares.", ephemeral=True)
         self.selected_sharer_id = None
         self.setup_items()
         await self.update_display()
@@ -543,19 +487,15 @@ class HubShareManagerView(HubBaseView):
         # Row 0: Mode
         style = discord.ButtonStyle.blurple if self.mode == "private" else discord.ButtonStyle.green
         label = "Mode: Private Sharing" if self.mode == "private" else "Mode: Public Publishing"
-        toggle_btn = ui.Button(label=label, style=style, row=0)
-        toggle_btn.callback = self.toggle_mode
-        self.add_item(toggle_btn)
+        add_button(self, label, self.toggle_mode, style=style, row=0)
 
         # Row 0, not beside the action buttons: in private mode row 2 already carries
         # the three pagination controls plus Send and Get Code, which is Discord's
         # five-per-row limit exactly. Sitting directly above the select reads as
         # belonging to it anyway.
         if self.selected_profiles:
-            clear_btn = ui.Button(label=f"Clear ({len(self.selected_profiles)})",
-                                  style=discord.ButtonStyle.secondary, row=0)
-            clear_btn.callback = self.clear_selection
-            self.add_item(clear_btn)
+            add_button(self, f"Clear ({len(self.selected_profiles)})", self.clear_selection,
+                       style=discord.ButtonStyle.secondary, row=0)
 
         # Row 1: Paginated Profiles.
         #
@@ -570,27 +510,19 @@ class HubShareManagerView(HubBaseView):
 
         options = []
         if page_profiles:
-            page_set = set(page_profiles)
-            page_selected = page_set.issubset(self.selected_profiles)
-            options.append(discord.SelectOption(
-                label="Unselect Page" if page_selected else "Select Page",
-                value="toggle_page", emoji="📄",
-                description="Toggle selection for every profile on this page."))
-
-            all_selected = set(self.personal_profiles).issubset(self.selected_profiles)
-            options.append(discord.SelectOption(
-                label="Unselect All" if all_selected else "Select All",
-                value="toggle_all", emoji="📚",
-                description="Toggle selection for every profile you own."))
+            options = bulk_select_options(
+                page_profiles, self.personal_profiles,
+                lambda p: p in self.selected_profiles,
+                page_description="Toggle selection for every profile on this page.",
+                all_description="Toggle selection for every profile you own.")
 
             for p in page_profiles:
                 options.append(discord.SelectOption(
                     label=p, value=p, default=(p in self.selected_profiles)))
 
         if options:
-            prof_sel = ui.Select(placeholder="Select profiles...", options=options, min_values=0, max_values=len(options), row=1)
-            prof_sel.callback = self.select_profiles
-            self.add_item(prof_sel)
+            add_select(self, options, self.select_profiles, placeholder="Select profiles...",
+                       min_values=0, max_values=len(options), row=1)
 
         # Row 2: Pagination Buttons (if needed) AND Action Buttons
         build_pagination_controls(self, self.current_page, num_pages, 2, self.prev_page, self.next_page)
@@ -603,9 +535,8 @@ class HubShareManagerView(HubBaseView):
             self.add_item(send_btn)
             self.add_item(code_btn)
         else:
-            apply_btn = ui.Button(label="Apply Changes", style=discord.ButtonStyle.green, row=2)
-            apply_btn.callback = self.apply_public
-            self.add_item(apply_btn)
+            add_button(self, "Apply Changes", self.apply_public, style=discord.ButtonStyle.green,
+                       row=2)
 
         # Row 3: User Select (Private)
         if self.mode == "private":
@@ -651,32 +582,11 @@ class HubShareManagerView(HubBaseView):
         await self.update_display()
 
     async def select_profiles(self, i: discord.Interaction):
-        vals = set(i.data.get('values', []))
         start = self.current_page * SHARE_PAGE_SIZE
-        page_profiles = set(self.personal_profiles[start : start + SHARE_PAGE_SIZE])
-        selected = set(self.selected_profiles)
-
-        # The sentinels are checked before the ordinary values, and short-circuit:
-        # picking "Select All" alongside three names is one gesture with one meaning,
-        # and applying both would leave a selection the user did not ask for.
-        if "toggle_page" in vals:
-            if page_profiles.issubset(selected):
-                selected -= page_profiles
-            else:
-                selected |= page_profiles
-        elif "toggle_all" in vals:
-            everything = set(self.personal_profiles)
-            if everything.issubset(selected):
-                selected -= everything
-            else:
-                selected |= everything
-        else:
-            # Only this page's membership is being restated; selections made on other
-            # pages are not in the payload and must survive.
-            selected -= page_profiles
-            selected |= vals
-
-        self.selected_profiles = sorted(selected)
+        self.selected_profiles = sorted(resolve_bulk_select(
+            i.data.get('values', []),
+            self.personal_profiles[start : start + SHARE_PAGE_SIZE],
+            self.personal_profiles, self.selected_profiles))
         self.setup_items()
         await i.response.defer()
         await self.update_display()
@@ -910,21 +820,19 @@ class HubCloningView(HubBaseView):
             options.append(discord.SelectOption(label=p, value=p, default=(p == self.selected_profile)))
         
         if options:
-            select = ui.Select(placeholder="Select a personal profile to clone...", options=options, row=0)
-            select.callback = self.select_profile_cb
-            self.add_item(select)
+            add_select(self, options, self.select_profile_cb,
+                       placeholder="Select a personal profile to clone...", row=0)
 
         build_pagination_controls(self, self.current_page, num_pages, 1, self.prev_page, self.next_page)
 
         action_row = 2 if num_pages > 1 else 1
         
-        btn_code = ui.Button(label="Generate Clone Code", style=discord.ButtonStyle.green, row=action_row, disabled=(not self.selected_profile))
-        btn_code.callback = self.generate_clone_code_cb
-        self.add_item(btn_code)
+        add_button(self, "Generate Clone Code", self.generate_clone_code_cb,
+                   style=discord.ButtonStyle.green, row=action_row,
+                   disabled=not self.selected_profile)
 
-        btn_redeem = ui.Button(label="Redeem Clone Code", style=discord.ButtonStyle.blurple, row=action_row)
-        btn_redeem.callback = self.redeem_clone_code_cb
-        self.add_item(btn_redeem)
+        add_button(self, "Redeem Clone Code", self.redeem_clone_code_cb,
+                   style=discord.ButtonStyle.blurple, row=action_row)
 
     async def update_display(self):
         embed = discord.Embed(title="Profile Cloning", description="Clone profiles to create independent copies. Cloned profiles will not copy memories or child bot configurations.", color=discord.Color.dark_purple())

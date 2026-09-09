@@ -13,7 +13,7 @@ from ...utils.constants import (
 )
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _format_history_entry, _resolve_safety_settings,
-    _scrub_response_text, is_citation_subtext, is_real_model,
+    _scrub_response_text, is_citation_subtext, is_real_model, record_billed_usage,
 )
 from ._shared import _strip_neuro_update_and_scrub
 
@@ -572,6 +572,7 @@ class RegenerationMixin:
                 "grounding_sources": regen_grounding_sources,
                 "ltms_recalled": []
             }
+            record_billed_usage(meta, response)
             if 'ltm_recall_text' in locals() and ltm_recall_text:
                 lines = ltm_recall_text.split('\n')
                 clean_lines = [l.strip() for l in lines if l.strip() and not l.startswith("<")]

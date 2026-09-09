@@ -13,7 +13,9 @@ if TYPE_CHECKING:
     from ..MimicCog import MimicCog
     from .gui_profiles import ProfileManageView
 
-from .base_components import BaseBulkProfileView, PageJumpModal, build_confirm_view, compute_window_slice
+from .base_components import (BaseBulkProfileView, PageJumpModal, add_button, add_select,
+                              build_confirm_view, build_pagination_controls,
+                              compute_window_slice)
 
 class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
     summary_field = ui.TextInput(label="Memory Summary", style=discord.TextStyle.paragraph, required=True, max_length=2000)
@@ -88,7 +90,7 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
         limit = defaultConfig.LIMIT_LTM
 
         if current_count >= limit:
-            msg = f"**Limit Reached.**\n"
+            msg = "**Limit Reached.**\n"
             msg += f"You have **{current_count}** memories (Limit: {limit}).\n"
             msg += "You cannot manually add more memories while at or above the limit. Please delete old memories first."
             await i.followup.send(msg, ephemeral=True)
@@ -148,7 +150,7 @@ class AddTrainingExampleModal(ui.Modal, title="Add Profile Training Example"):
         limit = defaultConfig.LIMIT_TRAINING
 
         if current_count >= limit:
-            msg = f"**Limit Reached.**\n"
+            msg = "**Limit Reached.**\n"
             msg += f"You have **{current_count}** training examples (Limit: {limit}).\n"
             msg += "You cannot add more examples. Please delete existing ones first."
             await i.followup.send(msg, ephemeral=True)
@@ -353,38 +355,29 @@ class DataManageView(ui.View):
 
         # Row 0: Navigation and Mode
         if not self.is_borrowed:
-            training_button = ui.Button(label="Training", style=discord.ButtonStyle.green if self.mode == 'training' else discord.ButtonStyle.grey, custom_id="mode_training", row=0)
-            training_button.callback = self.mode_button_callback
-            self.add_item(training_button)
+            add_button(self, "Training", self.mode_button_callback,
+                       style=discord.ButtonStyle.green if self.mode == 'training' else discord.ButtonStyle.grey,
+                       row=0, custom_id="mode_training")
 
-            ltm_button = ui.Button(label="LTMs", style=discord.ButtonStyle.green if self.mode == 'ltm' else discord.ButtonStyle.grey, custom_id="mode_ltm", row=0)
-            ltm_button.callback = self.mode_button_callback
-            self.add_item(ltm_button)
+            add_button(self, "LTMs", self.mode_button_callback,
+                       style=discord.ButtonStyle.green if self.mode == 'ltm' else discord.ButtonStyle.grey,
+                       row=0, custom_id="mode_ltm")
 
-        prev_button = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(self.current_page <= 1), row=0)
-        prev_button.callback = self.prev_page_callback
-        self.add_item(prev_button)
-
-        page_button = ui.Button(label=f"{self.current_page}/{self.max_pages}", style=discord.ButtonStyle.secondary, row=0)
-        page_button.callback = self.page_button_callback
-        self.add_item(page_button)
-
-        next_button = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(self.current_page >= self.max_pages), row=0)
-        next_button.callback = self.next_page_callback
-        self.add_item(next_button)
+        # `current_page` counts from 1 here and the builder's cursor is 0-based. A
+        # single page now renders no controls at all rather than three dead ones.
+        build_pagination_controls(self, self.current_page - 1, self.max_pages, 0,
+                                  self.prev_page_callback, self.next_page_callback,
+                                  self.page_button_callback)
 
         # [NEW] Move Analyse button to Row 1 (Only visible in training mode)
         if self.mode == 'training' and not self.is_borrowed:
-            analyse_button = ui.Button(label="Analyse", style=discord.ButtonStyle.blurple, row=1)
             async def analyse_cb(i): await i.response.send_modal(AnalyseExamplesModal(self))
-            analyse_button.callback = analyse_cb
-            self.add_item(analyse_button)
+            add_button(self, "Analyse", analyse_cb, style=discord.ButtonStyle.blurple, row=1)
 
         # Row 1: LTM Filter
         if self.mode == 'ltm' and ltm_filter_options:
-            ltm_filter_select = ui.Select(placeholder="Filter memories by server...", options=ltm_filter_options, row=1)
-            ltm_filter_select.callback = self.ltm_filter_callback
-            self.add_item(ltm_filter_select)
+            add_select(self, ltm_filter_options, self.ltm_filter_callback,
+                       placeholder="Filter memories by server...", row=1)
 
             # New sliding window logic
             start_slice_index, end_slice_index = compute_window_slice(self.current_page - 1, len(self.displayed_data_list))
@@ -409,26 +402,20 @@ class DataManageView(ui.View):
                 options.append(option)
 
             if options:
-                select = ui.Select(placeholder="Quick Navigation...", options=options, row=2)
-                select.callback = self.select_callback
-                self.add_item(select)
+                add_select(self, options, self.select_callback, placeholder="Quick Navigation...",
+                           row=2)
 
         # Row 3: Action Buttons
-        search_button = ui.Button(label="🔍 Search", style=discord.ButtonStyle.secondary, row=3)
-        search_button.callback = self.search_callback
-        self.add_item(search_button)
+        add_button(self, "🔍 Search", self.search_callback, style=discord.ButtonStyle.secondary,
+                   row=3)
 
-        add_button = ui.Button(label="Add New", style=discord.ButtonStyle.success, row=3)
-        add_button.callback = self.add_callback
-        self.add_item(add_button)
+        add_button(self, "Add New", self.add_callback, style=discord.ButtonStyle.success, row=3)
 
-        edit_button = ui.Button(label="Edit", style=discord.ButtonStyle.primary, row=3, disabled=(not page_items))
-        edit_button.callback = self.edit_callback
-        self.add_item(edit_button)
+        add_button(self, "Edit", self.edit_callback, style=discord.ButtonStyle.primary, row=3,
+                   disabled=not page_items)
 
-        delete_button = ui.Button(label="Delete", style=discord.ButtonStyle.danger, row=3, disabled=(not page_items))
-        delete_button.callback = self.delete_callback
-        self.add_item(delete_button)
+        add_button(self, "Delete", self.delete_callback, style=discord.ButtonStyle.danger, row=3,
+                   disabled=not page_items)
 
         delete_all_button = ui.Button(label="Delete All (Filtered)", style=discord.ButtonStyle.danger, row=3, disabled=True)
         if self.mode == 'ltm' and self.ltm_filter and self.ltm_filter.startswith("server_") and self.displayed_data_list:
@@ -437,14 +424,13 @@ class DataManageView(ui.View):
         self.add_item(delete_all_button)
 
         if self.parent_manage_view:
-            back_button = ui.Button(label="Back to Dashboard", style=discord.ButtonStyle.secondary, emoji="⬅️", row=4)
             async def back_callback(i: discord.Interaction):
                 await i.response.defer()
                 embed = await self.cog.profile_manager._build_profile_manage_embed(self.original_interaction, self.profile_name, target_user_id=self.parent_manage_view.user_id)
                 self.parent_manage_view._build_view()
                 await self.original_interaction.edit_original_response(embed=embed, view=self.parent_manage_view)
-            back_button.callback = back_callback
-            self.add_item(back_button)
+            add_button(self, "Back to Dashboard", back_callback,
+                       style=discord.ButtonStyle.secondary, row=4, emoji="⬅️")
 
     async def delete_all_callback(self, interaction: discord.Interaction):
         if not (self.mode == 'ltm' and self.ltm_filter and self.ltm_filter.startswith("server_")):
@@ -700,23 +686,15 @@ class BulkExportView(BaseBulkProfileView):
             discord.SelectOption(label="Training Examples", value="training", description="Optional. Include training input/output style examples.", default="training" in self.export_filters)
         ]
         
-        filter_select = ui.Select(
-            placeholder="Optional. Select additional memories to export...",
-            min_values=1,
-            max_values=len(filter_options),
-            options=filter_options,
-            row=2
-        )
-        filter_select.callback = self.filter_callback
-        self.add_item(filter_select)
+        add_select(self, filter_options, self.filter_callback,
+                   placeholder="Optional. Select additional memories to export...", min_values=1,
+                   max_values=len(filter_options), row=2)
 
-        export_master_btn = ui.Button(label="Standard Export", style=discord.ButtonStyle.primary, row=3)
-        export_master_btn.callback = self.export_master_callback
-        self.add_item(export_master_btn)
+        add_button(self, "Standard Export", self.export_master_callback,
+                   style=discord.ButtonStyle.primary, row=3)
 
-        export_selfhost_btn = ui.Button(label="Export for Self-Hosted", style=discord.ButtonStyle.secondary, row=3)
-        export_selfhost_btn.callback = self.export_selfhost_callback
-        self.add_item(export_selfhost_btn)
+        add_button(self, "Export for Self-Hosted", self.export_selfhost_callback,
+                   style=discord.ButtonStyle.secondary, row=3)
 
     async def filter_callback(self, interaction: discord.Interaction):
         self.export_filters = set(interaction.data['values'])

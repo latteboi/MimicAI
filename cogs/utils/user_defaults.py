@@ -258,6 +258,7 @@ SETTING_LABELS = {
     "speech_tts_enabled": "Text-to-Speech",
     "speech_temperature": "Speech Temperature",
     "show_fallback_indicator": "Fallback Indicator",
+    "openrouter_service_tier": "OpenRouter Service Tier",
     "child_bot_placeholder": "Child Bot Placeholder",
     "ollama_host_url": "Ollama Host URL",
 }

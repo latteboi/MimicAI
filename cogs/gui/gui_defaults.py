@@ -23,8 +23,8 @@ import discord
 from discord import ui
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from ..utils.constants import (TYPING_CURSOR_MODES, TYPING_CURSOR_NOTES,
-                               DEFAULT_TYPING_CURSOR)
+from ..utils.constants import TYPING_CURSOR_MODES, TYPING_CURSOR_NOTES
+from .base_components import add_button
 from ..utils.user_defaults import defaultable_keys, model_slot_labels
 from .gui_profiles import ModelPickerMixin
 from .gui_settings import SettingsBaseView
@@ -177,6 +177,26 @@ class SettingsDefaultsView(ModelPickerMixin, SettingsBaseView):
     def _ollama_host_url(self) -> Optional[str]:
         return self.defaults.get("ollama_host_url")
 
+    #: This screen's fourth state is an absent default, not a pending one.
+    _TIER_UNSET_WORDING = "Platform default"
+
+    def _tier_cycle(self) -> tuple:
+        return (None, "", "flex", "priority")
+
+    def _current_service_tier(self):
+        return self.defaults.get("openrouter_service_tier")
+
+    def _set_service_tier(self, value):
+        """`None` clears rather than stores, the same rule every other row here follows.
+
+        A stored None would count towards "n of m settings customised" and would be
+        written onto new profiles as a null, which is not what "I never chose" means.
+        """
+        if value is None:
+            self._clear("openrouter_service_tier")
+        else:
+            self._save_changes("openrouter_service_tier", value)
+
     def _get_selection_feedback_message(self) -> str:
         """Unused -- this view renders an embed -- but named by the mixin."""
         return ""
@@ -233,6 +253,11 @@ class SettingsDefaultsView(ModelPickerMixin, SettingsBaseView):
             if self.view_mode == "ollama":
                 e.add_field(name="Ollama Host",
                             value=self._show(self.defaults.get("ollama_host_url")), inline=True)
+            if self.view_mode == "openrouter":
+                tier = self.defaults.get("openrouter_service_tier")
+                e.add_field(name="Service Tier",
+                            value=("`Platform default`" if tier is None
+                                   else f"`{self.tier_wording(tier)[1]}`"), inline=True)
 
         if self.defaults:
             e.set_footer(text=f"{len(self.defaults)} of {total} settings customised")
@@ -321,8 +346,6 @@ class SettingsDefaultsView(ModelPickerMixin, SettingsBaseView):
                      else f"{wording}: {'ON' if state else 'OFF'}")
             style = (discord.ButtonStyle.secondary if state is None
                      else (discord.ButtonStyle.success if state else discord.ButtonStyle.danger))
-            btn = ui.Button(label=label, style=style, row=3)
-
             async def toggle(interaction: discord.Interaction, k=key, s=state):
                 # Tri-state, matching the bulk picker's fallback indicator: a default
                 # has to be removable, not just flippable, or "off" and "I never chose"
@@ -335,17 +358,12 @@ class SettingsDefaultsView(ModelPickerMixin, SettingsBaseView):
                     self._clear(k)
                 self._build_view()
                 await interaction.response.edit_message(**self._picker_render())
-
-            btn.callback = toggle
-            self.add_item(btn)
-
-        numbers = ui.Button(label="Memory & Timezone…", style=discord.ButtonStyle.primary, row=3)
+            add_button(self, label, toggle, style=style, row=3)
 
         async def open_numbers(interaction: discord.Interaction):
             await interaction.response.send_modal(DefaultsNumbersModal(self))
-
-        numbers.callback = open_numbers
-        self.add_item(numbers)
+        add_button(self, "Memory & Timezone…", open_numbers, style=discord.ButtonStyle.primary,
+                   row=3)
 
     async def update_display(self):
         await self.original_interaction.edit_original_response(**self._picker_render())

@@ -6,7 +6,7 @@ import datetime
 import httpx
 import orjson as json
 from collections import OrderedDict
-from typing import get_args, Any, List, Optional, Tuple
+from typing import get_args, Any, Dict, List, Optional, Tuple
 from discord.ext import tasks
 
 from ..utils.constants import (
@@ -19,7 +19,8 @@ from ..utils.constants import (
 from ..utils.blob_stream import InlineBlobExtractor, is_blob_sentinel, sentinel_path
 from ..utils.helpers import (_resolve_safety_settings, is_real_model,
                             google_thinking_caps, resolve_media_resolution,
-                            resolve_openrouter_image_detail, resolve_thinking_params)
+                            resolve_openrouter_image_detail, resolve_openrouter_service_tier,
+                            resolve_thinking_params)
 from ..utils.http_client import get_shared_client
 from ..utils.net_guard import safe_stream
 from ..utils.memory_tuning import maybe_trim_malloc
@@ -95,7 +96,7 @@ def _ollama_think_value(thinking_params: dict):
 
 class OpenRouterModel:
     def __init__(self, model_name, api_key, system_instruction=None, thinking_params=None,
-                 image_detail=None, **kwargs):
+                 image_detail=None, service_tier=None, **kwargs):
         self.model_name = model_name.replace("OPENROUTER/", "").replace("GOOGLE/", "")
         self.api_key = api_key
         self.system_instruction = system_instruction
@@ -104,6 +105,9 @@ class OpenRouterModel:
         #: OpenAI-compatible per-part `detail` hint, "low" or "high". None means send
         #: nothing and let the route decide, which is what this adapter always did.
         self.image_detail = image_detail
+        #: "flex", "priority" or None. Resolved once in `_instantiate_model` from the
+        #: profile, so every OpenRouter slot the profile uses asks for the same tier.
+        self.service_tier = service_tier
 
     async def generate_content_async(self, contents, generation_config=None, safety_settings=None, stream_state=None):
         messages = []
@@ -216,6 +220,12 @@ class OpenRouterModel:
             elif level != "none":
                 payload["reasoning"]["effort"] = level
 
+        # Set before the advanced splice, so an operator who puts `service_tier` in
+        # the advanced params still wins over the picker rather than being overwritten
+        # by it -- the same precedence every other key in that dict already has.
+        if self.service_tier:
+            payload["service_tier"] = self.service_tier
+
         if advanced:
             payload.update(advanced)
 
@@ -252,12 +262,20 @@ class OpenRouterModel:
             usage_obj = data.get('usage', {})
 
             class OpenRouterThoughtResponse:
-                def __init__(self, content, reasoning, finish_reason, input_toks, output_toks):
+                def __init__(self, content, reasoning, finish_reason, input_toks, output_toks,
+                             billed_cost=None, served_tier=None):
                     self.text = content
                     self.thought = reasoning or ""
                     self.input_tokens = input_toks
                     self.output_tokens = output_toks
                     self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
+                    #: What OpenRouter says it charged, and which tier served it. The
+                    #: gateway returns both unasked. Kept as None when absent rather
+                    #: than defaulted to 0.0, because a turn that reported no cost and
+                    #: a turn that genuinely cost nothing are different facts and
+                    #: `/session audit` labels them differently.
+                    self.billed_cost = billed_cost
+                    self.service_tier = served_tier
 
                     mock_part = type('obj', (object,), {'text': content})
                     mock_content = type('obj', (object,), {'parts': [mock_part]})
@@ -274,7 +292,9 @@ class OpenRouterModel:
                 msg_obj.get('reasoning', ''),
                 (choice.get('finish_reason') or 'STOP').upper(),
                 usage_obj.get('prompt_tokens', 0),
-                usage_obj.get('completion_tokens', 0)
+                usage_obj.get('completion_tokens', 0),
+                usage_obj.get('cost'),
+                data.get('service_tier'),
             )
         except httpx.RequestError as e:
             raise Exception(f"OpenRouter Network Error: {str(e)}")
@@ -1829,11 +1849,12 @@ class APIService:
         # it needs is already in hand.
         media_res = resolve_media_resolution(p_settings)
         image_detail = resolve_openrouter_image_detail(p_settings)
+        service_tier = resolve_openrouter_service_tier(p_settings)
 
         if is_openrouter:
             api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id, "openrouter") if guild_id else self.cog.storage_manager._get_api_key_for_user(user_id, "openrouter")
             if not api_key: raise ValueError(openrouter_key_error or "OpenRouter API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
-            model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params, image_detail=image_detail)
+            model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params, image_detail=image_detail, service_tier=service_tier)
             return _with_key_cooldown_tracking(self.cog, model, api_key)
         elif is_ollama:
             ollama_host = p_settings.get("ollama_host_url", OLLAMA_LOCAL_URL)
@@ -2204,3 +2225,19 @@ class APIService:
         cost_input = (input_tokens / 1000000) * input_rate
         cost_output = (output_tokens / 1000000) * output_rate
         return cost_input + cost_output
+
+    def turn_cost(self, meta: Dict[str, Any]) -> Tuple[float, bool]:
+        """One recorded turn's cost, and whether the provider billed it or we guessed.
+
+        The rate table is keyed on a listed model id at standard rates, so it cannot
+        price a flex or priority route, a `:floor`/`:nitro` variant (neither is a listed
+        id, so the lookup misses entirely and reports zero), or a cached-prompt rebate.
+        OpenRouter returns what it actually charged; when that is on the turn it is the
+        answer, and the estimate is only for turns from providers that report none.
+        """
+        billed = meta.get("cost")
+        if isinstance(billed, (int, float)) and not isinstance(billed, bool):
+            return float(billed), True
+        return self._calculate_turn_cost(meta.get("model", "") or "",
+                                         meta.get("input_tokens", 0) or 0,
+                                         meta.get("output_tokens", 0) or 0), False

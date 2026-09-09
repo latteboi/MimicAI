@@ -368,6 +368,23 @@ GOOGLE_ONLY_MODEL_KEYS = IMAGE_MODEL_KEYS | AUDIO_MODEL_KEYS | frozenset({
     'grounding_rag_model', 'grounding_rag_fallback_model',
 })
 
+#: OpenRouter's service tiers, as (stored value, wording, description). The empty
+#: string is the default tier and is what every profile had before this existed, so
+#: absent and "" have to mean the same thing wherever this is read.
+#:
+#: Safe to set once for a whole profile, which is why it is not per slot: a model whose
+#: pool holds no endpoint at the requested tier routes normally at standard rates
+#: rather than failing. Only `provider.allow_fallbacks: false` turns that into an
+#: error, and nothing here sends a provider object.
+OPENROUTER_SERVICE_TIERS = (
+    ("", "Auto", "Let OpenRouter route. Standard rates."),
+    ("flex", "Flex", "Cheaper endpoints, slower, may report no capacity."),
+    ("priority", "Priority", "Faster endpoints, at a premium."),
+)
+
+#: The tiers that are actually sent. "" is absence, not a value.
+OPENROUTER_SERVICE_TIER_VALUES = frozenset(v for v, _l, _d in OPENROUTER_SERVICE_TIERS if v)
+
 #: The dropdown value meaning "do not retry on anything". Only the utility fallback
 #: slots offer it; the response fallback is what _instantiate_model retries onto when
 #: the primary will not construct, so it has to name a real model.

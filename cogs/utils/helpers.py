@@ -27,6 +27,7 @@ from .constants import (
     THINKING_LEVELS, THINKING_SLOT_KEYS, THINKING_SLOT_DEFAULTS,
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
     MEDIA_RESOLUTION_VALUES, MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL,
+    OPENROUTER_SERVICE_TIER_VALUES,
 )
 
 
@@ -811,6 +812,38 @@ def resolve_openrouter_image_detail(config: Optional[Dict[str, Any]]) -> Optiona
     actually read images.
     """
     return MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL.get(resolve_media_resolution(config))
+
+
+def resolve_openrouter_service_tier(config: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The profile's OpenRouter service tier, or None for "let OpenRouter route".
+
+    Validated rather than trusted: the value goes straight onto the wire as
+    `service_tier`, and an imported profile or a shard written before this existed can
+    carry anything at all. "" and absent both resolve to None, which is the tier the
+    adapter has always used.
+    """
+    value = str((config or {}).get("openrouter_service_tier") or "").lower()
+    return value if value in OPENROUTER_SERVICE_TIER_VALUES else None
+
+
+def record_billed_usage(meta: Dict[str, Any], response) -> None:
+    """Copy the provider's own cost and served tier onto a turn's `meta`.
+
+    Written by every path that records a turn, read by `/session audit`. Only
+    OpenRouter reports either: it returns what it actually charged, which is the one
+    figure that survives a flex discount, a `:floor` route or a cached-prompt rebate.
+    The rate table `_calculate_turn_cost` reads is keyed on the listed model id and
+    knows about none of them, so it is the estimate and this is the invoice.
+
+    Both keys stay absent when the provider sent nothing, so the audit can tell a
+    billed figure from an estimated one instead of showing 0.00 as if it were free.
+    """
+    cost = getattr(response, "billed_cost", None)
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        meta["cost"] = float(cost)
+    tier = getattr(response, "service_tier", None)
+    if tier:
+        meta["service_tier"] = str(tier)
 
 
 def resolve_typing_cursor(config: Optional[Dict[str, Any]], fallback_emoji: str) -> Tuple[str, str]:
