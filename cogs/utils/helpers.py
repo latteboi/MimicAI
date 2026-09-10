@@ -931,6 +931,60 @@ def is_real_model(name: Optional[str]) -> bool:
     return text.upper() != NO_FALLBACK
 
 
+def is_gateway_shutdown(exc: BaseException) -> bool:
+    """Whether this exception is aiohttp's "the gateway went away", not a real fault.
+
+    Every long-lived worker loop has to tell the two apart: on shutdown the session
+    closes under whatever was in flight, and a worker that treats that as an error
+    prints a traceback per iteration for as long as it takes the process to die. The
+    three workers each carried their own copy of this string test, so a fourth added
+    without it would look exactly like a crash loop on every restart.
+    """
+    return isinstance(exc, RuntimeError) and "Session is closed" in str(exc)
+
+
+def resolve_grounding_mode(config: Optional[Dict[str, Any]]) -> str:
+    """One of "off", "rag", "native" -- the only three values the rest of the code sees.
+
+    The setting has had three encodings: a bool, then "on"/"on+", then today's
+    RAG/NATIVE. Nothing normalises it on write, so all three are still on disk and
+    every reader has to fold them in. Doing that inline is what let two vocabularies
+    drift apart -- `child_bot_manager` and the image-grounding path tested
+    `in ("on", "on+")`, which no profile written since the rename matches, so a
+    profile set to RAG silently got no grounding at all on those paths.
+    """
+    raw = (config or {}).get("grounding_mode", "off")
+    if isinstance(raw, bool):
+        return "rag" if raw else "off"
+    if raw in ("on", "on+"):
+        return "rag"
+    return raw if raw in ("off", "rag", "native") else "off"
+
+
+def resolve_url_mode(config: Optional[Dict[str, Any]]) -> str:
+    """One of "off", "rag", "native", reading off the older `url_fetching_enabled`
+    flag when `url_mode` is absent entirely."""
+    config = config or {}
+    if "url_mode" not in config:
+        return "rag" if config.get("url_fetching_enabled", False) else "off"
+    raw = config.get("url_mode", "off")
+    return raw if raw in ("off", "rag", "native") else "off"
+
+
+def resolve_native_tools(config: Optional[Dict[str, Any]]) -> Optional[List[Dict]]:
+    """The `tools` list an instantiated model needs for native grounding/URL context.
+
+    Google-only by construction: the caller decides whether the slot routes to Google
+    before asking, because these declarations only exist there.
+    """
+    tools = []
+    if resolve_grounding_mode(config) == "native":
+        tools.append({"google_search": {}})
+    if resolve_url_mode(config) == "native":
+        tools.append({"url_context": {}})
+    return tools or None
+
+
 def resolve_critic_settings(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """The Anti-Repetition Critic's effective settings for one profile.
 

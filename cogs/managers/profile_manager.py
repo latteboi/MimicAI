@@ -39,8 +39,8 @@ from ..utils.constants import (
     CONTENT_RATING_EMOJI,
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
     IMAGE_GROUNDING_LABELS, )
-from ..utils.helpers import (is_real_model, resolve_critic_settings,
-                            resolve_image_output_params, resolve_image_tools)
+from ..utils.helpers import (is_real_model, resolve_critic_settings, resolve_grounding_mode,
+                            resolve_image_output_params, resolve_image_tools, resolve_url_mode)
 from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
@@ -3162,8 +3162,7 @@ class ProfileManager:
         realistic_typing = profile_data.get("realistic_typing_enabled", False)
         timezone_str = profile_data.get("timezone", "UTC")
         
-        grounding_mode = profile_data.get("grounding_mode", "off")
-        if isinstance(grounding_mode, bool): grounding_mode = "on" if grounding_mode else "off"
+        grounding_mode = resolve_grounding_mode(profile_data)
         grounding_display = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(grounding_mode, "OFF")
 
         stm_length = profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
@@ -3512,15 +3511,9 @@ class ProfileManager:
             img_gen += f" `{img_detail}`"
 
 
-        raw_ground_mode = config.get("grounding_mode", "off")
-        if isinstance(raw_ground_mode, bool): raw_ground_mode = "rag" if raw_ground_mode else "off"
-        elif raw_ground_mode in ["on", "on+"]: raw_ground_mode = "rag"
-        grounding_display = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(raw_ground_mode, "`OFF`")
-
-        raw_url_mode = config.get("url_mode", "off")
-        if "url_mode" not in config:
-            raw_url_mode = "rag" if config.get("url_fetching_enabled", False) else "off"
-        url_ctx = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(raw_url_mode, "`OFF`")
+        _MODE_DISPLAY = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}
+        grounding_display = _MODE_DISPLAY.get(resolve_grounding_mode(config), "`OFF`")
+        url_ctx = _MODE_DISPLAY.get(resolve_url_mode(config), "`OFF`")
 
         timezone = config.get("timezone", "UTC")
         typing = "**`ON`**" if config.get("realistic_typing_enabled", False) else "`OFF`"

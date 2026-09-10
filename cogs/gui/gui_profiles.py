@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional
 from ..utils.content import OLLAMA_GUIDE_TEXT
 from ..utils.helpers import (
     _pf, _pi, _ps, _pb, is_real_model, image_model_caps, resolve_critic_settings,
-    google_thinking_caps, resolve_thinking_params,
+    google_thinking_caps, resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
 )
 from ..utils.http_client import get_shared_client
 from ..utils.user_defaults import setting_label
@@ -510,30 +510,15 @@ def _flag(value) -> str:
     return _ON if value else _OFF
 
 
-def _mode_display(raw, *, legacy_true="rag") -> str:
-    """off/native/rag, coercing the two legacy encodings this setting has had.
-
-    grounding_mode was a bool before it was a string and briefly took "on"/"on+";
-    url_mode reads off the older url_fetching_enabled flag when it is absent.
-    """
-    if isinstance(raw, bool):
-        raw = legacy_true if raw else "off"
-    elif raw in ("on", "on+"):
-        raw = legacy_true
-    return {"off": _OFF, "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(raw, _OFF)
+def _mode_display(mode: str) -> str:
+    """Label for an already-resolved off/native/rag mode. The legacy encodings are
+    folded in by helpers.resolve_grounding_mode / resolve_url_mode, which every
+    reader of these two settings goes through."""
+    return {"off": _OFF, "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(mode, _OFF)
 
 
-def _grounding_mode(config) -> str:
-    raw = config.get("grounding_mode", "off")
-    if isinstance(raw, bool):
-        return "rag" if raw else "off"
-    return "rag" if raw in ("on", "on+") else raw
-
-
-def _url_mode(config) -> str:
-    if "url_mode" not in config:
-        return "rag" if config.get("url_fetching_enabled", False) else "off"
-    return config.get("url_mode", "off")
+_grounding_mode = resolve_grounding_mode
+_url_mode = resolve_url_mode
 
 
 
@@ -591,7 +576,7 @@ def _render_image_toggle(ctx):
 
 
 def _render_grounding(ctx):
-    return "Grounding (Web Search)", _mode_display(ctx["config"].get("grounding_mode", "off")), True
+    return "Grounding (Web Search)", _mode_display(_grounding_mode(ctx["config"])), True
 
 
 def _render_url(ctx):

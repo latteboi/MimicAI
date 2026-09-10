@@ -14,7 +14,7 @@ from ...utils.constants import (
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_history_entry,
     _get_user_hash, _resolve_safety_settings, _scrub_response_text, default_profile_avatar_url,
-    resolve_thinking_params,
+    resolve_grounding_mode, resolve_native_tools, resolve_thinking_params,
 )
 from ._shared import _strip_neuro_update_and_scrub
 
@@ -248,9 +248,7 @@ class GlobalChatMixin:
                     final_user_parts.append(f"<document_context>\n" + "\n".join(u_text) + "\n</document_context>")
 
             # [NEW] RAG Grounding for Global Chat
-            grounding_mode = profile_data.get('grounding_mode', 'off')
-            if isinstance(grounding_mode, bool): grounding_mode = "rag" if grounding_mode else "off"
-            elif grounding_mode in ["on", "on+"]: grounding_mode = "rag"
+            grounding_mode = resolve_grounding_mode(profile_data)
 
             global_rag_sources = []
             if grounding_mode == "rag":
@@ -372,21 +370,7 @@ class GlobalChatMixin:
                         # resolves as the fallback role.
                         t_params_f = resolve_thinking_params(p_data_f, "response", "fallback")
 
-                        grounding_mode_native = p_data_f.get("grounding_mode", "off")
-                        if isinstance(grounding_mode_native, bool): grounding_mode_native = "rag" if grounding_mode_native else "off"
-                        elif grounding_mode_native in ["on", "on+"]: grounding_mode_native = "rag"
-
-                        url_mode_native = p_data_f.get("url_mode", "off")
-                        if "url_mode" not in p_data_f:
-                            url_mode_native = "rag" if p_data_f.get("url_fetching_enabled", False) else "off"
-
-                        model_tools_list = []
-                        if grounding_mode_native == "native":
-                            model_tools_list.append({"google_search": {}})
-                        if url_mode_native == "native":
-                            model_tools_list.append({"url_context": {}})
-
-                        model_tools = model_tools_list if model_tools_list else None
+                        model_tools = resolve_native_tools(p_data_f)
 
                         # One factory call in place of three hand-rolled provider branches.
                         # Those branches also left the generation call below nested inside the

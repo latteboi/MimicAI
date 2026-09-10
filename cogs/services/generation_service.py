@@ -27,7 +27,9 @@ from ..utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt,
     _format_history_entry, _get_user_hash, _resolve_safety_settings, _scrub_response_text,
     _split_into_sentences_with_abbreviations, is_real_model, resolve_critic_settings,
-    record_billed_usage, resolve_thinking_params, resolve_typing_cursor,
+    is_gateway_shutdown, record_billed_usage, resolve_grounding_mode, resolve_native_tools,
+    resolve_thinking_params,
+    resolve_typing_cursor,
 )
 from ..utils import mem_probe
 from ..managers.session_manager import intern_turn
@@ -677,9 +679,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     g_is_borrowed = g_profile_name in g_index.get("borrowed", [])
                     g_profile_settings = self.cog.profile_manager._get_profile_config(g_owner_id, g_profile_name, g_is_borrowed) or {}
                     
-                    grounding_mode = g_profile_settings.get("grounding_mode", "off")
-                    if isinstance(grounding_mode, bool): grounding_mode = "rag" if grounding_mode else "off"
-                    elif grounding_mode in ["on", "on+"]: grounding_mode = "rag"
+                    grounding_mode = resolve_grounding_mode(g_profile_settings)
                     
                     grounding_mode_for_citator = grounding_mode
 
@@ -844,6 +844,17 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     # them with the *previous* participant's container -- or, on the first
                     # participant, with none at all (UnboundLocalError).
                     state_container = None
+                    # Same hazard, same fix, for the three the meta block reads. They are
+                    # assigned deep inside the generation try/except -- the gather at the
+                    # top of it, and the neuro extraction after the response lands -- so a
+                    # turn that raises before those points reaches the meta block with the
+                    # *previous* participant's values still bound. The `in locals()` guards
+                    # there only ever caught the first participant's UnboundLocalError;
+                    # from the second onwards they read True and recorded profile A's
+                    # recalls, training count and hormone vector onto profile B's turn.
+                    ltm_recall_text = None
+                    training_examples_list = []
+                    parsed_neuro_state = None
                     
                     # Resolve Real-time settings
                     p_owner_id = participant['owner_id']
@@ -1139,7 +1150,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         t_params_worker["thinking_persistence"] = p_settings.get("thinking_persistence", 10)
                         
                         # [NEW] Re-evaluate Tools for internal model reconstruction
-                        model_tools = self._resolve_native_tools(p_settings)
+                        model_tools = resolve_native_tools(p_settings)
 
                         # Provider resolution goes through APIService._instantiate_model, the one
                         # factory. The worker used to inline its own copy of the prefix parsing,
@@ -1588,17 +1599,17 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         "input_tokens": getattr(response, 'input_tokens', 0) if response else 0,
                         "output_tokens": getattr(response, 'output_tokens', 0) if response else 0,
                         "reasoning_tokens": getattr(response, 'reasoning_tokens', 0) if response else 0,
-                        "training_recalled": len(training_examples_list) if 'training_examples_list' in locals() and training_examples_list else 0,
-                        "grounding_sources":[s.get('uri') for s in turn_grounding_sources if isinstance(s, dict) and s.get('uri')] if 'turn_grounding_sources' in locals() and turn_grounding_sources else [],
+                        "training_recalled": len(training_examples_list) if training_examples_list else 0,
+                        "grounding_sources":[s.get('uri') for s in turn_grounding_sources if isinstance(s, dict) and s.get('uri')] if turn_grounding_sources else [],
                         "ltms_recalled":[]
                     }
                     record_billed_usage(meta, response)
-                    if 'ltm_recall_text' in locals() and ltm_recall_text:
+                    if ltm_recall_text:
                         lines = ltm_recall_text.split('\n')
                         clean_lines = [l.strip() for l in lines if l.strip() and not l.startswith("<")]
                         meta["ltms_recalled"] = [l[:100] + "..." if len(l) > 100 else l for l in clean_lines]
                         
-                    if 'parsed_neuro_state' in locals() and parsed_neuro_state:
+                    if parsed_neuro_state:
                         meta["neuro_state"] = parsed_neuro_state
 
                     # Anti-Repetition Critic. Recorded only when the critic was actually
@@ -2144,12 +2155,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
             except asyncio.CancelledError:
                 break
-            except RuntimeError as e:
-                if "Session is closed" in str(e):
-                    break
-                print(f"Error in multi-profile worker for channel {channel_id}: {e}")
-                traceback.print_exc()
             except Exception as e:
+                if is_gateway_shutdown(e):
+                    break
                 print(f"Error in multi-profile worker for channel {channel_id}: {e}")
                 traceback.print_exc()
             finally:

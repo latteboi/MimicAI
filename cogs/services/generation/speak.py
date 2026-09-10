@@ -11,7 +11,7 @@ from ...utils.constants import (
 )
 from ...utils.helpers import (
     _format_history_entry, _resolve_safety_settings, _scrub_response_text,
-    resolve_thinking_params,
+    resolve_native_tools, resolve_thinking_params,
 )
 from ...managers.session_manager import intern_turn
 
@@ -235,7 +235,7 @@ class SpeakAsMixin:
             return None, f"Could not build the character's prompt: {e}"
 
         safety_settings = _resolve_safety_settings(channel, p_settings)
-        tools = self._resolve_native_tools(p_settings)
+        tools = resolve_native_tools(p_settings)
 
         gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
         # Mutated in place by every attempt, so a fallback keeps ticking the card the

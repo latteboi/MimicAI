@@ -42,40 +42,28 @@ import asyncio
 import random
 import time
 import traceback
-from collections import deque, OrderedDict
-from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional
+from collections import OrderedDict
+from typing import Any, Dict, List, Optional
 
 import discord
 
 from ..utils.constants import (
     DEFAULT_GAME_CONTEXT, DEFAULT_GAME_FINALE_USER, DEFAULT_GAME_OPENING_LIVE,
     DEFAULT_GAME_OPENING_OVER, DEFAULT_GAME_REACTION_USER, GAME_BEAT_STALE_SECONDS,
-    GAME_CONTEXT_EVENTS_KEEP, GAME_EMBED_MIN_INTERVAL_SECONDS,
+    GAME_EMBED_MIN_INTERVAL_SECONDS,
     GAME_EPILOGUE_CACHE_MAX_SIZE, GAME_EPILOGUE_SECONDS, GAME_FINALE_MAX_WORDS,
-    GAME_FINALE_STALE_SECONDS, GAME_MAX_CONCURRENT, GAME_PANEL_PUSH_WINDOW_SECONDS,
-    GAME_REACTION_MAX_CALLS, GAME_REACTION_MAX_WORDS, GAME_TABLE_REPOST_MIN_SECONDS,
+    GAME_FINALE_STALE_SECONDS, GAME_MAX_CONCURRENT,
+    GAME_REACTION_MAX_WORDS, GAME_TABLE_REPOST_MIN_SECONDS,
     GAME_TURN_PACE_SECONDS, GAME_LAST_CALL_WORDS,
 )
 from .games import ledger as ledger_mod, neuro, policy, eights
-from .games._shared import Event, Ev, IllegalMove, speaker_for
+#: Re-exported: the dataclasses moved to games/table.py, but `from .game_service
+#: import Game, Lobby` is what gui_games and the channel listener already say.
+from .games.table import Game, Lobby, Panel, Seat
+from .games import narration, table_view
+from .games._shared import Event, Ev, IllegalMove
 from .games.neuro import PRESETS, Temperament
-from .games.eights import GameState, Move, RuleSet
-
-#: Colour swatches for the status embed. Wild shows the declared colour, so the black
-#: square only ever appears for the top card itself, never for `active_colour`.
-_SWATCH = {
-    eights.RED: "\U0001F7E5", eights.YELLOW: "\U0001F7E8",
-    eights.GREEN: "\U0001F7E9", eights.BLUE: "\U0001F7E6", eights.WILD: "⬛",
-}
-_EMBED_COLOUR = {
-    eights.RED: 0xC42F35, eights.YELLOW: 0xB77C05,
-    eights.GREEN: 0x217D47, eights.BLUE: 0x1F6DBE, eights.WILD: 0x2B2F36,
-}
-_LABEL = {
-    eights.SKIP: "Skip", eights.REVERSE: "Reverse", eights.DRAW_TWO: "Draw Two",
-    eights.WILD_PLAIN: "Wild", eights.DRAW_FOUR: "Wild Draw Four",
-}
+from .games.eights import RuleSet
 
 #: How often a human turn wakes to redraw. Short enough that the footer's countdown
 #: reads as a clock and a buried table comes back quickly, long enough that a
@@ -83,159 +71,8 @@ _LABEL = {
 TURN_TICK_SECONDS = 5.0
 
 
-def card_label(card) -> str:
-    colour, value = card
-    return f"{_SWATCH.get(colour, '')} {_LABEL.get(value, value)}".strip()
+card_label = table_view.card_label
 
-
-@dataclass
-class Panel:
-    """A seat's live private hand message, and the handle that can still edit it.
-
-    The handle is the *most recent* interaction on the panel, not the one that created
-    it. That distinction is the whole trick: a component click mints its own fifteen
-    minute token targeting the message the component sits on, so re-binding on every
-    click means anyone actually playing always has a live handle, while someone who
-    walked away quietly stops being pushable. Their next click revives it.
-    """
-
-    interaction: Any
-    stamped: float = field(default_factory=time.monotonic)
-
-    #: Everything the panel is *showing*, at the last render. `_refresh_open_panels`
-    #: compares it against the live one to tell a stale panel from a correct one.
-    #:
-    #: This used to be the hand size alone, and that was wrong in a way that looked
-    #: exactly like the panel silently dying: your cards do not change while other
-    #: people play, but the top card, the active colour, the pending-draw pile and
-    #: whose turn it is all do -- and so do the enabled/disabled states of every
-    #: control derived from them. A panel opened early would sit there showing a board
-    #: six moves out of date, refusing to refresh because the one thing it was watching
-    #: had not moved. None means "unknown, redraw me".
-    signature: Optional[tuple] = None
-
-    #: The live view object, so it can be stopped when the panel is replaced or the
-    #: game ends. Views here have no timeout -- a game outlives discord.py's default
-    #: 180 seconds many times over, and a timed-out view stops answering its own
-    #: buttons -- so the only thing that ever retires one is this.
-    view: Any = None
-
-    @property
-    def pushable(self) -> bool:
-        """Whether the bot can still edit this panel *unprompted*. A click can always
-        edit it regardless -- that path uses the click's own token, not this one."""
-        return (time.monotonic() - self.stamped) < GAME_PANEL_PUSH_WINDOW_SECONDS
-
-
-@dataclass
-class Seat:
-    """One place at the table, and how to speak as whoever is in it."""
-
-    seat_id: str
-    display: str
-    kind: str = "profile"                 # "profile" | "human"
-    owner_id: Optional[int] = None
-    profile_name: Optional[str] = None
-    method: str = "webhook"               # "webhook" | "child_bot"
-    bot_id: Optional[str] = None
-
-
-@dataclass
-class Lobby:
-    """A table that is forming but has not been dealt.
-
-    Separate from `Game` rather than a phase on it, because everything that reads
-    `cog.active_games` -- `has_live_game`, the channel listener's Last Card hook,
-    `context_block`, the finale -- would otherwise have to learn to ignore a game with
-    no `state`. A lobby has no rules engine behind it at all; it is a guest list.
-
-    `humans` is a dict for the ordering as much as the lookup: seats are dealt in the
-    order people sat down, and insertion order is what preserves that.
-    """
-
-    channel_id: int
-    guild_id: Optional[int]
-    host_id: int
-    rules: RuleSet
-    #: Total seats the host asked for, profiles included. None means "as many as fit".
-    seats_wanted: Optional[int]
-    humans: "OrderedDict[int, str]" = field(default_factory=OrderedDict)
-    #: Locked by default, mirroring a global chat session: until the host unlocks it,
-    #: nobody else can take a seat. The emoji on the button is the whole UI for this.
-    open: bool = False
-    message: Optional[discord.Message] = None
-
-    @property
-    def limit(self) -> int:
-        """Seats at this table, profiles included."""
-        return min(self.seats_wanted or self.rules.seats_max, self.rules.seats_max)
-
-
-@dataclass
-class Game:
-    kind: str
-    state: GameState
-    seats: List[Seat]
-    neuro: Dict[str, Dict[str, int]]
-    temperaments: Dict[str, Temperament]
-    channel_id: int
-    guild_id: Optional[int]
-    started_by: int
-    rng: random.Random
-    message_id: Optional[int] = None
-    task: Optional[asyncio.Task] = None
-    started_at: float = field(default_factory=time.monotonic)
-    lap: int = 0
-    turns: int = 0
-    log: List[Event] = field(default_factory=list)
-    stopping: bool = False
-    _last_render: float = 0.0
-
-    #: Set by a seat's controls when it submits a move; the run loop waits on it.
-    #: The turn timer is this wait's timeout rather than a separate task -- the game
-    #: already owns a task, and a `wait_for` deadline costs nothing extra.
-    turn_event: Optional[asyncio.Event] = None
-    pending_move: Optional["Move"] = None
-    deadline: Optional[float] = None
-
-    #: Plain-language descriptions of the last few things that happened, for the
-    #: `<game_context>` block. Bounded, and never written to `unified_log` -- the log
-    #: gets dialogue, this gets the bookkeeping.
-    recent: Deque[str] = field(default_factory=lambda: deque(maxlen=GAME_CONTEXT_EVENTS_KEEP))
-
-    #: One live hand panel per seat, keyed by seat_id. See `Panel`.
-    panels: Dict[str, Panel] = field(default_factory=dict)
-
-    #: Seats that have called Last Card and not yet spent it, keyed by seat_id. It lives on
-    #: the game rather than on the panel or the view because it is now armed from the
-    #: channel -- a player types "last card" and the next play carries it -- and because a
-    #: pushed refresh builds a fresh view, which would otherwise silently disarm
-    #: someone who armed it and was then made to pick up four cards.
-    last_call_armed: Dict[str, bool] = field(default_factory=dict)
-
-    #: Sticky-table bookkeeping. `resink_pending` is what stops a burst of dialogue
-    #: becoming a burst of reposts, and what stops the repost's own gateway echo
-    #: triggering another one.
-    message: Optional[discord.Message] = None
-    resink_pending: bool = False
-    _last_repost: float = 0.0
-
-    #: Serialises `_render`. Two tasks can now reach it -- the run loop and a resink
-    #: scheduled by `nudge_table` -- and a repost is a delete followed by a send with an
-    #: await in between. Without this, both could observe the table as buried, both
-    #: delete (the second harmlessly failing), and both post: two tables, one of them
-    #: orphaned with a live view attached.
-    render_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-    #: Running record of the sitting. Deliberately not LTM -- see `games/ledger.py`.
-    ledger: Optional["ledger_mod.Ledger"] = None
-
-    #: Model calls this game has spent, capped at GAME_REACTION_MAX_CALLS. Counted
-    #: rather than assumed -- `tests/test_game_dialogue.py` asserts on it.
-    generations: int = 0
-
-    def seat(self, seat_id: str) -> Optional[Seat]:
-        return next((s for s in self.seats if s.seat_id == seat_id), None)
 
 
 class GameService:
@@ -561,7 +398,7 @@ class GameService:
         game = self.cog.active_games.get(channel_id)
         if not game or game.stopping:
             return self._epilogue_block(channel_id)
-        table = self._describe_table(game)
+        table = narration.describe_table(game)
         over = game.state.phase != "playing"
         if over:
             winner = game.seat(game.state.winner) if game.state.winner else None
@@ -570,10 +407,10 @@ class GameService:
         return DEFAULT_GAME_CONTEXT.format(
             opening=DEFAULT_GAME_OPENING_OVER if over else DEFAULT_GAME_OPENING_LIVE,
             table=table,
-            cast=self._describe_cast(game),
-            ledger=self._describe_ledger(game),
+            cast=narration.describe_cast(game),
+            ledger=narration.describe_ledger(game),
             events="\n".join(f"- {line}" for line in game.recent) or "- Nothing yet.",
-            rules=self._describe_rules(game),
+            rules=narration.describe_rules(game),
         )
 
     def _epilogue_block(self, channel_id: int) -> Optional[str]:
@@ -591,21 +428,6 @@ class GameService:
 
     # ------------------------------------------------------------------ panels
 
-    def panel_signature(self, game: Game, seat_id: str) -> tuple:
-        """Everything a hand panel renders, as one comparable value.
-
-        Deliberately covers the *board* as well as the hand. A seat's cards are only
-        one of the things its panel shows -- the top card, the active colour, the
-        pending draw and whose turn it is are all on the embed, and every control's
-        enabled state is derived from them. Watching the hand alone is what let a panel
-        sit frozen on a six-move-old board.
-        """
-        state = game.state
-        seat_state = state.seat(seat_id)
-        hand = tuple(sorted(seat_state.hand)) if seat_state else ()
-        return (hand, state.top, state.active_colour, state.pending_draw,
-                state.current.seat_id if state.phase == "playing" else None,
-                state.phase, bool(game.last_call_armed.get(seat_id)))
 
     def bind_panel(self, game: Game, seat_id: str, interaction, view=None) -> None:
         """Re-point a seat's panel handle at the interaction that just touched it.
@@ -662,7 +484,7 @@ class GameService:
                 except Exception:
                     pass
             panel.view = view
-            panel.signature = self.panel_signature(game, seat_id)
+            panel.signature = table_view.panel_signature(game, seat_id)
         except Exception:
             # An expired or invalidated handle. Drop it rather than retrying every
             # turn for the rest of the game; the seat's next click rebinds a fresh one.
@@ -848,7 +670,7 @@ class GameService:
                         events,
                         {s.seat_id: len(s.hand) for s in game.state.seats},
                         {s.seat_id: s.display for s in game.seats})
-                game.recent.extend(self._describe_events(game, events))
+                game.recent.extend(narration.describe_events(game, events))
                 game.turns += 1
                 game.lap += 1
 
@@ -860,14 +682,14 @@ class GameService:
                     game.lap = 0
                     neuro.decay(game.neuro)
 
-                await self._render(game, force=self._is_dramatic(events))
+                await self._render(game, force=narration.is_dramatic(events))
                 await self._refresh_open_panels(game)
 
                 # The winning move is not reacted to here even though WENT_OUT is loud
                 # enough to qualify. The finale below covers it, and covers it better:
                 # one character crowing and then the same character crowing again in
                 # the aftermath round is the sort of seam nobody can unsee.
-                beat = (self._beat_for(game, events)
+                beat = (narration.beat_for(game, events)
                         if game.state.phase == "playing" else None)
                 if beat is not None:
                     try:
@@ -962,154 +784,14 @@ class GameService:
     #: Events loud enough that a character would actually say something. Everything
     #: else -- a plain number card, a colour change, a quiet draw -- passes in silence,
     #: which is what keeps a fifty-turn game to a handful of generations.
-    REACT_ON = frozenset({
-        Ev.HIT_BY_DRAW, Ev.CALL_MADE, Ev.CALL_MISSED, Ev.WENT_OUT, Ev.PENALTY,
-    })
 
-    def _describe_event(self, game: Game, event: Event) -> Optional[str]:
-        """One event in plain language, from public information only.
 
-        Returns None for the mechanical ones nobody would narrate -- a card being drawn
-        off the pile, a colour being declared. `<game_context>` is a short window and
-        should not spend it on bookkeeping.
-        """
-        actor = game.seat(event.seat_id) if event.seat_id else None
-        target = game.seat(event.target_id) if event.target_id else None
-        who = actor.display if actor else "someone"
-        whom = target.display if target else "the next player"
-        if event.kind == Ev.HIT_BY_DRAW:
-            return f"{whom} had to pick up {event.amount} cards."
-        if event.kind == Ev.CALL_MADE:
-            return f"{who} is down to one card and called Last Card."
-        if event.kind == Ev.CALL_MISSED:
-            return f"{who} reached one card but forgot to call Last Card."
-        if event.kind == Ev.PENALTY and event.amount:
-            return f"{who} was penalised {event.amount} cards."
-        if event.kind == Ev.SKIPPED:
-            return f"{who} skipped {whom}."
-        if event.kind == Ev.REVERSED:
-            return f"{who} reversed the order of play."
-        if event.kind == Ev.STACKED and event.card:
-            return (f"{who} played a {_LABEL.get(event.card[1], event.card[1])} on "
-                    f"{whom}; {event.amount} now pending.")
-        if event.kind == Ev.WENT_OUT:
-            return f"{who} played their last card and won."
-        if event.kind == Ev.TIMED_OUT:
-            return f"{who} ran out of time and was played for."
-        if event.kind == Ev.RESHUFFLED:
-            return "The draw pile ran out and was reshuffled."
-        return None
 
-    def _describe_events(self, game: Game, events: List[Event]) -> List[str]:
-        return [line for line in (self._describe_event(game, e) for e in events) if line]
 
-    def _reactor_for(self, game: Game, event: Event) -> Optional[Seat]:
-        """Whose line this is.
 
-        `speaker_for` gives the seat the event happened *to*, which is the interesting
-        one, and the actor is the fallback. A human seat is skipped at every step: the
-        bot does not get to put words in a player's mouth. It falls through to whoever
-        else was involved rather than dropping the beat, so landing a Draw Four on a
-        person still gets a reaction -- from the character who threw it, which is the
-        funnier half anyway. A beat with no profile on either end passes in silence.
-        """
-        for candidate in (speaker_for(event), event.seat_id, event.target_id):
-            if not candidate:
-                continue
-            seat = game.seat(candidate)
-            if seat is not None and seat.kind == "profile" and seat.owner_id:
-                return seat
-        return None
 
-    def _beat_for(self, game: Game, events: List[Event]):
-        """The `(seat, description)` this move earned a reaction for, or None.
 
-        Three gates, cheapest first: the per-game ceiling, then whether anything loud
-        actually happened, then whether there is a character available to say it.
-        """
-        if game.generations >= GAME_REACTION_MAX_CALLS:
-            return None
-        event = next((e for e in events if e.kind in self.REACT_ON), None)
-        if event is None:
-            return None
-        seat = self._reactor_for(game, event)
-        if seat is None:
-            return None
-        beat = self._describe_event(game, event)
-        return (seat, beat) if beat else None
 
-    def _describe_cast(self, game: Game) -> str:
-        counts = {s["seat_id"]: s["cards"] for s in eights.public_view(game.state)["seats"]}
-        rows = []
-        for seat in game.seats:
-            state = game.neuro.get(seat.seat_id, neuro.BASELINE)
-            rows.append(f"- {seat.display}: {counts.get(seat.seat_id, 0)} cards, "
-                        f"looks {neuro.describe(state)}")
-        return "\n".join(rows)
-
-    def _describe_ledger(self, game: Game) -> str:
-        """The sitting's record, for a character to draw a barbed line out of.
-
-        Every figure here was counted by the engine, so a character bringing one up is
-        citing a fact rather than inventing a plausible-sounding detail. It is also the
-        cheapest thing in the payload: counters, not a retrieval.
-        """
-        if not game.ledger:
-            return ""
-        return game.ledger.render({s.seat_id: s.display for s in game.seats})
-
-    def _describe_rules(self, game: Game) -> str:
-        """How this particular table runs, in plain language.
-
-        Read off the snapshotted `RuleSet` rather than written out once, so it is
-        always the rules actually in force. `house_rule_summary` answers a different
-        question -- what deviates from the default, for a footer that has to fit -- and
-        the deviations are the wrong half here: a character needs to know that drawing
-        gives it one card even when that is the default, because the alternative is
-        guessing at it out loud.
-        """
-        rules = game.state.rules
-        lines = [
-            f"- Everyone was dealt {rules.initial_hand} cards. Play passes around the "
-            "table; Skip, Reverse and the draw cards do what they say.",
-        ]
-        if rules.stack_draw_two and rules.stack_draw_four:
-            lines.append("- Draw Twos stack onto Draw Twos and Draw Fours onto Draw "
-                         "Fours, so a pile can build before someone picks it all up.")
-        elif rules.stack_draw_two:
-            lines.append("- Draw Twos stack onto Draw Twos, so a pile can build before "
-                         "someone picks it all up. Draw Fours do not stack.")
-        else:
-            lines.append("- Nothing stacks: a draw card is picked up by the next "
-                         "player straight away.")
-        lines.append(
-            "- A Wild Draw Four may only be played by someone with no card of the "
-            "active colour." if rules.strict_draw_four else
-            "- A Wild Draw Four may be played at any time; nobody is challenged on it.")
-        if rules.draw_to_match:
-            lines.append("- A player who cannot go keeps drawing until they can.")
-        elif rules.play_after_draw:
-            lines.append("- A player who cannot go draws one card, and may play that "
-                         "card immediately if it fits.")
-        else:
-            lines.append("- A player who cannot go draws one card and the turn passes.")
-        lines.append(
-            f"- Going down to one card without calling Last Card costs {rules.miss_penalty} "
-            "cards, applied the moment it happens." if rules.auto_call_penalty else
-            f"- Going down to one card without calling Last Card can be caught by anyone "
-            f"else, for {rules.miss_penalty} cards.")
-        lines.append(
-            f"- A person at this table has {rules.turn_seconds} seconds to move, and is "
-            "played for automatically if the clock beats them. You are not; your turns "
-            "are taken for you as soon as they come around.")
-        lines.append("- The game ends the moment somebody plays their last card.")
-        return "\n".join(lines)
-
-    def _describe_table(self, game: Game) -> str:
-        view = eights.public_view(game.state)
-        return (f"Top card: {card_label(view['top'])}. "
-                f"Active colour: {view['active_colour']}. "
-                f"Cards left in the pile: {view['draw_pile_size']}.")
 
     def _participant_for(self, session: Dict[str, Any], seat: Seat):
         """The seat's entry in the live session cast, by identity.
@@ -1191,22 +873,6 @@ class GameService:
         }, participant))
         self._ensure_worker(game.channel_id, session)
 
-    def _finale_beat(self, game: Game) -> Optional[str]:
-        """How the game ended, in one line, from public information only.
-
-        Returns None for a game with no winner -- an abandoned table has nothing to
-        toast, and the cast saying "well, that was that" about nothing is worse than
-        the silence it replaces.
-        """
-        winner = game.seat(game.state.winner) if game.state.winner else None
-        if winner is None:
-            return None
-        counts = {s["seat_id"]: s["cards"] for s in eights.public_view(game.state)["seats"]}
-        left = ", ".join(f"{s.display} on {counts.get(s.seat_id, 0)}"
-                         for s in game.seats if s.seat_id != winner.seat_id)
-        line = (f"{winner.display} played their last card and won it, "
-                f"after {game.turns} turns.")
-        return f"{line} Everyone else was still holding cards: {left}." if left else line
 
     async def _request_finale(self, game: Game) -> None:
         """Ask the channel for the aftermath: one round, the whole table speaking.
@@ -1232,7 +898,7 @@ class GameService:
         queue = session.get("task_queue")
         if queue is None:
             return
-        beat = self._finale_beat(game)
+        beat = narration.finale_beat(game)
         if not beat:
             return
 
@@ -1312,15 +978,9 @@ class GameService:
         if not game.panels:
             return
         for seat_id, panel in list(game.panels.items()):
-            if panel.signature != self.panel_signature(game, seat_id):
+            if panel.signature != table_view.panel_signature(game, seat_id):
                 await self.refresh_panel(game, seat_id)
 
-    @staticmethod
-    def _is_dramatic(events: List[Event]) -> bool:
-        """Whether this move deserves an immediate redraw rather than waiting for the
-        end of the lap."""
-        loud = {Ev.HIT_BY_DRAW, Ev.CALL_MADE, Ev.CALL_MISSED, Ev.WENT_OUT, Ev.GAME_OVER}
-        return any(e.kind in loud for e in events)
 
     # ------------------------------------------------------------------ rendering
 
@@ -1353,7 +1013,7 @@ class GameService:
     async def _draw(self, game: Game, channel, final: bool = False,
                     note: Optional[str] = None) -> None:
         """The body of `_render`, under the lock."""
-        embed = self.build_embed(game, final=final, note=note)
+        embed = table_view.build_embed(game, final=final, note=note)
         # The table carries one public button, and only when somebody could use it.
         # An all-profile table has no private hands to open.
         view = None
@@ -1409,72 +1069,7 @@ class GameService:
         finally:
             game.message, game.message_id = None, None
 
-    @staticmethod
-    def house_rule_summary(rules: RuleSet) -> str:
-        """The non-default rules in play, for the table footer.
+    #: Kept on the service because gui_games calls it there; the implementation
+    #: lives with the rest of the table rendering.
+    house_rule_summary = staticmethod(table_view.house_rule_summary)
 
-        Only the deviations: a table running the defaults says nothing, and everyone
-        can see at a glance what they actually agreed to when it is not.
-        """
-        default = RuleSet()
-        bits = []
-        if not rules.stack_draw_two: bits.append("no stacking")
-        if rules.stack_draw_four: bits.append("D4 stacks")
-        if rules.draw_to_match: bits.append("draw to match")
-        if rules.strict_draw_four: bits.append("strict D4")
-        if not rules.play_after_draw: bits.append("no play after draw")
-        if rules.turn_seconds != default.turn_seconds:
-            bits.append(f"{int(rules.turn_seconds)}s turns")
-        return " · ".join(bits)
-
-    def build_embed(self, game: Game, final: bool = False,
-                    note: Optional[str] = None) -> discord.Embed:
-        """The shared table view. Built from `public_view` only -- never a hand."""
-        view = eights.public_view(game.state)
-        colour = _EMBED_COLOUR.get(view["active_colour"], 0x2B2F36)
-
-        if final:
-            winner_id = view["winner"]
-            winner = game.seat(winner_id) if winner_id else None
-            title = f"Mimic Eights — {winner.display} wins" if winner else "Mimic Eights — game over"
-        else:
-            title = f"Mimic Eights — {len(game.seats)} at the table"
-
-        embed = discord.Embed(title=title, colour=colour)
-
-        top = view["top"]
-        arrow = "⟳ clockwise" if view["direction"] > 0 else "⟲ anticlockwise"
-        board = [
-            f"**Top card** {card_label(top)}",
-            f"**Colour** {_SWATCH.get(view['active_colour'], '')} "
-            f"{view['active_colour'].capitalize()}",
-            f"**Order** {arrow}",
-        ]
-        if view["pending_draw"]:
-            board.append(f"**Pending** ⚠️ {view['pending_draw']} to draw")
-        embed.add_field(name="Board", value="\n".join(board), inline=False)
-
-        lines = []
-        for seat_view in view["seats"]:
-            seat = game.seat(seat_view["seat_id"])
-            name = seat.display if seat else seat_view["seat_id"]
-            here = "▸ " if seat_view["seat_id"] == view["current_seat"] else " "
-            count = seat_view["cards"]
-            tail = "  — **Last Card!**" if seat_view["called_last"] else ""
-            mood = neuro.describe(game.neuro.get(seat_view["seat_id"], neuro.BASELINE))
-            lines.append(f"{here}**{name}** · {count} card{'' if count == 1 else 's'}"
-                         f"{tail}  *{mood}*")
-        embed.add_field(name="Seats", value="\n".join(lines) or "—", inline=False)
-
-        if note:
-            embed.add_field(name="​", value=note, inline=False)
-
-        footer = f"turn {view['turn_no']} · {view['draw_pile_size']} in the pile"
-        house = self.house_rule_summary(game.state.rules)
-        if house:
-            footer += f" · {house}"
-        if game.deadline and not final:
-            left = max(0, int(game.deadline - time.monotonic()))
-            footer += f" · {left}s to play"
-        embed.set_footer(text=footer)
-        return embed

@@ -17,7 +17,7 @@ from ..utils.constants import (
     IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS,
 )
 from .api_service import GoogleGenAIModel, generate_google_tts_audio
-from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, resolve_image_output_params, resolve_image_tools, resolve_typing_cursor
+from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, is_gateway_shutdown, resolve_grounding_mode, resolve_image_output_params, resolve_image_tools, resolve_typing_cursor
 from ..utils.memory_tuning import maybe_trim_malloc
 
 
@@ -497,11 +497,9 @@ class MediaService:
                 self.cog.text_request_queue.task_done()
             except asyncio.CancelledError:
                 break
-            except RuntimeError as e:
-                if "Session is closed" in str(e):
-                    break
-                print(f"Error in image finisher worker: {e}"); traceback.print_exc()
             except Exception as e:
+                if is_gateway_shutdown(e):
+                    break
                 print(f"Error in image finisher worker: {e}"); traceback.print_exc()
                 # Ensure typing is stopped on error for child bots
                 if 'package' in locals() and package and package.get("is_child_bot"):
@@ -607,11 +605,9 @@ class MediaService:
                 self.cog.image_request_queue.task_done()
             except asyncio.CancelledError:
                 break
-            except RuntimeError as e:
-                if "Session is closed" in str(e):
-                    break
-                print(f"Error in image generation worker #{worker_id}: {e}"); traceback.print_exc()
             except Exception as e:
+                if is_gateway_shutdown(e):
+                    break
                 print(f"Error in image generation worker #{worker_id}: {e}"); traceback.print_exc()
 
     async def _process_text_attachments(self, attachments: List[Any], client: httpx.AsyncClient) -> str:
@@ -790,10 +786,9 @@ class MediaService:
             profile_name = effective_profile_name
 
             grounding_sources = []
-            grounding_mode = profile_data.get("grounding_mode", "off")
-            if isinstance(grounding_mode, bool): grounding_mode = "on" if grounding_mode else "off"
+            grounding_mode = resolve_grounding_mode(profile_data)
 
-            if grounding_mode in ["on", "on+"]:
+            if grounding_mode == "rag":
                 session_key = (channel_id, owner_id, profile_name)
                 img_session = self.cog.multi_profile_channels.get(channel_id) or {}
 

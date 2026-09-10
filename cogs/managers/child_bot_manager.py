@@ -18,7 +18,7 @@ from ..utils.constants import (
     IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS,
 )
 from ..utils.helpers import (_resolve_safety_settings, _split_into_sentences_with_abbreviations,
-                             apply_typing_cursor, typing_cursor_cost)
+                             apply_typing_cursor, resolve_grounding_mode, typing_cursor_cost)
 from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
 
@@ -1107,11 +1107,9 @@ class ChildBotManager:
                             break
 
             grounding_sources = []
-            grounding_mode = profile_data.get("grounding_mode", "off")
-            if isinstance(grounding_mode, bool):
-                grounding_mode = "on" if grounding_mode else "off"
+            grounding_mode = resolve_grounding_mode(profile_data)
 
-            if grounding_mode in ["on", "on+"]:
+            if grounding_mode == "rag":
                 session_key = (channel_id, owner_id, profile_name)
                 img_session = self.cog.multi_profile_channels.get(channel_id) or {}
                 g_bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)

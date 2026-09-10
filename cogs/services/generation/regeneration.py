@@ -14,6 +14,7 @@ from ...utils.constants import (
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _format_history_entry, _resolve_safety_settings,
     _scrub_response_text, is_citation_subtext, is_real_model, record_billed_usage,
+    resolve_native_tools,
 )
 from ._shared import _strip_neuro_update_and_scrub
 
@@ -329,7 +330,7 @@ class RegenerationMixin:
                 "thinking_budget": p_profile.get("thinking_budget", -1)
             }
 
-            model_tools = self._resolve_native_tools(p_profile)
+            model_tools = resolve_native_tools(p_profile)
 
             model = None
             model_warning = None
