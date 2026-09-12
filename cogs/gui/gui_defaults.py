@@ -154,13 +154,18 @@ class SettingsDefaultsView(ModelPickerMixin, SettingsBaseView):
         ("behaviour", "Behaviour", "Memory, typing, reasoning effort and timezone."),
     )
 
+    #: Row 4 is the settings tab bar, so there is no row for OpenRouter's Browse dropdown
+    #: here: the model rows page through Most Popular instead.
+    _BROWSE_ROW_AVAILABLE = False
+    #: One fewer than the pickers, for the "Platform default" row this screen adds on top.
+    _OPENROUTER_MODELS_PER_PAGE = ModelPickerMixin._OPENROUTER_MODELS_PER_PAGE - 1
+
     def __init__(self, cog: "MimicCog", interaction: discord.Interaction):
         super().__init__(cog, interaction, "defaults")
         self.defaults = cog.profile_manager._get_user_defaults(interaction.user.id)
         self.view_mode = "google"
         self.category = "response"
         self.ollama_working = None
-        self.cached_ollama_models = []
         self._build_view()
 
     # --- Mixin contract ---------------------------------------------------
@@ -258,6 +263,8 @@ class SettingsDefaultsView(ModelPickerMixin, SettingsBaseView):
                 e.add_field(name="Service Tier",
                             value=("`Platform default`" if tier is None
                                    else f"`{self.tier_wording(tier)[1]}`"), inline=True)
+            self._add_openrouter_details(e, [(labels.get(key, wording), self.defaults.get(key))
+                                             for key, wording, _default in self._CATEGORY_KEYS[self.category]])
 
         if self.defaults:
             e.set_footer(text=f"{len(self.defaults)} of {total} settings customised")

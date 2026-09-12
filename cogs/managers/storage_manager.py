@@ -19,6 +19,7 @@ import base64
 import orjson as json
 
 from ..utils.constants import SERVERS_DIR, CLEANUP_STATE_FILE
+from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
 
 # The member cache may legitimately shrink between runs -- people do leave servers --
 # so the guard has to allow a real decline while refusing a collapse. A run that sees
@@ -516,27 +517,80 @@ class StorageManager:
         except Exception as e:
             print(f"Could not refresh key flag for user {user_id}: {e}")
 
-    def _get_api_key_for_guild(self, guild_id: int, provider: str = "gemini") -> Optional[str]:
-        if not self.fernet: return None
-        guild_id_str = str(guild_id)
-        now = time.time()
-
+    def _guild_key_pointer(self, guild_id: int, provider: str) -> Optional[tuple]:
+        """(donor user_id, slot_id) of the key assigned to this guild, while the donor is still in it."""
         cache_key = (guild_id, provider)
         pointer = self.cog.server_key_pointers.get(cache_key)
 
         if not pointer:
-            server_index = self.cog.server_manager._get_server_index(guild_id_str)
+            server_index = self.cog.server_manager._get_server_index(str(guild_id))
             assigned = server_index.get("assigned_keys", {}).get(provider)
             if assigned:
                 pointer = (assigned["user_id"], assigned["slot"])
                 self.cog.server_key_pointers[cache_key] = pointer
 
         if pointer:
+            guild = self.cog.bot.get_guild(guild_id)
+            if not guild or not guild.get_member(pointer[0]):
+                self.cog.server_key_pointers.pop(cache_key, None)
+                return None
+        return pointer
+
+    def _gemini_slot_allowed_in_guild(self, guild_id: int, user_id: int, slot_id: str) -> bool:
+        """Whether this Gemini slot may carry the guild's messages -- see cogs/utils/data_policy."""
+        slot = (self._get_user_keys_data(user_id).get("slots") or {}).get(slot_id)
+        if is_paid_gemini_slot(slot):
+            return True
+        return training_opt_in(self.cog.server_manager._get_server_index(str(guild_id)), "gemini")
+
+    def gemini_blocked_for_guild(self, guild_id: Optional[int]) -> bool:
+        """True when the guild has a Gemini key that only its data policy is holding back.
+
+        Lets a caller say *why* there is no key, rather than reporting a key that is
+        sitting right there as "not configured".
+        """
+        if not guild_id or not self.fernet:
+            return False
+        pointer = self._guild_key_pointer(guild_id, "gemini")
+        if not pointer:
+            return False
+        user_id, slot_id = pointer
+        slot = (self._get_user_keys_data(user_id).get("slots") or {}).get(slot_id)
+        return bool(slot and slot.get("key")) and not self._gemini_slot_allowed_in_guild(guild_id, user_id, slot_id)
+
+    def personal_gemini_is_paid(self, user_id: int) -> bool:
+        """Whether the Gemini key on this user's Personal scope is billing-enabled."""
+        user_data = self._get_user_keys_data(user_id)
+        slot_id = (user_data.get("personal_assignments") or {}).get("gemini")
+        slot = (user_data.get("slots") or {}).get(slot_id) if slot_id else None
+        return is_paid_gemini_slot(slot)
+
+    def personal_gemini_allowed_in_conversation(self, user_id: int, guild_id: Optional[int]) -> bool:
+        """Whether a user's own Gemini key may carry a conversation opened in this guild.
+
+        Only Global Chat reaches here: it runs on the host's personal key, and whoever the
+        host unlocks it for can reply into it. A billing-enabled key always may. A free-tier
+        one only in a server the bot owner opened to it -- so never with no server, in a DM
+        or a group DM, where there is nothing to open.
+        """
+        if self.personal_gemini_is_paid(user_id):
+            return True
+        return bool(guild_id) and training_opt_in(
+            self.cog.server_manager._get_server_index(str(guild_id)), "gemini")
+
+    def _get_api_key_for_guild(self, guild_id: int, provider: str = "gemini") -> Optional[str]:
+        if not self.fernet: return None
+        now = time.time()
+
+        pointer = self._guild_key_pointer(guild_id, provider)
+
+        if pointer:
             user_id, slot_id = pointer
 
-            guild = self.cog.bot.get_guild(guild_id)
-            if not guild or not guild.get_member(user_id):
-                self.cog.server_key_pointers.pop(cache_key, None)
+            # A free-tier Gemini key may train on what it is sent. Refused here, at the
+            # one resolver every server-billed Google call goes through -- text, speech,
+            # images, grounding and embeddings alike -- rather than at each of them.
+            if provider == "gemini" and not self._gemini_slot_allowed_in_guild(guild_id, user_id, slot_id):
                 return None
 
             decrypted_key = self.cog.decrypted_key_cache.get((user_id, slot_id))
@@ -604,7 +658,6 @@ class StorageManager:
         await asyncio.to_thread(self._sync_perform_data_cleanup)
 
     def _sync_perform_data_cleanup(self):
-        log = ["Starting Automatic Daily Data Cleanup..."]
         bot_guild_ids = {g.id for g in self.cog.bot.guilds}
         all_bot_member_ids = {str(m.id) for g in self.cog.bot.guilds for m in g.members}
         all_bot_channel_ids = {c.id for g in self.cog.bot.guilds for c in g.channels}
@@ -664,8 +717,6 @@ class StorageManager:
             if now > data.get("expires_at", 0):
                 del self.cog.share_codes[code]
                 cleaned_codes += 1
-        if cleaned_codes > 0:
-            log.append(f"🧹 Removed {cleaned_codes} expired share codes.")
 
         # --- 2. Stale/Broken Profile Shares ---
         cleaned_shares = 0
@@ -689,8 +740,6 @@ class StorageManager:
                 self.cog.profile_shares[recipient_id_str] = valid_shares
                 cleaned_shares += original_len - len(valid_shares)
                 self.cog.profile_manager._save_profile_share_shard(recipient_id_str, valid_shares)
-        if cleaned_shares > 0:
-            log.append(f"🧹 Removed {cleaned_shares} stale or broken profile share requests.")
 
         # --- 3. Orphaned Server Pointers ---
         cleaned_pointers = 0
@@ -706,8 +755,6 @@ class StorageManager:
                     cleaned_pointers += 1
             if changed:
                 self.cog.server_manager._save_server_index(str(g.id), idx)
-        if cleaned_pointers > 0:
-            log.append(f"🧹 Removed {cleaned_pointers} orphaned server key assignments.")
 
         # --- 4. Orphaned Channel Webhooks ---
         cleaned_webhooks = 0
@@ -717,7 +764,6 @@ class StorageManager:
                 cleaned_webhooks += 1
         if cleaned_webhooks > 0:
             self.cog.server_manager._save_channel_webhooks()
-            log.append(f"🧹 Removed {cleaned_webhooks} orphaned channel webhooks.")
 
         # --- 5. Orphaned Server-Level Files ---
         cleaned_server_files = 0
@@ -730,8 +776,6 @@ class StorageManager:
                         cleaned_server_files += 1
                 except ValueError:
                     continue
-        if cleaned_server_files > 0:
-            log.append(f"🧹 Removed {cleaned_server_files} orphaned server-level data directories/files.")
 
         # --- 6. Full User Data Cleanup (Ghost Directories & Missing Users) ---
         cleaned_users_count = 0
@@ -768,8 +812,6 @@ class StorageManager:
                     self.cog.profile_manager._borrow_index_drop_user(int(user_id_str))
                     cleaned_users_count += 1
         
-        if cleaned_users_count > 0:
-            log.append(f"🧹 Removed {cleaned_users_count} ghost user directories or users no longer sharing a server.")
 
         # --- 7. Detailed Per-User & Per-Server Integrity Check ---
         cleaned_borrows = 0
@@ -867,9 +909,6 @@ class StorageManager:
                     
         if child_bots_changed: self.cog.child_bot_manager._load_child_bots()
 
-        if cleaned_borrows > 0: log.append(f"🧹 Removed {cleaned_borrows} broken borrowed profiles.")
-        if cleaned_session_files > 0: log.append(f"🧹 Removed {cleaned_session_files} orphaned session files for deleted profiles.")
-        if cleaned_child_bots > 0: log.append(f"🧹 Removed {cleaned_child_bots} orphaned child bot configurations.")
 
         # --- 8. Channel & User Session Directory Cleanup ---
         cleaned_channel_dirs, cleaned_user_session_dirs = 0, 0
@@ -915,8 +954,6 @@ class StorageManager:
                         server_dir.rmdir()
                 except (ValueError, OSError): continue
         
-        if cleaned_channel_dirs > 0: log.append(f"🧹 Removed {cleaned_channel_dirs} session directories for deleted channels.")
-        if cleaned_user_session_dirs > 0: log.append(f"🧹 Removed {cleaned_user_session_dirs} user session directories for users no longer in the server.")
 
         # --- 9. Final Config File Cleanup ---
         cleaned_channel_settings = 0
@@ -927,7 +964,6 @@ class StorageManager:
         
         if cleaned_channel_settings > 0:
             self.cog.session_manager._save_multi_profile_sessions()
-            log.append(f"🧹 Removed settings for {cleaned_channel_settings} deleted channels from config files.")
 
         # --- 10. Inactive Session File Cleanup (30-Day TTL) ---
         cleaned_session_files_ttl = 0
@@ -983,18 +1019,10 @@ class StorageManager:
                         _delete_file_shard(str(gc_file))
                         cleaned_session_files_ttl += 1
 
-        if cleaned_session_files_ttl > 0:
-            log.append(f"🧹 Removed {cleaned_session_files_ttl} inactive session logs (30-day TTL expired).")
-
-        log.append("Cleanup complete.")
-        print("\n".join(log).replace("**", ""))
-
     @tasks.loop(time=datetime.time(hour=17, minute=0, tzinfo=datetime.timezone.utc)) # 17:00 UTC = 3:00 AM AEST
     async def daily_cleanup_task(self):
         if self.cog.has_lock:
-            print("Starting daily data cleanup...")
             await self._perform_data_cleanup()
-            print("Daily data cleanup finished.")
 
     async def _has_api_key_access(self, user_id: int, guild_id: Optional[int] = None) -> bool:
         def _sync_check():

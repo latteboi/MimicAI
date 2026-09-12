@@ -80,6 +80,92 @@ class HeartbeatMixin:
             return sent[-1].id
         return None
 
+    async def _open_turn_feedback(self, session, channel, participant, p_settings=None):
+        """Puts a turn's placeholder or typing indicator up, owned from the first instant.
+
+        Returns the turn's state container, already registered in `in_flight`, and the
+        order is the point. The round's teardown only sweeps registered containers, and
+        the worker used to send the placeholder first and register its container several
+        awaits later -- grounding, image generation, LTM recall, the critic -- so a
+        cancel or an error anywhere in that gap left the placeholder in the channel for
+        good. Registering early costs /cancel nothing: is_delivering only counts a live
+        `sending_task`.
+
+        The send runs as its own task and records `msg_a_id` itself when it lands, the
+        same arrangement as `maybe_spawn`: cancelling whoever waits on it must not lose
+        the id of a message Discord has already posted. `_await_turn_feedback` is how
+        anything that needs the id waits, and `_stop_sending_heartbeat` -- so every
+        teardown -- waits the same way.
+        """
+        owner_id, profile_name = participant['owner_id'], participant['profile_name']
+        if p_settings is None:
+            index = self.cog.profile_manager._get_user_index(owner_id)
+            is_borrowed = profile_name in index.get("borrowed", [])
+            p_settings = self.cog.profile_manager._get_profile_config(
+                owner_id, profile_name, is_borrowed) or {}
+
+        app_name, app_avatar = self._resolve_appearance_data(owner_id, profile_name)
+        state_container = {
+            'msg_a_id': None,
+            'msg_b_id': None,
+            'app_name': app_name,
+            'app_avatar': app_avatar,
+            'message_type': "text",
+            'custom_emoji': p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI,
+            # Carried on the container so the round teardown can delete a child bot's
+            # placeholder without the participant dict, which it no longer has by the
+            # time it sweeps.
+            'bot_id': participant.get('bot_id'),
+            'placeholder_owned': True,
+        }
+        self.cog.session_manager.register_in_flight(session, state_container)
+
+        is_child = participant.get('method') == 'child_bot'
+        if is_child and not p_settings.get("child_bot_placeholder", False):
+            await self.cog.manager_queue.put({
+                "action": "send_to_child", "bot_id": participant['bot_id'],
+                "payload": {"action": "start_typing", "channel_id": channel.id}
+            })
+            return state_container
+
+        async def _post():
+            if is_child:
+                msg_id = await self._send_child_bot_placeholder(
+                    participant['bot_id'], channel.id, state_container['custom_emoji'])
+            else:
+                sent = await self._send_channel_message(
+                    channel, f"{PLACEHOLDER_EMOJI}",
+                    profile_owner_id_for_appearance=owner_id,
+                    profile_name_for_appearance=profile_name,
+                    bypass_typing=True)
+                msg_id = sent[0].id if sent else None
+            if msg_id:
+                state_container['msg_a_id'] = msg_id
+            return msg_id
+
+        state_container['feedback_task'] = asyncio.create_task(_post())
+        # One yield, so the send is actually on its way before the caller carries on.
+        # create_task only schedules it, and the trigger intake that follows the first
+        # call can run a long way without suspending when a message has nothing to fetch.
+        await asyncio.sleep(0)
+        return state_container
+
+    async def _await_turn_feedback(self, state_container):
+        """Waits for the placeholder `_open_turn_feedback` sent, without ever cancelling it.
+
+        asyncio.wait rather than an await on the task: a cancelled caller must leave the
+        send running, because the message may already be posted and the task is the only
+        thing that will learn its id. A send that failed is a turn without a placeholder,
+        not a failed turn, so its exception is reported and goes no further.
+        """
+        task = state_container.get('feedback_task') if state_container else None
+        if task is None:
+            return
+        await asyncio.wait((task,))
+        state_container['feedback_task'] = None
+        if not task.cancelled() and task.exception() is not None:
+            print(f"Feedback task error: {task.exception()}")
+
     async def _generate_with_heartbeat(self, model, contents, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name='Bot', app_avatar=None, existing_state=None, message_type="text"):
         # Hard Limits: 4 minutes for Main, 3 minutes for Fallback
         hard_timeout = 180.0 if is_fallback else 240.0
@@ -346,6 +432,10 @@ class HeartbeatMixin:
         """
         if not state_container:
             return
+
+        # The turn's own placeholder may still be on its way. It records its id when it
+        # lands, and every caller of this reads msg_a_id next to delete it.
+        await self._await_turn_feedback(state_container)
 
         task = state_container.get('sending_task')
         if task:

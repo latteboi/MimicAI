@@ -31,8 +31,9 @@ from discord import ui
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from ..utils.constants import CAST_POLICY_OPEN, DEFAULT_CAST_POLICY, defaultConfig
+from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
 from ..utils.content import HELP_CATEGORIES, WIZARD_COPY, WIZARD_TOUR
-from .base_components import DropdownContentView, TimeoutCleanupMixin, add_button
+from .base_components import BlockedGuard, DropdownContentView, TimeoutCleanupMixin, add_button
 
 if TYPE_CHECKING:
     from ..MimicCog import MimicCog
@@ -169,22 +170,40 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
                     written_name = name
                     break
 
+        # A free-tier Gemini key carries no conversation -- in a server or in Global Chat --
+        # unless the bot owner opened that server to it (cogs/utils/data_policy). The key
+        # step says so rather than just ticking, and a server whose only key is one is not
+        # counted as keyed.
+        gemini_open_here = guild is not None and training_opt_in(
+            cog.server_manager._get_server_index(str(guild.id)) or {}, "gemini")
+
         key_detail = ""
+        personal_assigned = False
         if has_key:
             keys_data = cog.storage_manager._get_user_keys_data(user_id) or {}
+            personal_assigned = bool(keys_data.get("personal_assignments"))
             slots = [s for s in (keys_data.get("slots") or {}).values()
                      if isinstance(s, dict) and s.get("key")]
-            providers = sorted({s.get("provider", "?") for s in slots})
-            tiers = sorted({str(s.get("tier", "free")).title() for s in slots})
             names = {"gemini": "Gemini", "openrouter": "OpenRouter"}
-            key_detail = (", ".join(names.get(p, p) for p in providers)
-                          + (f" · {'/'.join(tiers)} tier" if tiers else ""))
+            labels = []
+            for provider in sorted({s.get("provider", "?") for s in slots}):
+                mine = [s for s in slots if s.get("provider", "?") == provider]
+                tiers = "/".join(sorted({str(s.get("tier", "free")).title() for s in mine}))
+                label = f"{names.get(provider, provider)} · {tiers} tier"
+                if (provider == "gemini" and not gemini_open_here
+                        and not any(is_paid_gemini_slot(s) for s in mine)):
+                    label += " (not used in servers or Global Chat)"
+                labels.append(label)
+            key_detail = ", ".join(labels)
 
         server_has_key = False
+        server_key_held = False
         admin_guilds = 0
         if guild is not None:
             idx = cog.server_manager._get_server_index(str(guild.id)) or {}
-            server_has_key = bool(idx.get("assigned_keys"))
+            server_key_held = cog.storage_manager.gemini_blocked_for_guild(guild.id)
+            held = {"gemini"} if server_key_held else set()
+            server_has_key = bool(set(idx.get("assigned_keys") or {}) - held)
         else:
             for g in cog.bot.guilds:
                 member = g.get_member(user_id)
@@ -210,8 +229,13 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
         cast_policy = (cog.session_manager.cast_policy_for_channel(guild.id, channel_id)
                        if guild is not None else DEFAULT_CAST_POLICY)
 
+        # `_has_api_key_access` counts any key assigned to the server, including one the
+        # data policy holds back, which lets nothing here talk.
+        usable_key = has_key and (guild is None or personal_assigned or server_has_key)
+
         return {"personal": personal, "borrowed": borrowed, "written_name": written_name,
-                "key_detail": key_detail, "server_has_key": server_has_key,
+                "has_key": usable_key, "key_detail": key_detail,
+                "server_has_key": server_has_key, "server_key_held": server_key_held,
                 "admin_guilds": admin_guilds, "seated_disk": seated_disk,
                 "cast_policy": cast_policy}
 
@@ -228,7 +252,6 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
     hydrated = bool((session or {}).get("is_hydrated"))
 
     state.update({
-        "has_key": has_key,
         "in_guild": guild is not None,
         "is_admin": is_admin,
         "is_owner": is_owner,
@@ -252,7 +275,7 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
     return state
 
 
-class StartWizardView(TimeoutCleanupMixin, ui.View):
+class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     timeout_message = "Setup closed. Run `/start` again — it picks up where you left off."
 
     def __init__(self, cog: "MimicCog", interaction: discord.Interaction,
@@ -299,9 +322,15 @@ class StartWizardView(TimeoutCleanupMixin, ui.View):
 
         guild, channel = s["guild"], s["channel"]
         where = f"📍 **You're in** #{getattr(channel, 'name', 'this channel')} · **{guild.name}**\n"
-        key_line = ("🔑 **This server** has an API key assigned"
-                    if s["server_has_key"] else
-                    "🔑 **This server** has no API key assigned yet — nothing here can generate")
+        if s["server_has_key"]:
+            key_line = "🔑 **This server** has an API key assigned"
+            if s["server_key_held"]:
+                key_line += " (its free-tier Google key is not used here)"
+        elif s["server_key_held"]:
+            key_line = ("🔑 **This server**'s only key is a free-tier Google key, which is not "
+                        "used for server messages — nothing here can generate")
+        else:
+            key_line = "🔑 **This server** has no API key assigned yet — nothing here can generate"
 
         if s["is_admin"]:
             role = "🛡️ **Your role** Server administrator\n"

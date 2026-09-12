@@ -67,7 +67,8 @@ class ToolsService:
     async def _run_critic(self, history: list, char_name: str, guild_id: int,
                           p_config: Optional[Dict[str, Any]] = None,
                           session_transcript: Optional[List[str]] = None,
-                          instructions: Optional[str] = None
+                          instructions: Optional[str] = None,
+                          config_owner_id: Optional[int] = None
                           ) -> Tuple[Optional[str], Optional[str]]:
         """Finds linguistic loops in recent output and returns a negative constraint.
 
@@ -162,7 +163,8 @@ class ToolsService:
                 t_params = resolve_thinking_params(
                     p_config, "critic", "fallback" if is_fallback else "primary")
                 model = self.cog.api_service._instantiate_model(
-                    model_name, guild_id, None, system_instruction, None, t_params, None, p_config)
+                    model_name, guild_id, None, system_instruction, None, t_params, None, p_config,
+                    config_owner_id=config_owner_id)
                 return await model.generate_content_async(
                     [f"Transcript:\n{transcript}"], generation_config=critic_cfg)
 

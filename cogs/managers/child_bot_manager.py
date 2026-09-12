@@ -900,7 +900,14 @@ class ChildBotManager:
                 "method": "child_bot", "bot_id": bot_id, "ephemeral": ephemeral}
 
     async def handle_child_bot_event(self, event_data: Dict):
-        if event_data.get("message", {}).get("author_id") in self.cog.global_blacklist:
+        # generation_blocked, so both block scopes: everything downstream of here ends
+        # in a model call. A quarantined guild
+        # stops here too -- the child bots are the half of a server block that is easy
+        # to forget, because each one is its own gateway connection.
+        message = event_data.get("message", {})
+        if message.get("author_id") in self.cog.generation_blocked:
+            return
+        if message.get("guild_id") in self.cog.quarantined_guilds:
             return
 
         event_type = event_data.get("event_type")
@@ -992,7 +999,10 @@ class ChildBotManager:
             bot_config["presence"] = await asyncio.to_thread(_sync_update_presence)
 
     async def handle_child_bot_image_request(self, event_data: Dict):
-        if event_data.get("message", {}).get("author_id") in self.cog.global_blacklist:
+        message_payload = event_data.get("message", {})
+        if message_payload.get("author_id") in self.cog.generation_blocked:
+            return
+        if message_payload.get("guild_id") in self.cog.quarantined_guilds:
             return
 
         bot_id = str(event_data.get("bot_id"))

@@ -144,7 +144,9 @@ _STATIC_DASHBOARDS = [
                           "Reset All Content Ratings (instance-wide, one-off baseline reset)"]),
             ("Prompts", ["Override the global system prompts, including CONTENT_POLICY and HELP_MODE_INJECTION"]),
             ("Docs", ["Edit the documentation shards backing Help Mode; re-embeds on save"]),
-            ("Blacklist", ["Block users from the instance"]),
+            ("Blacklist", ["Block users and servers (leave, or quarantine), silently; "
+                           "blocks may be temporary",
+                           "Ban Effects: stop their child bots, unpublish, suspend their sessions"]),
         ],
     ),
 ]

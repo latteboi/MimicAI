@@ -119,6 +119,41 @@ class TimeoutCleanupMixin:
             pass
 
 
+class BlockedGuard:
+    """Refuses a component interaction from a blocked user, and says nothing.
+
+    `Cog.interaction_check` gates app commands and nothing else -- discord.py routes a
+    button or a select to the *view*, which has its own check. So every view in this
+    package answered a blacklisted user, and on a public one that is a live hole: the
+    Reply button under a global chat embed drives a generation with no command in sight,
+    and `is_locked` is a host control, not an access control.
+
+    Tests `generation_blocked`, so both block scopes stop here. Returning False without
+    responding is the whole refusal: Discord shows "This interaction failed", and nothing
+    here spends a request explaining it.
+
+    `block_exempt`, on the class or on one instance, opens a view anyway. It belongs only
+    on what `BLACKLIST_EXEMPT_COMMANDS` opens -- `PrivacyDashboardView`, and the `/terms`
+    browser -- and never on anything that can reach a model call.
+
+    Mix in ahead of `ui.View` so this wins the MRO. A view that needs its own check must
+    call `await super().interaction_check(interaction)` first and honour a False.
+
+    Reads `self.cog`, which every view in this package takes as its first constructor
+    argument. One that has no cog fails **open**, the same way `TimeoutCleanupMixin`
+    returns quietly with no `original_interaction`; `tests/test_blacklist_enforcement.py`
+    is what makes that safe, by refusing to let a view miss the guard silently.
+    """
+
+    block_exempt = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        cog = getattr(self, "cog", None)
+        if cog is None or interaction.user.id not in cog.generation_blocked:
+            return True
+        return self.block_exempt
+
+
 #: The two bulk sentinels a paginated multi-select carries above its real options.
 SELECT_PAGE = "toggle_page"
 SELECT_ALL = "toggle_all"
@@ -194,7 +229,7 @@ class ReportErrorMixin:
             pass
 
 
-class TabbedView(TimeoutCleanupMixin, ui.View):
+class TabbedView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     """Base for a screen whose tabs are sibling views: /hub, /settings, /mod.
 
     Each of the three carried its own copy of this constructor and a nav method per
@@ -326,6 +361,32 @@ class PageJumpModal(ui.Modal):
         await self.on_jump(interaction, page - 1 if self.zero_indexed else page)
 
 
+#: The values of the three page controls a paginated dropdown carries above its items.
+PAGE_NAV_VALUES = ("prev_page", "jump_page", "next_page")
+
+
+def paged_nav_options(current_page: int, num_pages: int, *, values=PAGE_NAV_VALUES,
+                      nav_suffix: str = "", always_show_jump: bool = False):
+    """Previous / Page n of m (jump) / Next, each only when there is somewhere to go.
+
+    The first options of every paginated dropdown -- the session audit's and the model
+    pickers' alike. `values` lets two paginated dropdowns on one view tell their controls
+    apart.
+    """
+    prev_value, jump_value, next_value = values
+    options = []
+    if current_page > 0:
+        options.append(discord.SelectOption(label="◀ Previous Page", value=prev_value,
+                                            description=f"Navigate to previous page{nav_suffix}"))
+    if always_show_jump or num_pages > 1:
+        options.append(discord.SelectOption(label=f"📄 Page {current_page + 1}/{num_pages} (Jump)",
+                                            value=jump_value, description="Click to jump to a page number"))
+    if current_page < num_pages - 1:
+        options.append(discord.SelectOption(label="▶ Next Page", value=next_value,
+                                            description=f"Navigate to next page{nav_suffix}"))
+    return options
+
+
 def build_pagination_controls(view: ui.View, current_page: int, num_pages: int, row: int, prev_cb, next_cb, page_cb=None):
     if num_pages <= 1: return
     prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(current_page == 0), row=row)
@@ -402,7 +463,7 @@ class ActionTextInputModal(ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         await self.on_submit_callback(interaction, self.input.value)
 
-class DropdownContentView(ui.View):
+class DropdownContentView(BlockedGuard, ui.View):
     def __init__(self, content_dict: dict, title: str, link_button_label: Optional[str] = None,
                  link_button_url: Optional[str] = None, start_category: Optional[str] = None,
                  start_page: Optional[str] = None):
@@ -457,7 +518,7 @@ class InviteView(ui.View):
         btn = ui.Button(label="Add MimicAI to Server", url=invite_url, style=discord.ButtonStyle.link)
         self.add_item(btn)
 
-class BaseBulkProfileView(ui.View):
+class BaseBulkProfileView(BlockedGuard, ui.View):
     def __init__(self, cog, user_id, include_borrowed=True, timeout=300, exclude_public=False):
         super().__init__(timeout=timeout)
         self.cog = cog

@@ -107,10 +107,11 @@ content classifier that confines profiles declared 18+ to age-restricted channel
 
 - **Python 3.10 or newer.**
 - A Discord bot application (free).
-- At least one API key: **Google AI Studio (Gemini)** or **OpenRouter**. Paid-tier Gemini
-  keys are strongly recommended — memory summarisation, training retrieval, grounding and
-  image generation all make their own calls, and free-tier rate limits will throttle them.
-  Alternatively, point a profile at a local **Ollama** server and pay nothing.
+- At least one API key: **Google AI Studio (Gemini)** or **OpenRouter**. A Gemini key has
+  to be paid-tier for conversations: Google may train on what a free-tier key is sent, so
+  the bot keeps server messages and Global Chat off one (see `/privacy`). Paid tier also avoids the
+  rate limits that throttle memory summarisation, training retrieval, grounding and image
+  generation. Alternatively, point a profile at a local **Ollama** server and pay nothing.
 - Linux, macOS or Windows. Production runs on a **GCP e2-micro** (1 GB RAM, 0.25 vCPU)
   24/7; see [ARCHITECTURE.md](ARCHITECTURE.md) for what that constraint did to the design.
 

@@ -13,7 +13,6 @@ from ..utils.helpers import (
     _pf, _pi, _ps, _pb, is_real_model, image_model_caps, resolve_critic_settings,
     google_thinking_caps, resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
 )
-from ..utils.http_client import get_shared_client
 from ..utils.user_defaults import setting_label
 
 if TYPE_CHECKING:
@@ -21,10 +20,15 @@ if TYPE_CHECKING:
     from ..MimicCog import MimicCog
 
 from .base_components import (
+    BlockedGuard,
     BaseBulkProfileView, ConfigModal, ActionTextInputModal, TimeoutCleanupMixin,
     ReportErrorMixin, add_button, add_select, build_pagination_controls,
-    build_confirm_view, invalidate_model_cache,
+    build_confirm_view, invalidate_model_cache, PageJumpModal, paged_nav_options,
 )
+from ..services.api.openrouter_catalogue import (
+    AUTHOR_PREFIX, BROWSE_CHEAPEST, BROWSE_POPULAR, BROWSE_TRENDING,
+)
+from ..utils.data_policy import may_pick_training_models
 from .gui_data import DataManageView
 from .gui_hub import HubShareManagerView
 from .gui_sessions import CustomModelModal
@@ -1052,7 +1056,7 @@ PROFILE_ACTIONS = (
 PROFILE_ACTIONS_BY_VALUE = {a.value: a for a in PROFILE_ACTIONS}
 
 
-class ProfileManageView(ui.View):
+class ProfileManageView(BlockedGuard, ui.View):
     def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction, profile_name: str, is_borrowed: bool, target_user_id: Optional[int] = None, is_mod_view: bool = False):
         super().__init__(timeout=600)
         self.cog = cog
@@ -1446,7 +1450,7 @@ class ProfileManageView(ui.View):
         try: await self.original_interaction.edit_original_response(content="Manager timed out.", view=None)
         except: pass
 
-class ProfileFunctionView(TimeoutCleanupMixin, ui.View):
+class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     """One setting's screen, rendered from its `_Screen` declaration.
 
     Swaps onto the dashboard's own message rather than stacking a fresh ephemeral under
@@ -2018,7 +2022,7 @@ class MediaOptionsMixin:
         self.add_item(select)
 
 
-class SingleProfileMediaOptionsView(MediaOptionsMixin, ui.View):
+class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
     """Image output settings and TTS voice for one profile, written as they are chosen.
 
     One view over both subjects rather than two near-identical ones: they differ only
@@ -2157,7 +2161,24 @@ class ModelPickerMixin(ReportErrorMixin):
     """
 
     def _get_top_models(self, provider: str, target_config_key: str) -> List[str]:
-        return self.cog.api_service.get_top_models(provider, target_config_key)
+        host = self._ollama_host_url() if provider == 'ollama' else None
+        return self.cog.api_service.get_top_models(provider, target_config_key, ollama_host=host)
+
+    def _may_use_ollama(self) -> bool:
+        """Ollama is offered only on the bot owner's own configs -- see OLLAMA_OWNER_ONLY.
+
+        Asked of `user_id`, the owner of whatever this picker writes to, because that is
+        who the model factory checks at call time.
+        """
+        return self.cog.profile_manager.may_use_ollama(getattr(self, "user_id", None))
+
+    def _shows_training_models(self) -> bool:
+        """Whether this picker offers OpenRouter models that may train on prompts.
+
+        Asked of `user_id` for the same reason `_may_use_ollama` is -- see
+        `may_pick_training_models`. Every catalogue read below passes it on.
+        """
+        return may_pick_training_models(getattr(self, "user_id", None))
 
     def _ollama_host_url(self) -> str:
         """Where this view reads the configured Ollama host from."""
@@ -2259,8 +2280,14 @@ class ModelPickerMixin(ReportErrorMixin):
 
         async def callback(self, interaction: discord.Interaction):
             view = self.view
+            if self.values[0] in ModelPickerMixin._MODEL_NAV_VALUES:
+                await view._turn_openrouter_page(interaction, "or_model_page", self.values[0])
+                return
             if self.values[0] == "ollama_offline":
-                await interaction.response.send_message("Ollama is offline or has no models downloaded.", ephemeral=True)
+                checking = getattr(view, 'ollama_working', None) == "processing"
+                await interaction.response.send_message(
+                    "Still checking the Ollama host -- try again in a moment." if checking
+                    else "Ollama is offline or has no models downloaded.", ephemeral=True)
                 return
             if self.values[0] == "custom_option":
                 await interaction.response.send_modal(CustomModelModal(view, self.target_config_key))
@@ -2269,7 +2296,162 @@ class ModelPickerMixin(ReportErrorMixin):
                 view._build_view()
                 await interaction.response.edit_message(**view._picker_render())
 
+    # --- OpenRouter browsing -------------------------------------------------------
+    #
+    # A select holds 25 options and OpenRouter lists hundreds of text models, so the list
+    # is paged the way the session audit pages turns: page controls first, then this
+    # screen's fixed rows (Custom, None, Current), then one page of models. A second
+    # dropdown above picks what the pages list -- see _add_openrouter_browse_select.
+
+    _MODEL_NAV_VALUES = ("or_models_prev", "or_models_jump", "or_models_next")
+    _BROWSE_NAV_VALUES = ("or_browse_prev", "or_browse_jump", "or_browse_next")
+    #: 3 controls + Custom + None + Current + 19 models = Discord's 25.
+    _OPENROUTER_MODELS_PER_PAGE = 19
+    _OPENROUTER_AUTHORS_PER_PAGE = 19
+    _BROWSE_GENERAL = (
+        (BROWSE_POPULAR, "Most Popular", "The models used most on this bot."),
+        (BROWSE_TRENDING, "Trending", "Biggest climbers in OpenRouter's rankings this week."),
+        (BROWSE_CHEAPEST, "Cheapest", "Lowest input plus output price first."),
+    )
+
+    def _openrouter_browse(self) -> str:
+        return getattr(self, "or_browse", BROWSE_POPULAR)
+
+    def _shows_openrouter_browse(self) -> bool:
+        """Whether this screen gives the Browse dropdown a row of its own."""
+        return (self.view_mode == 'openrouter' and self.category not in self._GOOGLE_ONLY_CATEGORIES
+                and getattr(self, "_BROWSE_ROW_AVAILABLE", True))
+
+    def _openrouter_model_options(self, current_val, target_config_key: str) -> List[discord.SelectOption]:
+        catalogue = self.cog.api_service.catalogue
+        browse = self._openrouter_browse()
+        ids, _note = catalogue.browse(browse, show_training=self._shows_training_models())
+        per_page = self._OPENROUTER_MODELS_PER_PAGE
+        num_pages = max(1, (len(ids) - 1) // per_page + 1)
+        page = max(0, min(getattr(self, "or_model_page", 0), num_pages - 1))
+        self.or_model_page = page
+
+        opts = paged_nav_options(page, num_pages, values=self._MODEL_NAV_VALUES, nav_suffix=" of models")
+        opts.append(discord.SelectOption(label="Custom Model...", value="custom_option",
+                                         description="Enter manually via modal"))
+        if target_config_key in UTILITY_FALLBACK_KEYS.values():
+            opts.append(discord.SelectOption(
+                label="None (no retry)", value=NO_FALLBACK,
+                description="Do not try a second model when this one fails.",
+                default=not is_real_model(current_val)))
+            if not is_real_model(current_val):
+                current_val = None
+        if current_val:
+            current_id = self.strip_prefix(current_val)
+            opts.append(discord.SelectOption(
+                label=f"Current: {catalogue.label(current_id)}"[:100], value=current_val,
+                description=catalogue.describe(current_id), default=True))
+
+        drop_author = browse.startswith(AUTHOR_PREFIX)
+        start = page * per_page
+        for model_id in ids[start:start + per_page]:
+            value = f"OPENROUTER/{model_id}"
+            if value == current_val:
+                continue
+            opts.append(discord.SelectOption(
+                label=catalogue.label(model_id, drop_author=drop_author), value=value,
+                description=catalogue.describe(model_id)))
+        return opts[:25]
+
+    def _add_openrouter_browse_select(self, row: int):
+        """Most Popular, Trending and Cheapest first on every page, then authors A-Z."""
+        catalogue = self.cog.api_service.catalogue
+        authors = catalogue.authors(show_training=self._shows_training_models())
+        browse = self._openrouter_browse()
+        per_page = self._OPENROUTER_AUTHORS_PER_PAGE
+        num_pages = max(1, (len(authors) - 1) // per_page + 1)
+        page = max(0, min(getattr(self, "or_browse_page", 0), num_pages - 1))
+        self.or_browse_page = page
+
+        opts = paged_nav_options(page, num_pages, values=self._BROWSE_NAV_VALUES, nav_suffix=" of authors")
+        for value, label, description in self._BROWSE_GENERAL:
+            opts.append(discord.SelectOption(label=label, value=value, description=description,
+                                             default=(browse == value)))
+        start = page * per_page
+        for author in authors[start:start + per_page]:
+            value = AUTHOR_PREFIX + author.slug
+            opts.append(discord.SelectOption(label=author.name[:100], value=value,
+                                             description=catalogue.describe_author(author),
+                                             default=(browse == value)))
+        select = ui.Select(placeholder="Browse OpenRouter models...", options=opts[:25], row=row)
+
+        async def callback(interaction: discord.Interaction):
+            value = select.values[0]
+            if value in self._BROWSE_NAV_VALUES:
+                await self._turn_openrouter_page(interaction, "or_browse_page", value)
+                return
+            self.or_browse = value
+            self.or_model_page = 0
+            self._build_view()
+            await interaction.response.edit_message(**self._picker_render())
+
+        select.callback = callback
+        self.add_item(select)
+
+    async def _turn_openrouter_page(self, interaction: discord.Interaction, attr: str, value: str):
+        """Previous, next or jump, for either paged dropdown; `attr` names whose page it is."""
+        if value.endswith("_jump"):
+            if attr == "or_model_page":
+                ids, _note = self.cog.api_service.catalogue.browse(
+                    self._openrouter_browse(), show_training=self._shows_training_models())
+                total, per_page = len(ids), self._OPENROUTER_MODELS_PER_PAGE
+            else:
+                total = len(self.cog.api_service.catalogue.authors(show_training=self._shows_training_models()))
+                per_page = self._OPENROUTER_AUTHORS_PER_PAGE
+
+            async def jump(i: discord.Interaction, page: int):
+                setattr(self, attr, page)
+                self._build_view()
+                await i.response.edit_message(**self._picker_render())
+
+            await interaction.response.send_modal(PageJumpModal(
+                max(1, (total - 1) // per_page + 1), jump, zero_indexed=True))
+            return
+        setattr(self, attr, getattr(self, attr, 0) + (-1 if value.endswith("_prev") else 1))
+        self._build_view()
+        await interaction.response.edit_message(**self._picker_render())
+
+    def _add_openrouter_details(self, embed: discord.Embed, slots) -> None:
+        """What the embed says about browsing and about each chosen OpenRouter model.
+
+        `slots` is (wording, stored value) per model slot on screen.
+        """
+        if self.view_mode != 'openrouter' or self.category in self._GOOGLE_ONLY_CATEGORIES:
+            return
+        catalogue = self.cog.api_service.catalogue
+        browse = self._openrouter_browse()
+        show_training = self._shows_training_models()
+        _ids, note = catalogue.browse(browse, show_training=show_training)
+        if self._shows_openrouter_browse():
+            label = next((lbl for value, lbl, _d in self._BROWSE_GENERAL if value == browse), None)
+            if label is None:
+                slug = browse[len(AUTHOR_PREFIX):]
+                label = next((a.name for a in catalogue.authors(show_training=show_training)
+                              if a.slug == slug), slug)
+            line = f"-# Browsing **{label}**" + (f" — {note}" if note else "")
+        else:
+            line = f"-# {note}" if note else ""
+        if line:
+            embed.description = f"{embed.description or ''}\n{line}".strip()
+        for wording, value in slots:
+            if not (isinstance(value, str) and value.startswith("OPENROUTER/")):
+                continue
+            model_id = self.strip_prefix(value)
+            details = catalogue.detail_lines(model_id)
+            if details:
+                embed.add_field(name=f"{wording} · {catalogue.label(model_id)}"[:256],
+                                value=details[:1024], inline=False)
+
     def _create_model_options(self, current_val: str, target_config_key: str) -> List[discord.SelectOption]:
+        if self.view_mode == 'ollama' and not self._may_use_ollama():
+            self.view_mode = 'google'
+        if self.view_mode == 'openrouter' and target_config_key not in GOOGLE_ONLY_MODEL_KEYS:
+            return self._openrouter_model_options(current_val, target_config_key)
         top_models = self._get_top_models(self.view_mode, target_config_key)
         opts = [discord.SelectOption(label="Custom Model...", value="custom_option", description="Enter manually via modal")]
 
@@ -2306,21 +2488,26 @@ class ModelPickerMixin(ReportErrorMixin):
                 added += 1
                 
         if self.view_mode == 'ollama' and not top_models:
-            opts.append(discord.SelectOption(label="⚠️ Ollama Offline / No Models", value="ollama_offline", description=f"Check {OLLAMA_LOCAL_URL}"))
+            host = self._ollama_host_url() or OLLAMA_LOCAL_URL
+            if getattr(self, 'ollama_working', None) == "processing":
+                opts.append(discord.SelectOption(label="Checking Ollama…", value="ollama_offline", description=host[:100]))
+            else:
+                opts.append(discord.SelectOption(label="⚠️ Ollama Offline / No Models", value="ollama_offline", description=f"Check {host}"[:100]))
             
         return opts
 
     async def _update_ollama_status(self):
-        host_url = self._ollama_host_url() or OLLAMA_LOCAL_URL
-        try:
-            resp = await get_shared_client().get(f"{host_url.rstrip('/')}/api/tags", timeout=2.0)
-            self.ollama_working = (resp.status_code == 200)
-            if self.ollama_working:
-                data = resp.json()
-                self.cached_ollama_models = [m['name'] for m in data.get('models', [])]
-        except Exception:
-            self.ollama_working = False
-            self.cached_ollama_models = []
+        """Probes this view's Ollama host; the models it lists are read back off the service.
+
+        The probe's model list used to be kept on the view, where nothing read it: the
+        dropdown asked the service, so the tab said "Offline / No Models" beside a green
+        host button. A host replaced while the probe was out keeps the status its own
+        probe sets -- Set Host URL runs one.
+        """
+        host = self._ollama_host_url()
+        answered, _models = await self.cog.api_service.probe_ollama(host)
+        if self._ollama_host_url() == host:
+            self.ollama_working = answered
 
     def _add_api_buttons(self, *, row: int = 3):
         """The API-mode and Ollama-host buttons, identical in both pickers.
@@ -2329,21 +2516,30 @@ class ModelPickerMixin(ReportErrorMixin):
         leaves room on this row for the fallback-indicator toggle that had a row of its
         own.
         """
-        api_modes = ['google', 'openrouter', 'ollama']
+        api_modes = ['google', 'openrouter'] + (['ollama'] if self._may_use_ollama() else [])
         api_labels = {'google': 'API: Google', 'openrouter': 'API: OpenRouter', 'ollama': 'API: Ollama (Local)'}
+        if self.view_mode not in api_modes:
+            self.view_mode = 'google'
         
         async def api_cb(i: discord.Interaction):
             next_idx = (api_modes.index(self.view_mode) + 1) % len(api_modes)
             self.view_mode = api_modes[next_idx]
-            if self.view_mode == 'ollama':
-                await i.response.defer()
-                self.ollama_working = "processing"
-                await self._update_ollama_status()
-                self._build_view()
-                await i.edit_original_response(**self._picker_render())
-            else:
+            if self.view_mode != 'ollama':
                 self._build_view()
                 await i.response.edit_message(**self._picker_render())
+                return
+            # The tab opens on the host's last answer and asks again behind it. It used to
+            # defer, wait on the probe -- most of its two-second timeout through a tunnel --
+            # then edit: two round trips to Discord plus the wait, where a tab takes one.
+            host = self._ollama_host_url()
+            shown = self.cog.api_service.last_ollama_probe(host)
+            self.ollama_working = shown[0] if shown else "processing"
+            self._build_view()
+            await i.response.edit_message(**self._picker_render())
+            await self._update_ollama_status()
+            if self.view_mode == 'ollama' and self.cog.api_service.last_ollama_probe(host) != shown:
+                self._build_view()
+                await i.edit_original_response(**self._picker_render())
         add_button(self, api_labels[self.view_mode], api_cb, style=discord.ButtonStyle.primary,
                    row=row, disabled=self.category in self._GOOGLE_ONLY_CATEGORIES)
         
@@ -2443,7 +2639,7 @@ class ModelPickerMixin(ReportErrorMixin):
 
 
 
-class SingleProfileModelView(ModelPickerMixin, ui.View):
+class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str, is_borrowed: Optional[bool] = None, user_id: Optional[int] = None):
         super().__init__(timeout=300)
         self.cog = cog
@@ -2524,6 +2720,8 @@ class SingleProfileModelView(ModelPickerMixin, ui.View):
                              f"/`{'Dyn' if budget == -1 else budget}`")
             e.add_field(name="Thinking", value=" \u2192 ".join(parts), inline=False)
 
+        self._add_openrouter_details(e, [(wording_slot, data.get(key, default))
+                                         for key, wording_slot, default in self._CATEGORY_KEYS[self.category]])
         e.set_footer(text=f"{self.profile_name} \u00b7 changes save as you make them")
         return e
 
@@ -2536,12 +2734,20 @@ class SingleProfileModelView(ModelPickerMixin, ui.View):
 
         self._add_category_select(0)
 
+        # OpenRouter takes a Browse row, which pushes the model rows down one and the
+        # buttons onto the bottom row with Thinking: four buttons, inside Discord's five.
+        browsing = self._shows_openrouter_browse()
+        if browsing:
+            self._add_openrouter_browse_select(1)
+        first_model_row = 2 if browsing else 1
+        button_row = 4 if browsing else 3
+
         for offset, (key, wording, default) in enumerate(self._CATEGORY_KEYS[self.category]):
             self.add_item(self.GenericModelSelect(
                 f"Select {wording} Model...",
-                self._create_model_options(data.get(key, default), key), offset + 1, key))
+                self._create_model_options(data.get(key, default), key), offset + first_model_row, key))
 
-        self._add_api_buttons(row=3)
+        self._add_api_buttons(row=button_row)
 
         if self.category == 'response':
             show_fb = data.get("show_fallback_indicator", True)
@@ -2551,7 +2757,7 @@ class SingleProfileModelView(ModelPickerMixin, ui.View):
                 await i.response.edit_message(**self._picker_render())
             add_button(self, f"Fallback Indicator: {'ON' if show_fb else 'OFF'}", fallback_cb,
                        style=discord.ButtonStyle.success if show_fb else discord.ButtonStyle.secondary,
-                       row=3)
+                       row=button_row)
 
         # Choosing a model and choosing how hard it thinks are one decision, and the
         # thinking picker is keyed on the same four slots this dropdown names -- so it
@@ -2765,7 +2971,7 @@ class _SlotThinkingBudgetModal(ui.Modal):
         await interaction.response.edit_message(**self.picker._render())
 
 
-class SingleProfileThinkingView(ThinkingPickerMixin, ui.View):
+class SingleProfileThinkingView(BlockedGuard, ThinkingPickerMixin, ui.View):
     """Per-slot, per-role thinking for one profile, written as it is chosen.
 
     Reachable from two places on purpose: `Set Thinking Parameters` on the Params tab,
@@ -2894,7 +3100,7 @@ class SingleProfileThinkingView(ThinkingPickerMixin, ui.View):
 _BULK_TIMEOUT = 840
 
 
-class _BulkSubView(ReportErrorMixin, ui.View):
+class _BulkSubView(BlockedGuard, ReportErrorMixin, ui.View):
     """A wizard step that borrows the wizard's message instead of opening its own.
 
     Every step of the bulk flow used to be a fresh `followup.send(ephemeral=True)`,
@@ -2920,7 +3126,12 @@ class _BulkSubView(ReportErrorMixin, ui.View):
         `_refresh_timeout` is discord.py's own mechanism for this (View.dispatch calls it
         on every interaction); guarded so a rename in a future release degrades to the
         old behaviour rather than breaking the view.
+
+        Chains to BlockedGuard first, and does not refresh a timer for an interaction
+        that is about to be refused.
         """
+        if not await super().interaction_check(interaction):
+            return False
         refresh = getattr(self.wizard, "_refresh_timeout", None)
         if callable(refresh):
             try:
@@ -2964,7 +3175,6 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
         self.view_mode = 'google'
         self.category = 'response'
         self.ollama_working = None
-        self.cached_ollama_models = []
         self.models_state = {k: None for k in (
             'primary_model', 'fallback_model',
             'image_generation_model', 'image_generation_fallback_model',
@@ -3062,6 +3272,8 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
             e.add_field(name="Service Tier",
                         value=f"`{self._clean(self.models_state['openrouter_service_tier'])}`",
                         inline=True)
+        self._add_openrouter_details(e, [(wording, self.models_state[key])
+                                         for key, wording, _default in self._CATEGORY_KEYS[self.category]])
 
         pending = self._pending()
         if pending:
@@ -3081,12 +3293,20 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
 
         self._add_category_select(0)
 
+        # As in the single-profile picker. Here the bottom row then holds API, Service
+        # Tier, Fallback Indicator, Back and Stage -- exactly Discord's five.
+        browsing = self._shows_openrouter_browse()
+        if browsing:
+            self._add_openrouter_browse_select(1)
+        first_model_row = 2 if browsing else 1
+        button_row = 4 if browsing else 3
+
         for offset, (key, wording, _default) in enumerate(self._CATEGORY_KEYS[self.category]):
             self.add_item(self.GenericBulkModelSelect(
                 f"Select {wording} Model...",
-                self._create_model_options(self.models_state[key], key), offset + 1, key))
+                self._create_model_options(self.models_state[key], key), offset + first_model_row, key))
 
-        self._add_api_buttons(row=3)
+        self._add_api_buttons(row=button_row)
 
         if self.category == 'response':
             state = self.show_fallback_indicator
@@ -3100,7 +3320,7 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
                 self.show_fallback_indicator = True if state is None else (False if state else None)
                 self._build_view()
                 await i.response.edit_message(**self._picker_render())
-            add_button(self, label, fallback_cb, style=style, row=3)
+            add_button(self, label, fallback_cb, style=style, row=button_row)
 
         self._add_back(4)
         add_button(self, "Stage Models", self._stage_callback, style=discord.ButtonStyle.success,
@@ -3579,7 +3799,7 @@ def build_timezone_options(page: int, current: Optional[str]) -> List[discord.Se
     return options
 
 
-class _TimezonePickerView(ui.View):
+class _TimezonePickerView(BlockedGuard, ui.View):
     """Shared body of the timezone pickers: the paged select, the jump, the modal.
 
     Three of these existed as separate views that differed only in where the current
@@ -4871,7 +5091,7 @@ class BulkManageView(BaseBulkProfileView):
         await self.refresh(interaction)
 
 
-class ContentSafetyView(ui.View):
+class ContentSafetyView(BlockedGuard, ui.View):
     """The Content Safety dashboard for one profile.
 
     Replaces the profile dashboard rather than opening beside it, because it is not
@@ -5180,7 +5400,7 @@ class ContentSafetyView(ui.View):
         await self._await_verdict(i)
 
 
-class PostEditRatingView(ui.View):
+class PostEditRatingView(BlockedGuard, ui.View):
     """The ephemeral prompt shown after editing a profile that was already rated.
 
     An edit invalidates the rating, and there are exactly two sensible responses:

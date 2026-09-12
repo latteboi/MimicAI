@@ -22,6 +22,7 @@ from ..utils.constants import (
     DEFAULT_SPEECH_VOICE, TTS_SYNTHESIS_PREAMBLE, CRITIC_AUDIT_TEXT_MAX,
     LOG_TRIM_TARGET, LOG_TRIM_HIGH_WATER,
     CONTENT_RATING_ADULT, CONTENT_RATING_EMOJI, CONTENT_RATING_LABELS,
+    GEMINI_FREE_TIER_BLOCKED,
 )
 from ..utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt,
@@ -46,11 +47,13 @@ from .generation.image_round import ImageRoundMixin
 from .generation.triggers import TriggerIntakeMixin
 from .generation.compaction import SessionCompactionMixin
 from .generation.ltm_capture import LtmCaptureMixin
+from .generation.turn_deletion import TurnDeletionMixin
 
 
 class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, RegenerationMixin,
                         SpeakAsMixin, GlobalChatMixin, WhisperMixin, ImageRoundMixin,
-                        TriggerIntakeMixin, SessionCompactionMixin, LtmCaptureMixin):
+                        TriggerIntakeMixin, SessionCompactionMixin, LtmCaptureMixin,
+                        TurnDeletionMixin):
     """Owns the core generation engine: the multi-participant turn-rotation worker
     (_multi_profile_worker, defined here) plus the heartbeat/prompt-building/delivery/
     regeneration/speak/global-chat/whisper mixins (each in cogs/services/generation/) that
@@ -137,6 +140,149 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             surviving.sort(key=lambda t: 0 if (isinstance(t, tuple)
                                                and t[0] == 'game_beat') else 1)
         return surviving, beat_participant, beat_cast
+
+    #: Trigger kinds that name the participant who answers first, at index 2.
+    SPEAKER_NAMING_TRIGGERS = ('reply', 'reaction', 'reaction_single', 'child_mention', 'game_beat')
+
+    @classmethod
+    def _starting_override(cls, triggers):
+        """The participant the round's first trigger names, or None.
+
+        Read straight off the tuple, with no await, so the worker can settle who speaks
+        -- and put that participant's placeholder up -- before `_collect_round_triggers`
+        spends its network round trips. It is the same read that function makes at
+        index 0, so the two cannot disagree.
+        """
+        first = triggers[0] if triggers else None
+        if isinstance(first, tuple) and len(first) > 2 and first[0] in cls.SPEAKER_NAMING_TRIGGERS:
+            return first[2]
+        return None
+
+    def _select_round_speakers(self, session, initial_trigger, triggers, game_beat_participant,
+                               game_beat_cast, starting_profile_override):
+        """The round's speaking order: the roll, the override, the cap and the ephemeral seat.
+
+        Returns an empty list when nobody answers. Synchronous on purpose -- it reads only
+        the raw triggers and the cast -- because the first participant's placeholder is put
+        up on its result, before the trigger intake spends any network round trips. The
+        worker still runs that intake for an empty order, so a message nobody answers is
+        recorded all the same.
+        """
+        session_mode = session.get("session_mode", "sequential")
+
+        is_single_turn_only = False
+        if isinstance(initial_trigger, tuple) and initial_trigger[0] == 'reaction_single':
+            is_single_turn_only = True
+        elif game_beat_participant is not None and not game_beat_cast and all(
+                isinstance(t, tuple) and t[0] == 'game_beat'
+                for t in triggers if t is not None):
+            # A beat on its own is one character's moment, not a cue for the
+            # whole cast -- five profiles all reacting to one Draw Four is the
+            # noise the batched narrator was removed for. A beat batched with
+            # real conversation is different: the others are answering the
+            # people, not the card, so they keep their turn.
+            #
+            # A finale carries a cast, and is the one beat that is meant for all
+            # of them: the game has ended, and a table that empties in silence
+            # is what this whole path exists to prevent.
+            is_single_turn_only = True
+
+        trigger_content_lower = ""
+        for t in triggers:
+            if isinstance(t, discord.Message): trigger_content_lower += t.clean_content.lower() + " "
+            elif isinstance(t, tuple) and len(t) > 1:
+                if isinstance(t[1], discord.Message): trigger_content_lower += t[1].clean_content.lower() + " "
+                elif isinstance(t[1], dict) and 'content' in t[1]: trigger_content_lower += t[1]['content'].lower() + " "
+            elif isinstance(t, str): trigger_content_lower += t.lower() + " "
+
+        active_participants = []
+        for p in session['profiles']:
+            if p.get('is_skipped', False): continue
+            chance = p.get('chance', 100)
+            wakewords = p.get('wakewords', [])
+            will_respond = False
+            if wakewords and any(w.lower() in trigger_content_lower for w in wakewords if w.strip()):
+                will_respond = True
+            else:
+                will_respond = (random.randint(1, 100) <= chance)
+
+            if will_respond: active_participants.append(p)
+
+        # The seat the beat landed on speaks regardless of its response chance.
+        # A reaction that rolls a die against `chance` is a reaction that
+        # silently vanishes for the profile the table is looking at, and the
+        # beat has already been paid for by the time it reaches here. For a
+        # finale that is every seat that played, not just the lead -- the whole
+        # point of the aftermath is that the table answers it.
+        if game_beat_participant is not None:
+            for seated in (game_beat_cast or [game_beat_participant]):
+                if not any(p is seated for p in active_participants):
+                    active_participants.insert(0, seated)
+
+        if not active_participants:
+            return []
+
+        if starting_profile_override:
+            start_p = starting_profile_override
+            if start_p.get('is_skipped') or start_p not in active_participants:
+                start_p = active_participants[0]
+
+            if session_mode == 'sequential':
+                try:
+                    start_idx = session['profiles'].index(start_p)
+                    new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
+                    session['profiles'] = new_order
+                    self.cog.session_manager._save_multi_profile_sessions()
+                except ValueError: pass
+
+            if is_single_turn_only:
+                profile_order = [start_p]
+            else:
+                profile_order = [p for p in session['profiles'] if p in active_participants]
+                if session_mode == 'random':
+                    if start_p in profile_order: profile_order.remove(start_p)
+                    random.shuffle(profile_order)
+                    profile_order.insert(0, start_p)
+        else:
+            profile_order = [p for p in session['profiles'] if p in active_participants]
+            if session_mode == 'random':
+                random.shuffle(profile_order)
+            elif session.get('last_speaker_key'):
+                try:
+                    last_speaker_index = next(i for i, p in enumerate(session['profiles']) if (p['owner_id'], p['profile_name']) == session['last_speaker_key'])
+                    start_index = (last_speaker_index + 1) % len(session['profiles'])
+                    rotated = session['profiles'][start_index:] + session['profiles'][:start_index]
+                    profile_order = [p for p in rotated if p in active_participants]
+                except (ValueError, StopIteration): pass
+
+        # Apply response limit if set
+        max_responses = session.get("max_responses", 10)
+        if len(profile_order) > max_responses:
+            profile_order = profile_order[:max_responses]
+
+        # --- Ephemeral Participant Injection ---
+        ephemeral_participant = None
+        if isinstance(initial_trigger, tuple):
+            if initial_trigger[0] in ['child_mention']:
+                _, _, ephemeral_participant = initial_trigger
+            elif initial_trigger[0] == 'reply' and starting_profile_override and starting_profile_override.get('ephemeral'):
+                ephemeral_participant = starting_profile_override
+
+        if ephemeral_participant:
+            # For child bots, bot_id is the key. For parent bot (webhook), profile_name/owner_id is the key.
+            existing_permanent = None
+            if ephemeral_participant.get('method') == 'child_bot':
+                existing_permanent = next((p for p in profile_order if p.get('bot_id') == ephemeral_participant.get('bot_id')), None)
+            else:
+                existing_permanent = next((p for p in profile_order if p['owner_id'] == ephemeral_participant['owner_id'] and p['profile_name'] == ephemeral_participant['profile_name']), None)
+
+            if existing_permanent:
+                profile_order.remove(existing_permanent)
+                profile_order.insert(0, existing_permanent)
+            else:
+                profile_order.insert(0, ephemeral_participant)
+
+        return profile_order
 
     #: Sent to the channel and logged verbatim. Names the rating the way the dashboard
     #: does -- "Adult 18+", the content rating -- rather than the retired
@@ -303,6 +449,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     m = self.cog.api_service._instantiate_model(
                                         model_raw, guild_id, session.get("owner_id"),
                                         system_instruction=sys_instr,
+                                        config_owner_id=session.get("owner_id"),
                                         thinking_params=resolve_thinking_params(None, "utility"))
                                     hist_text = ""
                                     for ht in session.get("unified_log", [])[-10:]:
@@ -330,13 +477,19 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     p_index = self.cog.profile_manager._get_user_index(p['owner_id'])
                     p_is_b = p['profile_name'] in p_index.get("borrowed", [])
                     p_cfg = self.cog.profile_manager._get_profile_config(p['owner_id'], p['profile_name'], p_is_b) or {}
-                    if p_cfg.get("primary_model", "").upper().startswith("OLLAMA/"):
+                    if (p_cfg.get("primary_model", "").upper().startswith("OLLAMA/")
+                            and self.cog.profile_manager.may_use_ollama(p['owner_id'])):
                         has_ollama = True
                         break
                 
                 if not has_gemini and not has_openrouter and not has_ollama:
+                    # A free-tier Gemini key held back by the server's data policy is not
+                    # a missing key, and saying so would send someone to add one they have.
+                    notice = (GEMINI_FREE_TIER_BLOCKED
+                              if self.cog.storage_manager.gemini_blocked_for_guild(channel.guild.id)
+                              else "An API key has not been configured for this server. You can use the `/settings` command in my DM to set one.")
                     try:
-                        await channel.send("An API key has not been configured for this server. You can use the `/settings` command in my DM to set one.")
+                        await channel.send(notice)
                     except discord.Forbidden: pass
                     
                     # Mark triggers as done to prevent queue stalling
@@ -396,149 +549,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # [UPDATED] Use new_round_turn_data with tuple format
                         new_round_turn_data.append((director_prompt, None, []))
 
-                (is_image_gen_round, image_gen_prompt, starting_profile_override,
-                 round_author_name, triggering_user_id) = await self._collect_round_triggers(
-                    session, session_type, channel_id, all_triggers_for_round,
-                    new_round_turn_data, pending_url_fetches, recent_processed_ids,
-                    is_image_gen_round, image_gen_prompt, starting_profile_override,
-                    round_author_name, triggering_user_id,
-                )
-
-                for content_obj in new_round_turn_data:
-                    pass
-
-                profile_order = []
-                session_mode = session.get("session_mode", "sequential")
-                channel = self.cog.bot.get_channel(channel_id)
-
-                is_single_turn_only = False
-                if isinstance(initial_trigger, tuple) and initial_trigger[0] == 'reaction_single':
-                    is_single_turn_only = True
-                elif game_beat_participant is not None and not game_beat_cast and all(
-                        isinstance(t, tuple) and t[0] == 'game_beat'
-                        for t in all_triggers_for_round if t is not None):
-                    # A beat on its own is one character's moment, not a cue for the
-                    # whole cast -- five profiles all reacting to one Draw Four is the
-                    # noise the batched narrator was removed for. A beat batched with
-                    # real conversation is different: the others are answering the
-                    # people, not the card, so they keep their turn.
-                    #
-                    # A finale carries a cast, and is the one beat that is meant for all
-                    # of them: the game has ended, and a table that empties in silence
-                    # is what this whole path exists to prevent.
-                    is_single_turn_only = True
-
-                trigger_content_lower = ""
-                for t in all_triggers_for_round:
-                    if isinstance(t, discord.Message): trigger_content_lower += t.clean_content.lower() + " "
-                    elif isinstance(t, tuple) and len(t) > 1:
-                        if isinstance(t[1], discord.Message): trigger_content_lower += t[1].clean_content.lower() + " "
-                        elif isinstance(t[1], dict) and 'content' in t[1]: trigger_content_lower += t[1]['content'].lower() + " "
-                    elif isinstance(t, str): trigger_content_lower += t.lower() + " "
-
-                active_participants = []
-                for p in session['profiles']:
-                    if p.get('is_skipped', False): continue
-                    chance = p.get('chance', 100)
-                    wakewords = p.get('wakewords', [])
-                    will_respond = False
-                    if wakewords and any(w.lower() in trigger_content_lower for w in wakewords if w.strip()):
-                        will_respond = True
-                    else:
-                        will_respond = (random.randint(1, 100) <= chance)
-
-                    if will_respond: active_participants.append(p)
-
-                # The seat the beat landed on speaks regardless of its response chance.
-                # A reaction that rolls a die against `chance` is a reaction that
-                # silently vanishes for the profile the table is looking at, and the
-                # beat has already been paid for by the time it reaches here. For a
-                # finale that is every seat that played, not just the lead -- the whole
-                # point of the aftermath is that the table answers it.
-                if game_beat_participant is not None:
-                    for seated in (game_beat_cast or [game_beat_participant]):
-                        if not any(p is seated for p in active_participants):
-                            active_participants.insert(0, seated)
-
-                if not active_participants:
-                    for trigger in all_triggers_for_round:
-                        if trigger is not None: session['task_queue'].task_done()
-                    session['is_running'] = False
-                    continue
-
-                if starting_profile_override:
-                    start_p = starting_profile_override
-                    if start_p.get('is_skipped') or start_p not in active_participants:
-                        start_p = active_participants[0]
-
-                    if session_mode == 'sequential':
-                        try:
-                            start_idx = session['profiles'].index(start_p)
-                            new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
-                            session['profiles'] = new_order
-                            self.cog.session_manager._save_multi_profile_sessions()
-                        except ValueError: pass
-
-                    if is_single_turn_only:
-                        profile_order = [start_p]
-                    else:
-                        profile_order = [p for p in session['profiles'] if p in active_participants]
-                        if session_mode == 'random':
-                            if start_p in profile_order: profile_order.remove(start_p)
-                            random.shuffle(profile_order)
-                            profile_order.insert(0, start_p)
-                else:
-                    profile_order = [p for p in session['profiles'] if p in active_participants]
-                    if session_mode == 'random':
-                        random.shuffle(profile_order)
-                    elif session.get('last_speaker_key'):
-                        try:
-                            last_speaker_index = next(i for i, p in enumerate(session['profiles']) if (p['owner_id'], p['profile_name']) == session['last_speaker_key'])
-                            start_index = (last_speaker_index + 1) % len(session['profiles'])
-                            rotated = session['profiles'][start_index:] + session['profiles'][:start_index]
-                            profile_order = [p for p in rotated if p in active_participants]
-                        except (ValueError, StopIteration): pass
-
-                # Apply response limit if set
-                max_responses = session.get("max_responses", 10)
-                if len(profile_order) > max_responses:
-                    profile_order = profile_order[:max_responses]
-
-                # --- Ephemeral Participant Injection ---
-                ephemeral_participant = None
-                if isinstance(initial_trigger, tuple):
-                    if initial_trigger[0] in ['child_mention']:
-                        _, _, ephemeral_participant = initial_trigger
-                    elif initial_trigger[0] == 'reply' and starting_profile_override and starting_profile_override.get('ephemeral'):
-                        ephemeral_participant = starting_profile_override
-
-                if ephemeral_participant:
-                    # For child bots, bot_id is the key. For parent bot (webhook), profile_name/owner_id is the key.
-                    existing_permanent = None
-                    if ephemeral_participant.get('method') == 'child_bot':
-                        existing_permanent = next((p for p in profile_order if p.get('bot_id') == ephemeral_participant.get('bot_id')), None)
-                    else:
-                        existing_permanent = next((p for p in profile_order if p['owner_id'] == ephemeral_participant['owner_id'] and p['profile_name'] == ephemeral_participant['profile_name']), None)
-
-                    if existing_permanent:
-                        profile_order.remove(existing_permanent)
-                        profile_order.insert(0, existing_permanent)
-                    else:
-                        profile_order.insert(0, ephemeral_participant)
-
-                channel = self.cog.bot.get_channel(channel_id)
-                has_gemini = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id, "gemini")
-                has_openrouter = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id, "openrouter")
-                
-                if not has_gemini and not has_openrouter:
-                    try:
-                        await channel.send("An API key has not been configured for this server. You can use the `/settings` command in my DM to set one.")
-                    except discord.Forbidden: pass
-                    
-                    # Mark triggers as done to prevent queue stalling
-                    for trigger in all_triggers_for_round:
-                        if trigger is not None: session['task_queue'].task_done()
-                    continue
+                # Who speaks is settled before the trigger intake runs, not after it. The
+                # choice reads only the raw triggers and the cast, and the placeholder waits
+                # on it; the intake waits on the network.
+                starting_profile_override = self._starting_override(all_triggers_for_round)
+                profile_order = self._select_round_speakers(
+                    session, initial_trigger, all_triggers_for_round,
+                    game_beat_participant, game_beat_cast, starting_profile_override)
 
                 # --- Age-restriction gate, applied before any feedback is dispatched ---
                 # The per-participant loop below re-checks this and skips the turn, but the
@@ -547,7 +564,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 # silent. Worse, profile_order[0] could itself be blocked, so the placeholder
                 # wore the name and avatar of a profile that was never going to speak.
                 # Filtering first also collapses the refusal notice to one per profile per
-                # round instead of one per turn.
+                # round instead of one per turn. The notices themselves wait for the trigger
+                # intake, so each lands in unified_log after the message it answers.
                 blocked_participants = [
                     p for p in profile_order
                     if not self.cog.profile_manager._check_unrestricted_safety_policy(
@@ -555,52 +573,46 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 ]
                 if blocked_participants:
                     profile_order = [p for p in profile_order if p not in blocked_participants]
-                    seen_blocked = set()
-                    for p in blocked_participants:
-                        key = (p['owner_id'], p['profile_name'])
-                        if key in seen_blocked:
-                            continue
-                        seen_blocked.add(key)
-                        await self._refuse_age_restricted(session, channel, p['profile_name'])
+
+                # --- Synchronised Feedback Step ---
+                # As early as it can safely go. Everything that decides who speaks is settled
+                # above -- the drain, the withdrawn-reaction filter, the key gate, the roll
+                # and the age filter -- and none of it waits on the network. The trigger
+                # intake does (reply lookups, attachment downloads, a reaction's fetch and
+                # clear), so it runs below with the placeholder already up.
+                #
+                # _open_turn_feedback registers the container before it sends. Anything that
+                # ends the round between here and the first participant's turn -- a cancel,
+                # an error in grounding or image generation -- tears the placeholder down
+                # rather than leaving it in the channel.
+                pending_state_container = None
+                first_participant = profile_order[0] if profile_order else None
+                if first_participant:
+                    pending_state_container = await self._open_turn_feedback(
+                        session, channel, first_participant)
+
+                # Runs for an empty order too: a message nobody answers is still part of
+                # the conversation the next round reads.
+                (is_image_gen_round, image_gen_prompt, starting_profile_override,
+                 round_author_name, triggering_user_id) = await self._collect_round_triggers(
+                    session, session_type, channel_id, all_triggers_for_round,
+                    new_round_turn_data, pending_url_fetches, recent_processed_ids,
+                    is_image_gen_round, image_gen_prompt, starting_profile_override,
+                    round_author_name, triggering_user_id,
+                )
+
+                seen_blocked = set()
+                for p in blocked_participants:
+                    key = (p['owner_id'], p['profile_name'])
+                    if key in seen_blocked:
+                        continue
+                    seen_blocked.add(key)
+                    await self._refuse_age_restricted(session, channel, p['profile_name'])
 
                 if not profile_order:
                     for trigger in all_triggers_for_round:
                         if trigger is not None: session['task_queue'].task_done()
                     continue
-
-                # --- Synchronised Feedback Step ---
-                # Hoisted to here, directly after the channel and API-key guards. The three
-                # things a placeholder needs — a resolved channel, a valid key, and
-                # profile_order[0] for the webhook name and avatar — are all settled by this
-                # point, and the age-restriction filter above has already removed every
-                # participant that would decline to respond.
-                # It previously sat below the anchor-message resolution, so the user waited on
-                # a channel.fetch_message round trip before seeing any feedback at all.
-                first_participant = profile_order[0] if profile_order else None
-                first_placeholder_message = None
-                feedback_task = None
-
-                if first_participant:
-                    if first_participant.get('method') == 'child_bot':
-                        p_index = self.cog.profile_manager._get_user_index(first_participant['owner_id'])
-                        p_is_b = first_participant['profile_name'] in p_index.get("borrowed", [])
-                        fp_settings = self.cog.profile_manager._get_profile_config(first_participant['owner_id'], first_participant['profile_name'], p_is_b) or {}
-
-                        if fp_settings.get("child_bot_placeholder", False):
-                            custom_emoji = fp_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
-                            feedback_task = asyncio.create_task(self._send_child_bot_placeholder(first_participant['bot_id'], channel_id, custom_emoji))
-                        else:
-                            await self.cog.manager_queue.put({
-                                "action": "send_to_child", "bot_id": first_participant['bot_id'],
-                                "payload": {"action": "start_typing", "channel_id": channel_id}
-                            })
-                    else: # Webhook
-                        feedback_task = asyncio.create_task(self._send_channel_message(
-                            channel, f"{PLACEHOLDER_EMOJI}",
-                            profile_owner_id_for_appearance=first_participant['owner_id'],
-                            profile_name_for_appearance=first_participant['profile_name'],
-                            bypass_typing=True
-                        ))
 
                 # --- Whisper barrier ---
                 # A whisper claims the channel and everything else queues behind it. The
@@ -806,7 +818,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                          image_gen_placeholder_id,
                          image_gen_error_msg) = await self._run_image_generation_round(
                             session, channel, generator_profile_key, image_gen_prompt,
-                            generator_display_name, first_participant, feedback_task,
+                            generator_display_name, first_participant, pending_state_container,
                             new_round_turn_data, generated_image_path_for_round,
                             image_gen_placeholder_id, image_gen_error_msg,
                         )
@@ -843,7 +855,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     # outside the generation try/except, so an early failure used to reach
                     # them with the *previous* participant's container -- or, on the first
                     # participant, with none at all (UnboundLocalError).
-                    state_container = None
+                    #
+                    # Usually already open, with this participant's placeholder on its way:
+                    # the feedback step opens it for the first seat, the previous turn's
+                    # handoff for every later one. Taken here, so every exit below owns it.
+                    state_container = pending_state_container
+                    pending_state_container = None
                     # Same hazard, same fix, for the three the meta block reads. They are
                     # assigned deep inside the generation try/except -- the gather at the
                     # top of it, and the neuro extraction after the response lands -- so a
@@ -866,9 +883,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     is_ollama = p_settings.get("primary_model", "").upper().startswith("OLLAMA/")
                     
                     if not api_key and not or_key and not is_ollama:
+                        await self._abandon_state_container(channel, state_container, session=session)
                         if i == 0:
+                            notice = (GEMINI_FREE_TIER_BLOCKED
+                                      if self.cog.storage_manager.gemini_blocked_for_guild(channel.guild.id)
+                                      else "An API key must be configured on this server for sessions.")
                             try:
-                                await channel.send("An API key must be configured on this server for sessions.")
+                                await channel.send(notice)
                             except discord.Forbidden:
                                 pass
                         break
@@ -928,6 +949,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     # Backstop only. profile_order was filtered before the feedback step, so
                     # this fires only if the channel's age-restricted flag is flipped mid-round.
                     if not self.cog.profile_manager._check_unrestricted_safety_policy(owner_id, profile_name, channel):
+                        await self._abandon_state_container(channel, state_container, session=session)
                         await self._refuse_age_restricted(session, channel, profile_name)
                         continue
 
@@ -1000,46 +1022,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         msg_a_id = None
                         app_name, app_avatar = self._resolve_appearance_data(owner_id, profile_name)
                         
-                        feedback_task_i = None
-                        if i == 0:
-                            feedback_task_i = feedback_task
-                            # Adopt any placeholder the image-gen heartbeat created. It was sent
-                            # by profile_order[0]'s bot, which is this participant, so the
-                            # appearance already matches and the normal end-of-turn deletion
-                            # path picks it up once it is in state_container.
-                            if image_gen_placeholder_id:
-                                msg_a_id = image_gen_placeholder_id
-                        elif i > 0:
-                            if participant.get('method') == 'child_bot':
-                                if p_settings.get("child_bot_placeholder", False):
-                                    custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
-                                    feedback_task_i = asyncio.create_task(self._send_child_bot_placeholder(participant['bot_id'], channel_id, custom_emoji))
-                                else:
-                                    await self.cog.manager_queue.put({
-                                        "action": "send_to_child", "bot_id": participant['bot_id'],
-                                        "payload": {"action": "start_typing", "channel_id": channel_id}
-                                    })
-                            else:
-                                feedback_task_i = asyncio.create_task(self._send_channel_message(
-                                    channel, f"{PLACEHOLDER_EMOJI}",
-                                    profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name
-                                ))
-
-                        # Initialise the persistent state container before we generate any media
-                        custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
-                        state_container = {
-                            'msg_a_id': msg_a_id,
-                            'msg_b_id': None,
-                            'app_name': app_name,
-                            'app_avatar': app_avatar,
-                            'message_type': "text",
-                            'custom_emoji': custom_emoji,
-                            # Carried on the container so the round teardown can delete a
-                            # child bot's placeholder without the participant dict, which
-                            # it no longer has by the time it sweeps.
-                            'bot_id': participant.get('bot_id'),
-                            'placeholder_owned': True,
-                        }
+                        # Opened already unless the seat before this one left the loop
+                        # before its handoff. The first participant's container is also the
+                        # one the image round ticked, so a placeholder its heartbeat spawned
+                        # is already recorded here.
+                        if state_container is None:
+                            state_container = await self._open_turn_feedback(
+                                session, channel, participant, p_settings)
 
                         image_gen_error_msg = None
 
@@ -1119,6 +1108,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     session_transcript=session_transcript,
                                     instructions=self.cog.profile_manager.resolve_critic_instructions(
                                         owner_id, profile_name),
+                                    config_owner_id=owner_id,
                                 )
                                 if critic_constraints and critic_settings["persistence"] > 0:
                                     session["critic_cache"][participant_key] = {
@@ -1165,6 +1155,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 t_params_worker, model_tools, p_settings,
                                 openrouter_key_error=f"API Configuration Error: OpenRouter API Key missing for this server. Cannot load model '{primary_model}'.",
                                 google_key_error=f"API Configuration Error: Google API Key missing for this server. Cannot load model '{primary_model}'.",
+                                config_owner_id=owner_id,
                             )
                         except ValueError as e:
                             warning_message = str(e)
@@ -1267,24 +1258,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         fallback_used = False
                         api_error_reason = None
                         main_api_error = None
-                        # Persist the existing state container populated during image generation
-                        if state_container is None:
-                            custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
-                            state_container = {
-                                'msg_a_id': msg_a_id,
-                                'msg_b_id': None,
-                                'app_name': app_name,
-                                'app_avatar': app_avatar,
-                                'message_type': "text",
-                                'custom_emoji': custom_emoji,
-                                'bot_id': participant.get('bot_id'),
-                                'placeholder_owned': True,
-                            }
-
-                        # Published so /cancel can tell generation from delivery. Released
-                        # below, after the heartbeat is stopped and the placeholders are
-                        # gone -- releasing earlier would let a cancel land in the gap.
-                        self.cog.session_manager.register_in_flight(session, state_container)
                         
                         all_participant_names = []
                         for p_data_temp in session.get("profiles", []):
@@ -1305,23 +1278,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             all_participant_names.append(display_name_temp)
                         
                         try:
-                            if feedback_task_i:
-                                try:
-                                    feedback_result_i = await feedback_task_i
-                                    if participant.get('method') == 'child_bot' and p_settings.get("child_bot_placeholder", False):
-                                        if feedback_result_i:
-                                            try: first_placeholder_message = await channel.fetch_message(feedback_result_i)
-                                            except: pass
-                                            msg_a_id = feedback_result_i
-                                    else:
-                                        if feedback_result_i:
-                                            first_placeholder_message = feedback_result_i[0]
-                                            msg_a_id = first_placeholder_message.id
-                                            
-                                    if state_container:
-                                        state_container['msg_a_id'] = msg_a_id
-                                except Exception as e:
-                                    print(f"Feedback task error: {e}")
+                            # Waited on, never awaited directly: an await cancelled the send
+                            # along with the turn, losing the id of a message Discord had
+                            # already posted. The send records that id on the container itself.
+                            await self._await_turn_feedback(state_container)
+                            msg_a_id = state_container.get('msg_a_id')
 
                             # A primary that could not even be constructed is an error like any other,
                             # and has to reach the same handler. Reporting it here instead meant a
@@ -1382,7 +1343,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     # nothing for a profile that never set one.
                                     t_params_fb = resolve_thinking_params(p_settings, "response", "fallback")
                                     t_params_fb["thinking_persistence"] = t_params_worker.get("thinking_persistence", 10)
-                                    fallback_instance = self.cog.api_service._instantiate_model(fb_name, channel.guild.id, triggering_user_id, full_system_instruction, dynamic_safety_settings, t_params_fb, model_tools, p_settings)
+                                    fallback_instance = self.cog.api_service._instantiate_model(fb_name, channel.guild.id, triggering_user_id, full_system_instruction, dynamic_safety_settings, t_params_fb, model_tools, p_settings, config_owner_id=owner_id)
                                     
                                     response, state_container = await self._generate_with_heartbeat(
                                         fallback_instance, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
@@ -1885,11 +1846,15 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         
                         # [NEW] Dispatch extra audio follow-up for Webhook
                         if extra_audio_file:
-                            await self._send_channel_message(
+                            # Recorded like every other message the turn posts. It was the
+                            # one follow-up left off message_ids, so deleting or
+                            # regenerating the turn could never reach it.
+                            a_msgs = await self._send_channel_message(
                                 channel, "", file=extra_audio_file,
                                 profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name,
                                 bypass_typing=True
                             )
+                            if a_msgs: sent_messages.extend(a_msgs)
 
                         if thought_file_to_send:
                             t_msgs = await self._send_channel_message(
@@ -1951,7 +1916,15 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                         # Yield briefly to ensure Discord orders messages correctly
                         await asyncio.sleep(0.2)
-                        
+
+                        # The next seat's placeholder goes up here rather than at the top of
+                        # its turn, where it waited on the mid-round intake below (reply
+                        # lookups, URL fetches). Not before the sleep: a child bot's warnings
+                        # leave through manager_queue as background sends, and the sleep is
+                        # their head start on this placeholder.
+                        pending_state_container = await self._open_turn_feedback(
+                            session, channel, next_p)
+
                         batched_triggers = []
                         while not session['task_queue'].empty():
                             try: batched_triggers.append(session['task_queue'].get_nowait())

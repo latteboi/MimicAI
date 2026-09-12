@@ -11,6 +11,7 @@ from typing import List
 
 import httpx
 
+from ...utils.constants import OPENROUTER_DATA_POLICY_BLOCKED
 from ...utils.helpers import (
     resolve_openrouter_image_detail, resolve_openrouter_service_tier,
 )
@@ -22,7 +23,7 @@ from .streaming import _FILE_BLOB_TOKEN, _aiter_streamed_body, _plan_streamed_bo
 
 class OpenRouterModel:
     def __init__(self, model_name, api_key, system_instruction=None, thinking_params=None,
-                 image_detail=None, service_tier=None, **kwargs):
+                 image_detail=None, service_tier=None, data_collection=None, **kwargs):
         self.model_name = model_name.replace("OPENROUTER/", "").replace("GOOGLE/", "")
         self.api_key = api_key
         self.system_instruction = system_instruction
@@ -34,6 +35,10 @@ class OpenRouterModel:
         #: "flex", "priority" or None. Resolved once in `_instantiate_model` from the
         #: profile, so every OpenRouter slot the profile uses asks for the same tier.
         self.service_tier = service_tier
+        #: "deny" keeps the request off hosts that may train on prompts; None sends no
+        #: preference. Decided by the model factory from the data policy the request
+        #: answers to -- a server's, or a Global Chat's -- see cogs/utils/data_policy.
+        self.data_collection = data_collection
 
     async def generate_content_async(self, contents, generation_config=None, safety_settings=None, stream_state=None):
         messages = []
@@ -155,6 +160,14 @@ class OpenRouterModel:
         if advanced:
             payload.update(advanced)
 
+        # After the advanced splice, and merged into whatever `provider` object that
+        # carried, so no profile setting can reopen hosts the server's policy closed.
+        if self.data_collection:
+            provider = payload.get("provider")
+            provider = dict(provider) if isinstance(provider, dict) else {}
+            provider["data_collection"] = self.data_collection
+            payload["provider"] = provider
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "HTTP-Referer": "https://discord.com",
@@ -177,7 +190,13 @@ class OpenRouterModel:
             else:
                 response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=120.0)
             if response.status_code != 200:
-                raise Exception(f"OpenRouter API Error {response.status_code}: {response.text}")
+                err = Exception(f"OpenRouter API Error {response.status_code}: {response.text}")
+                # OpenRouter answers a request whose data policy no host can meet with
+                # "No endpoints found matching your data policy". Said plainly instead,
+                # and carried whole: _format_api_error would cut it at 80 characters.
+                if self.data_collection == "deny" and "data policy" in response.text.lower():
+                    err.formatted_reason = OPENROUTER_DATA_POLICY_BLOCKED
+                raise err
 
             data = response.json()
             if 'error' in data:

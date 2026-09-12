@@ -7,7 +7,8 @@ from .utils.constants import (
     GAME_CACHE_MAX_SIZE, PURGED_MESSAGE_ID_CACHE_MAX_SIZE,
     PURGE_BUSY_WAIT_TIMEOUT_SECONDS, SERVERS_DIR,
     SESSIONS_GLOBAL_DIR, SESSION_BUSY_FLAGS, TRAIN_ARMED_CACHE_MAX_SIZE, TRAIN_INPUT_EMOJI,
-    TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check, is_owner_in_dm_check,
+    TRAIN_COMMAND_ENABLED, TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check,
+    is_owner_in_dm_check,
 )
 from .services.api_service import OpenRouterModel, GoogleGenAIModel
 from .listeners.event_listeners import EventListeners
@@ -18,13 +19,15 @@ from .gui.gui_sessions import (
     GlobalChatPlayView, GlobalChatHistoryView, WhisperHistoryView, SessionSwapListView,
     SessionView, SessionConfigView, SessionAuditView
 )
-from .gui.gui_settings import SettingsHomeView, ParentPresenceView, ShutdownConfirmView
+from .gui.gui_settings import (SettingsHomeView, ParentPresenceView, ShutdownConfirmView,
+                                build_about_embed)
 from .gui.gui_profiles import ProfileManageView, BulkManageView
 from .gui.gui_resolve import (
     autocorrect_profile, gather_owned_candidates, gather_participant_candidates,
     suggest_profile,
 )
 from .gui.gui_mod import ModStatsView
+from .services.generation.turn_deletion import is_visible_turn
 from .managers.storage_manager import MasterCipher, StorageManager
 from .managers.profile_manager import ProfileManager
 from .managers.session_manager import DEFAULT_COMPACTION_CONFIG, SessionManager
@@ -48,9 +51,10 @@ import os
 import orjson as json
 import datetime
 import uuid
-from typing import List, Dict, Tuple, Set, Literal, Any, Optional, get_args
+from typing import List, Dict, FrozenSet, Tuple, Set, Literal, Any, Optional, get_args
 import traceback
 import time
+import math
 import platform
 from collections import OrderedDict
 import re
@@ -87,6 +91,13 @@ class LRUCache(OrderedDict):
 class MimicCog(EventListeners, commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        if not TRAIN_COMMAND_ENABLED:
+            # Dropped before add_cog hands the cog's commands to the tree, so /train is
+            # never registered while the method stays in place. discord.py 2.x copies the
+            # class's app commands onto each instance in Cog.__new__, which is the list
+            # _inject reads -- see TRAIN_COMMAND_ENABLED for why it is off.
+            self.__cog_app_commands__ = [
+                c for c in self.__cog_app_commands__ if c.name != "train"]
         self.manager_queue = bot.manager_queue
         self.cog_id = str(uuid.uuid4()) 
         self.has_lock = False
@@ -240,7 +251,21 @@ class MimicCog(EventListeners, commands.Cog):
         # than an orphan -- but it counts against GAME_MAX_CONCURRENT while it stands,
         # so it cannot be used to queue up more games than the instance will run.
         self.pending_lobbies: LRUCache = LRUCache(max_size=GAME_CACHE_MAX_SIZE)
-        self.global_blacklist: Set[int] = set()
+        # The blacklist is two things. `blacklist_records` is the operator's copy --
+        # scope, reason, actor, date, expiry -- and is read by the dashboard, the
+        # expiry sweep and the user's standing page, never on a gateway path. The frozensets below
+        # are what every enforcement site tests, so a check stays one `in` against a
+        # set however much detail a record grows. `_rebuild_blacklist_sets` is the
+        # only writer of all four; do not mutate them.
+        self.blacklist_records: Dict[str, Dict[str, Any]] = {"users": {}, "guilds": {}}
+        self.global_blacklist: FrozenSet[int] = frozenset()      # scope: full
+        self.generation_blocked: FrozenSet[int] = frozenset()    # full + generation
+        self.blocked_guilds_leave: FrozenSet[int] = frozenset()
+        self.quarantined_guilds: FrozenSet[int] = frozenset()
+        # The earliest `until` still standing, or inf. The heartbeat compares one float
+        # against this before doing anything, so an instance with no timed blocks pays
+        # nothing for having the sweep.
+        self._next_blacklist_expiry: float = math.inf
         self.server_manager._load_blacklist()
         self.session_last_accessed = {}
         self.eviction_heap = []
@@ -619,17 +644,15 @@ class MimicCog(EventListeners, commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
         await self.profile_manager._execute_import(interaction, file_bytes)
 
-    @app_commands.command(name="privacy", description="Manage your data privacy and account deletion.")
+    @app_commands.command(name="privacy", description="Export or delete your data, and see this server's data policy.")
     @app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
     async def privacy_slash(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        view = PrivacyDashboardView(self, interaction.user.id)
-        embed = discord.Embed(
-            title="Privacy & Data Dashboard",
-            description="Request a full export of your data or permanently delete your account and all associated profiles, memories, and settings.",
-            color=discord.Color.red()
-        )
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        # `get_guild`, not `interaction.guild`: only a server the bot is in has a data
+        # policy to show.
+        guild = self.bot.get_guild(interaction.guild_id) if interaction.guild_id else None
+        view = PrivacyDashboardView(self, interaction.user.id, guild)
+        await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="whoami", description="Displays information about this bot's identity.")
     @app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
@@ -642,7 +665,7 @@ class MimicCog(EventListeners, commands.Cog):
         )
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
         
-        embed.add_field(name="Version", value="v0.5.0 Beta", inline=True)
+        embed.add_field(name="Version", value="v0.6.0 Beta", inline=True)
         embed.add_field(name="Global Scope", value=f"{len(self.bot.guilds)} Servers", inline=True)
 
         if is_owner:
@@ -1481,72 +1504,26 @@ class MimicCog(EventListeners, commands.Cog):
             progress_message = await interaction.followup.send(f"Deleted {len(messages_to_delete)} message(s). Now cleaning them from my memory...", ephemeral=True)
 
             session = self.multi_profile_channels.get(interaction.channel_id)
-            cleaned_turns_count = 0
+            report = {"turns": 0, "messages": 0, "synopses": 0}
 
             if session:
-                session_type = session.get("type", "multi")
-                
+                # A purge window rarely ends on a turn boundary. A turn it clipped goes
+                # whole -- its other messages with it -- so nothing is left in the channel
+                # that no turn points at. See TurnDeletionMixin.
                 deleted_msg_ids = {m.id for m in messages_to_delete}
-                unified_log = session.get("unified_log", [])
-
-                # One pass, keeping the turn objects rather than only their ids. The
-                # counter decrement below used to re-scan the whole log once per deleted
-                # turn to find each object again -- O(deleted x log) for something the
-                # first pass already had in hand.
                 turns_to_delete = [
-                    turn for turn in unified_log
+                    turn for turn in session.get("unified_log", [])
                     if any(mid in deleted_msg_ids for mid in turn.get("message_ids", []))
                 ]
+                report = await self.generation_service.delete_turns(
+                    interaction.channel, session, turns_to_delete, already_gone=deleted_msg_ids)
 
-                if turns_to_delete:
-                    cleaned_turns_count = len(turns_to_delete)
-
-                    # speaker_pid -> participant, resolved once. This was previously a
-                    # linear scan of the participant list, with a name->pid lookup per
-                    # candidate, repeated for every deleted turn.
-                    pid_to_profile = {}
-                    for p in session.get('profiles', []):
-                        pid = self.profile_manager._get_pid_from_name_any(p['owner_id'], p['profile_name'])
-                        pid_to_profile.setdefault(pid, p)
-
-                    for turn_obj in turns_to_delete:
-                        if turn_obj.get("is_user") is False:
-                            p = pid_to_profile.get(turn_obj.get("speaker_pid"))
-                            if p:
-                                p['ltm_counter'] = max(0, p.get('ltm_counter', 0) - 1)
-
-                    # Filter by object identity, not by turn_id. A turn carrying no
-                    # turn_id contributed None to the old id set, and every *other*
-                    # turn without a turn_id then matched `not in` and was dropped with
-                    # it -- silently deleting history the purge never touched.
-                    doomed = {id(turn) for turn in turns_to_delete}
-                    original_log_len = len(unified_log)
-                    session["unified_log"] = [
-                        turn for turn in unified_log if id(turn) not in doomed
-                    ]
-
-                    if len(session["unified_log"]) < original_log_len:
-                        is_effectively_empty = not session.get("unified_log") or all(
-                            turn.get("type") in ["whisper", "private_response"] for turn in session.get("unified_log", [])
-                        )
-                        
-                        dummy_session_key = (interaction.channel_id, None, None)
-                        if is_effectively_empty:
-                            await self.session_manager._delete_session_from_disk(dummy_session_key, session_type)
-                            for p in session.get("profiles", []):
-                                full_session_key = (interaction.channel_id, p['owner_id'], p['profile_name'])
-                                self.ltm_recall_history.pop(full_session_key, None)
-                        else:
-                            await self.session_manager._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
-
-                        # Deleting turns can strand or reveal a pending whisper, which is
-                        # the only state a rebuild derives -- so recompute that directly
-                        # rather than re-reading the log we just wrote.
-                        self.session_manager._recompute_pending_whispers(session)
-
-                    self.session_last_accessed[interaction.channel_id] = time.time()
-
-            await progress_message.edit(content=f"Deleted {len(messages_to_delete)} message(s) and cleaned {cleaned_turns_count} turn(s) from memory.")
+            summary = f"Deleted {len(messages_to_delete)} message(s) and cleaned {report['turns']} turn(s) from memory."
+            if report["messages"]:
+                summary += f" {report['messages']} more message(s) belonging to those turns went with them."
+            if report["synopses"]:
+                summary += f" Dropped {report['synopses']} session synopsis(es) that still summarised them."
+            await progress_message.edit(content=summary)
 
         except Exception as e:
             await interaction.followup.send(f"An error occurred during purge: {e}", ephemeral=True)
@@ -1554,6 +1531,72 @@ class MimicCog(EventListeners, commands.Cog):
         finally:
             if session_lock:
                 session_lock['is_purging'] = False
+
+    @app_commands.command(name="delete", description="Deletes this session's latest turns, every message of each, from channel and memory (Admin Only).")
+    @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
+    @app_commands.guild_only()
+    @is_admin_or_owner_check()
+    @app_commands.describe(amount="Turns to delete, newest first (1-100).")
+    async def delete_slash(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]):
+        """/purge counts messages; this counts turns, as the channel shows them.
+
+        A turn is one line of the conversation however many messages carried it -- the
+        reply, its overflow, citations, warnings, files. Only turns the channel can see
+        count: whispers, private responses and synopses are skipped and left in place.
+        """
+        if not self.has_lock: return
+        await interaction.response.defer(ephemeral=True)
+
+        if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+            await interaction.followup.send("Delete is not supported in this channel type.", ephemeral=True)
+            return
+        app_perms = interaction.app_permissions
+        if not app_perms or not app_perms.manage_messages:
+            await interaction.followup.send("I lack 'Manage Messages' permission.", ephemeral=True)
+            return
+
+        session = self.multi_profile_channels.get(interaction.channel_id)
+        if session and not session.get("is_hydrated"):
+            session = await self.session_manager._ensure_session_hydrated(
+                interaction.channel_id, session.get("type", "multi"))
+        if not session:
+            await interaction.followup.send("There is no session in this channel.", ephemeral=True)
+            return
+        # Two rewrites of one log must not overlap, and whichever finished first would
+        # release the flag out from under the other.
+        if session.get('is_purging'):
+            await interaction.followup.send(
+                "A purge or delete is already running in this channel. Try again in a moment.",
+                ephemeral=True)
+            return
+
+        session['is_purging'] = True
+        try:
+            # Everything but is_purging, which this has just claimed for itself.
+            if not await self.session_manager._wait_for_session_flags(
+                    session, tuple(f for f in SESSION_BUSY_FLAGS if f != 'is_purging'),
+                    PURGE_BUSY_WAIT_TIMEOUT_SECONDS):
+                await interaction.followup.send(
+                    f"The session is still generating after {int(PURGE_BUSY_WAIT_TIMEOUT_SECONDS)}s. "
+                    "Nothing was deleted \u2014 try again in a moment.", ephemeral=True)
+                return
+
+            visible = [turn for turn in session.get("unified_log", []) if is_visible_turn(turn)]
+            doomed = visible[-amount:]
+            if not doomed:
+                await interaction.followup.send("There are no turns to delete in this channel.", ephemeral=True)
+                return
+
+            report = await self.generation_service.delete_turns(interaction.channel, session, doomed)
+            summary = f"Deleted {report['turns']} turn(s) and {report['messages']} message(s)."
+            if report["synopses"]:
+                summary += f" Dropped {report['synopses']} session synopsis(es) that still summarised them."
+            await interaction.followup.send(summary, ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"An error occurred while deleting: {e}", ephemeral=True)
+            traceback.print_exc()
+        finally:
+            session['is_purging'] = False
 
     @app_commands.command(name="memorise", description="Forces long-term memory summarisation for this session's cast, right now (Admin Only).")
     @app_commands.checks.cooldown(2, 60.0, key=lambda i: i.user.id)
@@ -1694,7 +1737,7 @@ class MimicCog(EventListeners, commands.Cog):
 
     @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
     async def view_generation_trace(self, interaction: discord.Interaction, message: discord.Message):
-        if not self.has_lock: return
+        if not self.has_lock or self._refused_by_blacklist(interaction): return
         await interaction.response.defer(ephemeral=True)
             
         channel_id = message.channel.id
@@ -2056,7 +2099,7 @@ class MimicCog(EventListeners, commands.Cog):
             # --- Execute Pipeline ---
             try:
                 # Intentionally passing None for tools to strictly disable grounding/fetching overrides
-                model_instance = self.api_service._instantiate_model(model_to_use, guild_id, owner_id, sys_prompt, d_safe, t_params_worker, None, p_config)
+                model_instance = self.api_service._instantiate_model(model_to_use, guild_id, owner_id, sys_prompt, d_safe, t_params_worker, None, p_config, config_owner_id=owner_id)
                 resp = await model_instance.generate_content_async(contents_for_api_call, generation_config=gen_config)
                 
                 if not resp or not resp.candidates:
@@ -2066,7 +2109,7 @@ class MimicCog(EventListeners, commands.Cog):
             except Exception as e:
                 try:
                     model_to_use = fallback_model_name
-                    model_instance = self.api_service._instantiate_model(model_to_use, guild_id, owner_id, sys_prompt, d_safe, t_params_worker, None, p_config)
+                    model_instance = self.api_service._instantiate_model(model_to_use, guild_id, owner_id, sys_prompt, d_safe, t_params_worker, None, p_config, config_owner_id=owner_id)
                     resp = await model_instance.generate_content_async(contents_for_api_call, generation_config=gen_config)
                     
                     if not resp or not resp.candidates:
@@ -2144,6 +2187,7 @@ class MimicCog(EventListeners, commands.Cog):
             f"MimicAI Terms of Service & Privacy Policy · Effective {LEGAL_EFFECTIVE_DATE}",
             link_button_label="View on mimic-ai.org",
             link_button_url="https://mimic-ai.org/")
+        view.block_exempt = True
         await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="invite", description="Get the invite link to add MimicAI to your server.")
@@ -2194,34 +2238,18 @@ class MimicCog(EventListeners, commands.Cog):
             return
             
         await interaction.response.defer(ephemeral=True)
+        if interaction.user.id in self.generation_blocked:
+            await interaction.edit_original_response(
+                embed=build_about_embed(self, interaction.user.id))
+            return
         view = SettingsHomeView(self, interaction)
         await view.update_display()
 
     def _record_model_usage(self, model_name: str, provider: str):
         if not model_name or provider == "google": return
         if "OLLAMA/" in model_name.upper() or provider == "ollama": return
-        
-        filename = "openrouter_models.json"
-        path = os.path.join(self.MODELS_DATA_DIR, filename)
-        
-        try:
-            data = {}
-            if os.path.exists(path):
-                try:
-                    with open(path, 'rb') as f:
-                        content = f.read()
-                        if content.strip():
-                            data = json.loads(content)
-                except Exception:
-                    data = {}
-            
-            clean_name = model_name.replace("OPENROUTER/", "")
-            data[clean_name] = data.get(clean_name, 0) + 1
-            
-            with open(path, 'wb') as f:
-                f.write(json.dumps(data))
-        except Exception as e:
-            print(f"Error recording model usage: {e}")
+        # Held in memory and written now and then -- see APIService.record_openrouter_use.
+        self.api_service.record_openrouter_use(model_name.replace("OPENROUTER/", ""))
 
     def _log_api_call(self, user_id: int, guild_id: Optional[int], context: str, model_used: Any, status: str):
         if status == "success":
@@ -2540,6 +2568,15 @@ class MimicCog(EventListeners, commands.Cog):
     @tasks.loop(seconds=LOCK_REFRESH_INTERVAL_SECONDS)
     async def refresh_lock_task(self):
         if self.has_lock:
+            # Timed blocks expire here rather than on the daily cleanup: a block that
+            # lifts up to 24 hours after the operator said it should is not a temporary
+            # block. The float compare is the whole cost on an instance that has none.
+            if time.time() >= self._next_blacklist_expiry:
+                try:
+                    await asyncio.to_thread(self.server_manager.expire_blacklist)
+                except Exception as e:
+                    print(f"Error expiring blacklist entries: {e}")
+
             try:
                 await asyncio.to_thread(self._write_lock_file)
             except IOError as e:
@@ -2563,6 +2600,11 @@ class MimicCog(EventListeners, commands.Cog):
         await asyncio.to_thread(self._try_acquire_lock)
         if self.has_lock:
             print(f"MimicCog {self.cog_id} acquired lock on retry and is now ACTIVE.")
+            # A standby loaded the blacklist once, at boot, and has been watching the
+            # active instance edit it ever since. Taking over on that copy enforces
+            # whatever the file said hours ago -- and misses every block made since.
+            await asyncio.to_thread(self.server_manager._load_blacklist)
+            await self.server_manager.enforce_guild_blocks()
             if not self.refresh_lock_task.is_running():
                 self.refresh_lock_task.start()
             self.reacquire_lock_task.cancel()

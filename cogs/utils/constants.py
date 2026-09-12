@@ -137,6 +137,44 @@ DEFAULT_SYSTEM_INSTRUCTION = "."
 
 DEFAULT_SYSTEM_INSTRUCTION = "."
 OLLAMA_LOCAL_URL = "http://127.0.0.1:11434"
+# Ollama is a URL the bot dials with every message a profile sees -- other members'
+# messages and names included. Only the bot owner may configure it, so that URL is always
+# the instance operator's own machine and never a third party's; see
+# ProfileManager.may_use_ollama, which the model factory and the pickers both ask.
+OLLAMA_OWNER_ONLY = (
+    "Ollama models can only be used by this bot's owner. Choose a Google or OpenRouter "
+    "model in `/profile manage` -> Params -> Set Models."
+)
+
+# --- Providers that train on what they are sent -------------------------------------
+# Discord's Developer Policy forbids using message content to train AI models without
+# Discord's permission, and its Developer Terms allow API Data to be shared only with a
+# Service Provider that uses it for no purpose of its own. Google's free (unpaid) Gemini
+# tier and OpenRouter hosts that may train both fail that test, so a conversation is kept
+# off them: a server's traffic unless the bot owner opts the server in (from /privacy),
+# and a Global Chat unless its card was opened in a server so opted in. Those terms bind
+# the developer, not a server, so no server administrator can. A DM is a command centre
+# with no conversation: what it sends a provider is its own user's input under their own
+# key, and is not gated.
+GEMINI_FREE_TIER_BLOCKED = (
+    "The Google key in use here is on Gemini's free tier. Google may train its models on "
+    "what a free-tier key is sent, so it is not used for conversations in a server or in "
+    "Global Chat. Assign a billing-enabled (paid) key in `/settings`."
+)
+GEMINI_FREE_TIER_KEY_REFUSED = (
+    "This Google key is on Gemini's free tier, which Google may use to train its models, so "
+    "it was not saved. Submit a billing-enabled (paid) key. If billing is already on for "
+    "this key, try again in a few minutes."
+)
+OPENROUTER_DATA_POLICY_BLOCKED = (
+    "No OpenRouter host serves this model without the right to train on prompts, so it "
+    "cannot be used here. Choose another model in `/profile manage` -> Params -> Set Models."
+)
+#: What a typed model id meets when the dropdown would not have offered it.
+OPENROUTER_TRAINING_MODEL_HIDDEN = (
+    "No OpenRouter host is known to serve this model without training on prompts, so it "
+    "is not offered here. Choose another model."
+)
 
 # Define the allowed models for the new command
 ALLOWED_MODELS = Literal[
@@ -596,6 +634,38 @@ CHILD_BOTS_DIR = os.path.join(DATA_DIR, "child_bots")
 COG_LOCK_FILE_PATH = os.path.join(os.path.dirname(__file__), "gemini_agent.lock")  
 USERS_DIR = os.path.join(DATA_DIR, "users")
 BLACKLIST_FILE_PATH = os.path.join(MOD_DATA_DIR, "blacklist.json")
+#: Plaintext, like index.json and borrows.json: it holds Discord ids, a date and a short
+#: operator-written reason, and it must stay readable when the master key is the thing
+#: that has gone wrong. Nothing a user wrote is in it.
+#:
+#: The file was a bare list of user ids until v2. `_load_blacklist` still takes that
+#: shape; `_save_blacklist` only ever emits v2, so the first write converts.
+BLACKLIST_FORMAT_VERSION = 2
+#: The scope an operator recorded. "generation" was meant to close only what spends a
+#: model call; it is enforced as "full" because most commands can reach one -- see
+#: EventListeners._refused_by_blacklist.
+BLACKLIST_SCOPE_FULL = "full"
+BLACKLIST_SCOPE_GENERATION = "generation"
+BLACKLIST_SCOPES = (BLACKLIST_SCOPE_FULL, BLACKLIST_SCOPE_GENERATION)
+BLACKLIST_SCOPE_LABELS = {
+    BLACKLIST_SCOPE_FULL: "Full block",
+    BLACKLIST_SCOPE_GENERATION: "Generation only",
+}
+#: What a blocked guild does. "leave" departs on join and on boot and keeps departing on
+#: re-invite; "quarantine" stays present and refuses to generate, which leaves a channel
+#: to explain in and is reversible without a re-invite.
+GUILD_BLOCK_LEAVE = "leave"
+GUILD_BLOCK_QUARANTINE = "quarantine"
+GUILD_BLOCK_ACTIONS = (GUILD_BLOCK_LEAVE, GUILD_BLOCK_QUARANTINE)
+GUILD_BLOCK_LABELS = {
+    GUILD_BLOCK_LEAVE: "Leave the server",
+    GUILD_BLOCK_QUARANTINE: "Quarantine (stay, refuse to generate)",
+}
+#: All a blocked user can reach: the terms they are held to, their own data (export and
+#: account deletion) and their standing. Everything else refuses without a word -- telling
+#: someone why they are blocked tells them what an alt has to avoid. Matched against
+#: `qualified_name`, so a subcommand that happens to share a name is not let through.
+BLACKLIST_EXEMPT_COMMANDS = frozenset({"privacy", "terms", "settings"})
 GLOBAL_PROMPTS_FILE_PATH = os.path.join(MOD_DATA_DIR, "system_prompts.json")
 
 COG_LOCK_FILE_PATH = os.path.join(COGS_BASE, "gemini_agent.lock")
@@ -674,6 +744,12 @@ PURGED_MESSAGE_ID_CACHE_MAX_SIZE = 512
 # bounded: generation_service and the reaction listeners all spin on is_purging, so an
 # unbounded wait here wedges the entire channel for the life of the process.
 PURGE_BUSY_WAIT_TIMEOUT_SECONDS = 30.0
+# How long a turn whose message was deleted mid-round waits for the channel to go idle
+# before the rest of it is deleted anyway. A turn gains message ids while it is being
+# delivered -- citations, warnings and files go out after the reply -- so deleting it
+# early leaves those later messages behind with nothing pointing at them. Generation
+# alone can run 240 s plus a 180 s fallback, so this sits above both.
+TURN_DELETE_DEFER_TIMEOUT_SECONDS = 600.0
 # A whisper is a blocking private turn. /whisper does not generate on top of a live round
 # -- it waits for the channel to go idle, then claims it, and everything else queues behind
 # it. Both directions of that wait are bounded for the reason directly above: a flag that
@@ -724,6 +800,13 @@ MUTE_TURN_EMOJI = ["🔇", "🔕"]
 SKIP_PARTICIPANT_EMOJI = ["❌", "✖️"]
 TRAIN_INPUT_EMOJI = "1️⃣"
 TRAIN_OUTPUT_EMOJI = "2️⃣"
+# /train is switched off, not removed. It let whoever armed a channel store anyone's
+# messages as examples on their own profile, where the people who wrote them could
+# neither see nor delete them -- at odds with Discord's Developer Terms on sharing and
+# deleting API Data. While False, MimicCog.__init__ drops the command before it reaches
+# the tree and the reaction listeners ignore 1️⃣/2️⃣. Examples typed on a profile's own
+# Training Examples screen are unaffected.
+TRAIN_COMMAND_ENABLED = False
 # Who may open a channel's session editor. Admin-only is the shipped behaviour and the
 # default, and absent means CLOSED -- every blueprint written before this field existed
 # keeps the access it was configured under rather than silently opening.

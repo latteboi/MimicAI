@@ -1,4 +1,4 @@
-from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_MODEL
+from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_MODEL, GEMINI_FREE_TIER_BLOCKED
 from ...utils.helpers import _format_api_error, _resolve_safety_settings
 from ...utils.memory_tuning import maybe_trim_malloc
 from ...utils import mem_probe
@@ -11,7 +11,7 @@ class ImageRoundMixin:
 
     async def _run_image_generation_round(
         self, session, channel, generator_profile_key, image_gen_prompt,
-        generator_display_name, first_participant, feedback_task, new_round_turn_data,
+        generator_display_name, first_participant, feedback_state, new_round_turn_data,
         generated_image_path_for_round=None, image_gen_placeholder_id=None, image_gen_error_msg=None,
     ):
         """Runs the round's one image generation and returns
@@ -25,6 +25,11 @@ class ImageRoundMixin:
 
         The three values are passed in and returned so a profile with image generation
         disabled leaves the caller's state exactly as it found it.
+
+        `feedback_state` is the first participant's state container, opened and
+        registered by the worker's feedback step. The image heartbeat ticks that same
+        container, so a placeholder it spawns is owned by the round from the moment it
+        exists -- a cancel during a thirty-second image call used to strand it.
         """
         gen_owner_id, gen_profile_name = generator_profile_key
         gen_idx = self.cog.profile_manager._get_user_index(gen_owner_id)
@@ -42,7 +47,9 @@ class ImageRoundMixin:
         response = None
         try:
             api_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id)
-            if not api_key: raise ValueError("Server API key not configured.")
+            if not api_key:
+                raise ValueError(GEMINI_FREE_TIER_BLOCKED if self.cog.storage_manager.gemini_blocked_for_guild(channel.guild.id)
+                                 else "Server API key not configured.")
 
             img_model_raw = gen_cfg.get("image_generation_model", DEFAULT_IMAGE_MODEL)
             img_fallback_raw = gen_cfg.get("image_generation_fallback_model")
@@ -90,30 +97,22 @@ class ImageRoundMixin:
             # seconds) and was the one path with no heartbeat: the placeholder
             # created above just sat as a static emoji until the image landed.
             # Resolve the placeholder id first so _generate_with_heartbeat has
-            # something to edit. Awaiting feedback_task here is safe — it is an
-            # asyncio.Task, so the later await in the participant loop returns
-            # the same cached result rather than re-running it.
-            img_msg_a_id = None
-            if feedback_task is not None:
-                try:
-                    fb_result = await feedback_task
-                    if fb_result:
-                        if first_participant and first_participant.get('method') == 'child_bot':
-                            img_msg_a_id = fb_result
-                        else:
-                            img_msg_a_id = fb_result[0].id
-                except Exception as e:
-                    print(f"Image-gen feedback task error: {e}")
-
+            # something to edit. _await_turn_feedback only waits: the participant
+            # loop waits on the same send later and finds it already recorded.
             gen_app_name, gen_app_avatar = self._resolve_appearance_data(gen_owner_id, gen_profile_name)
-            image_state_container = {
-                'msg_a_id': img_msg_a_id,
-                'msg_b_id': None,
-                'app_name': gen_app_name,
-                'app_avatar': gen_app_avatar,
-                'message_type': "text",
-                'custom_emoji': gen_cfg.get("placeholder_emoji") or PLACEHOLDER_EMOJI,
-            }
+            if feedback_state is not None:
+                await self._await_turn_feedback(feedback_state)
+                image_state_container = feedback_state
+            else:
+                image_state_container = {
+                    'msg_a_id': None,
+                    'msg_b_id': None,
+                    'app_name': gen_app_name,
+                    'app_avatar': gen_app_avatar,
+                    'message_type': "text",
+                    'custom_emoji': gen_cfg.get("placeholder_emoji") or PLACEHOLDER_EMOJI,
+                }
+            img_msg_a_id = image_state_container.get('msg_a_id')
 
             async def _attempt(raw_name, _is_fallback):
                 nonlocal image_model

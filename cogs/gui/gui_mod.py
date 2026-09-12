@@ -1,13 +1,15 @@
 from ..utils.constants import *
 
 import asyncio
+import time
 import discord
 from discord import ui
 import datetime
 from string import Formatter
 from typing import TYPE_CHECKING, Dict, List, Set, Tuple, Optional
 from ..utils.helpers import _sanitise_filename
-from .base_components import TabbedView, add_button, add_select, build_confirm_view
+from .base_components import (BlockedGuard, TabbedView, add_button, add_select,
+                              build_confirm_view)
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -223,89 +225,310 @@ class ModDocsView(ModBaseView):
     async def update_display(self):
         await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
 
-class ModBlacklistModal(ui.Modal, title="Enter User ID"):
-    user_id_input = ui.TextInput(label="Discord User ID", required=True)
-    def __init__(self, view):
-        super().__init__()
+def _parse_block_duration(raw: str) -> Optional[float]:
+    """"7d" / "12h" / "30m" -> an absolute epoch time. Blank or "0" means permanent.
+
+    Returns None for permanent *and* for anything unparseable, because the two want the
+    same outcome: a block the operator has to lift by hand. A typo must never shorten a
+    block, and there is no reading of "7x" that is safer than "until I say otherwise".
+    """
+    raw = (raw or "").strip().lower()
+    if not raw or raw == "0":
+        return None
+    units = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+    unit = units.get(raw[-1])
+    if unit is None:
+        return None
+    try:
+        amount = float(raw[:-1])
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+    return time.time() + amount * unit
+
+
+class ModBlockUserModal(ui.Modal):
+    user_id_input = ui.TextInput(label="Discord User ID", required=True, max_length=25)
+    reason_input = ui.TextInput(label="Reason", required=False, max_length=300,
+                                style=discord.TextStyle.paragraph,
+                                placeholder="Your note. Never shown to them.")
+    duration_input = ui.TextInput(label="Duration (30m / 12h / 7d — blank = permanent)",
+                                  required=False, max_length=10)
+
+    def __init__(self, view, scope: str):
+        super().__init__(title=f"Block User — {BLACKLIST_SCOPE_LABELS[scope]}")
         self.parent_view = view
-        
+        self.scope = scope
+
     async def on_submit(self, i: discord.Interaction):
         uid_str = self.user_id_input.value.strip()
         if not uid_str.isdigit():
             await i.response.send_message("Invalid ID. Must be numeric.", ephemeral=True)
             return
-            
+
         uid = int(uid_str)
-        if uid not in self.parent_view.cog.global_blacklist:
-            self.parent_view.cog.global_blacklist.add(uid)
-            self.parent_view.cog.server_manager._save_blacklist()
-            
-        self.parent_view.selected_user_id = uid
+        if uid == int(defaultConfig.DISCORD_OWNER_ID):
+            # Nothing else in the dashboard can be undone from a locked-out account.
+            await i.response.send_message(
+                "You cannot block the bot owner — nothing would be left to unblock it with.",
+                ephemeral=True)
+            return
+
+        self.parent_view.cog.server_manager.block_user(
+            uid, scope=self.scope, reason=self.reason_input.value.strip(),
+            by=i.user.id, until=_parse_block_duration(self.duration_input.value))
+
+        self.parent_view.selected_id = uid
+        self.parent_view.mode = "users"
         self.parent_view._build_view()
         await i.response.edit_message(embed=self.parent_view._get_embed(), view=self.parent_view)
 
-class ModBlacklistView(ModBaseView):
-    def __init__(self, cog, interaction, target_user_id: Optional[int] = None):
-        super().__init__(cog, interaction, "blacklist", target_user_id=target_user_id)
-        self.selected_user_id = None
-        self.current_page = 0
+
+class ModBlockGuildModal(ui.Modal):
+    guild_id_input = ui.TextInput(label="Discord Server ID", required=True, max_length=25)
+    reason_input = ui.TextInput(label="Reason", required=False, max_length=300,
+                                style=discord.TextStyle.paragraph)
+
+    def __init__(self, view, action: str):
+        super().__init__(title="Block Server — " + ("Leave" if action == GUILD_BLOCK_LEAVE
+                                                    else "Quarantine"))
+        self.parent_view = view
+        self.action = action
+
+    async def on_submit(self, i: discord.Interaction):
+        gid_str = self.guild_id_input.value.strip()
+        if not gid_str.isdigit():
+            await i.response.send_message("Invalid ID. Must be numeric.", ephemeral=True)
+            return
+
+        gid = int(gid_str)
+        cog = self.parent_view.cog
+        cog.server_manager.block_guild(gid, action=self.action,
+                                       reason=self.reason_input.value.strip(), by=i.user.id)
+
+        self.parent_view.selected_id = gid
+        self.parent_view.mode = "guilds"
+        self.parent_view._build_view()
+        await i.response.edit_message(embed=self.parent_view._get_embed(), view=self.parent_view)
+
+        # After the repaint, not before: leaving tears down sessions and talks to every
+        # child bot, and the dashboard should not sit on an unacknowledged interaction
+        # for the length of that.
+        if self.action == GUILD_BLOCK_LEAVE:
+            guild = cog.bot.get_guild(gid)
+            if guild:
+                await cog.server_manager.leave_blocked_guild(guild)
+
+
+class ModBanEffectsView(BlockedGuard, ui.View):
+    """The opt-in half of a ban: what to do about the things that outlive the person.
+
+    Blocking someone stops them talking to the bot. It does not stop their child bots
+    speaking, their published profiles being borrowed, or the sessions their profiles
+    are seated in from rotating -- none of those paths asks who owns them. Each is a
+    separate decision because each has a different cost, and unpublishing in particular
+    cannot be undone from here.
+    """
+
+    def __init__(self, cog, user_id: int):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.user_id = user_id
+        self.effects = {"stop_bots": False, "unpublish": False, "suspend_sessions": False}
         self._build_view()
+
+    LABELS = (("stop_bots", "Stop their child bots"),
+              ("unpublish", "Unpublish from Public Library"),
+              ("suspend_sessions", "Suspend sessions they are seated in"))
 
     def _build_view(self):
         self.clear_items()
-        
-        blacklist = sorted(list(self.cog.global_blacklist))
-        
-        async def enter_cb(i: discord.Interaction):
-            await i.response.send_modal(ModBlacklistModal(self))
-        add_button(self, "Enter User ID", enter_cb, style=discord.ButtonStyle.primary, row=0)
-        
-        async def remove_cb(i: discord.Interaction):
-            if self.selected_user_id in self.cog.global_blacklist:
-                self.cog.global_blacklist.discard(self.selected_user_id)
-                self.cog.server_manager._save_blacklist()
-            self.selected_user_id = None
+        for key, label in self.LABELS:
+            async def cb(i: discord.Interaction, key=key):
+                self.effects[key] = not self.effects[key]
+                self._build_view()
+                await i.response.edit_message(view=self)
+            add_button(self, f"{'☑' if self.effects[key] else '☐'} {label}", cb,
+                       row=self.LABELS.index((key, label)),
+                       style=(discord.ButtonStyle.primary if self.effects[key]
+                              else discord.ButtonStyle.secondary))
+
+        async def apply_cb(i: discord.Interaction):
+            await i.response.defer()
+            applied = await self.cog.server_manager.apply_ban_effects(
+                self.user_id, **self.effects)
+            await i.edit_original_response(
+                content="\n".join(applied) if applied else "Nothing selected.", view=None)
+
+        add_button(self, "Apply", apply_cb, row=3, style=discord.ButtonStyle.danger,
+                   disabled=not any(self.effects.values()))
+
+
+class ModBlacklistView(ModBaseView):
+    """Users and servers, in one screen.
+
+    The two lists are the same shape and the same gestures, and a server block is
+    something the operator reaches for in the same moment as a user block -- one guild
+    inviting fresh accounts is the case a per-user list cannot answer on its own.
+    """
+
+    #: The two halves, in order. These are the record's own section keys, not display
+    #: names -- see _records.
+    MODES = ("users", "guilds")
+
+    def __init__(self, cog, interaction, target_user_id: Optional[int] = None):
+        super().__init__(cog, interaction, "blacklist", target_user_id=target_user_id)
+        self.mode = self.MODES[0]
+        self.selected_id = None
+        self.current_page = 0
+        self._build_view()
+
+    def _records(self) -> Dict[str, Dict]:
+        """The mode is the record key, deliberately -- a second spelling for the same
+        thing renders an empty list rather than an error."""
+        return self.cog.blacklist_records.get(self.mode, {})
+
+    def _entry(self, entry_id: int) -> Optional[Dict]:
+        return self._records().get(str(entry_id))
+
+    def _label_for(self, entry_id: int, entry: Dict) -> str:
+        if self.mode == "users":
+            user = self.cog.bot.get_user(entry_id)
+            name = user.name if user else "Unknown User"
+            marker = "⏳" if entry.get("until") else ""
+        else:
+            guild = self.cog.bot.get_guild(entry_id)
+            name = guild.name if guild else "Unknown Server"
+            marker = "🚪" if entry.get("action") == GUILD_BLOCK_LEAVE else "🔇"
+        return f"{marker} {name} ({entry_id})".strip()
+
+    def _build_view(self):
+        self.clear_items()
+        is_users = self.mode == "users"
+
+        async def mode_cb(i: discord.Interaction):
+            self.mode = "guilds" if is_users else "users"
+            self.selected_id = None
+            self.current_page = 0
             self._build_view()
             await i.response.edit_message(embed=self._get_embed(), view=self)
-        add_button(self, "Remove", remove_cb, style=discord.ButtonStyle.danger, row=0,
-                   disabled=self.selected_user_id is None)
-        
-        if blacklist:
-            num_pages = (len(blacklist) - 1) // DROPDOWN_MAX_OPTIONS + 1
-            if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
-            
+        add_button(self, "Servers ▶" if is_users else "◀ Users", mode_cb, row=0,
+                   style=discord.ButtonStyle.secondary)
+
+        if is_users:
+            for scope in BLACKLIST_SCOPES:
+                async def block_cb(i: discord.Interaction, scope=scope):
+                    await i.response.send_modal(ModBlockUserModal(self, scope))
+                add_button(self, f"Block ({BLACKLIST_SCOPE_LABELS[scope]})", block_cb, row=0,
+                           style=discord.ButtonStyle.primary)
+        else:
+            for action in GUILD_BLOCK_ACTIONS:
+                async def gblock_cb(i: discord.Interaction, action=action):
+                    await i.response.send_modal(ModBlockGuildModal(self, action))
+                add_button(self, "Block (Leave)" if action == GUILD_BLOCK_LEAVE
+                           else "Block (Quarantine)", gblock_cb, row=0,
+                           style=discord.ButtonStyle.primary)
+
+        entries = sorted(self._records().items(), key=lambda kv: kv[0])
+        if entries:
+            num_pages = (len(entries) - 1) // DROPDOWN_MAX_OPTIONS + 1
+            if self.current_page >= num_pages:
+                self.current_page = max(0, num_pages - 1)
+
             start = self.current_page * DROPDOWN_MAX_OPTIONS
-            page_items = blacklist[start : start + DROPDOWN_MAX_OPTIONS]
-            
             options = []
-            for uid in page_items:
-                user = self.cog.bot.get_user(uid)
-                uname = user.name if user else "Unknown User"
-                options.append(discord.SelectOption(label=f"{uname} ({uid})", value=str(uid), default=(self.selected_user_id == uid)))
-                
-            async def sel_cb(i: discord.Interaction):
-                self.selected_user_id = int(i.data['values'][0])
-                self._build_view()
-                await i.response.edit_message(embed=self._get_embed(), view=self)
-            add_select(self, options, sel_cb, placeholder="Select a blacklisted user...", row=1)
+            for id_str, entry in entries[start:start + DROPDOWN_MAX_OPTIONS]:
+                try:
+                    entry_id = int(id_str)
+                except ValueError:
+                    continue
+                options.append(discord.SelectOption(
+                    label=self._label_for(entry_id, entry)[:100], value=id_str,
+                    default=(self.selected_id == entry_id)))
+
+            if options:
+                async def sel_cb(i: discord.Interaction):
+                    self.selected_id = int(i.data['values'][0])
+                    self._build_view()
+                    await i.response.edit_message(embed=self._get_embed(), view=self)
+                add_select(self, options, sel_cb, row=1,
+                           placeholder=f"Select a blocked {'user' if is_users else 'server'}...")
 
             if num_pages > 1:
                 self._add_page_controls(num_pages, 2)
 
+        async def remove_cb(i: discord.Interaction):
+            if self.selected_id is not None:
+                if is_users:
+                    self.cog.server_manager.unblock_user(self.selected_id)
+                else:
+                    self.cog.server_manager.unblock_guild(self.selected_id)
+            self.selected_id = None
+            self._build_view()
+            await i.response.edit_message(embed=self._get_embed(), view=self)
+        add_button(self, "Remove", remove_cb, row=3, style=discord.ButtonStyle.danger,
+                   disabled=self.selected_id is None)
+
+        if is_users:
+            async def effects_cb(i: discord.Interaction):
+                await i.response.send_message(
+                    f"Effects to apply for `{self.selected_id}`. None of these is undone "
+                    f"by unblocking them.",
+                    view=ModBanEffectsView(self.cog, self.selected_id), ephemeral=True)
+            add_button(self, "Ban Effects...", effects_cb, row=3,
+                       disabled=self.selected_id is None)
+
         self._add_nav_buttons()
 
     def _get_embed(self):
-        embed = discord.Embed(title="Global Blacklist", color=discord.Color.dark_red())
-        if self.selected_user_id:
-            user = self.cog.bot.get_user(self.selected_user_id)
-            uname = user.name if user else "Unknown User"
-            embed.description = f"Selected User: **{uname}** (`{self.selected_user_id}`)\nClick 'Remove' to pardon them."
+        is_users = self.mode == "users"
+        embed = discord.Embed(
+            title="Blocked Users" if is_users else "Blocked Servers",
+            color=discord.Color.dark_red())
+
+        entry = self._entry(self.selected_id) if self.selected_id is not None else None
+        if entry:
+            lines = [f"**{self._label_for(self.selected_id, entry)}**"]
+            if is_users:
+                lines.append("Scope: "
+                             f"`{BLACKLIST_SCOPE_LABELS.get(entry.get('scope'), 'Full block')}`")
+            else:
+                lines.append("Action: "
+                             f"`{GUILD_BLOCK_LABELS.get(entry.get('action'), 'Leave the server')}`")
+            lines.append(f"Reason: {entry.get('reason') or '*none recorded*'}")
+            if entry.get("at"):
+                lines.append(f"Blocked: `{entry['at'][:19].replace('T', ' ')} UTC`")
+            if entry.get("by"):
+                lines.append(f"By: <@{entry['by']}>")
+            if entry.get("until"):
+                lines.append(f"Lifts: <t:{int(entry['until'])}:R>")
+            lines.append("\nUse 'Remove' to lift this block.")
+            embed.description = "\n".join(lines)
         else:
-            embed.description = f"Total Blacklisted Users: **{len(self.cog.global_blacklist)}**\nEnter a User ID to add them to the blacklist, or select an existing one below to remove them."
+            total = len(self._records())
+            if is_users:
+                embed.description = (
+                    f"Blocked users: **{total}**\n\n"
+                    "A blocked user is never told. They keep `/privacy`, `/terms`, and a "
+                    "`/settings` page showing that they are restricted and the dates — "
+                    "not the reason, and not who set it.\n\n"
+                    f"**{BLACKLIST_SCOPE_LABELS[BLACKLIST_SCOPE_GENERATION]}** is enforced "
+                    "as a full block for now: most commands can reach a model call.\n\n"
+                    "Blocks may be temporary; they lift on their own within 30 seconds of "
+                    "expiring.")
+            else:
+                embed.description = (
+                    f"Blocked servers: **{total}**\n\n"
+                    "🚪 **Leave** — departs now, on re-invite, and on boot; child bots go "
+                    "too.\n"
+                    "🔇 **Quarantine** — stays, generates nothing. Reversible without a "
+                    "re-invite.")
         return embed
 
     async def update_display(self):
         await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
+
 
 class ModStatsView(ModBaseView):
     def __init__(self, cog, interaction, target_user_id: Optional[int] = None):

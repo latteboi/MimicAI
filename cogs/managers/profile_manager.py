@@ -1424,10 +1424,11 @@ class ProfileManager:
         any chance of running, and an unassigned key is a step in `/start`, not a
         reason to rewrite someone's model choice out from under them.
 
-        Ollama needs no key at all -- it is a URL the bot dials -- so it always holds.
+        Ollama needs no key -- it is a URL the bot dials -- so it holds for whoever may
+        use it at all, which is the bot owner alone (see `may_use_ollama`).
         """
         if provider == "ollama":
-            return True
+            return self.may_use_ollama(user_id)
         try:
             keys_data = self.cog.storage_manager._get_user_keys_data(user_id) or {}
         except Exception:
@@ -1435,6 +1436,20 @@ class ProfileManager:
         return any(slot.get("provider") == provider and slot.get("key")
                    for slot in (keys_data.get("slots") or {}).values()
                    if isinstance(slot, dict))
+
+    @staticmethod
+    def may_use_ollama(user_id: Optional[int]) -> bool:
+        """Only the bot owner may configure or run Ollama models.
+
+        An Ollama host receives every message the profile sees, other members' included,
+        so it has to be the instance operator's own machine -- see OLLAMA_OWNER_ONLY. The
+        model factory asks this with the owner of the config that chose the model, and
+        refuses when it cannot tell whose that is.
+        """
+        try:
+            return user_id is not None and int(user_id) == int(defaultConfig.DISCORD_OWNER_ID)
+        except (TypeError, ValueError):
+            return False
 
     def _rescue_unusable_models(self, user_id: int, config: Dict[str, Any]) -> List[str]:
         """Repoints model slots naming a provider this user has no key for.
@@ -2123,22 +2138,30 @@ class ProfileManager:
             except Exception as e:
                 print(f"Error in cascade delete for user {user_id_str}: {e}")
 
-    def _classifier_api_key(self, owner_id: int, provider: str) -> Optional[str]:
-        """Personal -> instance-owner key for the classifier.
+    def _classifier_api_key(self, owner_id: int, provider: str) -> Tuple[Optional[str], bool]:
+        """Personal -> instance-owner key for the classifier, and whether it is the owner's.
 
         The auto-moderator only ever tried the personal key, which was fine while
         the only caller was publishing. Classification runs for every profile, so a
         user with no key of their own would otherwise never get a verdict. Guild
         keys are deliberately not used: a profile is not owned by a guild, and
         billing someone's server for another member's profile edit is surprising.
+
+        The fallback sends one user's profile to a provider on the operator's account
+        without that user having directed it, so it must not land where it may be
+        trained on (see cogs/utils/data_policy): a free-tier Gemini key is not used,
+        and the caller makes an OpenRouter request on it deny training hosts.
         """
-        key = self.cog.storage_manager._get_api_key_for_user(owner_id, provider)
+        storage = self.cog.storage_manager
+        key = storage._get_api_key_for_user(owner_id, provider)
         if key:
-            return key
+            return key, False
         bot_owner = int(defaultConfig.DISCORD_OWNER_ID)
-        if int(owner_id) != bot_owner:
-            return self.cog.storage_manager._get_api_key_for_user(bot_owner, provider)
-        return None
+        if int(owner_id) == bot_owner:
+            return None, False
+        if provider == "gemini" and not storage.personal_gemini_is_paid(bot_owner):
+            return None, False
+        return storage._get_api_key_for_user(bot_owner, provider), True
 
     async def _fetch_avatar_part(self, owner_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
         """The profile's avatar as an inline image part, or None.
@@ -2224,19 +2247,22 @@ class ProfileManager:
         model_name = None
         failures = []
         for provider, model_name, model_cls in attempts:
-            key = self._classifier_api_key(owner_id, provider)
+            key, on_operator_key = self._classifier_api_key(owner_id, provider)
             if not key:
-                # _get_api_key_for_user returns None both when no key is assigned for
-                # this provider AND when the assigned key is inside its rate-limit
-                # cooldown window. Both used to `continue` in silence, so a run that
-                # never reached a provider looked identical to one that failed at it.
-                failures.append(f"{provider}: no usable key (unassigned or rate-limit cooldown)")
+                # No key covers three cases: none assigned for this provider, the
+                # assigned key inside its rate-limit cooldown window, or the operator's
+                # free-tier Gemini key refused as a fallback. Recorded rather than
+                # skipped in silence, so a run that never reached a provider does not
+                # look identical to one that failed at it.
+                failures.append(f"{provider}: no usable key (unassigned, rate-limit cooldown, or a free-tier fallback)")
                 continue
             status = "api_error"
             try:
                 kwargs = {"api_key": key, "model_name": model_name, "system_instruction": prompt_text}
                 if model_cls is GoogleGenAIModel:
                     kwargs["safety_settings"] = DEFAULT_SAFETY_SETTINGS
+                elif on_operator_key:
+                    kwargs["data_collection"] = "deny"
                 model = model_cls(**kwargs)
                 response = await model.generate_content_async(payload, generation_config=gen_cfg)
                 if response and response.candidates:
@@ -3101,6 +3127,10 @@ class ProfileManager:
         # above never writes their index.json, so the reconcile in _save_user_index
         # cannot fire and both directions would otherwise survive the deletion.
         self._borrow_index_drop_user(user_id)
+
+        # Deliberately not touched: data/mod/blacklist.json. An enforcement record is
+        # about the account, not owned by it, and a ban that a user can lift by deleting
+        # and re-creating their profiles is not a ban. Privacy Policy 5 says so.
 
         # 5. Remove from In-Memory Dicts
         self.cog.user_indices.pop(user_id_str, None)

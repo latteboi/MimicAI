@@ -46,6 +46,12 @@ class EventListeners:
             self._member_probe_task = member_probe
 
         if self.has_lock:
+            # After start_all_child_bots above, so a blocked guild takes the children
+            # with it: each is its own gateway connection, and a parent that leaves
+            # alone leaves the profiles talking through their own bots. Covers a guild
+            # joined while the process was down, or blocked while it was running.
+            await self.server_manager.enforce_guild_blocks()
+
             await self._cache_command_ids()
             self.profile_manager._get_or_create_system_profile("mimicguide")
             self.bot.loop.create_task(self.help_service._load_and_embed_docs())
@@ -162,6 +168,15 @@ class EventListeners:
         if not self.has_lock:
             return
 
+        # Ahead of the greeting, and ahead of picking a channel to put it in: a blocked
+        # server that gets greeted has been told it is welcome moments before the bot
+        # walks out. Discord lets anyone re-invite, so this is also the whole mechanism
+        # by which a server block survives -- there is no other event to catch it on.
+        if guild.id in self.blocked_guilds_leave:
+            print(f"[GuildBlock] Invited to blocked guild {guild.id} ({guild.name}). Leaving.")
+            await self.server_manager.leave_blocked_guild(guild)
+            return
+
         channel = self._pick_welcome_channel(guild)
         if channel is None:
             return
@@ -189,10 +204,17 @@ class EventListeners:
         if message.id in self.processed_child_messages:
             return
 
-        if message.author.id in self.global_blacklist:
+        # generation_blocked, so both block scopes: this path ends in a model call.
+        if message.author.id in self.generation_blocked:
             return
-        
+
         if not message.guild or not self.has_lock or message.author.bot:
+            return
+
+        # A quarantined guild keeps the bot present and generates nothing. Tested here
+        # rather than at each trigger below: every one of them ends in a model call,
+        # and one test in front of all of them cannot be the one somebody forgets.
+        if message.guild.id in self.quarantined_guilds:
             return
 
         # Calling Last Card is a thing you say, not a button you press, so this sits
@@ -397,7 +419,11 @@ class EventListeners:
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
-        if payload.user_id in self.global_blacklist:
+        # Regeneration, /train capture and the purge controls all hang off this, and
+        # the first of them spends a model call -- so this is the generation scope too.
+        if payload.user_id in self.generation_blocked:
+            return
+        if payload.guild_id and payload.guild_id in self.quarantined_guilds:
             return
         if not self.has_lock or payload.user_id == self.bot.user.id:
             return
@@ -406,8 +432,8 @@ class EventListeners:
 
         # /train reactions work whether or not this channel has any active/logged chat
         # session at all, so this is handled and short-circuited before the
-        # session-required bail-out below.
-        if emoji_str in (TRAIN_INPUT_EMOJI, TRAIN_OUTPUT_EMOJI):
+        # session-required bail-out below. Inert while /train is switched off.
+        if TRAIN_COMMAND_ENABLED and emoji_str in (TRAIN_INPUT_EMOJI, TRAIN_OUTPUT_EMOJI):
             await self._handle_train_reaction(payload, emoji_str == TRAIN_INPUT_EMOJI)
             return
 
@@ -619,7 +645,7 @@ class EventListeners:
         
         emoji_str = str(payload.emoji)
 
-        if emoji_str in (TRAIN_INPUT_EMOJI, TRAIN_OUTPUT_EMOJI):
+        if TRAIN_COMMAND_ENABLED and emoji_str in (TRAIN_INPUT_EMOJI, TRAIN_OUTPUT_EMOJI):
             entry = self.armed_training_channels.get((payload.channel_id, payload.user_id))
             if entry:
                 slot_key = "slot1" if emoji_str == TRAIN_INPUT_EMOJI else "slot2"
@@ -881,53 +907,9 @@ class EventListeners:
                                 self.session_last_accessed[session_key] = time.time()
                             return
 
-        # 2. Check Multi/Freewill Sessions (Servers)
-        session = self.multi_profile_channels.get(payload.channel_id)
-        if not session: return
-        
-        session_type = session.get("type", "multi")
-        if not session.get("is_hydrated"):
-            session = await self.session_manager._ensure_session_hydrated(payload.channel_id, session_type)
-        if not session: return
-
-        turn_id_to_delete = None
-        turn_object = None
-        for turn in session.get("unified_log", []):
-            if deleted_message_id in turn.get("message_ids", []):
-                turn_id_to_delete = turn.get("turn_id")
-                turn_object = turn
-                break
-
-        if turn_id_to_delete and turn_object:
-            if turn_object.get("is_user") is False:
-                bot_pid = turn_object.get("speaker_pid")
-                for p in session.get('profiles', []):
-                    if self.profile_manager._get_pid_from_name_any(p['owner_id'], p['profile_name']) == bot_pid:
-                        p['ltm_counter'] = max(0, p.get('ltm_counter', 0) - 1)
-                        break
-
-            original_log_len = len(session.get("unified_log", []))
-            session["unified_log"] = [t for t in session.get("unified_log", []) if t.get("turn_id") != turn_id_to_delete]
-            
-            if len(session["unified_log"]) < original_log_len:
-                is_effectively_empty = not session.get("unified_log") or all(
-                    turn.get("type") in ["whisper", "private_response"] for turn in session.get("unified_log", [])
-                )
-                
-                dummy_session_key = (payload.channel_id, None, None)
-                if is_effectively_empty:
-                    await self.session_manager._delete_session_from_disk(dummy_session_key, session_type)
-                    for p in session.get("profiles", []):
-                        full_session_key = (payload.channel_id, p['owner_id'], p['profile_name'])
-                        self.ltm_recall_history.pop(full_session_key, None)
-                else:
-                    await self.session_manager._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
-
-                # See the note on _recompute_pending_whispers: this is what the
-                # rebuild used to derive, and all it derived.
-                self.session_manager._recompute_pending_whispers(session)
-
-            self.session_last_accessed[payload.channel_id] = time.time()
+        # 2. Multi/Freewill Sessions (Servers). Part of a turn gone means the whole turn
+        # goes, from the channel as well as the log -- see TurnDeletionMixin.
+        await self.generation_service.on_turn_messages_deleted(payload.channel_id, {deleted_message_id})
 
     @commands.Cog.listener()
     async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent):
@@ -963,54 +945,9 @@ class EventListeners:
         if not message_ids:
             return
 
-        session = self.multi_profile_channels.get(payload.channel_id)
-        if not session:
-            return
-
-        session_type = session.get("type", "multi")
-        if not session.get("is_hydrated"):
-            session = await self.session_manager._ensure_session_hydrated(payload.channel_id, session_type)
-        if not session:
-            return
-
-        unified_log = session.get("unified_log", [])
-        turns_to_delete = [
-            turn for turn in unified_log
-            if any(mid in message_ids for mid in turn.get("message_ids", []))
-        ]
-        if not turns_to_delete:
-            return
-
-        pid_to_profile = {}
-        for p in session.get('profiles', []):
-            pid = self.profile_manager._get_pid_from_name_any(p['owner_id'], p['profile_name'])
-            pid_to_profile.setdefault(pid, p)
-
-        for turn_obj in turns_to_delete:
-            if turn_obj.get("is_user") is False:
-                p = pid_to_profile.get(turn_obj.get("speaker_pid"))
-                if p:
-                    p['ltm_counter'] = max(0, p.get('ltm_counter', 0) - 1)
-
-        # Identity, not turn_id -- see the note on /purge in CLAUDE.md.
-        doomed = {id(turn) for turn in turns_to_delete}
-        session["unified_log"] = [t for t in unified_log if id(t) not in doomed]
-
-        is_effectively_empty = not session.get("unified_log") or all(
-            turn.get("type") in ["whisper", "private_response"] for turn in session.get("unified_log", [])
-        )
-
-        dummy_session_key = (payload.channel_id, None, None)
-        if is_effectively_empty:
-            await self.session_manager._delete_session_from_disk(dummy_session_key, session_type)
-            for p in session.get("profiles", []):
-                full_session_key = (payload.channel_id, p['owner_id'], p['profile_name'])
-                self.ltm_recall_history.pop(full_session_key, None)
-        else:
-            await self.session_manager._save_session_to_disk(dummy_session_key, session_type, session["unified_log"])
-
-        self.session_manager._recompute_pending_whispers(session)
-        self.session_last_accessed[payload.channel_id] = time.time()
+        # One pass over the log and at most one disk write for the whole payload, rather
+        # than the single-delete path once per message.
+        await self.generation_service.on_turn_messages_deleted(payload.channel_id, message_ids)
 
     @commands.Cog.listener()
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
@@ -1092,8 +1029,33 @@ class EventListeners:
             # speaker_pid/is_hidden and never content, so it cannot change either.
             self.session_last_accessed[channel_id] = time.time()
 
+    def _refused_by_blacklist(self, interaction: discord.Interaction) -> bool:
+        """True when a block closes this interaction to its user. Nothing is sent.
+
+        `generation_blocked` -- both scopes -- not `global_blacklist`. The generation
+        scope was meant to leave the command surface open, but most of it reaches a
+        model with no component in between: `/help ask`, `/trigger`, `/memorise`,
+        `/whisper` and an in-character `/speak` all do. Until that check lives at the
+        call itself, a narrower gate here is a hole with a label on it.
+
+        Shared with the error handler, the trace menu and autocomplete, so the refusal
+        and the silence after it cannot drift apart: a CheckFailure for any other
+        reason -- `dm_only` on an exempt command -- still gets its message.
+        """
+        if interaction.user.id not in self.generation_blocked:
+            return False
+        command = interaction.command
+        return command is None or command.qualified_name not in BLACKLIST_EXEMPT_COMMANDS
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return interaction.user.id not in self.global_blacklist
+        """Gates this cog's app commands; `BLACKLIST_EXEMPT_COMMANDS` stay open.
+
+        Component interactions are not covered here -- discord.py routes those to the
+        view, which is what `BlockedGuard` in base_components exists for. Nor are
+        context menus: they are added to the tree, not bound to the cog, so
+        `view_generation_trace` asks for itself.
+        """
+        return not self._refused_by_blacklist(interaction)
 
     async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.CommandOnCooldown):
@@ -1105,11 +1067,13 @@ class EventListeners:
             else:
                 await interaction.response.send_message(f"This command is on cooldown. Please try again in {seconds_total} second(s).", ephemeral=True)
         elif isinstance(error, app_commands.CheckFailure):
-            # The interaction_check for a blacklisted user will fail silently.
-            # This part handles other permission checks (like is_admin_or_owner_check) by sending a message.
-            if interaction.user.id not in self.global_blacklist:
-                await interaction.response.send_message("You do not have the required permissions (e.g., Server Administrator) to use this command.", ephemeral=True)
-            pass
+            # Two different refusals arrive here. A blocked user gets nothing: no
+            # notice, no reason, and no request spent sending one. Discord shows "This
+            # interaction failed"; their standing is on /settings for anyone who looks.
+            # Everything else is an ordinary permission check.
+            if self._refused_by_blacklist(interaction):
+                return
+            await interaction.response.send_message("You do not have the required permissions (e.g., Server Administrator) to use this command.", ephemeral=True)
         else:
             error_id = str(uuid.uuid4())[:8]
             print(f"Unhandled command error (ID: {error_id}): {error}")
@@ -1143,6 +1107,12 @@ class EventListeners:
 
         from ..services.api_service import close_google_rest_client
         await close_google_rest_client()
+
+        # Most Popular's count is written every few minutes; keep what is still unsaved.
+        try:
+            await asyncio.to_thread(self.api_service.catalogue.flush_usage)
+        except Exception as e:
+            print(f"Could not save OpenRouter usage counts on unload: {e}")
 
         from ..utils.http_client import close_shared_client
         await close_shared_client()
@@ -1178,6 +1148,10 @@ class EventListeners:
                     await self.session_manager._save_session_to_disk(dummy_session_key, session_type, unified_log)
 
     async def master_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+        # Autocomplete never reaches interaction_check, and building the choices reads
+        # the user's index -- for a command they are about to be refused.
+        if self._refused_by_blacklist(interaction):
+            return []
         def get_focused(options):
             for opt in options:
                 if opt.get('type') in (1, 2):

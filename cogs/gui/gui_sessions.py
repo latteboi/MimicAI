@@ -8,7 +8,9 @@ import time
 import asyncio
 from typing import TYPE_CHECKING, List, Dict, Any, Optional
 from ..utils.helpers import _estimate_text_tokens, resolve_openrouter_service_tier
-from .base_components import (PageJumpModal, SELECT_ALL, SELECT_PAGE, add_button,
+from ..utils.data_policy import may_pick_training_models
+from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PAGE, add_button,
+                              paged_nav_options,
                               add_select, build_pagination_controls,
                               bulk_select_options, resolve_bulk_select)
 from ..services.generation.compaction import resolve_compaction_settings
@@ -69,7 +71,7 @@ class GlobalChatInputModal(ui.Modal, title="Draft Your Reply"):
         else:
             await interaction.response.send_message(embed=embed, view=queue_view, ephemeral=True)
 
-class GlobalChatQueueView(ui.View):
+class GlobalChatQueueView(BlockedGuard, ui.View):
     def __init__(self, cog, parent_view, user_id):
         super().__init__(timeout=None)
         self.cog = cog
@@ -135,7 +137,7 @@ class GlobalChatQueueView(ui.View):
             
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
-class GlobalChatPlayView(ui.View):
+class GlobalChatPlayView(BlockedGuard, ui.View):
     def __init__(self, cog, interaction, user_id, profile_name):
         super().__init__(timeout=None)
         self.cog = cog
@@ -343,13 +345,26 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
             
             value = prefix + value
 
+        # A typed prefix reaches Ollama as surely as the API switch does.
+        if value.startswith("OLLAMA/") and not self.parent_view.cog.profile_manager.may_use_ollama(
+                getattr(self.parent_view, "user_id", interaction.user.id)):
+            await interaction.response.send_message(OLLAMA_OWNER_ONLY, ephemeral=True)
+            return
+
+        # A typed id is held to the list the dropdown offers -- see may_pick_training_models.
+        if (value.startswith("OPENROUTER/")
+                and not may_pick_training_models(getattr(self.parent_view, "user_id", interaction.user.id))
+                and not self.parent_view.cog.api_service.catalogue.open_to_all(value[len("OPENROUTER/"):])):
+            await interaction.response.send_message(OPENROUTER_TRAINING_MODEL_HIDDEN, ephemeral=True)
+            return
+
         self.parent_view._save_changes(self.target_config_key, value)
         self.parent_view._build_view()
         # Once, not twice: the second call raised InteractionResponded on every custom
         # model entry and was swallowed by Modal.on_error as a logged traceback.
         await interaction.response.edit_message(**self.parent_view._picker_render())
 
-class GlobalChatHistoryView(ui.View):
+class GlobalChatHistoryView(BlockedGuard, ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, user_id: int, initial_profile: Optional[str] = None):
         super().__init__(timeout=600)
         self.cog = cog
@@ -538,7 +553,7 @@ class GlobalChatHistoryView(ui.View):
         else:
             await interaction.followup.send("Failed to delete round.", ephemeral=True)
 
-class WhisperHistoryView(ui.View):
+class WhisperHistoryView(BlockedGuard, ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, all_whispers: List[Dict]):
         super().__init__(timeout=600)
         self.cog = cog
@@ -737,7 +752,7 @@ def build_speak_placeholder_embed(cog: 'MimicCog', ctx: Dict[str, Any], source_t
     return embed
 
 
-class SpeakPreviewView(ui.View):
+class SpeakPreviewView(BlockedGuard, ui.View):
     """The approve-before-posting step for `/speak style:in_character`.
 
     A re-voiced line is a roll of the dice, and without a preview every miss is a
@@ -869,7 +884,7 @@ class SpeakPreviewView(ui.View):
         self.stop()
 
 
-class WhisperActionView(ui.View):
+class WhisperActionView(BlockedGuard, ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, whisper_turn_id: str, response_turn_id: str, target_participant: Optional[Dict] = None, whisper_message: Optional[str] = None):
         super().__init__(timeout=300)
         self.cog = cog
@@ -1100,7 +1115,7 @@ class ResponseLimitModal(ui.Modal, title="Set Response Limit"):
         await interaction.response.defer()
         await self.view.update_display()
 
-class SessionSwapListView(ui.View):
+class SessionSwapListView(BlockedGuard, ui.View):
     def __init__(self, cog, interaction, session_data_idx):
         super().__init__(timeout=180)
         self.cog = cog
@@ -1152,7 +1167,7 @@ class SessionSwapListView(ui.View):
             
             build_pagination_controls(self, self.current_page, num_pages, 0, prev_cb, next_cb)
 
-class SessionView(ui.View):
+class SessionView(BlockedGuard, ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, session: Dict):
         super().__init__(timeout=600)
         self.cog = cog
@@ -1221,7 +1236,7 @@ class SessionView(ui.View):
         embed = await self.cog.profile_manager._build_profile_embed(participant['owner_id'], participant['profile_name'], self.channel_id)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-class SessionConfigView(ui.View):
+class SessionConfigView(BlockedGuard, ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, session: dict):
         super().__init__(timeout=600)
         self.cog = cog
@@ -2154,7 +2169,7 @@ class SessionConfigView(ui.View):
                    style=discord.ButtonStyle.success, row=3)
 
 
-class SessionAuditView(ui.View):
+class SessionAuditView(BlockedGuard, ui.View):
     def __init__(self, cog, interaction: discord.Interaction, session: dict, channel_id: int):
         super().__init__(timeout=600)
         self.cog = cog
@@ -2287,16 +2302,8 @@ class SessionAuditView(ui.View):
         start = self.current_page * per_page
         page_items = items[start : start + per_page]
 
-        opts = []
-        if self.current_page > 0:
-            opts.append(discord.SelectOption(label="◀ Previous Page", value="prev_page",
-                                             description=f"Navigate to previous page{nav_suffix}"))
-        if always_show_jump or self.num_pages > 1:
-            opts.append(discord.SelectOption(label=f"📄 Page {self.current_page + 1}/{self.num_pages} (Jump)",
-                                             value="jump_page", description="Click to jump to a page number"))
-        if self.current_page < self.num_pages - 1:
-            opts.append(discord.SelectOption(label="▶ Next Page", value="next_page",
-                                             description=f"Navigate to next page{nav_suffix}"))
+        opts = paged_nav_options(self.current_page, self.num_pages, nav_suffix=nav_suffix,
+                                 always_show_jump=always_show_jump)
 
         current = getattr(self, attr)
         for idx, item in enumerate(page_items):

@@ -152,11 +152,12 @@ class SessionCompactionMixin:
         if session.get("unified_log") is not unified_log:
             return False
 
-        marked = 0
+        marked_ids = []
         for turn in turns:
             if not turn.get("compacted"):
                 turn["compacted"] = True
-                marked += 1
+                marked_ids.append(turn.get("turn_id"))
+        marked = len(marked_ids)
         if not marked:
             return False
 
@@ -168,6 +169,10 @@ class SessionCompactionMixin:
             "message_ids": [],
             "content": synopsis,
             "covers": marked,
+            # Which turns it folded, so deleting one of them can find this synopsis --
+            # see turn_deletion. Left off when a folded turn has no id to name, and that
+            # synopsis is then found by position like the ones written before this.
+            **({"covers_turn_ids": marked_ids} if all(marked_ids) else {}),
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         })
         # After the last folded turn, so the synopsis sits where the range it replaces
@@ -179,8 +184,6 @@ class SessionCompactionMixin:
         session["_log_cold_len"] = 0
         await self.cog.session_manager.flush_session(
             (channel_id, None, None), session.get("type", "multi"), structural=True)
-
-        print(f"[Compaction] Channel {channel_id}: folded {marked} turn(s) into a synopsis.")
         return True
 
     async def _generate_synopsis(self, channel_id: int, session: Dict[str, Any], transcript: str,
@@ -207,6 +210,7 @@ class SessionCompactionMixin:
             model = self.cog.api_service._instantiate_model(
                 model_name, guild_id, session.get("owner_id"),
                 system_instruction=system_instruction,
+                config_owner_id=session.get("owner_id"),
                 thinking_params=resolve_thinking_params(None, "utility"))
             return await model.generate_content_async(
                 [user_prompt], generation_config={"temperature": 0.2, "top_p": 0.95})

@@ -10,6 +10,7 @@ from ...utils.constants import (
     defaultConfig, PRIMARY_MODEL_NAME, STM_LIMIT_MAX, PLACEHOLDER_EMOJI,
     ERR_GENERAL_ERROR, ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK,
     WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED,
+    GEMINI_FREE_TIER_BLOCKED,
 )
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_history_entry,
@@ -173,16 +174,29 @@ class GlobalChatMixin:
 
         user_api_key = self.cog.storage_manager._get_api_key_for_user(host_user_id, "gemini")
         or_key = self.cog.storage_manager._get_api_key_for_user(host_user_id, "openrouter")
-        has_ollama = profile_data.get("primary_model", "").upper().startswith("OLLAMA/")
+        has_ollama = (profile_data.get("primary_model", "").upper().startswith("OLLAMA/")
+                      and self.cog.profile_manager.may_use_ollama(source_owner_id))
+
+        # The host's own key, carrying a conversation others can be let into wherever the
+        # card was opened: a free Gemini tier answers to that server's policy, and is
+        # refused with no server at all. See cogs/utils/data_policy.
+        gemini_blocked = bool(user_api_key) and not self.cog.storage_manager.personal_gemini_allowed_in_conversation(
+            host_user_id, interaction.guild_id)
+        if gemini_blocked:
+            user_api_key = None
 
         if not user_api_key and not or_key and not has_ollama:
-            await interaction.followup.send("The host of this session needs to submit a personal API key using `/settings` to use this feature.", ephemeral=True)
+            await interaction.followup.send(
+                GEMINI_FREE_TIER_BLOCKED if gemini_blocked else
+                "The host of this session needs to submit a personal API key using `/settings` to use this feature.",
+                ephemeral=True)
             return
 
         model_cache_key = ('global', host_user_id, profile_name)
 
         try:
-            model, temp, top_p, top_k, warning_message, fallback_model_name = await self.cog.api_service._get_or_create_model_for_global_chat(host_user_id, profile_name)
+            model, temp, top_p, top_k, warning_message, fallback_model_name = await self.cog.api_service._get_or_create_model_for_global_chat(
+                host_user_id, profile_name, policy_guild_id=interaction.guild_id)
 
             # Resolve primary model and safety settings
             profile_data = self.cog.profile_manager._get_profile_config(source_owner_id, source_profile_name, False) or {}
@@ -384,6 +398,8 @@ class GlobalChatMixin:
                             sys_instr, d_safe, t_params_f, model_tools, p_data_f,
                             openrouter_key_error="No OR key for fallback",
                             google_key_error="No Google key for fallback",
+                            config_owner_id=source_id_f, policy_guild_id=interaction.guild_id,
+                            conversation=True,
                         )
 
                         response, state_container = await self._generate_with_heartbeat(

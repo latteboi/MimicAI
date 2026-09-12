@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import discord
 from discord import ui
 
-from .base_components import add_button, add_select
+from .base_components import BlockedGuard, add_button, add_select
 from ..services.games import eights
 from ..services.games.eights import COLOURS, Card, Move
 
@@ -199,7 +199,7 @@ def build_lobby_embed(cog: "MimicCog", lobby: "Lobby") -> discord.Embed:
     return embed
 
 
-class LobbyView(ui.View):
+class LobbyView(BlockedGuard, ui.View):
     """The forming table's three controls: Start, Sit Down, and the lock.
 
     Deliberately not timed out, for the same reason `TableView` is not: a lobby that
@@ -311,7 +311,7 @@ class LobbyView(ui.View):
         await self._repaint(interaction, lobby)
 
 
-class ColourChoiceView(ui.View):
+class ColourChoiceView(BlockedGuard, ui.View):
     """Second step of playing a wild. The colour arrives with the move, so the engine
     never needs a `choosing_colour` phase.
 
@@ -338,7 +338,7 @@ class ColourChoiceView(ui.View):
         await self.hand_view.redraw(interaction)
 
 
-class HandView(ui.View):
+class HandView(BlockedGuard, ui.View):
     """A seat's private controls. Rebuilt per interaction, but always onto the *same*
     message -- see the module docstring for why that is safe past fifteen minutes."""
 
@@ -537,7 +537,7 @@ class HandView(ui.View):
 
 # --------------------------------------------------------------------------- table
 
-class TableView(ui.View):
+class TableView(BlockedGuard, ui.View):
     """The one public control, attached to the table message.
 
     Anyone may click it; what comes back depends on whether they hold a seat. That is

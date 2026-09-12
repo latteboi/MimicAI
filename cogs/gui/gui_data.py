@@ -13,9 +13,11 @@ if TYPE_CHECKING:
     from ..MimicCog import MimicCog
     from .gui_profiles import ProfileManageView
 
-from .base_components import (BaseBulkProfileView, PageJumpModal, add_button, add_select,
+from .base_components import (BaseBulkProfileView, BlockedGuard, PageJumpModal, add_button, add_select,
                               build_confirm_view, build_pagination_controls,
                               compute_window_slice)
+from .gui_data_policy import DataPolicyView, add_data_policy_fields
+from ..utils.data_policy import may_set_data_policy
 
 class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
     summary_field = ui.TextInput(label="Memory Summary", style=discord.TextStyle.paragraph, required=True, max_length=2000)
@@ -199,7 +201,7 @@ class SearchDataModal(ui.Modal, title="Search Data"):
         self.parent_view.current_page = 1
         await self.parent_view._update_view(interaction)
 
-class DataManageView(ui.View):
+class DataManageView(BlockedGuard, ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str, is_borrowed: bool, mode: Optional[Literal['training', 'ltm']] = None, parent_manage_view: Optional['ProfileManageView'] = None, target_user_id: Optional[int] = None):
         super().__init__(timeout=600)
         self.cog = cog
@@ -616,11 +618,48 @@ class AnalyseExamplesModal(ui.Modal, title="Analyse Training Examples"):
         await interaction.response.defer(ephemeral=True, thinking=True)
         await self.parent_view.cog.memory_manager._execute_training_analysis(interaction, self.parent_view.profile_name, count, verbosity, model_name)
 
-class PrivacyDashboardView(ui.View):
-    def __init__(self, cog: 'MimicCog', user_id: int):
+class PrivacyDashboardView(BlockedGuard, ui.View):
+    # Open to a blocked user. Export and deletion are theirs whatever their standing --
+    # Privacy Policy §5 promises it -- and neither button reaches a model. The server's
+    # data policy is read-only here; the bot owner's button opens its own screen, which is
+    # not exempt.
+    block_exempt = True
+
+    def __init__(self, cog: 'MimicCog', user_id: int, guild: Optional[discord.Guild] = None):
         super().__init__(timeout=300)
         self.cog = cog
         self.user_id = user_id
+        #: The server /privacy was run in, whose data policy it shows. None in a DM.
+        self.guild = guild
+        if guild is not None and may_set_data_policy(user_id):
+            add_button(self, "Change Data Policy", self.open_data_policy, row=1, emoji="🛡️")
+
+    def embed(self) -> discord.Embed:
+        e = discord.Embed(
+            title="Privacy & Data Dashboard",
+            description="Request a full export of your data or permanently delete your account and all associated profiles, memories, and settings.",
+            color=discord.Color.red()
+        )
+        if self.guild is not None:
+            e.description += (
+                "\n\n**This server's data policy** decides whether its messages may reach AI "
+                "providers that train on them. Only the bot's owner can change it.")
+            add_data_policy_fields(e, self.cog.server_manager._get_server_index(str(self.guild.id)))
+            e.set_footer(text=self.guild.name)
+        return e
+
+    async def open_data_policy(self, interaction: discord.Interaction):
+        if not may_set_data_policy(interaction.user.id):
+            await interaction.response.send_message(
+                "Only this bot's owner can change a server's data policy.", ephemeral=True)
+            return
+
+        def back():
+            dashboard = PrivacyDashboardView(self.cog, self.user_id, self.guild)
+            return dashboard.embed(), dashboard
+
+        view = DataPolicyView(self.cog, self.guild, self.user_id, on_back=back)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
 
     @ui.button(label="Request Data Export", style=discord.ButtonStyle.blurple, emoji="📥")
     async def export_data(self, interaction: discord.Interaction, button: ui.Button):

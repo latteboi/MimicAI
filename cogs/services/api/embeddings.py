@@ -143,11 +143,12 @@ async def _fetch_embedding_vector(
             ),
             timeout=timeout,
         )
+        # None is the whole failure contract: every caller treats it as "skip this
+        # recall", and a transient 5xx is the common case. Nothing is printed -- the
+        # text is conversation content and does not belong in the host's journal.
         if response.status_code != 200:
-            print(f"Embedding err for '{text[:30]}...': Google API Error {response.status_code}: {response.text}")
             return None
         body = json.loads(response.content)
         return body.get("embedding", {}).get("values")
-    except Exception as e:
-        print(f"Embedding err for '{text[:30]}...': {e}")
+    except Exception:
         return None

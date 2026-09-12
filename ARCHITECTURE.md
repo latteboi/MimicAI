@@ -322,11 +322,29 @@ channel. Its shape:
 4. **Yield.** A queued whisper or an in-flight purge/regeneration takes precedence, using
    flag counters rather than polling — see the comments around `whisper_waiting` for why
    the naive version starves.
-5. **Normalise triggers** (`triggers.py`) into the round's user-side history: messages,
-   reactions, replies, proactive kicks.
-6. **Optionally generate one image** (`image_round.py`) *before* any participant speaks, so
+5. **Pick the speakers and show the first one working.** `_select_round_speakers` reads only
+   the raw triggers and the cast, so the first participant's placeholder goes up before
+   anything touches the network. `_open_turn_feedback` registers the container that owns it
+   *before* sending, so every exit from here on can tear it down.
+6. **Normalise triggers** (`triggers.py`) into the round's user-side history: messages,
+   reactions, replies, proactive kicks. This runs even when nobody will answer.
+7. **Optionally generate one image** (`image_round.py`) *before* any participant speaks, so
    every turn in the round can see it.
-7. **Rotate.** Each participant in turn: build its prompt, call its model, deliver.
+8. **Rotate.** Each participant in turn: build its prompt, call its model, deliver. The
+   next participant's placeholder goes up at the handoff, not at the top of its turn.
+
+### A turn is deleted whole
+
+A turn is often several messages on one log entry: reply, overflow past 2000 characters,
+citations, warnings, files. `TurnDeletionMixin` makes the turn the unit of deletion —
+`/delete` counts visible turns, `/purge` finishes any turn it clips, and a message deleted
+by anyone takes the rest of its turn with it. While the channel is busy the deletion waits:
+a turn gains messages during delivery, and deleting it early would strand the later ones.
+
+Rolling synopses chain — each is written from the previous one plus the next chunk, and
+only the latest is injected — so a deleted turn survives in the synopsis that folded it and
+every one after. Those are dropped and their turns un-compacted for compaction to fold
+again. New synopses record `covers_turn_ids`; older ones are found by position.
 
 ### Histories are derived, never maintained
 
@@ -354,11 +372,69 @@ the log.
 |---|---|---|
 | `GOOGLE/` | `GoogleRESTModel` | Hand-rolled REST over `httpx` |
 | `OPENROUTER/` | `OpenRouterModel` | OpenAI-compatible chat completions |
-| `OLLAMA/` | `OllamaModel` | User-supplied host URL, per profile |
+| `OLLAMA/` | `OllamaModel` | Host URL per profile; bot owner's configs only |
 | *(bare)* | heuristic | A `/` in the name, or `grok`/`anthropic`, implies OpenRouter |
 
 Prefixes are **case-sensitive**, because OpenRouter hosts models under lowercase creator
 namespaces like `google/gemini-2.5-flash` and the two must not collide.
+
+### Providers that train on what they are sent
+
+Discord's Developer Policy forbids using message content to train AI models without
+Discord's permission, and its Developer Terms let API Data go only to a Service Provider
+that uses it for no purpose of its own. Two routes fail that: Google's free Gemini tier and
+OpenRouter hosts whose policy allows training. Both are closed to a conversation until the
+bot owner opts its server in, on the screen `/privacy` gives them (`cogs/utils/data_policy.py`,
+stored sparse in the server's `index.json`); everyone else reads the policy there. The terms
+bind the developer, not a server, so no server administrator can: `training_opt_in` ignores
+a record anyone but the bot owner wrote.
+
+- **Gemini:** `_get_api_key_for_guild` will not hand out a free-tier (or untiered) key for
+  a server that has not opted in. It is the one resolver every server-billed Google call
+  uses — text, speech, images, grounding, embeddings — so the gate lives there, and
+  `gemini_blocked_for_guild` lets callers name the refusal instead of reporting a missing
+  key. `/settings` will not save a free-tier key for anyone but the bot owner
+  (`may_save_free_gemini_key`), since nobody else can open a server to one.
+- **Global Chat** spends the host's personal key and is a conversation wherever its card is
+  opened. Its builds pass `conversation=True`, which holds a free Gemini tier and OpenRouter's
+  `data_collection` to the server the card was opened in (`policy_guild_id`), and keeps both
+  closed with no server: a DM or group DM has none to open.
+- **OpenRouter:** the factory sets `provider.data_collection: "deny"` for a server that has
+  not opted in, applied after the advanced-parameter splice so no profile can reopen it.
+  The pickers offer a model only when some host is known to serve it without training (see
+  the catalogue below); the rest go to the bot owner alone (`may_pick_training_models`), and
+  a typed id is held to the same rule.
+- **The operator's key:** the content classifier falls back to the bot owner's key for a
+  profile whose owner has none (`_classifier_api_key`). Nobody directed that user's content
+  there, so a free-tier Gemini key is skipped and an OpenRouter request on it denies
+  training hosts.
+- **Ollama:** a host receives every message a profile sees, so it must be the operator's
+  own machine. The factory refuses `OLLAMA/` unless `config_owner_id` — which every call
+  passes — is the bot owner.
+
+A DM is a command centre with no conversation. What one sends a provider is its own user's
+input under their own key, and is not gated — a Global Chat opened in one is still a
+conversation, and is.
+
+### The OpenRouter catalogue
+
+`api/openrouter_catalogue.py` holds every text-output model OpenRouter lists, refreshed by
+`pricing_sync_task` at boot and daily from documented endpoints: `/models`, sorted by
+popularity, `/endpoints/zdr`, and `/models/user` read with the bot owner's key. It never
+reads OpenRouter's website-internal endpoints: OpenRouter's Terms prohibit scraping the
+Site. Parsing runs in a thread and keeps one slim record per model (~400 KB for ~440
+models). The pricing table is answered from memory rather than re-read per turn.
+
+No documented endpoint says which hosts train, so the catalogue infers it. A zero-retention
+host keeps nothing, and `/models/user` omits whatever the account's privacy settings
+exclude — with providers that may train switched off, every model only they serve. A
+listing that holds every model, is cut short or is missing leaves each model with what the
+last usable one said, and a model never checked counts as training. The bot owner's data
+policy screen shows how many models everyone else is offered, and when that was checked.
+
+The pickers browse it four ways — Most Popular (this bot's own usage count, written every
+few minutes rather than per call), Trending (rank climb against the oldest daily snapshot
+in a week), Cheapest, and per author — paged the way the session audit pages turns.
 
 ### No vendor SDKs
 

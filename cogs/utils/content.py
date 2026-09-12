@@ -53,9 +53,13 @@ HELP_CATEGORIES = {
             "• **A server:** used for every session in that server. Only administrators of that server can assign a key to it.\n\n"
             "A server needs *someone* to have assigned a key to it, otherwise its profiles cannot generate at all. "
             "If several people assign keys, the server index records the pointer -- the last assignment wins.\n\n"
-            "**Google keys are strongly recommended to be paid tier.** Long-term memory, training retrieval, grounding, the "
-            "content classifier and image generation all make their own calls. Free-tier rate limits throttle them badly, and image "
-            "generation is blocked on free keys entirely."
+            "**Conversations need a paid Google key.** Google may train its models on what a free-tier key is sent, so a "
+            "free-tier key is not used for a server's messages -- sessions, memories, images or speech -- nor for Global Chat, "
+            "wherever it is opened, and only the bot's owner can save one in `/settings`. OpenRouter requests for either only go "
+            "to hosts that do not train on prompts, and a model no "
+            "such host is known to serve is offered to the bot's owner alone. A server's administrators cannot change any of "
+            "this; only the bot's owner can, one server at a time, from `/privacy`. Paid tier also escapes the rate limits that "
+            "throttle long-term memory, grounding and the content classifier, and image generation is blocked on free keys entirely."
         ),
         "Profile Classes (PIDs)": (
             "Every profile has an immutable 16-character **Profile ID**. Its first letter records the class:\n\n"
@@ -493,13 +497,13 @@ HELP_CATEGORIES = {
             "**Profiles:** `/profile create`, `/profile generate`, `/profile manage`, `/profile list`, `/profile bulk manage`, `/profile hub`, "
             "`/profile global_chat`\n\n"
             "**Sessions:** `/session config`, `/session swap`, `/session view`, `/session audit`, `/trigger`\n\n"
-            "**In-channel:** `/whisper`, `/speak`, `/refresh`, `/cancel`, `/suspend`, `/purge`, `/clear`\n\n"
+            "**In-channel:** `/whisper`, `/speak`, `/refresh`, `/cancel`, `/suspend`, `/delete`, `/purge`, `/clear`\n\n"
             "**Setup and data:** `/settings`, `/export`, `/import`, `/privacy`, `/terms`, `/invite`, `/whoami`, `/viewavatar`\n\n"
             "**Documentation:** `/start` (guided setup), `/guide` (this browser), `/help`\n\n"
             "**Operator:** `/mod`, `/shutdown`\n\n"
-            "`/refresh`, `/cancel`, `/suspend`, `/purge`, `/memorise`, `/play stop`, `/session config` and `/session swap` require "
+            "`/refresh`, `/cancel`, `/suspend`, `/delete`, `/purge`, `/memorise`, `/play stop`, `/session config` and `/session swap` require "
             "administrator permission — though an admin can set a channel to **Open casting**, which opens `/session config` "
-            "(Cast tab only) to everyone. `/mod` and `/shutdown` are bot-owner only."
+            "(Cast tab only) to everyone. `/mod` and `/shutdown` are bot-owner only, as is changing a server's data policy in `/privacy`."
         ),
     },
 }
@@ -523,7 +527,8 @@ WIZARD_COPY = {
         "MimicAI is free, but the thinking is not: it calls a model provider with **your** key "
         "and they bill you directly.\n\n"
         "**Google Gemini** is the one to start with — it is the only provider here for images, "
-        "voice and web grounding. Free tier is fine for text. **OpenRouter** opens up Claude, GPT, "
+        "voice and web grounding. Use a **paid** (billing-enabled) key: Google may train on what a "
+        "free-tier key is sent, so free-tier keys are refused for everyone but the bot's owner. **OpenRouter** opens up Claude, GPT, "
         "Llama and a few hundred others, text only.\n\n"
         "You can add both, and **mix them inside a single character** — thinking on OpenRouter, "
         "pictures and voice on Google. A picture it draws comes back into its own context, so it "
@@ -589,8 +594,8 @@ WIZARD_TOUR = {
         "gets stuck in a loop.\n\n"
         "**Long-term** is summarised memories retrieved by relevance. `/memorise` forces summarisation right now "
         "rather than waiting for the interval.\n\n"
-        "**Training examples** are input/output pairs teaching a character how to phrase things. `/train` arms the "
-        "channel to capture one from reactions — 1️⃣ for the input, 2️⃣ for the output."
+        "**Training examples** are input/output pairs teaching a character how to phrase things. Write them in "
+        "`/profile manage` → **Memory** → Manage Training Examples."
     ),
     "Pictures and voice": (
         "Turn them on per character in `/profile manage` → **Tools** → Image Generation, and → **Params** → Speech "
@@ -746,28 +751,51 @@ DEFAULT_HELP_DOCS = {
     "apis/google_gemini.txt": (
         "Requirements: A Google API key from Google AI Studio, submitted via the `/settings` DM command.\n"
         "Capabilities: Powers standard text generation. It is the ONLY provider that natively supports Google Search Grounding and direct URL fetching, and the only one that can generate images or speech.\n"
-        "Free versus paid tier: Free-tier keys work for basic chat but rate-limit hard. Long-term memory summarisation, training retrieval, grounding, content classification and image generation all make their own calls, so a free key degrades the whole experience. Image generation is blocked outright on free-tier keys.\n"
+        "Free versus paid tier: Google may train its models on what a free-tier key is sent, so `/settings` refuses a free-tier key from anyone but the bot's owner, and one saved before that is not used for a server's messages or for Global Chat. Conversations on Gemini need a billing-enabled (paid) key. A server's administrators cannot change that; only the bot's owner can, one server at a time, from `/privacy`. Free keys also rate-limit hard, and image generation is blocked outright on them.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'The bot isn't responding in the server' or 'Bot is silent'. Fix: Ensure an administrator has assigned a Google API key to this server via `/settings` -> API Keys, and clicked Save Assignments.\n"
-        "- Symptom: 'Image generation failed' or 'Paid Key Required'. Fix: You are using a free-tier Google API key. You must configure billing in Google AI Studio to unlock image models."
+        "- Symptom: 'The bot isn't responding in the server' or 'Bot is silent'. Fix: Ensure an administrator has assigned a billing-enabled (paid) Google API key to this server via `/settings` -> API Keys, and clicked Save Assignments. A free-tier key is not used in a server.\n"
+        "- Symptom: 'Image generation failed' or 'Paid Key Required'. Fix: You are using a free-tier Google API key. You must configure billing in Google AI Studio to unlock image models.\n"
+        "- Symptom: 'The Google key in use here is on Gemini's free tier ... not used for conversations in a server or in Global Chat.' Fix: Google may train on what a free-tier key is sent, so neither uses one, and a server's administrators cannot change that. Assign a billing-enabled (paid) key in `/settings` -- to the server, or to Personal for your own Global Chat.\n"
+        "- Symptom: 'This Google key is on Gemini's free tier ... so it was not saved.' Fix: Only the bot's owner can save a free-tier key. Enable billing on the key's Google Cloud project and submit it again; if billing is already on, try again in a few minutes."
     ),
     "apis/openrouter.txt": (
         "Requirements: An OpenRouter API Key submitted via the `/settings` DM command.\n"
         "Capabilities: Allows users to access non-Google models like Anthropic's Claude, Meta's Llama, DeepSeek and xAI's Grok. OpenRouter models are also the only ones that honour the advanced sampling parameters (Min P, Top A, and the frequency, presence and repetition penalties).\n"
         "Limitations: OpenRouter models do NOT have native access to Google Search or URL fetching, and cannot generate images or speech. To use Grounding or URL Context with OpenRouter, you MUST go into `/profile manage` -> Tools -> and set Grounding/URL Context to RAG Mode.\n"
+        "Choosing a model: In `/profile manage` -> Params -> Set Models, switch the API button to OpenRouter. A Browse dropdown lists Most Popular (the models used most on this bot), Trending (biggest climbers in OpenRouter's rankings over the past week), Cheapest, and then every model author A-Z. The model dropdowns page through whatever is chosen, and every option shows its price per million tokens, context size, and whether it has zero-retention hosts (🔒 ZDR), sees images (👁) or is moderated (🛡). A model no host is known to serve without training on prompts is offered to the bot's owner alone. The list refreshes daily from OpenRouter. `/settings` -> Defaults pages through Most Popular without the Browse dropdown.\n"
         "Troubleshooting / Symptoms:\n"
+        "- Symptom: 'Trending is empty' or 'Trending needs a second day'. Fix: Trending compares daily snapshots of OpenRouter's rankings, so it fills in over the first week after the bot starts.\n"
+        "- Symptom: 'The model I want is not listed.' Fix: The list holds the text models OpenRouter currently lists, refreshed daily. Use Custom Model... and type its id if it is newer than the last refresh. A model no host is known to serve without training on prompts is offered to the bot's owner alone, typed or picked.\n"
         "- Symptom: 'My Claude profile is hallucinating web links' or 'Grounding failed with Claude'. Fix: You must set your Grounding mode to 'RAG'. Native grounding only works with Google.\n"
         "- Symptom: 'Insufficient Credits' or '402'. Fix: Your OpenRouter account has no remaining credit balance.\n"
-        "- Symptom: 'Capability Mismatch' or 'No endpoints found'. Fix: No provider on OpenRouter serves that model with the features requested. Pick a different model."
+        "- Symptom: 'Capability Mismatch' or 'No endpoints found'. Fix: No provider on OpenRouter serves that model with the features requested. Pick a different model.\n"
+        "- Symptom: 'No OpenRouter host serves this model without the right to train on prompts.' Fix: In a server and in Global Chat, OpenRouter requests only go to hosts that do not train on prompts, and a server's administrators cannot change that. Pick a model other hosts serve.\n"
+        "- Symptom: 'No OpenRouter host is known to serve this model without training on prompts, so it is not offered here.' Fix: Only the bot's owner is offered such models. Pick another."
+    ),
+    "apis/data_policy.txt": (
+        "Command: `/privacy` shows everyone the data policy of the server it is run in: whether that server's messages may be sent to AI providers that can train on them. Only the bot's owner can change it, with the Change Data Policy button there.\n"
+        "Concept: Two routes can train on what they are sent: Google's free (unpaid) Gemini tier, and OpenRouter hosts whose policy allows training. Both are closed in every server and in every Global Chat. Discord's Developer Policy does not allow message content to be used to train AI models without Discord's permission, and that permission could only be given to the bot's developer, so only the bot's owner can open either route. A server's administrators cannot.\n"
+        "Gemini free tier: While closed, a free-tier Google key is not used for the server's messages -- conversations, memories, web research, images and speech. Billing-enabled (paid) keys are unaffected.\n"
+        "OpenRouter: While closed, the server's OpenRouter requests ask OpenRouter to use only hosts that do not train on prompts. A model no such host serves stops working in that server. The model pickers offer such models to the bot's owner alone, and the bot owner's data policy screen says how many models everyone else is offered.\n"
+        "Global Chat: A Global Chat is a conversation wherever its card is opened, so it is held to the same rules. Opened in a server, it follows that server's policy; anywhere else -- a DM or a group DM -- both routes stay closed, because there is no server to open.\n"
+        "Scope: The bot owner's choice applies to one server at a time. Opening a route asks the bot owner to confirm, and the screen shows when it was opened.\n"
+        "Troubleshooting / Symptoms:\n"
+        "- Symptom: 'The bot says our Google key is on the free tier.' Fix: Assign a billing-enabled (paid) key to the server in `/settings`.\n"
+        "- Symptom: 'Global Chat says my Google key is on the free tier.' Fix: Assign a billing-enabled (paid) key to Personal in `/settings`, or add an OpenRouter key.\n"
+        "- Symptom: 'An OpenRouter model stopped working in our server or in Global Chat.' Fix: No host that avoids training serves it. Pick another model.\n"
+        "- Symptom: 'An OpenRouter model is missing from the list' or 'Typing its id is refused.' Fix: No host is known to serve it without training on prompts, so only the bot's owner is offered it.\n"
+        "- Symptom: 'Where is /data_policy?' or 'Our administrator can't allow the free tier.' Fix: The data policy is in `/privacy`. Everyone can read it there; only the bot's owner can change it."
     ),
     "apis/ollama.txt": (
+        "Availability: Only this bot's owner -- the person running the instance -- can use Ollama models. An Ollama host receives every message a profile sees, so it has to be the operator's own machine. Everyone else sees Google and OpenRouter only.\n"
         "Requirements: Ollama installed on your local machine, and the specific model downloaded via your terminal (e.g., `ollama run llama3`).\n"
-        "Setup: Go to `/profile manage` -> Params -> Set Models. Click the 'API' button until it says 'Ollama'. Click 'Set Host URL'.\n"
+        "Setup (bot owner): Go to `/profile manage` -> Params -> Set Models. Click the 'API' button until it says 'Ollama'. Click 'Set Host URL'.\n"
         "Cost: Ollama models run on your own hardware and cost nothing per message. They cannot generate images or speech, and must use RAG mode for Grounding and URL Context.\n"
         "Remote Hosting: If your Discord bot is hosted on a cloud server, it cannot see your home PC's 127.0.0.1 address. You MUST expose your local Ollama port using a secure SSH tunnel (e.g., `ssh -R 80:localhost:11434 nokey@localhost.run`) and paste the resulting HTTPS link into the Host URL setting.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Ollama is offline' or 'Network Error'. Fix: Ensure the Ollama app is actively running on your PC, and that the Host URL in the bot matches your tunnel address. Tunnel URLs usually change every time the tunnel restarts.\n"
-        "- Symptom: 'The Set Host URL button is red.' Fix: Red means the bot could not reach that URL. Green means it responded."
+        "- Symptom: 'The Set Host URL button is red.' Fix: Red means the bot could not reach that URL. Green means it responded.\n"
+        "- Symptom: 'Ollama models can only be used by this bot's owner.' or 'The API button never shows Ollama.' Fix: Ollama is limited to the instance owner. Choose a Google or OpenRouter model."
     ),
     "apis/rate_limits_and_errors.txt": (
         "Concept: API execution errors occur when an external inference endpoint rejects a generation payload. The bot parses these and shows a short diagnostic.\n"
@@ -879,11 +907,12 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'Other people in the channel can see my global chat.' Fix: They can, and that is by design -- the card is a normal message. The lock only stops them pressing the buttons. Run the command in a DM with the bot for a conversation nobody else can read; the history is the same one either way."
     ),
     "sessions/maintenance_commands.txt": (
-        "Commands: `/refresh`, `/cancel`, `/suspend`, `/purge`, `/memorise`, `/clear`, `/trigger`, `/session view`, `/session audit`\n"
+        "Commands: `/refresh`, `/cancel`, `/suspend`, `/delete`, `/purge`, `/memorise`, `/clear`, `/trigger`, `/session view`, `/session audit`\n"
         "- `/refresh`: Clears the short-term conversation buffer for this channel. Long-term memories and training examples are untouched. Use when a profile has become confused about recent events.\n"
         "- `/cancel`: Administrators. Stops whatever generation or typing indicator is currently running in this channel. It aborts the round the whole channel is waiting on, which is why it is not open to everyone.\n"
         "- `/suspend`: Administrators. Ends the session in this channel and stops the bot responding until it is configured again.\n"
-        "- `/purge`: Administrators. Deletes messages and the associated session memory.\n"
+        "- `/delete`: Administrators. Deletes the latest turns of the session, counted as the channel shows them -- one reply however many messages it took -- including every message of each (reply, citations, warnings, files), and removes those turns from memory. Whispers and private responses are not counted.\n"
+        "- `/purge`: Administrators. Deletes messages and the associated session memory. A turn the purge only partly covers is deleted whole.\n"
         "- `/memorise`: Administrators (or a participant's owner, for a single named profile). Forces long-term memory summarisation for the session's cast right now, instead of waiting for the automatic creation interval.\n"
         "- `/clear`: Clears the bot's own messages from a DM channel.\n"
         "- `/session view`: Shows the current session configuration and participant status.\n"
@@ -891,6 +920,8 @@ DEFAULT_HELP_DOCS = {
         "- `/session audit`: Reports token usage and diagnostics for the active session. Use it when you want to know what is actually filling the context window.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'The bot seems stuck typing forever.' Fix: Run `/cancel` in that channel.\n"
+        "- Symptom: 'I deleted one message and the rest of the reply disappeared too.' Fix: By design. A reply's messages are one turn, and deleting any of them deletes the whole turn from the channel and from memory, so nothing is left behind that the bot can no longer regenerate, mute or clean up.\n"
+        "- Symptom: 'After a delete the session synopsis is gone.' Fix: A synopsis that summarised a deleted turn is dropped along with every later one, and the turns it covered are summarised again over the next rounds.\n"
         "- Symptom: 'Responses are getting expensive or slow and I do not know why.' Fix: Run `/session audit` to see the token breakdown per participant.\n"
         "- Symptom: 'I want my characters to remember this conversation right now instead of waiting.' Fix: Run `/memorise`."
     ),
@@ -924,11 +955,11 @@ DEFAULT_HELP_DOCS = {
         "Best use: Situational voice -- how the character greets someone, reacts to an insult, or handles a question it cannot answer.\n"
         "Management: `/profile manage` -> Memory -> Manage Training Examples. Tune matching with 'Set Training Parameters'.\n"
         "Availability: Training Examples belong to the profile owner. They cannot be edited on a borrowed profile.\n"
-        "Quick capture via reactions: Run `/train <profile>` to arm a channel, then react 1️⃣ on any message to use as the input and 2️⃣ on any message to use as the output -- any two messages, from anyone, in any order, whether or not either one is part of an active session. Each completed pair becomes one example immediately and the channel stays armed for more. Only your own reactions count while armed, and arming expires after 15 minutes of inactivity.\n"
+        "Reaction capture: `/train` is switched off. It could store other people's messages on your profile where they could neither see nor delete them. Examples are written on the Manage Training Examples screen.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'My training examples never seem to apply.' Fix: Lower the relevance threshold in Set Training Parameters, or rewrite the example input to resemble how users actually phrase things.\n"
         "- Symptom: 'The character copies my examples word for word.' Fix: Provide several varied examples for the same situation rather than one, and raise temperature slightly.\n"
-        "- Symptom: 'Reacting 1️⃣/2️⃣ does nothing.' Fix: Run `/train <profile>` first to arm the channel -- reactions only count while a channel is armed, only from whoever ran the command, and only within 15 minutes of the last matching reaction."
+        "- Symptom: 'Reacting 1️⃣/2️⃣ does nothing' or 'There is no /train command.' Fix: Reaction capture is switched off. Add the example on the Manage Training Examples screen instead."
     ),
     "memory/context_metadata_and_xml.txt": (
         "Concept: MimicAI uses an XML partitioning protocol to keep background technical context isolated from conversational chat. Models separate tagged system data from user speech far more reliably than they separate prose from prose.\n"
@@ -1094,7 +1125,7 @@ WELCOME_CHANNEL_HINTS = ("welcome", "general", "lobby", "chat", "main", "bot")
 #: Keep this in step with the site. It is the same document, not a summary of one:
 #: shortening a clause here would leave the bot and the website disagreeing about what
 #: the operator has undertaken.
-LEGAL_EFFECTIVE_DATE = "25 May, 2026 (UTC)"
+LEGAL_EFFECTIVE_DATE = "10 September, 2026 (UTC)"
 
 LEGAL_DOCUMENTS = {
     "Terms of Service": {
@@ -1115,7 +1146,14 @@ LEGAL_DOCUMENTS = {
             "a tool for creative expression; the user (or the administrator of a self-hosted "
             "instance) bears all liability for generated output. While the official Service "
             "applies safety checks to the Public Library, private profiles may be governed by "
-            "the safety policies of the underlying API providers (Google or OpenRouter)."
+            "the safety policies of the underlying API providers (Google or OpenRouter).\n\n"
+            "**Prohibited use.** Regardless of where a profile runs, you must not use the "
+            "Software or the Service to: generate or solicit sexual content involving minors; "
+            "threaten, harass or incite violence against a real person or group; publish "
+            "another person's private information; obtain instructions for weapons, explosives "
+            "or other activity likely to cause serious real-world harm; or coordinate fraud or "
+            "other criminal activity. These prohibitions apply to what you prompt as well as "
+            "to what a profile produces, and they apply in age-restricted channels."
         ),
         "4. API Costs & Liability": (
             "By providing a personal API key, you acknowledge that you are solely responsible "
@@ -1166,7 +1204,13 @@ LEGAL_DOCUMENTS = {
             "We reserve the right to terminate or suspend your access to the Official Instance "
             "(including blacklisting your Discord ID) without notice for violations of these "
             "terms, attempting to exploit the service, or actions that threaten platform "
-            "stability."
+            "stability.\n\n"
+            "Access may be suspended for a fixed period or permanently. Whatever the "
+            "restriction, your current standing is shown in /settings, and your data remains "
+            "available for export or deletion through /privacy. We may also "
+            "decline to operate in a particular Discord server and remove the bot from it. "
+            "Where we act, we retain a record of the account or server, the date, the "
+            "restriction applied, and the reason."
         ),
     },
     "Privacy Policy": {
@@ -1192,7 +1236,9 @@ LEGAL_DOCUMENTS = {
             "temporarily to maintain conversation history.\n"
             "• **Profile Customisation:** Custom display names and avatar URLs.\n"
             "• **Technical Credentials:** API keys (Google/OpenRouter). Discord Bot Tokens "
-            "are strictly collected and stored only for the instance owner."
+            "are strictly collected and stored only for the instance owner.\n"
+            "• **Enforcement Records:** where access is restricted, the Discord account or "
+            "server ID, the date, the restriction applied, and a short reason."
         ),
         "4. Third-Party Data Processing": (
             "**AI Providers:** Your inputs are sent to Google (Gemini) or OpenRouter in "
@@ -1204,12 +1250,15 @@ LEGAL_DOCUMENTS = {
             "footprint, inactive Chat Session logs are automatically purged from our servers "
             "after 30 days of inactivity. Users may also export and import data shards between "
             "instances, allowing full migration from the managed Service to self-hosted "
-            "hardware."
+            "hardware.\n\n"
+            "Enforcement records are the exception: they are retained while a restriction is in "
+            "force, and for a reasonable period afterwards to prevent evasion, and they are not "
+            "removed by deleting your profiles or your account."
         ),
         "6. No Sale of Data": (
             "We do not sell, trade, or rent your personal identification information or "
-            "conversation logs to others. Your data is used strictly to provide the chatbot "
-            "service and maintain your personalised experience."
+            "conversation logs to others. Your data is used to provide the chatbot service, to "
+            "maintain your personalised experience, and to enforce these terms."
         ),
         "7. Changes to Policy": (
             "We may update this privacy policy to reflect changes in our practices or Software "

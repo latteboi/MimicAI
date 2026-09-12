@@ -574,6 +574,10 @@ def _format_and_chunk_thought_summary(thought_text: str) -> List[str]:
 
 def _format_api_error(error: Exception) -> str:
     """Analyses API exceptions to provide specific, user-friendly diagnostic strings."""
+    # An exception that arrives already phrased for the user keeps its phrasing.
+    formatted = getattr(error, "formatted_reason", None)
+    if formatted:
+        return formatted
     if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
         return "Generation Stalled (No data received for 20s)" if "Generation stalled or timed out" in str(error) else "Response Timed-out (Took longer than 2 minutes)"
 

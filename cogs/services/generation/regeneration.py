@@ -75,77 +75,83 @@ class RegenerationMixin:
         # 1. State Locking & Pre-emptive Persistence
         session['is_regenerating'] = True
 
-        actual_turn_index = -1
-        target_turn = None
-        for i, t in enumerate(session.get("unified_log", [])):
-            if t.get("turn_id") == turn_id:
-                actual_turn_index = i
-                target_turn = t
-                break
-
-        if not target_turn:
-            session['is_regenerating'] = False
-            return
-
-        p_owner_id = participant['owner_id']
-        p_name = participant['profile_name']
-        p_key = (p_owner_id, p_name)
-        bot_pid = self.cog.profile_manager._get_pid_from_name_any(p_owner_id, p_name)
-
-        p_index = self.cog.profile_manager._get_user_index(p_owner_id)
-        p_is_borrowed = p_name in p_index.get("borrowed", [])
-        p_profile = self.cog.profile_manager._get_profile_config(p_owner_id, p_name, p_is_borrowed) or {}
-
-        custom_emoji = p_profile.get("placeholder_emoji") or PLACEHOLDER_EMOJI
-
-        # The message being regenerated is edited in place, so its current text is the
-        # only copy of what to put back if this cannot run or is cancelled. Read once,
-        # here, because every path below has already overwritten it with the emoji.
-        #
-        # The cancel handlers used to call _safe_delete_placeholder on it instead --
-        # correct in the worker, where msg_a_id is a throwaway placeholder, but here
-        # msg_a_id *is* the turn's real message, so a cancelled regeneration deleted it
-        # out of the channel and left its unified_log entry pointing at nothing.
-        original_message_content = None
-        original_attachments = []
-        try:
-            _original_message = await channel.fetch_message(payload.message_id)
-            original_message_content = _original_message.content
-            original_attachments = [a for a in _original_message.attachments
-                                    if a.content_type and a.content_type.startswith("image/")]
-        except Exception:
-            pass
-
-        # Pre-emptive visual feedback before disk I/O and context gathering
-        if participant.get('method') == 'child_bot':
-            child_emoji = await self.cog.child_bot_manager.resolve_emoji_for_child(
-                participant['bot_id'], custom_emoji)
-            await self.cog.manager_queue.put({
-                "action": "send_to_child", "bot_id": participant['bot_id'],
-                "payload": {
-                    "action": "regenerate_message", "channel_id": channel.id,
-                    "message_id": payload.message_id, "content": child_emoji
-                }
-            })
-        else:
-            try:
-                await self.cog.server_manager.run_webhook(
-                    channel, "edit_message", payload.message_id, content=custom_emoji,
-                    attachments=original_attachments)
-            except Exception: pass
-
         session_type = session.get("type", "multi")
         dummy_key = (channel.id, None, None)
         # Set once the new text is on the message. Everything after that point --
         # notably the session flush -- must not roll the channel back to the old reply,
         # because the log already holds the new one.
         delivered = False
+        original_message_content = None
+        original_attachments = []
 
-        # Flush session state to disk in parallel with initial cleanups
-        self.cog.session_manager._save_multi_profile_sessions()
-        await self.cog.session_manager._save_session_to_disk(dummy_key, session_type, session["unified_log"])
-
+        # Everything after the flag runs inside the try whose handlers put the
+        # message back and whose finally clears is_regenerating. The fetch, the emoji
+        # edit and the log save used to sit above it, so a cancel landing on any of them
+        # -- the user pulling the reaction back off, or /cancel -- left the message
+        # showing the emoji for good and is_regenerating set, which parks the channel's
+        # worker until somebody runs /cancel.
         try:
+            actual_turn_index = -1
+            target_turn = None
+            for i, t in enumerate(session.get("unified_log", [])):
+                if t.get("turn_id") == turn_id:
+                    actual_turn_index = i
+                    target_turn = t
+                    break
+
+            if not target_turn:
+                session['is_regenerating'] = False
+                return
+
+            p_owner_id = participant['owner_id']
+            p_name = participant['profile_name']
+            p_key = (p_owner_id, p_name)
+            bot_pid = self.cog.profile_manager._get_pid_from_name_any(p_owner_id, p_name)
+
+            p_index = self.cog.profile_manager._get_user_index(p_owner_id)
+            p_is_borrowed = p_name in p_index.get("borrowed", [])
+            p_profile = self.cog.profile_manager._get_profile_config(p_owner_id, p_name, p_is_borrowed) or {}
+
+            custom_emoji = p_profile.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+
+            # The message being regenerated is edited in place, so its current text is the
+            # only copy of what to put back if this cannot run or is cancelled. Read once,
+            # here, because every path below has already overwritten it with the emoji.
+            #
+            # The cancel handlers used to call _safe_delete_placeholder on it instead --
+            # correct in the worker, where msg_a_id is a throwaway placeholder, but here
+            # msg_a_id *is* the turn's real message, so a cancelled regeneration deleted it
+            # out of the channel and left its unified_log entry pointing at nothing.
+            try:
+                _original_message = await channel.fetch_message(payload.message_id)
+                original_message_content = _original_message.content
+                original_attachments = [a for a in _original_message.attachments
+                                        if a.content_type and a.content_type.startswith("image/")]
+            except Exception:
+                pass
+
+            # Pre-emptive visual feedback before disk I/O and context gathering
+            if participant.get('method') == 'child_bot':
+                child_emoji = await self.cog.child_bot_manager.resolve_emoji_for_child(
+                    participant['bot_id'], custom_emoji)
+                await self.cog.manager_queue.put({
+                    "action": "send_to_child", "bot_id": participant['bot_id'],
+                    "payload": {
+                        "action": "regenerate_message", "channel_id": channel.id,
+                        "message_id": payload.message_id, "content": child_emoji
+                    }
+                })
+            else:
+                try:
+                    await self.cog.server_manager.run_webhook(
+                        channel, "edit_message", payload.message_id, content=custom_emoji,
+                        attachments=original_attachments)
+                except Exception: pass
+
+            # Flush session state to disk in parallel with initial cleanups
+            self.cog.session_manager._save_multi_profile_sessions()
+            await self.cog.session_manager._save_session_to_disk(dummy_key, session_type, session["unified_log"])
+
             message_ids_to_check = target_turn.get("message_ids", [])
 
             # 2. Cleanup follow-up messages
@@ -338,7 +344,7 @@ class RegenerationMixin:
                 model = self.cog.api_service._instantiate_model(
                     primary_model, channel.guild.id, payload.user_id,
                     full_system_instruction, dynamic_safety_settings,
-                    t_params_worker, model_tools, p_profile)
+                    t_params_worker, model_tools, p_profile, config_owner_id=p_owner_id)
             except ValueError as e:
                 model_warning = str(e)
             except Exception as e:
@@ -422,7 +428,8 @@ class RegenerationMixin:
                     try:
                         fallback_instance = self.cog.api_service._instantiate_model(
                             fallback_model_name, channel.guild.id, payload.user_id, full_system_instruction, dynamic_safety_settings, t_params_worker, model_tools, p_profile,
-                            openrouter_key_error="No OpenRouter key for fallback", use_broad_openrouter_heuristic=False
+                            openrouter_key_error="No OpenRouter key for fallback", use_broad_openrouter_heuristic=False,
+                            config_owner_id=p_owner_id,
                         )
 
                         response, state_container = await self._generate_with_heartbeat(

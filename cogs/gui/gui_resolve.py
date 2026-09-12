@@ -15,7 +15,7 @@ import discord
 from discord import ui
 from typing import TYPE_CHECKING, Awaitable, Callable, List, Optional, Sequence
 
-from .base_components import add_button, add_select
+from .base_components import BlockedGuard, add_button, add_select
 from ..utils.fuzzy import MAX_CHOICES, best_match, rank_keyed
 
 if TYPE_CHECKING:
@@ -64,7 +64,7 @@ class ProfileCandidate:
         return self.name[:80]
 
 
-class ProfileSuggestionView(ui.View):
+class ProfileSuggestionView(BlockedGuard, ui.View):
     """"Did you mean?" prompt: top matches as buttons, the rest in a dropdown.
 
     Does not resolve anything itself. On a selection it invokes `on_pick`, which is the
@@ -97,7 +97,12 @@ class ProfileSuggestionView(ui.View):
 
         These prompts are ephemeral, so this is belt-and-braces rather than a live hole
         -- but it means the view stays safe if it is ever reused somewhere public.
+
+        Chains to BlockedGuard first: an owner check is not a block check, and a view
+        that answers its own question stops asking the one in front of it.
         """
+        if not await super().interaction_check(interaction):
+            return False
         if interaction.user.id != self.user_id:
             await interaction.response.send_message(
                 "This prompt isn't yours to answer.", ephemeral=True)

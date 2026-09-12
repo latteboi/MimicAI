@@ -253,7 +253,7 @@ class SpeakAsMixin:
                 model_name, guild_id, owner_id, system_instruction, safety_settings,
                 resolve_thinking_params(p_settings, "response",
                                         "fallback" if is_fallback else "primary"),
-                tools, p_settings,
+                tools, p_settings, config_owner_id=owner_id,
             )
             return await self._generate_with_heartbeat(
                 model, contents, gen_config, channel, None, None,

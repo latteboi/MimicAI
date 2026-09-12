@@ -6,8 +6,9 @@ import asyncio
 import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from .base_components import TabbedView, add_button, add_select
+from .base_components import BlockedGuard, TabbedView, add_button, add_select
 from ..utils.helpers import _get_user_hash, _resolve_zoneinfo
+from ..utils.data_policy import is_paid_gemini_slot, may_save_free_gemini_key
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -28,6 +29,12 @@ class OllamaHostModal(ui.Modal, title="Set Ollama Host URL"):
             self.host_input.default = getattr(view, 'models_state', {}).get("ollama_host_url", OLLAMA_LOCAL_URL)
 
     async def on_submit(self, interaction: discord.Interaction):
+        # The host is where every message a profile sees would be sent, and the probe
+        # below dials it from the bot's own network: the bot owner's call alone.
+        if not self.parent_view.cog.profile_manager.may_use_ollama(
+                getattr(self.parent_view, "user_id", interaction.user.id)):
+            await interaction.response.send_message(OLLAMA_OWNER_ONLY, ephemeral=True)
+            return
         url = self.host_input.value.strip()
         if not url:
             url = OLLAMA_LOCAL_URL
@@ -69,7 +76,13 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
         if not is_valid:
             await interaction.followup.send(f"❌ **Validation Failed:** {err}", ephemeral=True)
             return
-        
+
+        # Refused before anything is written -- see may_save_free_gemini_key.
+        if (self.provider == "gemini" and not is_paid_gemini_slot({"tier": tier})
+                and not may_save_free_gemini_key(interaction.user.id)):
+            await interaction.followup.send(f"❌ {GEMINI_FREE_TIER_KEY_REFUSED}", ephemeral=True)
+            return
+
         user_data = self.cog.storage_manager._get_user_keys_data(interaction.user.id)
         user_data.setdefault("slots", {})[self.slot_id] = {
             "key": raw_key,
@@ -86,6 +99,8 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
         # repair on the next hourly pass.
 
         msg = f"✅ {self.provider.title()} key saved to slot `{self.slot_id}` ({tier.title()} Tier)."
+        if self.provider == "gemini" and not is_paid_gemini_slot({"tier": tier}):
+            msg += "\nGoogle may train on what a free-tier key is sent, so it is not used in servers or Global Chat."
 
         if self.view:
             self.view.setup_items()
@@ -93,7 +108,7 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
             
         await interaction.followup.send(msg, ephemeral=True)
 
-class OverrideConfirmView(ui.View):
+class OverrideConfirmView(BlockedGuard, ui.View):
     def __init__(self, cog: 'MimicCog', user_id: int, slot_id: str, provider: str, new_scopes: List[str], parent_view: ui.View):
         super().__init__(timeout=120)
         self.cog = cog
@@ -195,6 +210,74 @@ class SettingsHomeView(SettingsBaseView):
         
         await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
 
+def _standing_text(cog: 'MimicCog', user_id: int) -> str:
+    """Whether the user is restricted, since when, and until when.
+
+    Never why, and never by whom: those are the operator's note. The Privacy Policy
+    discloses that a reason is held, not that it is shown. Set membership decides, not
+    the record, so an elapsed block reads as lifted before the sweep has pruned it.
+    """
+    if user_id not in cog.generation_blocked:
+        return "No restrictions."
+    entry = cog.server_manager.blacklist_entry(user_id) or {}
+    lines = ["**Restricted.** Only `/privacy`, `/terms` and `/settings` are available to you."]
+    try:
+        since = int(datetime.datetime.fromisoformat(entry["at"]).timestamp())
+        lines.append(f"Since <t:{since}:D>")
+    except (KeyError, TypeError, ValueError):
+        pass
+    until = entry.get("until")
+    lines.append(f"Lifts <t:{int(until)}:R>" if until else "No end date.")
+    return "\n".join(lines)
+
+
+def build_about_embed(cog: 'MimicCog', user_id: int) -> discord.Embed:
+    """About Me, with the user's standing.
+
+    The About tab renders this, and so does `/settings` for a blocked user in place of
+    the tabs, with no view attached -- nothing on it is theirs to change while blocked.
+    """
+    about = cog.profile_manager.get_user_about(user_id)
+    stored_tz = about.get("timezone")
+
+    # The resolved value is what actually gets used, so it is what is shown --
+    # "unset" is reported as the fallback it resolves to, not as a blank.
+    tz_name = stored_tz or "UTC"
+    try:
+        tz_obj, _ = _resolve_zoneinfo(tz_name)
+        now_str = datetime.datetime.now(tz_obj).strftime("%I:%M %p (%Z)")
+    except Exception:
+        now_str = "Unknown"
+
+    tz_value = (f"`{tz_name}` -- local time `{now_str}`" if stored_tz
+                else f"`Not set` -- using `UTC`, local time `{now_str}`")
+
+    embed = discord.Embed(
+        title="About Me",
+        description=("Your own settings, separate from any character's. These follow "
+                     "you into every server."),
+        color=discord.Color.dark_teal())
+    embed.set_thumbnail(url=THINKING_THUMBNAIL_URL)
+
+    embed.add_field(
+        name="\N{GLOBE WITH MERIDIANS} Your Timezone",
+        value=(f"{tz_value}\n"
+               "Timestamps your messages carry into a character's history. A "
+               "character's *own* clock is set per profile, under "
+               "`/profile manage` -> Timezone."),
+        inline=False)
+
+    embed.add_field(
+        name="\N{BUST IN SILHOUETTE} Your Identifiers",
+        value=(f"**Discord ID:** `{user_id}`\n"
+               f"**Handle characters see:** `{_get_user_hash(user_id)}`"),
+        inline=False)
+
+    embed.add_field(name="\N{SCALES} Standing", value=_standing_text(cog, user_id),
+                    inline=False)
+    return embed
+
+
 class SettingsAboutView(SettingsBaseView):
     """The user's own settings, as opposed to any character's.
 
@@ -220,44 +303,8 @@ class SettingsAboutView(SettingsBaseView):
         self._add_nav_buttons()
 
     async def update_display(self):
-        about = self.cog.profile_manager.get_user_about(self.user_id)
-        stored_tz = about.get("timezone")
-
-        # The resolved value is what actually gets used, so it is what is shown --
-        # "unset" is reported as the fallback it resolves to, not as a blank.
-        tz_name = stored_tz or "UTC"
-        try:
-            tz_obj, _ = _resolve_zoneinfo(tz_name)
-            now_str = datetime.datetime.now(tz_obj).strftime("%I:%M %p (%Z)")
-        except Exception:
-            now_str = "Unknown"
-
-        tz_value = (f"`{tz_name}` -- local time `{now_str}`" if stored_tz
-                    else f"`Not set` -- using `UTC`, local time `{now_str}`")
-
-        embed = discord.Embed(
-            title="About Me",
-            description=("Your own settings, separate from any character's. These follow "
-                         "you into every server."),
-            color=discord.Color.dark_teal())
-        embed.set_thumbnail(url=THINKING_THUMBNAIL_URL)
-
-        embed.add_field(
-            name="\N{GLOBE WITH MERIDIANS} Your Timezone",
-            value=(f"{tz_value}\n"
-                   "Timestamps your messages carry into a character's history. A "
-                   "character's *own* clock is set per profile, under "
-                   "`/profile manage` -> Timezone."),
-            inline=False)
-
-        embed.add_field(
-            name="\N{BUST IN SILHOUETTE} Your Identifiers",
-            value=(f"**Discord ID:** `{self.user_id}`\n"
-                   f"**Handle characters see:** `{_get_user_hash(self.user_id)}`"),
-            inline=False)
-
         await self.original_interaction.edit_original_response(
-            content=None, embed=embed, view=self)
+            content=None, embed=build_about_embed(self.cog, self.user_id), view=self)
 
     async def _act_timezone(self, i: discord.Interaction):
         # Deferred, not module scope: gui_profiles imports OllamaHostModal from this
@@ -370,7 +417,14 @@ class SettingsAPIView(SettingsBaseView):
             
             if slot_data:
                 tier = slot_data.get("tier", "free").title()
-                embed.add_field(name=f"Slot: {label}", value=f"**Status:** ✅ Set\n**Tier:** `{tier}`", inline=False)
+                provider = next(p for s, l, p in self.slots_config if s == self.selected_slot)
+                value = f"**Status:** ✅ Set\n**Tier:** `{tier}`"
+                if provider == "gemini" and not is_paid_gemini_slot(slot_data):
+                    # Assigning one to a server looks like it worked, and then nothing
+                    # there can use it -- see cogs/utils/data_policy.
+                    value += ("\n-# Google may train on what a free-tier key is sent, so it "
+                              "is not used in servers or Global Chat.")
+                embed.add_field(name=f"Slot: {label}", value=value, inline=False)
                 
                 provider = next(p for s, l, p in self.slots_config if s == self.selected_slot)
                 assignments = []
@@ -694,7 +748,7 @@ class ParentActivityModal(ui.Modal):
         
         await interaction.response.send_message(f"Activity set to **{self.act_type.title()} {text}**.", ephemeral=True)
 
-class ParentPresenceView(ui.View):
+class ParentPresenceView(BlockedGuard, ui.View):
     def __init__(self, cog):
         super().__init__(timeout=300)
         self.cog = cog
@@ -754,7 +808,7 @@ class ParentPresenceView(ui.View):
         await self.cog.bot.change_presence(status=status_map.get(status_val, discord.Status.online), activity=None)
         await interaction.response.send_message("Activity cleared.", ephemeral=True)
 
-class ShutdownConfirmView(ui.View):
+class ShutdownConfirmView(BlockedGuard, ui.View):
     def __init__(self, cog: 'MimicCog'):
         super().__init__(timeout=60)
         self.cog = cog

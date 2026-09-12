@@ -809,7 +809,7 @@ class MemoryManager:
                     profile_owner_id, instructions, DEFAULT_SAFETY_SETTINGS,
                     resolve_thinking_params(
                         params_source, "ltm", "fallback" if is_fallback else "primary"),
-                    None, params_source)
+                    None, params_source, config_owner_id=profile_owner_id)
                 return await m.generate_content_async(
                     [f"<target_transcript>\n{convo}\n</target_transcript>"], generation_config=cfg)
 
@@ -998,7 +998,7 @@ class MemoryManager:
             p_is_b = profile_name in index.get("borrowed", [])
             p_cfg = self.cog.profile_manager._get_profile_config(user_id, profile_name, p_is_b) or {}
             
-            model = self.cog.api_service._instantiate_model(model_name, interaction.guild_id, user_id, None, None, {}, None, p_cfg)
+            model = self.cog.api_service._instantiate_model(model_name, interaction.guild_id, user_id, None, None, {}, None, p_cfg, config_owner_id=user_id)
             resp = await model.generate_content_async([prompt])
             response_text = resp.text
 
