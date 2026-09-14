@@ -175,6 +175,22 @@ OPENROUTER_TRAINING_MODEL_HIDDEN = (
     "No OpenRouter host is known to serve this model without training on prompts, so it "
     "is not offered here. Choose another model."
 )
+#: A typed OpenRouter id in an image slot that the image catalogue does not list: a text
+#: model there would reach the Image API and 400, and one the catalogue left out was left
+#: out on purpose -- see api/openrouter_image_catalogue.
+OPENROUTER_NOT_IMAGE_MODEL = (
+    "That is not one of the OpenRouter image models this bot can use. Choose one from the "
+    "OpenRouter tab."
+)
+#: A typed OpenRouter id in a text slot for a model that also outputs images or audio. The
+#: pickers leave those out, because the chat adapter asks for text alone.
+OPENROUTER_NOT_TEXT_MODEL = (
+    "That OpenRouter model makes images or audio as well as text, and this slot only uses "
+    "text. Choose a model from the OpenRouter tab."
+)
+IMAGE_MODEL_NO_OLLAMA = (
+    "Image generation has no Ollama path. Choose a Google or OpenRouter image model."
+)
 
 # Define the allowed models for the new command
 ALLOWED_MODELS = Literal[
@@ -235,14 +251,20 @@ IMAGE_SIZES_ALL = ('512', '1K', '2K')
 #: type -- retrieving real photographs off the web and using them as visual reference
 #: rather than only reading text. Both are narrower than the text-model story: 3 Pro
 #: grounds against web search only, and the Lite model takes neither.
+#: What every Google row shares beside the keys above. `quality`, `formats` and `max_refs`
+#: are OpenRouter's (see OPENROUTER_IMAGE_CAPS_UNKNOWN): Gemini has no quality knob, answers
+#: in PNG unasked, and takes references as File API parts the call sites cap themselves.
+#: `sampling` is whether the image_temperature/top_p/top_k keys are sent at all.
+_GOOGLE_IMAGE_CAPS_SHARED = {'quality': (), 'formats': (), 'max_refs': None, 'sampling': True}
+
 IMAGE_MODEL_CAPS = {
-    'gemini-3.1-flash-image':      {'sizes': ('512', '1K', '2K'), 'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'modalities': ('IMAGE',),          'grounding': True,  'image_search': True},
+    'gemini-3.1-flash-image':      {'sizes': ('512', '1K', '2K'), 'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'modalities': ('IMAGE',),          'grounding': True,  'image_search': True,  **_GOOGLE_IMAGE_CAPS_SHARED},
     # 1K and nothing else. It was listed with ('512', '1K') from the 3.1 Flash row; the
     # published table gives the Lite model one resolution, so an empty tuple is the
     # honest encoding -- send no imageSize and let the model use the only one it has.
-    'gemini-3.1-flash-lite-image': {'sizes': (),                  'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'modalities': ('IMAGE',),          'grounding': False, 'image_search': False},
-    'gemini-3-pro-image':          {'sizes': ('1K', '2K'),        'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': True,  'modalities': ('IMAGE',),          'grounding': True,  'image_search': False},
-    'gemini-2.5-flash-image':      {'sizes': (),                  'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': False, 'modalities': ('TEXT', 'IMAGE'),   'grounding': False, 'image_search': False},
+    'gemini-3.1-flash-lite-image': {'sizes': (),                  'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'modalities': ('IMAGE',),          'grounding': False, 'image_search': False, **_GOOGLE_IMAGE_CAPS_SHARED},
+    'gemini-3-pro-image':          {'sizes': ('1K', '2K'),        'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': True,  'modalities': ('IMAGE',),          'grounding': True,  'image_search': False, **_GOOGLE_IMAGE_CAPS_SHARED},
+    'gemini-2.5-flash-image':      {'sizes': (),                  'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': False, 'modalities': ('TEXT', 'IMAGE'),   'grounding': False, 'image_search': False, **_GOOGLE_IMAGE_CAPS_SHARED},
 }
 
 #: What an unknown image model gets: ratios every listed model shares, no imageSize and
@@ -253,7 +275,16 @@ IMAGE_MODEL_CAPS = {
 #: unrecognised model gets: asking for a combination it does not support is an error,
 #: and we cannot know which combinations a model we have never seen lists.
 IMAGE_MODEL_CAPS_DEFAULT = {'sizes': (), 'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': False,
-                            'modalities': (), 'grounding': False, 'image_search': False}
+                            'modalities': (), 'grounding': False, 'image_search': False,
+                            **_GOOGLE_IMAGE_CAPS_SHARED}
+
+#: What an OpenRouter image model the image catalogue does not list gets: nothing at all.
+#: The factory refuses such an id wherever a server's data policy applies, and anywhere
+#: else no option is the one request no model rejects. A listed model's caps come from its
+#: own `supported_parameters` -- see api/openrouter_image_catalogue.
+OPENROUTER_IMAGE_CAPS_UNKNOWN = {'sizes': (), 'ratios': (), 'thinking': False, 'modalities': (),
+                                 'grounding': False, 'image_search': False, 'quality': (),
+                                 'formats': (), 'max_refs': 0, 'sampling': False}
 
 #: What each ratio is *for*. A dropdown of fourteen bare numbers tells nobody which one
 #: is the phone-shaped one, and the four extreme ratios are easy to pick by accident.
@@ -263,6 +294,10 @@ IMAGE_ASPECT_RATIO_NOTES = {
     '4:1': 'Wide banner', '4:3': 'Landscape', '4:5': 'Portrait (social)',
     '5:4': 'Landscape (social)', '8:1': 'Extreme wide banner',
     '9:16': 'Tall (phone / story)', '16:9': 'Widescreen', '21:9': 'Ultrawide',
+    # Ratios only some OpenRouter image models take.
+    '1:2': 'Tall', '2:1': 'Wide', '9:19.5': 'Tall (modern phone)',
+    '19.5:9': 'Wide (modern phone)', '9:20': 'Tall (phone)', '20:9': 'Wide (phone)',
+    '9:21': 'Ultratall',
 }
 
 IMAGE_SIZE_NOTES = {
@@ -281,11 +316,37 @@ IMAGE_THINKING_NOTES = {
 #: draws, and is billed for the thinking tokens either way.
 IMAGE_THINKING_LEVELS = ('MINIMAL', 'HIGH')
 
+#: OpenRouter's rendering quality levels, in the order a picker lists them. "auto" is left
+#: out: it is the absence of a choice, which a blank `image_quality` already sends. Only a
+#: model whose `supported_parameters` carry `quality` is offered one -- Gemini has none.
+IMAGE_QUALITY_LEVELS = ('low', 'medium', 'high', 'xhigh', 'max')
+
+IMAGE_QUALITY_NOTES = {
+    'low': 'Fastest and cheapest.',
+    'medium': 'The balance most models are tuned for.',
+    'high': 'More detail. Slower, and billed for it.',
+    'xhigh': 'Extra detail, at a higher price again.',
+    'max': "The model's best, and its dearest.",
+}
+
+#: The output formats Discord previews inline. An image model that answers only in
+#: something else -- SVG, today -- is not offered at all.
+IMAGE_RASTER_FORMATS = ('png', 'jpeg', 'webp')
+
+#: A generated image's type and the suffix it is saved under. The suffix is what carries the
+#: type from the response to the send, because a path is the only thing that moves between.
+IMAGE_MIME_SUFFIXES = {'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp'}
+IMAGE_SUFFIX_MIMES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+                      '.webp': 'image/webp'}
+
 #: Native search grounding on an *image* request. Three states rather than a boolean,
 #: because Google splits the one `google_search` tool into two search types and only
 #: 3.1 Flash Image carries the second:
 #:
 #:   off        -- no tool. The model draws from what it already knows.
+#:   rag        -- no tool either. The grounding summariser searches first and its visual
+#:                 summary is written into the prompt (helpers.image_rag_enabled), so every
+#:                 image model can take it. The profile's chat `grounding_mode` never does.
 #:   web        -- {"google_search": {}}. Web search only: the model looks facts up and
 #:                 renders from the text it read (today's weather map, a current logo).
 #:   web_images -- adds the imageSearch search type, so the tool returns image *bytes*
@@ -300,17 +361,20 @@ IMAGE_THINKING_LEVELS = ('MINIMAL', 'HIGH')
 #:
 #: A mode the chosen model does not carry is dropped exactly as an unsupported
 #: resolution is -- the profile keeps its preference, the request goes without.
-IMAGE_GROUNDING_MODES = ('off', 'web', 'web_images')
+IMAGE_GROUNDING_MODES = ('off', 'rag', 'web', 'web_images')
+#: The modes sent as Gemini's search tool; the other two send none.
+IMAGE_GROUNDING_TOOL_MODES = ('web', 'web_images')
 
 IMAGE_GROUNDING_NOTES = {
     'off': 'No search. The model draws from what it knows.',
+    'rag': 'Search and summarise first, then draw. Any image model.',
     'web': 'Google Search for facts, then draws. 3.1 Flash and 3 Pro.',
     'web_images': 'Also pulls reference photos off the web. 3.1 Flash only.',
 }
 
-#: The same three states as a phrase short enough to sit in the /profile manage
-#: summary line beside the ratio and the resolution.
-IMAGE_GROUNDING_LABELS = {'web': 'Web search', 'web_images': 'Web + image search'}
+#: The same states as a phrase short enough to sit in the /profile manage summary line
+#: beside the ratio and the resolution.
+IMAGE_GROUNDING_LABELS = {'rag': 'RAG', 'web': 'Web search', 'web_images': 'Web + image search'}
 
 #: Sampling controls for the image slot, kept separate from the text profile's
 #: `temperature`/`top_p`/`top_k` because they are a different model on a different
@@ -378,10 +442,10 @@ TTS_SYNTHESIS_PREAMBLE = (
     "never be spoken aloud."
 )
 
-#: The three per-profile image output settings, named once so the picker, the bulk row
-#: and the queue payload cannot disagree about which keys travel together.
+#: The per-profile image output settings, named once so the picker, the bulk row and the
+#: queue payload cannot disagree about which keys travel together.
 IMAGE_OUTPUT_KEYS = ('image_aspect_ratio', 'image_size', 'image_thinking_level',
-                     'image_grounding_mode')
+                     'image_grounding_mode', 'image_quality')
 
 #: Defaults for the two media slots, named rather than repeated as literals across the
 #: profile template, the pickers and four generation call sites -- which had already
@@ -390,19 +454,21 @@ DEFAULT_IMAGE_MODEL = 'GOOGLE/gemini-2.5-flash-image'
 DEFAULT_SPEECH_MODEL = 'GOOGLE/gemini-2.5-flash-preview-tts'
 
 #: Config keys whose option list is the image or audio catalogue rather than the text
-#: one, and whose values are always Google-routed. The fallback slots belong here too:
-#: without them a fallback dropdown would offer text models for an image slot.
+#: one. The fallback slots belong here too: without them a fallback dropdown would offer
+#: text models for an image slot. Image slots route by prefix, to Gemini or to OpenRouter's
+#: Image API (api/openrouter_images); audio slots are always Google-routed.
 IMAGE_MODEL_KEYS = frozenset({'image_generation_model', 'image_generation_fallback_model'})
 AUDIO_MODEL_KEYS = frozenset({'speech_model', 'speech_fallback_model'})
 
 #: Slots that may only ever hold a Google model, and the reason differs per slot.
-#: Image and speech are Google-only because the OpenRouter adapter speaks
-#: chat/completions and those live on separate OpenRouter endpoints. Grounding is
+#: Speech is Google-only because the OpenRouter adapter speaks chat/completions and speech
+#: lives on a separate OpenRouter endpoint nothing here calls. Grounding is
 #: Google-only because the phase attaches the native `google_search` tool, which has no
 #: equivalent our adapter can send -- an OpenRouter id here never ran on OpenRouter, it
 #: silently resolved to the Google default. The pickers refuse these rather than storing
-#: a value that cannot be honoured.
-GOOGLE_ONLY_MODEL_KEYS = IMAGE_MODEL_KEYS | AUDIO_MODEL_KEYS | frozenset({
+#: a value that cannot be honoured. Image left this set when OpenRouter's Image API got an
+#: adapter of its own.
+GOOGLE_ONLY_MODEL_KEYS = AUDIO_MODEL_KEYS | frozenset({
     'grounding_rag_model', 'grounding_rag_fallback_model',
 })
 
@@ -1412,7 +1478,8 @@ DEFAULT_SESSION_SYNOPSIS_PROMPT = (
     "Discard: turn-by-turn phrasing, greetings, small talk, and anything already implied "
     "by what you keep.\n\n"
     "Do not invent events. Do not address the reader. Do not use XML tags, headings or "
-    "bullet points -- write flowing prose of at most {max_words} words."
+    "bullet points -- write flowing prose of about {max_words} words, or fewer when there "
+    "is less worth keeping."
 )
 
 DEFAULT_SESSION_SYNOPSIS_USER_PROMPT = (
@@ -1420,9 +1487,13 @@ DEFAULT_SESSION_SYNOPSIS_USER_PROMPT = (
     "Write the updated synopsis."
 )
 
-# Roughly a paragraph per compaction; the synopsis replaces many turns, so it has to
-# stay cheaper than what it replaces or compaction gains nothing.
-COMPACTION_SYNOPSIS_MAX_WORDS = 220
+# The length of the whole synopsis, not of each fold: every fold rewrites the previous
+# synopsis plus the new excerpt into one block, so this is how much of a long session
+# survives. A session may set its own within the bounds. The ceiling is a cost bound --
+# the synopsis rides in the system instruction of every reply in the channel.
+COMPACTION_SYNOPSIS_WORDS_DEFAULT = 220
+COMPACTION_SYNOPSIS_WORDS_MIN = 100
+COMPACTION_SYNOPSIS_WORDS_MAX = 800
 
 DEFAULT_IMAGE_PRESENT = (
     "<image_context>You have just generated the following image based on the prompt: "

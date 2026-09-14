@@ -133,7 +133,8 @@ class WhisperMixin:
         # hides other participants' — so the privacy boundary is enforced in one place.
         bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
         contents_for_api_call = self.cog.session_manager._build_history_for_participant(
-            session.get("unified_log", []), bot_pid, p_settings
+            session.get("unified_log", []), bot_pid, p_settings,
+            hide_folded=self.cog.session_manager.compaction_enabled(session),
         )
 
         # Ensure alternating roles by appending to the last user turn if present
@@ -428,6 +429,7 @@ class WhisperMixin:
         participant_history = self.cog.session_manager._build_history_for_participant(
             sliced_log, bot_pid, p_settings,
             reserved_tail=len(sliced_log) - batch_start_index,
+            hide_folded=self.cog.session_manager.compaction_enabled(session),
         )
 
         gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "thinking_config": {"include_thoughts": True}}

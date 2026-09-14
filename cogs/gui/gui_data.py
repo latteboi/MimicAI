@@ -5,6 +5,7 @@ from discord import ui
 import datetime
 import traceback
 from typing import TYPE_CHECKING, List, Dict, Tuple, Optional
+from ..utils.helpers import suppress_link_previews
 from ..managers.memory_manager import (EMBEDDING_FAILED_MSG, NO_EMBEDDING_KEY_MSG,
                                        encode_embedding_b64)
 
@@ -613,7 +614,7 @@ class AnalyseExamplesModal(ui.Modal, title="Analyse Training Examples"):
             if not (model_name.upper().startswith("GOOGLE/") or model_name.upper().startswith("OPENROUTER/")):
                 raise ValueError("Model must start with GOOGLE/ or OPENROUTER/.")
         except ValueError as e:
-            await interaction.response.send_message(f"❌ **Invalid Input:** {e}", ephemeral=True); return
+            await interaction.response.send_message(f"❌ **Invalid Input:** {suppress_link_previews(str(e))}", ephemeral=True); return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         await self.parent_view.cog.memory_manager._execute_training_analysis(interaction, self.parent_view.profile_name, count, verbosity, model_name)

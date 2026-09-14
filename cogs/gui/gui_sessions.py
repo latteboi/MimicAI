@@ -7,7 +7,7 @@ import pathlib
 import time
 import asyncio
 from typing import TYPE_CHECKING, List, Dict, Any, Optional
-from ..utils.helpers import _estimate_text_tokens, resolve_openrouter_service_tier
+from ..utils.helpers import _estimate_text_tokens, _get_user_hash, resolve_openrouter_service_tier
 from ..utils.data_policy import may_pick_training_models
 from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PAGE, add_button,
                               paged_nav_options,
@@ -320,16 +320,16 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
         has_explicit_prefix = any(value.startswith(p) for p in system_prefixes)
 
         # The dropdown pins these slots to Google, but rule 1 above would still honour a
-        # typed 'OPENROUTER/' here -- and image, speech and grounding all construct a
-        # Google client directly, so the id would reach the Google API verbatim and 404.
+        # typed 'OPENROUTER/' here -- and speech and grounding both construct a Google
+        # client directly, so the id would reach the Google API verbatim and 404.
         # Refused rather than rewritten: 'OPENROUTER/x-ai/grok-4' has no Google meaning,
         # and silently saving 'GOOGLE/x-ai/grok-4' would only move the 404 later.
         if self.target_config_key in GOOGLE_ONLY_MODEL_KEYS:
             if has_explicit_prefix and not value.startswith("GOOGLE/"):
                 await interaction.response.send_message(
-                    f"`{self.target_config_key}` only accepts Google models — image, "
-                    "speech and grounding have no OpenRouter or Ollama path in the "
-                    "adapters. Enter the model id without a provider prefix.",
+                    f"`{self.target_config_key}` only accepts Google models — speech and "
+                    "grounding have no OpenRouter or Ollama path in the adapters. Enter the "
+                    "model id without a provider prefix.",
                     ephemeral=True)
                 return
             if not has_explicit_prefix:
@@ -345,18 +345,37 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
             
             value = prefix + value
 
+        is_image_slot = self.target_config_key in IMAGE_MODEL_KEYS
+        if value.startswith("OLLAMA/") and is_image_slot:
+            await interaction.response.send_message(IMAGE_MODEL_NO_OLLAMA, ephemeral=True)
+            return
+
         # A typed prefix reaches Ollama as surely as the API switch does.
         if value.startswith("OLLAMA/") and not self.parent_view.cog.profile_manager.may_use_ollama(
                 getattr(self.parent_view, "user_id", interaction.user.id)):
             await interaction.response.send_message(OLLAMA_OWNER_ONLY, ephemeral=True)
             return
 
-        # A typed id is held to the list the dropdown offers -- see may_pick_training_models.
-        if (value.startswith("OPENROUTER/")
-                and not may_pick_training_models(getattr(self.parent_view, "user_id", interaction.user.id))
-                and not self.parent_view.cog.api_service.catalogue.open_to_all(value[len("OPENROUTER/"):])):
-            await interaction.response.send_message(OPENROUTER_TRAINING_MODEL_HIDDEN, ephemeral=True)
-            return
+        if value.startswith("OPENROUTER/"):
+            model_id = value[len("OPENROUTER/"):]
+            api_service = self.parent_view.cog.api_service
+            catalogue = api_service.image_catalogue if is_image_slot else api_service.catalogue
+            # An image slot answers to the image catalogue: a text model there would reach the
+            # Image API and 400, and one the catalogue left out was left out on purpose.
+            # Judged once the catalogue has loaded, not on a fresh install before its sync.
+            if is_image_slot and catalogue.models and model_id not in catalogue.models:
+                await interaction.response.send_message(OPENROUTER_NOT_IMAGE_MODEL, ephemeral=True)
+                return
+            # A text slot is held to its list the same way: a model that also makes images or
+            # audio is left out of it, since the chat adapter asks for text alone.
+            if not is_image_slot and not catalogue.outputs_text_only(model_id):
+                await interaction.response.send_message(OPENROUTER_NOT_TEXT_MODEL, ephemeral=True)
+                return
+            # A typed id is held to the list the dropdown offers -- see may_pick_training_models.
+            if (not may_pick_training_models(getattr(self.parent_view, "user_id", interaction.user.id))
+                    and not catalogue.open_to_all(model_id)):
+                await interaction.response.send_message(OPENROUTER_TRAINING_MODEL_HIDDEN, ephemeral=True)
+                return
 
         self.parent_view._save_changes(self.target_config_key, value)
         self.parent_view._build_view()
@@ -1042,6 +1061,7 @@ class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
 class CompactionSettingsModal(ui.Modal, title="Rolling Synopsis"):
     threshold_input = ui.TextInput(label=f"Compact after N turns ({COMPACTION_THRESHOLD_MIN}-{COMPACTION_THRESHOLD_MAX})", placeholder=f"Default: {COMPACTION_THRESHOLD_DEFAULT}", required=True, max_length=3)
     chunk_input = ui.TextInput(label="Turns to fold each time", placeholder=f"Default: {COMPACTION_CHUNK_DEFAULT}", required=True, max_length=3)
+    length_input = ui.TextInput(label=f"Synopsis length in words ({COMPACTION_SYNOPSIS_WORDS_MIN}-{COMPACTION_SYNOPSIS_WORDS_MAX})", placeholder=f"Default: {COMPACTION_SYNOPSIS_WORDS_DEFAULT}", required=False, max_length=3)
     model_input = ui.TextInput(label="Summariser Model", placeholder=f"Default: {COMPACTION_MODEL_DEFAULT}", required=False, max_length=100)
     fallback_input = ui.TextInput(label="Fallback Model", placeholder=f"Default: {COMPACTION_FALLBACK_MODEL_DEFAULT}", required=False, max_length=100)
 
@@ -1051,6 +1071,9 @@ class CompactionSettingsModal(ui.Modal, title="Rolling Synopsis"):
         cfg = resolve_compaction_settings(view.session)
         self.threshold_input.default = str(cfg["threshold"])
         self.chunk_input.default = str(cfg["chunk"])
+        # Blank until a length is chosen, so an unset one keeps following the default.
+        if "max_words" in (view.session.get("compaction") or {}):
+            self.length_input.default = str(cfg["max_words"])
         self.model_input.default = cfg["model"]
         self.fallback_input.default = cfg["fallback_model"]
 
@@ -1058,13 +1081,18 @@ class CompactionSettingsModal(ui.Modal, title="Rolling Synopsis"):
         try:
             threshold = int(self.threshold_input.value)
             chunk = int(self.chunk_input.value)
+            length = int(self.length_input.value) if self.length_input.value.strip() else None
         except ValueError:
-            await interaction.response.send_message("❌ Turn counts must be whole numbers.", ephemeral=True)
+            await interaction.response.send_message("❌ Turn counts and the length must be whole numbers.", ephemeral=True)
             return
 
         cfg = self.view.session.setdefault("compaction", {})
         cfg["threshold"] = threshold
         cfg["chunk"] = chunk
+        if length is None:
+            cfg.pop("max_words", None)
+        else:
+            cfg["max_words"] = length
         # Unprefixed ids default to Google, matching the Director model field. Both
         # providers are valid here -- unlike image, speech and grounding, summarisation
         # is an ordinary text slot.
@@ -1085,6 +1113,10 @@ class CompactionSettingsModal(ui.Modal, title="Rolling Synopsis"):
         applied = resolve_compaction_settings(self.view.session)
         cfg["threshold"] = applied["threshold"]
         cfg["chunk"] = applied["chunk"]
+        if "max_words" in cfg:
+            cfg["max_words"] = applied["max_words"]
+        # New settings, so a summariser that failed before gets tried at the next round end.
+        self.view.session.pop("_compaction_retry_at", None)
 
         self.view.cog.session_manager._save_multi_profile_sessions()
         await interaction.response.defer()
@@ -2073,6 +2105,7 @@ class SessionConfigView(BlockedGuard, ui.View):
         embed.add_field(name="Status", value="**`ON`**" if enabled else "`OFF`", inline=True)
         embed.add_field(name="Trigger", value=f"Every `{cfg['threshold']}` turns", inline=True)
         embed.add_field(name="Fold Size", value=f"`{cfg['chunk']}` turns", inline=True)
+        embed.add_field(name="Length", value=f"About `{cfg['max_words']}` words", inline=True)
         embed.add_field(
             name="Summariser",
             value=f"`{cfg['model']}`\nFallback: `{cfg['fallback_model']}`",
@@ -2197,7 +2230,49 @@ class SessionAuditView(BlockedGuard, ui.View):
 
         self._build_view()
 
+    _SYSTEM_KIND_LABELS = {"synopsis": "Synopsis", "director": "Director's Note", "note": "System note"}
+
+    @staticmethod
+    def _turn_timestamp(turn: dict) -> str:
+        """When a turn happened, as a Discord timestamp shown in the viewer's own timezone.
+
+        Only regenerations and system turns write a `timestamp`, which is why every user
+        message read `None`. A delivered turn carries its message ids, and a Discord id
+        encodes the moment its message was sent.
+        """
+        when = None
+        if turn.get("timestamp"):
+            try:
+                when = datetime.datetime.fromisoformat(str(turn["timestamp"]))
+            except ValueError:
+                pass
+        if when is None and turn.get("message_ids"):
+            try:
+                when = discord.utils.snowflake_time(int(turn["message_ids"][0]))
+            except (TypeError, ValueError):
+                pass
+        return f"<t:{int(when.timestamp())}:f>" if when else "`not recorded`"
+
+    @staticmethod
+    def _system_kind(turn: dict) -> Optional[str]:
+        """"synopsis", "director" or "note" for a turn nobody spoke, else None.
+
+        These carry no profile name, so they were listed as "Bot" with a preview of "No text
+        content" -- the preview strips everything inside `<system_note>`, which is all a note
+        is -- and inspected as a model reply with no model and no tokens.
+        """
+        if turn.get("type") == "synopsis":
+            return "synopsis"
+        if turn.get("speaker_pid") == "SYSTEM" and not turn.get("type"):
+            return "director" if "Director's Note:" in (turn.get("content") or "") else "note"
+        return None
+
     def _resolve_turn_speaker_name(self, turn: dict) -> str:
+        kind = self._system_kind(turn)
+        if kind == "synopsis":
+            return f"Synopsis ({turn.get('covers', 0)} turns)"
+        if kind:
+            return self._SYSTEM_KIND_LABELS[kind]
         if turn.get("is_user"):
             name = turn.get("display_name")
             if not name and turn.get("speaker_pid", "").isdigit():
@@ -2213,6 +2288,11 @@ class SessionAuditView(BlockedGuard, ui.View):
     def _extract_turn_preview(self, turn: dict) -> str:
         content = turn.get("content", "")
         import re
+        if self._system_kind(turn):
+            # A note is its tags' contents, so only the tags go.
+            content = re.sub(r"</?[^>]+>", "", content).replace("Director's Note:", "")
+            clean_text = " ".join(content.split()) or "No text content"
+            return f"{clean_text[:15]}..." if len(clean_text) > 15 else clean_text
         # Was a hand-copied duplicate of SYSTEM_XML_TAGS that had to be edited in
         # lockstep with constants.py; a tag added there but missed here leaked into
         # this preview. Use the one list.
@@ -2276,7 +2356,8 @@ class SessionAuditView(BlockedGuard, ui.View):
     def _turn_option(self, t: dict, abs_index: int, current) -> discord.SelectOption:
         display = self._resolve_turn_speaker_name(t)
         preview = self._extract_turn_preview(t)
-        label = f"Turn #{abs_index + 1} - {display} ({preview})"
+        folded = " [folded]" if t.get("compacted") else ""
+        label = f"Turn #{abs_index + 1}{folded} - {display} ({preview})"
         return discord.SelectOption(label=label[:100], value=t.get("turn_id"),
                                     default=(t.get("turn_id") == current))
 
@@ -2346,6 +2427,43 @@ class SessionAuditView(BlockedGuard, ui.View):
         "cache": "Carried over from an earlier round",
     }
 
+    def _add_system_turn_fields(self, embed: discord.Embed, turn: dict, log: list) -> None:
+        """The inspector for a turn nobody spoke: what it is, when, and whether the model
+        is given it -- which, for a synopsis, is the question that matters."""
+        import re
+        kind = self._system_kind(turn)
+        content = turn.get("content") or ""
+        lines = [f"├── Kind: `{self._SYSTEM_KIND_LABELS[kind]}`",
+                 f"├── Timestamp: {self._turn_timestamp(turn)}"]
+        synopsis_on = self.cog.session_manager.compaction_enabled(self.session)
+
+        if kind == "synopsis":
+            latest = next((t for t in reversed(log) if t.get("type") == "synopsis"), None)
+            if not synopsis_on:
+                sent = "No -- the rolling synopsis is off"
+            elif latest is not turn:
+                sent = "No -- a later synopsis replaced it"
+            else:
+                sent = "Yes -- in the system instruction of every reply"
+            lines += [f"├── Covers: `{turn.get('covers', 0)}` turns",
+                      f"├── Sent: {sent}",
+                      f"└── Adds per reply: `~{_estimate_text_tokens(content):,}` tokens"]
+            text = content
+        else:
+            if turn.get("is_hidden"):
+                sent = "No -- muted"
+            elif turn.get("compacted") and synopsis_on:
+                sent = "No -- folded into a synopsis"
+            else:
+                sent = "In the conversation, while inside a profile's Short-Term Memory"
+            lines.append(f"└── Sent: {sent}")
+            text = re.sub(r"</?(system_note|internal_note)>", "", content).strip()
+
+        embed.add_field(name="System Turn", value="\n".join(lines), inline=False)
+        text = text.replace("```", "'''")
+        body = text if len(text) <= 1000 else text[:997] + "..."
+        embed.add_field(name="Text", value=f"```\n{body}\n```" if body else "`(empty)`", inline=False)
+
     def _critic_field(self, meta: dict) -> Optional[str]:
         """The critic's verdict for one turn, or None if it was not running.
 
@@ -2414,18 +2532,28 @@ class SessionAuditView(BlockedGuard, ui.View):
 
             elif self.mode == "inspector":
                 target = next((t for t in log if t.get("turn_id") == self.selected_turn_id), None)
+                if target and target.get("compacted"):
+                    embed.description = ("Folded into a synopsis: left out of prompts while the "
+                                         "rolling synopsis is on.")
                 if not target:
                     embed.description = "Select a turn to inspect."
+                elif self._system_kind(target):
+                    self._add_system_turn_fields(embed, target, log)
                 elif target.get("is_user"):
                     speaker_name = self._resolve_turn_speaker_name(target)
                     content = target.get("content", "")
                     if target.get("url_context"):
                         content += f"\n<document_context>\n{target.get('url_context')}\n</document_context>"
                     input_tokens = _estimate_text_tokens(content)
-                    
+                    # The id the profiles see in this user's history header.
+                    speaker_id = str(target.get("speaker_pid") or "")
+                    mimic_id = _get_user_hash(int(speaker_id)) if speaker_id.isdigit() else "unknown"
+
                     embed.add_field(
                         name="Payload Data",
-                        value=f"├── Speaker: `{speaker_name}`\n├── Speaker ID: `{target.get('speaker_pid')}`\n├── Timestamp: `{target.get('timestamp')}`\n└── Input Tokens: `{input_tokens:,}`",
+                        value=(f"├── Speaker: `{speaker_name}`\n├── Speaker ID: `{speaker_id}`\n"
+                               f"├── Mimic ID: `{mimic_id}`\n├── Timestamp: {self._turn_timestamp(target)}\n"
+                               f"└── Input Tokens: `{input_tokens:,}`"),
                         inline=False
                     )
                 else:
@@ -2443,7 +2571,7 @@ class SessionAuditView(BlockedGuard, ui.View):
                     cost_line = (f"Turn Cost: `~${cost:.6f} USD` (estimated)" if not billed
                                  else f"Turn Cost: `${cost:.6f} USD` (billed)")
                     
-                    embed.add_field(name="Turn Telemetry", value=f"├── Speaker: `{target.get('profile_name')}`\n├── Model Used: `{mod}`\n{tier_line}├── Duration: `{meta.get('duration', 0.0)}s`\n├── Input Tokens: `{i_tok:,}`\n├── Output Tokens: `{o_tok:,}` (Reasoning: `{r_tok:,}`)\n└── {cost_line}", inline=False)
+                    embed.add_field(name="Turn Telemetry", value=f"├── Speaker: `{target.get('profile_name')}`\n├── Mimic ID: `{target.get('speaker_pid')}`\n├── Timestamp: {self._turn_timestamp(target)}\n├── Model Used: `{mod}`\n{tier_line}├── Duration: `{meta.get('duration', 0.0)}s`\n├── Input Tokens: `{i_tok:,}`\n├── Output Tokens: `{o_tok:,}` (Reasoning: `{r_tok:,}`)\n└── {cost_line}", inline=False)
                     
                     recalled = len(meta.get("ltms_recalled", []))
                     trained = meta.get("training_recalled", 0)
@@ -2468,12 +2596,17 @@ class SessionAuditView(BlockedGuard, ui.View):
                         p_idx = self.cog.profile_manager._get_user_index(o_id)
                         is_b = p_name in p_idx.get("borrowed", [])
                         p_cfg = self.cog.profile_manager._get_profile_config(o_id, p_name, is_b) or {}
-                        stm_len = int(p_cfg.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
-                        
                         sys_toks = _estimate_text_tokens(sys_instr)
-                        
-                        recent_hist = log[-stm_len:] if stm_len > 0 else []
-                        hist_str = "\n".join([t.get("content", "") for t in recent_hist])
+
+                        # The window the next reply would actually get. The last N raw
+                        # entries counted folded, muted and synopsis turns and other
+                        # participants' whispers, none of which the prompt carries.
+                        bot_pid = self.cog.profile_manager._get_pid_from_name_any(o_id, p_name)
+                        history = self.cog.session_manager._build_history_for_participant(
+                            log, bot_pid, p_cfg, len(self.session.get("profiles", [])) or 1,
+                            hide_folded=self.cog.session_manager.compaction_enabled(self.session))
+                        hist_str = "\n".join(part for content in history
+                                             for part in content.get("parts", []) if isinstance(part, str))
                         hist_toks = _estimate_text_tokens(hist_str)
                         
                         total_est = sys_toks + hist_toks

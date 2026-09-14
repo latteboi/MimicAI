@@ -4,6 +4,8 @@ import discord
 from discord import ui
 from typing import Awaitable, Callable, Optional
 
+from ..utils.helpers import suppress_link_previews
+
 def build_tab_nav_bar(target_view: ui.View, current_tab: str, tabs, row: int = 4):
     """Attaches a row of tab-navigation buttons to target_view.
 
@@ -419,7 +421,7 @@ class ConfigModal(ui.Modal):
             config_updates = updates.get("config", {})
             prompt_updates = updates.get("prompts", {})
         except ValueError as e:
-            await interaction.followup.send(f"❌ **Invalid Input:** {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ **Invalid Input:** {suppress_link_previews(str(e))}", ephemeral=True)
             return
         except Exception:
             await interaction.followup.send("❌ Error parsing input.", ephemeral=True)

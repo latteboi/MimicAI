@@ -216,6 +216,7 @@ class SpeakAsMixin:
             contents = self.cog.session_manager._build_history_for_participant(
                 session.get("unified_log", []), bot_pid,
                 {**p_settings, "stm_length": SPEAK_REWRITE_HISTORY_TURNS},
+                hide_folded=self.cog.session_manager.compaction_enabled(session),
             )
 
         # Its own final user turn where the history allows one. Merged into a trailing

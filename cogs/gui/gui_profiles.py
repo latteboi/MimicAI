@@ -10,7 +10,8 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional
 from ..utils.content import OLLAMA_GUIDE_TEXT
 from ..utils.helpers import (
-    _pf, _pi, _ps, _pb, is_real_model, image_model_caps, resolve_critic_settings,
+    _pf, _pi, _ps, _pb, is_real_model, image_model_caps, openrouter_image_ratios,
+    resolve_critic_settings,
     google_thinking_caps, resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
 )
 from ..utils.user_defaults import setting_label
@@ -858,10 +859,10 @@ PROFILE_ACTIONS = (
                        keys=("image_generation_enabled",),
                        prompt_keys=("image_generation_prompt",))),
     _Action("image_output", "tools", "Set Image Output",
-            "Set aspect ratio, resolution, thinking level and search grounding.",
+            "Set aspect ratio, resolution, quality, thinking level and search grounding.",
             _method("_act_image_output", wants_profile=True),
             bulk=_Bulk(_bulk_sub("ImageOutputApplyView"), scope="all", label="Set Image Output",
-                       description="Stage aspect ratio, resolution, thinking level and grounding.",
+                       description="Stage aspect ratio, resolution, quality, thinking level and grounding.",
                        keys=IMAGE_OUTPUT_KEYS)),
     _Action("image_sampling", "tools", "Set Image Sampling",
             "Temperature, Top P and Top K for the image model.",
@@ -881,7 +882,8 @@ PROFILE_ACTIONS = (
                  ("Native", "native", "Provider-side Google Search. Google models only."),
                  ("RAG", "rag", "Search, then summarise. Works on any provider.")),
                 read=_grounding_mode, placeholder="Grounding mode..."),
-                note="-# OpenRouter and Ollama models must use **RAG**; Native is a Google-side tool."),
+                note="-# OpenRouter and Ollama models must use **RAG**; Native is a Google-side tool. "
+                     "This grounds replies; images have their own setting in **Set Image Output**."),
             bulk=_Bulk(_bulk_choice("Select Grounding Mode...",
                                     [("Off", "off"), ("Native", "native"), ("RAG", "rag")],
                                     to_payload=lambda v: {"grounding_mode": v}),
@@ -2080,28 +2082,41 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
             raw = data.get("image_generation_model") or DEFAULT_IMAGE_MODEL
             caps = image_model_caps(raw)
             lines.append(f"**Image model:** `{raw}`")
-            lines.append(f"**Aspect ratio:** `{data.get('image_aspect_ratio') or 'model default'}`")
+            if caps is OPENROUTER_IMAGE_CAPS_UNKNOWN:
+                lines.append("-# This model is not in the OpenRouter image list, so no options "
+                             "are sent with it.")
+            if caps["ratios"]:
+                lines.append(f"**Aspect ratio:** `{data.get('image_aspect_ratio') or 'model default'}`")
+            else:
+                lines.append("**Aspect ratio:** `fixed by the model`")
             if caps["sizes"]:
                 lines.append(f"**Resolution:** `{data.get('image_size') or 'model default'}`")
             else:
                 lines.append("**Resolution:** `fixed by the model` — this model renders at one "
                              "size and rejects a resolution request.")
+            if caps["quality"]:
+                lines.append(f"**Quality:** `{data.get('image_quality') or 'model default'}`")
             if caps["thinking"]:
                 lines.append(f"**Thinking:** `{data.get('image_thinking_level') or 'model default'}`")
-            if caps["grounding"]:
-                mode = data.get("image_grounding_mode") or ""
-                lines.append("**Search grounding:** "
-                             f"`{IMAGE_GROUNDING_LABELS.get(mode, 'off')}`")
+            mode = data.get("image_grounding_mode") or ""
+            grounding = f"**Search grounding:** `{IMAGE_GROUNDING_LABELS.get(mode, 'off')}`"
+            if mode in IMAGE_GROUNDING_TOOL_MODES and not caps["grounding"]:
+                grounding += (" — kept, but this model takes no search tool, so nothing is "
+                              "sent. RAG works with any image model.")
+            lines.append(grounding)
+            if caps["max_refs"]:
+                lines.append(f"**Reference images:** up to {caps['max_refs']} per request")
+            if caps["sampling"]:
+                sampling = " · ".join(
+                    f"{label} `{data.get(key)}`"
+                    for key, label in (("image_temperature", "temp"),
+                                       ("image_top_p", "top P"),
+                                       ("image_top_k", "top K"))
+                    if data.get(key) not in (None, ""))
+                lines.append(f"**Sampling:** {sampling or '`model default`'}")
             else:
-                lines.append("**Search grounding:** `unavailable` — this model takes no "
-                             "search tool on an image request.")
-            sampling = " · ".join(
-                f"{label} `{data.get(key)}`"
-                for key, label in (("image_temperature", "temp"),
-                                   ("image_top_p", "top P"),
-                                   ("image_top_k", "top K"))
-                if data.get(key) not in (None, ""))
-            lines.append(f"**Sampling:** {sampling or '`model default`'}")
+                lines.append("**Sampling:** `unavailable` — this model takes no temperature, "
+                             "Top P or Top K.")
             lines.append(f"\nOptions are limited to what `{raw}` accepts. Anything this model "
                          "does not carry is kept on the profile but left out of the request, so "
                          "switching models back restores it.")
@@ -2125,23 +2140,32 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
         self.clear_items()
         if self.mode == "image":
             caps = image_model_caps(self._profile().get("image_generation_model") or DEFAULT_IMAGE_MODEL)
-            self._add_choice_select("image_aspect_ratio", "Aspect ratio...",
-                                    caps["ratios"], IMAGE_ASPECT_RATIO_NOTES, 0)
+            if caps["ratios"]:
+                self._add_choice_select("image_aspect_ratio", "Aspect ratio...",
+                                        caps["ratios"], IMAGE_ASPECT_RATIO_NOTES, 0)
             if caps["sizes"]:
                 self._add_choice_select("image_size", "Resolution...",
                                         caps["sizes"], IMAGE_SIZE_NOTES, 1)
-            if caps["thinking"]:
+            # One row for whichever of the two the model takes: quality is OpenRouter's knob
+            # and thinkingLevel Gemini's, and a select needs a row to itself.
+            if caps["quality"]:
+                self._add_choice_select("image_quality", "Quality...",
+                                        caps["quality"], IMAGE_QUALITY_NOTES, 2)
+            elif caps["thinking"]:
                 self._add_choice_select("image_thinking_level", "Thinking level...",
                                         IMAGE_THINKING_LEVELS, IMAGE_THINKING_NOTES, 2)
-            if caps["grounding"]:
+            if caps is not OPENROUTER_IMAGE_CAPS_UNKNOWN:
                 # "Off" is this row's blank, not a value of its own: an empty
-                # image_grounding_mode and a stored "off" both resolve to no tool,
-                # and the AUTO option is what writes the empty one.
-                modes = ('web', 'web_images') if caps["image_search"] else ('web',)
+                # image_grounding_mode and a stored "off" both resolve to no search,
+                # and the AUTO option is what writes the empty one. RAG is on every
+                # model's row -- it runs before the request -- and web search only on
+                # the models that take the tool.
+                tool_modes = (IMAGE_GROUNDING_TOOL_MODES if caps["image_search"]
+                              else IMAGE_GROUNDING_TOOL_MODES[:1] if caps["grounding"] else ())
                 self._add_choice_select("image_grounding_mode", "Search grounding...",
-                                        modes, IMAGE_GROUNDING_NOTES, 3,
+                                        ('rag',) + tool_modes, IMAGE_GROUNDING_NOTES, 3,
                                         auto_label="Off",
-                                        auto_description="No search tool on the request.",
+                                        auto_description="No search before the image is drawn.",
                                         labels=IMAGE_GROUNDING_LABELS)
         else:
             self._add_voice_select("speech_voice", 0)
@@ -2219,10 +2243,11 @@ class ModelPickerMixin(ReportErrorMixin):
 
     #: Categories whose every slot is in GOOGLE_ONLY_MODEL_KEYS. They pin the API
     #: switch to Google rather than letting a stale mode sit behind a disabled button.
-    #: Grounding joins image and TTS here: it attaches the native `google_search` tool,
-    #: so an OpenRouter id in that slot was never honoured -- it resolved to the Google
-    #: default at call time, which read as the picker having accepted the choice.
-    _GOOGLE_ONLY_CATEGORIES = ("image", "tts", "grounding")
+    #: Grounding joins TTS here: it attaches the native `google_search` tool, so an
+    #: OpenRouter id in that slot was never honoured -- it resolved to the Google default
+    #: at call time, which read as the picker having accepted the choice. Image left when
+    #: OpenRouter's Image API got an adapter; its OpenRouter tab browses the image catalogue.
+    _GOOGLE_ONLY_CATEGORIES = ("tts", "grounding")
 
     @classmethod
     def display_model(cls, value) -> str:
@@ -2255,7 +2280,14 @@ class ModelPickerMixin(ReportErrorMixin):
         select = ui.Select(placeholder="Choose a model category...", options=options, row=row)
 
         async def callback(interaction: discord.Interaction):
-            self.category = select.values[0]
+            chosen = select.values[0]
+            # Image models browse a catalogue of their own, so a browse key and pages from
+            # the text catalogue mean nothing on the other side of the switch.
+            if (chosen == "image") != (self.category == "image"):
+                self.or_browse = BROWSE_POPULAR
+                self.or_browse_page = 0
+                self.or_model_page = 0
+            self.category = chosen
             self._build_view()
             await interaction.response.edit_message(**self._picker_render())
 
@@ -2313,6 +2345,20 @@ class ModelPickerMixin(ReportErrorMixin):
         (BROWSE_TRENDING, "Trending", "Biggest climbers in OpenRouter's rankings this week."),
         (BROWSE_CHEAPEST, "Cheapest", "Lowest input plus output price first."),
     )
+    #: The image category's general row. Trending is not tracked for image models, and
+    #: Cheapest cannot rank a per-image price against a per-megapixel one.
+    _IMAGE_BROWSE_GENERAL = (
+        (BROWSE_POPULAR, "Most Popular", "OpenRouter's own ranking of image models."),
+    )
+
+    def _openrouter_catalogue(self):
+        """What this picker's OpenRouter tab browses: the image catalogue for the image
+        category, the text one for every other. Both answer the same browsing calls."""
+        service = self.cog.api_service
+        return service.image_catalogue if self.category == "image" else service.catalogue
+
+    def _browse_general(self):
+        return self._IMAGE_BROWSE_GENERAL if self.category == "image" else self._BROWSE_GENERAL
 
     def _openrouter_browse(self) -> str:
         return getattr(self, "or_browse", BROWSE_POPULAR)
@@ -2323,7 +2369,7 @@ class ModelPickerMixin(ReportErrorMixin):
                 and getattr(self, "_BROWSE_ROW_AVAILABLE", True))
 
     def _openrouter_model_options(self, current_val, target_config_key: str) -> List[discord.SelectOption]:
-        catalogue = self.cog.api_service.catalogue
+        catalogue = self._openrouter_catalogue()
         browse = self._openrouter_browse()
         ids, _note = catalogue.browse(browse, show_training=self._shows_training_models())
         per_page = self._OPENROUTER_MODELS_PER_PAGE
@@ -2360,7 +2406,7 @@ class ModelPickerMixin(ReportErrorMixin):
 
     def _add_openrouter_browse_select(self, row: int):
         """Most Popular, Trending and Cheapest first on every page, then authors A-Z."""
-        catalogue = self.cog.api_service.catalogue
+        catalogue = self._openrouter_catalogue()
         authors = catalogue.authors(show_training=self._shows_training_models())
         browse = self._openrouter_browse()
         per_page = self._OPENROUTER_AUTHORS_PER_PAGE
@@ -2369,7 +2415,7 @@ class ModelPickerMixin(ReportErrorMixin):
         self.or_browse_page = page
 
         opts = paged_nav_options(page, num_pages, values=self._BROWSE_NAV_VALUES, nav_suffix=" of authors")
-        for value, label, description in self._BROWSE_GENERAL:
+        for value, label, description in self._browse_general():
             opts.append(discord.SelectOption(label=label, value=value, description=description,
                                              default=(browse == value)))
         start = page * per_page
@@ -2397,11 +2443,11 @@ class ModelPickerMixin(ReportErrorMixin):
         """Previous, next or jump, for either paged dropdown; `attr` names whose page it is."""
         if value.endswith("_jump"):
             if attr == "or_model_page":
-                ids, _note = self.cog.api_service.catalogue.browse(
+                ids, _note = self._openrouter_catalogue().browse(
                     self._openrouter_browse(), show_training=self._shows_training_models())
                 total, per_page = len(ids), self._OPENROUTER_MODELS_PER_PAGE
             else:
-                total = len(self.cog.api_service.catalogue.authors(show_training=self._shows_training_models()))
+                total = len(self._openrouter_catalogue().authors(show_training=self._shows_training_models()))
                 per_page = self._OPENROUTER_AUTHORS_PER_PAGE
 
             async def jump(i: discord.Interaction, page: int):
@@ -2423,12 +2469,12 @@ class ModelPickerMixin(ReportErrorMixin):
         """
         if self.view_mode != 'openrouter' or self.category in self._GOOGLE_ONLY_CATEGORIES:
             return
-        catalogue = self.cog.api_service.catalogue
+        catalogue = self._openrouter_catalogue()
         browse = self._openrouter_browse()
         show_training = self._shows_training_models()
         _ids, note = catalogue.browse(browse, show_training=show_training)
         if self._shows_openrouter_browse():
-            label = next((lbl for value, lbl, _d in self._BROWSE_GENERAL if value == browse), None)
+            label = next((lbl for value, lbl, _d in self._browse_general() if value == browse), None)
             if label is None:
                 slug = browse[len(AUTHOR_PREFIX):]
                 label = next((a.name for a in catalogue.authors(show_training=show_training)
@@ -3490,19 +3536,27 @@ class ImageOutputApplyView(_MediaOptionsApplyView):
     ACTION = "image_output"
     TITLE = "Set Image Output"
 
+    def __init__(self, wizard):
+        #: Whose option fills row 2. Ratio, resolution, thinking, grounding and the
+        #: Back/Stage row already take Discord's five, so OpenRouter's quality gets a page
+        #: of its own in thinking's place rather than a sixth row.
+        self.options_page = "gemini"
+        super().__init__(wizard)
+
     def embed(self) -> discord.Embed:
         chosen = {k: self.staged.get(k) for k in IMAGE_OUTPUT_KEYS}
         e = discord.Embed(
             title=self.TITLE, colour=discord.Colour.blurple(),
-            description=("Aspect ratio, resolution and reasoning depth for generated "
-                         "images.\n\nThe full list is offered here because the selected "
-                         "profiles may be on different image models. Each request drops "
-                         "whatever its own model does not accept, so a profile on a model "
-                         "with one fixed resolution simply ignores a staged one, and a "
-                         "profile on a model that takes no search tool ignores a staged "
-                         "grounding mode."))
+            description=("Aspect ratio, resolution, quality, reasoning depth and search "
+                         "grounding for generated images.\n\nThe full list is offered here "
+                         "because the selected profiles may be on different image models. Each "
+                         "request drops whatever its own model does not accept, so a profile on "
+                         "a model with one fixed resolution simply ignores a staged one, a "
+                         "Gemini model ignores a staged quality, and an OpenRouter model ignores "
+                         "a staged thinking level or web search. RAG applies to every model."))
         for key, label in (("image_aspect_ratio", "Aspect ratio"),
                            ("image_size", "Resolution"),
+                           ("image_quality", "Quality"),
                            ("image_thinking_level", "Thinking"),
                            ("image_grounding_mode", "Search grounding")):
             value = chosen.get(key)
@@ -3517,18 +3571,37 @@ class ImageOutputApplyView(_MediaOptionsApplyView):
 
     def _build_view(self):
         self.clear_items()
+        # Gemini's ratios, then any only an OpenRouter image model takes, inside the
+        # 25-option cap alongside the "model default" row.
+        ratios = IMAGE_ASPECT_RATIOS_FULL + tuple(
+            r for r in openrouter_image_ratios() if r not in IMAGE_ASPECT_RATIOS_FULL)
         self._add_choice_select("image_aspect_ratio", "Aspect ratio...",
-                                IMAGE_ASPECT_RATIOS_FULL, IMAGE_ASPECT_RATIO_NOTES, 0)
+                                ratios[:24], IMAGE_ASPECT_RATIO_NOTES, 0)
         self._add_choice_select("image_size", "Resolution...",
                                 IMAGE_SIZES_ALL, IMAGE_SIZE_NOTES, 1)
-        self._add_choice_select("image_thinking_level", "Thinking level...",
-                                IMAGE_THINKING_LEVELS, IMAGE_THINKING_NOTES, 2)
+        if self.options_page == "openrouter":
+            self._add_choice_select("image_quality", "Quality...",
+                                    IMAGE_QUALITY_LEVELS, IMAGE_QUALITY_NOTES, 2)
+        else:
+            self._add_choice_select("image_thinking_level", "Thinking level...",
+                                    IMAGE_THINKING_LEVELS, IMAGE_THINKING_NOTES, 2)
+        # On both pages: RAG reaches every model, and a web mode is dropped by one that
+        # takes no search tool, exactly as the embed says.
         self._add_choice_select("image_grounding_mode", "Search grounding...",
-                                ('web', 'web_images'), IMAGE_GROUNDING_NOTES, 3,
+                                ('rag',) + IMAGE_GROUNDING_TOOL_MODES, IMAGE_GROUNDING_NOTES, 3,
                                 auto_label="Off",
-                                auto_description="No search tool on the request.",
+                                auto_description="No search before the image is drawn.",
                                 labels=IMAGE_GROUNDING_LABELS)
         self._stage_row(4, "Stage Image Output")
+
+        other = "gemini" if self.options_page == "openrouter" else "openrouter"
+
+        async def swap(interaction: discord.Interaction):
+            self.options_page = other
+            self._build_view()
+            await interaction.response.edit_message(**self._render())
+        add_button(self, "Gemini options" if other == "gemini" else "OpenRouter options", swap,
+                   style=discord.ButtonStyle.secondary, row=4)
 
 
 class VoiceApplyView(_MediaOptionsApplyView):

@@ -4,13 +4,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ...utils.constants import (
     COMPACTION_CHUNK_DEFAULT, COMPACTION_CHUNK_MIN, COMPACTION_FALLBACK_MODEL_DEFAULT,
-    COMPACTION_MAX_CHUNK_RATIO, COMPACTION_MODEL_DEFAULT, COMPACTION_SYNOPSIS_MAX_WORDS,
+    COMPACTION_MAX_CHUNK_RATIO, COMPACTION_MODEL_DEFAULT, COMPACTION_SYNOPSIS_WORDS_DEFAULT,
+    COMPACTION_SYNOPSIS_WORDS_MAX, COMPACTION_SYNOPSIS_WORDS_MIN,
     COMPACTION_THRESHOLD_DEFAULT, COMPACTION_THRESHOLD_MAX, COMPACTION_THRESHOLD_MIN,
     DEFAULT_SESSION_SYNOPSIS_PROMPT, DEFAULT_SESSION_SYNOPSIS_USER_PROMPT,
     SESSION_BUSY_FLAGS,
 )
 from ...utils.helpers import resolve_thinking_params
-from ...managers.session_manager import intern_turn
+from ...managers.session_manager import SessionManager, intern_turn
 
 
 def resolve_compaction_settings(session: Dict[str, Any]) -> Dict[str, Any]:
@@ -40,13 +41,21 @@ def resolve_compaction_settings(session: Dict[str, Any]) -> Dict[str, Any]:
     # read, and for the next synopsis to be written against.
     chunk = max(COMPACTION_CHUNK_MIN, min(chunk, int(threshold * COMPACTION_MAX_CHUNK_RATIO)))
 
+    words = raw.get("max_words", COMPACTION_SYNOPSIS_WORDS_DEFAULT)
+    try:
+        words = int(words)
+    except (TypeError, ValueError):
+        words = COMPACTION_SYNOPSIS_WORDS_DEFAULT
+    words = max(COMPACTION_SYNOPSIS_WORDS_MIN, min(COMPACTION_SYNOPSIS_WORDS_MAX, words))
+
     model = (raw.get("model") or COMPACTION_MODEL_DEFAULT).strip() or COMPACTION_MODEL_DEFAULT
     fallback = (raw.get("fallback_model") or COMPACTION_FALLBACK_MODEL_DEFAULT).strip()
 
     return {
-        "enabled": bool(raw.get("enabled", False)),
+        "enabled": SessionManager.compaction_enabled(session),
         "threshold": threshold,
         "chunk": chunk,
+        "max_words": words,
         "model": model,
         "fallback_model": fallback or COMPACTION_FALLBACK_MODEL_DEFAULT,
     }
@@ -111,6 +120,10 @@ class SessionCompactionMixin:
         candidates = self._compactable_indices(unified_log)
         if len(candidates) < settings["threshold"]:
             return None
+        # Backing off after a failure. On a server where neither summariser can run,
+        # every round end used to spend both attempts again, for the life of the session.
+        if len(candidates) < session.get("_compaction_retry_at", 0):
+            return None
 
         return candidates[:settings["chunk"]], settings
 
@@ -145,7 +158,12 @@ class SessionCompactionMixin:
 
         synopsis = await self._generate_synopsis(channel_id, session, transcript, previous, settings)
         if not synopsis:
+            # Tried again once another fold's worth of public turns has built up. Held in
+            # memory only: a restart is a fair moment to try again.
+            session["_compaction_retry_at"] = (
+                len(self._compactable_indices(session.get("unified_log") or [])) + settings["chunk"])
             return False
+        session.pop("_compaction_retry_at", None)
 
         # Re-read the log: generating awaited, and a whisper or a delete could have
         # landed on it. Positions are only meaningful against the list we planned from.
@@ -195,7 +213,7 @@ class SessionCompactionMixin:
 
         system_instruction = self.cog.global_prompts.get(
             "SESSION_SYNOPSIS", DEFAULT_SESSION_SYNOPSIS_PROMPT
-        ).format(max_words=COMPACTION_SYNOPSIS_MAX_WORDS)
+        ).format(max_words=settings["max_words"])
 
         previous_block = f"Synopsis of everything before this excerpt:\n{previous}\n\n" if previous else ""
         user_prompt = self.cog.global_prompts.get(

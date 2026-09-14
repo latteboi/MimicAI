@@ -18,9 +18,10 @@ from ..utils.constants import (
     IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS,
 )
 from ..utils.helpers import (_resolve_safety_settings, _split_into_sentences_with_abbreviations,
-                             apply_typing_cursor, resolve_grounding_mode, typing_cursor_cost)
+                             apply_typing_cursor, image_rag_enabled, typing_cursor_cost)
 from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
+from .session_manager import NEW_SESSION_COMPACTION
 
 MAX_AVATAR_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 MAX_EMOJI_SIZE_BYTES = 256 * 1024  # Discord's limit on an uploaded emoji, app or guild.
@@ -1117,14 +1118,15 @@ class ChildBotManager:
                             break
 
             grounding_sources = []
-            grounding_mode = resolve_grounding_mode(profile_data)
 
-            if grounding_mode == "rag":
+            # The image's own search setting, never the profile's chat grounding_mode.
+            if image_rag_enabled(profile_data):
                 session_key = (channel_id, owner_id, profile_name)
                 img_session = self.cog.multi_profile_channels.get(channel_id) or {}
                 g_bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
                 history_for_grounding = self.cog.session_manager._build_history_for_participant(
-                    img_session.get("unified_log", []), g_bot_pid, profile_data
+                    img_session.get("unified_log", []), g_bot_pid, profile_data,
+                    hide_folded=self.cog.session_manager.compaction_enabled(img_session),
                 )
 
                 mapping_key = self.cog.session_manager._get_mapping_key_for_session(session_key, 'multi')
@@ -1145,7 +1147,7 @@ class ChildBotManager:
                 "bot_display_name": bot_display_name, "safety_settings": dynamic_safety_settings,
                 "system_instruction": system_instruction, "reference_image_urls": reference_image_urls,
                 "placeholder_message": placeholder_message_obj,
-                "grounding_sources": grounding_sources, "grounding_mode": grounding_mode,
+                "grounding_sources": grounding_sources,
                 "image_generation_model": profile_data.get("image_generation_model", DEFAULT_IMAGE_MODEL),
                 "image_generation_fallback_model": profile_data.get("image_generation_fallback_model"),
                 "image_output": {k: profile_data.get(k)
@@ -1175,7 +1177,8 @@ class ChildBotManager:
                 "owner_id": event_data.get("user_id"), "is_running": False,
                 "task_queue": asyncio.Queue(),
                 "worker_task": None, "turns_since_last_ltm": 0, "session_prompt": None,
-                "session_mode": "sequential", "audio_mode": "off"
+                "session_mode": "sequential", "audio_mode": "off",
+                "compaction": dict(NEW_SESSION_COMPACTION),
             }
             self.cog.multi_profile_channels[channel_id] = session
             result_msg = "Created a new Chat Session with this bot."

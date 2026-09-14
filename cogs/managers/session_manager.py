@@ -20,8 +20,6 @@ import orjson as json
 from ..utils.constants import (
     USERS_DIR, SERVERS_DIR, SESSIONS_GLOBAL_DIR, defaultConfig,
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
-    COMPACTION_THRESHOLD_DEFAULT, COMPACTION_CHUNK_DEFAULT,
-    COMPACTION_MODEL_DEFAULT, COMPACTION_FALLBACK_MODEL_DEFAULT,
     DEFAULT_CAST_POLICY, DELIVERY_GUARD_SECONDS,
 )
 from .storage_manager import (IOManager, _delete_file_shard, _get_compressor,
@@ -38,14 +36,10 @@ SESSION_HOT_TAIL_MAX = 250
 # only bounds how long a mid-round append can sit in memory.
 SESSION_FLUSH_INTERVAL_SECONDS = 5.0
 
-# Compaction is opt-in: a session that never enables it behaves exactly as before.
-DEFAULT_COMPACTION_CONFIG = {
-    "enabled": False,
-    "threshold": COMPACTION_THRESHOLD_DEFAULT,
-    "chunk": COMPACTION_CHUNK_DEFAULT,
-    "model": COMPACTION_MODEL_DEFAULT,
-    "fallback_model": COMPACTION_FALLBACK_MODEL_DEFAULT,
-}
+# A session created from here on starts with the rolling synopsis on. Only the switch is
+# written: the other fields resolve to today's defaults in resolve_compaction_settings.
+# Existing sessions are deliberately left as they were -- see compaction_enabled.
+NEW_SESSION_COMPACTION = {"enabled": True}
 
 # Repeated verbatim on every turn of a session's log: interning them means one string
 # object per session instead of one per turn.
@@ -762,7 +756,7 @@ class SessionManager:
                         "session_mode": session_data.get("session_mode", "sequential"),
                         "type": "multi",
                         "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 20, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
-                        "compaction": session_data.get("compaction", DEFAULT_COMPACTION_CONFIG.copy()),
+                        "compaction": session_data.get("compaction", {}),
                         # Absent means CLOSED: a blueprint written before this field
                         # existed keeps the admin-only access it was configured under.
                         "cast_policy": session_data.get("cast_policy", DEFAULT_CAST_POLICY),
@@ -815,7 +809,7 @@ class SessionManager:
                     "session_mode": session_data.get("session_mode", "sequential"),
                     "type": "multi",
                     "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
-                    "compaction": session_data.get("compaction", DEFAULT_COMPACTION_CONFIG.copy()),
+                    "compaction": session_data.get("compaction", {}),
                     "cast_policy": session_data.get("cast_policy", DEFAULT_CAST_POLICY),
                     "started": bool(session_data.get("started", True)),
                 }
@@ -1091,7 +1085,7 @@ class SessionManager:
                             "session_mode": session_config.get("session_mode", "sequential"),
                             "type": "multi",
                             "proactivity": session_config.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
-                            "compaction": session_config.get("compaction", DEFAULT_COMPACTION_CONFIG.copy()),
+                            "compaction": session_config.get("compaction", {}),
                             "cast_policy": session_config.get("cast_policy", DEFAULT_CAST_POLICY),
                             "task_queue": asyncio.Queue(),
                             "is_running": False,
@@ -1106,7 +1100,7 @@ class SessionManager:
                         session["session_mode"] = session_config.get("session_mode", "sequential")
                         session["type"] = "multi"
                         session["proactivity"] = session_config.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."})
-                        session["compaction"] = session_config.get("compaction", DEFAULT_COMPACTION_CONFIG.copy())
+                        session["compaction"] = session_config.get("compaction", {})
                         session["cast_policy"] = session_config.get("cast_policy", DEFAULT_CAST_POLICY)
 
         if not session: return None
@@ -1356,13 +1350,28 @@ class SessionManager:
         return pending
 
     @staticmethod
+    def compaction_enabled(session: Optional[Dict]) -> bool:
+        """Whether this session's rolling synopsis is on.
+
+        Absent means off. Sessions created since new ones started with it on are written
+        with an explicit True (`NEW_SESSION_COMPACTION`); every older one stored either an
+        explicit False or nothing at all, and both keep the setting they had. Defaulting
+        this to True would switch the synopsis on for all of them at once.
+        """
+        return bool(((session or {}).get("compaction") or {}).get("enabled", False))
+
+    @staticmethod
     def get_latest_synopsis(session: Optional[Dict]) -> Optional[str]:
-        """The most recent rolling synopsis for a session, or None.
+        """The synopsis to send with this session's replies, or None.
+
+        None while the rolling synopsis is off. Turning it off brings the folded turns
+        back into history, and sending the synopsis as well would hand the model the
+        same events twice.
 
         Read by _construct_system_instructions on every turn, so it walks backwards and
         stops at the first hit rather than scanning the log.
         """
-        if not session:
+        if not SessionManager.compaction_enabled(session):
             return None
         for turn in reversed(session.get("unified_log") or []):
             if turn.get("type") == "synopsis":
@@ -1370,9 +1379,9 @@ class SessionManager:
         return None
 
     @staticmethod
-    def _select_history_window(full_log: List[Dict], window: int) -> List[Dict]:
+    def _select_history_window(full_log: List[Dict], window: int, hide_folded: bool) -> List[Dict]:
         """The trailing slice of `full_log` holding `window` turns that will actually
-        be shown.
+        be shown -- which counts folded turns only while `hide_folded` is off.
 
         Counting raw turns instead would let muted and compacted turns eat the window:
         `full_log[-40:]` on a log whose oldest 25 turns were compacted yields 40 turns
@@ -1387,14 +1396,15 @@ class SessionManager:
         kept = 0
         for index in range(len(full_log) - 1, -1, -1):
             turn = full_log[index]
-            if turn.get("is_hidden") or turn.get("compacted") or turn.get("type") == "synopsis":
+            if (turn.get("is_hidden") or (hide_folded and turn.get("compacted"))
+                    or turn.get("type") == "synopsis"):
                 continue
             kept += 1
             if kept >= window:
                 return full_log[index:]
         return list(full_log)
 
-    def _build_history_for_participant(self, full_log: List[Dict], bot_pid: str, p_settings: Dict[str, Any], num_participants: int = 1, reserved_tail: int = 0) -> List[Dict]:
+    def _build_history_for_participant(self, full_log: List[Dict], bot_pid: str, p_settings: Dict[str, Any], num_participants: int = 1, reserved_tail: int = 0, *, hide_folded: bool) -> List[Dict]:
         """This participant's view of the log: the last `stm_length` turns, with other
         participants' private exchanges hidden and its own rewritten into their XML tags.
 
@@ -1408,16 +1418,21 @@ class SessionManager:
         turns of history to make room -- so a profile's memory silently shortened in
         proportion to how many people spoke at once. Windowing lives here now; pass the
         whole log and say how much of its tail is the current round.
+
+        `hide_folded` is `compaction_enabled(session)`, and has no default so that no
+        caller can leave it out. A folded turn is hidden only because a synopsis stands in
+        for it; with the rolling synopsis off that synopsis is not sent, so the turns come
+        back rather than being missing from both.
         """
         stm_length = int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
         effective_stm = max(stm_length, num_participants) if stm_length > 0 else 0
         # stm_length 0 means "no memory", but the current round is still in front of it.
         window = effective_stm + max(0, reserved_tail)
-        log_slice = self._select_history_window(full_log, window)
+        log_slice = self._select_history_window(full_log, window, hide_folded)
 
         participant_history = []
         for turn in log_slice:
-            if turn.get("is_hidden") or turn.get("compacted"): continue
+            if turn.get("is_hidden") or (hide_folded and turn.get("compacted")): continue
 
             turn_type = turn.get("type")
             # Not conversation. A synopsis is standing context injected into the system
@@ -1502,7 +1517,7 @@ class SessionManager:
                 "pending_image_gen_data": None,
                 "pending_whispers": {},
                 "audio_mode": "off",
-                "compaction": DEFAULT_COMPACTION_CONFIG.copy(),
+                "compaction": dict(NEW_SESSION_COMPACTION),
                 "cast_policy": DEFAULT_CAST_POLICY,
                 "started": True,
             }
@@ -1556,6 +1571,87 @@ class SessionManager:
         code path built, keeps running untouched.
         """
         return bool(session) and bool(session.get("started", True))
+
+    @staticmethod
+    def next_reaction_speaker(session: Dict, reacted_to: Optional[Dict]) -> Optional[Dict]:
+        """Who a 🍿 or ⏯️ hands the floor to, or None when nobody is seated.
+
+        `reacted_to` is the seated participant who wrote the message, or None when that
+        profile has since left the cast. The press still asks the scene to carry on, so
+        it carries on from the last speaker, exactly as a press on the last speaker's own
+        message does. It used to do nothing and leave the reaction on the message, and
+        pulling it off to try again then withdrew a trigger nobody had queued.
+        """
+        profiles = session.get('profiles') or []
+        if not profiles:
+            return None
+        last_key = session.get('last_speaker_key')
+        if reacted_to is not None and (reacted_to['owner_id'], reacted_to['profile_name']) != last_key:
+            # An earlier speaker's message: the floor goes to the seat after them.
+            return profiles[(profiles.index(reacted_to) + 1) % len(profiles)]
+
+        if session.get("session_mode", "sequential") == 'sequential':
+            last_index = next((i for i, p in enumerate(profiles)
+                               if (p['owner_id'], p['profile_name']) == last_key), None)
+            return profiles[0] if last_index is None else profiles[(last_index + 1) % len(profiles)]
+
+        # Random passes over whoever just spoke -- unless nobody else is seated, where
+        # excluding them used to leave nobody and the press did nothing.
+        others = [p for p in profiles if (p['owner_id'], p['profile_name']) != last_key]
+        return random.choice(others or profiles)
+
+    @staticmethod
+    def note_reaction_queued(session: Dict, key: Tuple[int, str]) -> None:
+        """Record a 🍿 or ⏯️ trigger as waiting in the queue, keyed `(message_id, emoji)`."""
+        session.setdefault('queued_reaction_triggers', set()).add(key)
+
+    @staticmethod
+    def cancel_queued_reaction(session: Dict, key: Tuple[int, str]) -> bool:
+        """Withdraw a waiting reaction trigger whose reaction was pulled back. True if one was.
+
+        Only a trigger that is actually waiting can be withdrawn. Pulling back any 🍿 or
+        ⏯️ used to record a cancellation whether or not anything was queued, and the next
+        drain then swallowed the *next* press of that emoji on that message -- so retrying
+        a reaction that had done nothing did nothing either, and the one after that worked.
+        """
+        queued = session.get('queued_reaction_triggers')
+        if not queued or key not in queued:
+            return False
+        queued.discard(key)
+        session.setdefault('cancelled_reaction_triggers', set()).add(key)
+        return True
+
+    @staticmethod
+    def withdraw_cancelled_reactions(session: Dict, triggers: List[Any]) -> List[Any]:
+        """The drained batch minus the reaction triggers withdrawn while they waited.
+
+        Every reaction trigger in the batch stops counting as queued here, run or not. One
+        cancellation withdraws one trigger, so the same emoji pressed again after it still
+        runs. Anything left in the cancellation set afterwards is cleared: the worker
+        drains the whole queue with no await before this call, so no queued trigger is
+        left for it to match.
+        """
+        queued = session.get('queued_reaction_triggers')
+        cancelled = session.get('cancelled_reaction_triggers')
+        surviving = []
+        for trigger in triggers:
+            if isinstance(trigger, tuple) and trigger[0] in ('reaction', 'reaction_single'):
+                key = (trigger[1].message_id, str(trigger[1].emoji))
+                if queued:
+                    queued.discard(key)
+                if cancelled and key in cancelled:
+                    cancelled.discard(key)
+                    continue
+            surviving.append(trigger)
+        if cancelled:
+            cancelled.clear()
+        return surviving
+
+    @staticmethod
+    def forget_queued_reactions(session: Dict) -> None:
+        """For a queue emptied without a round: nothing it held can be withdrawn any more."""
+        session.pop('queued_reaction_triggers', None)
+        session.pop('cancelled_reaction_triggers', None)
 
     @staticmethod
     def register_in_flight(session: Dict, state_container: Dict) -> None:
@@ -1636,6 +1732,7 @@ class SessionManager:
                         q.task_done()
                     except (asyncio.QueueEmpty, ValueError):
                         break
+            self.forget_queued_reactions(session)
 
             # Cancel running session worker task
             worker_task = session.get('worker_task')

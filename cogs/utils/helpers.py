@@ -1,3 +1,4 @@
+import os
 import re
 import zlib
 import asyncio
@@ -18,7 +19,8 @@ from .constants import (
     PATTERN_SPEAKER_CLOSE,
     PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK,
     IMAGE_MODEL_CAPS, IMAGE_MODEL_CAPS_DEFAULT, IMAGE_THINKING_LEVELS,
-    IMAGE_GROUNDING_MODES, DEFAULT_TYPING_CURSOR,
+    OPENROUTER_IMAGE_CAPS_UNKNOWN, IMAGE_MIME_SUFFIXES, IMAGE_SUFFIX_MIMES,
+    IMAGE_GROUNDING_TOOL_MODES, DEFAULT_TYPING_CURSOR,
     CRITIC_MODES, CRITIC_SCOPES, CRITIC_STRICTNESS_LEVELS, CRITIC_STRICTNESS_MIN_GRAM,
     DEFAULT_CRITIC_MODE, DEFAULT_CRITIC_SCOPE, DEFAULT_CRITIC_STRICTNESS,
     DEFAULT_CRITIC_LOOKBACK, DEFAULT_CRITIC_PERSISTENCE,
@@ -572,8 +574,64 @@ def _format_and_chunk_thought_summary(thought_text: str) -> List[str]:
 
     return chunks
 
+#: A bare link: anchored on its scheme, and stopped at whitespace, a quote or an angle
+#: bracket, since error text quotes the URL it failed on as 'https://...'.
+_BARE_LINK = re.compile(r"https?://[^\s<>'\"]+")
+#: A link already wrapped for Discord, which a length cut must not split.
+_WRAPPED_LINK = re.compile(r"<https?://[^\s<>]*>")
+_LINK_OPENERS = {")": "(", "]": "[", "}": "{"}
+
+
+def suppress_link_previews(text: str) -> str:
+    """`text` with every bare link wrapped in `<...>`, so Discord previews none of them.
+
+    For anything that puts error text in front of a user. An exception's message carries
+    the URL it failed on, and posted bare it unfurled into an embed of that page -- or of
+    whatever half of a link survived a length cut. Wrapped, the link stays clickable. A
+    link already wrapped is left alone, so running this twice changes nothing.
+    """
+    def wrap(match: "re.Match[str]") -> str:
+        link = match.group(0)
+        if match.start() and text[match.start() - 1] == "<":
+            return link
+        end = len(link)
+        # Sentence punctuation after a link is not part of it. A closing bracket is only
+        # when the link opened one, as a Wikipedia title does.
+        while end:
+            last = link[end - 1]
+            if last in ".,;:!?":
+                end -= 1
+            elif last in _LINK_OPENERS and link.count(last, 0, end) > link.count(_LINK_OPENERS[last], 0, end):
+                end -= 1
+            else:
+                break
+        return f"<{link[:end]}>{link[end:]}"
+    return _BARE_LINK.sub(wrap, text)
+
+
+def _cut_outside_links(text: str, limit: int) -> str:
+    """`text` cut to `limit` characters and an ellipsis, stopping short of a wrapped link
+    rather than cutting through it -- half a link is a broken one, and unwrapped."""
+    if len(text) <= limit:
+        return text
+    cut = limit
+    for match in _WRAPPED_LINK.finditer(text):
+        if match.start() < cut < match.end():
+            cut = match.start()
+            break
+    return text[:cut].rstrip() + "..."
+
+
 def _format_api_error(error: Exception) -> str:
-    """Analyses API exceptions to provide specific, user-friendly diagnostic strings."""
+    """Analyses API exceptions to provide specific, user-friendly diagnostic strings.
+
+    Whichever branch answers, the answer leaves through suppress_link_previews: several
+    pass a provider's own message through, and those carry links.
+    """
+    return suppress_link_previews(_describe_api_error(error))
+
+
+def _describe_api_error(error: Exception) -> str:
     # An exception that arrives already phrased for the user keeps its phrasing.
     formatted = getattr(error, "formatted_reason", None)
     if formatted:
@@ -602,22 +660,51 @@ def _format_api_error(error: Exception) -> str:
         if any(k in error_str_clean for k in keys):
             return error_msg
 
-    clean_err = error_str.replace('"', "'").replace('{', '').replace('}', '').replace('\n', ' ')
-    return clean_err[:80] + "..." if len(clean_err) > 80 else clean_err
+    clean_err = suppress_link_previews(
+        error_str.replace('"', "'").replace('{', '').replace('}', '').replace('\n', ' '))
+    # Wrapped before the cut, so the cut can stop short of a link instead of splitting it.
+    return _cut_outside_links(clean_err, 80)
+
+
+#: model id -> `image_model_caps` for OpenRouter's image models, installed whole by the image
+#: catalogue each time it loads or syncs. A registry rather than a catalogue lookup because
+#: the pickers, the request path and /profile manage all ask `image_model_caps`, and a utils
+#: function reaching into a service for it would be the wrong direction. Bounded by the image
+#: models OpenRouter lists.
+_OPENROUTER_IMAGE_CAPS: Dict[str, dict] = {}
+
+
+def install_openrouter_image_caps(caps: Dict[str, dict]) -> None:
+    """Replaces the OpenRouter image caps in one assignment, so no reader sees half a table."""
+    global _OPENROUTER_IMAGE_CAPS
+    _OPENROUTER_IMAGE_CAPS = dict(caps)
+
+
+def openrouter_image_ratios() -> Tuple[str, ...]:
+    """Every aspect ratio some listed OpenRouter image model takes, in first-seen order."""
+    seen: Dict[str, None] = {}
+    for caps in _OPENROUTER_IMAGE_CAPS.values():
+        for ratio in caps["ratios"]:
+            seen.setdefault(ratio, None)
+    return tuple(seen)
 
 
 def image_model_caps(raw_name: Optional[str]) -> dict:
-    """What image options `raw_name` will honour: allowed ratios, sizes, thinkingLevel.
+    """What image options `raw_name` will honour: ratios, sizes, quality, thinkingLevel.
 
     Shared by the picker, which uses it to decide what to offer, and by
     MediaService.resolve_image_output_params, which uses it to decide what to send. If
     those two ever answered differently the dropdown would be offering settings the
     request path then silently dropped.
 
-    An unrecognised id -- a model newer than this table, or a typo -- gets the
-    conservative default rather than the full set.
+    An unrecognised Google id -- a model newer than this table, or a typo -- gets the
+    conservative default rather than the full set. An OpenRouter id the image catalogue
+    does not list gets nothing at all: see OPENROUTER_IMAGE_CAPS_UNKNOWN.
     """
     name = raw_name or ""
+    # Case-sensitive, as every routing prefix is -- see APIService._instantiate_model.
+    if name.startswith("OPENROUTER/"):
+        return _OPENROUTER_IMAGE_CAPS.get(name[len("OPENROUTER/"):], OPENROUTER_IMAGE_CAPS_UNKNOWN)
     if name.upper().startswith("GOOGLE/"):
         name = name[7:]
     return IMAGE_MODEL_CAPS.get(name.lower(), IMAGE_MODEL_CAPS_DEFAULT)
@@ -663,23 +750,53 @@ def resolve_image_output_params(image_config, raw_name: Optional[str]) -> dict:
     if caps["thinking"] and level in IMAGE_THINKING_LEVELS:
         out["thinking_level"] = level
 
+    quality = (cfg.get("image_quality") or "").lower()
+    if quality in caps["quality"]:
+        out["quality"] = quality
+
+    # Not preferences either, like `modalities`: how this model is asked to encode, and how
+    # many references it takes. PNG where the model offers a choice, because the 2K cap and
+    # Discord's preview were both reasoned about in PNG; a model with no choice sends its own.
+    if "png" in caps["formats"]:
+        out["output_format"] = "png"
+    if caps["max_refs"]:
+        out["max_refs"] = caps["max_refs"]
+
     # Sampling. Carried through the same per-model filter as everything else even
     # though no image model rejects these outright, so that one call -- and one
     # stored profile -- decides the whole request. Absent stays absent: an image
     # model with no temperature on the wire uses its own, which for the Gemini 3
-    # family is the value Google asks you not to move.
-    for stored, wire in (("image_temperature", "temperature"),
-                         ("image_top_p", "top_p"),
-                         ("image_top_k", "top_k")):
-        value = cfg.get(stored)
-        if value is None or value == "":
-            continue
-        try:
-            out[wire] = int(value) if wire == "top_k" else float(value)
-        except (TypeError, ValueError):
-            continue
+    # family is the value Google asks you not to move. OpenRouter's Image API takes
+    # none of the three, so its models skip this outright.
+    if caps["sampling"]:
+        for stored, wire in (("image_temperature", "temperature"),
+                             ("image_top_p", "top_p"),
+                             ("image_top_k", "top_k")):
+            value = cfg.get(stored)
+            if value is None or value == "":
+                continue
+            try:
+                out[wire] = int(value) if wire == "top_k" else float(value)
+            except (TypeError, ValueError):
+                continue
 
     return out
+
+
+def image_suffix_for_mime(mime_type: Optional[str]) -> str:
+    """The suffix a generated image is saved under. PNG when the type is missing or unknown,
+    which is what every generated image was before a provider could answer in another."""
+    return IMAGE_MIME_SUFFIXES.get(str(mime_type or "").split(";", 1)[0].strip().lower(), ".png")
+
+
+def generated_image_attachment(path: Optional[str]) -> Tuple[str, str]:
+    """(filename, mime type) for a generated image, read back off the suffix it was saved under.
+
+    The suffix is the one place the type survives from the response to the send: a path is
+    all that moves between the image workers, the round and the child bots.
+    """
+    mime_type = IMAGE_SUFFIX_MIMES.get(os.path.splitext(path or "")[1].lower(), "image/png")
+    return f"generated_image{IMAGE_MIME_SUFFIXES[mime_type]}", mime_type
 
 
 def google_thinking_caps(model_name: Optional[str]) -> Dict[str, Any]:
@@ -905,7 +1022,8 @@ def resolve_image_tools(image_config, raw_name: Optional[str]) -> Optional[list]
     """
     caps = image_model_caps(raw_name)
     mode = ((image_config or {}).get("image_grounding_mode") or "off")
-    if mode not in IMAGE_GROUNDING_MODES or mode == "off":
+    # "rag" is retrieval this side of the call (image_rag_enabled), never a declared tool.
+    if mode not in IMAGE_GROUNDING_TOOL_MODES:
         return None
     if not caps["grounding"]:
         return None
@@ -914,6 +1032,17 @@ def resolve_image_tools(image_config, raw_name: Optional[str]) -> Optional[list]
         # `searchTypes` stays camelCase here: _build_tools only maps the outer key.
         return [{"google_search": {"searchTypes": {"webSearch": {}, "imageSearch": {}}}}]
     return [{"google_search": {}}]
+
+
+def image_rag_enabled(image_config) -> bool:
+    """Whether an image is researched before it is drawn: the grounding summariser searches,
+    and its visual summary is written into the prompt whichever model then draws.
+
+    Read off `image_grounding_mode`, never the profile's chat `grounding_mode`. The image
+    paths used to follow that one, so a profile could not ground its replies without every
+    picture also paying for a search and drawing from its summary.
+    """
+    return (image_config or {}).get("image_grounding_mode") == "rag"
 
 
 def is_real_model(name: Optional[str]) -> bool:

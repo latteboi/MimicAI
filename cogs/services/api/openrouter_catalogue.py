@@ -2,6 +2,11 @@
 
 Built from OpenRouter's documented API only: `/api/v1/models` (text output is its default
 filter), `/api/v1/endpoints/zdr`, and `/api/v1/models/user` read with the bot owner's key.
+
+That default filter matches text *among* a model's outputs, so image and audio models that
+also write arrive with the rest. Their records are kept -- the pricing table and a profile
+already on one still read them -- but no list offers them and a typed id for one is refused:
+the chat adapter asks for text alone, so whatever else they make is thrown away.
 OpenRouter's website has richer internal endpoints -- per-host training and retention
 policy among them -- but its Terms (§7) prohibit software that scrapes the Site, so
 nothing here reads them.
@@ -48,7 +53,7 @@ USAGE_FLUSH_INTERVAL_SECONDS = 300.0
 
 #: Bumped when ModelInfo's fields change; a saved catalogue in another format is ignored
 #: until the next sync rewrites it, rather than misread positionally.
-CATALOGUE_FORMAT = 2
+CATALOGUE_FORMAT = 3
 
 BROWSE_POPULAR = "popular"
 BROWSE_TRENDING = "trending"
@@ -76,6 +81,9 @@ class ModelInfo(NamedTuple):
     #: training; True when a listing that did filter left it out; None when no usable
     #: listing has ever covered it.
     trains: Optional[bool]
+    #: False for a model that also outputs images or audio. Kept for its price and label,
+    #: never listed -- see the module docstring.
+    text_only: bool
 
 
 class AuthorInfo(NamedTuple):
@@ -142,6 +150,12 @@ def _open_to_all(info: ModelInfo) -> bool:
     Unknown counts as no: a model nothing has vouched for is offered to the bot owner alone.
     """
     return bool(info.zdr_hosts) or info.trains is False
+
+
+def _listable(info: ModelInfo) -> bool:
+    """Whether a browse list may show this model: not an alias of one already shown, and
+    text is all it outputs."""
+    return not info.alias_of and info.text_only
 
 
 def _author_rows(models: Dict[str, ModelInfo], ids: Iterable[str]) -> List[AuthorInfo]:
@@ -272,6 +286,7 @@ class OpenRouterCatalogue:
                 continue
             pricing = raw.get("pricing") or {}
             reasoning = raw.get("reasoning") or {}
+            architecture = raw.get("architecture") or {}
             if without_training is not None:
                 trains = model_id not in without_training
             else:
@@ -281,7 +296,7 @@ class OpenRouterCatalogue:
                 name=raw.get("name") or model_id,
                 author=model_id.split("/", 1)[0],
                 context=int(raw.get("context_length") or 0),
-                image_input="image" in ((raw.get("architecture") or {}).get("input_modalities") or []),
+                image_input="image" in (architecture.get("input_modalities") or []),
                 prompt_1m=_float(pricing.get("prompt")) * 1_000_000,
                 completion_1m=_float(pricing.get("completion")) * 1_000_000,
                 moderated=bool((raw.get("top_provider") or {}).get("is_moderated")),
@@ -293,6 +308,8 @@ class OpenRouterCatalogue:
                 alias_of=raw.get("alias_target"),
                 open_weights=bool(raw.get("hugging_face_id")),
                 trains=trains,
+                # Absent reads as text: the listing asked for text output.
+                text_only=set(architecture.get("output_modalities") or ["text"]) == {"text"},
             )
             models[model_id] = info
             popular.append(model_id)
@@ -332,7 +349,7 @@ class OpenRouterCatalogue:
         listed += [model_id for model_id in models if model_id not in seen]
         position = {model_id: i for i, model_id in enumerate(listed)}
         # An alias is another id for a model already listed; showing both duplicates it.
-        visible = [model_id for model_id in listed if not models[model_id].alias_of]
+        visible = [model_id for model_id in listed if _listable(models[model_id])]
 
         cheapest = sorted(visible, key=lambda m: (_blended(models[m]), position[m]))
 
@@ -381,7 +398,7 @@ class OpenRouterCatalogue:
         if key.startswith(AUTHOR_PREFIX):
             return offered(self._by_author.get(key[len(AUTHOR_PREFIX):], [])), None
         used = offered(model_id for model_id, _count in self.usage.most_common()
-                       if not self.models or (model_id in self.models and not self.models[model_id].alias_of))
+                       if not self.models or (model_id in self.models and _listable(self.models[model_id])))
         if used:
             return used, None
         return offered(self._popular), "Nothing listed here has been used on this bot yet, so this is OpenRouter's own ranking."
@@ -390,6 +407,11 @@ class OpenRouterCatalogue:
         """Whether anyone may be offered this model. An id the listing lacks is not judged."""
         info = self.models.get(model_id)
         return info is None or _open_to_all(info)
+
+    def outputs_text_only(self, model_id: str) -> bool:
+        """Whether a text slot may take this model. An id the listing lacks is not judged."""
+        info = self.models.get(model_id)
+        return info is None or info.text_only
 
     def training_status(self) -> Tuple[int, int, Optional[int]]:
         """(models offered to everyone, models listed, when training was last checked)."""
@@ -453,6 +475,9 @@ class OpenRouterCatalogue:
             lines.append(("No host is known to serve it without training on prompts"
                           if info.trains else "Not yet checked for a host that avoids training on prompts")
                          + ", so it is offered to the bot owner alone")
+        if not info.text_only:
+            lines.append("Makes images or audio as well as text, which replies cannot use, "
+                         "so it is not listed")
         extra = []
         if info.reasoning_mandatory:
             extra.append("Reasoning always on")

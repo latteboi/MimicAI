@@ -1,5 +1,5 @@
-from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_MODEL, GEMINI_FREE_TIER_BLOCKED
-from ...utils.helpers import _format_api_error, _resolve_safety_settings
+from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_MODEL
+from ...utils.helpers import _format_api_error, _resolve_safety_settings, image_suffix_for_mime
 from ...utils.memory_tuning import maybe_trim_malloc
 from ...utils import mem_probe
 
@@ -46,11 +46,6 @@ class ImageRoundMixin:
         image_state_container = None
         response = None
         try:
-            api_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id)
-            if not api_key:
-                raise ValueError(GEMINI_FREE_TIER_BLOCKED if self.cog.storage_manager.gemini_blocked_for_guild(channel.guild.id)
-                                 else "Server API key not configured.")
-
             img_model_raw = gen_cfg.get("image_generation_model", DEFAULT_IMAGE_MODEL)
             img_fallback_raw = gen_cfg.get("image_generation_fallback_model")
 
@@ -86,10 +81,11 @@ class ImageRoundMixin:
             # Determine safety
             dynamic_safety_settings = _resolve_safety_settings(channel, gen_cfg)
 
-            # Built up front so the `finally` that logs the call has a model to name even
-            # if the first attempt raises before rebinding it.
-            image_model = self.cog.media_service.build_image_model(
-                img_model_raw, api_key, system_instruction, dynamic_safety_settings, gen_cfg)
+            # Built per attempt by the model factory, which keys it for whichever provider
+            # the attempt names -- so a primary that cannot run here still hands over to its
+            # fallback. Named by id until then, so the `finally` that logs the call always
+            # has something to name.
+            image_model = img_model_raw
 
             status = "api_error"
 
@@ -117,7 +113,8 @@ class ImageRoundMixin:
             async def _attempt(raw_name, _is_fallback):
                 nonlocal image_model
                 image_model = self.cog.media_service.build_image_model(
-                    raw_name, api_key, system_instruction, dynamic_safety_settings, gen_cfg)
+                    raw_name, channel.guild.id, gen_owner_id, system_instruction,
+                    dynamic_safety_settings, gen_cfg, config_owner_id=gen_owner_id)
                 # image_state_container is mutated in place by the heartbeat, so a retry
                 # edits the placeholder the first attempt made rather than adding one.
                 return await self._generate_with_heartbeat(
@@ -148,18 +145,21 @@ class ImageRoundMixin:
                 if candidate.finish_reason.name != 'STOP':
                     image_gen_error_msg = f"process stopped: {candidate.finish_reason.name.replace('_', ' ').title()}"
                 else:
-                    img_data = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
+                    image_part = next((part.inline_data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
+                    img_data = image_part.data if image_part else None
                     if img_data:
                         # Already on disk: the response streamed it there rather
                         # than through the heap (cogs/utils/blob_stream), so this
                         # is a rename. A small enough image is still bytes and
-                        # gets written here, exactly as it always was.
+                        # gets written here, exactly as it always was. The suffix
+                        # carries the type: an OpenRouter model may answer in JPEG.
                         with mem_probe.probe("  image gen: to file"):
                             generated_image_path_for_round = await self.cog.api_service.materialise_inline_data(
-                                response, img_data, ".png")
+                                response, img_data, image_suffix_for_mime(image_part.mime_type))
                         img_data = None
                     else:
                         image_gen_error_msg = "no image data returned"
+                    image_part = None
 
             self.cog._log_api_call(user_id=session.get('owner_id', 0), guild_id=channel.guild.id, context="image_generation_multi", model_used=image_model, status=status)
 

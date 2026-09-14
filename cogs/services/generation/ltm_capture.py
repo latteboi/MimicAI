@@ -34,7 +34,8 @@ class LtmCaptureMixin:
         ltm_bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
         profile_order_len = len(session.get("profiles", [])) or 1
         ltm_history = self.cog.session_manager._build_history_for_participant(
-            session.get("unified_log", []), ltm_bot_pid, ltm_p_settings, profile_order_len
+            session.get("unified_log", []), ltm_bot_pid, ltm_p_settings, profile_order_len,
+            hide_folded=self.cog.session_manager.compaction_enabled(session),
         )
         if len(ltm_history) < 2:
             return False, "not enough history"

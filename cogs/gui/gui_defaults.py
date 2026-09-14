@@ -9,7 +9,7 @@ This screen is deliberately thin. It does not know which settings exist: the key
 is derived from `PROFILE_ACTIONS` in `utils/user_defaults`, and the model rows come
 from `ModelPickerMixin._CATEGORY_KEYS` -- the same table the profile picker and the
 bulk picker build themselves from. Adopting the mixin rather than reimplementing it is
-what keeps the Google-only slots enforced here too: image, TTS and grounding pin the
+what keeps the Google-only slots enforced here too: TTS and grounding pin the
 API switch exactly as they do everywhere else, so a default cannot be stored that the
 profile dashboard would have refused.
 

@@ -574,70 +574,61 @@ class EventListeners:
                     self.session_manager._save_multi_profile_sessions()
                     return
 
+            # A draft session runs no rounds, whichever way one is asked for.
+            next_participant = None
+            if (is_continue or is_next) and self.session_manager.is_started(session):
                 try:
-                    next_participant = None
-                    last_speaker_key = session.get('last_speaker_key')
-                    reacted_to_key = (reacted_to_participant['owner_id'], reacted_to_participant['profile_name'])
-
-                    if is_continue or is_next:
-                        if reacted_to_key == last_speaker_key:
-                            session_mode = session.get("session_mode", "sequential")
-                            if session_mode == 'sequential':
-                                try:
-                                    last_speaker_index = next(i for i, p in enumerate(session['profiles']) if (p['owner_id'], p['profile_name']) == last_speaker_key)
-                                    next_speaker_index = (last_speaker_index + 1) % len(session['profiles'])
-                                    next_participant = session['profiles'][next_speaker_index]
-                                except (ValueError, StopIteration):
-                                    if session['profiles']:
-                                        next_participant = session['profiles'][0]
-                            else: # Random mode
-                                potential_responders = [p for p in session['profiles'] if (p['owner_id'], p['profile_name']) != last_speaker_key]
-                                if potential_responders:
-                                    next_participant = random.choice(potential_responders)
-                        else:
-                            reacted_to_index = session['profiles'].index(reacted_to_participant)
-                            next_speaker_index = (reacted_to_index + 1) % len(session['profiles'])
-                            next_participant = session['profiles'][next_speaker_index]
-
-                    if next_participant:
-                        session_mode = session.get("session_mode", "sequential")
-                        if session_mode == 'sequential':
-                            try:
-                                start_idx = session['profiles'].index(next_participant)
-                                new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
-                                session['profiles'] = new_order
-                                self.session_manager._save_multi_profile_sessions()
-                            except ValueError:
-                                pass
-
-                        is_busy = any(session.get(flag) for flag in SESSION_BUSY_FLAGS)
-                        
-                        async def _ack_nav_reaction(busy: bool):
-                            try:
-                                ch = self.bot.get_channel(payload.channel_id)
-                                if ch:
-                                    msg = await ch.fetch_message(payload.message_id)
-                                    if busy:
-                                        await msg.add_reaction(payload.emoji)
-                                    else:
-                                        await msg.clear_reaction(payload.emoji)
-                            except Exception: pass
-
-                        asyncio.create_task(_ack_nav_reaction(is_busy))
-
-                        trigger_type = 'reaction_single' if is_next else 'reaction'
-                        reaction_trigger = (trigger_type, payload, next_participant)
-                        
-                        if 'task_queue' not in session or session['task_queue'] is None:
-                            session['task_queue'] = asyncio.Queue()
-
-                        await session['task_queue'].put(reaction_trigger)
-                        if not session.get('worker_task') or session['worker_task'].done():
-                            task = self.bot.loop.create_task(self.generation_service._multi_profile_worker(payload.channel_id))
-                            session['worker_task'] = task
-                            self.background_tasks.add(task)
-                except (ValueError, IndexError):
+                    next_participant = self.session_manager.next_reaction_speaker(
+                        session, reacted_to_participant)
+                except ValueError:
                     pass
+
+            if next_participant:
+                session_mode = session.get("session_mode", "sequential")
+                if session_mode == 'sequential':
+                    try:
+                        start_idx = session['profiles'].index(next_participant)
+                        new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
+                        session['profiles'] = new_order
+                        self.session_manager._save_multi_profile_sessions()
+                    except ValueError:
+                        pass
+
+                is_busy = any(session.get(flag) for flag in SESSION_BUSY_FLAGS)
+
+                async def _ack_nav_reaction(busy: bool):
+                    try:
+                        ch = self.bot.get_channel(payload.channel_id)
+                        if ch:
+                            msg = await ch.fetch_message(payload.message_id)
+                            if busy:
+                                await msg.add_reaction(payload.emoji)
+                            else:
+                                await msg.clear_reaction(payload.emoji)
+                    except Exception: pass
+
+                asyncio.create_task(_ack_nav_reaction(is_busy))
+
+                trigger_type = 'reaction_single' if is_next else 'reaction'
+                reaction_trigger = (trigger_type, payload, next_participant)
+
+                if 'task_queue' not in session or session['task_queue'] is None:
+                    session['task_queue'] = asyncio.Queue()
+
+                # Recorded before the put, so pulling the reaction back off can find it.
+                self.session_manager.note_reaction_queued(session, (payload.message_id, emoji_str))
+                await session['task_queue'].put(reaction_trigger)
+                if not session.get('worker_task') or session['worker_task'].done():
+                    task = self.bot.loop.create_task(self.generation_service._multi_profile_worker(payload.channel_id))
+                    session['worker_task'] = task
+                    self.background_tasks.add(task)
+                return
+
+            # Nothing this reaction asks for can happen: 🔁 or ❌ on a profile that has left
+            # the cast, or ⏯️/🍿 on a draft or an empty session. It comes back off rather
+            # than sitting on the message looking ignored, which is what invited pulling it
+            # off and pressing it again.
+            asyncio.create_task(self._pull_back_reaction(payload))
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
@@ -700,12 +691,13 @@ class EventListeners:
                 return
             
             elif is_continue or is_next:
-                session.setdefault('cancelled_reaction_triggers', set()).add((payload.message_id, emoji_str))
-                try:
-                    channel = self.bot.get_channel(payload.channel_id)
-                    msg = await channel.fetch_message(payload.message_id)
-                    await msg.clear_reaction(payload.emoji)
-                except: pass
+                # Only a trigger still waiting can be withdrawn -- see cancel_queued_reaction.
+                if self.session_manager.cancel_queued_reaction(session, (payload.message_id, emoji_str)):
+                    try:
+                        channel = self.bot.get_channel(payload.channel_id)
+                        msg = await channel.fetch_message(payload.message_id)
+                        await msg.clear_reaction(payload.emoji)
+                    except: pass
                 return
                 
             elif is_mute:

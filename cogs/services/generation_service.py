@@ -27,8 +27,10 @@ from ..utils.constants import (
 from ..utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt,
     _format_history_entry, _get_user_hash, _resolve_safety_settings, _scrub_response_text,
-    _split_into_sentences_with_abbreviations, is_real_model, resolve_critic_settings,
-    is_gateway_shutdown, record_billed_usage, resolve_grounding_mode, resolve_native_tools,
+    _split_into_sentences_with_abbreviations, generated_image_attachment, is_real_model,
+    resolve_critic_settings,
+    image_rag_enabled, is_gateway_shutdown, record_billed_usage, resolve_grounding_mode,
+    resolve_native_tools,
     resolve_thinking_params,
     resolve_typing_cursor,
 )
@@ -331,6 +333,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             "is_user": False,
             "speaker_pid": "SYSTEM",
             "message_ids": [m.id for m in sent if m],
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "content": f"<system_note>\n{text}\n</system_note>",
         }
         session.setdefault("unified_log", []).append(intern_turn(turn))
@@ -388,15 +391,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     try: all_triggers_for_round.append(session['task_queue'].get_nowait())
                     except asyncio.QueueEmpty: break
                 
-                # [NEW] Filter out cancelled reaction triggers
-                valid_triggers = []
-                for t in all_triggers_for_round:
-                    if isinstance(t, tuple) and t[0] in ['reaction', 'reaction_single']:
-                        cancellation_key = (t[1].message_id, str(t[1].emoji))
-                        if cancellation_key in session.get('cancelled_reaction_triggers', set()):
-                            session['cancelled_reaction_triggers'].remove(cancellation_key)
-                            continue
-                    valid_triggers.append(t)
+                # Reactions pulled back off while they waited are withdrawn, and every
+                # reaction in the batch stops counting as queued.
+                valid_triggers = self.cog.session_manager.withdraw_cancelled_reactions(
+                    session, all_triggers_for_round)
                 
                 all_triggers_for_round = valid_triggers
 
@@ -405,21 +403,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     session, all_triggers_for_round)
                 if game_beat_participant is not None:
                     initial_trigger = all_triggers_for_round[0]
-
-                # This drain is the only consumer of cancelled_reaction_triggers, so a
-                # key that survives it is stale: it cancelled a trigger that was never
-                # queued, or one an earlier round already ran. Leaving them made this an
-                # unbounded set keyed by message id -- and worse, a stale
-                # (message_id, emoji) silently swallowed the *next* identical reaction on
-                # that message. It is reachable whenever msg.clear_reaction fails, which
-                # needs Manage Messages -- a permission the bot often lacks, as /purge
-                # checking for it explicitly implies -- because the user then removes the
-                # emoji by hand and strands a key every single time. There is no await
-                # between the filter above and this clear, so nothing can be recorded in
-                # the gap.
-                cancelled_keys = session.get('cancelled_reaction_triggers')
-                if cancelled_keys:
-                    cancelled_keys.clear()
 
                 # [NEW] Record the start of this batch for Hybrid STM
                 batch_start_index = len(session.get("unified_log", []))
@@ -697,7 +680,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                     # Parallelise Grounding RAG and URL Research Context Fetching
                     grounding_task = None
-                    if grounding_mode == "rag":
+                    # An image round's search goes into the image prompt alone -- its replies
+                    # have never carried one -- so it answers to the image setting instead.
+                    wants_rag = (image_rag_enabled(g_profile_settings) if is_image_gen_round
+                                 else grounding_mode == "rag")
+                    if wants_rag:
                         g_participant_key = (g_owner_id, g_profile_name)
                         # Derived from unified_log rather than the shadow chat_sessions copy.
                         g_stm_length = int(g_profile_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
@@ -706,7 +693,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         if g_stm_capped > 0:
                             g_bot_pid = self.cog.profile_manager._get_pid_from_name_any(g_owner_id, g_profile_name)
                             history_for_grounding = self.cog.session_manager._build_history_for_participant(
-                                session.get("unified_log", []), g_bot_pid, g_profile_settings, len(profile_order) or 1
+                                session.get("unified_log", []), g_bot_pid, g_profile_settings, len(profile_order) or 1,
+                                hide_folded=self.cog.session_manager.compaction_enabled(session),
                             )[-(g_stm_capped * 2):]
 
                         # Safety Logic for Grounding
@@ -1041,10 +1029,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
 
                         unified_log = session.get("unified_log", [])
+                        hide_folded = self.cog.session_manager.compaction_enabled(session)
                         contents_for_api_call = self.cog.session_manager._build_history_for_participant(
                             unified_log, bot_pid, p_settings,
                             len(profile_order) or 1,
                             reserved_tail=len(unified_log) - batch_start_index,
+                            hide_folded=hide_folded,
                         )
 
                         round_context_text = "\n".join([t[0] for t in new_round_turn_data])
@@ -1091,8 +1081,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 if critic_settings["scope"] == "session":
                                     session_transcript = []
                                     for _t in reversed(unified_log):
-                                        if (_t.get("is_user") or _t.get("type")
-                                                or _t.get("is_hidden") or _t.get("compacted")):
+                                        if (_t.get("is_user") or _t.get("type") or _t.get("is_hidden")
+                                                or (hide_folded and _t.get("compacted"))):
                                             continue
                                         session_transcript.append(_t.get("content", ""))
                                         if len(session_transcript) >= critic_settings["lookback"]:
@@ -1216,8 +1206,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     system_note = other_template.format(name=generator_display_name, prompt=image_gen_prompt)
                                 
                                 text_gen_parts = [
-                                    system_note, 
-                                    {"mime_type": "image/png", "url": generated_image_path_for_round}
+                                    system_note,
+                                    {"mime_type": generated_image_attachment(generated_image_path_for_round)[1],
+                                     "url": generated_image_path_for_round}
                                 ]
                                 supplementary_parts.extend(text_gen_parts)
                             else:
@@ -1688,7 +1679,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     file_to_send = None
                     extra_audio_file = None
                     if is_generator and generated_image_path_for_round:
-                        file_to_send = discord.File(generated_image_path_for_round, filename="generated_image.png")
+                        file_to_send = discord.File(
+                            generated_image_path_for_round,
+                            filename=generated_image_attachment(generated_image_path_for_round)[0])
                         if audio_file_for_send:
                             extra_audio_file = audio_file_for_send
                     elif audio_file_for_send:
@@ -1760,7 +1753,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             attachment_data = None
                             if is_generator and generated_image_path_for_round:
                                 attachment_data = {
-                                    "filename": "generated_image.png",
+                                    "filename": generated_image_attachment(generated_image_path_for_round)[0],
                                     "path": generated_image_path_for_round
                                 }
                             elif audio_file_for_send:
@@ -1969,7 +1962,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     url_media_batch = []
                                     
                                     if any_url_enabled_batch:
-                                        url_text_list, url_media, _ = await self.cog.tools_service._process_urls_in_content(content, trigger.guild.id, {"url_fetching_enabled": True}, warning_channel=channel)
+                                        # The message's own text, not the quoted reply folded into
+                                        # `content` above -- see _collect_round_triggers.
+                                        url_text_list, url_media, _ = await self.cog.tools_service._process_urls_in_content(trigger.clean_content, trigger.guild.id, {"url_fetching_enabled": True}, warning_channel=channel)
                                         if url_text_list: url_text_batch = "\n".join(url_text_list)
                                         url_media_batch = url_media
 

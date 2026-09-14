@@ -52,7 +52,7 @@ from ..utils.constants import (
     DEFAULT_TRAINING_ANALYST_PROMPT,
 )
 from ..utils.helpers import (Timeout, _format_api_error, _get_sanitized_history_and_author,
-                            resolve_thinking_params)
+                            resolve_thinking_params, suppress_link_previews)
 from .storage_manager import IOManager
 from ..services.api_service import get_embedding_vector
 
@@ -1023,7 +1023,7 @@ class MemoryManager:
                 await interaction.followup.send("❌ Profile not found.", ephemeral=True)
 
         except Exception as e:
-            await interaction.followup.send(f"❌ **Analysis Failed:** {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ **Analysis Failed:** {suppress_link_previews(str(e))}", ephemeral=True)
 
     async def bulk_reset_examples(self, user_id: int, profile_names: List[str]) -> str:
         user_id_str = str(user_id)

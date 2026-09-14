@@ -15,12 +15,14 @@ from ..utils.constants import (
     IMAGE_MODEL_KEYS, AUDIO_MODEL_KEYS, DEFAULT_SPEECH_VOICE,
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
     THINKING_LEVELS_TO_OLLAMA, GEMINI_FREE_TIER_BLOCKED, OLLAMA_OWNER_ONLY,
+    OPENROUTER_DATA_POLICY_BLOCKED, IMAGE_MODEL_NO_OLLAMA,
 )
 from ..utils.data_policy import openrouter_data_collection
 from ..managers.storage_manager import IOManager
 from ..utils.blob_stream import InlineBlobExtractor, is_blob_sentinel, sentinel_path
 from ..utils.helpers import (_resolve_safety_settings, is_real_model,
-                            google_thinking_caps, resolve_media_resolution,
+                            google_thinking_caps, resolve_image_output_params,
+                            resolve_image_tools, resolve_media_resolution,
                             resolve_native_tools, resolve_openrouter_image_detail,
                             resolve_openrouter_service_tier, resolve_thinking_params)
 from ..utils.http_client import get_shared_client
@@ -44,6 +46,8 @@ from .api.google_rest import (
 from .api.ollama import OllamaModel, OllamaResponse
 from .api.openrouter import OpenRouterModel
 from .api.openrouter_catalogue import BROWSE_POPULAR, OpenRouterCatalogue
+from .api.openrouter_image_catalogue import OpenRouterImageCatalogue
+from .api.openrouter_images import OpenRouterImageModel
 from .api.rest_view import _BlobRef, _EnumStr, _RestView
 
 _KEY_COOLDOWN_SECONDS = 60.0
@@ -105,6 +109,10 @@ class APIService:
         #: Every text-output OpenRouter model, loaded by the first pricing sync and
         #: refreshed by each one after. See api/openrouter_catalogue.
         self.catalogue = OpenRouterCatalogue(MODELS_DATA_DIR)
+        #: The image models the same sync lists -- see api/openrouter_image_catalogue. Loaded
+        #: and refreshed with the text catalogue; `_instantiate_model` reads it to decide
+        #: whether an OpenRouter image model may serve a server at all.
+        self.image_catalogue = OpenRouterImageCatalogue(MODELS_DATA_DIR)
         self._catalogue_loaded = False
         #: The pricing table, held in memory. `_get_model_pricing` used to re-read and
         #: parse the whole file per call, and the audit screens call it once per turn.
@@ -113,7 +121,7 @@ class APIService:
         #: first. Shared by every picker -- see probe_ollama.
         self._ollama_probes: "OrderedDict[str, Tuple[bool, List[str]]]" = OrderedDict()
 
-    def _instantiate_model(self, raw_model_name: str, guild_id, user_id, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, profile_settings=None, openrouter_key_error: str = None, google_key_error: str = None, use_broad_openrouter_heuristic: bool = True, config_owner_id=None, policy_guild_id=None, conversation: bool = False):
+    def _instantiate_model(self, raw_model_name: str, guild_id, user_id, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, profile_settings=None, openrouter_key_error: str = None, google_key_error: str = None, use_broad_openrouter_heuristic: bool = True, config_owner_id=None, policy_guild_id=None, conversation: bool = False, image_config=None):
         """One adapter for `raw_model_name`, keyed and policed for where it will run.
 
         `guild_id` picks whose key pays: the server's, or `user_id`'s own when None. A
@@ -128,6 +136,14 @@ class APIService:
 
         `config_owner_id` is the owner of the config that chose this model. Ollama is
         refused unless that is the bot owner, and refused when it is not given.
+
+        `image_config` makes it an image model: the profile's image output and sampling
+        keys, resolved here for the model named. Every image path builds through here
+        (MediaService.build_image_model), because an OpenRouter image request cannot carry
+        `data_collection` -- the Image API takes no such field. Where a text model is told to
+        deny training hosts, an image model is refused outright unless the image catalogue
+        knows its one host does not train; an id the catalogue does not list is refused
+        too, since there is no per-request deny to fall back on.
         """
         # System prefixes 'GOOGLE/', 'OPENROUTER/', and 'OLLAMA/' are strictly case-sensitive.
         # OpenRouter hosts models under lowercase creator namespaces like 'google/gemini-2.5-flash'.
@@ -169,9 +185,22 @@ class APIService:
             data_collection = (openrouter_data_collection(
                 self.cog.server_manager._get_server_index(str(policy_guild)) if policy_guild else None)
                 if gated else None)
+            if image_config is not None:
+                # No `data_collection` to send, so the model itself is judged -- see above.
+                if data_collection == "deny" and not self.image_catalogue.is_open(actual_name):
+                    refusal = ValueError(OPENROUTER_DATA_POLICY_BLOCKED)
+                    # Carried whole: _format_api_error cuts a plain message at 80 characters.
+                    refusal.formatted_reason = OPENROUTER_DATA_POLICY_BLOCKED
+                    raise refusal
+                model = OpenRouterImageModel(
+                    actual_name, api_key=api_key, system_instruction=system_instruction,
+                    image_params=resolve_image_output_params(image_config, f"OPENROUTER/{actual_name}"))
+                return _with_key_cooldown_tracking(self.cog, model, api_key)
             model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params, image_detail=image_detail, service_tier=service_tier, data_collection=data_collection)
             return _with_key_cooldown_tracking(self.cog, model, api_key)
         elif is_ollama:
+            if image_config is not None:
+                raise ValueError(IMAGE_MODEL_NO_OLLAMA)
             if not self.cog.profile_manager.may_use_ollama(config_owner_id):
                 raise ValueError(OLLAMA_OWNER_ONLY)
             ollama_host = p_settings.get("ollama_host_url", OLLAMA_LOCAL_URL)
@@ -186,7 +215,16 @@ class APIService:
                     raise ValueError(GEMINI_FREE_TIER_BLOCKED)
                 api_key = storage._get_api_key_for_user(user_id)
             if not api_key: raise ValueError(google_key_error or "Google API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
-            model = GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instruction, safety_settings=safety_settings, thinking_params=t_params, tools=tools, media_resolution=media_res)
+            if image_config is not None:
+                # No thinking config and no mediaResolution, which an image request rejects
+                # or ignores: its options and search tool are resolved for this model instead.
+                model = GoogleGenAIModel(api_key=api_key, model_name=actual_name,
+                                         system_instruction=system_instruction,
+                                         safety_settings=safety_settings,
+                                         tools=resolve_image_tools(image_config, raw_model_name),
+                                         image_params=resolve_image_output_params(image_config, raw_model_name))
+            else:
+                model = GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instruction, safety_settings=safety_settings, thinking_params=t_params, tools=tools, media_resolution=media_res)
             return _with_key_cooldown_tracking(self.cog, model, api_key)
 
     async def run_with_fallback(self, primary: str, fallback: Optional[str], attempt,
@@ -231,7 +269,10 @@ class APIService:
 
     def get_top_models(self, provider: str, target_config_key: str,
                        ollama_host: Optional[str] = None) -> List[str]:
-        if target_config_key in IMAGE_MODEL_KEYS: return list(get_args(IMAGE_MODELS))
+        if target_config_key in IMAGE_MODEL_KEYS:
+            if provider == 'openrouter':
+                return self.image_catalogue.browse(BROWSE_POPULAR, show_training=False)[0]
+            return list(get_args(IMAGE_MODELS))
         if target_config_key in AUDIO_MODEL_KEYS: return list(get_args(AUDIO_MODELS))
         if provider == 'google': return list(get_args(ALLOWED_MODELS))
         elif provider == 'ollama': return list((self.last_ollama_probe(ollama_host) or (False, []))[1])
@@ -524,6 +565,7 @@ class APIService:
             os.makedirs(MODELS_DATA_DIR, exist_ok=True)
             if not self._catalogue_loaded:
                 await asyncio.to_thread(self.catalogue.load)
+                await asyncio.to_thread(self.image_catalogue.load)
                 self._catalogue_loaded = True
 
             previous = self._pricing_rates or await asyncio.to_thread(self._read_pricing_file)
@@ -552,6 +594,14 @@ class APIService:
                 rates.update({k: v for k, v in (previous or {}).items() if k.startswith("OPENROUTER/")})
                 print(f"Warning: Failed to fetch the OpenRouter catalogue: {e}")
 
+            # After the text listing, because its training check is what lets the image
+            # listing mean anything -- see api/openrouter_image_catalogue. A failure here
+            # leaves yesterday's image models in place and touches no text price.
+            try:
+                await self._sync_image_catalogue(get_shared_client())
+            except Exception as e:
+                print(f"Warning: Failed to fetch the OpenRouter image catalogue: {e}")
+
             cache_data = {
                 "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "rates": rates
@@ -562,8 +612,42 @@ class APIService:
         except Exception as e:
             print(f"Error in pricing_sync_task: {e}")
 
-    async def _owner_model_listing(self, client) -> Tuple[Optional[bytes], Optional[str]]:
+    #: Endpoint lookups the image sync runs at once: some fifty small requests a day, spread
+    #: thin enough never to crowd a turn out of the shared client's connection pool.
+    _IMAGE_ENDPOINT_CONCURRENCY = 4
+
+    async def _sync_image_catalogue(self, client) -> None:
+        """Refreshes the OpenRouter image catalogue from its four documented endpoints."""
+        models_resp = await client.get("https://openrouter.ai/api/v1/images/models", timeout=20.0)
+        if models_resp.status_code != 200:
+            raise RuntimeError(f"HTTP {models_resp.status_code}")
+        ranking_resp = await client.get(
+            "https://openrouter.ai/api/v1/models?output_modalities=image&sort=most-popular", timeout=20.0)
+        model_ids = [m["id"] for m in (json.loads(models_resp.content).get("data") or [])
+                     if isinstance(m, dict) and m.get("id")]
+        gate = asyncio.Semaphore(self._IMAGE_ENDPOINT_CONCURRENCY)
+
+        async def endpoints(model_id: str):
+            async with gate:
+                try:
+                    resp = await client.get(
+                        f"https://openrouter.ai/api/v1/images/models/{model_id}/endpoints", timeout=20.0)
+                except httpx.HTTPError:
+                    return model_id, None
+            return model_id, (resp.content if resp.status_code == 200 else None)
+
+        endpoint_bodies = dict(await asyncio.gather(*(endpoints(m) for m in model_ids)))
+        account_body, _problem = await self._owner_model_listing(client, "output_modalities=image&limit=1000")
+        await asyncio.to_thread(
+            self.image_catalogue.apply_listing, models_resp.content,
+            ranking_resp.content if ranking_resp.status_code == 200 else None,
+            endpoint_bodies, account_body, self.catalogue.training_current)
+
+    async def _owner_model_listing(self, client, query: str = "limit=1000") -> Tuple[Optional[bytes], Optional[str]]:
         """`/models/user` as the bot owner's OpenRouter account sees it, or why there is none.
+
+        `query` picks what it lists. OpenRouter lists text models unless told otherwise, and
+        the image sync asks for `output_modalities=image`.
 
         No key is not a problem to log: that operator offers everyone else zero-retention
         models only, and their data policy screen says why.
@@ -576,7 +660,7 @@ class APIService:
         if not key:
             return None, None
         try:
-            resp = await client.get("https://openrouter.ai/api/v1/models/user?limit=1000",
+            resp = await client.get(f"https://openrouter.ai/api/v1/models/user?{query}",
                                     headers={"Authorization": f"Bearer {key}"}, timeout=20.0)
         except httpx.HTTPError as e:
             return None, type(e).__name__

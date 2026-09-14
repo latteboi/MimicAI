@@ -344,7 +344,9 @@ a turn gains messages during delivery, and deleting it early would strand the la
 Rolling synopses chain — each is written from the previous one plus the next chunk, and
 only the latest is injected — so a deleted turn survives in the synopsis that folded it and
 every one after. Those are dropped and their turns un-compacted for compaction to fold
-again. New synopses record `covers_turn_ids`; older ones are found by position.
+again. New synopses record `covers_turn_ids`; older ones are found by position. Folded turns
+stay hidden, and the synopsis is sent, only while the session's rolling synopsis is on
+(`compaction_enabled`), so switching it off puts the whole transcript back in the prompt.
 
 ### Histories are derived, never maintained
 
@@ -372,6 +374,7 @@ the log.
 |---|---|---|
 | `GOOGLE/` | `GoogleRESTModel` | Hand-rolled REST over `httpx` |
 | `OPENROUTER/` | `OpenRouterModel` | OpenAI-compatible chat completions |
+| `OPENROUTER/`, image slot | `OpenRouterImageModel` | `/api/v1/images`; built only with `image_config=`, streamed like Gemini's `inlineData` |
 | `OLLAMA/` | `OllamaModel` | Host URL per profile; bot owner's configs only |
 | *(bare)* | heuristic | A `/` in the name, or `grok`/`anthropic`, implies OpenRouter |
 
@@ -404,6 +407,11 @@ a record anyone but the bot owner wrote.
   The pickers offer a model only when some host is known to serve it without training (see
   the catalogue below); the rest go to the bot owner alone (`may_pick_training_models`), and
   a typed id is held to the same rule.
+- **OpenRouter images:** the Image API takes no `data_collection` and routes by the privacy
+  settings of whichever account's key pays. So for a server that has not opted in, the
+  factory refuses an image model unless the image catalogue knows it has one host company
+  and the bot owner's filtering listing kept it. Every image path builds through
+  `MediaService.build_image_model`, which calls the factory, and resolves no key itself.
 - **The operator's key:** the content classifier falls back to the bot owner's key for a
   profile whose owner has none (`_classifier_api_key`). Nobody directed that user's content
   there, so a free-tier Gemini key is skipped and an OpenRouter request on it denies
@@ -423,7 +431,9 @@ conversation, and is.
 popularity, `/endpoints/zdr`, and `/models/user` read with the bot owner's key. It never
 reads OpenRouter's website-internal endpoints: OpenRouter's Terms prohibit scraping the
 Site. Parsing runs in a thread and keeps one slim record per model (~400 KB for ~440
-models). The pricing table is answered from memory rather than re-read per turn.
+models). The pricing table is answered from memory rather than re-read per turn. `/models`
+matches text *among* a model's outputs, so a model that also makes images or audio keeps
+its record — price, label — but no browse list shows it and a typed id for one is refused.
 
 No documented endpoint says which hosts train, so the catalogue infers it. A zero-retention
 host keeps nothing, and `/models/user` omits whatever the account's privacy settings
@@ -435,6 +445,16 @@ policy screen shows how many models everyone else is offered, and when that was 
 The pickers browse it four ways — Most Popular (this bot's own usage count, written every
 few minutes rather than per call), Trending (rank climb against the oldest daily snapshot
 in a week), Cheapest, and per author — paged the way the session audit pages turns.
+
+`api/openrouter_image_catalogue.py` is its image counterpart, refreshed by the same sync:
+`/images/models` for what each model accepts, `/models?output_modalities=image` for the
+ranking, each model's `/images/models/{id}/endpoints` for its hosts and price, and
+`/models/user?output_modalities=image` on the bot owner's key. It lists only models Discord
+can show (raster output, no reference image required) with **exactly one host company** —
+see the data policy above — and trusts the account listing only in a sync whose text
+listing proved the settings filter. It fills the caps registry `image_model_caps` reads, so
+the Image Output screens and the request offer and send only what the chosen model takes.
+The picker's image category browses it through the same code, by Most Popular and author.
 
 ### No vendor SDKs
 

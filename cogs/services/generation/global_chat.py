@@ -15,7 +15,7 @@ from ...utils.constants import (
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_history_entry,
     _get_user_hash, _resolve_safety_settings, _scrub_response_text, default_profile_avatar_url,
-    resolve_grounding_mode, resolve_native_tools, resolve_thinking_params,
+    resolve_grounding_mode, resolve_native_tools, resolve_thinking_params, suppress_link_previews,
 )
 from ._shared import _strip_neuro_update_and_scrub
 
@@ -549,5 +549,5 @@ class GlobalChatMixin:
             await self.cog.session_manager._save_session_to_disk(model_cache_key, 'global_chat', session_data)
 
         except Exception as e:
-            await interaction.followup.send(f"An error occurred during the global chat: {e}", ephemeral=True)
+            await interaction.followup.send(f"An error occurred during the global chat: {suppress_link_previews(str(e))}", ephemeral=True)
             traceback.print_exc()

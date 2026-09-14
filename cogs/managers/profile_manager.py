@@ -39,8 +39,9 @@ from ..utils.constants import (
     CONTENT_RATING_EMOJI,
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
     IMAGE_GROUNDING_LABELS, )
-from ..utils.helpers import (is_real_model, resolve_critic_settings, resolve_grounding_mode,
-                            resolve_image_output_params, resolve_image_tools, resolve_url_mode)
+from ..utils.helpers import (image_rag_enabled, is_real_model, resolve_critic_settings,
+                            resolve_grounding_mode, resolve_image_output_params,
+                            resolve_image_tools, resolve_url_mode, suppress_link_previews)
 from ..utils.http_client import get_shared_client
 from .storage_manager import IOManager
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
@@ -1633,6 +1634,7 @@ class ProfileManager:
                 # because every image model already has one and ours would only
                 # override it on profiles nobody configured.
                 "image_aspect_ratio": "", "image_size": "", "image_thinking_level": "",
+                "image_quality": "",
                 # Same "empty means send nothing" rule: no search tool on an image
                 # request, and no sampling overrides, unless the profile asks.
                 "image_grounding_mode": "",
@@ -1700,6 +1702,7 @@ class ProfileManager:
                 # because every image model already has one and ours would only
                 # override it on profiles nobody configured.
                 "image_aspect_ratio": "", "image_size": "", "image_thinking_level": "",
+                "image_quality": "",
                 # Same "empty means send nothing" rule: no search tool on an image
                 # request, and no sampling overrides, unless the profile asks.
                 "image_grounding_mode": "",
@@ -3018,7 +3021,7 @@ class ProfileManager:
         except ValueError as ve:
             await interaction.followup.send(f"❌ **Import Rejected:** {ve}", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ **Import Failed:** An unexpected error occurred: {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ **Import Failed:** An unexpected error occurred: {suppress_link_previews(str(e))}", ephemeral=True)
 
     async def _execute_privacy_export(self, user_id: int, interaction: discord.Interaction):
         user_id_str = str(user_id)
@@ -3079,7 +3082,7 @@ class ProfileManager:
             file = discord.File(zip_path, filename=f"privacy_export_{user_id_str}.zip")
             await interaction.followup.send("Here is your complete data export. This archive contains your profiles, API keys, and memory data in unencrypted, uncompressed JSON format.", file=file, ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"Failed to send export file: {e}", ephemeral=True)
+            await interaction.followup.send(f"Failed to send export file: {suppress_link_previews(str(e))}", ephemeral=True)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -3534,8 +3537,9 @@ class ProfileManager:
             config, config.get("image_generation_model") or DEFAULT_IMAGE_MODEL)
         img_detail = " \u00b7 ".join(v for v in (
             img_out.get("aspect_ratio"), img_out.get("image_size"),
-            img_out.get("thinking_level"),
-            IMAGE_GROUNDING_LABELS.get(config.get("image_grounding_mode")) if img_ground else None,
+            img_out.get("quality"), img_out.get("thinking_level"),
+            IMAGE_GROUNDING_LABELS.get(config.get("image_grounding_mode"))
+            if img_ground or image_rag_enabled(config) else None,
         ) if v)
         if img_detail:
             img_gen += f" `{img_detail}`"

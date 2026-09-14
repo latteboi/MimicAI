@@ -16,8 +16,8 @@ from ..utils.constants import (
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
     IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS,
 )
-from .api_service import GoogleGenAIModel, generate_google_tts_audio
-from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, is_gateway_shutdown, resolve_grounding_mode, resolve_image_output_params, resolve_image_tools, resolve_typing_cursor
+from .api_service import generate_google_tts_audio
+from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, generated_image_attachment, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor
 from ..utils.memory_tuning import maybe_trim_malloc
 
 
@@ -38,25 +38,27 @@ class MediaService:
         paths and their tests already reach for."""
         return resolve_image_output_params(image_config, raw_name)
 
-    @staticmethod
-    def build_image_model(raw_name: str, api_key: str, system_instruction, safety_settings,
-                          image_config=None):
+    def build_image_model(self, raw_name: str, guild_id, user_id, system_instruction,
+                          safety_settings, image_config=None, *, config_owner_id):
         """One image-model constructor for the three places that build one.
 
-        All three stripped the GOOGLE/ prefix by hand and two of them defaulted to an
-        unprefixed id that the third prefixed, so the "same" default was two different
-        strings depending on which path reached it.
+        A thin call into `APIService._instantiate_model`, which keys the model for
+        whichever provider `raw_name` routes to and applies the data policy to it: the
+        free-tier Gemini refusal, and -- for an OpenRouter image model, which cannot carry
+        `data_collection` -- the check that its one host does not train. The call sites
+        used to resolve a Gemini key themselves and hand it in, which the data policy could
+        not see and no OpenRouter model could use.
 
-        `image_config` is the profile's raw IMAGE_OUTPUT_KEYS, not a validated payload:
-        validation depends on `raw_name`, and this is the one place that knows both.
+        `image_config` is the profile's raw IMAGE_OUTPUT_KEYS and IMAGE_SAMPLING_KEYS, not
+        a validated payload: validation depends on `raw_name`, and the factory is the one
+        place that knows both.
         """
-        name = raw_name[7:] if raw_name.upper().startswith("GOOGLE/") else raw_name
-        return GoogleGenAIModel(api_key=api_key, model_name=name,
-                                system_instruction=system_instruction,
-                                safety_settings=safety_settings,
-                                tools=resolve_image_tools(image_config, raw_name),
-                                image_params=MediaService.resolve_image_output_params(
-                                    image_config, raw_name))
+        return self.cog.api_service._instantiate_model(
+            raw_name, guild_id, user_id, system_instruction=system_instruction,
+            safety_settings=safety_settings, image_config=image_config or {},
+            config_owner_id=config_owner_id,
+            google_key_error="Server API key not configured.",
+            openrouter_key_error="Server OpenRouter key not configured.")
 
     async def _generate_google_tts(self, text: str, guild_id: int, model_id: str = DEFAULT_SPEECH_MODEL, voice_name: str = "Aoede", temperature: float = 1.0, fallback_model_id: Optional[str] = None):
         """Generates a playable WAV audio stream utilising Google Gemini Speech Generation models.
@@ -163,20 +165,18 @@ class MediaService:
                     try:
                         # --- Just-in-Time Generation for Reference Images ---
                         if package.get("reference_image_urls"):
-                            image_data, failure_reason, response = None, None, None
+                            image_data, image_mime, failure_reason, response = None, None, None, None
                             # response is reset per request, not merely on the error path:
                             # these workers loop inside one frame, so a generation that
                             # raises before rebinding it would otherwise leave the
                             # *previous* request's response to be closed here.
                             try:
-                                api_key = self.cog.storage_manager._get_api_key_for_guild(package['guild_id'])
-                                if not api_key: raise ValueError("Server API key not configured.")
-
                                 img_model_raw = package.get("image_generation_model", DEFAULT_IMAGE_MODEL)
                                 img_fallback_raw = package.get("image_generation_fallback_model")
-                                image_model = self.build_image_model(
-                                    img_model_raw, api_key, package['system_instruction'],
-                                    package['safety_settings'], package.get('image_output'))
+                                # Built per attempt by the model factory, which keys it for the
+                                # provider the attempt names -- so a primary that cannot run here
+                                # still hands over to its fallback. Named by id until then.
+                                image_model = img_model_raw
                                 parts = [package['prompt_text']]
                                 for ref in package.get("reference_image_urls", []):
                                     parts.append({"url": ref["url"], "mime_type": ref.get("mime_type", "image/png")})
@@ -202,8 +202,10 @@ class MediaService:
                                     async def _attempt(raw_name, _is_fallback):
                                         nonlocal image_model
                                         image_model = self.build_image_model(
-                                            raw_name, api_key, package['system_instruction'],
-                                            package['safety_settings'], package.get('image_output'))
+                                            raw_name, package['guild_id'], package['author_id'],
+                                            package['system_instruction'], package['safety_settings'],
+                                            package.get('image_output'),
+                                            config_owner_id=package['effective_profile_owner_id'])
                                         # The state container is mutated in place, so a retry
                                         # re-uses the placeholder the first attempt created
                                         # rather than stacking a second one beside it.
@@ -232,7 +234,10 @@ class MediaService:
                                         candidate = response.candidates[0]
                                         if candidate.finish_reason.name != 'STOP': failure_reason = f"the process being stopped for reason: **{candidate.finish_reason.name.replace('_', ' ').title()}**"
                                         else:
-                                            image_data = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
+                                            image_part = next((part.inline_data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
+                                            if image_part:
+                                                image_data, image_mime = image_part.data, image_part.mime_type
+                                            image_part = None
                                             if not image_data: failure_reason = "an unknown issue (the model returned no image data)"
                             except Exception as e:
                                 if not failure_reason: failure_reason = f"an unexpected error: `{e}`"
@@ -242,9 +247,10 @@ class MediaService:
                                 # off the socket (cogs/utils/blob_stream), so this
                                 # takes ownership of that file rather than writing
                                 # one. A small enough image is still bytes and is
-                                # written here, as it always was.
+                                # written here, as it always was. The suffix carries
+                                # the type: an OpenRouter model may answer in JPEG.
                                 package['generated_image_path'] = await self.cog.api_service.materialise_inline_data(
-                                    response, image_data, ".png")
+                                    response, image_data, image_suffix_for_mime(image_mime))
                                 image_data = None
                             if response is not None:
                                 # Unlinks any blob the package did not take -- what a
@@ -285,7 +291,8 @@ class MediaService:
                             package['effective_profile_owner_id'], package['effective_profile_name']
                         )
                         contents_for_api_call = self.cog.session_manager._build_history_for_participant(
-                            img_session.get("unified_log", []), img_bot_pid, profile_settings
+                            img_session.get("unified_log", []), img_bot_pid, profile_settings,
+                            hide_folded=self.cog.session_manager.compaction_enabled(img_session),
                         )
 
                         turn_id = str(uuid.uuid4())
@@ -296,7 +303,8 @@ class MediaService:
 
                             final_user_parts = [
                                 system_note,
-                                {"mime_type": "image/png", "url": package['generated_image_path']}
+                                {"mime_type": generated_image_attachment(package['generated_image_path'])[1],
+                                 "url": package['generated_image_path']}
                             ]
 
                             user_turn = {'role': 'user', 'parts': final_user_parts}
@@ -392,7 +400,9 @@ class MediaService:
 
                         # --- Final Message Sending ---
                         if package.get('generated_image_path') and not package.get('failure_reason'):
-                            image_file_to_send = discord.File(package['generated_image_path'], filename="generated_image.png")
+                            image_file_to_send = discord.File(
+                                package['generated_image_path'],
+                                filename=generated_image_attachment(package['generated_image_path'])[0])
 
                         final_response_text = response_text
                         is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
@@ -447,7 +457,7 @@ class MediaService:
                             # in-process asyncio.Queue cost ~4x its size in live
                             # copies and bought nothing.
                             payload["attachment"] = {
-                                "filename": "generated_image.png",
+                                "filename": generated_image_attachment(package['generated_image_path'])[0],
                                 "path": package['generated_image_path'],
                             }
                         await self.cog.manager_queue.put({"action": "send_to_child", "bot_id": package['bot_id'], "payload": payload})
@@ -534,28 +544,28 @@ class MediaService:
                     continue
 
                 # --- Pre-fetch Logic ---
-                image_data, failure_reason, response = None, None, None
+                image_data, image_mime, failure_reason, response = None, None, None, None
                 # response is reset per request, not merely on the error path:
                 # these workers loop inside one frame, so a generation that
                 # raises before rebinding it would otherwise leave the
                 # *previous* request's response to be closed here.
                 try:
-                    api_key = self.cog.storage_manager._get_api_key_for_guild(request_data['guild_id'])
-                    if not api_key: raise ValueError("Server API key is not configured.")
-
                     img_model_raw = request_data.get("image_generation_model", DEFAULT_IMAGE_MODEL)
                     img_fallback_raw = request_data.get("image_generation_fallback_model")
-                    image_model = self.build_image_model(
-                        img_model_raw, api_key, request_data['system_instruction'],
-                        request_data['safety_settings'], request_data.get('image_output'))
+                    # Built per attempt by the model factory, which keys it for the provider
+                    # the attempt names -- so a primary that cannot run here still hands
+                    # over to its fallback. Named by id until then, for the log.
+                    image_model = img_model_raw
 
                     status = "api_error"
                     try:
                         async def _attempt(raw_name, _is_fallback):
                             nonlocal image_model
                             image_model = self.build_image_model(
-                                raw_name, api_key, request_data['system_instruction'],
-                                request_data['safety_settings'], request_data.get('image_output'))
+                                raw_name, request_data['guild_id'], request_data['author_id'],
+                                request_data['system_instruction'], request_data['safety_settings'],
+                                request_data.get('image_output'),
+                                config_owner_id=request_data['effective_profile_owner_id'])
                             return await image_model.generate_content_async([{'role': 'user', 'parts': [request_data['prompt_text']]}])
 
                         response, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
@@ -573,16 +583,21 @@ class MediaService:
                         if candidate.finish_reason.name != 'STOP':
                             failure_reason = f"the process being stopped for reason: **{candidate.finish_reason.name.replace('_', ' ').title()}**"
                         else:
-                            image_data = next((part.inline_data.data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
+                            image_part = next((part.inline_data for part in candidate.content.parts if getattr(part, 'inline_data', None) and part.inline_data.mime_type.startswith('image/')), None)
+                            if image_part:
+                                image_data, image_mime = image_part.data, image_part.mime_type
+                            image_part = None
                             if not image_data: failure_reason = "an unknown issue (the model returned no image data)"
                 except Exception as e:
-                    failure_reason = f"an unexpected error: `{e}`"
+                    # A refusal already phrased for the user -- the data policy's -- keeps its words.
+                    failure_reason = getattr(e, "formatted_reason", None) or f"an unexpected error: `{e}`"
 
                 if image_data:
                     # Takes ownership of the file blob_stream already wrote; only a
-                    # sub-threshold image is still bytes needing a write here.
+                    # sub-threshold image is still bytes needing a write here. The suffix
+                    # carries the type: an OpenRouter model may answer in JPEG.
                     request_data['generated_image_path'] = await self.cog.api_service.materialise_inline_data(
-                        response, image_data, ".png")
+                        response, image_data, image_suffix_for_mime(image_mime))
                 # image_data and response are only rebound when the *next* request
                 # arrives, and this worker spends most of its life blocked on the
                 # queue below -- so without dropping them here, whatever the last
@@ -786,9 +801,9 @@ class MediaService:
             profile_name = effective_profile_name
 
             grounding_sources = []
-            grounding_mode = resolve_grounding_mode(profile_data)
 
-            if grounding_mode == "rag":
+            # The image's own search setting, never the profile's chat grounding_mode.
+            if image_rag_enabled(profile_data):
                 session_key = (channel_id, owner_id, profile_name)
                 img_session = self.cog.multi_profile_channels.get(channel_id) or {}
 
@@ -798,7 +813,8 @@ class MediaService:
                 if grounding_stm > 0:
                     g_bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
                     history_for_grounding = self.cog.session_manager._build_history_for_participant(
-                        img_session.get("unified_log", []), g_bot_pid, profile_data
+                        img_session.get("unified_log", []), g_bot_pid, profile_data,
+                        hide_folded=self.cog.session_manager.compaction_enabled(img_session),
                     )[-grounding_stm:]
 
                 mapping_key = self.cog.session_manager._get_mapping_key_for_session(session_key, 'multi')
@@ -816,7 +832,7 @@ class MediaService:
                 "effective_profile_owner_id": effective_profile_owner_id, "effective_profile_name": effective_profile_name, 
                 "bot_display_name": bot_display_name, "safety_settings": dynamic_safety_settings,
                 "system_instruction": system_instruction, "reference_image_urls": reference_image_urls, "placeholder_message": placeholder_message,
-                "grounding_sources": grounding_sources, "grounding_mode": grounding_mode,
+                "grounding_sources": grounding_sources,
                 "image_generation_model": profile_data.get("image_generation_model", DEFAULT_IMAGE_MODEL),
                 "image_generation_fallback_model": profile_data.get("image_generation_fallback_model"),
                 # Carried rather than re-read off the profile in the worker: the request

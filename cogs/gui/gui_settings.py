@@ -7,7 +7,7 @@ import datetime
 from typing import TYPE_CHECKING, List, Optional
 
 from .base_components import BlockedGuard, TabbedView, add_button, add_select
-from ..utils.helpers import _get_user_hash, _resolve_zoneinfo
+from ..utils.helpers import _get_user_hash, _resolve_zoneinfo, suppress_link_previews
 from ..utils.data_policy import is_paid_gemini_slot, may_save_free_gemini_key
 
 if TYPE_CHECKING:
@@ -74,7 +74,7 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
         )
         
         if not is_valid:
-            await interaction.followup.send(f"❌ **Validation Failed:** {err}", ephemeral=True)
+            await interaction.followup.send(f"❌ **Validation Failed:** {suppress_link_previews(str(err))}", ephemeral=True)
             return
 
         # Refused before anything is written -- see may_save_free_gemini_key.
@@ -683,7 +683,7 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
             return
         except Exception as e:
             await temp_client.close()
-            await interaction.followup.send(f"Error: An unexpected error occurred while validating the token: {e}", ephemeral=True)
+            await interaction.followup.send(f"Error: An unexpected error occurred while validating the token: {suppress_link_previews(str(e))}", ephemeral=True)
             return
 
         if bot_user_id in self.cog.child_bots:

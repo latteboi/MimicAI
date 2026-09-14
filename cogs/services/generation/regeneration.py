@@ -195,7 +195,8 @@ class RegenerationMixin:
             reserved_tail = len(sliced_unified_log) - batch_start_index
 
             participant_history = self.cog.session_manager._build_history_for_participant(
-                sliced_unified_log, bot_pid, p_profile, reserved_tail=reserved_tail
+                sliced_unified_log, bot_pid, p_profile, reserved_tail=reserved_tail,
+                hide_folded=self.cog.session_manager.compaction_enabled(session),
             )
             pending_whispers_for_regen = self.cog.session_manager._get_pending_whispers_for_participant(sliced_unified_log, bot_pid)
 

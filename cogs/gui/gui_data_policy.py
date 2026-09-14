@@ -126,7 +126,11 @@ class DataPolicyView(BlockedGuard, ui.View):
                    "training. It reads OpenRouter's model list through your Personal "
                    "OpenRouter key, filtered by that account's privacy settings -- turn off "
                    "providers that may train on inputs there.")
-        return f"**{shown}** of {total}. {how}"[:1024]
+        # Image models answer to the same account listing, but only count once it has
+        # proved the settings filter -- see api/openrouter_image_catalogue.
+        images_shown, images_total, _checked = self.cog.api_service.image_catalogue.training_status()
+        images = f"\nImage models: **{images_shown}** of {images_total}." if images_total else ""
+        return f"**{shown}** of {total}. {how}{images}"[:1024]
 
     def _build(self):
         self.clear_items()

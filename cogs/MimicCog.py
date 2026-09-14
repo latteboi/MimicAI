@@ -30,7 +30,7 @@ from .gui.gui_mod import ModStatsView
 from .services.generation.turn_deletion import is_visible_turn
 from .managers.storage_manager import MasterCipher, StorageManager
 from .managers.profile_manager import ProfileManager
-from .managers.session_manager import DEFAULT_COMPACTION_CONFIG, SessionManager
+from .managers.session_manager import NEW_SESSION_COMPACTION, SessionManager
 from .managers.memory_manager import MemoryManager
 from .managers.server_manager import ServerManager
 from .managers.child_bot_manager import ChildBotManager
@@ -59,7 +59,8 @@ import platform
 from collections import OrderedDict
 import re
 import pathlib
-from .utils.helpers import _resolve_safety_settings, _scrub_response_text, resolve_thinking_params
+from .utils.helpers import (_resolve_safety_settings, _scrub_response_text, resolve_thinking_params,
+                            suppress_link_previews)
 
 class LRUCache(OrderedDict):
     def __init__(self, max_size, *args, **kwargs):
@@ -478,7 +479,7 @@ class MimicCog(EventListeners, commands.Cog):
         except json.JSONDecodeError:
             await interaction.followup.send("❌ **Generation Failed:** The AI returned an invalid data format. Please try again.", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ **Generation Failed:** An error occurred: {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ **Generation Failed:** An error occurred: {suppress_link_previews(str(e))}", ephemeral=True)
 
     @profile_group.command(name="manage", description="Manage all settings for a specific profile from a unified dashboard.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -638,7 +639,7 @@ class MimicCog(EventListeners, commands.Cog):
                 await interaction.response.send_modal(ImportPassphraseModal(self, file_bytes))
                 return
         except Exception as e:
-            await interaction.response.send_message(f"❌ Failed to read or parse file: {e}", ephemeral=True)
+            await interaction.response.send_message(f"❌ Failed to read or parse file: {suppress_link_previews(str(e))}", ephemeral=True)
             return
         
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -757,6 +758,9 @@ class MimicCog(EventListeners, commands.Cog):
                 "session_mode": session_config.get("session_mode", "sequential"),
                 "proactivity": session_config.get("proactivity", proactivity_defaults),
                 "cast_policy": session_config.get("cast_policy", DEFAULT_CAST_POLICY),
+                # Carried like every other setting. Without it the editor showed the
+                # synopsis off, and the next save wrote that over the blueprint.
+                "compaction": session_config.get("compaction", {}),
                 "started": session_config.get("started", True),
             }
         else:
@@ -769,6 +773,7 @@ class MimicCog(EventListeners, commands.Cog):
                 "session_prompt": None, "session_mode": "sequential",
                 "proactivity": proactivity_defaults,
                 "cast_policy": DEFAULT_CAST_POLICY,
+                "compaction": dict(NEW_SESSION_COMPACTION),
                 # Opening the editor seats nobody and starts nothing.
                 "started": False,
             }
@@ -1001,7 +1006,7 @@ class MimicCog(EventListeners, commands.Cog):
                     "worker_task": None, "turns_since_last_ltm": 0, "session_prompt": None,
                     "session_mode": "sequential", "pending_image_gen_data": None, "pending_whispers": {},
                     "audio_mode": "off",
-                    "compaction": DEFAULT_COMPACTION_CONFIG.copy(),
+                    "compaction": dict(NEW_SESSION_COMPACTION),
                     "cast_policy": DEFAULT_CAST_POLICY,
                     "started": True,
                 }
@@ -1305,6 +1310,8 @@ class MimicCog(EventListeners, commands.Cog):
 
         session['is_hydrated'] = True
         session['unified_log'] = []
+        # The queue is emptied below without a round, so no reaction it held is waiting.
+        self.session_manager.forget_queued_reactions(session)
 
         if session.get('worker_task'):
             self.session_manager._safe_cancel_task(session['worker_task'])
@@ -1402,6 +1409,7 @@ class MimicCog(EventListeners, commands.Cog):
                     dropped += 1
                 except (asyncio.QueueEmpty, ValueError):
                     break
+        self.session_manager.forget_queued_reactions(session)
 
         for p in session.get('profiles', []):
             if p.get('method') == 'child_bot' and p.get('bot_id'):
@@ -1526,7 +1534,7 @@ class MimicCog(EventListeners, commands.Cog):
             await progress_message.edit(content=summary)
 
         except Exception as e:
-            await interaction.followup.send(f"An error occurred during purge: {e}", ephemeral=True)
+            await interaction.followup.send(f"An error occurred during purge: {suppress_link_previews(str(e))}", ephemeral=True)
             traceback.print_exc()
         finally:
             if session_lock:
@@ -1593,7 +1601,7 @@ class MimicCog(EventListeners, commands.Cog):
                 summary += f" Dropped {report['synopses']} session synopsis(es) that still summarised them."
             await interaction.followup.send(summary, ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"An error occurred while deleting: {e}", ephemeral=True)
+            await interaction.followup.send(f"An error occurred while deleting: {suppress_link_previews(str(e))}", ephemeral=True)
             traceback.print_exc()
         finally:
             session['is_purging'] = False
@@ -2146,7 +2154,8 @@ class MimicCog(EventListeners, commands.Cog):
                 session = {
                     "type": "multi", "profiles": [participant],
                     "unified_log": [], "is_hydrated": False, "owner_id": interaction.user.id, "is_running": False,
-                    "task_queue": asyncio.Queue(), "worker_task": None, "session_mode": "sequential"
+                    "task_queue": asyncio.Queue(), "worker_task": None, "session_mode": "sequential",
+                    "compaction": dict(NEW_SESSION_COMPACTION),
                 }
                 self.multi_profile_channels[interaction.channel_id] = session
                 result_msg = "MimicGuide joined and created a new Chat Session."

@@ -86,7 +86,8 @@ class TriggerIntakeMixin:
                         "is_user": False,
                         "speaker_pid": "SYSTEM",
                         "message_ids": [],
-                        "content": system_content
+                        "content": system_content,
+                        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     }
                     session.setdefault("unified_log", []).append(intern_turn(turn_object))
 
@@ -142,6 +143,11 @@ class TriggerIntakeMixin:
                     reply_context = await self._resolve_reply_context(message_trigger)
 
                 content = trigger_obj['content'] if is_child_mention else trigger_obj.clean_content
+                # What the person typed, before text files and the quoted reply are folded
+                # in. URL Context reads links from this alone: a link inside an attached file
+                # or someone else's quoted message is not one they asked the profile to
+                # open, and the quote is cut at 150 characters, so its link can be half a URL.
+                typed_text = content
 
                 raw_att_list = trigger_obj['attachments'] if is_child_mention else trigger_obj.attachments
                 # Shared client: _process_text_attachments sets its own
@@ -178,7 +184,7 @@ class TriggerIntakeMixin:
                 if any_url_enabled and any_url_rag:
                     # Defer URL fetching until after placeholder is sent
                     pending_url_fetches.append({
-                        "content": content,
+                        "content": typed_text,
                         "guild_id": trigger_obj['guild_id'] if is_child_mention else trigger_obj.guild.id,
                         "turn_data_index": len(new_round_turn_data)
                     })

@@ -249,6 +249,13 @@ class ToolsService:
                 # distinguishing "refused" from "timed out" would tell whoever
                 # posted the link which internal hosts exist.
                 warnings.append(WARN_URL_FETCHING_FAILED.format(reason="destination not permitted"))
+            except httpx.HTTPStatusError as e:
+                # The site answered with an error. Its status is the whole story -- the link
+                # is the one they just posted -- and _format_api_error reads statuses as a
+                # model API's, where a 404 is "Model Not Found".
+                status = e.response
+                warnings.append(WARN_URL_FETCHING_FAILED.format(
+                    reason=f"HTTP {status.status_code} {status.reason_phrase}".strip()))
             except Exception as e:
                 warnings.append(WARN_URL_FETCHING_FAILED.format(reason=_format_api_error(e)))
 
