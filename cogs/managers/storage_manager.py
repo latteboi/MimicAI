@@ -345,6 +345,38 @@ class IOManager:
                 except OSError: pass
             raise
 
+    @staticmethod
+    def read_blob(file_path: str, fernet) -> Optional[bytes]:
+        """A sealed binary file's plaintext, or None when it is absent or will not open.
+
+        For what does not compress -- audio -- so there is no zstd pass either way.
+        """
+        if not os.path.exists(file_path):
+            return None
+        try:
+            with open(file_path, 'rb') as f:
+                return unseal_blob(f.read(), fernet)
+        except (IOError, OSError, InvalidToken) as e:
+            print(f"IOManager Read Error ({file_path}): {e}")
+            return None
+
+    @staticmethod
+    def write_blob(payload: bytes, file_path: str, fernet):
+        """Seals `payload` to disk as it is, atomically."""
+        temp_file_path = file_path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            sealed = seal_blob(payload, fernet)
+            with open(temp_file_path, 'wb') as f:
+                f.write(sealed)
+            os.replace(temp_file_path, file_path)
+        except Exception as e:
+            print(f"IOManager Write Error ({file_path}): {e}")
+            if os.path.exists(temp_file_path):
+                try: os.remove(temp_file_path)
+                except OSError: pass
+            raise
+
 class StorageManager:
     """Owns key-derived encryption, atomic .json/.json.gz persistence primitives, generic entity
     shard IO, API key persistence, and legacy filesystem migration utilities.
@@ -557,6 +589,30 @@ class StorageManager:
         user_id, slot_id = pointer
         slot = (self._get_user_keys_data(user_id).get("slots") or {}).get(slot_id)
         return bool(slot and slot.get("key")) and not self._gemini_slot_allowed_in_guild(guild_id, user_id, slot_id)
+
+    def key_cooling_down(self, guild_id: Optional[int], user_id: Optional[int],
+                         provider: str = "gemini") -> bool:
+        """True when the key a call would use exists but is resting after a rate limit.
+
+        The guild's key when `guild_id` is given, else `user_id`'s personal one -- the choice
+        the model factory makes. Both resolvers hand out nothing while a key cools down, and
+        this lets a caller say so rather than report a key that is sitting there as missing.
+        """
+        if not self.fernet:
+            return False
+        if guild_id:
+            pointer = self._guild_key_pointer(guild_id, provider)
+        else:
+            assignments = (self._get_user_keys_data(user_id).get("personal_assignments") or {}) if user_id else {}
+            pointer = (user_id, assignments[provider]) if assignments.get(provider) else None
+        if not pointer:
+            return False
+        owner_id, slot_id = pointer
+        key = self.cog.decrypted_key_cache.get((owner_id, slot_id))
+        if not key:
+            slot = (self._get_user_keys_data(owner_id).get("slots") or {}).get(slot_id)
+            key = slot.get("key") if slot else None
+        return bool(key) and time.time() <= self.cog.api_key_cooldowns.get(key, 0)
 
     def personal_gemini_is_paid(self, user_id: int) -> bool:
         """Whether the Gemini key on this user's Personal scope is billing-enabled."""

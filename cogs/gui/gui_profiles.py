@@ -86,27 +86,32 @@ def ProfileDirectorDeskModal(cog, profile_name: str, current_params: Dict[str, A
 
 def ProfileSpeechSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     # No voice field: it moved to the Choose TTS Voice picker. A text box here accepted
-    # any string, and an unknown voice name comes back as a 400 that _generate_google_tts
-    # turns into silence -- the profile looked configured and simply never spoke.
+    # any string, and an unknown voice name comes back as a 400 on every turn -- the
+    # profile looked configured and never spoke.
     # values_only drops the fields the setting's own screen renders as controls. The
     # full form is what the bulk wizard still opens, so nothing is unreachable there.
     fields = [] if values_only else [
         {"label": "Enable TTS (on/off)", "custom_id": "speech_tts_enabled", "default": "on" if current_params.get("speech_tts_enabled", False) else "off", "required": True, "max_length": 10},
     ]
-    fields.append(
-        {"label": "Temperature (0.0 - 2.0)", "custom_id": "speech_temperature", "default": str(current_params.get("speech_temperature", 1.0)), "required": False, "max_length": 5}
-    )
+    speed = current_params.get("speech_speed")
+    # Each label names the voices it reaches: temperature is sent to Gemini alone, and speed
+    # to OpenRouter alone, where most hosts ignore it as well.
+    fields += [
+        {"label": "Temperature · Gemini voices (0.0 - 2.0)", "custom_id": "speech_temperature", "default": str(current_params.get("speech_temperature", 1.0)), "required": False, "max_length": 5},
+        {"label": f"Speed · OpenRouter voices ({SPEECH_SPEED_MIN} - {SPEECH_SPEED_MAX})", "custom_id": "speech_speed", "default": "" if speed is None else str(speed), "required": False, "max_length": 5, "placeholder": "Blank: the model's own pace. Most hosts ignore it."},
+    ]
     def parser(v):
         c = {}
         if "speech_tts_enabled" in v:
             c["speech_tts_enabled"] = _pb(v["speech_tts_enabled"])
         c.update(_ranged(v, "speech_temperature", 0.0, 2.0, "Temperature"))
+        # A cleared box writes None, which sends no speed -- so blank is a value here.
+        c["speech_speed"] = _ranged(v, "speech_speed", SPEECH_SPEED_MIN, SPEECH_SPEED_MAX, "Speed").get("speech_speed")
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Speech Settings", fields, parser, callback, target_user_id)
 
 #: Tab order for ProfileManageView's nav bar. "persona" is hidden for borrowed profiles.
-#: Tab order for ProfileManageView's nav bar. "persona" is hidden for borrowed profiles.
-PROFILE_TABS = ("home", "persona", "params", "tools", "memory")
+PROFILE_TABS = ("home", "persona", "params", "tools", "media", "memory")
 
 
 class _Bulk:
@@ -143,10 +148,10 @@ class _Bulk:
     """
 
     __slots__ = ("run", "scope", "destructive", "terminal", "warning", "description",
-                 "label", "keys", "prompt_keys")
+                 "label", "keys", "prompt_keys", "needs")
 
     def __init__(self, run, *, scope="all", destructive=False, terminal=False,
-                 warning=None, description=None, label=None, keys=(), prompt_keys=()):
+                 warning=None, description=None, label=None, keys=(), prompt_keys=(), needs=()):
         self.run = run
         self.scope = scope
         self.destructive = destructive
@@ -156,6 +161,9 @@ class _Bulk:
         self.label = label
         self.keys = tuple(keys)
         self.prompt_keys = tuple(prompt_keys)
+        #: Config keys that must already be staged before the row is offered: a value that
+        #: only means something against another setting waits for that setting.
+        self.needs = tuple(needs)
 
     @property
     def copyable(self) -> bool:
@@ -560,12 +568,54 @@ def _render_media_resolution(ctx):
     return "Media Input Resolution", f"Resolution: `{label}`", True
 
 
+#: Discord's cap on the options in one select.
+_SELECT_MAX_OPTIONS = 25
+
+
+def _select_chunks(options):
+    """`options` in the runs Discord renders: 25 to a select, a longer list continuing in
+    another select on the next row."""
+    return [options[i:i + _SELECT_MAX_OPTIONS]
+            for i in range(0, len(options), _SELECT_MAX_OPTIONS)] or [options]
+
+
+#: The Language picker's "send nothing" row. Discord rejects an empty option value, so it
+#: travels as a sentinel, as `_MEDIA_RES_DEFAULT` does.
+_SPEECH_LANGUAGE_AUTO = "__auto__"
+_SPEECH_LANGUAGE_CHOICES = (
+    (("Auto-detect", _SPEECH_LANGUAGE_AUTO, "Send no language: the model detects it from the text."),)
+    + tuple((name, code, code) for code, name in SPEECH_LANGUAGES))
+
+
+def _speech_language_payload(value):
+    return {"speech_language": "" if value == _SPEECH_LANGUAGE_AUTO else value}
+
+
+def _speech_language_name(config) -> str:
+    code = config.get("speech_language") or ""
+    return SPEECH_LANGUAGE_NAMES.get(code, code) if code else "Auto-detect"
+
+
 def _render_speech(ctx):
     config = ctx["config"]
+    speed = config.get("speech_speed")
+    if ctx.get("voice_sample"):
+        sample = "`Set`"
+    elif ctx.get("is_borrowed"):
+        sample = "`None`"
+    else:
+        sample = "`None` · give it one with `/profile voice_sample`"
     return "Speech TTS", (
         f"Enabled: {_flag(config.get('speech_tts_enabled', False))}\n"
-        f"Temperature: `{config.get('speech_temperature', 1.0)}`"
+        f"Temperature (Gemini): `{config.get('speech_temperature', 1.0)}`\n"
+        f"Speed (OpenRouter): `{speed if speed is not None else 'Model default'}`\n"
+        f"Language (Gemini): `{_speech_language_name(config)}`\n"
+        f"Voice sample: {sample}"
     ), True
+
+
+def _render_speech_language(ctx):
+    return "TTS Language", f"Language: `{_speech_language_name(ctx['config'])}`", True
 
 
 
@@ -766,12 +816,6 @@ PROFILE_ACTIONS = (
                                "typed, across all four parts. Part 4 is the slot the training analyser "
                                "writes to, so any generated style guide is overwritten too. The previous "
                                "text is not recoverable.")),
-    _Action("tts_instructions", "persona", "TTS Instructions", "Configure the 'Director's Desk' for vocal performance.",
-            _modal("ProfileDirectorDeskModal", pass_borrowed=False),
-            bulk=_Bulk(_bulk_modal("ProfileDirectorDeskModal", pass_borrowed=False),
-                       scope="personal",
-                       keys=("speech_archetype", "speech_accent", "speech_pacing",
-                             "speech_dynamics", "speech_style"))),
     _Action("edit_appearance", "persona", "Edit Appearance", "Edit the custom Webhook name and avatar.",
             _method("_handle_appearance"), _own),
 
@@ -823,7 +867,7 @@ PROFILE_ACTIONS = (
                             "media_input_resolution": "" if v == _MEDIA_RES_DEFAULT else v},
                         placeholder="Input media resolution..."),
                 note="This is what the model spends reading media **you send it** -- the "
-                     "opposite direction from the image size under Media Options, which is "
+                     "opposite direction from the image size on the Media tab, which is "
                      "about what an image model draws. Google honours it exactly; "
                      "OpenRouter gets the nearest of its two `detail` steps; Ollama has no "
                      "equivalent and ignores it."),
@@ -836,20 +880,8 @@ PROFILE_ACTIONS = (
                        scope="all", label="Set Media Input Resolution",
                        description="Stage the input media resolution.",
                        keys=("media_input_resolution",))),
-    _Action("speech_settings", "params", "Set Speech Settings", "Turn TTS on or off and set its temperature.",
-            _open_screen("speech_settings"), render=_render_speech,
-            screen=_Screen(_Toggle("speech_tts_enabled", "TTS"),
-                           modal="ProfileSpeechSettingsModal", modal_label="Edit temperature…"),
-            bulk=_Bulk(_bulk_modal("ProfileSpeechSettingsModal"), scope="all",
-                       keys=("speech_tts_enabled", "speech_temperature"))),
-    _Action("voice", "params", "Choose TTS Voice", "Pick from the thirty prebuilt Gemini voices.",
-            _method("_act_voice", wants_profile=True),
-            bulk=_Bulk(_bulk_sub("VoiceApplyView"), scope="all", label="Choose TTS Voice",
-                       description="Stage one of the thirty prebuilt voices.",
-                       keys=("speech_voice",))),
-
-    # --- Tools ---
-    _Action("image_toggle", "tools", "Image Generation", "Allow this profile to generate images via !image/!imagine.",
+    # --- Media (what a profile draws and how it sounds; the models stay in Set Models) ---
+    _Action("image_toggle", "media", "Image Generation", "Allow this profile to generate images via !image/!imagine.",
             _open_screen("image_toggle"), render=_render_image_toggle,
             screen=_Screen(_Toggle("image_generation_enabled", "Image Generation"),
                            modal="ProfileImageGenSettingsModal", modal_label="Edit prompt…"),
@@ -858,19 +890,53 @@ PROFILE_ACTIONS = (
                        description="Set up models, prompts, and toggles for multiple profiles.",
                        keys=("image_generation_enabled",),
                        prompt_keys=("image_generation_prompt",))),
-    _Action("image_output", "tools", "Set Image Output",
+    _Action("image_output", "media", "Set Image Output",
             "Set aspect ratio, resolution, quality, thinking level and search grounding.",
             _method("_act_image_output", wants_profile=True),
             bulk=_Bulk(_bulk_sub("ImageOutputApplyView"), scope="all", label="Set Image Output",
                        description="Stage aspect ratio, resolution, quality, thinking level and grounding.",
                        keys=IMAGE_OUTPUT_KEYS)),
-    _Action("image_sampling", "tools", "Set Image Sampling",
+    _Action("image_sampling", "media", "Set Image Sampling",
             "Temperature, Top P and Top K for the image model.",
             _modal("ProfileImageSamplingModal"),
             bulk=_Bulk(_bulk_modal("ProfileImageSamplingModal"), scope="all",
                        label="Set Image Sampling",
                        description="Stage temperature, Top P and Top K for the image slot.",
                        keys=IMAGE_SAMPLING_KEYS)),
+    _Action("speech_settings", "media", "Set Speech Settings",
+            "Turn TTS on or off, and set its temperature and speed.",
+            _open_screen("speech_settings"), render=_render_speech,
+            screen=_Screen(_Toggle("speech_tts_enabled", "TTS"),
+                           modal="ProfileSpeechSettingsModal", modal_label="Edit temperature & speed…"),
+            bulk=_Bulk(_bulk_modal("ProfileSpeechSettingsModal"), scope="all",
+                       keys=("speech_tts_enabled", "speech_temperature", "speech_speed"))),
+    _Action("voice", "media", "Choose TTS Voice", "Pick a voice from the ones its speech model offers.",
+            _method("_act_voice", wants_profile=True),
+            bulk=_Bulk(_bulk_sub("VoiceApplyView"), scope="all", label="Choose TTS Voice",
+                       description="Stage a voice for the TTS model staged in Set Models.",
+                       keys=("speech_voice",), needs=("speech_model",))),
+    _Action("speech_language", "media", "Set TTS Language",
+            "Pin the language a Gemini voice speaks, or let it detect one.",
+            _open_screen("speech_language"), render=_render_speech_language,
+            screen=_Screen(
+                _Choice("speech_language", "Language", _SPEECH_LANGUAGE_CHOICES,
+                        read=lambda c: c.get("speech_language") or _SPEECH_LANGUAGE_AUTO,
+                        to_payload=_speech_language_payload, placeholder="Speech language..."),
+                note="-# Gemini voices only: OpenRouter's speech endpoint takes no language."),
+            bulk=_Bulk(_bulk_choice("Select speech language...", _SPEECH_LANGUAGE_CHOICES,
+                                    to_payload=_speech_language_payload),
+                       scope="all", label="Set TTS Language", keys=("speech_language",),
+                       description="Pin the language Gemini voices speak, or let them detect it.")),
+    # Owner-only, as it was: the Persona tab it moved from is hidden on a borrow, and that
+    # was the only thing keeping a borrower out of it.
+    _Action("tts_instructions", "media", "TTS Instructions", "Configure the 'Director's Desk' for vocal performance.",
+            _modal("ProfileDirectorDeskModal", pass_borrowed=False), _own,
+            bulk=_Bulk(_bulk_modal("ProfileDirectorDeskModal", pass_borrowed=False),
+                       scope="personal",
+                       keys=("speech_archetype", "speech_accent", "speech_pacing",
+                             "speech_dynamics", "speech_style"))),
+
+    # --- Tools ---
     _Action("grounding", "tools", "Grounding (Web Search)", "Choose Off, Native or RAG web search.",
             _open_screen("grounding"), render=_render_grounding,
             # A select, not the old three-way cycle: going Off -> Native -> RAG -> Off
@@ -1249,8 +1315,13 @@ class ProfileManageView(BlockedGuard, ui.View):
         await self._open_media_options(interaction, "voice")
 
     async def _open_media_options(self, interaction: discord.Interaction, mode: str):
+        # Read before the view is built: whether there is a sample decides its rows, and the
+        # record is a file read that belongs off the event loop.
+        sample = (await self.cog.profile_manager.voice_sample_record(self.user_id, self.profile_name)
+                  if mode == "voice" else None)
         view = SingleProfileMediaOptionsView(self.cog, self.original_interaction, self.profile_name,
-                                             mode, is_borrowed=self.is_borrowed, user_id=self.user_id)
+                                             mode, is_borrowed=self.is_borrowed, user_id=self.user_id,
+                                             voice_sample=sample)
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
     async def _act_manage_ltm(self, interaction: discord.Interaction, profile: Dict[str, Any]):
@@ -1508,9 +1579,15 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
                     label=label[:100], value=value,
                     description=description[:100] if description else None,
                     default=(value == current)))
-            add_select(self, options, self._choice_callback(choice),
-                       placeholder=choice.placeholder, row=row)
-            row += 1
+            # A list longer than a select holds -- the speech languages -- continues in a
+            # second select on the next row, each naming its part.
+            chunks = _select_chunks(options)
+            for part, chunk in enumerate(chunks):
+                placeholder = (choice.placeholder if len(chunks) == 1
+                               else f"{choice.placeholder} ({part + 1}/{len(chunks)})")
+                add_select(self, chunk, self._choice_callback(choice),
+                           placeholder=placeholder, row=row)
+                row += 1
 
         for toggle in self.screen.toggles:
             on = toggle.read(config)
@@ -1936,8 +2013,7 @@ class MediaOptionsMixin:
 
     Both settings are fixed enumerations the API validates strictly, and neither
     survives a text box: "16;9" and "Kore " are accepted by a modal and answered by a
-    400 -- which reaches the user as a missing image, or, for TTS, as silence, because
-    `_generate_google_tts` swallows the failure and returns no stream. A dropdown of the
+    400 -- a missing image, or a failed voice line, on every request. A dropdown of the
     values the model actually carries is the only version of this that cannot be typed
     wrong.
 
@@ -1978,38 +2054,46 @@ class MediaOptionsMixin:
         select.callback = callback
         self.add_item(select)
 
+    #: Voices per page for an OpenRouter model, leaving room for the two page controls.
+    _VOICES_PER_PAGE = 23
+
+    def _voice_model(self) -> Optional[str]:
+        """The speech model whose voices the select offers. None offers the Gemini voices,
+        which is what the bulk picker does: its profiles may be on different models."""
+        return None
+
+    def _offered_voices(self) -> Optional[tuple]:
+        """The voices of an OpenRouter speech model, or None for a Google one.
+
+        An OpenRouter model the speech catalogue does not list offers nothing to choose.
+        """
+        model = self._voice_model()
+        if not (isinstance(model, str) and model.startswith("OPENROUTER/")):
+            return None
+        return self.cog.api_service.speech_catalogue.voices(model[len("OPENROUTER/"):]) or ()
+
     def _add_voice_select(self, key: str, row: int):
-        """The voice list, one gender at a time, with the other reachable from inside.
+        """The voices of the model this voice is for, a page at a time.
 
         Paged through an option rather than a pair of buttons because the select has an
         option cap but the view has rows to spare, and it keeps the whole control in one
         component -- the timezone picker settled the same question the same way.
 
-        The gender is Google's own attribute for the voice, published on the Cloud
-        Text-to-Speech side rather than in the Gemini API docs. It is the page break
-        because it is the filter someone casting a character reaches for first; the
-        one-word character narrows it from there.
+        A Gemini model's thirty voices page by gender: Google's own attribute for the voice,
+        published on the Cloud Text-to-Speech side rather than in the Gemini API docs, and
+        the filter someone casting a character reaches for first; the one-word character
+        narrows it from there. An OpenRouter model's voices are whatever it lists, with
+        nothing to group them by, so they page by count -- some models list ninety.
         """
-        current = self._current_value(key) or DEFAULT_SPEECH_VOICE
-        gender, chunk = TTS_VOICE_GROUPS[self.voice_page]
+        offered = self._offered_voices()
+        if offered is None:
+            options, placeholder = self._gemini_voice_options(key)
+        elif offered:
+            options, placeholder = self._listed_voice_options(key, offered)
+        else:
+            return  # Nothing to choose from; the screen says so.
 
-        options = []
-        for page_idx, (other_gender, other) in enumerate(TTS_VOICE_GROUPS):
-            if page_idx == self.voice_page:
-                continue
-            options.append(discord.SelectOption(
-                label=f"Switch to {other_gender.lower()} voices",
-                value=f"__page_{page_idx}", emoji="📑",
-                description=f"{len(other)} voices"))
-
-        for name, character, _gender in chunk:
-            options.append(discord.SelectOption(
-                label=name, value=name, description=character,
-                default=(name == current)))
-
-        select = ui.Select(
-            placeholder=f"Choose a voice ({gender.lower()}, {len(chunk)})...",
-            options=options, row=row)
+        select = ui.Select(placeholder=placeholder, options=options, row=row)
 
         async def callback(interaction: discord.Interaction):
             chosen = select.values[0]
@@ -2023,6 +2107,48 @@ class MediaOptionsMixin:
         select.callback = callback
         self.add_item(select)
 
+    def _gemini_voice_options(self, key: str):
+        """(options, placeholder) for one gender's page of the thirty Gemini voices."""
+        current = self._current_value(key) or DEFAULT_SPEECH_VOICE
+        page = min(self.voice_page, len(TTS_VOICE_GROUPS) - 1)
+        gender, chunk = TTS_VOICE_GROUPS[page]
+
+        options = []
+        for page_idx, (other_gender, other) in enumerate(TTS_VOICE_GROUPS):
+            if page_idx == page:
+                continue
+            options.append(discord.SelectOption(
+                label=f"Switch to {other_gender.lower()} voices",
+                value=f"__page_{page_idx}", emoji="📑",
+                description=f"{len(other)} voices"))
+
+        for name, character, _gender in chunk:
+            options.append(discord.SelectOption(
+                label=name, value=name, description=character,
+                default=(name == current)))
+        return options, f"Choose a voice ({gender.lower()}, {len(chunk)})..."
+
+    def _listed_voice_options(self, key: str, offered: tuple):
+        """(options, placeholder) for one page of the voices an OpenRouter model lists."""
+        per_page = self._VOICES_PER_PAGE
+        pages = (len(offered) - 1) // per_page + 1
+        page = min(self.voice_page, pages - 1)
+        current = self._current_value(key)
+
+        options = []
+        if page > 0:
+            options.append(discord.SelectOption(
+                label="Previous voices", value=f"__page_{page - 1}", emoji="◀️",
+                description=f"Page {page} of {pages}"))
+        if page < pages - 1:
+            options.append(discord.SelectOption(
+                label="More voices", value=f"__page_{page + 1}", emoji="▶️",
+                description=f"Page {page + 2} of {pages}"))
+        for voice in offered[page * per_page:(page + 1) * per_page]:
+            options.append(discord.SelectOption(label=voice[:100], value=voice[:100],
+                                                default=(voice == current)))
+        return options, f"Choose a voice ({len(offered)} on this model)..."
+
 
 class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
     """Image output settings and TTS voice for one profile, written as they are chosen.
@@ -2032,7 +2158,8 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
     """
 
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str,
-                 mode: str, is_borrowed: bool = False, user_id: Optional[int] = None):
+                 mode: str, is_borrowed: bool = False, user_id: Optional[int] = None,
+                 voice_sample: Optional[Dict[str, Any]] = None):
         super().__init__(timeout=300)
         self.cog = cog
         self.original_interaction = interaction
@@ -2041,6 +2168,8 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
         self.is_borrowed = is_borrowed
         self.mode = mode
         self.voice_page = 0
+        #: The profile's voice sample record, read by whoever opened the screen; None for none.
+        self.voice_sample = voice_sample
         self._build_view()
 
     def _profile(self) -> Dict[str, Any]:
@@ -2049,6 +2178,9 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
 
     def _current_value(self, key: str):
         return self._profile().get(key)
+
+    def _voice_model(self) -> Optional[str]:
+        return self._profile().get("speech_model") or DEFAULT_SPEECH_MODEL
 
     def _apply(self, key: str, value: Any):
         data = self._profile()
@@ -2123,14 +2255,39 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
             if not data.get("image_generation_enabled"):
                 lines.append("\n⚠️ Image generation is currently **off** for this profile.")
         else:
-            voice = data.get("speech_voice") or DEFAULT_SPEECH_VOICE
-            described = " · ".join(d for d in (TTS_VOICE_GENDER.get(voice),
-                                               TTS_VOICE_CHARACTER.get(voice)) if d)
-            lines.append(f"**Voice:** `{voice}`" + (f" ({described})" if described else ""))
-            lines.append(f"**Speech model:** `{data.get('speech_model') or DEFAULT_SPEECH_MODEL}`")
-            lines.append("\nVoices are grouped by gender, then described by Google's own "
-                         "one-word character. Everything beyond that — accent, mood, pacing — is "
-                         "the Director's Desk, not the voice.")
+            model = data.get("speech_model") or DEFAULT_SPEECH_MODEL
+            stored = data.get("speech_voice")
+            offered = self._offered_voices()
+            if offered is None:
+                voice = stored or DEFAULT_SPEECH_VOICE
+                described = " · ".join(d for d in (TTS_VOICE_GENDER.get(voice),
+                                                   TTS_VOICE_CHARACTER.get(voice)) if d)
+                lines.append(f"**Voice:** `{voice}`" + (f" ({described})" if described else ""))
+                if voice.lower() not in TTS_VOICE_LOOKUP:
+                    lines.append(f"-# Not a Gemini voice, so `{DEFAULT_SPEECH_VOICE}` speaks instead.")
+                lines.append(f"**Speech model:** `{model}`")
+                lines.append("\nVoices are grouped by gender, then described by Google's own "
+                             "one-word character. Everything beyond that — accent, mood, pacing — is "
+                             "the Director's Desk, not the voice.")
+            else:
+                lines.append(f"**Voice:** `{stored or 'model default'}`")
+                if offered and (stored or "").lower() not in {v.lower() for v in offered}:
+                    lines.append(f"-# Not one this model lists, so `{offered[0]}` speaks instead.")
+                lines.append(f"**Speech model:** `{model}`")
+                note = ("These are the voices this model lists on OpenRouter." if offered else
+                        "This model lists no voices to choose from, so it speaks in its own.")
+                lines.append(f"\n{note} The Director's Desk reaches Google speech models only: "
+                             "an OpenRouter model is sent the reply alone.")
+            if self.voice_sample:
+                model_id = model[len("OPENROUTER/"):] if model.startswith("OPENROUTER/") else None
+                clones = bool(model_id) and self.cog.api_service.speech_catalogue.clones(model_id)
+                lines.append(f"**Voice sample:** `{self.voice_sample.get('filename') or 'recording'}`"
+                             + (" with a transcript" if self.voice_sample.get("transcript") else ""))
+                lines.append("-# This model clones it, so the profile speaks in that voice." if clones else
+                             "-# This model cannot clone a voice, so the voice above is used. Choose "
+                             "a model marked 'clones voices' to hear the sample.")
+            elif self.cog.profile_manager.may_set_voice_sample(self.user_id, self.profile_name):
+                lines.append("-# Give this profile a cloned voice with `/profile voice_sample`.")
             if not data.get("speech_tts_enabled"):
                 lines.append("\n⚠️ TTS is currently **off** for this profile.")
 
@@ -2169,6 +2326,15 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
                                         labels=IMAGE_GROUNDING_LABELS)
         else:
             self._add_voice_select("speech_voice", 0)
+            if self.voice_sample and self.cog.profile_manager.may_set_voice_sample(self.user_id, self.profile_name):
+                add_button(self, "Remove Voice Sample", self._remove_voice_sample,
+                           style=discord.ButtonStyle.danger, row=1)
+
+    async def _remove_voice_sample(self, interaction: discord.Interaction):
+        await self.cog.profile_manager.delete_voice_sample(self.user_id, self.profile_name)
+        self.voice_sample = None
+        self._build_view()
+        await interaction.response.edit_message(**self._render())
 
 
 class ModelPickerMixin(ReportErrorMixin):
@@ -2243,11 +2409,11 @@ class ModelPickerMixin(ReportErrorMixin):
 
     #: Categories whose every slot is in GOOGLE_ONLY_MODEL_KEYS. They pin the API
     #: switch to Google rather than letting a stale mode sit behind a disabled button.
-    #: Grounding joins TTS here: it attaches the native `google_search` tool, so an
-    #: OpenRouter id in that slot was never honoured -- it resolved to the Google default
-    #: at call time, which read as the picker having accepted the choice. Image left when
-    #: OpenRouter's Image API got an adapter; its OpenRouter tab browses the image catalogue.
-    _GOOGLE_ONLY_CATEGORIES = ("tts", "grounding")
+    #: Grounding attaches the native `google_search` tool, so an OpenRouter id in that slot
+    #: was never honoured -- it resolved to the Google default at call time, which read as
+    #: the picker having accepted the choice. Image and TTS left when OpenRouter's image and
+    #: speech endpoints got adapters; their OpenRouter tabs browse catalogues of their own.
+    _GOOGLE_ONLY_CATEGORIES = ("grounding",)
 
     @classmethod
     def display_model(cls, value) -> str:
@@ -2281,9 +2447,9 @@ class ModelPickerMixin(ReportErrorMixin):
 
         async def callback(interaction: discord.Interaction):
             chosen = select.values[0]
-            # Image models browse a catalogue of their own, so a browse key and pages from
-            # the text catalogue mean nothing on the other side of the switch.
-            if (chosen == "image") != (self.category == "image"):
+            # Image and speech models browse catalogues of their own, so a browse key and
+            # pages from one catalogue mean nothing on the other side of the switch.
+            if self._OWN_CATALOGUES.get(chosen) != self._OWN_CATALOGUES.get(self.category):
                 self.or_browse = BROWSE_POPULAR
                 self.or_browse_page = 0
                 self.or_model_page = 0
@@ -2350,15 +2516,23 @@ class ModelPickerMixin(ReportErrorMixin):
     _IMAGE_BROWSE_GENERAL = (
         (BROWSE_POPULAR, "Most Popular", "OpenRouter's own ranking of image models."),
     )
+    #: The TTS category's, for the same reasons: speech calls are not counted either, and a
+    #: per-character price does not rank against a per-token one.
+    _SPEECH_BROWSE_GENERAL = (
+        (BROWSE_POPULAR, "Most Popular", "OpenRouter's own ranking of speech models."),
+    )
+    #: Categories whose OpenRouter tab browses a catalogue other than the text one, by the
+    #: APIService attribute holding it.
+    _OWN_CATALOGUES = {"image": "image_catalogue", "tts": "speech_catalogue"}
 
     def _openrouter_catalogue(self):
-        """What this picker's OpenRouter tab browses: the image catalogue for the image
-        category, the text one for every other. Both answer the same browsing calls."""
-        service = self.cog.api_service
-        return service.image_catalogue if self.category == "image" else service.catalogue
+        """What this picker's OpenRouter tab browses: the image or speech catalogue for those
+        categories, the text one for every other. All three answer the same browsing calls."""
+        return getattr(self.cog.api_service, self._OWN_CATALOGUES.get(self.category, "catalogue"))
 
     def _browse_general(self):
-        return self._IMAGE_BROWSE_GENERAL if self.category == "image" else self._BROWSE_GENERAL
+        return {"image": self._IMAGE_BROWSE_GENERAL,
+                "tts": self._SPEECH_BROWSE_GENERAL}.get(self.category, self._BROWSE_GENERAL)
 
     def _openrouter_browse(self) -> str:
         return getattr(self, "or_browse", BROWSE_POPULAR)
@@ -3605,17 +3779,34 @@ class ImageOutputApplyView(_MediaOptionsApplyView):
 
 
 class VoiceApplyView(_MediaOptionsApplyView):
+    """Stages a voice for the TTS model staged beside it.
+
+    Offered only once Set Models has staged a speech model (`_Bulk.needs`): voices differ
+    per model, and profiles selected together may be on different ones, so the voice list
+    is the one model the changeset is about to put them all on.
+    """
+
     ACTION = "voice"
     TITLE = "Choose TTS Voice"
 
+    def _voice_model(self) -> Optional[str]:
+        return self.session.config.get("speech_model")
+
     def embed(self) -> discord.Embed:
         chosen = self.staged.get("speech_voice")
+        offered = self._offered_voices()
+        if offered is None:
+            about = ("Its thirty prebuilt voices, grouped by gender and described by Google's "
+                     "own one-word character.")
+        elif offered:
+            about = "The voices this model lists on OpenRouter."
+        else:
+            about = "This model lists no voices to choose from, so it speaks in its own."
         e = discord.Embed(
             title=self.TITLE, colour=discord.Colour.blurple(),
-            description=("One of the thirty prebuilt Gemini voices, grouped by gender and "
-                         "described by Google's own one-word character.\n\nThe voice is the "
-                         "instrument; accent, mood and pacing come from the Director's Desk, "
-                         "which is a separate row."))
+            description=(f"Voices for `{self._voice_model()}`, the TTS model staged in Set "
+                         f"Models. {about}\n\nThe voice is the instrument; accent, mood and "
+                         "pacing come from the Director's Desk, which is a separate row."))
         described = " · ".join(d for d in (TTS_VOICE_GENDER.get(chosen),
                                            TTS_VOICE_CHARACTER.get(chosen)) if d)
         e.add_field(name="Voice",
@@ -3629,6 +3820,85 @@ class VoiceApplyView(_MediaOptionsApplyView):
         self.clear_items()
         self._add_voice_select("speech_voice", 0)
         self._stage_row(1, "Stage Voice")
+
+
+class VoiceSampleConsentView(BlockedGuard, ui.View):
+    """The one step between a voice sample being uploaded and being kept.
+
+    A cloned voice can put words in a real person's mouth, so the upload is not stored until
+    its owner says the voice is theirs or theirs to use, and that is stored with it.
+    Everything checkable about the file was checked by `/profile voice_sample` first.
+    """
+
+    def __init__(self, cog: 'MimicCog', user_id: int, profile_name: str, sample: discord.Attachment,
+                 mime_type: str, transcript: Optional[str]):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.user_id = user_id
+        self.profile_name = profile_name
+        self.sample = sample
+        self.mime_type = mime_type
+        self.transcript = transcript
+        #: What happened, once something has; the screen then says only that.
+        self.outcome: Optional[str] = None
+        self._build_view()
+
+    def embed(self) -> discord.Embed:
+        if self.outcome:
+            return discord.Embed(title="Voice Sample", description=self.outcome,
+                                 colour=discord.Colour.blurple())
+        catalogue = self.cog.api_service.speech_catalogue
+        cloning = [catalogue.label(m) for m in catalogue.cloning_models()]
+        e = discord.Embed(
+            title=f"Give {self.profile_name} a cloned voice?", colour=discord.Colour.orange(),
+            description=("Only continue if this is **your own voice**, or you have the speaker's "
+                         "permission to clone it.\n\nThe recording is stored encrypted with this "
+                         "profile and sent to the speech model whenever the profile speaks on a "
+                         "model that can clone voices. Anyone who borrows this profile speaks "
+                         "with it too. Remove it any time from Choose TTS Voice."))
+        e.add_field(name="Recording",
+                    value=f"`{self.sample.filename}` · {self.sample.size / 1048576:.1f} MB", inline=True)
+        e.add_field(name="Transcript", value="Provided" if self.transcript else "None", inline=True)
+        e.add_field(name="Models that clone voices",
+                    value=(", ".join(cloning) or "None listed right now")[:1024], inline=False)
+        return e
+
+    def _build_view(self):
+        self.clear_items()
+        if self.outcome:
+            return
+        add_button(self, "It's my voice, or I have permission", self._confirm,
+                   style=discord.ButtonStyle.success, row=0)
+        add_button(self, "Cancel", self._cancel, style=discord.ButtonStyle.secondary, row=0)
+
+    async def _finish(self, interaction: discord.Interaction, outcome: str):
+        self.outcome = outcome
+        self._build_view()
+        self.stop()
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=self.embed(), view=self)
+        else:
+            await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def _confirm(self, interaction: discord.Interaction):
+        # Deferred: reading the upload back from Discord can outlast the three seconds an
+        # interaction has to be answered in.
+        await interaction.response.defer()
+        try:
+            audio = await self.sample.read()
+        except discord.HTTPException:
+            await self._finish(interaction, "The recording could not be read back from Discord, "
+                                            "so nothing was saved. Upload it again.")
+            return
+        saved = await self.cog.profile_manager.save_voice_sample(
+            self.user_id, self.profile_name, audio, mime_type=self.mime_type,
+            filename=self.sample.filename, transcript=self.transcript)
+        await self._finish(interaction, (
+            f"Saved. **{self.profile_name}** now speaks with this voice on models that clone voices."
+            if saved else VOICE_SAMPLE_NOT_OWN))
+
+    async def _cancel(self, interaction: discord.Interaction):
+        await self._finish(interaction, "Nothing was saved.")
 
 
 class _BulkSession:
@@ -4541,12 +4811,16 @@ class BulkManageView(BaseBulkProfileView):
         return (action.bulk is not None
                 and (action.bulk.scope == "all" or self.session.scope == "personal"))
 
+    def _offered(self, action) -> bool:
+        """Allowed, and everything the row is chosen against (`_Bulk.needs`) already staged."""
+        return self._allowed(action) and all(self.session.config.get(k) for k in action.bulk.needs)
+
     def _tabs(self):
         return [t for t in PROFILE_TABS
-                if any(a.tab == t and self._allowed(a) for a in PROFILE_ACTIONS)]
+                if any(a.tab == t and self._offered(a) for a in PROFILE_ACTIONS)]
 
     def _actions_for_tab(self, tab):
-        return [a for a in PROFILE_ACTIONS if a.tab == tab and self._allowed(a)]
+        return [a for a in PROFILE_ACTIONS if a.tab == tab and self._offered(a)]
 
     # --- Anchor (copy one profile's setup onto the rest) --------------------
 
@@ -4882,13 +5156,23 @@ class BulkManageView(BaseBulkProfileView):
                    row=2)
         self._add_cancel(2)
 
-    def _add_tab_row(self, tabs, row: int = 1):
-        """The wizard's own tab strip: Inherit and Actions both draw it."""
-        for tab in tabs:
-            add_button(self, tab.title(), self._pick_tab(tab), row=row,
+    def _add_tab_row(self, tabs, row: int = 1) -> int:
+        """The wizard's own tab strip: Inherit and Actions both draw it. Returns the first
+        row below it.
+
+        Five buttons fit a row, and there are six tabs. Pinned to one row, a sixth raises
+        "item would not fit" and the wizard cannot open, so they wrap as ProfileManageView's
+        do, split evenly.
+        """
+        if not tabs:
+            return row
+        per_row = len(tabs) if len(tabs) <= 5 else (len(tabs) + 1) // 2
+        for position, tab in enumerate(tabs):
+            add_button(self, tab.title(), self._pick_tab(tab), row=row + position // per_row,
                        disabled=(tab == self.current_tab),
                        style=(discord.ButtonStyle.primary if tab == self.current_tab
                               else discord.ButtonStyle.secondary))
+        return row + (len(tabs) + per_row - 1) // per_row
 
     def _build_inherit_step(self):
         tabs = self._inherit_tabs()
@@ -4911,13 +5195,13 @@ class BulkManageView(BaseBulkProfileView):
                        placeholder=f"Choose {self.current_tab.title()} settings to inherit…",
                        min_values=0, max_values=len(options), row=0)
 
-        self._add_tab_row(tabs)
+        nav_row = self._add_tab_row(tabs)
 
         add_button(self, "◀ Anchor", self._nav("anchor"), style=discord.ButtonStyle.secondary,
-                   row=2)
+                   row=nav_row)
         add_button(self, f"Copy Selected ({len(self._inherit_picks)}) ▶", self._copy_callback,
-                   style=discord.ButtonStyle.primary, row=2, disabled=not self._inherit_picks)
-        self._add_cancel(2)
+                   style=discord.ButtonStyle.primary, row=nav_row, disabled=not self._inherit_picks)
+        self._add_cancel(nav_row)
 
     def _build_actions_step(self):
         tabs = self._tabs()
@@ -4940,25 +5224,30 @@ class BulkManageView(BaseBulkProfileView):
             add_select(self, options, self._action_callback,
                        placeholder=f"Choose a {self.current_tab.title()} action…", row=0)
 
-        self._add_tab_row(tabs)
+        nav_row = self._add_tab_row(tabs)
 
         add_button(self, "◀ Profiles", self._nav("targets"), style=discord.ButtonStyle.secondary,
-                   row=2)
+                   row=nav_row)
         if self.session.has_changes:
             add_button(self, "Clear Staged", self._nav("actions", clear_changes=True),
-                       style=discord.ButtonStyle.secondary, row=2)
+                       style=discord.ButtonStyle.secondary, row=nav_row)
         add_button(self, f"Review & Apply ({len(self.session.staged)})", self._nav("review"),
-                   style=discord.ButtonStyle.success, row=2, disabled=not self.session.has_changes)
-        self._add_cancel(2)
+                   style=discord.ButtonStyle.success, row=nav_row, disabled=not self.session.has_changes)
+        self._add_cancel(nav_row)
 
     def _build_choice_step(self):
         for option in self._choice["options"]:
             option.default = (option.value == self._choice["chosen"])
-        add_select(self, self._choice["options"], self._choice_callback,
-                   placeholder=self._choice["placeholder"], row=0)
+        # 25 options to a select, as on a single profile's own screen.
+        chunks = _select_chunks(self._choice["options"])
+        for part, chunk in enumerate(chunks):
+            placeholder = self._choice["placeholder"]
+            if len(chunks) > 1:
+                placeholder = f"{placeholder} ({part + 1}/{len(chunks)})"
+            add_select(self, chunk, self._choice_callback, placeholder=placeholder, row=part)
         add_button(self, "◀ Back", self._nav("actions"), style=discord.ButtonStyle.secondary,
-                   row=1)
-        self._add_cancel(1)
+                   row=len(chunks))
+        self._add_cancel(len(chunks))
 
     def _build_review_step(self):
         destructive = bool(self._warnings())
@@ -5023,7 +5312,7 @@ class BulkManageView(BaseBulkProfileView):
 
     async def _action_callback(self, interaction: discord.Interaction):
         action = PROFILE_ACTIONS_BY_VALUE.get(interaction.data['values'][0])
-        if action is None or not self._allowed(action):
+        if action is None or not self._offered(action):
             await self.refresh(interaction)
             return
         if action.bulk.terminal and self.session.has_changes:

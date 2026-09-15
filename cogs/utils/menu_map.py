@@ -26,9 +26,10 @@ _CACHED_MAP: Optional[str] = None
 # Wording for the `/profile manage` tab buttons, keyed by the tab ids in PROFILE_TABS.
 _TAB_TITLES = {
     "home": "Home (profile-level operations)",
-    "persona": "Persona (identity and voice)",
+    "persona": "Persona (identity)",
     "params": "Params (model and sampling)",
     "tools": "Tools (external systems and per-turn behaviour)",
+    "media": "Media (image generation and voice)",
     "memory": "Memory (long-term memory and training examples)",
 }
 

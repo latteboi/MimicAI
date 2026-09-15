@@ -320,16 +320,16 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
         has_explicit_prefix = any(value.startswith(p) for p in system_prefixes)
 
         # The dropdown pins these slots to Google, but rule 1 above would still honour a
-        # typed 'OPENROUTER/' here -- and speech and grounding both construct a Google
-        # client directly, so the id would reach the Google API verbatim and 404.
-        # Refused rather than rewritten: 'OPENROUTER/x-ai/grok-4' has no Google meaning,
-        # and silently saving 'GOOGLE/x-ai/grok-4' would only move the 404 later.
+        # typed 'OPENROUTER/' here -- and grounding constructs a Google client directly,
+        # so the id would reach the Google API verbatim and 404. Refused rather than
+        # rewritten: 'OPENROUTER/x-ai/grok-4' has no Google meaning, and silently saving
+        # 'GOOGLE/x-ai/grok-4' would only move the 404 later.
         if self.target_config_key in GOOGLE_ONLY_MODEL_KEYS:
             if has_explicit_prefix and not value.startswith("GOOGLE/"):
                 await interaction.response.send_message(
-                    f"`{self.target_config_key}` only accepts Google models — speech and "
-                    "grounding have no OpenRouter or Ollama path in the adapters. Enter the "
-                    "model id without a provider prefix.",
+                    f"`{self.target_config_key}` only accepts Google models — grounding has "
+                    "no OpenRouter or Ollama path in the adapters. Enter the model id without "
+                    "a provider prefix.",
                     ephemeral=True)
                 return
             if not has_explicit_prefix:
@@ -346,8 +346,10 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
             value = prefix + value
 
         is_image_slot = self.target_config_key in IMAGE_MODEL_KEYS
-        if value.startswith("OLLAMA/") and is_image_slot:
-            await interaction.response.send_message(IMAGE_MODEL_NO_OLLAMA, ephemeral=True)
+        is_speech_slot = self.target_config_key in AUDIO_MODEL_KEYS
+        if value.startswith("OLLAMA/") and (is_image_slot or is_speech_slot):
+            await interaction.response.send_message(
+                IMAGE_MODEL_NO_OLLAMA if is_image_slot else SPEECH_MODEL_NO_OLLAMA, ephemeral=True)
             return
 
         # A typed prefix reaches Ollama as surely as the API switch does.
@@ -359,16 +361,20 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
         if value.startswith("OPENROUTER/"):
             model_id = value[len("OPENROUTER/"):]
             api_service = self.parent_view.cog.api_service
-            catalogue = api_service.image_catalogue if is_image_slot else api_service.catalogue
-            # An image slot answers to the image catalogue: a text model there would reach the
-            # Image API and 400, and one the catalogue left out was left out on purpose.
-            # Judged once the catalogue has loaded, not on a fresh install before its sync.
-            if is_image_slot and catalogue.models and model_id not in catalogue.models:
-                await interaction.response.send_message(OPENROUTER_NOT_IMAGE_MODEL, ephemeral=True)
+            catalogue = (api_service.image_catalogue if is_image_slot
+                         else api_service.speech_catalogue if is_speech_slot
+                         else api_service.catalogue)
+            # An image or speech slot answers to its own catalogue: a text model there would
+            # reach an endpoint that 400s it, and one the catalogue left out was left out on
+            # purpose. Judged once the catalogue has loaded, not on a fresh install before its sync.
+            if (is_image_slot or is_speech_slot) and catalogue.models and model_id not in catalogue.models:
+                await interaction.response.send_message(
+                    OPENROUTER_NOT_IMAGE_MODEL if is_image_slot else OPENROUTER_NOT_SPEECH_MODEL,
+                    ephemeral=True)
                 return
             # A text slot is held to its list the same way: a model that also makes images or
             # audio is left out of it, since the chat adapter asks for text alone.
-            if not is_image_slot and not catalogue.outputs_text_only(model_id):
+            if not (is_image_slot or is_speech_slot) and not catalogue.outputs_text_only(model_id):
                 await interaction.response.send_message(OPENROUTER_NOT_TEXT_MODEL, ephemeral=True)
                 return
             # A typed id is held to the list the dropdown offers -- see may_pick_training_models.

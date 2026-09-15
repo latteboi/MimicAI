@@ -130,7 +130,9 @@ class DataPolicyView(BlockedGuard, ui.View):
         # proved the settings filter -- see api/openrouter_image_catalogue.
         images_shown, images_total, _checked = self.cog.api_service.image_catalogue.training_status()
         images = f"\nImage models: **{images_shown}** of {images_total}." if images_total else ""
-        return f"**{shown}** of {total}. {how}{images}"[:1024]
+        speech_shown, speech_total, _checked = self.cog.api_service.speech_catalogue.training_status()
+        speech = f"\nSpeech models: **{speech_shown}** of {speech_total}." if speech_total else ""
+        return f"**{shown}** of {total}. {how}{images}{speech}"[:1024]
 
     def _build(self):
         self.clear_items()

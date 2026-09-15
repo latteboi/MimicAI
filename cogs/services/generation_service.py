@@ -15,6 +15,7 @@ from ..utils.constants import (
     ERR_GENERAL_ERROR, ERR_REASON_EMPTY_RESPONSE, ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK,
     WHISPER_BUSY_WAIT_TIMEOUT_SECONDS,
     WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED, WARN_VOICE_SYNTHESIS_FAILED,
+    ERR_REASON_AUDIO_TOO_LARGE, ERR_REASON_AUDIO_NOT_UPLOADED,
     DEFAULT_KICKSTART_START, DEFAULT_KICKSTART_CONTINUE, DEFAULT_KICKSTART_IDLE,
     DEFAULT_WHISPER_RECAP, DEFAULT_DIRECTOR_USER_PROMPT,
     DEFAULT_IMAGE_GROUNDING, DEFAULT_IMAGE_PRESENT,
@@ -34,6 +35,7 @@ from ..utils.helpers import (
     resolve_thinking_params,
     resolve_typing_cursor,
 )
+from ..utils.attachment_limits import over_attachment_limit, skipped_attachment_note
 from ..utils import mem_probe
 from ..managers.session_manager import intern_turn
 
@@ -356,6 +358,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
         session['is_running'] = False
         recent_processed_ids = collections.deque(maxlen=20)
+        #: Speech files synthesised and not yet removed. A turn removes its own once it has
+        #: been delivered; the round's `finally` sweeps what a turn that raised left behind.
+        round_audio_paths = []
         
         while True:
             try:
@@ -1603,6 +1608,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                     # [NEW] Unified Synthesis Logic
                     audio_file_for_send = None
+                    turn_audio_path = None
+                    #: The messages meant to carry this turn's audio, to tell afterwards
+                    #: whether Discord took it.
+                    audio_carriers = []
                     
                     if profile_settings.get("speech_tts_enabled", False) and session.get("audio_mode", "off") == "on":
                         s_voice = profile_settings.get("speech_voice", DEFAULT_SPEECH_VOICE)
@@ -1659,22 +1668,48 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             if state_container:
                                 state_container['phase_label'] = "Synthesising speech"
                             try:
-                                turn_audio_stream = await self.cog.media_service._generate_google_tts(
-                                    tts_priming_prompt,
+                                turn_audio_path = await self.cog.media_service.synthesise_speech(
+                                    response_text,
                                     channel.guild.id,
+                                    directed_prompt=tts_priming_prompt,
+                                    voice_sample_of=(owner_id, profile_name),
+                                    user_id=triggering_user_id,
+                                    config_owner_id=owner_id,
                                     model_id=s_model,
                                     voice_name=s_voice,
                                     temperature=s_temp,
+                                    speed=profile_settings.get("speech_speed"),
+                                    language_code=profile_settings.get("speech_language") or None,
                                     fallback_model_id=profile_settings.get("speech_fallback_model"),
+                                    # Audio past it is paid for and then refused, so a model
+                                    # billed by the second is capped here, not only checked below.
+                                    max_bytes=channel.guild.filesize_limit,
                                 )
+                                round_audio_paths.append(turn_audio_path)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as e:
+                                tts_reason = _format_api_error(e)
+                                print(f"Text-to-speech failed for '{profile_name}': {tts_reason}")
+                                turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(reason=tts_reason))
                             finally:
                                 if state_container:
                                     state_container['phase_label'] = "Sending"
-                            
-                            if turn_audio_stream:
-                                audio_file_for_send = discord.File(turn_audio_stream, filename=f"voice_{turn_id[:4]}.wav")
-                            else:
-                                turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(reason="API Error or Unknown"))
+
+                            if turn_audio_path:
+                                # Checked before sending, so a file over the limit is never
+                                # uploaded only to be refused.
+                                audio_size = os.path.getsize(turn_audio_path)
+                                upload_limit = channel.guild.filesize_limit
+                                if audio_size > upload_limit:
+                                    turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(
+                                        reason=ERR_REASON_AUDIO_TOO_LARGE.format(
+                                            size=f"{audio_size / 1048576:.1f}",
+                                            limit=f"{upload_limit / 1048576:.0f}")))
+                                else:
+                                    audio_file_for_send = discord.File(
+                                        turn_audio_path,
+                                        filename=f"voice_{turn_id[:4]}{os.path.splitext(turn_audio_path)[1]}")
 
                     file_to_send = None
                     extra_audio_file = None
@@ -1757,10 +1792,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     "path": generated_image_path_for_round
                                 }
                             elif audio_file_for_send:
-                                turn_audio_stream.seek(0)
                                 attachment_data = {
-                                    "filename": f"voice_{turn_id[:4]}.wav",
-                                    "data": turn_audio_stream.read()
+                                    "filename": audio_file_for_send.filename,
+                                    "path": turn_audio_path
                                 }
                             if attachment_data:
                                 payload["attachment"] = attachment_data
@@ -1774,6 +1808,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                         # Direct in-process execution (replaces 45-second queue wait)
                         sent_child_messages = await self.cog.child_bot_manager.execute_send(participant['bot_id'], payload)
+                        if audio_file_for_send and not extra_audio_file:
+                            audio_carriers.extend(sent_child_messages or [])
                         
                         if sent_child_messages:
                             session['last_bot_message_id'] = sent_child_messages[-1].id
@@ -1792,12 +1828,15 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                         turn_object.setdefault("message_ids", []).append(sm.id)
 
                         # Dispatch extra audio attachment directly
-                        if extra_audio_file and 'turn_audio_stream' in locals() and turn_audio_stream:
-                            turn_audio_stream.seek(0)
+                        if extra_audio_file:
+                            # A path, as the image goes: execute_send opens its own handle, so
+                            # the one opened for the webhook branch is released here.
+                            extra_audio_file.close()
                             a_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
                                 "channel_id": channel.id, "content": "", "realistic_typing": False,
-                                "attachment": {"filename": f"voice_{turn_id[:4]}.wav", "data": turn_audio_stream.read()}
+                                "attachment": {"filename": extra_audio_file.filename, "path": turn_audio_path}
                             })
+                            audio_carriers.extend(a_msgs or [])
                             if a_msgs:
                                 for sm in a_msgs:
                                     turn_object.setdefault("message_ids", []).append(sm.id)
@@ -1828,6 +1867,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name,
                             file=file_to_send, reply_to=(anchor_message if i == 0 else None)
                         )
+                        if audio_file_for_send and not extra_audio_file:
+                            audio_carriers.extend(sent_messages)
                         
                         if sources_text_list:
                             for source_msg in sources_text_list:
@@ -1847,6 +1888,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name,
                                 bypass_typing=True
                             )
+                            audio_carriers.extend(a_msgs)
                             if a_msgs: sent_messages.extend(a_msgs)
 
                         if thought_file_to_send:
@@ -1880,7 +1922,22 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         state_container['msg_a_id'] = None
                         state_container['msg_b_id'] = None
                         
+                    # The text posted and the audio did not: Discord refused the file after all,
+                    # and the send went on without it rather than lose the reply.
+                    if audio_file_for_send and turn_object.get("message_ids") and not any(
+                            m.attachments for m in audio_carriers):
+                        turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(reason=ERR_REASON_AUDIO_NOT_UPLOADED))
+
                     await self._dispatch_warnings(channel, participant.get('method', 'webhook'), participant.get('bot_id'), turn_warnings, owner_id, profile_name, session, turn_object)
+
+                    # Delivered or lost by now, and nothing reads the file again.
+                    if turn_audio_path:
+                        for audio_file in (audio_file_for_send, extra_audio_file):
+                            if audio_file:
+                                audio_file.close()
+                        try: os.remove(turn_audio_path)
+                        except OSError: pass
+                        round_audio_paths.remove(turn_audio_path)
                     
                     # [FIXED] Turn cleanup: release turn-specific buffers without purging the round's generated image
                     if 'contents_for_api_call' in locals():
@@ -1977,11 +2034,19 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     
                                     batch_msg_media = []
                                     message_attachments = [a for a in trigger.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))]
+                                    skipped_notes = []
                                     for attachment in message_attachments:
+                                        if over_attachment_limit(attachment):
+                                            skipped_notes.append(skipped_attachment_note(attachment))
+                                            continue
                                         try:
                                             batch_msg_media.append({"url": attachment.url, "mime_type": attachment.content_type})
                                         except Exception as e:
                                             print(f"Failed to process batched media attachment {attachment.filename}: {e}")
+                                    if skipped_notes:
+                                        # Said in the turn, as on the single-turn path in triggers.py.
+                                        content = f"{' '.join(skipped_notes)}\n{content}"
+                                        user_line = _format_history_entry(author_name, trigger.created_at, content, batch_tz, entity_id=batch_hash)
 
                                     if trigger.author.id in self.cog.debug_users:
                                         try:
@@ -2131,6 +2196,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             finally:
                 # Round has concluded, AI is no longer active
                 session['is_running'] = False
+                # Speech files a turn made but never reached its own cleanup for: a delivery
+                # that raised. Each is a whole reply as WAV, so /tmp would fill with them.
+                for audio_path in round_audio_paths:
+                    try: os.remove(audio_path)
+                    except OSError: pass
+                round_audio_paths.clear()
                 # Nothing this round published is in flight any more. The per-participant
                 # release below the delivery step handles the normal path; this catches
                 # the cancelled and errored ones, which leave the loop without reaching it.

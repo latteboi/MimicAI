@@ -38,11 +38,12 @@ from ..utils.constants import (
     CONTENT_RATING_CAPABILITIES, CONTENT_CAPABILITY_DENIALS,
     CONTENT_RATING_EMOJI,
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
-    IMAGE_GROUNDING_LABELS, )
+    NEW_PROFILE_SPEECH_TEMPERATURE, SPEECH_LANGUAGE_NAMES,
+    IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_AUDIO_FILE, VOICE_SAMPLE_RECORD_FILE, )
 from ..utils.helpers import (image_rag_enabled, is_real_model, resolve_critic_settings,
                             resolve_grounding_mode, resolve_image_output_params,
                             resolve_image_tools, resolve_url_mode, suppress_link_previews)
-from ..utils.http_client import get_shared_client
+from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
 
@@ -1548,6 +1549,120 @@ class ProfileManager:
 
         return user_id, profile_name
 
+    # --- Voice samples -------------------------------------------------------------------
+
+    def _voice_sample_dir(self, user_id: int, profile_name: str) -> Optional[str]:
+        """The profile directory holding the voice sample this profile speaks with, or None.
+
+        A borrow speaks with its source's, found through `original_pid` -- the name it
+        carries is a snapshot. A personal or System profile has its own.
+        """
+        index = self._get_user_index(user_id)
+        if profile_name in index.get("borrowed", []):
+            config = self._get_profile_config(user_id, profile_name, True) or {}
+            owner = config.get("original_owner_id")
+            pid = config.get("original_pid") or config.get("original_profile_id")
+            if not owner or not pid or pid == _UNKNOWN_SOURCE_PID:
+                return None
+            return os.path.join(USERS_DIR, str(owner), "profiles", pid)
+        pid = self._get_pid_from_name(user_id, profile_name)
+        if pid is None:
+            return None
+        owner = user_id if profile_name in index.get("personal", []) else int(defaultConfig.DISCORD_OWNER_ID)
+        return os.path.join(USERS_DIR, str(owner), "profiles", pid)
+
+    def may_set_voice_sample(self, user_id: int, profile_name: str) -> bool:
+        """Only a profile's owner gives it a voice: a personal profile, or a System one for the bot owner."""
+        index = self._get_user_index(user_id)
+        if profile_name in index.get("personal", []):
+            return True
+        return (profile_name not in index.get("borrowed", [])
+                and profile_name in self._system_index()
+                and str(user_id) == str(defaultConfig.DISCORD_OWNER_ID))
+
+    async def _has_voice_sample(self, user_id: int, profile_name: str) -> bool:
+        """Whether this profile speaks with a voice sample, from a stat of its record."""
+        p_dir = self._voice_sample_dir(user_id, profile_name)
+        return bool(p_dir) and await asyncio.to_thread(
+            os.path.exists, os.path.join(p_dir, VOICE_SAMPLE_RECORD_FILE))
+
+    async def voice_sample_record(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
+        """What this profile's voice sample is and who vouched for it, or None."""
+        p_dir = self._voice_sample_dir(user_id, profile_name)
+        if not p_dir:
+            return None
+        return await asyncio.to_thread(
+            IOManager.read_json_gzip, os.path.join(p_dir, VOICE_SAMPLE_RECORD_FILE), self.cog.fernet)
+
+    async def save_voice_sample(self, user_id: int, profile_name: str, audio: bytes, *,
+                                mime_type: str, filename: str, transcript: Optional[str]) -> bool:
+        """Stores a voice sample with the consent given for it; False if it is not the user's to give."""
+        if not self.may_set_voice_sample(user_id, profile_name):
+            return False
+        p_dir = self._voice_sample_dir(user_id, profile_name)
+        if not p_dir:
+            return False
+        record = {"mime_type": mime_type, "filename": filename, "size": len(audio),
+                  "transcript": (transcript or "").strip(),
+                  # Who said the voice is theirs, or theirs to use, and when.
+                  "consented_by": user_id, "consented_at": int(time.time())}
+        fernet = self.cog.fernet
+
+        def _write():
+            # The audio first: a crash between the two orphans a file, never a record that
+            # names nothing.
+            IOManager.write_blob(audio, os.path.join(p_dir, VOICE_SAMPLE_AUDIO_FILE), fernet)
+            IOManager.write_json_gzip(record, os.path.join(p_dir, VOICE_SAMPLE_RECORD_FILE), fernet)
+
+        await asyncio.to_thread(_write)
+        return True
+
+    async def delete_voice_sample(self, user_id: int, profile_name: str) -> bool:
+        if not self.may_set_voice_sample(user_id, profile_name):
+            return False
+        p_dir = self._voice_sample_dir(user_id, profile_name)
+        if not p_dir:
+            return False
+
+        def _delete():
+            # The record first, for the reason the audio is written first.
+            for name in (VOICE_SAMPLE_RECORD_FILE, VOICE_SAMPLE_AUDIO_FILE):
+                try:
+                    os.remove(os.path.join(p_dir, name))
+                except FileNotFoundError:
+                    pass
+
+        await asyncio.to_thread(_delete)
+        return True
+
+    async def materialise_voice_sample(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
+        """This profile's voice sample decrypted to a temp file the caller removes, or None.
+
+        `{"path", "mime_type", "transcript"}`, the shape the OpenRouter speech adapter sends.
+        Decrypted per request rather than kept: the plaintext of someone's voice sits in the
+        temp directory only while one request takes.
+        """
+        p_dir = self._voice_sample_dir(user_id, profile_name)
+        if not p_dir:
+            return None
+        fernet = self.cog.fernet
+
+        def _load():
+            import tempfile
+            record = IOManager.read_json_gzip(os.path.join(p_dir, VOICE_SAMPLE_RECORD_FILE), fernet)
+            if not record:
+                return None
+            audio = IOManager.read_blob(os.path.join(p_dir, VOICE_SAMPLE_AUDIO_FILE), fernet)
+            if not audio:
+                return None
+            fd, path = tempfile.mkstemp(suffix=".voice")
+            with os.fdopen(fd, "wb") as f:
+                f.write(audio)
+            return {"path": path, "mime_type": record.get("mime_type") or "audio/wav",
+                    "transcript": record.get("transcript") or ""}
+
+        return await asyncio.to_thread(_load)
+
     def _get_user_appearance(self, owner_id: int, profile_name: str) -> Dict[str, Optional[str]]:
         eff_owner_id, eff_name = self._resolve_effective_profile(owner_id, profile_name)
         owner_id_str = str(eff_owner_id)
@@ -1642,7 +1757,7 @@ class ProfileManager:
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
                 "thinking_level": "low", "thinking_budget": -1,
                 "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": DEFAULT_SPEECH_VOICE,
-                "speech_model": DEFAULT_SPEECH_MODEL, "speech_temperature": 1.0,
+                "speech_model": DEFAULT_SPEECH_MODEL, "speech_temperature": NEW_PROFILE_SPEECH_TEMPERATURE,
                 "neuro_engine_enabled": False, "neuro_state": {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20},
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }
@@ -1710,7 +1825,7 @@ class ProfileManager:
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
                 "thinking_level": "low", "thinking_budget": -1,
                 "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": DEFAULT_SPEECH_VOICE,
-                "speech_model": DEFAULT_SPEECH_MODEL, "speech_temperature": 1.0,
+                "speech_model": DEFAULT_SPEECH_MODEL, "speech_temperature": NEW_PROFILE_SPEECH_TEMPERATURE,
                 "neuro_engine_enabled": False, "neuro_state": {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20},
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "help_mode_enabled": False
@@ -2193,16 +2308,22 @@ class ProfileManager:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                      "AppleWebKit/537.36 (KHTML, like Gecko) "
                                      "Chrome/120.0.0.0 Safari/537.36"}
-            response = await get_shared_client().get(
-                avatar_url, follow_redirects=True, timeout=10.0, headers=headers)
-            response.raise_for_status()
+            # Read in chunks and dropped at the cap. A plain GET had buffered whatever the
+            # URL served before its size was ever tested.
+            response = await get_capped(
+                get_shared_client(), avatar_url, defaultConfig.CONTENT_CLASSIFY_MAX_IMAGE_BYTES,
+                timeout=10.0, headers=headers)
         except Exception as e:
             print(f"Classifier could not fetch the avatar for {eff_owner}/{eff_name} "
                   f"({type(e).__name__}); judging the text alone.")
             return None
+        if response.status_code != 200:
+            print(f"Classifier could not fetch the avatar for {eff_owner}/{eff_name} "
+                  f"(HTTP {response.status_code}); judging the text alone.")
+            return None
 
         data = response.content
-        if not data or len(data) > defaultConfig.CONTENT_CLASSIFY_MAX_IMAGE_BYTES:
+        if not data:
             return None
 
         content_type = (response.headers.get("Content-Type") or "image/png").split(";")[0].strip()
@@ -3313,6 +3434,8 @@ class ProfileManager:
             "ltm_count": ltm_count,
             "training_count": train_count,
             "is_borrowed": is_borrowed,
+            # A stat, not a read: the dashboard says whether a sample exists, never what it holds.
+            "voice_sample": await self._has_voice_sample(user_id, profile_name),
         }
 
     async def build_function_embed(self, user_id: int, profile_name: str, channel_id: int,
@@ -3594,10 +3717,16 @@ class ProfileManager:
         s_described = " \u00b7 ".join(d for d in (TTS_VOICE_GENDER.get(s_voice),
                                              TTS_VOICE_CHARACTER.get(s_voice)) if d)
 
+        s_speed = config.get("speech_speed")
+        s_language = config.get("speech_language") or ""
+        s_sample = await self._has_voice_sample(user_id, profile_name)
         speech_val = (
             f"Enabled: {s_enabled}\n"
             f"Voice: `{s_voice}`" + (f" ({s_described})\n" if s_described else "\n") +
-            f"Temperature: `{s_temp}`"
+            f"Temperature (Gemini): `{s_temp}`\n"
+            f"Speed (OpenRouter): `{s_speed if s_speed is not None else 'Model default'}`\n"
+            f"Language (Gemini): `{SPEECH_LANGUAGE_NAMES.get(s_language, s_language) or 'Auto-detect'}`\n"
+            f"Voice sample: `{'Set' if s_sample else 'None'}`"
         )
         embed.add_field(name="Speech TTS", value=speech_val, inline=True)
 

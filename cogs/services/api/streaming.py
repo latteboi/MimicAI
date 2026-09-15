@@ -9,8 +9,9 @@ Content-Length that count buys is what keeps httpx off chunked encoding.
 import base64
 import os
 import orjson as json
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
+from ...utils.constants import defaultConfig
 from ...utils.net_guard import safe_stream
 
 
@@ -142,19 +143,40 @@ async def _aiter_streamed_body(segments: List[Any]):
         _close_body_segments(segments)
 
 
-async def _stream_to_tempfile(url: str, client, timeout: float = 15.0) -> str:
+class DownloadTooLarge(Exception):
+    """A download ran past its byte limit. Raised rather than cut short: part of a video is
+    not the file that was sent, and every caller drops a media part it cannot resolve."""
+
+
+async def _stream_to_tempfile(url: str, client, timeout: float = 15.0,
+                              max_bytes: Optional[int] = None) -> str:
     """Downloads `url` to a temp file without ever holding it in RAM. Returns the
-    path; the caller owns it."""
+    path; the caller owns it.
+
+    Raises `DownloadTooLarge` past `max_bytes`, which is `LIMIT_ATTACHMENT_BYTES` unless
+    given. An attachment is refused on its stated size before it gets here; this bounds
+    what arrives with none, such as an image linked in a message. The timeout is per read,
+    so without a limit a slow, steady download of any size went through.
+    """
     import tempfile
 
+    limit = defaultConfig.LIMIT_ATTACHMENT_BYTES if max_bytes is None else max_bytes
     fd, path = tempfile.mkstemp(suffix=".tmp")
     try:
-        # Both callers pass a URL a Discord user supplied, so the destination is
-        # validated on every redirect hop rather than trusted once.
-        async with safe_stream(client, "GET", url, timeout=timeout) as resp:
-            resp.raise_for_status()
-            with os.fdopen(fd, 'wb') as f:
+        # Opened before the request, so a refusal before the body closes the descriptor too.
+        with os.fdopen(fd, 'wb') as f:
+            # Both callers pass a URL a Discord user supplied, so the destination is
+            # validated on every redirect hop rather than trusted once.
+            async with safe_stream(client, "GET", url, timeout=timeout) as resp:
+                resp.raise_for_status()
+                declared = resp.headers.get("content-length", "")
+                if declared.isdigit() and int(declared) > limit:
+                    raise DownloadTooLarge(f"{declared} bytes, over the {limit}-byte limit")
+                written = 0
                 async for chunk in resp.aiter_bytes(chunk_size=_DOWNLOAD_CHUNK_BYTES):
+                    written += len(chunk)
+                    if written > limit:
+                        raise DownloadTooLarge(f"over the {limit}-byte limit")
                     f.write(chunk)
     except BaseException:
         try:

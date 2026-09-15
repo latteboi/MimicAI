@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple, Any, Optional, Union
 import orjson as json
 from .constants import (
-    DISCORD_MAX_MESSAGE_LENGTH, API_ERROR_MAPPINGS,
+    DISCORD_MAX_MESSAGE_LENGTH, API_ERROR_MAPPINGS, VOICE_SAMPLE_TYPES,
     HARM_CATEGORIES, HarmBlockThreshold, HarmCategory,
     PATTERN_SYSTEM_XML_BLOCKS, PATTERN_SYSTEM_XML_ORPHANS,
     PATTERN_REASONING_BLOCKS, PATTERN_REASONING_ORPHANS, PATTERN_SYSTEM_HEADER,
@@ -664,6 +664,26 @@ def _describe_api_error(error: Exception) -> str:
         error_str.replace('"', "'").replace('{', '').replace('}', '').replace('\n', ' '))
     # Wrapped before the cut, so the cut can stop short of a link instead of splitting it.
     return _cut_outside_links(clean_err, 80)
+
+
+def upload_too_large(error: BaseException) -> bool:
+    """Whether Discord refused a send for what it attached: HTTP 413, error code 40005.
+
+    The message itself was fine, so a sender posts it again without the file rather than
+    lose both. No other refusal says anything about the attachment.
+    """
+    return isinstance(error, discord.HTTPException) and (error.status == 413 or error.code == 40005)
+
+
+def voice_sample_mime_type(content_type: Optional[str], filename: Optional[str]) -> Optional[str]:
+    """The audio type an uploaded voice sample is stored and sent as, or None if it is not audio.
+
+    Discord's own label wins; an upload it did not label is judged by its suffix.
+    """
+    declared = (content_type or "").split(";", 1)[0].strip().lower()
+    if declared.startswith("audio/"):
+        return declared
+    return VOICE_SAMPLE_TYPES.get(os.path.splitext(filename or "")[1].lower())
 
 
 #: model id -> `image_model_caps` for OpenRouter's image models, installed whole by the image

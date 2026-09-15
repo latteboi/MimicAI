@@ -16,8 +16,9 @@ from ..utils.constants import (
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
     IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS,
 )
-from .api_service import generate_google_tts_audio
 from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, generated_image_attachment, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor
+from ..utils.attachment_limits import over_attachment_limit, skipped_attachment_note
+from ..utils.http_client import get_capped
 from ..utils.memory_tuning import maybe_trim_malloc
 
 
@@ -60,41 +61,69 @@ class MediaService:
             google_key_error="Server API key not configured.",
             openrouter_key_error="Server OpenRouter key not configured.")
 
-    async def _generate_google_tts(self, text: str, guild_id: int, model_id: str = DEFAULT_SPEECH_MODEL, voice_name: str = "Aoede", temperature: float = 1.0, fallback_model_id: Optional[str] = None):
-        """Generates a playable WAV audio stream utilising Google Gemini Speech Generation models.
+    async def synthesise_speech(self, transcript: str, guild_id: int, *, user_id: int, config_owner_id: int,
+                                directed_prompt: Optional[str] = None,
+                                voice_sample_of: Optional[tuple] = None,
+                                model_id: str = DEFAULT_SPEECH_MODEL, voice_name: str = DEFAULT_SPEECH_VOICE,
+                                temperature: float = 1.0, fallback_model_id: Optional[str] = None,
+                                max_bytes: Optional[int] = None, speed: Optional[float] = None,
+                                language_code: Optional[str] = None) -> str:
+        """Returns the path of an audio file of `transcript` spoken, and hands the file to the caller.
+
+        `directed_prompt` is the Director's Desk wrapped around the transcript. Each adapter
+        takes what its model can use -- Gemini the directed prompt, an OpenRouter model the
+        transcript alone -- and resolves the voice to one its model carries, so a fallback
+        on the other provider still gets both right. `voice_sample_of` is the (owner id,
+        profile name) whose voice sample a model that clones voices speaks with; it is
+        decrypted only for such a model. `max_bytes` is the largest file the channel can
+        upload, which a Gemini model's audio is capped to. `speed` reaches an OpenRouter
+        model and `language_code` a Gemini one; each adapter ignores the other's.
 
         One choke point for every TTS call in the bot, which is why the retry lives here
         rather than at each caller: a preview speech model going 404 or 503 mid-session
         otherwise silences the whole round with nothing tried in its place.
+
+        A timeout is retried once per turn, across both models. The audio may already have
+        been generated and billed, so a second timeout ends the turn's speech rather than
+        paying for it again -- on the fallback included.
+
+        Raises when there is no audio, and what it raises is the reason. This used to return
+        None for every failure, which reached the channel as "API Error or Unknown" whether
+        the quota was spent, the text was refused or the server had no key. Each attempt
+        builds through the model factory, so the data policy's key gate and the rate-limit
+        cooldown reach speech as they reach every other slot.
         """
-        import wave
-        api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id)
-        if not api_key:
-            return None
+        timeout_retries = 1
 
-        try:
-            async def _attempt(name, _is_fallback):
-                return await generate_google_tts_audio(
-                    api_key, name, text, voice_name=voice_name, temperature=temperature)
+        async def load_voice_sample():
+            return await self.cog.profile_manager.materialise_voice_sample(*voice_sample_of)
 
-            raw_audio_bytes, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                model_id, fallback_model_id, _attempt, label="Text-to-speech")
+        async def _attempt(name, _is_fallback):
+            nonlocal timeout_retries
+            model = self.cog.api_service._instantiate_model(
+                name, guild_id, user_id, config_owner_id=config_owner_id, speech=True,
+                google_key_error="No Google key is assigned to this server.",
+                openrouter_key_error="No OpenRouter key is assigned to this server.")
+            while True:
+                try:
+                    return await model.synthesise(
+                        transcript, directed_prompt=directed_prompt, voice_name=voice_name,
+                        temperature=temperature,
+                        voice_sample=load_voice_sample if voice_sample_of else None,
+                        max_bytes=max_bytes, speed=speed, language_code=language_code)
+                except Exception as e:
+                    if not getattr(e, "timed_out", False):
+                        raise
+                    if not timeout_retries:
+                        # The turn's one retry is spent, and the fallback is not tried either.
+                        e.retryable = False
+                        raise
+                    timeout_retries -= 1
+                    print(f"Text-to-speech: {name} timed out; retrying once for this turn.")
 
-            if raw_audio_bytes:
-                wav_io = io.BytesIO()
-                with wave.open(wav_io, 'wb') as wav_file:
-                    wav_file.setnchannels(1)      # Mono
-                    wav_file.setsampwidth(2)      # 16-bit
-                    wav_file.setframerate(24000)  # 24kHz
-                    wav_file.writeframes(raw_audio_bytes)
-                wav_io.seek(0)
-                return wav_io
-            return None
-        except Exception as e:
-            err_msg = _format_api_error(e)
-            if "404" not in err_msg:
-                print(f"Google TTS Error: {err_msg}")
-            return None
+        path, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
+            model_id, fallback_model_id, _attempt, label="Text-to-speech")
+        return path
 
     def _stitch_wav_segments(self, segments):
         """Concatenates multiple WAV Byte streams into a single Master stream without re-encoding."""
@@ -625,6 +654,11 @@ class MediaService:
                     break
                 print(f"Error in image generation worker #{worker_id}: {e}"); traceback.print_exc()
 
+    #: Bytes of a text attachment worth reading: the 40,000 characters it is cut to below, at
+    #: UTF-8's four bytes a character at most, and one character more so a file just past
+    #: the cut still says it was cut.
+    _TEXT_ATTACHMENT_READ_BYTES = 40001 * 4
+
     async def _process_text_attachments(self, attachments: List[Any], client: httpx.AsyncClient) -> str:
         text_blocks = []
         text_extensions = ('.txt', '.log', '.md', '.csv', '.json', '.py', '.js', '.html', '.css', '.xml')
@@ -646,13 +680,19 @@ class MediaService:
             if not is_text or not url:
                 continue
                 
+            if over_attachment_limit(att):
+                text_blocks.append(skipped_attachment_note(att))
+                continue
+
             try:
-                resp = await client.get(url, follow_redirects=True, timeout=10.0)
-                resp.raise_for_status()
-                
-                raw_bytes = resp.content
-                if len(raw_bytes) > 5 * 1024 * 1024:
-                    raw_bytes = raw_bytes[:5 * 1024 * 1024]
+                # Read in chunks and cut at what the character cut below keeps. This was a
+                # buffered GET cut to 5 MB afterwards, which bounded nothing: the whole
+                # upload was in memory by then.
+                body = await get_capped(client, url, self._TEXT_ATTACHMENT_READ_BYTES,
+                                        timeout=10.0, truncate=True)
+                if body.content is None:
+                    raise ValueError(f"HTTP {body.status_code}")
+                raw_bytes = body.content
                     
                 decoded = raw_bytes.decode('utf-8', errors='replace')
                 
@@ -784,13 +824,15 @@ class MediaService:
                 
                 if ref_msg and isinstance(ref_msg, discord.Message):
                     for attachment in ref_msg.attachments:
-                        if attachment.content_type and attachment.content_type.startswith("image/"):
+                        if (attachment.content_type and attachment.content_type.startswith("image/")
+                                and not over_attachment_limit(attachment)):
                             reference_image_urls.append({"url": attachment.url, "mime_type": attachment.content_type})
                             if len(reference_image_urls) >= 2: break
             
             if len(reference_image_urls) < 10 and message.attachments:
                 for attachment in message.attachments:
-                    if attachment.content_type and attachment.content_type.startswith("image/"):
+                    if (attachment.content_type and attachment.content_type.startswith("image/")
+                            and not over_attachment_limit(attachment)):
                         reference_image_urls.append({"url": attachment.url, "mime_type": attachment.content_type})
                         if len(reference_image_urls) >= 10: break
 

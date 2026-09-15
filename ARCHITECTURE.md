@@ -150,6 +150,12 @@ Sessions have their own eviction: `session_last_accessed` plus an `eviction_heap
 `SessionManager.evict_inactive_sessions_task`. An evicted session is *dehydrated* to disk,
 not lost — `_ensure_session_hydrated` reloads it on the next trigger.
 
+A session's blueprint — `active_sessions` in `servers/<guild_id>/index.json` — outlives its
+channel dropping out of discord.py's cache, which an archived thread does and a guild in an
+outage looks like. Boot restores it while the bot is still in the guild, a save files it
+where it already is (`_blueprint_homes`), and only a channel Discord answers with a 404 is
+suspended (`_drop_deleted_channel_sessions`).
+
 ### The shard cache is opt-in, and the question is frequency
 
 `read_json_gzip_cached` keeps *decrypted plaintext* per path, stamped with
@@ -407,11 +413,12 @@ a record anyone but the bot owner wrote.
   The pickers offer a model only when some host is known to serve it without training (see
   the catalogue below); the rest go to the bot owner alone (`may_pick_training_models`), and
   a typed id is held to the same rule.
-- **OpenRouter images:** the Image API takes no `data_collection` and routes by the privacy
-  settings of whichever account's key pays. So for a server that has not opted in, the
-  factory refuses an image model unless the image catalogue knows it has one host company
-  and the bot owner's filtering listing kept it. Every image path builds through
-  `MediaService.build_image_model`, which calls the factory, and resolves no key itself.
+- **OpenRouter images and speech:** neither the Image API nor the speech endpoint takes
+  `data_collection`; both route by the privacy settings of whichever account's key pays. So
+  for a server that has not opted in, the factory refuses an image or speech model unless its
+  catalogue knows it has one host company and the bot owner's filtering listing kept it. Every
+  image path builds through `MediaService.build_image_model` and every voice line through
+  `MediaService.synthesise_speech`; both call the factory and resolve no key themselves.
 - **The operator's key:** the content classifier falls back to the bot owner's key for a
   profile whose owner has none (`_classifier_api_key`). Nobody directed that user's content
   there, so a free-tier Gemini key is skipped and an OpenRouter request on it denies
@@ -455,6 +462,23 @@ see the data policy above — and trusts the account listing only in a sync whos
 listing proved the settings filter. It fills the caps registry `image_model_caps` reads, so
 the Image Output screens and the request offer and send only what the chosen model takes.
 The picker's image category browses it through the same code, by Most Popular and author.
+
+`api/openrouter_speech_catalogue.py` is the speech counterpart, from
+`/models?output_modalities=speech` (names, ranking, and each model's `supported_voices`), each
+model's `/models/{id}/endpoints` (hosts, price, whether it takes a voice sample) and
+`/models/user?output_modalities=speech` on the bot owner's key, under the same one-host and
+proof rules. The TTS category browses it, and the voice screen offers the chosen model's own
+voices. Each speech adapter swaps a voice its model lacks for one it has — the Gemini
+default, or an OpenRouter model's first — so a fallback on the other provider still speaks.
+An OpenRouter model is sent the reply alone, as MP3: the Director's Desk reaches Google only.
+
+A profile its owner can edit may carry a **voice sample** (`/profile voice_sample`): the
+audio sealed beside the profile's shards, and a sealed record of its type, transcript and
+who vouched that the voice was theirs to use. A borrow speaks with its source's, resolved
+through `original_pid`. Nothing copies it — clone, convert and export rebuild a profile from
+its config and prompts — and removing the profile's directory removes it. It is decrypted to
+a temp file per request, only for a model whose host clones voices, and sent in place of a
+preset voice. A turn's speech retries one timeout and no more, across both of its models.
 
 ### No vendor SDKs
 
@@ -617,6 +641,9 @@ Any dict keyed by channel, user or profile must be an `LRUCache` or have an evic
 - **Per-participant history objects.** Derive from `unified_log`.
 - **Inline media download-and-upload.** Go through `_resolve_media_uri` — a TTL'd, bounded
   cache with single-flight, so concurrent rounds share one upload.
+- **Downloading a user's file before testing its size.** Test `over_attachment_limit` on the
+  size Discord states, and read anything stating none through `_stream_to_tempfile` or
+  `get_capped`, which stop at their limit: a buffered GET measured afterwards bounds nothing.
 - **`gc.collect()` per participant per round.** That was ~11 ms of GIL-held CPU per
   participant. Refcounting frees image buffers when the last reference drops.
 - **A module-level zstd compressor or decompressor.** See above — it is a data race, not a

@@ -8,7 +8,8 @@ from .utils.constants import (
     PURGE_BUSY_WAIT_TIMEOUT_SECONDS, SERVERS_DIR,
     SESSIONS_GLOBAL_DIR, SESSION_BUSY_FLAGS, TRAIN_ARMED_CACHE_MAX_SIZE, TRAIN_INPUT_EMOJI,
     TRAIN_COMMAND_ENABLED, TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check,
-    is_owner_in_dm_check,
+    is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
+    IMPORT_FILE_TOO_LARGE,
 )
 from .services.api_service import OpenRouterModel, GoogleGenAIModel
 from .listeners.event_listeners import EventListeners
@@ -21,7 +22,7 @@ from .gui.gui_sessions import (
 )
 from .gui.gui_settings import (SettingsHomeView, ParentPresenceView, ShutdownConfirmView,
                                 build_about_embed)
-from .gui.gui_profiles import ProfileManageView, BulkManageView
+from .gui.gui_profiles import ProfileManageView, BulkManageView, VoiceSampleConsentView
 from .gui.gui_resolve import (
     autocorrect_profile, gather_owned_candidates, gather_participant_candidates,
     suggest_profile,
@@ -60,7 +61,7 @@ from collections import OrderedDict
 import re
 import pathlib
 from .utils.helpers import (_resolve_safety_settings, _scrub_response_text, resolve_thinking_params,
-                            suppress_link_previews)
+                            suppress_link_previews, voice_sample_mime_type)
 
 class LRUCache(OrderedDict):
     def __init__(self, max_size, *args, **kwargs):
@@ -624,6 +625,12 @@ class MimicCog(EventListeners, commands.Cog):
         if not file.filename.endswith('.mimic'):
             await interaction.response.send_message("❌ Invalid file type. Please upload a `.mimic` file.", ephemeral=True)
             return
+        # On the size Discord states, before read() holds the whole file in memory.
+        if file.size > defaultConfig.LIMIT_ATTACHMENT_BYTES:
+            await interaction.response.send_message(
+                IMPORT_FILE_TOO_LARGE.format(limit=defaultConfig.LIMIT_ATTACHMENT_BYTES // (1024 * 1024)),
+                ephemeral=True)
+            return
         
         try:
             file_bytes = await file.read()
@@ -674,6 +681,31 @@ class MimicCog(EventListeners, commands.Cog):
             await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         else:
             await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @profile_group.command(name="voice_sample", description="Give a profile you own a cloned voice, from a short recording.")
+    @app_commands.checks.cooldown(3, 60.0, key=lambda i: i.user.id)
+    @app_commands.describe(profile_name="The profile to give the voice.",
+                           sample="A clean 10-30 second recording of one speaker.",
+                           transcript="Optional: exactly what is said in the recording. It improves the match.")
+    @app_commands.autocomplete(profile_name=EventListeners.master_autocomplete)
+    async def voice_sample_slash(self, interaction: discord.Interaction, profile_name: str,
+                                 sample: discord.Attachment,
+                                 transcript: Optional[app_commands.Range[str, 1, 2000]] = None):
+        # Checked before the consent screen, so nobody vouches for a file that would be refused.
+        if not self.profile_manager.may_set_voice_sample(interaction.user.id, profile_name):
+            await interaction.response.send_message(VOICE_SAMPLE_NOT_OWN, ephemeral=True)
+            return
+        mime_type = voice_sample_mime_type(sample.content_type, sample.filename)
+        if mime_type is None:
+            await interaction.response.send_message(VOICE_SAMPLE_NOT_AUDIO, ephemeral=True)
+            return
+        limit = defaultConfig.LIMIT_VOICE_SAMPLE_BYTES
+        if sample.size > limit:
+            await interaction.response.send_message(
+                VOICE_SAMPLE_TOO_LARGE.format(limit=limit // (1024 * 1024)), ephemeral=True)
+            return
+        view = VoiceSampleConsentView(self, interaction.user.id, profile_name, sample, mime_type, transcript)
+        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
     @profile_group.command(name="hub", description="The unified dashboard for managing profiles, sharing, and the public library.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -762,6 +794,8 @@ class MimicCog(EventListeners, commands.Cog):
                 # synopsis off, and the next save wrote that over the blueprint.
                 "compaction": session_config.get("compaction", {}),
                 "started": session_config.get("started", True),
+                "audio_mode": session_config.get("audio_mode", "off"),
+                "max_responses": session_config.get("max_responses", 10),
             }
         else:
             # Blank session

@@ -3,6 +3,7 @@ import discord
 import datetime
 
 from ...utils.helpers import _format_debug_prompt, _format_history_entry, _get_user_hash
+from ...utils.attachment_limits import over_attachment_limit, skipped_attachment_note
 from ...utils.http_client import get_shared_client
 from ...managers.session_manager import intern_turn
 
@@ -252,25 +253,27 @@ class TriggerIntakeMixin:
 
                         if ref_msg and ref_msg.attachments:
                             # Find the first image/audio/video attachment in the referenced message
-                            ref_media = next((a for a in ref_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))), None)
+                            ref_media = next((a for a in ref_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/")) and not over_attachment_limit(a)), None)
                             if ref_media:
                                 new_message_parts.append({"url": ref_media.url, "mime_type": ref_media.content_type})
                     except Exception as e:
                         print(f"Error fetching replied media: {e}")
 
-                attachments = trigger_obj['attachments'] if is_child_mention else [
-                    a for a in trigger_obj.attachments 
-                    if a.content_type and (
-                        a.content_type.startswith("image/") or 
-                        a.content_type.startswith("audio/") or 
-                        a.content_type.startswith("video/")
-                    )
+                # Media only, from a child bot's payload as from a message: the payload
+                # carries text files too, and those were read into the turn above.
+                attachments = [
+                    a for a in (trigger_obj['attachments'] if is_child_mention else trigger_obj.attachments)
+                    if ((a.get('content_type') if isinstance(a, dict) else a.content_type) or "").startswith(
+                        ("image/", "audio/", "video/"))
                 ]
 
                 if attachments:
                     att_tags = []
                     for attachment in attachments:
                         try:
+                            if over_attachment_limit(attachment):
+                                att_tags.append(skipped_attachment_note(attachment))
+                                continue
                             attachment_url = attachment['url'] if is_child_mention else attachment.url
                             fname = attachment.get('filename', 'attachment.png') if is_child_mention and isinstance(attachment, dict) else getattr(attachment, 'filename', 'attachment.png')
 

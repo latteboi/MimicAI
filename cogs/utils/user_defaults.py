@@ -257,6 +257,8 @@ SETTING_LABELS = {
     "image_generation_enabled": "Image Generation",
     "speech_tts_enabled": "Text-to-Speech",
     "speech_temperature": "Speech Temperature",
+    "speech_speed": "Speech Speed",
+    "speech_language": "Speech Language",
     "show_fallback_indicator": "Fallback Indicator",
     "openrouter_service_tier": "OpenRouter Service Tier",
     "child_bot_placeholder": "Child Bot Placeholder",

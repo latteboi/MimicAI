@@ -8,16 +8,22 @@ and TTS calls generateContent with a speechConfig no other provider takes.
 import asyncio
 import base64
 import os
+import random
+import re
+import tempfile
 import time
+import wave
 import orjson as json
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from ...utils.blob_stream import InlineBlobExtractor
+from ...utils.blob_stream import InlineBlobExtractor, TruncatedJSONError
 from ...utils.constants import (
-    DEFAULT_SPEECH_VOICE, THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
+    DEFAULT_SPEECH_VOICE, ERR_REASON_NO_AUDIO, ERR_REASON_SPEECH_PROHIBITED,
+    ERR_REASON_SPEECH_REFUSED, ERR_REASON_SPEECH_TIMED_OUT, THINKING_LEVELS_TO_GOOGLE,
+    THINKING_LEVELS_TO_GOOGLE_BINARY, TTS_VOICE_LOOKUP,
 )
 from ...utils.helpers import google_thinking_caps, resolve_media_resolution
 from ...utils.http_client import get_shared_client
@@ -705,22 +711,172 @@ async def materialise_inline_data(response, value, suffix: str = ".png") -> Opti
 # speechConfig shape that no other caller needs, so it stays outside the shared
 # generate_content_async interface rather than widening it for one consumer. Same
 # endpoint, same routing switch as GoogleGenAIModel and get_embedding_vector above.
+
+#: Seconds to wait before the one same-model retry, drawn fresh each time: long enough not
+#: to land inside the blip that caused the failure, short because a turn is waiting on it.
+_TTS_RETRY_DELAY = (0.5, 1.5)
+
+#: Gemini's speech output rate, for an audio part whose mimeType does not name one.
+_TTS_DEFAULT_RATE = 24000
+
+#: finishReason values meaning the model declined the text rather than failed to voice it.
+#: The same text is declined the same way, by this model or any other.
+_TTS_REFUSAL_FINISH_REASONS = frozenset({
+    "SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION",
+})
+
+#: Gemini bills speech at 25 output tokens for each second of audio.
+_TTS_TOKENS_PER_SECOND = 25
+
+#: The longest a line may take to say, in seconds per character: 0.2 for most scripts,
+#: about three times an ordinary speaking pace, and 0.5 for a CJK character, which carries
+#: more of a word. Generous on purpose -- the cap is for audio that runs on past its words,
+#: and a slow, directed delivery must never be what it cuts short.
+_TTS_SECONDS_PER_CHAR = 0.2
+_TTS_SECONDS_PER_WIDE_CHAR = 0.5
+#: The first code point of the CJK blocks, counted at the wide rate.
+_TTS_WIDE_FROM = 0x2E80
+#: Seconds any line is allowed however short, for a sigh or a pause around one word.
+_TTS_MIN_SECONDS = 10
+#: A WAV file's header, ahead of its PCM frames.
+_WAV_HEADER_BYTES = 44
+
+#: Models that refused `maxOutputTokens`, recorded the way `_OLLAMA_NO_THINK` records a
+#: refused `think`, and bounded as it is: a server holds a handful of speech models.
+_TTS_NO_OUTPUT_CAP: set = set()
+_TTS_NO_OUTPUT_CAP_MAX = 16
+_OUTPUT_CAP_FIELD = re.compile(r"max_?output_?tokens", re.IGNORECASE)
+#: Models that refused `speechConfig.languageCode`, recorded and bounded the same way: the
+#: field is documented for speech, but not per model.
+_TTS_NO_LANGUAGE: set = set()
+_LANGUAGE_FIELD = re.compile(r"language_?code", re.IGNORECASE)
+
+
+def _refused_speech_field(detail: str, capped: bool, languaged: bool):
+    """(the record of models refusing it, how to say it) for the field a 400 names, or None.
+
+    A field the request did not carry is never blamed, and a 400 naming neither -- an
+    unknown voice -- is not taken for a refusal of either.
+    """
+    if capped and _OUTPUT_CAP_FIELD.search(detail):
+        return _TTS_NO_OUTPUT_CAP, "an output cap"
+    if languaged and _LANGUAGE_FIELD.search(detail):
+        return _TTS_NO_LANGUAGE, "a language code"
+    return None
+
+
+def _speech_token_cap(transcript: str, max_bytes: Optional[int] = None) -> int:
+    """`maxOutputTokens` for one spoken line: the audio its words can need, and no more.
+
+    A Gemini speech request has no length limit short of the model's output ceiling --
+    minutes of audio -- and every second is billed. A line that runs on past its words, in
+    trailing silence or with its direction read aloud, is billed to that ceiling, and a
+    timeout retry bills it again. So the cap follows the transcript alone, never the
+    Director's Desk wrapped around it, and stops at the largest WAV `max_bytes` allows:
+    audio the server cannot upload is audio paid for and never heard.
+    """
+    wide = sum(1 for ch in transcript if ord(ch) >= _TTS_WIDE_FROM)
+    seconds = (_TTS_MIN_SECONDS + (len(transcript) - wide) * _TTS_SECONDS_PER_CHAR
+               + wide * _TTS_SECONDS_PER_WIDE_CHAR)
+    if max_bytes:
+        seconds = min(seconds, (max_bytes - _WAV_HEADER_BYTES) / (_TTS_DEFAULT_RATE * 2))
+    return max(1, int(seconds * _TTS_TOKENS_PER_SECOND))
+
+
+def _log_speech_usage(model_id: str, tokens: int, finish: str, cap: Optional[int]) -> None:
+    """One terminal line per line spoken: the audio billed, and whether the cap ended it.
+
+    Nothing else in the bot records a speech call, so this is what traces a day's bill back
+    to the lines that ran it up. A count past the cap the request carried means the model
+    does not honour `maxOutputTokens`, and the line says so.
+    """
+    if not tokens:
+        return
+    if finish == "MAX_TOKENS":
+        note = f", stopped by its {cap}-token cap" if cap else ", stopped at the model's output limit"
+    elif cap and tokens > cap:
+        note = f", past its {cap}-token cap: this model does not honour the cap"
+    else:
+        note = ""
+    print(f"Google TTS: {model_id} generated {tokens / _TTS_TOKENS_PER_SECOND:.0f} s of audio "
+          f"({tokens} output tokens{note}).")
+
+
+def _speech_refusal(code: str) -> Exception:
+    """A content refusal phrased for the channel, and marked `retryable = False` -- which
+    both the retry below and `run_with_fallback` honour."""
+    reason = (ERR_REASON_SPEECH_PROHIBITED if code == "PROHIBITED_CONTENT"
+              else code.replace('_', ' ').title())
+    error = Exception(f"Google TTS refused the text: {code}")
+    error.formatted_reason = ERR_REASON_SPEECH_REFUSED.format(reason=reason)
+    error.retryable = False
+    return error
+
+
+def _pcm_rate(mime_type: Optional[str]) -> int:
+    """The sample rate named in an `audio/L16;codec=pcm;rate=24000` mimeType."""
+    match = re.search(r"rate=(\d+)", mime_type or "")
+    return int(match.group(1)) if match else _TTS_DEFAULT_RATE
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _pcm_file_to_wav(pcm_path: str, rate: int) -> str:
+    """Wraps a 16-bit mono PCM file in a WAV header, file to file, and removes the PCM.
+
+    Blocking: run it in a thread.
+    """
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        with open(pcm_path, 'rb') as src, wave.open(wav_path, 'wb') as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(rate)
+            while True:
+                chunk = src.read(_DOWNLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                wav.writeframesraw(chunk)
+    except BaseException:
+        _remove_quietly(wav_path)
+        raise
+    finally:
+        _remove_quietly(pcm_path)
+    return wav_path
+
+
 async def generate_google_tts_audio(
     api_key: str,
     model_id: str,
     text: str,
     voice_name: str = DEFAULT_SPEECH_VOICE,
     temperature: float = 1.0,
-) -> Optional[bytes]:
-    """Returns raw PCM audio bytes for `text`.
+    max_output_tokens: Optional[int] = None,
+    language_code: Optional[str] = None,
+) -> str:
+    """Returns the path of a WAV file of `text` spoken, and hands the file to the caller.
 
-    Raises on network/API failure — same contract as generate_content_async — so
-    media_service's existing try/except keeps handling errors uniformly. A response
-    that parsed cleanly but carried no audio raises too: see the retry loop below.
+    Raises on every failure, with an error `_format_api_error` can word. This used to
+    return bytes or None, and None reached the channel as "API Error or Unknown" whatever
+    had gone wrong. The audio streams to disk as it comes off the socket and is wrapped
+    into a WAV there, so a long line is never held in the heap.
+
+    `max_output_tokens` caps the audio billed -- see `_speech_token_cap`. `language_code` is
+    a profile's chosen `speechConfig.languageCode`. A model that refuses either field is
+    asked once more without it, and is not sent it again.
     """
     if model_id.upper().startswith("GOOGLE/"):
         model_id = model_id[7:]
 
+    capped = bool(max_output_tokens) and model_id not in _TTS_NO_OUTPUT_CAP
+    languaged = bool(language_code) and model_id not in _TTS_NO_LANGUAGE
+    refused_field = False
     payload = {
         "contents": [{"role": "user", "parts": [{"text": text}]}],
         "generationConfig": {
@@ -733,6 +889,10 @@ async def generate_google_tts_audio(
             },
         },
     }
+    if capped:
+        payload["generationConfig"]["maxOutputTokens"] = max_output_tokens
+    if languaged:
+        payload["generationConfig"]["speechConfig"]["languageCode"] = language_code
     model_path = model_id if model_id.startswith("models/") else f"models/{model_id}"
     client = get_google_rest_client()
 
@@ -743,16 +903,17 @@ async def generate_google_tts_audio(
     # answers with a 500, "randomly in a very small percentage of requests", with an
     # explicit recommendation to retry. Retrying the same model is the only thing that
     # helps there; a fallback model would be answering a fault the primary does not
-    # actually have.
+    # actually have. A dropped connection gets the same second chance. A refusal gets
+    # none, here or on the fallback: it is a decision about the text.
     body = json.dumps(payload)
 
     last_error = None
     for attempt in range(2):
+        if attempt:
+            await asyncio.sleep(random.uniform(*_TTS_RETRY_DELAY))
         # Streamed for the same reason generate_content_async is: PCM does not
         # compress on the wire the way a PNG does, so a long line costs as much
-        # in transient copies as a small image. The audio still ends up in RAM --
-        # _stitch_wav_segments and discord.File both want bytes -- but it arrives
-        # there once instead of three times over.
+        # in transient copies as a small image.
         extractor = InlineBlobExtractor(suffix=".pcm")
         try:
             async with client.stream(
@@ -763,6 +924,21 @@ async def generate_google_tts_audio(
             ) as response:
                 if response.status_code != 200:
                     detail = (await response.aread()).decode('utf-8', 'replace')
+                    # The speech classifier can refuse the request outright, as well as
+                    # answer it with the block reasons read below.
+                    if response.status_code < 500 and "PROHIBITED_CONTENT" in detail:
+                        raise _speech_refusal("PROHIBITED_CONTENT")
+                    # A model that takes no output cap, or no language code, names the field
+                    # in its 400. The refusal is the probe: remembered, and the line asked
+                    # for once more without the field, below.
+                    refused = (_refused_speech_field(detail, capped, languaged)
+                               if response.status_code == 400 else None)
+                    if refused and len(refused[0]) < _TTS_NO_OUTPUT_CAP_MAX:
+                        refused[0].add(model_id)
+                        print(f"Google TTS: {model_id} refused {refused[1]}; asking again without it, and remembering.")
+                        extractor.cleanup()
+                        refused_field = True
+                        break
                     error = Exception(f"Google API Error {response.status_code}: {detail}")
                     # 4xx is a bad request -- a voice that does not exist, a model that
                     # is not a TTS model, an exhausted quota. Sending it again changes
@@ -771,33 +947,59 @@ async def generate_google_tts_audio(
                         raise error
                     last_error = error
                     print(f"Google TTS: {model_id} returned {response.status_code}; retrying once.")
-                    skeleton = None
-                else:
-                    async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK_BYTES):
-                        extractor.feed(chunk)
-                    skeleton, blob_paths = extractor.finish()
-        except httpx.RequestError as e:
+                    continue
+                async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK_BYTES):
+                    extractor.feed(chunk)
+                skeleton, blob_paths = extractor.finish()
+        except (httpx.ReadTimeout, httpx.WriteTimeout) as e:
+            # Not retried here: the audio may already have been generated and billed.
+            # synthesise_speech allows a turn one retry after a timeout, across both models.
             extractor.cleanup()
-            raise Exception(f"Google API Network Error: {str(e)}")
+            error = Exception(f"Google TTS: {model_id} timed out")
+            error.formatted_reason = ERR_REASON_SPEECH_TIMED_OUT
+            error.timed_out = True
+            raise error from e
+        except (httpx.RequestError, TruncatedJSONError) as e:
+            extractor.cleanup()
+            last_error = Exception(f"Google API Network Error: {str(e) or type(e).__name__}")
+            if attempt == 1:
+                raise last_error from e
+            print(f"Google TTS: {model_id} connection failed ({type(e).__name__}); retrying once.")
+            continue
         except BaseException:
             extractor.cleanup()
             raise
 
-        if skeleton is None:
-            continue
-
-        parsed = GoogleRESTResponse(json.loads(skeleton), blob_paths=blob_paths)
         try:
-            if parsed.candidates and parsed.candidates[0].content and parsed.candidates[0].content.parts:
-                for part in parsed.candidates[0].content.parts:
-                    if getattr(part, 'inline_data', None) and part.inline_data.data:
-                        value = part.inline_data.data
-                        if isinstance(value, _BlobRef):
-                            # Read once and drop the file: the caller's contract is
-                            # bytes, and the stitching and upload paths below both
-                            # need it in memory anyway.
-                            return await asyncio.to_thread(value.read_bytes)
-                        return value
+            body_json = json.loads(skeleton)
+        except json.JSONDecodeError:
+            for path in blob_paths:
+                _remove_quietly(path)
+            raise Exception(f"Google API Error: {model_id} sent a speech response that could not be read.")
+        skeleton = None
+
+        parsed = GoogleRESTResponse(body_json, blob_paths=blob_paths)
+        body_json = None
+        try:
+            block = parsed.prompt_feedback.block_reason if parsed.prompt_feedback else None
+            if block:
+                raise _speech_refusal(str(block))
+            candidate = parsed.candidates[0] if parsed.candidates else None
+            finish = str(candidate.finish_reason or "") if candidate else ""
+            if finish in _TTS_REFUSAL_FINISH_REASONS:
+                raise _speech_refusal(finish)
+            parts = (candidate.content.parts or []) if candidate and candidate.content else []
+            for part in parts:
+                inline = part.inline_data
+                if not (inline and inline.data):
+                    continue
+                # A path either way: a long line was diverted to disk as it streamed, and a
+                # short one is still bytes and is written out here.
+                pcm_path = await materialise_inline_data(parsed, inline.data, ".pcm")
+                if pcm_path:
+                    _log_speech_usage(model_id, parsed.output_tokens, finish,
+                                      max_output_tokens if capped else None)
+                    return await asyncio.to_thread(_pcm_file_to_wav, pcm_path, _pcm_rate(inline.mime_type))
         finally:
             parsed.close()
 
@@ -806,7 +1008,47 @@ async def generate_google_tts_audio(
         # produced no speech" and stops there, so a configured fallback model was never
         # tried for what is a transient fault on the primary.
         last_error = Exception(f"Google TTS Error: {model_id} returned no audio data.")
+        last_error.formatted_reason = ERR_REASON_NO_AUDIO
         if attempt == 0:
             print(f"Google TTS: {model_id} returned no audio; retrying once.")
 
+    if refused_field:
+        # The refused field is remembered now and not sent again, so the same refusal
+        # cannot bring the line back here.
+        return await generate_google_tts_audio(api_key, model_id, text, voice_name=voice_name,
+                                               temperature=temperature,
+                                               max_output_tokens=max_output_tokens,
+                                               language_code=language_code)
     raise last_error
+
+
+class GoogleSpeechModel:
+    """A Gemini TTS model, as `APIService._instantiate_model(speech=True)` hands it out.
+
+    It holds the key the factory resolved -- after the data policy's gate -- so speech never
+    looks one up for itself, and `synthesise` is what the factory's cooldown tracking wraps,
+    so a 429 rests the key as it does for every other slot.
+    """
+
+    def __init__(self, model_name: str, api_key: str):
+        self.model_name = model_name
+        self.api_key = api_key
+
+    async def synthesise(self, transcript: str, directed_prompt: Optional[str] = None,
+                         voice_name: Optional[str] = None, temperature: float = 1.0,
+                         voice_sample=None, max_bytes: Optional[int] = None,
+                         speed: Optional[float] = None, language_code: Optional[str] = None) -> str:
+        """The path of an audio file of the reply spoken; the caller owns it.
+
+        Gemini is sent the Director's Desk prompt when there is one. A voice it does not
+        carry -- one a profile kept from an OpenRouter model -- is swapped for the default
+        rather than sent to a 400. Gemini clones no voice, so `voice_sample` is never loaded,
+        and takes no speed. The audio billed is capped by the transcript and `max_bytes`,
+        never by the prompt.
+        """
+        voice = TTS_VOICE_LOOKUP.get((voice_name or "").lower(), DEFAULT_SPEECH_VOICE)
+        return await generate_google_tts_audio(
+            self.api_key, self.model_name, directed_prompt or transcript,
+            voice_name=voice, temperature=temperature,
+            max_output_tokens=_speech_token_cap(transcript, max_bytes),
+            language_code=language_code)

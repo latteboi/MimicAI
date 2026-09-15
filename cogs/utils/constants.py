@@ -87,6 +87,11 @@ class DefaultConfigNamespace:
         self.LIMIT_BORROWED = 100
         self.LIMIT_LTM = 5000
         self.LIMIT_TRAINING = 100
+        self.LIMIT_VOICE_SAMPLE_BYTES = 2 * 1024 * 1024
+        # The largest file anyone sends the bot that it will download: an attachment a
+        # character reads, a reference picture, a `.mimic` import. Discord lets Nitro
+        # upload 500 MB, and media is billed by its length as well as held on disk.
+        self.LIMIT_ATTACHMENT_BYTES = 25 * 1024 * 1024
         self.CHATBOT_MEMORY_LENGTH = 20
         self.GEMINI_TEMPERATURE = 1.0
         self.GEMINI_TOP_P = 0.95
@@ -170,6 +175,13 @@ OPENROUTER_DATA_POLICY_BLOCKED = (
     "No OpenRouter host serves this model without the right to train on prompts, so it "
     "cannot be used here. Choose another model in `/profile manage` -> Params -> Set Models."
 )
+#: A key that exists but is resting after a rate limit (api_service._KEY_COOLDOWN_SECONDS).
+#: The key resolvers hand out nothing meanwhile, which the model factory would otherwise
+#: report as a missing key -- sending someone off to add a key they already have.
+API_KEY_COOLING_DOWN = (
+    "The API key in use here just hit its rate limit and is paused for up to a minute. "
+    "Try again shortly."
+)
 #: What a typed model id meets when the dropdown would not have offered it.
 OPENROUTER_TRAINING_MODEL_HIDDEN = (
     "No OpenRouter host is known to serve this model without training on prompts, so it "
@@ -182,6 +194,13 @@ OPENROUTER_NOT_IMAGE_MODEL = (
     "That is not one of the OpenRouter image models this bot can use. Choose one from the "
     "OpenRouter tab."
 )
+#: The speech slots' counterpart: a text model there would reach the speech endpoint and
+#: 400, and one the speech catalogue left out was left out on purpose -- see
+#: api/openrouter_speech_catalogue.
+OPENROUTER_NOT_SPEECH_MODEL = (
+    "That is not one of the OpenRouter speech models this bot can use. Choose one from the "
+    "OpenRouter tab."
+)
 #: A typed OpenRouter id in a text slot for a model that also outputs images or audio. The
 #: pickers leave those out, because the chat adapter asks for text alone.
 OPENROUTER_NOT_TEXT_MODEL = (
@@ -190,6 +209,9 @@ OPENROUTER_NOT_TEXT_MODEL = (
 )
 IMAGE_MODEL_NO_OLLAMA = (
     "Image generation has no Ollama path. Choose a Google or OpenRouter image model."
+)
+SPEECH_MODEL_NO_OLLAMA = (
+    "Text-to-speech has no Ollama path. Choose a Google or OpenRouter speech model."
 )
 
 # Define the allowed models for the new command
@@ -211,10 +233,8 @@ AUDIO_MODELS = Literal[
 #
 #: The image models take their output controls in `generationConfig.imageConfig`
 #: and the TTS models take a voice name in `speechConfig`. Neither is a free string: an
-#: unknown voice or an aspect ratio the model does not carry comes back as a 400, and for
-#: TTS that surfaces as silence rather than an error, because _generate_google_tts
-#: swallows the failure and returns no stream. So the pickers offer these lists and
-#: nothing else.
+#: unknown voice or an aspect ratio the model does not carry comes back as a 400 on every
+#: request. So the pickers offer these lists and nothing else.
 
 #: Every aspect ratio the Gemini 3 image models accept. The 2.5 model and 3 Pro carry
 #: the ten "photographic" ones only -- the four extreme banner ratios are 3.1-exclusive,
@@ -452,23 +472,43 @@ IMAGE_OUTPUT_KEYS = ('image_aspect_ratio', 'image_size', 'image_thinking_level',
 #: drifted, one summary defaulting to an unprefixed id its own builder prefixed.
 DEFAULT_IMAGE_MODEL = 'GOOGLE/gemini-2.5-flash-image'
 DEFAULT_SPEECH_MODEL = 'GOOGLE/gemini-2.5-flash-preview-tts'
+#: The speech temperature written into every profile created from now on. A profile with
+#: none still reads 1.0, which is why this is written in rather than made the fallback:
+#: existing profiles keep sounding as they do.
+NEW_PROFILE_SPEECH_TEMPERATURE = 0.1
+#: The `speechConfig.languageCode` values Google documents for speech, as (code, name), in
+#: name order. A profile stores one as `speech_language`; absent or "" sends no field, and
+#: the model detects the language from the text.
+SPEECH_LANGUAGES = (
+    ("ar-XA", "Arabic"), ("bn-IN", "Bengali"), ("nl-NL", "Dutch"),
+    ("en-AU", "English (Australia)"), ("en-IN", "English (India)"), ("en-GB", "English (UK)"),
+    ("en-US", "English (US)"), ("fr-CA", "French (Canada)"), ("fr-FR", "French (France)"),
+    ("de-DE", "German"), ("gu-IN", "Gujarati"), ("hi-IN", "Hindi"), ("id-ID", "Indonesian"),
+    ("it-IT", "Italian"), ("ja-JP", "Japanese"), ("kn-IN", "Kannada"), ("ko-KR", "Korean"),
+    ("ml-IN", "Malayalam"), ("cmn-CN", "Mandarin Chinese"), ("mr-IN", "Marathi"),
+    ("pl-PL", "Polish"), ("pt-BR", "Portuguese (Brazil)"), ("ru-RU", "Russian"),
+    ("es-ES", "Spanish (Spain)"), ("es-US", "Spanish (US)"), ("ta-IN", "Tamil"),
+    ("te-IN", "Telugu"), ("th-TH", "Thai"), ("tr-TR", "Turkish"), ("vi-VN", "Vietnamese"),
+)
+SPEECH_LANGUAGE_NAMES = dict(SPEECH_LANGUAGES)
+#: `speed` on OpenRouter's speech endpoint, bounded as OpenAI's TTS bounds it. Hosts that do
+#: not support it ignore it.
+SPEECH_SPEED_MIN, SPEECH_SPEED_MAX = 0.25, 4.0
 
 #: Config keys whose option list is the image or audio catalogue rather than the text
 #: one. The fallback slots belong here too: without them a fallback dropdown would offer
-#: text models for an image slot. Image slots route by prefix, to Gemini or to OpenRouter's
-#: Image API (api/openrouter_images); audio slots are always Google-routed.
+#: text models for an image slot. Both route by prefix: image to Gemini or OpenRouter's
+#: Image API (api/openrouter_images), audio to Gemini or OpenRouter's speech endpoint
+#: (api/openrouter_speech).
 IMAGE_MODEL_KEYS = frozenset({'image_generation_model', 'image_generation_fallback_model'})
 AUDIO_MODEL_KEYS = frozenset({'speech_model', 'speech_fallback_model'})
 
-#: Slots that may only ever hold a Google model, and the reason differs per slot.
-#: Speech is Google-only because the OpenRouter adapter speaks chat/completions and speech
-#: lives on a separate OpenRouter endpoint nothing here calls. Grounding is
-#: Google-only because the phase attaches the native `google_search` tool, which has no
-#: equivalent our adapter can send -- an OpenRouter id here never ran on OpenRouter, it
-#: silently resolved to the Google default. The pickers refuse these rather than storing
-#: a value that cannot be honoured. Image left this set when OpenRouter's Image API got an
-#: adapter of its own.
-GOOGLE_ONLY_MODEL_KEYS = AUDIO_MODEL_KEYS | frozenset({
+#: Slots that may only ever hold a Google model. Grounding attaches the native
+#: `google_search` tool, which has no equivalent our adapter can send -- an OpenRouter id
+#: here never ran on OpenRouter, it silently resolved to the Google default. The pickers
+#: refuse these rather than storing a value that cannot be honoured. Image and then speech
+#: left this set when OpenRouter's endpoints for each got an adapter of their own.
+GOOGLE_ONLY_MODEL_KEYS = frozenset({
     'grounding_rag_model', 'grounding_rag_fallback_model',
 })
 
@@ -684,6 +724,18 @@ BORROW_INDEX_FILE = os.path.join(DATA_DIR, "borrows.json")
 #: Plaintext costs nothing: the same names are already in index.json, and are what
 #: the profile answers to in chat.
 PROFILE_NAME_SIDECAR = "name.json"
+#: A profile's voice sample: the sealed audio, and a sealed record of what it is and who
+#: vouched for it. Kept in the profile's own directory, so deleting the profile removes
+#: them, and never copied -- clone, convert and export build a profile from its config and
+#: prompts. A borrow speaks with its source's, found through `original_pid`.
+VOICE_SAMPLE_AUDIO_FILE = "voice_sample.bin"
+VOICE_SAMPLE_RECORD_FILE = "voice_sample.json.gz"
+#: File suffix -> the audio type a sample is stored and sent as, for an upload Discord did
+#: not label.
+VOICE_SAMPLE_TYPES = {
+    ".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".opus": "audio/ogg",
+    ".flac": "audio/flac", ".m4a": "audio/mp4", ".webm": "audio/webm",
+}
 #: The first character of a PID records which map in index.json owns it. Minted in
 #: _get_or_create_user_profile ('A'), _get_or_create_system_profile ('X') and
 #: _accept_share_request ('B' private share / 'C' public library).
@@ -1657,6 +1709,37 @@ ERR_REASON_PROVIDER_ERROR = "Provider Error"
 ERR_REASON_TIMEOUT_MAIN = "Timed-out"
 ERR_REASON_TIMEOUT_FALLBACK = "Fallback Timed-out"
 ERR_REASON_TIMEOUT_BOTH = "Timed-out"
+
+#: Why a voice line did not arrive. A refusal names what refused: Google documents that
+#: vague performance direction fails its speech classifier as PROHIBITED_CONTENT, so that
+#: one points at the Director's Desk rather than at the reply.
+ERR_REASON_SPEECH_REFUSED = "Refused by the speech model: {reason}"
+ERR_REASON_SPEECH_PROHIBITED = "Prohibited Content; vague Director's Desk notes can trigger this"
+ERR_REASON_NO_AUDIO = "The speech model returned no audio"
+ERR_REASON_NOTHING_TO_SPEAK = "The reply has nothing to say aloud"
+#: A turn's speech retries one timeout and no more, so a timeout that surfaces is the second.
+ERR_REASON_SPEECH_TIMED_OUT = "The speech model timed out twice"
+
+#: Why a voice sample was not taken. The size is LIMIT_VOICE_SAMPLE_BYTES: cloning needs
+#: seconds of clean speech, and the sample rides every request the profile speaks with.
+VOICE_SAMPLE_NOT_OWN = (
+    "Only a profile you own can be given a cloned voice. A borrowed profile speaks with "
+    "its author's."
+)
+VOICE_SAMPLE_NOT_AUDIO = (
+    "That file is not audio. Upload a WAV, MP3, OGG, FLAC, M4A or WebM recording."
+)
+VOICE_SAMPLE_TOO_LARGE = (
+    "That recording is over the {limit} MB limit. A clean 10 to 30 second clip of one "
+    "speaker is all a model needs."
+)
+ERR_REASON_AUDIO_TOO_LARGE = "{size} MB of audio, over this server's {limit} MB upload limit"
+ERR_REASON_AUDIO_NOT_UPLOADED = "Discord refused the audio file as too large"
+
+#: Stands in a user's turn for an attachment over LIMIT_ATTACHMENT_BYTES, which is never
+#: downloaded, so the character knows a file was sent instead of answering as if none was.
+ATTACHMENT_SKIPPED_NOTE = "[Attachment not read, over the {limit} MB limit: {filename} ({size} MB)]"
+IMPORT_FILE_TOO_LARGE = "❌ That file is over the {limit} MB import limit."
 
 API_ERROR_MAPPINGS = {
     ("empty response",): "Empty Response (AI failed to output text content)",

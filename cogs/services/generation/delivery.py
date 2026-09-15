@@ -8,7 +8,7 @@ from typing import Optional, List
 from ...utils.constants import PLACEHOLDER_EMOJI
 from ...utils.helpers import (_split_into_sentences_with_abbreviations, _yield_message_chunks,
                               apply_typing_cursor, default_profile_avatar_url,
-                              resolve_typing_cursor, typing_cursor_cost)
+                              resolve_typing_cursor, typing_cursor_cost, upload_too_large)
 
 
 class DeliveryMixin:
@@ -27,8 +27,44 @@ class DeliveryMixin:
                                    profile_owner_id_for_appearance: Optional[int] = None,
                                    profile_name_for_appearance: Optional[str] = None,
                                    file: Optional[discord.File] = None,
-                                   bypass_typing: bool = False # [NEW] Flag to skip delays
+                                   bypass_typing: bool = False
                                    ) -> List[discord.Message]:
+        """Sends `content` as the profile, and sends it again without `file` if Discord
+        refuses the file as too large.
+
+        The file only ever rides the first message, so a refusal means nothing has posted
+        and the second send duplicates nothing. Without it the refusal escaped and took the
+        text with it: a voice line past the server's upload limit lost the reply it read.
+        """
+        kwargs = dict(embeds=embeds, reply_to=reply_to, mention_user=mention_user,
+                      store_prompt_for_id=store_prompt_for_id,
+                      target_message_to_edit=target_message_to_edit,
+                      profile_owner_id_for_appearance=profile_owner_id_for_appearance,
+                      profile_name_for_appearance=profile_name_for_appearance,
+                      bypass_typing=bypass_typing)
+        try:
+            return await self._send_channel_message_once(channel, content, file=file, **kwargs)
+        except discord.HTTPException as e:
+            if file is None or not upload_too_large(e):
+                raise
+            print(f"Discord refused {file.filename} as too large; sending the message without it.")
+            if not content.strip() and not embeds:
+                return []
+            return await self._send_channel_message_once(channel, content, **kwargs)
+
+    async def _send_channel_message_once(self,
+                                         channel: discord.abc.Messageable,
+                                         content: str,
+                                         embeds: Optional[List[discord.Embed]] = None,
+                                         reply_to: Optional[discord.Message] = None,
+                                         mention_user: bool = False,
+                                         store_prompt_for_id: Optional[str] = None,
+                                         target_message_to_edit: Optional[discord.Message] = None,
+                                         profile_owner_id_for_appearance: Optional[int] = None,
+                                         profile_name_for_appearance: Optional[str] = None,
+                                         file: Optional[discord.File] = None,
+                                         bypass_typing: bool = False # [NEW] Flag to skip delays
+                                         ) -> List[discord.Message]:
 
         if not content.strip() and target_message_to_edit:
             try:
@@ -262,6 +298,10 @@ class DeliveryMixin:
                         pass
                 return sent_messages_list
             except Exception as e:
+                if file and upload_too_large(e):
+                    # Straight to _send_channel_message, which drops the file: the standard
+                    # send below would only upload it again for the same answer.
+                    raise
                 print(f"Realistic typing failed, falling back to standard send. Error: {e}")
                 traceback.print_exc()
 
@@ -315,6 +355,10 @@ class DeliveryMixin:
                     print(f"Webhook send failed, falling back to regular message. Error: {e}")
                     sent_message_part = None
                 except Exception as e:
+                    if current_file_for_api and upload_too_large(e):
+                        # The file was refused, not the webhook: channel.send would upload
+                        # it again for the same answer. _send_channel_message drops it.
+                        raise
                     print(f"Webhook send failed, falling back to regular message. Error: {e}")
                     sent_message_part = None
 

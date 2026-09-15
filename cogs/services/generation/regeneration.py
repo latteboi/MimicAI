@@ -16,6 +16,7 @@ from ...utils.helpers import (
     _scrub_response_text, is_citation_subtext, is_real_model, record_billed_usage,
     resolve_native_tools,
 )
+from ...utils.attachment_limits import over_attachment_limit
 from ._shared import _strip_neuro_update_and_scrub
 
 
@@ -268,7 +269,9 @@ class RegenerationMixin:
                     target_msg_id = user_msg_ids[-1]
                     try:
                         target_msg = await channel.fetch_message(target_msg_id)
-                        attachments = [a for a in target_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))]
+                        # A file over the limit was never read into the turn, so it is not
+                        # recovered into the regeneration either.
+                        attachments = [a for a in target_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/")) and not over_attachment_limit(a)]
                         if attachments:
                             for attachment in attachments:
                                 recovered_media_parts.append({"url": attachment.url, "mime_type": attachment.content_type})
@@ -279,7 +282,7 @@ class RegenerationMixin:
                                 r_ch = self.cog.bot.get_channel(target_msg.reference.channel_id)
                                 if r_ch: ref_msg = await r_ch.fetch_message(target_msg.reference.message_id)
                             if ref_msg and ref_msg.attachments:
-                                ref_media = next((a for a in ref_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))), None)
+                                ref_media = next((a for a in ref_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/")) and not over_attachment_limit(a)), None)
                                 if ref_media:
                                     recovered_media_parts.append({"url": ref_media.url, "mime_type": ref_media.content_type})
                     except Exception as e:

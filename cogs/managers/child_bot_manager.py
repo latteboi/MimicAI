@@ -18,8 +18,10 @@ from ..utils.constants import (
     IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS,
 )
 from ..utils.helpers import (_resolve_safety_settings, _split_into_sentences_with_abbreviations,
-                             apply_typing_cursor, image_rag_enabled, typing_cursor_cost)
-from ..utils.http_client import get_shared_client
+                             apply_typing_cursor, image_rag_enabled, typing_cursor_cost,
+                             upload_too_large)
+from ..utils.attachment_limits import over_attachment_limit
+from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager
 from .session_manager import NEW_SESSION_COMPACTION
 
@@ -465,9 +467,9 @@ class ChildBotManager:
         try:
             # size=96 is what a message renders at, and it keeps an animated source
             # inside the 256 KB upload limit that the full-size original can exceed.
-            resp = await get_shared_client().get(
-                f"{partial.url}?size=96", follow_redirects=True, timeout=15.0)
-            if resp.status_code != 200 or len(resp.content) > MAX_EMOJI_SIZE_BYTES:
+            resp = await get_capped(get_shared_client(), f"{partial.url}?size=96",
+                                    MAX_EMOJI_SIZE_BYTES, timeout=15.0)
+            if resp.content is None:
                 return None
             created = await child.create_application_emoji(name=name, image=resp.content)
             return str(created)
@@ -750,6 +752,15 @@ class ChildBotManager:
 
             return sent_messages
         except Exception as e:
+            if file_to_send is not None and not sent_messages and upload_too_large(e):
+                # The file was refused, not the message. It only rides the first send, so
+                # nothing has posted: send the text on its own rather than lose both.
+                print(f"[ChildBotManager] Bot {bot_id}: {file_to_send.filename} refused as too large; "
+                      f"sending the text without it.")
+                if content.strip():
+                    return await self.execute_send(
+                        bot_id, {k: v for k, v in payload.items() if k != "attachment"})
+                return sent_messages
             print(f"[ChildBotManager] Delivery error for {bot_id}: {e}")
             return sent_messages
         finally:
@@ -801,10 +812,11 @@ class ChildBotManager:
                 if url:
                     # Was a per-call aiohttp.ClientSession, which built its own SSL
                     # context and connector for one GET. Shares the pool now.
-                    resp = await get_shared_client().get(url, follow_redirects=True, timeout=15.0)
-                    if resp.status_code == 200:
+                    resp = await get_capped(get_shared_client(), url, MAX_AVATAR_SIZE_BYTES,
+                                            timeout=15.0)
+                    if resp.content is not None:
                         data = resp.content
-                        if len(data) < MAX_AVATAR_SIZE_BYTES:
+                        if data:
                             # Imported here rather than at module scope: Pillow
                             # costs ~6 MB of RSS and this -- a child bot having its
                             # avatar changed -- is the only path in the process
@@ -1112,7 +1124,7 @@ class ChildBotManager:
             attachments_data = message_data.get("attachments", [])
             if len(reference_image_urls) < 10 and attachments_data:
                 for attachment in attachments_data:
-                    if attachment.get("url"):
+                    if attachment.get("url") and not over_attachment_limit(attachment):
                         reference_image_urls.append({"url": attachment.get("url"), "mime_type": attachment.get("content_type", "image/png")})
                         if len(reference_image_urls) >= 10:
                             break

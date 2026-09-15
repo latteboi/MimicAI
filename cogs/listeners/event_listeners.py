@@ -16,6 +16,7 @@ from ..utils.member_probe import start_member_probe
 from ..utils import mem_probe
 from ..utils.content import WELCOME_MESSAGE, WELCOME_CHANNEL_HINTS
 from ..utils.helpers import _format_history_entry, _get_user_hash
+from ..utils.attachment_limits import over_attachment_limit
 from ..utils.fuzzy import rank_keyed
 
 
@@ -327,11 +328,11 @@ class EventListeners:
             image_prefixes = ("!image", "!imagine")
             is_image_request = content_lower.startswith(image_prefixes)
 
-            attachments_data = [{"url": a.url, "filename": a.filename, "content_type": a.content_type} for a in message.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/") or a.content_type.startswith("text/") or a.filename.lower().endswith(('.txt', '.log', '.md', '.csv', '.json', '.py', '.js', '.html', '.css', '.xml')))]
+            attachments_data = [{"url": a.url, "filename": a.filename, "content_type": a.content_type, "size": a.size} for a in message.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/") or a.content_type.startswith("text/") or a.filename.lower().endswith(('.txt', '.log', '.md', '.csv', '.json', '.py', '.js', '.html', '.css', '.xml')))]
             
             reply_data = None
             if ref_msg:
-                ref_attach_url = ref_msg.attachments[0].url if ref_msg.attachments and ref_msg.attachments[0].content_type.startswith("image/") else None
+                ref_attach_url = ref_msg.attachments[0].url if ref_msg.attachments and ref_msg.attachments[0].content_type.startswith("image/") and not over_attachment_limit(ref_msg.attachments[0]) else None
                 reply_data = {
                     "id": ref_msg.id, "channel_id": ref_msg.channel.id,
                     "attachment_url": ref_attach_url, "author_name": ref_msg.author.display_name

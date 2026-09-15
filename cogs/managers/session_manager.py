@@ -81,6 +81,10 @@ class SessionManager:
         channel = self.cog.bot.get_channel(channel_id)
         server_id = channel.guild.id if channel and getattr(channel, 'guild', None) else None
         if not server_id:
+            # An archived thread is not cached, but its log is filed under the same server
+            # as its blueprint -- which is how a deleted channel's log is found to remove.
+            server_id = self._blueprint_homes().get(str(channel_id))
+        if not server_id:
             raise ValueError("Sessions are not supported in Direct Messages.")
         return pathlib.Path(SERVERS_DIR) / str(server_id) / "sessions" / str(channel_id) / session_type
 
@@ -468,11 +472,12 @@ class SessionManager:
         """Delete every `<server>/sessions/` tree left on disk. Returns the count.
 
         `_delete_session_from_disk` resolves a channel's directory through
-        `bot.get_channel`, so a session whose channel is uncached -- deleted, or in a
-        guild the bot has lost access to -- keeps its log no matter how many times it
-        is suspended. Those are precisely the logs a global wipe exists to reach, so
-        the sweep goes by path rather than by live channel. Nothing but session logs
-        lives under `sessions/`; profiles, memories and the server index sit elsewhere.
+        `bot.get_channel`, or else the server its blueprint is filed under, so a session
+        with neither -- its channel gone and its blueprint already dropped -- keeps its log
+        no matter how many times it is suspended. Those are precisely the logs a global
+        wipe exists to reach, so the sweep goes by path rather than by live channel.
+        Nothing but session logs lives under `sessions/`; profiles, memories and the
+        server index sit elsewhere.
         """
         removed = 0
         servers_path = pathlib.Path(SERVERS_DIR)
@@ -707,6 +712,8 @@ class SessionManager:
         # walked, rather than per session -- _save_multi_profile_sessions rewrites all
         # of them anyway, so calling it inside the loop would be O(servers) full saves.
         repaired_any = False
+        #: Restored sessions whose channel is not cached, in a guild that is up.
+        uncached = []
 
         servers_dir = SERVERS_DIR
         if not os.path.isdir(servers_dir):
@@ -715,6 +722,7 @@ class SessionManager:
         for server_id_str in os.listdir(servers_dir):
             if not server_id_str.isdigit():
                 continue
+            guild = self.cog.bot.get_guild(int(server_id_str))
 
             server_index = self.cog.server_manager._get_server_index(server_id_str)
             active_sessions = server_index.get("active_sessions", {})
@@ -728,7 +736,14 @@ class SessionManager:
                 try:
                     channel_id = int(ch_id_str)
                     channel = self.cog.bot.get_channel(channel_id)
-                    if not channel or not channel.guild: continue
+                    # An archived thread drops out of discord.py's cache, and a guild in an
+                    # outage has no channels. Skipping those erased them, since the next save
+                    # rebuilds every index from memory: restored while the bot is still in
+                    # the guild, and suspended only once Discord reports the channel deleted.
+                    if channel is None and guild is None:
+                        continue
+                    if channel is not None and not channel.guild:
+                        continue
 
                     owner_id = session_data.get("owner_id")
                     profiles_data = session_data.get("profiles",[])
@@ -761,16 +776,79 @@ class SessionManager:
                         # existed keeps the admin-only access it was configured under.
                         "cast_policy": session_data.get("cast_policy", DEFAULT_CAST_POLICY),
                         "started": session_data.get("started", True),
+                        # Set in /session config like everything above; a blueprint that left
+                        # them out lost the TTS toggle and the response limit on every restart.
+                        "audio_mode": session_data.get("audio_mode", "off"),
+                        "max_responses": session_data.get("max_responses", 10),
                     }
+                    if channel is None and not guild.unavailable:
+                        uncached.append(channel_id)
                 except Exception as e:
                     print(f"Unexpected error reloading multi-profile sessions for server {server_id_str}, channel {ch_id_str}: {e}")
 
         if repaired_any:
             self._save_multi_profile_sessions()
 
+        if uncached:
+            # In the background: it is a request per channel, and boot has child bots to
+            # start. A guild still in an outage is not asked; the next boot asks for it.
+            task = asyncio.create_task(self._drop_deleted_channel_sessions(uncached))
+            self.cog.background_tasks.add(task)
+            task.add_done_callback(self.cog.background_tasks.discard)
+
+    async def _drop_deleted_channel_sessions(self, channel_ids: List[int]) -> None:
+        """Suspends each restored session whose channel Discord reports deleted.
+
+        Boot restores a session whose channel is not cached, because that is also what an
+        archived thread looks like, and only asking Discord tells the two apart. Only a 404
+        counts: a thread that still exists, a channel the bot has lost access to and a
+        request that failed all keep the session.
+        """
+        dropped = False
+        for channel_id in channel_ids:
+            if channel_id not in self.cog.multi_profile_channels or self.cog.bot.get_channel(channel_id):
+                continue
+            try:
+                await self.cog.bot.fetch_channel(channel_id)
+                continue
+            except discord.NotFound:
+                pass
+            except Exception:
+                continue
+            if await self.suspend_channel_session(channel_id):
+                dropped = True
+                print(f"Suspended the session in channel {channel_id}: Discord reports the channel deleted.")
+        if dropped:
+            self._save_multi_profile_sessions()
+
+    def _blueprint_homes(self) -> Dict[str, str]:
+        """Channel id -> the server whose index files its blueprint, for every blueprint.
+
+        A session's server is read off its cached channel, but an archived thread drops out
+        of discord.py's cache and a guild in an outage has no channels -- while the session's
+        blueprint and log stay filed under that server. Walks every server index, so it is
+        for the uncached case only.
+        """
+        homes = {}
+        if not os.path.isdir(SERVERS_DIR):
+            return homes
+        for server_id_str in os.listdir(SERVERS_DIR):
+            if not server_id_str.isdigit():
+                continue
+            active_sessions = self.cog.server_manager._get_server_index(server_id_str).get("active_sessions")
+            if not isinstance(active_sessions, dict):
+                continue
+            for category in active_sessions.values():
+                if isinstance(category, dict):
+                    for ch_id_str in category:
+                        homes.setdefault(ch_id_str, server_id_str)
+        return homes
+
     def _save_multi_profile_sessions(self):
         try:
             current_server_sessions = collections.defaultdict(lambda: {"regular": {}})
+            #: Where each blueprint is filed, read only once a session's channel is not cached.
+            homes = None
 
             for channel_id, session_data in self.cog.multi_profile_channels.items():
                 # A shell opened by `/session config` and abandoned before anyone was
@@ -780,7 +858,18 @@ class SessionManager:
                     continue
 
                 channel = self.cog.bot.get_channel(channel_id)
-                server_id_str = str(channel.guild.id) if channel and getattr(channel, 'guild', None) else "dm"
+                if channel is not None and getattr(channel, 'guild', None):
+                    server_id_str = str(channel.guild.id)
+                else:
+                    # Not cached: an archived thread, or a guild in an outage. Filing it
+                    # under "dm" wrote it nowhere, so the save dropped it from its guild's
+                    # index and the next restart lost the session. It stays where it is
+                    # filed; one never filed has nowhere to go.
+                    if homes is None:
+                        homes = self._blueprint_homes()
+                    server_id_str = homes.get(str(channel_id))
+                    if server_id_str is None:
+                        continue
 
                 category = "regular"
 
@@ -812,6 +901,8 @@ class SessionManager:
                     "compaction": session_data.get("compaction", {}),
                     "cast_policy": session_data.get("cast_policy", DEFAULT_CAST_POLICY),
                     "started": bool(session_data.get("started", True)),
+                    "audio_mode": session_data.get("audio_mode", "off"),
+                    "max_responses": session_data.get("max_responses", 10),
                 }
 
                 current_server_sessions[server_id_str][category][str(channel_id)] = blueprint
@@ -1090,6 +1181,8 @@ class SessionManager:
                             "task_queue": asyncio.Queue(),
                             "is_running": False,
                             "started": session_config.get("started", True),
+                            "audio_mode": session_config.get("audio_mode", "off"),
+                            "max_responses": session_config.get("max_responses", 10),
                         }
                         self.cog.multi_profile_channels[channel_id] = session
                     else:
@@ -1102,6 +1195,8 @@ class SessionManager:
                         session["proactivity"] = session_config.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."})
                         session["compaction"] = session_config.get("compaction", {})
                         session["cast_policy"] = session_config.get("cast_policy", DEFAULT_CAST_POLICY)
+                        session["audio_mode"] = session_config.get("audio_mode", "off")
+                        session["max_responses"] = session_config.get("max_responses", 10)
 
         if not session: return None
 

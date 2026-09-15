@@ -15,7 +15,8 @@ from ..utils.constants import (
     IMAGE_MODEL_KEYS, AUDIO_MODEL_KEYS, DEFAULT_SPEECH_VOICE,
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
     THINKING_LEVELS_TO_OLLAMA, GEMINI_FREE_TIER_BLOCKED, OLLAMA_OWNER_ONLY,
-    OPENROUTER_DATA_POLICY_BLOCKED, IMAGE_MODEL_NO_OLLAMA,
+    OPENROUTER_DATA_POLICY_BLOCKED, IMAGE_MODEL_NO_OLLAMA, SPEECH_MODEL_NO_OLLAMA,
+    API_KEY_COOLING_DOWN,
 )
 from ..utils.data_policy import openrouter_data_collection
 from ..managers.storage_manager import IOManager
@@ -40,7 +41,7 @@ from ..utils import mem_probe
 # help_service all import them from here.
 from .api.embeddings import get_embedding_vector
 from .api.google_rest import (
-    GoogleRESTModel, GoogleRESTResponse, close_google_rest_client,
+    GoogleRESTModel, GoogleRESTResponse, GoogleSpeechModel, close_google_rest_client,
     generate_google_tts_audio, get_google_rest_client, materialise_inline_data,
 )
 from .api.ollama import OllamaModel, OllamaResponse
@@ -48,6 +49,8 @@ from .api.openrouter import OpenRouterModel
 from .api.openrouter_catalogue import BROWSE_POPULAR, OpenRouterCatalogue
 from .api.openrouter_image_catalogue import OpenRouterImageCatalogue
 from .api.openrouter_images import OpenRouterImageModel
+from .api.openrouter_speech import OpenRouterSpeechModel
+from .api.openrouter_speech_catalogue import OpenRouterSpeechCatalogue
 from .api.rest_view import _BlobRef, _EnumStr, _RestView
 
 _KEY_COOLDOWN_SECONDS = 60.0
@@ -64,9 +67,13 @@ def _cooldown_key_on_rate_limit(cog, api_key: Optional[str], error: BaseExceptio
         cog.api_key_cooldowns[api_key] = time.time() + _KEY_COOLDOWN_SECONDS
 
 
-def _with_key_cooldown_tracking(cog, model, api_key: str):
-    """Wraps model.generate_content_async so a rate-limit response cools the BYO key down."""
-    original = model.generate_content_async
+def _with_key_cooldown_tracking(cog, model, api_key: str, method: str = "generate_content_async"):
+    """Wraps the model's call method so a rate-limit response cools the BYO key down.
+
+    `method` is `generate_content_async` for every adapter but speech, whose one call is
+    `synthesise`.
+    """
+    original = getattr(model, method)
 
     async def _tracked(*args, **kwargs):
         try:
@@ -77,8 +84,16 @@ def _with_key_cooldown_tracking(cog, model, api_key: str):
             _cooldown_key_on_rate_limit(cog, api_key, e)
             raise
 
-    model.generate_content_async = _tracked
+    setattr(model, method, _tracked)
     return model
+
+
+def _refusal(message: str) -> ValueError:
+    """A refusal already phrased for the user, carried whole as `formatted_reason`:
+    `_format_api_error` would cut a plain message at 80 characters."""
+    error = ValueError(message)
+    error.formatted_reason = message
+    return error
 
 
 # --- Google adapter routing ----------------------------------------------------
@@ -113,6 +128,9 @@ class APIService:
         #: and refreshed with the text catalogue; `_instantiate_model` reads it to decide
         #: whether an OpenRouter image model may serve a server at all.
         self.image_catalogue = OpenRouterImageCatalogue(MODELS_DATA_DIR)
+        #: The speech models the same sync lists -- see api/openrouter_speech_catalogue. Read
+        #: by the factory for the same decision, and for the voices each model takes.
+        self.speech_catalogue = OpenRouterSpeechCatalogue(MODELS_DATA_DIR)
         self._catalogue_loaded = False
         #: The pricing table, held in memory. `_get_model_pricing` used to re-read and
         #: parse the whole file per call, and the audit screens call it once per turn.
@@ -121,7 +139,7 @@ class APIService:
         #: first. Shared by every picker -- see probe_ollama.
         self._ollama_probes: "OrderedDict[str, Tuple[bool, List[str]]]" = OrderedDict()
 
-    def _instantiate_model(self, raw_model_name: str, guild_id, user_id, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, profile_settings=None, openrouter_key_error: str = None, google_key_error: str = None, use_broad_openrouter_heuristic: bool = True, config_owner_id=None, policy_guild_id=None, conversation: bool = False, image_config=None):
+    def _instantiate_model(self, raw_model_name: str, guild_id, user_id, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, profile_settings=None, openrouter_key_error: str = None, google_key_error: str = None, use_broad_openrouter_heuristic: bool = True, config_owner_id=None, policy_guild_id=None, conversation: bool = False, image_config=None, speech: bool = False):
         """One adapter for `raw_model_name`, keyed and policed for where it will run.
 
         `guild_id` picks whose key pays: the server's, or `user_id`'s own when None. A
@@ -144,7 +162,16 @@ class APIService:
         deny training hosts, an image model is refused outright unless the image catalogue
         knows its one host does not train; an id the catalogue does not list is refused
         too, since there is no per-request deny to fall back on.
+
+        `speech=True` makes it a speech model: an adapter whose `synthesise(transcript,
+        directed_prompt, voice_name, temperature)` returns the path of an audio file. Built
+        here for the reason images are -- the key gate and the rate-limit cooldown live in
+        this one place, and speech that resolved its own key was subject to neither. An
+        OpenRouter speech model is judged as an image model is: its endpoint takes no
+        `data_collection` either, so the speech catalogue decides.
         """
+        if speech and image_config is not None:
+            raise TypeError("a model is an image model or a speech model, not both")
         # System prefixes 'GOOGLE/', 'OPENROUTER/', and 'OLLAMA/' are strictly case-sensitive.
         # OpenRouter hosts models under lowercase creator namespaces like 'google/gemini-2.5-flash'.
         actual_name = raw_model_name
@@ -181,17 +208,24 @@ class APIService:
 
         if is_openrouter:
             api_key = storage._get_api_key_for_guild(guild_id, "openrouter") if guild_id else storage._get_api_key_for_user(user_id, "openrouter")
+            if not api_key and storage.key_cooling_down(guild_id, user_id, "openrouter"):
+                raise _refusal(API_KEY_COOLING_DOWN)
             if not api_key: raise ValueError(openrouter_key_error or "OpenRouter API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
             data_collection = (openrouter_data_collection(
                 self.cog.server_manager._get_server_index(str(policy_guild)) if policy_guild else None)
                 if gated else None)
+            if speech:
+                # No `data_collection` to send here either, so the model itself is judged.
+                if data_collection == "deny" and not self.speech_catalogue.is_open(actual_name):
+                    raise _refusal(OPENROUTER_DATA_POLICY_BLOCKED)
+                model = OpenRouterSpeechModel(actual_name, api_key,
+                                              voices=self.speech_catalogue.voices(actual_name),
+                                              clones=self.speech_catalogue.clones(actual_name))
+                return _with_key_cooldown_tracking(self.cog, model, api_key, "synthesise")
             if image_config is not None:
                 # No `data_collection` to send, so the model itself is judged -- see above.
                 if data_collection == "deny" and not self.image_catalogue.is_open(actual_name):
-                    refusal = ValueError(OPENROUTER_DATA_POLICY_BLOCKED)
-                    # Carried whole: _format_api_error cuts a plain message at 80 characters.
-                    refusal.formatted_reason = OPENROUTER_DATA_POLICY_BLOCKED
-                    raise refusal
+                    raise _refusal(OPENROUTER_DATA_POLICY_BLOCKED)
                 model = OpenRouterImageModel(
                     actual_name, api_key=api_key, system_instruction=system_instruction,
                     image_params=resolve_image_output_params(image_config, f"OPENROUTER/{actual_name}"))
@@ -201,6 +235,8 @@ class APIService:
         elif is_ollama:
             if image_config is not None:
                 raise ValueError(IMAGE_MODEL_NO_OLLAMA)
+            if speech:
+                raise ValueError(SPEECH_MODEL_NO_OLLAMA)
             if not self.cog.profile_manager.may_use_ollama(config_owner_id):
                 raise ValueError(OLLAMA_OWNER_ONLY)
             ollama_host = p_settings.get("ollama_host_url", OLLAMA_LOCAL_URL)
@@ -209,12 +245,17 @@ class APIService:
             if guild_id:
                 api_key = storage._get_api_key_for_guild(guild_id)
                 if not api_key and storage.gemini_blocked_for_guild(guild_id):
-                    raise ValueError(GEMINI_FREE_TIER_BLOCKED)
+                    raise _refusal(GEMINI_FREE_TIER_BLOCKED)
             else:
                 if conversation and not storage.personal_gemini_allowed_in_conversation(user_id, policy_guild):
-                    raise ValueError(GEMINI_FREE_TIER_BLOCKED)
+                    raise _refusal(GEMINI_FREE_TIER_BLOCKED)
                 api_key = storage._get_api_key_for_user(user_id)
+            if not api_key and storage.key_cooling_down(guild_id, user_id):
+                raise _refusal(API_KEY_COOLING_DOWN)
             if not api_key: raise ValueError(google_key_error or "Google API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
+            if speech:
+                return _with_key_cooldown_tracking(
+                    self.cog, GoogleSpeechModel(actual_name, api_key), api_key, "synthesise")
             if image_config is not None:
                 # No thinking config and no mediaResolution, which an image request rejects
                 # or ignores: its options and search tool are resolved for this model instead.
@@ -235,11 +276,13 @@ class APIService:
         handling; this owns only which name to try and when to stop. That puts the five
         utility paths -- critic, grounding, LTM, image and speech -- on one retry policy
         without forcing them into one call shape, which they genuinely do not share: one
-        returns audio bytes, one drives a heartbeat, three return a candidate list.
+        returns an audio file's path, one drives a heartbeat, three return a candidate list.
 
         Only exceptions retry. An empty or safety-blocked response is a decision about
         the content, not a statement about the model being unavailable, and re-rolling
-        it on a second model spends another call to be refused again.
+        it on a second model spends another call to be refused again. An exception marked
+        `retryable = False` is that same decision raised rather than returned -- speech
+        has no response object to carry a block reason -- and is re-raised at once.
 
         A fallback equal to the primary is skipped rather than tried twice, which is
         what makes the shipped defaults cost nothing: every utility fallback defaults to
@@ -261,6 +304,8 @@ class APIService:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                if getattr(e, "retryable", True) is False:
+                    raise
                 last_error = e
                 if not is_fallback and len(attempts) > 1:
                     print(f"{label}: primary '{name}' failed "
@@ -273,7 +318,10 @@ class APIService:
             if provider == 'openrouter':
                 return self.image_catalogue.browse(BROWSE_POPULAR, show_training=False)[0]
             return list(get_args(IMAGE_MODELS))
-        if target_config_key in AUDIO_MODEL_KEYS: return list(get_args(AUDIO_MODELS))
+        if target_config_key in AUDIO_MODEL_KEYS:
+            if provider == 'openrouter':
+                return self.speech_catalogue.browse(BROWSE_POPULAR, show_training=False)[0]
+            return list(get_args(AUDIO_MODELS))
         if provider == 'google': return list(get_args(ALLOWED_MODELS))
         elif provider == 'ollama': return list((self.last_ollama_probe(ollama_host) or (False, []))[1])
         return self.catalogue.browse(BROWSE_POPULAR, show_training=False)[0]
@@ -566,6 +614,7 @@ class APIService:
             if not self._catalogue_loaded:
                 await asyncio.to_thread(self.catalogue.load)
                 await asyncio.to_thread(self.image_catalogue.load)
+                await asyncio.to_thread(self.speech_catalogue.load)
                 self._catalogue_loaded = True
 
             previous = self._pricing_rates or await asyncio.to_thread(self._read_pricing_file)
@@ -601,6 +650,11 @@ class APIService:
                 await self._sync_image_catalogue(get_shared_client())
             except Exception as e:
                 print(f"Warning: Failed to fetch the OpenRouter image catalogue: {e}")
+            # Likewise after the text listing, and independent of the image one.
+            try:
+                await self._sync_speech_catalogue(get_shared_client())
+            except Exception as e:
+                print(f"Warning: Failed to fetch the OpenRouter speech catalogue: {e}")
 
             cache_data = {
                 "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -612,9 +666,24 @@ class APIService:
         except Exception as e:
             print(f"Error in pricing_sync_task: {e}")
 
-    #: Endpoint lookups the image sync runs at once: some fifty small requests a day, spread
-    #: thin enough never to crowd a turn out of the shared client's connection pool.
-    _IMAGE_ENDPOINT_CONCURRENCY = 4
+    #: Endpoint lookups the image and speech syncs each run at once: a few dozen small
+    #: requests a day, spread thin enough never to crowd a turn out of the shared client's
+    #: connection pool.
+    _ENDPOINT_CONCURRENCY = 4
+
+    async def _endpoint_bodies(self, client, model_ids: List[str], url: str) -> Dict[str, Optional[bytes]]:
+        """Each model's endpoints body, from `url` with its id filled in; None where it failed."""
+        gate = asyncio.Semaphore(self._ENDPOINT_CONCURRENCY)
+
+        async def fetch(model_id: str):
+            async with gate:
+                try:
+                    resp = await client.get(url.format(model_id), timeout=20.0)
+                except httpx.HTTPError:
+                    return model_id, None
+            return model_id, (resp.content if resp.status_code == 200 else None)
+
+        return dict(await asyncio.gather(*(fetch(m) for m in model_ids)))
 
     async def _sync_image_catalogue(self, client) -> None:
         """Refreshes the OpenRouter image catalogue from its four documented endpoints."""
@@ -625,23 +694,32 @@ class APIService:
             "https://openrouter.ai/api/v1/models?output_modalities=image&sort=most-popular", timeout=20.0)
         model_ids = [m["id"] for m in (json.loads(models_resp.content).get("data") or [])
                      if isinstance(m, dict) and m.get("id")]
-        gate = asyncio.Semaphore(self._IMAGE_ENDPOINT_CONCURRENCY)
-
-        async def endpoints(model_id: str):
-            async with gate:
-                try:
-                    resp = await client.get(
-                        f"https://openrouter.ai/api/v1/images/models/{model_id}/endpoints", timeout=20.0)
-                except httpx.HTTPError:
-                    return model_id, None
-            return model_id, (resp.content if resp.status_code == 200 else None)
-
-        endpoint_bodies = dict(await asyncio.gather(*(endpoints(m) for m in model_ids)))
+        endpoint_bodies = await self._endpoint_bodies(
+            client, model_ids, "https://openrouter.ai/api/v1/images/models/{}/endpoints")
         account_body, _problem = await self._owner_model_listing(client, "output_modalities=image&limit=1000")
         await asyncio.to_thread(
             self.image_catalogue.apply_listing, models_resp.content,
             ranking_resp.content if ranking_resp.status_code == 200 else None,
             endpoint_bodies, account_body, self.catalogue.training_current)
+
+    async def _sync_speech_catalogue(self, client) -> None:
+        """Refreshes the OpenRouter speech catalogue from its three documented endpoints.
+
+        The listing is sorted by popularity, so it is the ranking too. Run after the text
+        sync, whose training check is what lets the speech account listing mean anything.
+        """
+        models_resp = await client.get(
+            "https://openrouter.ai/api/v1/models?output_modalities=speech&sort=most-popular", timeout=20.0)
+        if models_resp.status_code != 200:
+            raise RuntimeError(f"HTTP {models_resp.status_code}")
+        model_ids = [m["id"] for m in (json.loads(models_resp.content).get("data") or [])
+                     if isinstance(m, dict) and m.get("id")]
+        endpoint_bodies = await self._endpoint_bodies(
+            client, model_ids, "https://openrouter.ai/api/v1/models/{}/endpoints")
+        account_body, _problem = await self._owner_model_listing(client, "output_modalities=speech&limit=1000")
+        await asyncio.to_thread(
+            self.speech_catalogue.apply_listing, models_resp.content, endpoint_bodies,
+            account_body, self.catalogue.training_current)
 
     async def _owner_model_listing(self, client, query: str = "limit=1000") -> Tuple[Optional[bytes], Optional[str]]:
         """`/models/user` as the bot owner's OpenRouter account sees it, or why there is none.
