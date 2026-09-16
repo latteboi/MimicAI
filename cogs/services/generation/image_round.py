@@ -1,4 +1,4 @@
-from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_MODEL
+from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_MODEL, STATUS_IMAGINING_IMAGE
 from ...utils.helpers import _format_api_error, _resolve_safety_settings, image_suffix_for_mime
 from ...utils.memory_tuning import maybe_trim_malloc
 from ...utils import mem_probe
@@ -127,6 +127,7 @@ class ImageRoundMixin:
                     app_name=gen_app_name,
                     app_avatar=gen_app_avatar,
                     existing_state=image_state_container,
+                    status_label=STATUS_IMAGINING_IMAGE,
                 )
 
             with mem_probe.probe("  image gen: API call", peak=False):

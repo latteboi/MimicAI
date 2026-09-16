@@ -1,4 +1,6 @@
 import os
+import re
+import math
 import time
 import asyncio
 import base64
@@ -31,11 +33,6 @@ from ..utils.net_guard import safe_stream
 from ..utils.memory_tuning import maybe_trim_malloc
 from ..utils import mem_probe
 
-# How long a key that just got rate-limited is skipped for. storage_manager's
-# _get_api_key_for_guild/_get_api_key_for_user consult cog.api_key_cooldowns before
-# handing a key back out, so this is what stops a 429'd BYO key from being retried
-# on the very next turn instead of backing off.
-
 # The adapters moved to `services/api/`; these names are re-exported because
 # MimicCog, profile_manager, memory_manager, media_service, tools_service and
 # help_service all import them from here.
@@ -53,22 +50,66 @@ from .api.openrouter_speech import OpenRouterSpeechModel
 from .api.openrouter_speech_catalogue import OpenRouterSpeechCatalogue
 from .api.rest_view import _BlobRef, _EnumStr, _RestView
 
-_KEY_COOLDOWN_SECONDS = 60.0
+# A rate-limited model rests on the key that was refused, so the next turn does not send
+# it straight back into the same 429. `cog.api_key_cooldowns` maps (key, model id) to when
+# the rest ends, and `_instantiate_model` is the one place that reads it.
+#
+# Per model, not per key: Google counts its quotas per model, and an OpenRouter 429 is most
+# often one model's host turning traffic away. A whole-key rest also took the fallback down
+# with the primary -- the fallback is built after the primary fails, so it found its key
+# already resting, in exactly the case a fallback exists for.
+#
+# The provider's own hint sets the length when it gives one: Google's `retryDelay`, or the
+# reset time OpenRouter reports for its own limits. A daily quota rests the longest, because
+# nothing will be accepted before it resets.
+_RATE_LIMIT_REST_DEFAULT = 10.0
+_RATE_LIMIT_REST_MIN = 2.0
+_RATE_LIMIT_REST_MAX = 600.0
+
+_GOOGLE_RETRY_DELAY = re.compile(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"')
+# Quoted either way: OpenRouter's error body arrives as JSON text, or as the repr of a dict
+# when the error came inside a 200.
+_OPENROUTER_RATE_LIMIT_RESET = re.compile(r'''["']X-RateLimit-Reset["']\s*:\s*["']?(\d+)''', re.IGNORECASE)
 
 
+def _rate_limit_rest_seconds(error: BaseException, now: Optional[float] = None) -> Optional[float]:
+    """How long to rest a model after `error`, or None when it was not a rate limit."""
+    err_str = str(error)
+    if "429" not in err_str and "RESOURCE_EXHAUSTED" not in err_str:
+        return None
+    if "PerDay" in err_str:
+        return _RATE_LIMIT_REST_MAX
+    rest = _RATE_LIMIT_REST_DEFAULT
+    if match := _GOOGLE_RETRY_DELAY.search(err_str):
+        rest = float(match.group(1))
+    elif match := _OPENROUTER_RATE_LIMIT_RESET.search(err_str):
+        reset = int(match.group(1))
+        # Milliseconds since the epoch; seconds are accepted too.
+        reset_at = reset / 1000 if reset > 10_000_000_000 else reset
+        rest = reset_at - (time.time() if now is None else now)
+    return min(max(rest, _RATE_LIMIT_REST_MIN), _RATE_LIMIT_REST_MAX)
 
 
-
-def _cooldown_key_on_rate_limit(cog, api_key: Optional[str], error: BaseException) -> None:
+def _rest_model_on_rate_limit(cog, api_key: Optional[str], model_id: str, error: BaseException) -> None:
     if not api_key:
         return
-    err_str = str(error)
-    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-        cog.api_key_cooldowns[api_key] = time.time() + _KEY_COOLDOWN_SECONDS
+    rest = _rate_limit_rest_seconds(error)
+    if rest is not None:
+        cog.api_key_cooldowns[(api_key, model_id)] = time.time() + rest
 
 
-def _with_key_cooldown_tracking(cog, model, api_key: str, method: str = "generate_content_async"):
-    """Wraps the model's call method so a rate-limit response cools the BYO key down.
+def _rest_ends(cog, api_key: str, model_id: str) -> float:
+    """When `model_id` may next be sent on `api_key`, or 0.0 if it may be sent now."""
+    ends = cog.api_key_cooldowns.get((api_key, model_id), 0.0)
+    if ends and ends <= time.time():
+        cog.api_key_cooldowns.pop((api_key, model_id), None)
+        return 0.0
+    return ends
+
+
+def _with_key_cooldown_tracking(cog, model, api_key: str, model_id: str,
+                                method: str = "generate_content_async"):
+    """Wraps the model's call method so a rate-limit response rests this model on the key.
 
     `method` is `generate_content_async` for every adapter but speech, whose one call is
     `synthesise`.
@@ -81,7 +122,7 @@ def _with_key_cooldown_tracking(cog, model, api_key: str, method: str = "generat
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            _cooldown_key_on_rate_limit(cog, api_key, e)
+            _rest_model_on_rate_limit(cog, api_key, model_id, e)
             raise
 
     setattr(model, method, _tracked)
@@ -94,6 +135,15 @@ def _refusal(message: str) -> ValueError:
     error = ValueError(message)
     error.formatted_reason = message
     return error
+
+
+def _refuse_if_resting(cog, api_key: str, model_id: str) -> None:
+    ends = _rest_ends(cog, api_key, model_id)
+    if ends:
+        error = _refusal(API_KEY_COOLING_DOWN.format(model=model_id, ends=f"<t:{math.ceil(ends)}:R>"))
+        #: Read by callers that treat a rate limit as routine rather than as a fault.
+        error.rate_limited = True
+        raise error
 
 
 # --- Google adapter routing ----------------------------------------------------
@@ -208,9 +258,8 @@ class APIService:
 
         if is_openrouter:
             api_key = storage._get_api_key_for_guild(guild_id, "openrouter") if guild_id else storage._get_api_key_for_user(user_id, "openrouter")
-            if not api_key and storage.key_cooling_down(guild_id, user_id, "openrouter"):
-                raise _refusal(API_KEY_COOLING_DOWN)
             if not api_key: raise ValueError(openrouter_key_error or "OpenRouter API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
+            _refuse_if_resting(self.cog, api_key, actual_name)
             data_collection = (openrouter_data_collection(
                 self.cog.server_manager._get_server_index(str(policy_guild)) if policy_guild else None)
                 if gated else None)
@@ -221,7 +270,7 @@ class APIService:
                 model = OpenRouterSpeechModel(actual_name, api_key,
                                               voices=self.speech_catalogue.voices(actual_name),
                                               clones=self.speech_catalogue.clones(actual_name))
-                return _with_key_cooldown_tracking(self.cog, model, api_key, "synthesise")
+                return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name, "synthesise")
             if image_config is not None:
                 # No `data_collection` to send, so the model itself is judged -- see above.
                 if data_collection == "deny" and not self.image_catalogue.is_open(actual_name):
@@ -229,9 +278,9 @@ class APIService:
                 model = OpenRouterImageModel(
                     actual_name, api_key=api_key, system_instruction=system_instruction,
                     image_params=resolve_image_output_params(image_config, f"OPENROUTER/{actual_name}"))
-                return _with_key_cooldown_tracking(self.cog, model, api_key)
+                return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
             model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params, image_detail=image_detail, service_tier=service_tier, data_collection=data_collection)
-            return _with_key_cooldown_tracking(self.cog, model, api_key)
+            return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
         elif is_ollama:
             if image_config is not None:
                 raise ValueError(IMAGE_MODEL_NO_OLLAMA)
@@ -250,12 +299,11 @@ class APIService:
                 if conversation and not storage.personal_gemini_allowed_in_conversation(user_id, policy_guild):
                     raise _refusal(GEMINI_FREE_TIER_BLOCKED)
                 api_key = storage._get_api_key_for_user(user_id)
-            if not api_key and storage.key_cooling_down(guild_id, user_id):
-                raise _refusal(API_KEY_COOLING_DOWN)
             if not api_key: raise ValueError(google_key_error or "Google API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
+            _refuse_if_resting(self.cog, api_key, actual_name)
             if speech:
                 return _with_key_cooldown_tracking(
-                    self.cog, GoogleSpeechModel(actual_name, api_key), api_key, "synthesise")
+                    self.cog, GoogleSpeechModel(actual_name, api_key), api_key, actual_name, "synthesise")
             if image_config is not None:
                 # No thinking config and no mediaResolution, which an image request rejects
                 # or ignores: its options and search tool are resolved for this model instead.
@@ -266,7 +314,7 @@ class APIService:
                                          image_params=resolve_image_output_params(image_config, raw_model_name))
             else:
                 model = GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instruction, safety_settings=safety_settings, thinking_params=t_params, tools=tools, media_resolution=media_res)
-            return _with_key_cooldown_tracking(self.cog, model, api_key)
+            return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
 
     async def run_with_fallback(self, primary: str, fallback: Optional[str], attempt,
                                 *, label: str = "utility"):
@@ -474,7 +522,7 @@ class APIService:
         self.cog.channel_model_last_profile_key[model_cache_key] = current_profile_key_for_model
         return model_instance, final_error_state, temperature, top_p, top_k, warning_message, fallback_model
 
-    async def _get_or_create_model_for_global_chat(self, user_id: int, profile_name: str, policy_guild_id: Optional[int] = None) -> Tuple[Optional[Any], float, float, int, Optional[str], Optional[str]]:
+    async def _get_or_create_model_for_global_chat(self, user_id: int, profile_name: str, policy_guild_id: Optional[int] = None, present_users: Optional[List[Tuple[int, str]]] = None) -> Tuple[Optional[Any], float, float, int, Optional[str], Optional[str]]:
         source_owner_id, source_profile_name = self.cog.profile_manager._resolve_effective_profile(user_id, profile_name)
         
         profile_data = self.cog.profile_manager._get_profile_config(source_owner_id, source_profile_name, False)
@@ -488,7 +536,8 @@ class APIService:
         fallback_model = profile_data.get("fallback_model", FALLBACK_MODEL_NAME)
         
         warning_message = None
-        system_instructions, _, _, _, _, _, _, _ = self.cog.generation_service._construct_system_instructions(user_id, profile_name, 0)
+        system_instructions, _, _, _, _, _, _, _ = self.cog.generation_service._construct_system_instructions(
+            user_id, profile_name, 0, present_users=present_users or [])
         
         user_api_key = self.cog.storage_manager._get_api_key_for_user(user_id, "gemini")
         or_key = self.cog.storage_manager._get_api_key_for_user(user_id, "openrouter")

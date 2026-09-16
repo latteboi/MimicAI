@@ -39,10 +39,11 @@ from ..utils.constants import (
     CONTENT_RATING_EMOJI,
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
     NEW_PROFILE_SPEECH_TEMPERATURE, SPEECH_LANGUAGE_NAMES,
-    IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_AUDIO_FILE, VOICE_SAMPLE_RECORD_FILE, )
+    IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_SLOT_FILES, VOICE_SAMPLE_SLOT_KEY, VOICE_SAMPLE_SLOTS, )
 from ..utils.helpers import (image_rag_enabled, is_real_model, resolve_critic_settings,
                             resolve_grounding_mode, resolve_image_output_params,
-                            resolve_image_tools, resolve_url_mode, suppress_link_previews)
+                            resolve_image_tools, resolve_url_mode, suppress_link_previews,
+                            describe_voice_samples)
 from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
@@ -1580,24 +1581,62 @@ class ProfileManager:
                 and profile_name in self._system_index()
                 and str(user_id) == str(defaultConfig.DISCORD_OWNER_ID))
 
-    async def _has_voice_sample(self, user_id: int, profile_name: str) -> bool:
-        """Whether this profile speaks with a voice sample, from a stat of its record."""
-        p_dir = self._voice_sample_dir(user_id, profile_name)
-        return bool(p_dir) and await asyncio.to_thread(
-            os.path.exists, os.path.join(p_dir, VOICE_SAMPLE_RECORD_FILE))
+    @staticmethod
+    def _valid_voice_slot(value) -> Optional[int]:
+        return value if isinstance(value, int) and 1 <= value <= VOICE_SAMPLE_SLOTS else None
 
-    async def voice_sample_record(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
-        """What this profile's voice sample is and who vouched for it, or None."""
+    def voice_sample_slot(self, user_id: int, profile_name: str) -> int:
+        """The slot this profile speaks with: its own choice, else a borrow's source's, else 1.
+
+        Exactly one slot is always selected, and only it is sent; an empty one means the
+        preset voice. A borrow copies its author's choice when it is made, and one made
+        before the author chose follows the author's current choice rather than slot 1.
+        """
+        index = self._get_user_index(user_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
+        config = self._get_profile_config(user_id, profile_name, is_borrowed) or {}
+        slot = self._valid_voice_slot(config.get(VOICE_SAMPLE_SLOT_KEY))
+        if slot is None and is_borrowed:
+            owner = config.get("original_owner_id")
+            pid = config.get("original_pid") or config.get("original_profile_id")
+            if owner and pid and pid != _UNKNOWN_SOURCE_PID:
+                source = self._get_profile_by_pid(int(owner), pid) or {}
+                slot = self._valid_voice_slot((source.get("config") or {}).get(VOICE_SAMPLE_SLOT_KEY))
+        return slot or 1
+
+    async def voice_sample_summary(self, user_id: int, profile_name: str) -> Tuple[int, int, bool]:
+        """(slots filled, selected slot, whether the selected one is filled), from stats of the records.
+
+        For the dashboards, which say whether samples exist, never what they hold.
+        """
+        slot = self.voice_sample_slot(user_id, profile_name)
         p_dir = self._voice_sample_dir(user_id, profile_name)
         if not p_dir:
-            return None
-        return await asyncio.to_thread(
-            IOManager.read_json_gzip, os.path.join(p_dir, VOICE_SAMPLE_RECORD_FILE), self.cog.fernet)
+            return 0, slot, False
 
-    async def save_voice_sample(self, user_id: int, profile_name: str, audio: bytes, *,
+        def _stat():
+            return [os.path.exists(os.path.join(p_dir, record)) for _audio, record in VOICE_SAMPLE_SLOT_FILES]
+
+        filled = await asyncio.to_thread(_stat)
+        return sum(filled), slot, filled[slot - 1]
+
+    async def voice_sample_records(self, user_id: int, profile_name: str) -> List[Optional[Dict[str, Any]]]:
+        """What each slot's voice sample is and who vouched for it, None for an empty slot."""
+        p_dir = self._voice_sample_dir(user_id, profile_name)
+        if not p_dir:
+            return [None] * VOICE_SAMPLE_SLOTS
+        fernet = self.cog.fernet
+
+        def _read():
+            return [IOManager.read_json_gzip(os.path.join(p_dir, record), fernet)
+                    for _audio, record in VOICE_SAMPLE_SLOT_FILES]
+
+        return await asyncio.to_thread(_read)
+
+    async def save_voice_sample(self, user_id: int, profile_name: str, audio: bytes, *, slot: int,
                                 mime_type: str, filename: str, transcript: Optional[str]) -> bool:
-        """Stores a voice sample with the consent given for it; False if it is not the user's to give."""
-        if not self.may_set_voice_sample(user_id, profile_name):
+        """Stores a voice sample in `slot` with the consent given for it; False if it is not the user's to give."""
+        if not self.may_set_voice_sample(user_id, profile_name) or not self._valid_voice_slot(slot):
             return False
         p_dir = self._voice_sample_dir(user_id, profile_name)
         if not p_dir:
@@ -1607,26 +1646,28 @@ class ProfileManager:
                   # Who said the voice is theirs, or theirs to use, and when.
                   "consented_by": user_id, "consented_at": int(time.time())}
         fernet = self.cog.fernet
+        audio_file, record_file = VOICE_SAMPLE_SLOT_FILES[slot - 1]
 
         def _write():
             # The audio first: a crash between the two orphans a file, never a record that
             # names nothing.
-            IOManager.write_blob(audio, os.path.join(p_dir, VOICE_SAMPLE_AUDIO_FILE), fernet)
-            IOManager.write_json_gzip(record, os.path.join(p_dir, VOICE_SAMPLE_RECORD_FILE), fernet)
+            IOManager.write_blob(audio, os.path.join(p_dir, audio_file), fernet)
+            IOManager.write_json_gzip(record, os.path.join(p_dir, record_file), fernet)
 
         await asyncio.to_thread(_write)
         return True
 
-    async def delete_voice_sample(self, user_id: int, profile_name: str) -> bool:
-        if not self.may_set_voice_sample(user_id, profile_name):
+    async def delete_voice_sample(self, user_id: int, profile_name: str, slot: int) -> bool:
+        if not self.may_set_voice_sample(user_id, profile_name) or not self._valid_voice_slot(slot):
             return False
         p_dir = self._voice_sample_dir(user_id, profile_name)
         if not p_dir:
             return False
+        audio_file, record_file = VOICE_SAMPLE_SLOT_FILES[slot - 1]
 
         def _delete():
             # The record first, for the reason the audio is written first.
-            for name in (VOICE_SAMPLE_RECORD_FILE, VOICE_SAMPLE_AUDIO_FILE):
+            for name in (record_file, audio_file):
                 try:
                     os.remove(os.path.join(p_dir, name))
                 except FileNotFoundError:
@@ -1636,23 +1677,25 @@ class ProfileManager:
         return True
 
     async def materialise_voice_sample(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
-        """This profile's voice sample decrypted to a temp file the caller removes, or None.
+        """The selected slot's voice sample decrypted to a temp file the caller removes, or None.
 
         `{"path", "mime_type", "transcript"}`, the shape the OpenRouter speech adapter sends.
-        Decrypted per request rather than kept: the plaintext of someone's voice sits in the
-        temp directory only while one request takes.
+        Only the selected slot, never the others beside it. Decrypted per request rather
+        than kept: the plaintext of someone's voice sits in the temp directory only while
+        one request takes.
         """
         p_dir = self._voice_sample_dir(user_id, profile_name)
         if not p_dir:
             return None
         fernet = self.cog.fernet
+        audio_file, record_file = VOICE_SAMPLE_SLOT_FILES[self.voice_sample_slot(user_id, profile_name) - 1]
 
         def _load():
             import tempfile
-            record = IOManager.read_json_gzip(os.path.join(p_dir, VOICE_SAMPLE_RECORD_FILE), fernet)
+            record = IOManager.read_json_gzip(os.path.join(p_dir, record_file), fernet)
             if not record:
                 return None
-            audio = IOManager.read_blob(os.path.join(p_dir, VOICE_SAMPLE_AUDIO_FILE), fernet)
+            audio = IOManager.read_blob(os.path.join(p_dir, audio_file), fernet)
             if not audio:
                 return None
             fd, path = tempfile.mkstemp(suffix=".voice")
@@ -1741,7 +1784,7 @@ class ProfileManager:
                 "ltm_context_size": 3, "ltm_relevance_threshold": 0.75, "ltm_creation_interval": 10,
                 "ltm_summarization_context": 10,
                 "primary_model": PRIMARY_MODEL_NAME, "fallback_model": FALLBACK_MODEL_NAME,
-                "time_tracking_enabled": True, "timezone": "UTC",
+                "timezone": "UTC",
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
                 "image_generation_enabled": False, "image_generation_model": DEFAULT_IMAGE_MODEL,
                 # Empty means "send no such field" -- see
@@ -1809,7 +1852,7 @@ class ProfileManager:
                 "ltm_context_size": 0, "ltm_relevance_threshold": 1.0, "ltm_creation_interval": 100,
                 "ltm_summarization_context": 10,
                 "primary_model": "GOOGLE/gemini-2.5-flash-lite", "fallback_model": "GOOGLE/gemini-2.5-flash-lite",
-                "time_tracking_enabled": True, "timezone": "UTC", "generation_metadata_enabled": False,
+                "timezone": "UTC", "generation_metadata_enabled": False,
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
                 "image_generation_enabled": False, "image_generation_model": DEFAULT_IMAGE_MODEL,
                 # Empty means "send no such field" -- see
@@ -3434,8 +3477,8 @@ class ProfileManager:
             "ltm_count": ltm_count,
             "training_count": train_count,
             "is_borrowed": is_borrowed,
-            # A stat, not a read: the dashboard says whether a sample exists, never what it holds.
-            "voice_sample": await self._has_voice_sample(user_id, profile_name),
+            # Stats, not reads: the dashboard says which samples exist, never what they hold.
+            "voice_sample": await self.voice_sample_summary(user_id, profile_name),
         }
 
     async def build_function_embed(self, user_id: int, profile_name: str, channel_id: int,
@@ -3719,14 +3762,14 @@ class ProfileManager:
 
         s_speed = config.get("speech_speed")
         s_language = config.get("speech_language") or ""
-        s_sample = await self._has_voice_sample(user_id, profile_name)
+        s_sample = describe_voice_samples(await self.voice_sample_summary(user_id, profile_name))
         speech_val = (
             f"Enabled: {s_enabled}\n"
             f"Voice: `{s_voice}`" + (f" ({s_described})\n" if s_described else "\n") +
             f"Temperature (Gemini): `{s_temp}`\n"
             f"Speed (OpenRouter): `{s_speed if s_speed is not None else 'Model default'}`\n"
             f"Language (Gemini): `{SPEECH_LANGUAGE_NAMES.get(s_language, s_language) or 'Auto-detect'}`\n"
-            f"Voice sample: `{'Set' if s_sample else 'None'}`"
+            f"Voice sample: `{s_sample or 'None'}`"
         )
         embed.add_field(name="Speech TTS", value=speech_val, inline=True)
 

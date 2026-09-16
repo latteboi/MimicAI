@@ -789,6 +789,7 @@ MOD_PROMPT_CATEGORIES = [
     ("Core Instructions", [
         ("Context Rules", "CONTEXT_RULES", DEFAULT_CONTEXT_RULES),
         ("Time Context", "TIME_CONTEXT", DEFAULT_TIME_CONTEXT),
+        ("Birthday Context", "BIRTHDAY_CONTEXT", DEFAULT_BIRTHDAY_CONTEXT),
         ("Negative Constraints", "NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS),
         ("Training Data Injection", "TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION),
         ("Neuro-Endocrine Engine", "NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION),
@@ -844,6 +845,7 @@ MOD_PROMPT_DEFINITIONS = [entry for _cat, entries in MOD_PROMPT_CATEGORIES for e
 MOD_PROMPT_PLACEHOLDERS: Dict[str, Tuple[Set[str], str]] = {
     "CONTEXT_RULES": ({"profile_id_placeholder"}, "format"),
     "TIME_CONTEXT": ({"time_str"}, "format"),
+    "BIRTHDAY_CONTEXT": ({"birthdays"}, "format"),
     "NEGATIVE_CONSTRAINTS": ({"constraints"}, "format"),
     "TRAINING_DATA_INJECTION": ({"examples_block"}, "format"),
     "NEURO_ENGINE": ({"d", "c", "o", "a"}, "format"),

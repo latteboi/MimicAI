@@ -10,7 +10,7 @@ from ...utils.constants import (
     defaultConfig, PRIMARY_MODEL_NAME, STM_LIMIT_MAX, PLACEHOLDER_EMOJI,
     ERR_GENERAL_ERROR, ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK,
     WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED,
-    GEMINI_FREE_TIER_BLOCKED,
+    GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB,
 )
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_history_entry,
@@ -195,8 +195,10 @@ class GlobalChatMixin:
         model_cache_key = ('global', host_user_id, profile_name)
 
         try:
+            # The people writing in this round: whose birthdays the character may know.
+            present_users = [(t["user_id"], t["display_name"]) for t in queued_turns]
             model, temp, top_p, top_k, warning_message, fallback_model_name = await self.cog.api_service._get_or_create_model_for_global_chat(
-                host_user_id, profile_name, policy_guild_id=interaction.guild_id)
+                host_user_id, profile_name, policy_guild_id=interaction.guild_id, present_users=present_users)
 
             # Resolve primary model and safety settings
             profile_data = self.cog.profile_manager._get_profile_config(source_owner_id, source_profile_name, False) or {}
@@ -251,6 +253,24 @@ class GlobalChatMixin:
             final_user_parts = []
             turn_warnings =[]
 
+            custom_emoji = profile_data.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+
+            # --- EDIT ORIGINAL RESPONSE ---
+            # `incoming` is passed explicitly: this round's turns are only appended to
+            # unified_log once the reply lands, so the card would otherwise show the
+            # previous round's speakers while answering this one.
+            #
+            # Before link reading and the web search, not after: the search names itself
+            # on this placeholder when it runs long. GlobalChatPlayView rebuilds the card
+            # once this returns, so a failure in either still leaves a working card.
+            placeholder_embed = build_global_chat_embed(
+                self.cog, host_user_id, profile_name, session_data,
+                description=custom_emoji, incoming=queued_turns,
+                colour=discord.Colour.dark_grey())
+
+            await interaction.edit_original_response(embed=placeholder_embed, view=None)
+            placeholder_msg = await interaction.original_response()
+
             url_mode = profile_data.get('url_mode', 'off')
             if 'url_mode' not in profile_data:
                 url_mode = 'rag' if profile_data.get('url_fetching_enabled', False) else 'off'
@@ -277,7 +297,10 @@ class GlobalChatMixin:
                 # any global-chat profile with RAG grounding enabled.)
                 d_safe = _resolve_safety_settings(None, profile_data)
 
-                g_res = await self.cog.tools_service._get_hybrid_grounding_context(combined_prompt_text, 0, g_hist, ('global_chat', host_user_id), safety_settings=d_safe)
+                g_res = await self._await_with_status(
+                    self.cog.tools_service._get_hybrid_grounding_context(combined_prompt_text, 0, g_hist, ('global_chat', host_user_id), safety_settings=d_safe),
+                    STATUS_SEARCHING_WEB, interaction.channel, None,
+                    {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg, "message_type": "embed"})
                 if g_res:
                     g_ctx, g_srcs, _, g_warn = g_res
                     if g_warn: turn_warnings.append(g_warn)
@@ -313,20 +336,6 @@ class GlobalChatMixin:
             api_error_reason = None
             main_api_error = None
             state_container = None
-
-            custom_emoji = profile_data.get("placeholder_emoji") or PLACEHOLDER_EMOJI
-
-            # --- EDIT ORIGINAL RESPONSE ---
-            # `incoming` is passed explicitly: this round's turns are only appended to
-            # unified_log once the reply lands, so the card would otherwise show the
-            # previous round's speakers while answering this one.
-            placeholder_embed = build_global_chat_embed(
-                self.cog, host_user_id, profile_name, session_data,
-                description=custom_emoji, incoming=queued_turns,
-                colour=discord.Colour.dark_grey())
-
-            await interaction.edit_original_response(embed=placeholder_embed, view=None)
-            placeholder_msg = await interaction.original_response()
 
             app_name, app_avatar = self._resolve_appearance_data(host_user_id, profile_name)
 
@@ -365,7 +374,9 @@ class GlobalChatMixin:
                         # Global Chat card can be opened in any channel and none is
                         # guaranteed age-restricted, which is the same reason
                         # content_capability refuses an Adult profile here.
-                        sys_instr, _, _, _, _, _, _, _ = await asyncio.to_thread(self._construct_system_instructions, host_user_id, profile_name, 0)
+                        sys_instr, _, _, _, _, _, _, _ = await asyncio.to_thread(
+                            self._construct_system_instructions, host_user_id, profile_name, 0,
+                            present_users=present_users)
 
                         user_index_f = self.cog.profile_manager._get_user_index(host_user_id)
                         is_borrowed_f = profile_name in user_index_f.get("borrowed", [])

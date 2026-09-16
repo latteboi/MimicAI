@@ -87,7 +87,8 @@ class DefaultConfigNamespace:
         self.LIMIT_BORROWED = 100
         self.LIMIT_LTM = 5000
         self.LIMIT_TRAINING = 100
-        self.LIMIT_VOICE_SAMPLE_BYTES = 2 * 1024 * 1024
+        # Per recording, not per profile: only a profile's selected slot is ever sent.
+        self.LIMIT_VOICE_SAMPLE_BYTES = 1 * 1024 * 1024
         # The largest file anyone sends the bot that it will download: an attachment a
         # character reads, a reference picture, a `.mimic` import. Discord lets Nitro
         # upload 500 MB, and media is billed by its length as well as held on disk.
@@ -175,12 +176,13 @@ OPENROUTER_DATA_POLICY_BLOCKED = (
     "No OpenRouter host serves this model without the right to train on prompts, so it "
     "cannot be used here. Choose another model in `/profile manage` -> Params -> Set Models."
 )
-#: A key that exists but is resting after a rate limit (api_service._KEY_COOLDOWN_SECONDS).
-#: The key resolvers hand out nothing meanwhile, which the model factory would otherwise
-#: report as a missing key -- sending someone off to add a key they already have.
+#: A model resting on its key after a rate limit (see api_service._RATE_LIMIT_REST_DEFAULT).
+#: `{ends}` is a Discord relative timestamp, which renders as "in 8 seconds". Said as a pause
+#: rather than a missing key, and naming the model, because a different model on the same
+#: key -- the fallback -- still runs.
 API_KEY_COOLING_DOWN = (
-    "The API key in use here just hit its rate limit and is paused for up to a minute. "
-    "Try again shortly."
+    "`{model}` just hit its rate limit on the API key in use here and is paused. It can be "
+    "tried again {ends}; other models on the key are unaffected."
 )
 #: What a typed model id meets when the dropdown would not have offered it.
 OPENROUTER_TRAINING_MODEL_HIDDEN = (
@@ -724,12 +726,23 @@ BORROW_INDEX_FILE = os.path.join(DATA_DIR, "borrows.json")
 #: Plaintext costs nothing: the same names are already in index.json, and are what
 #: the profile answers to in chat.
 PROFILE_NAME_SIDECAR = "name.json"
-#: A profile's voice sample: the sealed audio, and a sealed record of what it is and who
-#: vouched for it. Kept in the profile's own directory, so deleting the profile removes
-#: them, and never copied -- clone, convert and export build a profile from its config and
-#: prompts. A borrow speaks with its source's, found through `original_pid`.
-VOICE_SAMPLE_AUDIO_FILE = "voice_sample.bin"
-VOICE_SAMPLE_RECORD_FILE = "voice_sample.json.gz"
+#: A profile's voice samples, one (sealed audio, sealed record of what it is and who vouched
+#: for it) pair per slot. Kept in the profile's own directory, so deleting the profile
+#: removes them, and never copied -- clone, convert and export build a profile from its
+#: config and prompts. A borrow speaks with its source's, found through `original_pid`.
+#:
+#: Slot 1 keeps the names from before there were slots, so a sample saved then is slot 1
+#: with nothing moved. Renaming them strands every existing sample.
+VOICE_SAMPLE_SLOT_FILES = (
+    ("voice_sample.bin", "voice_sample.json.gz"),
+    ("voice_sample_2.bin", "voice_sample_2.json.gz"),
+    ("voice_sample_3.bin", "voice_sample_3.json.gz"),
+)
+VOICE_SAMPLE_SLOTS = len(VOICE_SAMPLE_SLOT_FILES)
+#: The config key naming the slot a profile speaks with, 1-based. Absent means slot 1, or
+#: for a borrow its source's choice. Deliberately in no bulk `keys`, so never a default:
+#: a slot number means nothing on a profile holding other recordings.
+VOICE_SAMPLE_SLOT_KEY = "voice_sample_slot"
 #: File suffix -> the audio type a sample is stored and sent as, for an upload Discord did
 #: not label.
 VOICE_SAMPLE_TYPES = {
@@ -793,6 +806,14 @@ DISCORD_MAX_MESSAGE_LENGTH = 2000
 PLEASE_TRY_AGAIN_ERROR_MESSAGE = 'There was an issue with your question please try again...'
 MAX_LTM_COUNT_PER_PROFILE_CONTEXT = 1000
 STM_LIMIT_MAX = 50
+
+# How much of a session round's own messages may sit outside STM. The turns a round is
+# answering are exempt from the window (see _bound_reserved_tail); past either bound the
+# older ones fall back under STM like any other turn. The newest is always exempt.
+ROUND_EXEMPT_USER_TURNS = 20
+ROUND_EXEMPT_USER_CHARS = 100_000
+# The round's attachments sent with each character's turn. The newest are kept.
+ROUND_MEDIA_MAX = 10
 
 # Archive depth for a session's unified_log, which is NOT its context window --
 # _build_history_for_participant windows to stm_length, capped at STM_LIMIT_MAX.
@@ -885,6 +906,11 @@ DELIVERY_GUARD_SECONDS = 180.0
 # round it belongs to is cancelled, which is what runs the placeholder teardown. Well
 # beyond DELIVERY_GUARD_SECONDS, so an admin's /cancel always gets the first move.
 DELIVERY_HARD_TIMEOUT_SECONDS = 420.0
+# What a placeholder says during a slow step that is not writing a reply. Kept to these
+# two on purpose: every label is the bot narrating itself mid-scene, so only a web search
+# and an image, the waits a person would wonder about, are named.
+STATUS_SEARCHING_WEB = "Searching the web"
+STATUS_IMAGINING_IMAGE = "Imagining image"
 # Every flag that means "this channel is mid-operation". A whisper claims the channel only
 # once all of them are clear; the check and the claim must be in the same synchronous step.
 SESSION_BUSY_FLAGS = ('is_running', 'is_regenerating', 'is_purging', 'is_whispering', 'is_memorising')
@@ -1392,6 +1418,15 @@ DEFAULT_TIME_CONTEXT = (
     "</time_context>"
 )
 
+#: Sent only when a birthday falls yesterday, today or tomorrow: the character's own, or
+#: that of someone in the conversation. `{birthdays}` is one sentence per birthday.
+DEFAULT_BIRTHDAY_CONTEXT = (
+    "<birthday_context>\n"
+    "{birthdays}\n"
+    "Let this colour the conversation where it fits. Do not force it into every reply.\n"
+    "</birthday_context>"
+)
+
 # Injected whenever the destination channel is NOT age-restricted, regardless of
 # the profile's content rating. The rating only decides *where* a profile may
 # run; this is the only part of the content system that shapes what the model
@@ -1731,7 +1766,11 @@ VOICE_SAMPLE_NOT_AUDIO = (
 )
 VOICE_SAMPLE_TOO_LARGE = (
     "That recording is over the {limit} MB limit. A clean 10 to 30 second clip of one "
-    "speaker is all a model needs."
+    "speaker is all a model needs, and as an MP3 it fits easily."
+)
+VOICE_SAMPLE_SLOTS_FULL = (
+    "All {slots} voice sample slots on **{profile}** are full. Run the command again with "
+    "`slot` set to the one to replace."
 )
 ERR_REASON_AUDIO_TOO_LARGE = "{size} MB of audio, over this server's {limit} MB upload limit"
 ERR_REASON_AUDIO_NOT_UPLOADED = "Discord refused the audio file as too large"
@@ -1739,6 +1778,10 @@ ERR_REASON_AUDIO_NOT_UPLOADED = "Discord refused the audio file as too large"
 #: Stands in a user's turn for an attachment over LIMIT_ATTACHMENT_BYTES, which is never
 #: downloaded, so the character knows a file was sent instead of answering as if none was.
 ATTACHMENT_SKIPPED_NOTE = "[Attachment not read, over the {limit} MB limit: {filename} ({size} MB)]"
+#: Sent with a character's turn in place of the round's attachments past ROUND_MEDIA_MAX.
+#: Their messages still say "[Attached Image: ...]", and without this the character would
+#: answer as if it had seen them.
+ROUND_MEDIA_SKIPPED_NOTE = "[Older attachments from this round not shown, over the limit of {limit}: {count}]"
 IMPORT_FILE_TOO_LARGE = "❌ That file is over the {limit} MB import limit."
 
 API_ERROR_MAPPINGS = {
@@ -1817,7 +1860,7 @@ SYSTEM_XML_TAGS = [
     "scene_prompt", "neuro_endocrine_engine", "neuro_update", "persona_profile",
     "technical_manual", "training_data", "context_rules", "image_context",
     "system_note", "reply_context", "negative_constraints", "content_policy",
-    "session_synopsis", "game_context",
+    "session_synopsis", "game_context", "birthday_context",
     # Persona assembly (prompt_builder._construct_system_instructions).
     "character_instructions", "instructions",
     "backstory", "personality_traits", "likes", "dislikes", "appearance",

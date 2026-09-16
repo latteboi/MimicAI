@@ -13,7 +13,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..utils.constants import (
-    PLACEHOLDER_EMOJI, IMAGE_QUEUE_PRIORITY,
+    PLACEHOLDER_EMOJI, IMAGE_QUEUE_PRIORITY, STATUS_SEARCHING_WEB,
     DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING, DEFAULT_IMAGE_MODEL,
     IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS,
 )
@@ -1065,9 +1065,9 @@ class ChildBotManager:
             profile_data = self.cog.profile_manager._get_profile_config(owner_id, profile_name, is_borrowed) or {}
 
             placeholder_message_obj = None
+            placeholder_emoji = profile_data.get("placeholder_emoji") or PLACEHOLDER_EMOJI
             if profile_data.get("child_bot_placeholder", False):
-                custom_emoji = profile_data.get("placeholder_emoji") or PLACEHOLDER_EMOJI
-                msg_id = await self.cog.generation_service._send_child_bot_placeholder(bot_id, channel_id, custom_emoji)
+                msg_id = await self.cog.generation_service._send_child_bot_placeholder(bot_id, channel_id, placeholder_emoji)
                 if msg_id:
                     try:
                         ch = self.cog.bot.get_channel(channel_id)
@@ -1143,7 +1143,15 @@ class ChildBotManager:
 
                 mapping_key = self.cog.session_manager._get_mapping_key_for_session(session_key, 'multi')
                 ch_obj = self.cog.bot.get_channel(channel_id)
-                grounding_result = await self.cog.tools_service._get_hybrid_grounding_context(prompt_text, guild_id, history_for_grounding, mapping_key, is_for_image=True, warning_channel=ch_obj)
+                grounding_call = self.cog.tools_service._get_hybrid_grounding_context(prompt_text, guild_id, history_for_grounding, mapping_key, is_for_image=True, warning_channel=ch_obj)
+                if ch_obj:
+                    grounding_result = await self.cog.generation_service._await_with_status(
+                        grounding_call, STATUS_SEARCHING_WEB, ch_obj,
+                        {"method": "child_bot", "bot_id": bot_id},
+                        {"msg_a_id": placeholder_message_obj.id if placeholder_message_obj else None,
+                         "custom_emoji": placeholder_emoji})
+                else:
+                    grounding_result = await grounding_call
                 if grounding_result:
                     grounding_context, sources, *_ = grounding_result
                     if grounding_context:
@@ -1159,6 +1167,8 @@ class ChildBotManager:
                 "bot_display_name": bot_display_name, "safety_settings": dynamic_safety_settings,
                 "system_instruction": system_instruction, "reference_image_urls": reference_image_urls,
                 "placeholder_message": placeholder_message_obj,
+                # So a status written onto that placeholder later keeps its emoji.
+                "placeholder_emoji": placeholder_emoji,
                 "grounding_sources": grounding_sources,
                 "image_generation_model": profile_data.get("image_generation_model", DEFAULT_IMAGE_MODEL),
                 "image_generation_fallback_model": profile_data.get("image_generation_fallback_model"),

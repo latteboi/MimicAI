@@ -166,7 +166,101 @@ class HeartbeatMixin:
         if not task.cancelled() and task.exception() is not None:
             print(f"Feedback task error: {task.exception()}")
 
-    async def _generate_with_heartbeat(self, model, contents, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name='Bot', app_avatar=None, existing_state=None, message_type="text"):
+    @staticmethod
+    def _status_line(label: str, elapsed: float) -> str:
+        """`-# Searching the web... (0:20)`: the line a heartbeat writes under the emoji."""
+        return f"-# {label}... ({int(elapsed) // 60}:{int(elapsed) % 60:02d})"
+
+    async def _edit_placeholder_status(self, channel, participant, state_container, text):
+        """Writes `text` under the emoji of a placeholder that already exists.
+
+        Creates nothing: whoever opened the turn owns its placeholder, and a message made
+        here would be one no teardown knows about. Covers the three shapes a placeholder
+        takes -- a child bot's own message, an embed, a webhook message.
+        """
+        msg_a_id = state_container.get('msg_a_id')
+        custom_emoji = state_container.get('custom_emoji', PLACEHOLDER_EMOJI)
+        if participant and participant.get('method') == 'child_bot':
+            if msg_a_id:
+                bot_id = participant.get('bot_id')
+                child_emoji = await self.cog.child_bot_manager.resolve_emoji_for_child(
+                    bot_id, custom_emoji)
+                await self.cog.manager_queue.put({
+                    "action": "send_to_child", "bot_id": bot_id,
+                    "payload": {
+                        "action": "regenerate_message", "channel_id": channel.id,
+                        "message_id": msg_a_id, "content": f"{child_emoji}\n\n{text}"
+                    }
+                })
+        elif state_container.get('message_type') == "embed" and state_container.get('placeholder_msg'):
+            try:
+                msg_obj = state_container['placeholder_msg']
+                if msg_obj and msg_obj.embeds:
+                    embed = msg_obj.embeds[0]
+                    embed.description = f"{custom_emoji}\n\n{text}"
+                    await msg_obj.edit(embed=embed)
+            except Exception: pass
+        elif msg_a_id:
+            await self.cog.server_manager.run_webhook(
+                channel, "edit_message", msg_a_id,
+                content=f"{custom_emoji}\n\n{text}")
+
+    async def _await_with_status(self, awaitable, label, channel, participant, state_container):
+        """Awaits `awaitable`, naming the step on the turn's placeholder once it passes ten seconds.
+
+        For a slow step before a reply is written; the labels are in constants.py beside
+        STATUS_SEARCHING_WEB, and why there are so few. Anything under ten seconds shows
+        nothing. A child bot with no placeholder is kept typing instead, the same as
+        during generation.
+        """
+        task = asyncio.ensure_future(awaitable)
+        if not state_container:
+            return await task
+
+        is_child = bool(participant) and participant.get('method') == 'child_bot'
+        start = time.monotonic()
+        last_interval = 0
+        last_typing = 0.0
+        try:
+            while not task.done():
+                # A wait rather than a sleep, so the step's result is not held up to a
+                # second after it lands.
+                await asyncio.wait((task,), timeout=1.0)
+                if task.done():
+                    break
+                elapsed = time.monotonic() - start
+
+                if is_child and not state_container.get('msg_a_id') and elapsed - last_typing >= 5:
+                    last_typing = elapsed
+                    await self.cog.manager_queue.put({
+                        "action": "send_to_child", "bot_id": participant.get('bot_id'),
+                        "payload": {"action": "start_typing", "channel_id": channel.id}
+                    })
+
+                interval = int(elapsed // 10)
+                if interval > last_interval:
+                    last_interval = interval
+                    try:
+                        await self._edit_placeholder_status(
+                            channel, participant, state_container, self._status_line(label, elapsed))
+                    except Exception:
+                        pass
+            return task.result()
+        except asyncio.CancelledError:
+            task.cancel()
+            try:
+                await task
+            except (Exception, asyncio.CancelledError):
+                pass
+            raise
+
+    async def _generate_with_heartbeat(self, model, contents, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name='Bot', app_avatar=None, existing_state=None, message_type="text", status_label=None):
+        """Runs one generation, writing a running timer onto its placeholder every ten seconds.
+
+        `status_label` names what is being made when it is not a reply
+        (STATUS_IMAGINING_IMAGE), and holds through a fallback attempt, which is the same
+        step.
+        """
         # Hard Limits: 4 minutes for Main, 3 minutes for Fallback
         hard_timeout = 180.0 if is_fallback else 240.0
 
@@ -212,55 +306,27 @@ class HeartbeatMixin:
                 if current_interval > last_interval:
                     last_interval = current_interval
 
-                    mins = int(elapsed) // 60
-                    secs = int(elapsed) % 60
-                    time_str = f"{mins}:{secs:02d}"
-
-                    base_text = "Using fallback model" if is_fallback else "Still generating"
-                    text = f"-# {base_text}... ({time_str})"
+                    base_text = status_label or ("Using fallback model" if is_fallback else "Still generating")
+                    text = self._status_line(base_text, elapsed)
 
                     msg_a_id = state_container.get('msg_a_id')
                     custom_emoji = state_container.get('custom_emoji', PLACEHOLDER_EMOJI)
 
                     try:
-                        if participant and participant.get('method') == 'child_bot':
+                        if participant and participant.get('method') == 'child_bot' and not msg_a_id:
                             bot_id = participant.get('bot_id')
-                            if msg_a_id:
-                                child_emoji = await self.cog.child_bot_manager.resolve_emoji_for_child(
-                                    bot_id, custom_emoji)
-                                await self.cog.manager_queue.put({
-                                    "action": "send_to_child", "bot_id": bot_id,
-                                    "payload": {
-                                        "action": "regenerate_message", "channel_id": channel.id,
-                                        "message_id": msg_a_id, "content": f"{child_emoji}\n\n{text}"
-                                    }
-                                })
-                            else:
-                                # Only spawn a placeholder if generation is actively still running
-                                if not gen_task.done():
-                                    new_msg_id = await self._send_child_bot_placeholder(bot_id, channel.id, custom_emoji, text)
-                                    if new_msg_id:
-                                        if gen_task.done():
-                                            # If generation completed while awaiting placeholder creation, delete immediately
-                                            await self._safe_delete_placeholder(channel, new_msg_id, bot_id=bot_id)
-                                        else:
-                                            state_container['msg_a_id'] = new_msg_id
-                                            msg_a_id = new_msg_id
+                            # Only spawn a placeholder if generation is actively still running
+                            if not gen_task.done():
+                                new_msg_id = await self._send_child_bot_placeholder(bot_id, channel.id, custom_emoji, text)
+                                if new_msg_id:
+                                    if gen_task.done():
+                                        # If generation completed while awaiting placeholder creation, delete immediately
+                                        await self._safe_delete_placeholder(channel, new_msg_id, bot_id=bot_id)
+                                    else:
+                                        state_container['msg_a_id'] = new_msg_id
+                                        msg_a_id = new_msg_id
                         else:
-                            if state_container.get('message_type') == "embed" and state_container.get('placeholder_msg'):
-                                try:
-                                    msg_obj = state_container['placeholder_msg']
-                                    if msg_obj and msg_obj.embeds:
-                                        embed = msg_obj.embeds[0]
-                                        embed.description = f"{custom_emoji}\n\n{text}"
-                                        await msg_obj.edit(embed=embed)
-                                except Exception: pass
-                            else:
-                                # Webhooks
-                                if msg_a_id:
-                                    await self.cog.server_manager.run_webhook(
-                                        channel, "edit_message", msg_a_id,
-                                        content=f"{custom_emoji}\n\n{text}")
+                            await self._edit_placeholder_status(channel, participant, state_container, text)
                     except Exception:
                         pass
 

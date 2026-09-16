@@ -590,30 +590,6 @@ class StorageManager:
         slot = (self._get_user_keys_data(user_id).get("slots") or {}).get(slot_id)
         return bool(slot and slot.get("key")) and not self._gemini_slot_allowed_in_guild(guild_id, user_id, slot_id)
 
-    def key_cooling_down(self, guild_id: Optional[int], user_id: Optional[int],
-                         provider: str = "gemini") -> bool:
-        """True when the key a call would use exists but is resting after a rate limit.
-
-        The guild's key when `guild_id` is given, else `user_id`'s personal one -- the choice
-        the model factory makes. Both resolvers hand out nothing while a key cools down, and
-        this lets a caller say so rather than report a key that is sitting there as missing.
-        """
-        if not self.fernet:
-            return False
-        if guild_id:
-            pointer = self._guild_key_pointer(guild_id, provider)
-        else:
-            assignments = (self._get_user_keys_data(user_id).get("personal_assignments") or {}) if user_id else {}
-            pointer = (user_id, assignments[provider]) if assignments.get(provider) else None
-        if not pointer:
-            return False
-        owner_id, slot_id = pointer
-        key = self.cog.decrypted_key_cache.get((owner_id, slot_id))
-        if not key:
-            slot = (self._get_user_keys_data(owner_id).get("slots") or {}).get(slot_id)
-            key = slot.get("key") if slot else None
-        return bool(key) and time.time() <= self.cog.api_key_cooldowns.get(key, 0)
-
     def personal_gemini_is_paid(self, user_id: int) -> bool:
         """Whether the Gemini key on this user's Personal scope is billing-enabled."""
         user_data = self._get_user_keys_data(user_id)
@@ -635,8 +611,9 @@ class StorageManager:
             self.cog.server_manager._get_server_index(str(guild_id)), "gemini")
 
     def _get_api_key_for_guild(self, guild_id: int, provider: str = "gemini") -> Optional[str]:
+        # Which key, not whether a model may use it now: a rate-limit rest belongs to one
+        # model on the key, and APIService._instantiate_model is where the model is known.
         if not self.fernet: return None
-        now = time.time()
 
         pointer = self._guild_key_pointer(guild_id, provider)
 
@@ -651,22 +628,19 @@ class StorageManager:
 
             decrypted_key = self.cog.decrypted_key_cache.get((user_id, slot_id))
             if decrypted_key:
-                if decrypted_key not in self.cog.api_key_cooldowns or now > self.cog.api_key_cooldowns[decrypted_key]:
-                    return decrypted_key
+                return decrypted_key
 
             user_data = self._get_user_keys_data(user_id)
             slot_data = user_data.get("slots", {}).get(slot_id)
             if slot_data and slot_data.get("key"):
                 raw_key = slot_data["key"]
                 self.cog.decrypted_key_cache[(user_id, slot_id)] = raw_key
-                if raw_key not in self.cog.api_key_cooldowns or now > self.cog.api_key_cooldowns[raw_key]:
-                    return raw_key
+                return raw_key
 
         return None
 
     def _get_api_key_for_user(self, user_id: int, provider: str = "gemini") -> Optional[str]:
         if not self.fernet: return None
-        now = time.time()
 
         user_data = self._get_user_keys_data(user_id)
         slot_id = user_data.get("personal_assignments", {}).get(provider)
@@ -674,15 +648,13 @@ class StorageManager:
         if slot_id:
             decrypted_key = self.cog.decrypted_key_cache.get((user_id, slot_id))
             if decrypted_key:
-                if decrypted_key not in self.cog.api_key_cooldowns or now > self.cog.api_key_cooldowns[decrypted_key]:
-                    return decrypted_key
+                return decrypted_key
 
             slot_data = user_data.get("slots", {}).get(slot_id)
             if slot_data and slot_data.get("key"):
                 raw_key = slot_data["key"]
                 self.cog.decrypted_key_cache[(user_id, slot_id)] = raw_key
-                if raw_key not in self.cog.api_key_cooldowns or now > self.cog.api_key_cooldowns[raw_key]:
-                    return raw_key
+                return raw_key
 
         return None
 

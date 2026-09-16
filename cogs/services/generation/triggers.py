@@ -1,17 +1,80 @@
 import uuid
 import discord
 import datetime
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from ...utils.helpers import _format_debug_prompt, _format_history_entry, _get_user_hash
+from ...utils.helpers import _format_history_entry, _get_user_hash
 from ...utils.attachment_limits import over_attachment_limit, skipped_attachment_note
 from ...utils.http_client import get_shared_client
 from ...managers.session_manager import intern_turn
+from ...utils.constants import ROUND_MEDIA_MAX, ROUND_MEDIA_SKIPPED_NOTE
 
 
 class TriggerIntakeMixin:
     """Turns the raw triggers batched for one multi-profile round -- messages,
     reactions, replies, proactive kicks -- into the round's user-side history.
     """
+
+    async def _compose_user_turn(self, typed: str, attachments: Sequence[Any],
+                                 reply_context: Optional[str] = None, *,
+                                 edited: bool = False) -> Tuple[str, List[Dict[str, str]]]:
+        """A user message's turn content, and the media parts to send with it.
+
+        The one builder for what a user's message says in `unified_log`: a new message, one
+        batched mid-round and an edited one all come through here. Each used to build it by
+        hand, and they drifted -- an edit rebuilt the turn from the message text alone, which
+        dropped any text file the message carried from the log, and so from every later
+        turn and regeneration; a batched message never read its text files at all.
+
+        `attachments` are discord.Attachment objects, or the dicts a child bot's payload
+        carries. `typed` is only what the person wrote: URL Context reads links from that
+        and nothing folded in here.
+        """
+        content = f"{typed}\n(edited)" if edited else typed
+
+        # Shared client: _process_text_attachments sets its own
+        # per-request timeout, so nothing is lost by not owning one.
+        text_att_content = await self.cog.media_service._process_text_attachments(
+            attachments, get_shared_client())
+        if text_att_content:
+            content = f"{content}\n\n{text_att_content}"
+
+        if reply_context:
+            content = f"{reply_context}\n{content}"
+
+        media_parts = []
+        att_tags = []
+        for attachment in attachments:
+            is_dict = isinstance(attachment, dict)
+            ctype = (attachment.get('content_type') if is_dict else attachment.content_type) or ""
+            if not ctype.startswith(("image/", "audio/", "video/")):
+                continue
+            if over_attachment_limit(attachment):
+                att_tags.append(skipped_attachment_note(attachment))
+                continue
+            url = attachment.get('url') if is_dict else attachment.url
+            fname = (attachment.get('filename') if is_dict else attachment.filename) or 'attachment.png'
+            media_parts.append({"url": url, "mime_type": ctype})
+            att_tags.append(f"[Attached Image: {fname}]")
+
+        if att_tags:
+            content = f"{' '.join(att_tags)}\n{content}".strip()
+        return content, media_parts
+
+    @staticmethod
+    def _round_media(new_round_turn_data) -> Tuple[List[Dict[str, str]], Optional[str]]:
+        """The round's attachments to send with a character's turn, and a note for any left out.
+
+        Every attachment in the round used to go to every character: up to ten a message,
+        across however many messages the round took in. The newest ROUND_MEDIA_MAX go.
+        The rest are counted in the note, because their messages still say something was
+        attached.
+        """
+        media = [part for _text, _url, turn_media in new_round_turn_data for part in turn_media]
+        if len(media) <= ROUND_MEDIA_MAX:
+            return media, None
+        note = ROUND_MEDIA_SKIPPED_NOTE.format(limit=ROUND_MEDIA_MAX, count=len(media) - ROUND_MEDIA_MAX)
+        return media[-ROUND_MEDIA_MAX:], note
 
     async def _collect_round_triggers(
         self, session, session_type, channel_id, all_triggers_for_round,
@@ -143,24 +206,15 @@ class TriggerIntakeMixin:
                 elif message_trigger:
                     reply_context = await self._resolve_reply_context(message_trigger)
 
-                content = trigger_obj['content'] if is_child_mention else trigger_obj.clean_content
                 # What the person typed, before text files and the quoted reply are folded
                 # in. URL Context reads links from this alone: a link inside an attached file
                 # or someone else's quoted message is not one they asked the profile to
                 # open, and the quote is cut at 150 characters, so its link can be half a URL.
-                typed_text = content
+                typed_text = trigger_obj['content'] if is_child_mention else trigger_obj.clean_content
 
                 raw_att_list = trigger_obj['attachments'] if is_child_mention else trigger_obj.attachments
-                # Shared client: _process_text_attachments sets its own
-                # per-request timeout, so nothing is lost by not owning one.
-                text_att_content = await self.cog.media_service._process_text_attachments(
-                    raw_att_list, get_shared_client()
-                )
-
-                if text_att_content:
-                    content = f"{content}\n\n{text_att_content}"
-
-                content = f"{reply_context}\n{content}" if reply_context else content
+                content, own_media_parts = await self._compose_user_turn(
+                    typed_text, raw_att_list, reply_context)
 
                 # [NEW] URL Context Logic: Enforce Profile Setting & Separation
                 any_url_enabled = False
@@ -259,60 +313,15 @@ class TriggerIntakeMixin:
                     except Exception as e:
                         print(f"Error fetching replied media: {e}")
 
-                # Media only, from a child bot's payload as from a message: the payload
-                # carries text files too, and those were read into the turn above.
-                attachments = [
-                    a for a in (trigger_obj['attachments'] if is_child_mention else trigger_obj.attachments)
-                    if ((a.get('content_type') if isinstance(a, dict) else a.content_type) or "").startswith(
-                        ("image/", "audio/", "video/"))
-                ]
-
-                if attachments:
-                    att_tags = []
-                    for attachment in attachments:
-                        try:
-                            if over_attachment_limit(attachment):
-                                att_tags.append(skipped_attachment_note(attachment))
-                                continue
-                            attachment_url = attachment['url'] if is_child_mention else attachment.url
-                            fname = attachment.get('filename', 'attachment.png') if is_child_mention and isinstance(attachment, dict) else getattr(attachment, 'filename', 'attachment.png')
-
-                            ctype = "image/png"
-                            if not is_child_mention and attachment.content_type:
-                                ctype = attachment.content_type
-                            elif is_child_mention and isinstance(attachment, dict):
-                                ctype = attachment.get('content_type', "image/png")
-
-                            new_message_parts.append({"url": attachment_url, "mime_type": ctype})
-                            att_tags.append(f"[Attached Image: {fname}]")
-                        except Exception as e:
-                            print(f"Failed to process media attachment in multi-profile trigger: {e}")
-
-                    if att_tags:
-                        content = f"{' '.join(att_tags)}\n{content}".strip()
-                        user_line = _format_history_entry(author_name, created_at, content, author_tz, entity_id=user_hash)
-                        turn_object["content"] = user_line
+                # The message's own media after the replied-to picture, the order they had
+                # when both were gathered here.
+                new_message_parts.extend(own_media_parts)
 
                 # Combine standard attachments with URL-extracted media
                 trigger_media_parts.extend(new_message_parts)
 
                 # Store raw components for gating logic
                 new_round_turn_data.append((user_line, url_text_content, trigger_media_parts))
-
-                if triggering_user_id in self.cog.debug_users:
-                    try:
-                        user_to_dm = self.cog.bot.get_user(triggering_user_id)
-                        if user_to_dm:
-                            # Create a temporary debug obj
-                            debug_parts = [user_line]
-                            if url_text_content: debug_parts.append(url_text_content)
-                            debug_parts.extend(trigger_media_parts)
-                            debug_obj = {'role': 'user', 'parts': debug_parts}
-
-                            debug_message = _format_debug_prompt([debug_obj])
-                            await user_to_dm.send(debug_message)
-                    except Exception as e:
-                        print(f"Failed to send user turn debug DM to user {triggering_user_id}: {e}")
 
             elif reaction_trigger and i == 0:
                 triggering_user_id = reaction_trigger.user_id

@@ -23,10 +23,10 @@ from ..utils.constants import (
     DEFAULT_SPEECH_VOICE, TTS_SYNTHESIS_PREAMBLE, CRITIC_AUDIT_TEXT_MAX,
     LOG_TRIM_TARGET, LOG_TRIM_HIGH_WATER,
     CONTENT_RATING_ADULT, CONTENT_RATING_EMOJI, CONTENT_RATING_LABELS,
-    GEMINI_FREE_TIER_BLOCKED,
+    GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB,
 )
 from ..utils.helpers import (
-    _add_inline_citations, _format_api_error, _format_citation_subtext, _format_debug_prompt,
+    _add_inline_citations, _format_api_error, _format_citation_subtext,
     _format_history_entry, _get_user_hash, _resolve_safety_settings, _scrub_response_text,
     _split_into_sentences_with_abbreviations, generated_image_attachment, is_real_model,
     resolve_critic_settings,
@@ -35,7 +35,6 @@ from ..utils.helpers import (
     resolve_thinking_params,
     resolve_typing_cursor,
 )
-from ..utils.attachment_limits import over_attachment_limit, skipped_attachment_note
 from ..utils import mem_probe
 from ..managers.session_manager import intern_turn
 
@@ -722,7 +721,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 # Gather Grounding and URL tasks to run concurrently
                 tasks_to_gather = []
                 if grounding_task:
-                    tasks_to_gather.append(grounding_task)
+                    tasks_to_gather.append(self._await_with_status(
+                        grounding_task, STATUS_SEARCHING_WEB, channel,
+                        first_participant, pending_state_container))
                 for ut in url_tasks:
                     tasks_to_gather.append(ut)
 
@@ -1194,10 +1195,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                         # [FIXED] Ephemeral Media Injection: Manually add all current round media to the API call
                         # This allows participants to see images this round without them persisting in RAM history.
-                        all_current_media = []
-                        for _, _, turn_media in new_round_turn_data:
-                            all_current_media.extend(turn_media)
-                        
+                        all_current_media, media_skipped_note = self._round_media(new_round_turn_data)
+                        if media_skipped_note:
+                            supplementary_parts.append(media_skipped_note)
                         if all_current_media:
                             supplementary_parts.extend(all_current_media)
                         
@@ -1475,26 +1475,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             t1_formatted = t1_start_utc.strftime('%I:%M:%S %p UTC')
                         metadata_line = f"(Thought Initiated: {t1_formatted} | Duration: {duration:.2f}s)"
                         history_line = f"{main_history_line.strip()}\n{metadata_line}\n"
-
-                        model_content_obj = {'role': 'model', 'parts': [history_line]}
-                        user_content_obj = {'role': 'user', 'parts': [history_line]}
-
-                        if owner_id in self.cog.debug_users:
-                            try:
-                                user_to_dm = self.cog.bot.get_user(owner_id)
-                                if user_to_dm:
-                                    turns_for_debug = []
-                                    if grounding_context and participant_key == grounding_profile_key:
-                                        turns_for_debug.append({'role': 'user', 'parts': [grounding_context, "\n"]})
-                                    if ltm_recall_text:
-                                        turns_for_debug.append({'role': 'user', 'parts': [ltm_recall_text, "\n"]})
-                                    
-                                    turns_for_debug.append(model_content_obj)
-
-                                    debug_message = _format_debug_prompt(turns_for_debug)
-                                    await user_to_dm.send(debug_message)
-                            except Exception as e:
-                                print(f"Failed to send debug DM to user {owner_id}: {e}")
 
                     except Exception as e:
                         print(f"Multi-profile generation error for '{profile_name}': {e}")
@@ -1998,8 +1978,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                                     author_name = trigger.author.display_name
                                     reply_context = await self._resolve_reply_context(trigger)
-                                    # [UPDATED] Apply newline separator to mid-round batch content
-                                    content = f"{reply_context}\n{trigger.clean_content}" if reply_context else trigger.clean_content
+                                    content, batch_msg_media = await self._compose_user_turn(
+                                        trigger.clean_content, trigger.attachments, reply_context)
                                     
                                     # [NEW] Batch URL Context Logic
                                     any_url_enabled_batch = False
@@ -2031,39 +2011,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     batch_hash = _get_user_hash(trigger.author.id)
 
                                     user_line = _format_history_entry(author_name, trigger.created_at, content, batch_tz, entity_id=batch_hash)
-                                    
-                                    batch_msg_media = []
-                                    message_attachments = [a for a in trigger.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/"))]
-                                    skipped_notes = []
-                                    for attachment in message_attachments:
-                                        if over_attachment_limit(attachment):
-                                            skipped_notes.append(skipped_attachment_note(attachment))
-                                            continue
-                                        try:
-                                            batch_msg_media.append({"url": attachment.url, "mime_type": attachment.content_type})
-                                        except Exception as e:
-                                            print(f"Failed to process batched media attachment {attachment.filename}: {e}")
-                                    if skipped_notes:
-                                        # Said in the turn, as on the single-turn path in triggers.py.
-                                        content = f"{' '.join(skipped_notes)}\n{content}"
-                                        user_line = _format_history_entry(author_name, trigger.created_at, content, batch_tz, entity_id=batch_hash)
 
-                                    if trigger.author.id in self.cog.debug_users:
-                                        try:
-                                            user_to_dm = self.cog.bot.get_user(trigger.author.id)
-                                            if user_to_dm:
-                                                # Create temporary debug object with all context
-                                                debug_parts = [user_line]
-                                                if url_text_batch: debug_parts.append(url_text_batch)
-                                                debug_parts.extend(url_media_batch)
-                                                debug_parts.extend(batch_msg_media)
-                                                debug_obj = {'role': 'user', 'parts': debug_parts}
-                                                
-                                                debug_message = _format_debug_prompt([debug_obj])
-                                                await user_to_dm.send(debug_message)
-                                        except Exception as e:
-                                            print(f"Failed to send batched user turn debug DM to user {trigger.author.id}: {e}")
-                                    
                                     new_turn_id = str(uuid.uuid4())
                                     new_turn_object = {
                                         "turn_id": new_turn_id,
@@ -2075,6 +2023,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     if url_text_batch:
                                         new_turn_object["url_context"] = url_text_batch
                                     session.setdefault("unified_log", []).append(intern_turn(new_turn_object))
+                                    # Into the round's turn data as well, or its pictures reach
+                                    # no one: the log keeps text only, and the characters still
+                                    # to speak take their media from here.
+                                    new_round_turn_data.append(
+                                        (user_line, url_text_batch, batch_msg_media + url_media_batch))
 
                             all_triggers_for_round.extend(batched_triggers)
                     

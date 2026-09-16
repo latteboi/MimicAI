@@ -396,10 +396,21 @@ HELP_CATEGORIES = {
             "conversation rather than resetting each message. Nothing about the mechanism is visible in chat."
         ),
         "Time Awareness": (
-            "`/profile manage` -> **Tools** -> Set Time & Timezone. Enable tracking and give the profile an IANA timezone "
-            "(`Australia/Sydney`, `Europe/London`).\n\n"
+            "Every profile knows the time. `/profile manage` -> **Tools** -> Set Timezone gives it an IANA timezone "
+            "(`Australia/Sydney`, `Europe/London`); until you set one it runs on UTC.\n\n"
             "The profile's local time is injected as `<time_context>`, and every message in history carries a timestamp. Together these give the "
-            "character a real sense of when things happened -- that it is late at night where it is, or that you have not spoken in three days."
+            "character a real sense of when things happened -- that it is late at night where it is, or that you have not spoken in three days. "
+            "Your own messages are timestamped in the timezone you set in `/settings` -> About Me."
+        ),
+        "Birthdays": (
+            "A character can have a birthday, and so can you.\n\n"
+            "**The character's**: `/profile manage` -> **Persona** -> Set Birthday. Day and month, and a year if you want it to have an age "
+            "to turn. It belongs to the character, so anyone borrowing the profile gets the same one.\n\n"
+            "**Yours**: `/settings` -> About Me -> Set Birthday. Day and month only; no year is kept.\n\n"
+            "The day before, on the day and the day after, the character is told in `<birthday_context>` -- its own birthday going by its "
+            "timezone, yours going by yours. Your birthday only reaches a character you are talking with: someone with a public message inside "
+            "its short-term memory in a session, or someone writing in a Global Chat round. Nothing is posted on its own; the character "
+            "brings it up when you talk."
         ),
     },
     "7. Sharing and Publishing": {
@@ -485,8 +496,9 @@ HELP_CATEGORIES = {
         ),
         "Reading API Errors": (
             "• **401 Invalid API Key** -- the key is wrong, expired or revoked. Re-submit it.\n"
-            "• **429 Rate Limited** -- on Google, usually a free-tier quota; on OpenRouter, an empty credit balance. The bot cools the key down "
-            "and retries through your Fallback Model.\n"
+            "• **429 Rate Limited** -- on Google, a per-minute or daily quota for that model; on OpenRouter, usually the model's host turning "
+            "traffic away, or a free model's allowance used up. The bot pauses that one model on the key -- for as long as the provider asks, "
+            "or a few seconds when it does not say -- and your Fallback Model answers meanwhile.\n"
             "• **402 Insufficient Credits** -- OpenRouter balance exhausted.\n"
             "• **403 Access Forbidden / Moderated** -- the model is restricted to your account, or the provider's own safety filter refused the "
             "content.\n"
@@ -817,7 +829,7 @@ DEFAULT_HELP_DOCS = {
         "Concept: API execution errors occur when an external inference endpoint rejects a generation payload. The bot parses these and shows a short diagnostic.\n"
         "Status Code Meanings:\n"
         "- 401 (Invalid API Key): The API key submitted is invalid, expired, or has been revoked by the provider.\n"
-        "- 429 (Rate Limited): The key has hit its Requests-Per-Minute or daily quota. For Google, common on free accounts. For OpenRouter, it usually means an empty credit balance.\n"
+        "- 429 (Rate Limited): The model has hit a Requests-Per-Minute or daily quota on this key. For Google, quotas are counted per model. For OpenRouter, it usually means the model's host is turning traffic away, or a free model's allowance is used up. The bot pauses only that model on the key, for as long as the provider asks, so the Fallback Model still answers.\n"
         "- 402 (Insufficient Credits): OpenRouter balance exhausted.\n"
         "- 403 (Access Forbidden / Moderated): The model is restricted for your account, or the content tripped the provider's own safety moderation.\n"
         "- 404 (Model Not Found): The selected model has been deprecated or renamed by the provider.\n"
@@ -1016,7 +1028,7 @@ DEFAULT_HELP_DOCS = {
         "Configuration: The Director's Desk (`/profile manage` -> Media -> TTS Instructions) takes plain English for Vocal Archetype, Accent, Dynamics, and Pacing and Style.\n"
         "Voice: `/profile manage` -> Media -> Choose TTS Voice offers the voices of the profile's speech model. On a Gemini model that is all thirty prebuilt voices, grouped by gender (14 female, 16 male) and described by Google's own one-word character (Kore is firm, Enceladus breathy, Sulafat warm); on an OpenRouter model, the voices that model lists, a page at a time. It is a dropdown rather than a text box because an unrecognised voice name is rejected by the API. A voice the model does not carry, such as one kept from another model, is swapped for the Gemini default or the OpenRouter model's first voice.\n"
         "Other speech settings: TTS on/off, temperature and speed are at `/profile manage` -> Media -> Set Speech Settings, and the language at Media -> Set TTS Language; the speech model is under Set Models, on Google or OpenRouter. Temperature, language and the Director's Desk reach Gemini models only: an OpenRouter speech model is sent the reply alone, as MP3, with the speed if one is set -- and only some hosts, such as OpenAI's, honour speed. Language is Auto-detect unless pinned, and Gemini then reads it from the text. New profiles start at temperature 0.1; a lower temperature produces stable audio, and values far from default cause audible artefacts.\n"
-        "Cloned voice: `/profile voice_sample` gives a profile you own a voice cloned from a short recording -- a clean 10 to 30 seconds of one speaker, up to 2 MB, with an optional transcript of what is said. Only upload your own voice, or one you have the speaker's permission to use. It is stored encrypted with the profile, sent only to speech models that can clone a voice (marked 'clones voices' in the OpenRouter tab), and used by anyone who borrows the profile. Remove it from Choose TTS Voice.\n"
+        "Cloned voice: `/profile voice_sample` gives a profile you own a voice cloned from a short recording -- a clean 10 to 30 seconds of one speaker, up to 1 MB, with an optional transcript of what is said. A profile has 3 slots; choose one with `slot`, or leave it out to fill an empty one. Choose TTS Voice selects which slot the profile speaks with, and only that recording is sent. Only upload your own voice, or one you have the speaker's permission to use. It is stored encrypted with the profile, sent only to speech models that can clone a voice (marked 'clones voices' in the OpenRouter tab), and used by anyone who borrows the profile. Remove a slot's recording from Choose TTS Voice.\n"
         "Audio tags: Inline tags in a response steer delivery for that stretch of text -- `[whispers]`, `[shouting]`, `[laughs]`, `[sighs]`, `[excitedly]`, `[sarcastic]`. There is no fixed list; the model interprets what it is given. OpenRouter speech models other than Fish Audio S2 and Qwen Audio 3.0 are sent the reply without them, and every OpenRouter model without an action standing as its own sentence ('*sighs* Fine.'), so neither is read out as words; a stressed word, as in 'I *never* said that', is still spoken.\n"
         "Session audio: `/session config` -> Config -> Toggle TTS chooses text-only, audio plus text, audio only, or multi-audio, which holds each participant's audio until the round ends and stitches it into one file.\n"
         "Troubleshooting / Symptoms:\n"

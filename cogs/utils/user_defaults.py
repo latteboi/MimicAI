@@ -240,7 +240,6 @@ SETTING_LABELS = {
     "typing_mode": "Typing Chunking",
     "typing_cps": "Typing Speed",
     "typing_max_delay": "Typing Maximum Delay",
-    "time_tracking_enabled": "Time Awareness",
     "timezone": "Timezone",
     "response_mode": "Response Mode",
     "grounding_mode": "Grounding",

@@ -13,8 +13,10 @@ from ..utils.helpers import (
     _pf, _pi, _ps, _pb, is_real_model, image_model_caps, openrouter_image_ratios,
     resolve_critic_settings,
     google_thinking_caps, resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
+    describe_voice_samples,
 )
 from ..utils.user_defaults import setting_label
+from ..utils.birthdays import MONTH_NAMES, format_birthday, parse_birthday, valid_birthday
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -109,6 +111,28 @@ def ProfileSpeechSettingsModal(cog, profile_name: str, current_params: Dict[str,
         c["speech_speed"] = _ranged(v, "speech_speed", SPEECH_SPEED_MIN, SPEECH_SPEED_MAX, "Speed").get("speech_speed")
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Speech Settings", fields, parser, callback, target_user_id)
+
+
+def ProfileBirthdayModal(cog, profile_name: str, current: Optional[Dict[str, int]], callback=None, target_user_id: Optional[int] = None):
+    """A character's birthday, written to its prompts so a borrow reads the original's.
+
+    Day and month are separate boxes, so no date can be read the wrong way round.
+    """
+    current = valid_birthday(current) or {}
+    fields = [
+        {"label": "Day", "custom_id": "day", "default": str(current.get("day", "")),
+         "required": False, "max_length": 2, "placeholder": "1-31"},
+        {"label": "Month", "custom_id": "month",
+         "default": MONTH_NAMES[current["month"] - 1] if current.get("month") else "",
+         "required": False, "max_length": 9, "placeholder": "March, Mar or 3"},
+        {"label": "Year (optional)", "custom_id": "year", "default": str(current.get("year", "")),
+         "required": False, "max_length": 4, "placeholder": "Gives the character an age to turn"},
+    ]
+
+    def parser(v):
+        # None clears it: every box left blank.
+        return {"prompts": {"birthday": parse_birthday(v["day"], v["month"], v["year"], allow_year=True)}}
+    return ConfigModal(cog, profile_name, False, "Character Birthday", fields, parser, callback, target_user_id)
 
 #: Tab order for ProfileManageView's nav bar. "persona" is hidden for borrowed profiles.
 PROFILE_TABS = ("home", "persona", "params", "tools", "media", "memory")
@@ -599,8 +623,9 @@ def _speech_language_name(config) -> str:
 def _render_speech(ctx):
     config = ctx["config"]
     speed = config.get("speech_speed")
-    if ctx.get("voice_sample"):
-        sample = "`Set`"
+    described = describe_voice_samples(ctx.get("voice_sample"))
+    if described:
+        sample = f"`{described}`"
     elif ctx.get("is_borrowed"):
         sample = "`None`"
     else:
@@ -648,11 +673,11 @@ def _render_response_mode(ctx):
 
 
 def _render_time(ctx):
-    config = ctx["config"]
-    return "Time & Timezone", (
-        f"Tracking: {_flag(config.get('time_tracking_enabled', False))}\n"
-        f"Zone: `{config.get('timezone', 'UTC')}`"
-    ), True
+    return "Timezone", f"Zone: `{ctx['config'].get('timezone', 'UTC')}`", True
+
+
+def _render_birthday(ctx):
+    return "Birthday", f"`{format_birthday(ctx['prompts'].get('birthday')) or 'Not set'}`", True
 
 
 def _render_typing(ctx):
@@ -818,6 +843,10 @@ PROFILE_ACTIONS = (
                                "text is not recoverable.")),
     _Action("edit_appearance", "persona", "Edit Appearance", "Edit the custom Webhook name and avatar.",
             _method("_handle_appearance"), _own),
+    # Identity, so it is stored with the persona and a borrow reads the original's. No
+    # bulk form: one birthday stamped onto forty characters means nothing.
+    _Action("birthday", "persona", "Set Birthday", "Set the character's birthday, and the year if it has one.",
+            _method("_act_birthday"), _own, render=_render_birthday),
 
     # --- Params ---
     _Action("models", "params", "Set Models", "Choose Primary and Fallback AI models.",
@@ -992,18 +1021,12 @@ PROFILE_ACTIONS = (
                                     to_payload=lambda v: {"response_mode": v}),
                        scope="all", label="Set Response Mode", keys=("response_mode",),
                        description="Choose Regular, Mention, Reply or Mention+Reply.")),
-    _Action("time", "tools", "Set Time & Timezone", "Enable time awareness and set the profile's timezone.",
-            _open_screen("time"), render=_render_time,
-            # Picking a timezone force-sets time_tracking_enabled, and nothing in the
-            # single-profile GUI could set it back -- a profile that had ever chosen a
-            # zone was stuck with time awareness on unless it went through the bulk
-            # manager. The toggle here is the off switch that was missing.
-            screen=_Screen(
-                _Toggle("time_tracking_enabled", "Time Awareness"),
-                sub_view=("Choose timezone…",
-                          _method("_handle_timezone", wants_profile=True, wants_borrowed=True))),
-            bulk=_Bulk(_bulk_sub("BulkTimezoneView"), scope="all",
-                       keys=("timezone", "time_tracking_enabled"))),
+    # Time awareness is always on, so the zone is the whole setting and the row opens its
+    # picker directly. The on/off toggle that used to sit on a screen here is retired with
+    # `time_tracking_enabled`, which nothing reads any more.
+    _Action("time", "tools", "Set Timezone", "Set the timezone the character's clock runs on.",
+            _method("_handle_timezone", wants_profile=True, wants_borrowed=True), render=_render_time,
+            bulk=_Bulk(_bulk_sub("BulkTimezoneView"), scope="all", keys=("timezone",))),
     _Action("typing", "tools", "Realistic Typing", "Enable a human-like delay when the bot sends messages.",
             _open_screen("typing"), render=_render_typing,
             screen=_Screen(
@@ -1293,6 +1316,12 @@ class ProfileManageView(BlockedGuard, ui.View):
         modal = EditUserProfilePersonaModal(self.cog, self.profile_name, prompts.get("persona", {}), self.user_id)
         await interaction.response.send_modal(modal)
 
+    async def _act_birthday(self, interaction: discord.Interaction):
+        prompts = self.cog.profile_manager._get_profile_prompts(self.user_id, self.profile_name) or {}
+        await interaction.response.send_modal(ProfileBirthdayModal(
+            self.cog, self.profile_name, prompts.get("birthday"),
+            callback=self._refresh_dashboard, target_user_id=self.user_id))
+
     async def _act_edit_instructions(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         prompts = self.cog.profile_manager._get_profile_prompts(self.user_id, self.profile_name) or {}
         modal = EditUserProfileAIInstructionsModal(self.cog, self.profile_name, prompts.get("ai_instructions", ""), self.user_id)
@@ -1315,13 +1344,13 @@ class ProfileManageView(BlockedGuard, ui.View):
         await self._open_media_options(interaction, "voice")
 
     async def _open_media_options(self, interaction: discord.Interaction, mode: str):
-        # Read before the view is built: whether there is a sample decides its rows, and the
-        # record is a file read that belongs off the event loop.
-        sample = (await self.cog.profile_manager.voice_sample_record(self.user_id, self.profile_name)
-                  if mode == "voice" else None)
+        # Read before the view is built: which slots hold a sample decides its rows, and the
+        # records are file reads that belong off the event loop.
+        samples = (await self.cog.profile_manager.voice_sample_records(self.user_id, self.profile_name)
+                   if mode == "voice" else None)
         view = SingleProfileMediaOptionsView(self.cog, self.original_interaction, self.profile_name,
                                              mode, is_borrowed=self.is_borrowed, user_id=self.user_id,
-                                             voice_sample=sample)
+                                             voice_samples=samples)
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
     async def _act_manage_ltm(self, interaction: discord.Interaction, profile: Dict[str, Any]):
@@ -2159,7 +2188,7 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
 
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str,
                  mode: str, is_borrowed: bool = False, user_id: Optional[int] = None,
-                 voice_sample: Optional[Dict[str, Any]] = None):
+                 voice_samples: Optional[List[Optional[Dict[str, Any]]]] = None):
         super().__init__(timeout=300)
         self.cog = cog
         self.original_interaction = interaction
@@ -2168,8 +2197,9 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
         self.is_borrowed = is_borrowed
         self.mode = mode
         self.voice_page = 0
-        #: The profile's voice sample record, read by whoever opened the screen; None for none.
-        self.voice_sample = voice_sample
+        #: Each slot's voice sample record, None for an empty slot, read by whoever opened
+        #: the screen.
+        self.voice_samples = list(voice_samples or [None] * VOICE_SAMPLE_SLOTS)
         self._build_view()
 
     def _profile(self) -> Dict[str, Any]:
@@ -2278,14 +2308,18 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
                         "This model lists no voices to choose from, so it speaks in its own.")
                 lines.append(f"\n{note} The Director's Desk reaches Google speech models only: "
                              "an OpenRouter model is sent the reply alone.")
-            if self.voice_sample:
+            slot = self._voice_slot()
+            selected = self.voice_samples[slot - 1]
+            if selected:
                 model_id = model[len("OPENROUTER/"):] if model.startswith("OPENROUTER/") else None
                 clones = bool(model_id) and self.cog.api_service.speech_catalogue.clones(model_id)
-                lines.append(f"**Voice sample:** `{self.voice_sample.get('filename') or 'recording'}`"
-                             + (" with a transcript" if self.voice_sample.get("transcript") else ""))
+                lines.append(f"**Voice sample:** slot {slot} \u00b7 `{selected.get('filename') or 'recording'}`"
+                             + (" with a transcript" if selected.get("transcript") else ""))
                 lines.append("-# This model clones it, so the profile speaks in that voice." if clones else
                              "-# This model cannot clone a voice, so the voice above is used. Choose "
                              "a model marked 'clones voices' to hear the sample.")
+            elif any(self.voice_samples):
+                lines.append(f"**Voice sample:** slot {slot} \u00b7 empty, so the voice above is used.")
             elif self.cog.profile_manager.may_set_voice_sample(self.user_id, self.profile_name):
                 lines.append("-# Give this profile a cloned voice with `/profile voice_sample`.")
             if not data.get("speech_tts_enabled"):
@@ -2326,13 +2360,49 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
                                         labels=IMAGE_GROUNDING_LABELS)
         else:
             self._add_voice_select("speech_voice", 0)
-            if self.voice_sample and self.cog.profile_manager.may_set_voice_sample(self.user_id, self.profile_name):
-                add_button(self, "Remove Voice Sample", self._remove_voice_sample,
-                           style=discord.ButtonStyle.danger, row=1)
+            if any(self.voice_samples):
+                self._add_voice_slot_select(1)
+            slot = self._voice_slot()
+            if self.voice_samples[slot - 1] and self.cog.profile_manager.may_set_voice_sample(
+                    self.user_id, self.profile_name):
+                add_button(self, f"Remove Slot {slot}", self._remove_voice_sample,
+                           style=discord.ButtonStyle.danger, row=2)
+
+    def _voice_slot(self) -> int:
+        return self.cog.profile_manager.voice_sample_slot(self.user_id, self.profile_name)
+
+    def _add_voice_slot_select(self, row: int):
+        """The three slots, one always selected: only that one is sent, and an empty one
+        speaks with the preset voice. Shown once any slot is filled -- until then there is
+        nothing to choose between, and the screen says how to fill one."""
+        current = self._voice_slot()
+        own = self.cog.profile_manager.may_set_voice_sample(self.user_id, self.profile_name)
+        options = []
+        for slot, record in enumerate(self.voice_samples, start=1):
+            if record:
+                label = f"Slot {slot} \u00b7 {record.get('filename') or 'recording'}"
+                description = "With a transcript" if record.get("transcript") else "No transcript"
+            else:
+                label = f"Slot {slot} \u00b7 Empty"
+                description = (f"Fill it with /profile voice_sample slot:{slot}" if own
+                               else "Speaks with the preset voice")
+            options.append(discord.SelectOption(label=label[:100], value=str(slot),
+                                                description=description, default=(slot == current)))
+
+        select = ui.Select(placeholder="Voice sample slot...", options=options, row=row)
+
+        async def callback(interaction: discord.Interaction):
+            self._apply(VOICE_SAMPLE_SLOT_KEY, int(select.values[0]))
+            self._build_view()
+            await interaction.response.edit_message(**self._render())
+
+        select.callback = callback
+        self.add_item(select)
 
     async def _remove_voice_sample(self, interaction: discord.Interaction):
-        await self.cog.profile_manager.delete_voice_sample(self.user_id, self.profile_name)
-        self.voice_sample = None
+        slot = self._voice_slot()
+        await self.cog.profile_manager.delete_voice_sample(self.user_id, self.profile_name, slot)
+        self.voice_samples[slot - 1] = None
         self._build_view()
         await interaction.response.edit_message(**self._render())
 
@@ -3831,7 +3901,7 @@ class VoiceSampleConsentView(BlockedGuard, ui.View):
     """
 
     def __init__(self, cog: 'MimicCog', user_id: int, profile_name: str, sample: discord.Attachment,
-                 mime_type: str, transcript: Optional[str]):
+                 mime_type: str, transcript: Optional[str], *, slot: int, replaces: Optional[str] = None):
         super().__init__(timeout=300)
         self.cog = cog
         self.user_id = user_id
@@ -3839,6 +3909,9 @@ class VoiceSampleConsentView(BlockedGuard, ui.View):
         self.sample = sample
         self.mime_type = mime_type
         self.transcript = transcript
+        self.slot = slot
+        #: The filename already in that slot, which confirming overwrites; None for an empty slot.
+        self.replaces = replaces
         #: What happened, once something has; the screen then says only that.
         self.outcome: Optional[str] = None
         self._build_view()
@@ -3854,11 +3927,14 @@ class VoiceSampleConsentView(BlockedGuard, ui.View):
             description=("Only continue if this is **your own voice**, or you have the speaker's "
                          "permission to clone it.\n\nThe recording is stored encrypted with this "
                          "profile and sent to the speech model whenever the profile speaks on a "
-                         "model that can clone voices. Anyone who borrows this profile speaks "
-                         "with it too. Remove it any time from Choose TTS Voice."))
+                         "model that can clone voices, while its slot is the one selected. Anyone "
+                         "who borrows this profile speaks with it too. Select or remove it any "
+                         "time from Choose TTS Voice."))
         e.add_field(name="Recording",
                     value=f"`{self.sample.filename}` · {self.sample.size / 1048576:.1f} MB", inline=True)
         e.add_field(name="Transcript", value="Provided" if self.transcript else "None", inline=True)
+        e.add_field(name="Slot", value=f"{self.slot} of {VOICE_SAMPLE_SLOTS}"
+                    + (f" · replaces `{self.replaces}`" if self.replaces else " · empty"), inline=True)
         e.add_field(name="Models that clone voices",
                     value=(", ".join(cloning) or "None listed right now")[:1024], inline=False)
         return e
@@ -3890,12 +3966,20 @@ class VoiceSampleConsentView(BlockedGuard, ui.View):
             await self._finish(interaction, "The recording could not be read back from Discord, "
                                             "so nothing was saved. Upload it again.")
             return
-        saved = await self.cog.profile_manager.save_voice_sample(
-            self.user_id, self.profile_name, audio, mime_type=self.mime_type,
+        manager = self.cog.profile_manager
+        saved = await manager.save_voice_sample(
+            self.user_id, self.profile_name, audio, slot=self.slot, mime_type=self.mime_type,
             filename=self.sample.filename, transcript=self.transcript)
-        await self._finish(interaction, (
-            f"Saved. **{self.profile_name}** now speaks with this voice on models that clone voices."
-            if saved else VOICE_SAMPLE_NOT_OWN))
+        if not saved:
+            outcome = VOICE_SAMPLE_NOT_OWN
+        elif manager.voice_sample_slot(self.user_id, self.profile_name) == self.slot:
+            outcome = (f"Saved to slot {self.slot}. **{self.profile_name}** now speaks with this voice "
+                       "on models that clone voices.")
+        else:
+            # Not switched to: slots are there to keep a voice for later, and the one in use stays.
+            outcome = (f"Saved to slot {self.slot}. Select it in Choose TTS Voice for "
+                       f"**{self.profile_name}** to speak with it.")
+        await self._finish(interaction, outcome)
 
     async def _cancel(self, interaction: discord.Interaction):
         await self._finish(interaction, "Nothing was saved.")
@@ -4216,10 +4300,8 @@ class _TimezonePickerView(BlockedGuard, ui.View):
 class UserTimezoneView(_TimezonePickerView):
     """Timezone picker for the user themselves, not for a character.
 
-    Writes `index.json["about"]["timezone"]` and sets nothing else: the profile-side
-    picker also force-sets `time_tracking_enabled`, because a zone on a profile that
-    never reads the clock does nothing. A user's zone has no such switch -- it is
-    always used, to timestamp their own messages in history.
+    Writes `index.json["about"]["timezone"]` and nothing else. It timestamps the user's
+    own messages in history, and decides which day their birthday falls on.
     """
 
     def __init__(self, cog: 'MimicCog', parent_about_view):
@@ -4261,9 +4343,7 @@ class SingleProfileTimezoneView(_TimezonePickerView):
                 + self._clock_line(self._current_tz()))
 
     async def apply(self, interaction: discord.Interaction, canonical_tz: str):
-        # Time awareness comes on with the zone: a clock nothing reads is not a setting.
         self.profile_config["timezone"] = canonical_tz
-        self.profile_config["time_tracking_enabled"] = True
         owner_id = self.parent_manage_view.user_id
         name = self.parent_manage_view.profile_name
         self.cog.profile_manager._save_profile_config(
@@ -4295,7 +4375,7 @@ class BulkTimezoneView(_BulkSubView):
 
     Four pages of twenty zones plus manual IANA entry is more than fits beside anything
     else, which is why this is a sub-view rather than a plain choice step. It no longer
-    owns a profile picker or an apply loop: it produces two config keys and hands them
+    owns a profile picker or an apply loop: it produces the timezone key and hands it
     back.
     """
 
@@ -4307,12 +4387,10 @@ class BulkTimezoneView(_BulkSubView):
 
     def embed(self) -> discord.Embed:
         e = discord.Embed(
-            title="Set Time & Timezone",
+            title="Set Timezone",
             colour=discord.Colour.blurple(),
-            description=("Staging a timezone also switches **time awareness on** for every "
-                         "selected profile — a zone set on a profile that never reads the "
-                         "clock does nothing.\n\nBrowse a region, jump between regions, or "
-                         "enter any IANA timezone ID by hand."))
+            description=("The zone each selected character's clock runs on.\n\nBrowse a "
+                         "region, jump between regions, or enter any IANA timezone ID by hand."))
         e.add_field(name="Region", value=PARTITION_NAMES[self.tz_page], inline=True)
         e.add_field(name="Chosen", value=f"`{self.selected_tz or 'nothing yet'}`", inline=True)
         e.set_footer(text=f"{len(self.wizard.selected_profiles)} profile(s) selected · "
@@ -4352,7 +4430,7 @@ class BulkTimezoneView(_BulkSubView):
             await interaction.response.send_message("Choose a timezone first.", ephemeral=True)
             return
         self.wizard._stage_change(
-            "time", config={"timezone": self.selected_tz, "time_tracking_enabled": True})
+            "time", config={"timezone": self.selected_tz})
         await self.wizard.refresh(interaction)
 
 

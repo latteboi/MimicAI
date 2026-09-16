@@ -49,7 +49,7 @@ else:
 from ..utils.constants import (
     defaultConfig, FALLBACK_MODEL_NAME, DEFAULT_SAFETY_SETTINGS,
     MIN_HISTORY_FOR_LTM_CREATION,
-    DEFAULT_TRAINING_ANALYST_PROMPT, API_KEY_COOLING_DOWN,
+    DEFAULT_TRAINING_ANALYST_PROMPT,
 )
 from ..utils.helpers import (Timeout, _format_api_error, _get_sanitized_history_and_author,
                             resolve_thinking_params, suppress_link_previews)
@@ -833,7 +833,7 @@ class MemoryManager:
             # configured one provider, and that should not read as a crash.
             if ("429" not in err_str and "RESOURCE_EXHAUSTED" not in err_str and "503" not in err_str
                     and "UNAVAILABLE" not in err_str and "API Key not found" not in err_str
-                    and API_KEY_COOLING_DOWN not in err_str):
+                    and not getattr(e, "rate_limited", False)):
                 print(f"LTM Gen err {user_dn}: {e}")
                 traceback.print_exc()
                 if warning_channel:

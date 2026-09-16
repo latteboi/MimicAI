@@ -9,6 +9,7 @@ from .utils.constants import (
     SESSIONS_GLOBAL_DIR, SESSION_BUSY_FLAGS, TRAIN_ARMED_CACHE_MAX_SIZE, TRAIN_INPUT_EMOJI,
     TRAIN_COMMAND_ENABLED, TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check,
     is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
+    VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
     IMPORT_FILE_TOO_LARGE,
 )
 from .services.api_service import OpenRouterModel, GoogleGenAIModel
@@ -237,7 +238,6 @@ class MimicCog(EventListeners, commands.Cog):
         self.max_history_items = defaultConfig.CHATBOT_MEMORY_LENGTH
         
         self.model_override_warnings_sent: Set[Tuple[int, int, str]] = set()
-        self.debug_users: Set[int] = set()
         self.global_chat_sessions: LRUCache = LRUCache(max_size=10)
         self.purged_message_ids: LRUCache = LRUCache(PURGED_MESSAGE_ID_CACHE_MAX_SIZE)
         # /train arms a channel to capture a training example from 1️⃣/2️⃣ reactions.
@@ -276,7 +276,6 @@ class MimicCog(EventListeners, commands.Cog):
         self.dirty_sessions: Dict[Any, str] = {}
         self.session_manager.evict_inactive_sessions_task.start()
         self.session_manager.flush_dirty_sessions_task.start()
-        self.message_cooldown = commands.CooldownMapping.from_cooldown(5, 60.0, commands.BucketType.user)
         self.processed_child_messages: LRUCache = LRUCache(max_size=25)
         self.all_bot_ids: Set[int] = set()
         self.image_gen_semaphore = asyncio.Semaphore(3)
@@ -292,8 +291,10 @@ class MimicCog(EventListeners, commands.Cog):
         self.background_tasks = set()
         self.child_bot_single_sessions = {}
         
-        # API Key Health & Tier Tracking
-        self.api_key_cooldowns: Dict[str, float] = {}
+        # (API key, model id) -> when that model's rate-limit rest ends. See
+        # api_service._rest_model_on_rate_limit. An ended rest is dropped when that pair is
+        # next asked about, and the LRU bound covers pairs that never are.
+        self.api_key_cooldowns: LRUCache = LRUCache(max_size=256)
         
         # Model Stats Initialization
         self.MODELS_DATA_DIR = os.path.join(DATA_DIR, "models")
@@ -686,11 +687,13 @@ class MimicCog(EventListeners, commands.Cog):
     @app_commands.checks.cooldown(3, 60.0, key=lambda i: i.user.id)
     @app_commands.describe(profile_name="The profile to give the voice.",
                            sample="A clean 10-30 second recording of one speaker.",
-                           transcript="Optional: exactly what is said in the recording. It improves the match.")
+                           transcript="Optional: exactly what is said in the recording. It improves the match.",
+                           slot=f"Optional: which of the {VOICE_SAMPLE_SLOTS} slots to save it in. Defaults to an empty one.")
     @app_commands.autocomplete(profile_name=EventListeners.master_autocomplete)
     async def voice_sample_slash(self, interaction: discord.Interaction, profile_name: str,
                                  sample: discord.Attachment,
-                                 transcript: Optional[app_commands.Range[str, 1, 2000]] = None):
+                                 transcript: Optional[app_commands.Range[str, 1, 2000]] = None,
+                                 slot: Optional[app_commands.Range[int, 1, VOICE_SAMPLE_SLOTS]] = None):
         # Checked before the consent screen, so nobody vouches for a file that would be refused.
         if not self.profile_manager.may_set_voice_sample(interaction.user.id, profile_name):
             await interaction.response.send_message(VOICE_SAMPLE_NOT_OWN, ephemeral=True)
@@ -704,7 +707,20 @@ class MimicCog(EventListeners, commands.Cog):
             await interaction.response.send_message(
                 VOICE_SAMPLE_TOO_LARGE.format(limit=limit // (1024 * 1024)), ephemeral=True)
             return
-        view = VoiceSampleConsentView(self, interaction.user.id, profile_name, sample, mime_type, transcript)
+        records = await self.profile_manager.voice_sample_records(interaction.user.id, profile_name)
+        if slot is None:
+            # The selected slot while it is empty, so a first upload is heard straight away;
+            # otherwise the first empty one, so leaving `slot` out never overwrites a voice.
+            selected = self.profile_manager.voice_sample_slot(interaction.user.id, profile_name)
+            empty = [n for n, record in enumerate(records, start=1) if not record]
+            slot = selected if selected in empty else (empty[0] if empty else None)
+        if slot is None:
+            await interaction.response.send_message(
+                VOICE_SAMPLE_SLOTS_FULL.format(slots=VOICE_SAMPLE_SLOTS, profile=profile_name), ephemeral=True)
+            return
+        replaces = (records[slot - 1].get("filename") or "recording") if records[slot - 1] else None
+        view = VoiceSampleConsentView(self, interaction.user.id, profile_name, sample, mime_type, transcript,
+                                      slot=slot, replaces=replaces)
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
     @profile_group.command(name="hub", description="The unified dashboard for managing profiles, sharing, and the public library.")
@@ -1489,7 +1505,7 @@ class MimicCog(EventListeners, commands.Cog):
 
         self.session_manager._save_multi_profile_sessions()
 
-        await interaction.followup.send(f"Session suspended for {interaction.channel.mention} and Freewill triggers disabled. The bot will be silent until mentioned or configured again.", ephemeral=True)
+        await interaction.followup.send(f"Session suspended for {interaction.channel.mention}. The bot will be silent until configured again.", ephemeral=True)
 
     @app_commands.command(name="purge", description="Purges messages and the associated session memory (Admin Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)

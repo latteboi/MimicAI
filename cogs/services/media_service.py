@@ -14,7 +14,7 @@ from ..utils.constants import (
     defaultConfig, IMAGE_QUEUE_PRIORITY,
     DEFAULT_IMAGE_PRESENT, DEFAULT_IMAGE_FAILED, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING,
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
-    IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS,
+    IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS, STATUS_IMAGINING_IMAGE,
 )
 from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, generated_image_attachment, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor
 from ..utils.attachment_limits import over_attachment_limit, skipped_attachment_note
@@ -223,7 +223,7 @@ class MediaService:
                                         'app_name': app_name,
                                         'app_avatar': app_avatar,
                                         'message_type': "embed" if is_child_bot else "text",
-                                        'custom_emoji': PLACEHOLDER_EMOJI
+                                        'custom_emoji': package.get("placeholder_emoji") or PLACEHOLDER_EMOJI
                                     }
 
                                     participant = {"method": "child_bot", "bot_id": package.get("bot_id")} if is_child_bot else None
@@ -239,7 +239,8 @@ class MediaService:
                                         # re-uses the placeholder the first attempt created
                                         # rather than stacking a second one beside it.
                                         return await self.cog.generation_service._generate_with_heartbeat(
-                                            image_model, [{'role': 'user', 'parts': parts}], None, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type=state_container['message_type']
+                                            image_model, [{'role': 'user', 'parts': parts}], None, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type=state_container['message_type'],
+                                            status_label=STATUS_IMAGINING_IMAGE,
                                         )
 
                                     result, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
@@ -360,7 +361,7 @@ class MediaService:
                             'app_name': app_name,
                             'app_avatar': app_avatar,
                             'message_type': "embed" if is_child_bot else "text",
-                            'custom_emoji': PLACEHOLDER_EMOJI
+                            'custom_emoji': package.get("placeholder_emoji") or PLACEHOLDER_EMOJI
                         }
 
                         text_failure_reason = None
@@ -597,8 +598,21 @@ class MediaService:
                                 config_owner_id=request_data['effective_profile_owner_id'])
                             return await image_model.generate_content_async([{'role': 'user', 'parts': [request_data['prompt_text']]}])
 
-                        response, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
+                        # The request's placeholder, made when it was queued, is the only
+                        # thing in the channel while this runs, and nothing else ticks it.
+                        generation = self.cog.api_service.run_with_fallback(
                             img_model_raw, img_fallback_raw, _attempt, label="Image generation")
+                        status_channel = self.cog.bot.get_channel(request_data['channel_id'])
+                        if status_channel:
+                            placeholder = request_data.get("placeholder_message")
+                            response, _used, _was_fallback = await self.cog.generation_service._await_with_status(
+                                generation, STATUS_IMAGINING_IMAGE, status_channel,
+                                ({"method": "child_bot", "bot_id": request_data.get("bot_id")}
+                                 if request_data.get("is_child_bot") else None),
+                                {"msg_a_id": placeholder.id if placeholder else None,
+                                 "custom_emoji": request_data.get("placeholder_emoji") or PLACEHOLDER_EMOJI})
+                        else:
+                            response, _used, _was_fallback = await generation
                         status = "blocked_by_safety" if not response.candidates else "success"
                     finally:
                         self.cog._log_api_call(user_id=request_data['author_id'], guild_id=request_data['guild_id'], context="image_generation_prefetch", model_used=image_model, status=status)

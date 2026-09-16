@@ -324,7 +324,10 @@ channel. Its shape:
    that scan decrypts profile files).
 2. **Block on the queue.** `session['task_queue'].get()` waits for a trigger.
 3. **Batch.** Everything already queued is drained into one round, so a burst of messages
-   produces one round rather than one per message.
+   produces one round rather than one per message. Messages arriving mid-round are drained
+   again at each handoff. The round's messages are exempt from STM only up to
+   `ROUND_EXEMPT_USER_TURNS` / `ROUND_EXEMPT_USER_CHARS` (`_bound_reserved_tail`), and each
+   character is sent the newest `ROUND_MEDIA_MAX` attachments (`_round_media`).
 4. **Yield.** A queued whisper or an in-flight purge/regeneration takes precedence, using
    flag counters rather than polling — see the comments around `whisper_waiting` for why
    the naive version starves.
@@ -472,13 +475,16 @@ voices. Each speech adapter swaps a voice its model lacks for one it has — the
 default, or an OpenRouter model's first — so a fallback on the other provider still speaks.
 An OpenRouter model is sent the reply alone, as MP3: the Director's Desk reaches Google only.
 
-A profile its owner can edit may carry a **voice sample** (`/profile voice_sample`): the
-audio sealed beside the profile's shards, and a sealed record of its type, transcript and
-who vouched that the voice was theirs to use. A borrow speaks with its source's, resolved
-through `original_pid`. Nothing copies it — clone, convert and export rebuild a profile from
-its config and prompts — and removing the profile's directory removes it. It is decrypted to
-a temp file per request, only for a model whose host clones voices, and sent in place of a
-preset voice. A turn's speech retries one timeout and no more, across both of its models.
+A profile its owner can edit may carry up to three **voice samples** (`/profile
+voice_sample`), one per slot: the audio sealed beside the profile's shards, and a sealed
+record of its type, transcript and who vouched that the voice was theirs to use. Slot 1 is
+the pre-slot file names. One slot is always selected (`voice_sample_slot` in config,
+`ProfileManager.voice_sample_slot`), and only it is sent; an empty one means the preset voice.
+A borrow speaks with its source's recordings, resolved through `original_pid`; it keeps the
+selection its config was copied with, and follows the source's while it has none. Nothing copies them — clone, convert and export
+rebuild a profile from its config and prompts — and removing the profile's directory removes
+them. The selected one is decrypted to a temp file per request, only for a model whose host
+clones voices, and sent in place of a preset voice. A turn's speech retries one timeout and no more, across both of its models.
 
 ### No vendor SDKs
 
@@ -547,7 +553,7 @@ what is true for the whole scene. It is assembled in three bands:
 | Band | Blocks | Why there |
 |---|---|---|
 | stable | `scene_prompt`, `persona_profile`, `character_instructions` | changes rarely, so it is the cacheable prefix |
-| volatile | `session_synopsis`, `game_context`, `neuro_endocrine_engine`, `time_context`, `training_data`, `archive_context`, `negative_constraints` | changes per turn or per minute |
+| volatile | `session_synopsis`, `game_context`, `neuro_endocrine_engine`, `time_context`, `birthday_context`, `training_data`, `archive_context`, `negative_constraints` | changes per turn or per minute |
 | trailing | `context_rules`, `content_policy` | output-format and hard-content rules, last for recency |
 
 Providers cache on a shared prefix, so **the first block that changes invalidates every

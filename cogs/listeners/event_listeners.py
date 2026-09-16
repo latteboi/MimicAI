@@ -948,10 +948,19 @@ class EventListeners:
         
         message_id = payload.message_id
         channel_id = payload.channel_id
-        
+
         session = self.multi_profile_channels.get(channel_id)
         if not session: return
-        
+
+        # Discord sends this event for more than an edit: a link preview being attached, for
+        # one. A message never edited has nothing to rewrite, and one whose edit time has not
+        # moved since the cached copy has not been edited again.
+        msg = payload.message
+        if msg.edited_at is None:
+            return
+        if payload.cached_message is not None and payload.cached_message.edited_at == msg.edited_at:
+            return
+
         session_type = session.get("type", "multi")
         if not session.get("is_hydrated"):
             session = await self.session_manager._ensure_session_hydrated(channel_id, session_type)
@@ -978,28 +987,19 @@ class EventListeners:
             # either; rewriting one here would flatten its type and leak it.
             if turn_object.get("is_user") is not True or turn_object.get("type"):
                 return
-            
-            channel = self.bot.get_channel(channel_id)
-            if not channel: return
-            
-            try:
-                msg = await channel.fetch_message(message_id)
-            except discord.NotFound:
-                return
-            
+
             author_id = msg.author.id
             # Must match what triggers.py stamped when the turn was first written,
             # or an edit re-renders the line in a different timezone from the original.
             user_tz = self.profile_manager.user_timezone(author_id)
-            
-            # Format the new content
-            new_content = msg.clean_content
+
+            # Rebuilt by the same builder that wrote the turn, so the text files, image tags
+            # and quoted reply survive the edit. Read from the message as it is now: an
+            # attachment removed in the edit goes from the turn too.
             reply_context = await self.generation_service._resolve_reply_context(msg)
-            if reply_context:
-                new_content = f"{reply_context}\n{new_content}"
-                
-            new_content += "\n(edited)"
-            
+            new_content, _ = await self.generation_service._compose_user_turn(
+                msg.clean_content, msg.attachments, reply_context, edited=True)
+
             # Format and inject, keeping the original timestamp
             original_ts = msg.created_at
             # The same hash triggers.py stamped on the turn when it was first written.
@@ -1008,7 +1008,11 @@ class EventListeners:
             new_history_line = _format_history_entry(
                 msg.author.display_name, original_ts, new_content, user_tz,
                 entity_id=_get_user_hash(author_id))
-            
+
+            # An update to a message that was edited once already, with no cached copy to
+            # compare its edit time against, rebuilds to the same line: nothing to save.
+            if new_history_line == turn_object.get("content"):
+                return
             turn_object["content"] = new_history_line
             
             # Flush changes to disk

@@ -7,6 +7,7 @@ import datetime
 from typing import TYPE_CHECKING, List, Optional
 
 from .base_components import BlockedGuard, TabbedView, add_button, add_select
+from ..utils.birthdays import MONTH_NAMES, format_birthday, parse_birthday, valid_birthday
 from ..utils.helpers import _get_user_hash, _resolve_zoneinfo, suppress_link_previews
 from ..utils.data_policy import is_paid_gemini_slot, may_save_free_gemini_key
 
@@ -267,6 +268,14 @@ def build_about_embed(cog: 'MimicCog', user_id: int) -> discord.Embed:
                "`/profile manage` -> Timezone."),
         inline=False)
 
+    birthday = format_birthday(about.get("birthday"))
+    embed.add_field(
+        name="\N{BIRTHDAY CAKE} Your Birthday",
+        value=(f"`{birthday or 'Not set'}`\n"
+               "A character you are talking with knows it the day before, on the day and the "
+               "day after, going by your timezone. Only the day and month are kept."),
+        inline=False)
+
     embed.add_field(
         name="\N{BUST IN SILHOUETTE} Your Identifiers",
         value=(f"**Discord ID:** `{user_id}`\n"
@@ -296,9 +305,16 @@ class SettingsAboutView(SettingsBaseView):
         add_button(self, "Set Timezone", self._act_timezone, style=discord.ButtonStyle.primary,
                    row=0, emoji="\N{GLOBE WITH MERIDIANS}")
 
-        if self.cog.profile_manager.get_user_about(self.user_id).get("timezone"):
+        about = self.cog.profile_manager.get_user_about(self.user_id)
+        if about.get("timezone"):
             add_button(self, "Clear Timezone", self._act_clear_timezone,
                        style=discord.ButtonStyle.secondary, row=0)
+
+        add_button(self, "Set Birthday", self._act_birthday, style=discord.ButtonStyle.primary,
+                   row=1, emoji="\N{BIRTHDAY CAKE}")
+        if about.get("birthday"):
+            add_button(self, "Clear Birthday", self._act_clear_birthday,
+                       style=discord.ButtonStyle.secondary, row=1)
 
         self._add_nav_buttons()
 
@@ -322,6 +338,58 @@ class SettingsAboutView(SettingsBaseView):
         self.cog.profile_manager.save_user_about(self.user_id, about)
         self._build_view()
         await self.update_display()
+
+    async def _act_birthday(self, i: discord.Interaction):
+        await i.response.send_modal(UserBirthdayModal(self.cog, self))
+
+    async def _act_clear_birthday(self, i: discord.Interaction):
+        await i.response.defer()
+        about = self.cog.profile_manager.get_user_about(self.user_id)
+        about.pop("birthday", None)
+        self.cog.profile_manager.save_user_about(self.user_id, about)
+        self._build_view()
+        await self.update_display()
+
+
+class UserBirthdayModal(ui.Modal, title="Your Birthday"):
+    """Day and month only, into `index.json["about"]["birthday"]`.
+
+    No year: a character can mention a birthday without the bot holding anyone's age.
+    Day and month are separate boxes, so no date can be read the wrong way round.
+    """
+
+    def __init__(self, cog: 'MimicCog', parent_about_view):
+        super().__init__()
+        self.cog = cog
+        self.parent_about_view = parent_about_view
+        current = valid_birthday(
+            cog.profile_manager.get_user_about(parent_about_view.user_id).get("birthday")) or {}
+        self.day = ui.TextInput(label="Day", default=str(current.get("day", "")),
+                                required=False, max_length=2, placeholder="1-31")
+        self.month = ui.TextInput(
+            label="Month", default=MONTH_NAMES[current["month"] - 1] if current.get("month") else "",
+            required=False, max_length=9, placeholder="March, Mar or 3")
+        self.add_item(self.day)
+        self.add_item(self.month)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            birthday = parse_birthday(self.day.value, self.month.value, allow_year=False)
+        except ValueError as e:
+            await interaction.response.send_message(
+                f"❌ **Invalid Input:** {suppress_link_previews(str(e))}", ephemeral=True)
+            return
+        user_id = self.parent_about_view.user_id
+        about = self.cog.profile_manager.get_user_about(user_id)
+        if birthday:
+            about["birthday"] = birthday
+        else:
+            about.pop("birthday", None)
+        self.cog.profile_manager.save_user_about(user_id, about)
+
+        await interaction.response.defer()
+        self.parent_about_view._build_view()
+        await self.parent_about_view.update_display()
 
 class SettingsAPIView(SettingsBaseView):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):

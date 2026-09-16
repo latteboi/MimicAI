@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple, Any, Optional, Union
 import orjson as json
 from .constants import (
-    DISCORD_MAX_MESSAGE_LENGTH, API_ERROR_MAPPINGS, VOICE_SAMPLE_TYPES,
+    DISCORD_MAX_MESSAGE_LENGTH, API_ERROR_MAPPINGS, VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_TYPES,
     HARM_CATEGORIES, HarmBlockThreshold, HarmCategory,
     PATTERN_SYSTEM_XML_BLOCKS, PATTERN_SYSTEM_XML_ORPHANS,
     PATTERN_REASONING_BLOCKS, PATTERN_REASONING_ORPHANS, PATTERN_SYSTEM_HEADER,
@@ -406,11 +406,10 @@ def _format_history_entry(display_name: str, timestamp: Union[datetime.datetime,
     """One turn's stored form: the identity header the model reads, plus the content.
 
     `entity_id` is required and keyword-only. It used to default to "00000000", which
-    is not a marker of anything -- it is a plausible-looking id that reads as real. Two
-    call sites had quietly been taking it: editing a Discord message rewrote the user's
-    turn with it in place of their stable hash, and the debug prompt dump showed it
-    instead of the speaking profile's PID. Both were invisible because the output still
-    looked well-formed. A missing id is now a TypeError at the call site.
+    is not a marker of anything -- it is a plausible-looking id that reads as real.
+    Editing a Discord message had quietly been taking it, rewriting the user's turn with
+    it in place of their stable hash, invisibly because the output still looked
+    well-formed. A missing id is now a TypeError at the call site.
     """
     # Convert string timestamp to datetime object if necessary
     if isinstance(timestamp, str):
@@ -508,42 +507,6 @@ def is_citation_subtext(content: str) -> bool:
 def _get_sanitized_history_and_author(history: List[str], user_id_map: Dict[int, str], primary_author_id: int) -> Tuple[List[str], str]:
     primary_author_name = user_id_map.get(primary_author_id, "A user")
     return history, primary_author_name
-
-def _serialize_content_for_debug(content: Any) -> Optional[Dict]:
-    if not content or not hasattr(content, 'role') or not hasattr(content, 'parts'):
-        return None
-
-    parts_list = []
-    for part in content.parts:
-        if hasattr(part, 'text'):
-            parts_list.append({'text': part.text})
-        elif hasattr(part, 'inline_data') and part.inline_data:
-            # Redact image data for brevity in debug logs
-            parts_list.append({'inline_data': {'mime_type': part.inline_data.mime_type, 'data': '[IMAGE_DATA]'}})
-        elif hasattr(part, 'file_data') and part.file_data:
-            parts_list.append({'file_data': {'file_uri': part.file_data.file_uri}})
-
-    if not parts_list:
-        return None
-
-    return {'role': content.role, 'parts': parts_list}
-
-def _format_debug_prompt(turns_for_debug: List[Any]) -> str:
-    serialized_turns = []
-    for turn in turns_for_debug:
-        serialized = _serialize_content_for_debug(turn)
-        if serialized:
-            serialized_turns.append(serialized)
-
-    if not serialized_turns:
-        return "```json\n[]\n```"
-
-    json_string = json.dumps(serialized_turns, option=json.OPT_INDENT_2).decode('utf-8')
-
-    if len(json_string) > 1980: # Add buffer for markdown
-        json_string = json_string[:1977] + "..."
-
-    return f"```json\n{json_string}```"
 
 def _format_and_chunk_thought_summary(thought_text: str) -> List[str]:
     if not thought_text:
@@ -647,7 +610,15 @@ def _describe_api_error(error: Exception) -> str:
     if "OpenRouter API Error" in error_str:
         try:
             err_data = json.loads(error_str[error_str.find("{"):])
-            msg = err_data.get("error", {}).get("message", "")
+            err = err_data.get("error", {})
+            msg = err.get("message", "")
+            if err.get("code") == 429:
+                # "Provider returned error" is all a host's own 429 says at the top level,
+                # which read as a fault rather than as traffic that will clear.
+                if msg == "Provider returned error":
+                    host = (err.get("metadata") or {}).get("provider_name") or "The model's host"
+                    return f"**OpenRouter Rate Limit:** {host} is turning requests away. Try again shortly."
+                return f"**OpenRouter Rate Limit:** {msg}"
             return "Provider Error" if msg == "Provider returned error" else f"OpenRouter: {msg}"
         except Exception: pass
 
@@ -684,6 +655,15 @@ def voice_sample_mime_type(content_type: Optional[str], filename: Optional[str])
     if declared.startswith("audio/"):
         return declared
     return VOICE_SAMPLE_TYPES.get(os.path.splitext(filename or "")[1].lower())
+
+
+def describe_voice_samples(summary: Optional[Tuple[int, int, bool]]) -> Optional[str]:
+    """A dashboard's line for `ProfileManager.voice_sample_summary`, or None when no slot is filled."""
+    filled, slot, selected_filled = summary or (0, 1, False)
+    if not filled:
+        return None
+    return (f"Slot {slot}" + ("" if selected_filled else " (empty)")
+            + f" \u00b7 {filled} of {VOICE_SAMPLE_SLOTS} saved")
 
 
 #: model id -> `image_model_caps` for OpenRouter's image models, installed whole by the image

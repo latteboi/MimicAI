@@ -21,6 +21,7 @@ from ..utils.constants import (
     USERS_DIR, SERVERS_DIR, SESSIONS_GLOBAL_DIR, defaultConfig,
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
     DEFAULT_CAST_POLICY, DELIVERY_GUARD_SECONDS,
+    ROUND_EXEMPT_USER_TURNS, ROUND_EXEMPT_USER_CHARS,
 )
 from .storage_manager import (IOManager, _delete_file_shard, _get_compressor,
                               _get_decompressor, seal_blob, unseal_blob)
@@ -1499,6 +1500,30 @@ class SessionManager:
                 return full_log[index:]
         return list(full_log)
 
+    @staticmethod
+    def _bound_reserved_tail(full_log: List[Dict], reserved_tail: int) -> int:
+        """`reserved_tail`, cut short once the round's user messages pass either bound.
+
+        The exemption used to be the whole round. A burst of forty messages, each able to
+        carry two text files of 40,000 characters, went out on top of STM once per
+        character in the round. Counted newest first: past ROUND_EXEMPT_USER_TURNS or
+        ROUND_EXEMPT_USER_CHARS the older messages come under STM like any other turn,
+        still in the log. The newest is always exempt, however long, since it is what the
+        round answers. Replies in the tail count towards neither bound: the next character
+        has to see what was just said.
+        """
+        reserved_tail = min(max(0, reserved_tail), len(full_log))
+        users = chars = 0
+        for kept in range(reserved_tail):
+            turn = full_log[len(full_log) - 1 - kept]
+            if not turn.get("is_user"):
+                continue
+            users += 1
+            chars += len(turn.get("content") or "")
+            if users > 1 and (users > ROUND_EXEMPT_USER_TURNS or chars > ROUND_EXEMPT_USER_CHARS):
+                return kept
+        return reserved_tail
+
     def _build_history_for_participant(self, full_log: List[Dict], bot_pid: str, p_settings: Dict[str, Any], num_participants: int = 1, reserved_tail: int = 0, *, hide_folded: bool) -> List[Dict]:
         """This participant's view of the log: the last `stm_length` turns, with other
         participants' private exchanges hidden and its own rewritten into their XML tags.
@@ -1506,7 +1531,8 @@ class SessionManager:
         `reserved_tail` exempts that many trailing turns from the window -- the turns a
         round has just added, which the participant is being asked to respond to. STM
         governs how far back it remembers, not how much of the present it is allowed to
-        see, so a busy round must not push the conversation out of its own prompt.
+        see, so a busy round must not push the conversation out of its own prompt. How
+        many messages that exempts is bounded by `_bound_reserved_tail`.
 
         Callers used to express that by pre-slicing `past[-stm:] + batch` and passing the
         result here, which then re-sliced it to `stm` and dropped the oldest `len(batch)`
@@ -1522,7 +1548,7 @@ class SessionManager:
         stm_length = int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
         effective_stm = max(stm_length, num_participants) if stm_length > 0 else 0
         # stm_length 0 means "no memory", but the current round is still in front of it.
-        window = effective_stm + max(0, reserved_tail)
+        window = effective_stm + self._bound_reserved_tail(full_log, reserved_tail)
         log_slice = self._select_history_window(full_log, window, hide_folded)
 
         participant_history = []

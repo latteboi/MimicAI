@@ -1,16 +1,22 @@
 import re
 import datetime
+import itertools
 import discord
 from zoneinfo import ZoneInfo
-from typing import Any, Optional, Dict, List, Tuple
+from typing import Any, Optional, Dict, List, Sequence, Tuple
 
 from ...utils.constants import (
     defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
     DEFAULT_SYSTEM_INSTRUCTION, DEFAULT_CONTEXT_RULES, DEFAULT_NEURO_INSTRUCTION,
     DEFAULT_TRAINING_DATA_INJECTION, DEFAULT_TIME_CONTEXT, DEFAULT_NEGATIVE_CONSTRAINTS,
-    DEFAULT_CONTENT_POLICY,
+    DEFAULT_CONTENT_POLICY, DEFAULT_BIRTHDAY_CONTEXT,
 )
-from ...utils.helpers import Timeout, default_profile_avatar_url
+from ...utils.birthdays import describe_birthday
+from ...utils.helpers import Timeout, _get_user_hash, default_profile_avatar_url
+
+#: The most users whose birthdays one prompt carries. A history window rarely holds more
+#: people than this, and the bound keeps a crowded channel from growing every prompt.
+BIRTHDAY_USERS_MAX = 10
 
 
 class PromptBuilderMixin:
@@ -54,7 +60,76 @@ class PromptBuilderMixin:
         except Exception:
             pass
 
-    def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None) -> Tuple[str, bool, bool, float, float, int, str, str]:
+    def _users_in_history_window(self, session: Optional[Dict], profile_data: Dict[str, Any]) -> List[Tuple[int, str]]:
+        """(user id, display name) for each user with a public turn inside this profile's
+        history window, most recent speaker first.
+
+        The window is the profile's `stm_length`, the span `_build_history_for_participant`
+        shows it. A user who spoke earlier than that, or only in a whisper, is not part of
+        the conversation this prompt answers, and their details stay out of it.
+        """
+        log = (session or {}).get("unified_log") or []
+        stm_length = int(profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
+        users: Dict[int, str] = {}
+        for turn in itertools.islice(reversed(log), max(stm_length, 0)):
+            if turn.get("is_user") is not True or turn.get("type") or turn.get("is_hidden"):
+                continue
+            try:
+                user_id = int(turn.get("speaker_pid"))
+            except (TypeError, ValueError):
+                continue
+            if user_id in users:
+                continue
+            # The name the model reads in that turn's header, `<Name> [ID: hash] ...`.
+            content = turn.get("content") or ""
+            end = content.find("> [ID: ")
+            users[user_id] = content[1:end] if content.startswith("<") and end > 1 else "a user"
+            if len(users) >= BIRTHDAY_USERS_MAX:
+                break
+        return list(users.items())
+
+    def _birthday_lines(self, profile_owner_id: Optional[int], profile_name: str,
+                        profile_today: datetime.date,
+                        users: Sequence[Tuple[int, str]]) -> List[str]:
+        """What the model is told about birthdays within a day of today, if anything.
+
+        The character's own is read from the source profile's prompts, so a borrow keeps
+        the original's, and judged on the character's clock. Each user's comes from their
+        About Me and is judged on theirs: a birthday is the date where its owner is.
+        """
+        lines = []
+        if profile_owner_id is not None:
+            prompts = self.cog.profile_manager._get_profile_prompts(profile_owner_id, profile_name) or {}
+            own = describe_birthday(prompts.get("birthday"), profile_today)
+            if own:
+                lines.append(own)
+
+        from ...utils.helpers import _resolve_zoneinfo
+        seen = set()
+        for user_id, display_name in users:
+            if user_id in seen:
+                continue
+            seen.add(user_id)
+            about = self.cog.profile_manager.get_user_about(user_id)
+            if not about.get("birthday"):
+                continue
+            try:
+                tz, _ = _resolve_zoneinfo(about.get("timezone") or "UTC")
+            except Exception:
+                tz = datetime.timezone.utc
+            line = describe_birthday(about["birthday"], datetime.datetime.now(tz).date(),
+                                     f"{display_name} [ID: {_get_user_hash(user_id)}]")
+            if line:
+                lines.append(line)
+        return lines
+
+    def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None, present_users: Optional[Sequence[Tuple[int, str]]] = None) -> Tuple[str, bool, bool, float, float, int, str, str]:
+        """The system instruction for one profile's generation, plus its sampling values.
+
+        `present_users` is (user id, display name) for the people in the conversation, whose
+        birthdays the character may know. A session derives them from its own log, so only
+        a caller with no session -- Global Chat -- passes them.
+        """
         persona_data: Dict[str, List[str]] = {}
         # profile_owner_id is Optional, but profile_data is read unconditionally below.
         profile_data: Dict[str, Any] = {}
@@ -65,7 +140,6 @@ class PromptBuilderMixin:
         top_k = defaultConfig.GEMINI_TOP_K
         primary_model = PRIMARY_MODEL_NAME
         fallback_model = FALLBACK_MODEL_NAME
-        time_tracking_enabled = False
         timezone_str = "UTC"
         neuro_enabled = False
         neuro_state = {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20}
@@ -78,7 +152,6 @@ class PromptBuilderMixin:
             persona_data, ai_instr_str, grounding_enabled, temperature, top_p, top_k, _, _, primary_model, fallback_model = self.cog.session_manager._get_user_profile_for_model(profile_owner_id, channel_id, profile_name_to_use)
 
         if profile_data:
-            time_tracking_enabled = profile_data.get("time_tracking_enabled", False)
             timezone_str = profile_data.get("timezone", "UTC")
             neuro_enabled = profile_data.get("neuro_engine_enabled", False)
             neuro_state = profile_data.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
@@ -97,8 +170,8 @@ class PromptBuilderMixin:
         stable_parts = []
         volatile_parts = []
 
+        session = self.cog.multi_profile_channels.get(channel_id) if is_multi_profile else None
         if is_multi_profile:
-            session = self.cog.multi_profile_channels.get(channel_id)
             if session and session.get("session_prompt"):
                 stable_parts.append(f"<scene_prompt>\n{session['session_prompt']}\n</scene_prompt>")
 
@@ -166,19 +239,29 @@ class PromptBuilderMixin:
             )
             volatile_parts.append(neuro_block)
 
-        if time_tracking_enabled:
-            time_template = self.cog.global_prompts.get("TIME_CONTEXT", DEFAULT_TIME_CONTEXT)
-            try:
-                from ...utils.helpers import _resolve_zoneinfo
-                tz, _ = _resolve_zoneinfo(timezone_str)
-                now = datetime.datetime.now(tz)
-                time_str = now.strftime("%A, %d %B %Y, %I:%M %p (%Z)")
-                volatile_parts.append(time_template.format(time_str=time_str))
-            except Exception as e:
-                print(f"Error processing timezone '{timezone_str}': {e}. Defaulting to UTC.")
-                now_utc = datetime.datetime.now(datetime.timezone.utc)
-                time_str_utc = now_utc.strftime("%A, %d %B %Y, %I:%M %p (UTC)")
-                volatile_parts.append(time_template.format(time_str=time_str_utc))
+        # Always sent. `time_tracking_enabled` used to switch this block off; that mode is
+        # retired and the key is no longer read, so a profile still carrying False gets
+        # its clock like every other.
+        time_template = self.cog.global_prompts.get("TIME_CONTEXT", DEFAULT_TIME_CONTEXT)
+        try:
+            from ...utils.helpers import _resolve_zoneinfo
+            tz, _ = _resolve_zoneinfo(timezone_str)
+            now = datetime.datetime.now(tz)
+            time_str = now.strftime("%A, %d %B %Y, %I:%M %p (%Z)")
+        except Exception as e:
+            print(f"Error processing timezone '{timezone_str}': {e}. Defaulting to UTC.")
+            now = datetime.datetime.now(datetime.timezone.utc)
+            time_str = now.strftime("%A, %d %B %Y, %I:%M %p (UTC)")
+        volatile_parts.append(time_template.format(time_str=time_str))
+
+        # Beside <time_context>, which already changes every minute, so it costs no
+        # prompt caching the clock was not already costing.
+        if present_users is None:
+            present_users = self._users_in_history_window(session, profile_data) if session else []
+        birthday_lines = self._birthday_lines(profile_owner_id, profile_name_to_use, now.date(), present_users)
+        if birthday_lines:
+            birthday_template = self.cog.global_prompts.get("BIRTHDAY_CONTEXT", DEFAULT_BIRTHDAY_CONTEXT)
+            volatile_parts.append(birthday_template.format(birthdays="\n".join(birthday_lines)))
 
         if training_examples_list:
             examples_block = "\n---\n".join(training_examples_list)
