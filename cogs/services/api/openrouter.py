@@ -233,7 +233,9 @@ class OpenRouterModel:
                 def __bool__(self): return True
 
             return OpenRouterThoughtResponse(
-                msg_obj.get('content', ''),
+                # A reply with no text (all reasoning, or a refusal) is `"content": null`,
+                # which a .get default does not catch -- and every caller strips `.text`.
+                msg_obj.get('content') or '',
                 msg_obj.get('reasoning', ''),
                 (choice.get('finish_reason') or 'STOP').upper(),
                 usage_obj.get('prompt_tokens', 0),

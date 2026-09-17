@@ -21,6 +21,7 @@ from ..utils.helpers import (_resolve_safety_settings, _split_into_sentences_wit
                              apply_typing_cursor, image_rag_enabled, typing_cursor_cost,
                              upload_too_large)
 from ..utils.attachment_limits import over_attachment_limit
+from ..utils.discord_cdn import signed_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager
 from .session_manager import NEW_SESSION_COMPACTION
@@ -810,6 +811,7 @@ class ChildBotManager:
             elif action == "update_avatar":
                 url = payload.get("avatar_url")
                 if url:
+                    url = await signed_attachment_url(bot.http, url)
                     # Was a per-call aiohttp.ClientSession, which built its own SSL
                     # context and connector for one GET. Shares the pool now.
                     resp = await get_capped(get_shared_client(), url, MAX_AVATAR_SIZE_BYTES,

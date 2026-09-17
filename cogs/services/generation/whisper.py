@@ -158,7 +158,7 @@ class WhisperMixin:
         custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
 
         display_name = effective_profile_name
-        appearance = self.cog.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name)
+        appearance = self.cog.profile_manager._get_user_appearance(effective_owner_id, effective_profile_name)
         avatar_url = self.cog.bot.user.display_avatar.url
         if appearance:
             display_name = appearance.get("custom_display_name") or display_name
@@ -391,7 +391,7 @@ class WhisperMixin:
         custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
 
         display_name = effective_profile_name
-        appearance = self.cog.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name)
+        appearance = self.cog.profile_manager._get_user_appearance(effective_owner_id, effective_profile_name)
         avatar_url = self.cog.bot.user.display_avatar.url
         if appearance:
             display_name = appearance.get("custom_display_name") or display_name

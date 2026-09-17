@@ -8,6 +8,7 @@ import uuid
 import time
 from typing import TYPE_CHECKING, List, Optional
 
+from ..utils.discord_cdn import unsigned_attachment_url
 from .base_components import (PageJumpModal, TabbedView, add_button, add_select,
                               build_pagination_controls, bulk_select_options,
                               paged_nav_options, resolve_bulk_select)
@@ -256,7 +257,7 @@ class HubPublicLibraryView(HubBaseView):
         owner_name = owner.name if owner else "Unknown"
         
         disp_name = cfg_data.get("custom_display_name", p_info['profile_name'])
-        avatar_url = cfg_data.get("custom_avatar_url")
+        avatar_url = unsigned_attachment_url(cfg_data.get("custom_avatar_url"))
 
         byline = f"Created by **{owner_name}**"
         borrowers = len({borrower_id for borrower_id, _ in

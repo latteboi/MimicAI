@@ -113,7 +113,7 @@ cogs/
   listeners/               gateway events; inherited by MimicCog
   gui/                     Discord UI views and modals
   utils/                   constants, helpers, content, fuzzy, http_client, memory_tuning,
-                           loop_probe
+                           loop_probe, discord_cdn
 ```
 
 **Managers own persisted state. Services own operations.** Both take a back-reference to
@@ -676,6 +676,11 @@ Any dict keyed by channel, user or profile must be an `LRUCache` or have an evic
   granularity. Never call it inside `asyncio.to_thread`.
 - **Australian/British spelling** in user-facing strings and comments ("synchronised",
   "behaviour"). Match the surrounding file.
+- **Avatars are read through `ProfileManager._get_user_appearance`**, never straight from a
+  profile's config. A Discord attachment link expires a day after issue; that lookup hands
+  Discord the link with no signature, which Discord re-signs itself. The config keeps the
+  link as typed, and code that downloads the image calls `signed_attachment_url` first
+  (`utils/discord_cdn.py`).
 - **Long explanatory comments are the house style.** Where a decision looks strange, the
   reasoning is written down next to it. Preserve those comments when refactoring; they are
   the record of what was already tried.

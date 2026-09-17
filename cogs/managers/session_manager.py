@@ -24,6 +24,7 @@ from ..utils.constants import (
     DEFAULT_CAST_POLICY, DELIVERY_GUARD_SECONDS,
     ROUND_EXEMPT_USER_TURNS, ROUND_EXEMPT_USER_CHARS, SESSION_BUSY_FLAGS,
 )
+from ..utils.discord_cdn import unsigned_attachment_url
 from .storage_manager import (IOManager, _delete_file_shard, _get_compressor,
                               _get_decompressor, seal_blob, unseal_blob)
 
@@ -1088,7 +1089,7 @@ class SessionManager:
 
             if active_appearance:
                 app_name = active_appearance.get("custom_display_name") or app_name
-                app_avatar_url = active_appearance.get("custom_avatar_url") or app_avatar_url
+                app_avatar_url = unsigned_attachment_url(active_appearance.get("custom_avatar_url")) or app_avatar_url
 
             embed.add_field(name="Linked Appearance", value=f"Name: {app_name}", inline=False)
             if app_avatar_url:

@@ -7,7 +7,8 @@ import pathlib
 import time
 import asyncio
 from typing import TYPE_CHECKING, List, Dict, Any, Optional
-from ..utils.helpers import _estimate_text_tokens, _get_user_hash, resolve_openrouter_service_tier
+from ..utils.helpers import (_estimate_text_tokens, _get_user_hash, resolve_openrouter_service_tier,
+                             strip_history_envelope)
 from ..utils.data_policy import may_pick_training_models
 from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PAGE, add_button,
                               paged_nav_options,
@@ -639,8 +640,7 @@ class WhisperHistoryView(BlockedGuard, ui.View):
                     ts = datetime.datetime.now(datetime.timezone.utc)
                 ts_str = ts.strftime('%b %d, %I:%M %p')
                 
-                c_split = whisper.get("content", "").split("\n")
-                content_preview = c_split[1][:50] if len(c_split) > 1 else c_split[0][:50]
+                content_preview = strip_history_envelope(whisper.get("content", "")).split("\n", 1)[0][:50]
                 
                 whisper_options.append(discord.SelectOption(label=f"({ts_str}) {content_preview}...", value=str(i), default=(i == self.current_page)))
             
@@ -669,11 +669,10 @@ class WhisperHistoryView(BlockedGuard, ui.View):
 
         whisper_turn, response_turn = self.filtered_whispers[self.current_page]
         
-        r_split = response_turn.get("content", "").split("\n")
-        response_content = "\n".join(r_split[1:]).strip() if len(r_split) > 1 else r_split[0].strip()
-        
-        w_split = whisper_turn.get("content", "").split("\n")
-        whisper_content = "\n".join(w_split[1:]).strip() if len(w_split) > 1 else w_split[0].strip()
+        # Stored turns carry the `<Name> [ID: ...]` header and the `</Name>` close the model
+        # reads. Dropping only the first line had left the close at the foot of both.
+        response_content = strip_history_envelope(response_turn.get("content", ""))
+        whisper_content = strip_history_envelope(whisper_turn.get("content", ""))
 
         target_pid = whisper_turn.get("target_pid")
         index = self.cog.profile_manager._get_user_index(self.user_id)

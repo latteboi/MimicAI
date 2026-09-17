@@ -44,6 +44,7 @@ from ..utils.helpers import (image_rag_enabled, is_real_model, resolve_critic_se
                             resolve_grounding_mode, resolve_image_output_params,
                             resolve_image_tools, resolve_url_mode, suppress_link_previews,
                             describe_voice_samples)
+from ..utils.discord_cdn import signed_attachment_url, unsigned_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
@@ -1739,18 +1740,28 @@ class ProfileManager:
         return await asyncio.to_thread(_load)
 
     def _get_user_appearance(self, owner_id: int, profile_name: str) -> Dict[str, Optional[str]]:
+        """The name and avatar a profile shows, with the avatar ready for Discord to draw.
+
+        The cache keeps the avatar as typed, which is what Edit Appearance shows back. A
+        Discord attachment is handed out without its signature, which expires a day
+        after issue -- see `cogs/utils/discord_cdn.py`. Anything that downloads the
+        avatar itself reads the config and signs it.
+        """
         eff_owner_id, eff_name = self._resolve_effective_profile(owner_id, profile_name)
         owner_id_str = str(eff_owner_id)
         if owner_id_str in self.cog.user_appearances and eff_name in self.cog.user_appearances[owner_id_str]:
-            return self.cog.user_appearances[owner_id_str][eff_name]
+            data = self.cog.user_appearances[owner_id_str][eff_name]
+        else:
+            config = self._get_profile_config(eff_owner_id, eff_name, False) or {}
+            disp = config.get("custom_display_name")
+            ava = config.get("custom_avatar_url")
 
-        config = self._get_profile_config(eff_owner_id, eff_name, False) or {}
-        disp = config.get("custom_display_name")
-        ava = config.get("custom_avatar_url")
+            data = {"custom_display_name": disp, "custom_avatar_url": ava}
+            self.cog.user_appearances.setdefault(owner_id_str, {})[eff_name] = data
 
-        data = {"custom_display_name": disp, "custom_avatar_url": ava}
-        self.cog.user_appearances.setdefault(owner_id_str, {})[eff_name] = data
-        return data
+        avatar = data.get("custom_avatar_url")
+        drawable = unsigned_attachment_url(avatar)
+        return data if drawable == avatar else {**data, "custom_avatar_url": drawable}
 
     def _get_profile_prompts(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
         eff_owner, pid = self._resolve_prompt_owner_and_pid(user_id, profile_name)
@@ -2382,6 +2393,7 @@ class ProfileManager:
         if not avatar_url:
             return None
 
+        avatar_url = await signed_attachment_url(self.cog.bot.http, avatar_url)
         try:
             # The spoofed User-Agent rides on the request, not the client, so this
             # can share the process-wide pool with everything else.

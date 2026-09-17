@@ -861,12 +861,11 @@ TYPING_CURSOR_NOTES = {
 }
 # Thumbnail for the "thinking" state on the hub and settings embeds. One constant
 # rather than the literal repeated per view, so a swap is one edit and the two
-# surfaces cannot drift apart.
+# surfaces cannot drift apart. Bare, with no `?ex=`: a signed attachment link expires a
+# day after issue (this one did, on 2 Sept 2026), and Discord signs a bare one itself.
 THINKING_THUMBNAIL_URL = (
-    "https://media.discordapp.net/attachments/1466353749172682854/"
+    "https://cdn.discordapp.com/attachments/1466353749172682854/"
     "1544349430088728747/mimic_thinking_sierra.gif"
-    "?ex=6a982efc&is=6a96dd7c"
-    "&hm=70e0136ac4236ea1fef473642ad264c4b9c5572dc95b0bf3fcdea8563fd3479b&="
 )
 LOCK_STALE_THRESHOLD_SECONDS = 60 
 LOCK_REFRESH_INTERVAL_SECONDS = 30 

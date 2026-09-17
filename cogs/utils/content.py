@@ -878,6 +878,7 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'A profile is missing from the dropdown, or shows Already seated.' Fix: It is already in the cast the other way round -- as a child bot if you are looking at a webhook source, or the reverse. Remove it first.\n"
         "- Symptom: 'Select All did not clear everything.' Fix: The Select All and Unselect All options only affect the source currently shown; 'Clear Cast' empties all four.\n"
         "- Symptom: 'My characters post under the bot's own name and avatar.' Fix: The bot needs Manage Webhooks in that channel; without it there is no way to give a character its own name and face. If it has the permission and someone deleted the webhook, it now notices and makes a new one on the next message rather than falling back forever. A character with no Appearance set still speaks under its own name, with one of Discord's default avatars.\n"
+        "- Symptom: 'A character's avatar vanished a day after I set it.' Fix: Discord attachment links (an image uploaded to Discord, then 'Copy Link') expire after about a day. The bot now hands Discord the link without its expiry, so Discord keeps it working, as long as the message the image was posted in still exists. Links from other image hosts are unaffected.\n"
         "- Symptom: 'Only some of my cast replies each round.' Fix: That is the Response Limit. Raise it in the Config tab.\n"
         "- Symptom: 'A long session forgot what happened early on.' Fix: Turn the Rolling Synopsis on in the Memory tab, or give it more words in Edit Settings. A profile with a short Short-Term Memory can still miss turns too recent to have been folded yet."
     ),
@@ -941,7 +942,9 @@ DEFAULT_HELP_DOCS = {
         "Speak styles: `verbatim` (default) sends your text exactly as written, with no generation. `in_character` has the profile rewrite your line in its own voice first and shows it to you privately, with Send, Reroll, Edit, Switch fidelity and Cancel -- nothing is posted until you press Send. `fidelity:strict` preserves your meaning and length; `fidelity:loose` plays your line as a beat and improvises. Both styles append a spoiler-tagged authorship note to the posted message.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Whisper says there is no active session.' Fix: Whisper targets a participant in a running multi-profile session. Start one with `/session config` first.\n"
-        "- Symptom: 'Other characters reacted to something I whispered.' Fix: They should not. Whisper turns are filtered out of every other participant's history; if the content also appeared as a normal message, that is what they saw."
+        "- Symptom: 'Other characters reacted to something I whispered.' Fix: They should not. Whisper turns are filtered out of every other participant's history; if the content also appeared as a normal message, that is what they saw.\n"
+        "- Symptom: 'Whisper history ends with a stray tag like </Name>.' Fix: Fixed. The history now shows only what was written.\n"
+        "- Symptom: 'A whisper never answered, and the placeholder stayed.' Fix: Fixed. A reply that came back with no text now shows the profile's error message instead."
     ),
     "sessions/global_chat.txt": (
         "Command: `/profile global_chat`\n"
