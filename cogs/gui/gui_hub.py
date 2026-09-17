@@ -2,14 +2,16 @@ from ..utils.constants import *
 
 import discord
 from discord import ui
+import asyncio
 import datetime
 import uuid
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from .base_components import (PageJumpModal, TabbedView, add_button, add_select,
                               build_pagination_controls, bulk_select_options,
-                              compute_window_slice, resolve_bulk_select)
+                              paged_nav_options, resolve_bulk_select)
+from .gui_start import NewProfileModal
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -92,8 +94,8 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
             else:
                 desired_name = self.cog.profile_manager._generate_unique_local_name(interaction.user.id, current_name, sharer_name)
             
-            await self.cog.profile_manager._accept_share_request(interaction, int(owner_id_str), target_pid, current_name, desired_name, is_public_borrow=False)
-            accepted_profiles.append(f"`{fallback_name}` (as `{desired_name}`)")
+            if await self.cog.profile_manager._accept_share_request(interaction, int(owner_id_str), target_pid, current_name, desired_name, is_public_borrow=False):
+                accepted_profiles.append(f"`{fallback_name}` (as `{desired_name}`)")
 
         if accepted_profiles:
             del self.cog.share_codes[code]
@@ -104,7 +106,9 @@ class RedeemCodeModal(ui.Modal, title="Redeem a Share Code"):
         if failed_profiles:
             message += "\n\n⚠️ **Issues:**\n" + "\n".join([f"`{p}`: {r}" for p, r in failed_profiles.items()])
         
-        await interaction.followup.send(message, ephemeral=True)
+        # Empty when every refusal was already explained by _accept_share_request.
+        if message:
+            await interaction.followup.send(message.strip(), ephemeral=True)
 
 class HubBaseView(TabbedView):
     TABS = (
@@ -148,13 +152,21 @@ class HubHomeView(HubBaseView):
         await i.response.send_modal(modal)
 
 class HubPublicLibraryView(HubBaseView):
+    #: Profiles per dropdown page: 25 options, less the three page controls above them.
+    PER_PAGE = 22
+
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, filtered_list=None):
         super().__init__(cog, interaction, "library")
         self.all_public = []
         self._load_public_data()
         self.filtered_list = filtered_list if filtered_list is not None else self.all_public
         
-        self.current_page = 0 
+        # Two positions, because they move independently: the profile the embed shows,
+        # and the dropdown page being looked through. They used to be one number, which
+        # is why the dropdown was a window sliding round the shown profile and its
+        # "page" counter counted profiles.
+        self.selected_index = 0
+        self.current_page = 0
         
         self.setup_items()
 
@@ -163,69 +175,58 @@ class HubPublicLibraryView(HubBaseView):
         raw_list.sort(key=lambda x: x['published_at'], reverse=True)
         self.all_public = raw_list
 
+    def _num_pages(self) -> int:
+        return max(1, (len(self.filtered_list) - 1) // self.PER_PAGE + 1)
+
+    def _has_borrowed(self, p_info) -> bool:
+        """Whether the viewer already holds a borrow of this listing: one borrow-index lookup.
+
+        This runs on every repaint. It used to read the config of every profile the
+        viewer had borrowed, and matched on `original_profile_name` -- a snapshot, so a
+        listing renamed after the borrow offered Borrow again.
+        """
+        return any(borrower_id == self.user_id for borrower_id, _ in
+                   self.cog.profile_manager._borrowers_of(p_info['owner_id'], p_info.get('original_pid')))
+
     def setup_items(self):
         for item in self.children[:]:
             if item.row != 4: self.remove_item(item)
 
-        if not self.filtered_list:
-            add_button(self, "Search / Sort", self.search_cb, style=discord.ButtonStyle.secondary,
-                       row=1)
-            return
+        total = len(self.filtered_list)
+        self.selected_index = max(0, min(self.selected_index, total - 1))
+        num_pages = self._num_pages()
+        self.current_page = max(0, min(self.current_page, num_pages - 1))
 
-        num_profiles = len(self.filtered_list)
-        if self.current_page >= num_profiles: self.current_page = max(0, num_profiles - 1)
-        if self.current_page < 0: self.current_page = 0
-        
-        start_slice, end_slice = compute_window_slice(self.current_page, num_profiles)
-
-        page_items = self.filtered_list[start_slice:end_slice]
-
-        options = []
-        for i, p in enumerate(page_items):
-            abs_index = start_slice + i
-            owner = self.cog.bot.get_user(p['owner_id'])
-            owner_name = owner.name if owner else "Unknown"
-            label = f"{p['profile_name']} (by {owner_name})"[:100]
-            
-            option = discord.SelectOption(label=label, value=str(abs_index), default=(abs_index == self.current_page))
-            options.append(option)
-
-        if options:
+        if total:
+            start = self.current_page * self.PER_PAGE
+            options = paged_nav_options(self.current_page, num_pages, nav_suffix=" of profiles")
+            for abs_index, p in enumerate(self.filtered_list[start:start + self.PER_PAGE], start):
+                owner = self.cog.bot.get_user(p['owner_id'])
+                options.append(discord.SelectOption(
+                    label=p['profile_name'][:100], value=str(abs_index),
+                    description=f"by {owner.name}"[:100] if owner else None,
+                    default=(abs_index == self.selected_index)))
             add_select(self, options, self.select_callback,
-                       placeholder="Select a profile to view...", min_values=1, max_values=1,
-                       row=0)
+                       placeholder="Select a profile to view...", row=0)
 
-        build_pagination_controls(self, self.current_page, num_profiles, 1, self.prev_page_cb, self.next_page_cb, self.page_jump_cb)
-        
-        p_info = self.filtered_list[self.current_page]
-        
-        borrow_label = "Borrow"
-        borrow_style = discord.ButtonStyle.green
-        borrow_disabled = False
+            add_button(self, "◀", self.prev_profile_cb, row=1,
+                       disabled=(self.selected_index == 0))
+            add_button(self, "▶", self.next_profile_cb, row=1,
+                       disabled=(self.selected_index >= total - 1))
 
-        if self.user_id == p_info['owner_id']:
-            borrow_label = "Own Profile"
-            borrow_style = discord.ButtonStyle.grey
-            borrow_disabled = True
-        else:
-            index = self.cog.profile_manager._get_user_index(self.user_id)
-            for b_name in index.get("borrowed", []):
-                b_data = self.cog.profile_manager._get_profile_config(self.user_id, b_name, True)
-                if b_data and int(b_data.get("original_owner_id", 0)) == p_info['owner_id'] and \
-                   b_data.get("original_profile_name") == p_info['profile_name']:
-                    borrow_label = "Borrowed"
-                    borrow_style = discord.ButtonStyle.grey
-                    borrow_disabled = True
-                    break
+            p_info = self.filtered_list[self.selected_index]
+            if self.user_id == p_info['owner_id']:
+                add_button(self, "Edit Intro", self.edit_intro_cb, row=1,
+                           style=discord.ButtonStyle.blurple)
+            elif self._has_borrowed(p_info):
+                add_button(self, "Borrowed", self.borrow_cb, row=1,
+                           style=discord.ButtonStyle.grey, disabled=True)
+            else:
+                add_button(self, "Borrow", self.borrow_cb, row=1, style=discord.ButtonStyle.green)
 
-        borrow_btn = ui.Button(label=borrow_label, style=borrow_style, row=1, disabled=borrow_disabled)
-        borrow_btn.callback = self.borrow_cb
-        
-        search_btn = ui.Button(label="Search / Sort", style=discord.ButtonStyle.secondary, row=1)
-        search_btn.callback = self.search_cb
-
-        self.add_item(borrow_btn)
-        self.add_item(search_btn)
+        add_button(self, "Search", self.search_cb, row=1)
+        add_button(self, "Generate", self.generate_cb, row=1,
+                   style=discord.ButtonStyle.blurple, emoji="✨")
 
     async def update_display(self):
         if not self.filtered_list:
@@ -233,10 +234,10 @@ class HubPublicLibraryView(HubBaseView):
             await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
             return
 
-        if self.current_page >= len(self.filtered_list):
-            self.current_page = 0
+        if self.selected_index >= len(self.filtered_list):
+            self.selected_index = 0
         
-        p_info = self.filtered_list[self.current_page]
+        p_info = self.filtered_list[self.selected_index]
         owner_id = p_info['owner_id']
         original_pid = p_info.get('original_pid')
         
@@ -257,48 +258,88 @@ class HubPublicLibraryView(HubBaseView):
         disp_name = cfg_data.get("custom_display_name", p_info['profile_name'])
         avatar_url = cfg_data.get("custom_avatar_url")
 
-        embed = discord.Embed(title=disp_name, description=f"Created by **{owner_name}**", color=discord.Color.random())
+        byline = f"Created by **{owner_name}**"
+        borrowers = len({borrower_id for borrower_id, _ in
+                         self.cog.profile_manager._borrowers_of(owner_id, original_pid)})
+        if borrowers:
+            byline += f" \u00B7 Borrowed by {borrowers} {'user' if borrowers == 1 else 'users'}"
+        intro = cfg_data.get("library_intro")
+        description = f"{intro}\n\n{byline}" if intro else byline
+
+        embed = discord.Embed(title=disp_name, description=description, color=discord.Color.random())
         if avatar_url: embed.set_image(url=avatar_url)
-        embed.set_footer(text=f"ID: {p_info['id']} | {self.current_page + 1} of {len(self.filtered_list)}")
+        embed.set_footer(text=f"ID: {p_info['id']} | {self.selected_index + 1} of {len(self.filtered_list)}")
         
         await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
 
-    async def select_callback(self, i: discord.Interaction):
-        self.current_page = int(i.data['values'][0])
+    async def _show_profile(self, i: discord.Interaction, index: int):
+        """Show one listing and turn the dropdown to the page it is on."""
+        self.selected_index = index
+        self.current_page = index // self.PER_PAGE
         self.setup_items()
         await i.response.defer()
         await self.update_display()
 
+    async def select_callback(self, i: discord.Interaction):
+        value = i.data['values'][0]
+        if value == "jump_page":
+            async def _jump(inner: discord.Interaction, page: int):
+                self.current_page = page
+                self.setup_items()
+                await inner.response.edit_message(view=self)
 
-    async def page_jump_cb(self, i: discord.Interaction):
-        async def _jump(inner: discord.Interaction, page: int):
-            self.current_page = page
+            await i.response.send_modal(PageJumpModal(self._num_pages(), _jump, zero_indexed=True))
+            return
+        if value in ("prev_page", "next_page"):
+            # Only the dropdown moves; the profile on show stays put.
+            self.current_page += -1 if value == "prev_page" else 1
             self.setup_items()
-            await inner.response.defer()
-            await self.update_display()
+            await i.response.edit_message(view=self)
+            return
+        await self._show_profile(i, int(value))
 
-        await i.response.send_modal(PageJumpModal(
-            len(self.filtered_list), _jump,
-            title="Jump to Profile", label="Profile Number", zero_indexed=True))
+    async def prev_profile_cb(self, i: discord.Interaction):
+        await self._show_profile(i, max(0, self.selected_index - 1))
+
+    async def next_profile_cb(self, i: discord.Interaction):
+        await self._show_profile(i, min(len(self.filtered_list) - 1, self.selected_index + 1))
 
     async def borrow_cb(self, i: discord.Interaction):
-        if self.current_page >= len(self.filtered_list): return
+        if self.selected_index >= len(self.filtered_list): return
         
-        p_info = self.filtered_list[self.current_page]
+        p_info = self.filtered_list[self.selected_index]
         if i.user.id == p_info['owner_id']:
             await i.response.send_message("You cannot borrow your own profile.", ephemeral=True)
             return
         
-        index = self.cog.profile_manager._get_user_index(i.user.id)
-        for b_name in index.get("borrowed",[]):
-            b_data = self.cog.profile_manager._get_profile_config(i.user.id, b_name, True)
-            if b_data and int(b_data.get("original_owner_id", 0)) == p_info['owner_id'] and \
-               (b_data.get("original_pid") == p_info.get('original_pid') or b_data.get("original_profile_name") == p_info['profile_name']):
-                await i.response.send_message("You already have this profile.", ephemeral=True)
-                return
+        if self._has_borrowed(p_info):
+            await i.response.send_message("You already have this profile.", ephemeral=True)
+            return
 
         modal = BorrowNameModal(self.cog, self.original_interaction, p_info['owner_id'], p_info.get('original_pid'), p_info['profile_name'], is_public_borrow=True)
         await i.response.send_modal(modal)
+
+    async def edit_intro_cb(self, i: discord.Interaction):
+        # Deferred: gui_profiles imports this module at load time.
+        from .gui_profiles import LibraryIntroModal
+
+        p_info = self.filtered_list[self.selected_index]
+        if i.user.id != p_info['owner_id']:
+            return
+        # Resolved from the PID: an entry's stored name is a snapshot of when it was
+        # published, and the profile may have been renamed since.
+        name = self.cog.profile_manager._get_name_from_pid(p_info['owner_id'], p_info.get('original_pid'))
+        if not name:
+            await i.response.send_message("That profile no longer exists.", ephemeral=True)
+            return
+
+        async def repaint(_interaction: discord.Interaction):
+            await self.update_display()
+
+        await i.response.send_modal(LibraryIntroModal(self.cog, i.user.id, name, on_saved=repaint))
+
+    async def generate_cb(self, i: discord.Interaction):
+        await i.response.send_modal(NewProfileModal(self.cog, generate=True))
 
     async def search_cb(self, i: discord.Interaction):
         modal = ui.Modal(title="Search Public Library")
@@ -308,9 +349,9 @@ class HubPublicLibraryView(HubBaseView):
             term = inp.value.lower()
             if term:
                 self.filtered_list = [p for p in self.all_public if term in p['profile_name'].lower()]
-                self.current_page = 0
             else:
                 self.filtered_list = self.all_public
+            self.selected_index = self.current_page = 0
             self.setup_items()
             await mi.response.defer()
             await self.update_display()
@@ -441,8 +482,8 @@ class HubIncomingView(HubBaseView):
                 continue
 
             local_name = self.cog.profile_manager._generate_unique_local_name(self.user_id, current_name, sharer_name)
-            await self.cog.profile_manager._accept_share_request(self.original_interaction, sharer_id, target_pid, current_name, local_name, is_public_borrow=False)
-            accepted.append(current_name)
+            if await self.cog.profile_manager._accept_share_request(self.original_interaction, sharer_id, target_pid, current_name, local_name, is_public_borrow=False):
+                accepted.append(current_name)
         
         msg = f"Accepted: {', '.join(accepted)}" if accepted else "No valid profiles found."
         await i.followup.send(msg, ephemeral=True)
@@ -469,10 +510,30 @@ class HubShareManagerView(HubBaseView):
         self.selected_users = []
         self.processing = False
         
-        index = self.cog.profile_manager._get_user_index(self.user_id)
-        self.personal_profiles = sorted(list(index.get("personal", [])))
+        #: What the dropdown offers in the current mode, filled by `load_profiles`: only
+        #: profiles whose rating lets them be shared (or published), because listing the
+        #: rest offered a choice every button then refused.
+        self.personal_profiles: List[str] = []
+        self._loaded_mode: Optional[str] = None
         self.current_page = 0
         
+        self.setup_items()
+
+    def _eligible_profiles(self) -> List[str]:
+        """Blocking: one rating read per personal profile."""
+        pm = self.cog.profile_manager
+        capability = "share" if self.mode == "private" else "publish"
+        names = sorted(pm._get_user_index(self.user_id).get("personal", []))
+        eligible = {name for name in names if pm.content_capability(self.user_id, name, capability)[0]}
+        if self.mode == "public":
+            # Already listed stays offered whatever its rating, or it could not be
+            # deselected to unpublish it.
+            eligible |= {name for name, _ in self._get_user_public_profiles()} & set(names)
+        return sorted(eligible)
+
+    async def load_profiles(self):
+        self.personal_profiles = await asyncio.to_thread(self._eligible_profiles)
+        self._loaded_mode = self.mode
         self.setup_items()
 
     def _get_user_public_profiles(self):
@@ -537,6 +598,10 @@ class HubShareManagerView(HubBaseView):
         else:
             add_button(self, "Apply Changes", self.apply_public, style=discord.ButtonStyle.green,
                        row=2)
+            # One intro at a time, so only with one profile selected. Row 2 holds at most
+            # the three page controls and Apply Changes beside it.
+            add_button(self, "Edit Intro", self.edit_intro, row=2,
+                       disabled=len(self.selected_profiles) != 1)
 
         # Row 3: User Select (Private)
         if self.mode == "private":
@@ -545,16 +610,29 @@ class HubShareManagerView(HubBaseView):
             self.add_item(user_sel)
 
     async def update_display(self):
+        if self._loaded_mode != self.mode:
+            await self.load_profiles()
+        await self.original_interaction.edit_original_response(content=None, embed=self.build_embed(), view=self)
+
+    def build_embed(self) -> discord.Embed:
         desc = "Manage how you share your profiles.\n\n"
         if self.mode == "private":
-            desc += "**Private Mode:** Share specifically with friends via DM or Code."
+            desc += ("**Private Mode:** Share specifically with friends via DM or Code.\n"
+                     "Only profiles rated **General** or **Exempt** are listed.")
         else:
-            desc += "**Public Mode:** Publish your profiles to the global library for anyone to borrow."
+            desc += ("**Public Mode:** Publish your profiles to the global library for anyone to borrow.\n"
+                     "Only profiles rated **General** or **Exempt** are listed, with any already published. "
+                     "Select a single profile to give it an intro for its listing.")
+        if not self.personal_profiles:
+            desc += (f"\n\nNone of your profiles can be {'shared' if self.mode == 'private' else 'published'} "
+                     f"yet. Rate one from `/profile manage` → Home → **Content Safety**.")
             
         embed = discord.Embed(title="Share Manager", description=desc, color=discord.Color.teal())
         
         full_text = ", ".join(self.selected_profiles)
-        if len(full_text) > 4000: full_text = full_text[:4000] + "..." # Prevent total embed failure
+        # A field value, so 1024. This cut at 4000, the description's limit, and Select All
+        # on a large account made Discord refuse the whole embed.
+        if len(full_text) > 1024: full_text = full_text[:1021] + "..."
         if not full_text: full_text = "None"
         embed.add_field(name="Selected Profiles", value=full_text, inline=False)
 
@@ -565,7 +643,7 @@ class HubShareManagerView(HubBaseView):
             if len(val) > 1024: val = val[:1021] + "..."
             embed.add_field(name="Your Currently Public Profiles", value=val, inline=False)
 
-        await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
+        return embed
 
     async def toggle_mode(self, i: discord.Interaction):
         # [UPDATED] Free users CAN toggle to Public to UNPUBLISH. Validation happens on Apply.
@@ -580,6 +658,14 @@ class HubShareManagerView(HubBaseView):
         self.setup_items()
         await i.response.defer()
         await self.update_display()
+
+    async def edit_intro(self, i: discord.Interaction):
+        # Deferred: gui_profiles imports this module at load time.
+        from .gui_profiles import LibraryIntroModal
+
+        if len(self.selected_profiles) != 1:
+            return
+        await i.response.send_modal(LibraryIntroModal(self.cog, self.user_id, self.selected_profiles[0]))
 
     async def select_profiles(self, i: discord.Interaction):
         start = self.current_page * SHARE_PAGE_SIZE
@@ -669,10 +755,10 @@ class HubShareManagerView(HubBaseView):
         """Splits a selection into (allowed, {name: reason}) for the share gates.
 
         Sharing is the point at which a profile stops being only its owner's
-        business, so it is gated on the rating exactly as publishing is -- the
-        difference being that Adult may be shared privately and may not be
-        published. Both gates read content_capability so the refusal wording is the
-        same sentence the Content Safety dashboard shows.
+        business, so it is gated on the rating exactly as publishing is: Adult may be
+        neither. Both gates read content_capability so the refusal wording is the
+        same sentence the Content Safety dashboard shows. The dropdown already hides
+        what fails here; this catches a rating that changed after it was drawn.
         """
         allowed, refused = [], {}
         for name in names:
@@ -848,6 +934,12 @@ class HubCloningView(HubBaseView):
 
     async def generate_clone_code_cb(self, i: discord.Interaction):
         if not self.selected_profile: return
+        allowed, reason = self.cog.profile_manager.content_capability(
+            self.user_id, self.selected_profile, "share")
+        if not allowed:
+            await i.response.send_message(
+                f"**'{self.selected_profile}' cannot be cloned.**\n{reason}", ephemeral=True)
+            return
         code = f"CLN-{uuid.uuid4().hex[:8].upper()}"
         
         pid = self.cog.profile_manager._get_pid_from_name_any(self.user_id, self.selected_profile)
@@ -944,5 +1036,5 @@ class BorrowNameModal(ui.Modal, title="Name Your Borrowed Profile"):
             await interaction.followup.send(f"You already have a profile named '{desired_name}'. Please choose a different name.", ephemeral=True)
             return
 
-        await self.cog.profile_manager._accept_share_request(interaction, self.sharer_id, self.target_pid, self.fallback_name, desired_name, self.is_public_borrow)
-        await interaction.followup.send(f"✅ Successfully borrowed profile **{self.fallback_name}** and named it **{desired_name}**.", ephemeral=True)
+        if await self.cog.profile_manager._accept_share_request(interaction, self.sharer_id, self.target_pid, self.fallback_name, desired_name, self.is_public_borrow):
+            await interaction.followup.send(f"✅ Successfully borrowed profile **{self.fallback_name}** and named it **{desired_name}**.", ephemeral=True)

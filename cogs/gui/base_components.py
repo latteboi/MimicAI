@@ -309,10 +309,6 @@ class TabbedView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     async def next_page(self, i: discord.Interaction):
         await self._turn_page(i, 1)
 
-    # HubPublicLibraryView wires its buttons to the *_cb spelling.
-    prev_page_cb = prev_page
-    next_page_cb = next_page
-
 
 class PageJumpModal(ui.Modal):
     """Jump-to-page prompt for any paginated view.

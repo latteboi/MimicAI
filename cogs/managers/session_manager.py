@@ -8,6 +8,7 @@ import shutil
 import asyncio
 import random
 import time
+import contextlib
 from discord.ext import tasks
 import pathlib
 import datetime
@@ -21,7 +22,7 @@ from ..utils.constants import (
     USERS_DIR, SERVERS_DIR, SESSIONS_GLOBAL_DIR, defaultConfig,
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
     DEFAULT_CAST_POLICY, DELIVERY_GUARD_SECONDS,
-    ROUND_EXEMPT_USER_TURNS, ROUND_EXEMPT_USER_CHARS,
+    ROUND_EXEMPT_USER_TURNS, ROUND_EXEMPT_USER_CHARS, SESSION_BUSY_FLAGS,
 )
 from .storage_manager import (IOManager, _delete_file_shard, _get_compressor,
                               _get_decompressor, seal_blob, unseal_blob)
@@ -1289,6 +1290,35 @@ class SessionManager:
                 return False
             await asyncio.sleep(0.5)
         return True
+
+    @contextlib.asynccontextmanager
+    async def regeneration_turn(self, session: Dict, timeout: float):
+        """Wait for this 🔄's turn at the channel, in the order the presses arrived.
+
+        Yields True once every earlier regeneration has finished and the channel is idle,
+        False if that took longer than `timeout` -- and holds the place in line for the
+        whole body, so the next press cannot start until this one's work is over.
+
+        Each press used to poll the busy flags on its own 0.5 s timer, so when one
+        regeneration finished, the next to run was whichever timer fired first: press A,
+        B, C and C could run before B. Only the front of the line may claim now. A ticket
+        rather than an `asyncio.Lock`: on 3.10, `wait_for(lock.acquire())` can time out
+        holding the lock. The body inherits `_wait_for_session_flags`' contract: claim
+        the channel before the first await.
+        """
+        line = session.setdefault('regen_line', collections.deque())
+        ticket = object()
+        line.append(ticket)
+        try:
+            deadline = time.monotonic() + timeout
+            while line[0] is not ticket or any(session.get(flag) for flag in SESSION_BUSY_FLAGS):
+                if time.monotonic() > deadline:
+                    yield False
+                    return
+                await asyncio.sleep(0.5)
+            yield True
+        finally:
+            line.remove(ticket)
 
     def _mark_session_accessed(self, key):
         ts = time.time()

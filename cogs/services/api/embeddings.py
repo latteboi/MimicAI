@@ -1,23 +1,46 @@
-"""Query embeddings, and the small cache in front of them.
+"""Embeddings, the routes they may take, and the small cache in front of them.
 
 One vector per (text, task type, dimensionality). The cache exists because the same
 query is embedded more than once per turn -- LTM recall and help retrieval both ask.
+
+Every vector comes from Google's gemini-embedding-001, asked for directly on a Gemini key
+or through OpenRouter on an OpenRouter key. Both give the same vector for the same text,
+so one archive holds either; a different model would not, which is why OpenRouter is not
+offered any other.
 """
 
 import asyncio
 import orjson as json
-import time
 from collections import OrderedDict
-from typing import Any, List, Optional
+from typing import Any, List, NamedTuple, Optional, Sequence
 
+from ...utils.http_client import get_shared_client
 from .google_rest import get_google_rest_client
 
 
+class EmbeddingRoute(NamedTuple):
+    """One key an embedding may be requested on. Resolved by
+    `StorageManager._embedding_routes`, which also decides `data_collection`."""
+    provider: str  # "gemini" or "openrouter"
+    api_key: str
+    #: OpenRouter's `provider.data_collection`; None sends nothing.
+    data_collection: Optional[str] = None
 
-# Migration 2 step 2. One function, three call sites (memory_manager LTM/training
-# recall, help_service's two RAG builders) — all three already share this exact
-# payload shape, so the flag is applied here rather than at each site, same as
-# GoogleGenAIModel above.
+
+_OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
+_OPENROUTER_EMBEDDING_MODEL = "google/gemini-embedding-001"
+
+#: `input_type` and the hosts allowed, per task type. Measured against Google's API
+#: directly (September 2026): both of OpenRouter's Google hosts return Google's own
+#: vectors and honour `dimensions`, but only Vertex passes the task type on. AI Studio
+#: embeds everything as a query, so a memory saved through it would sit at ~0.93 of the
+#: vector search expects, for good. A query may go to either; a document only to Vertex.
+_OPENROUTER_TASKS = {
+    "RETRIEVAL_QUERY": ("search_query", ("google-vertex", "google-ai-studio")),
+    "RETRIEVAL_DOCUMENT": ("search_document", ("google-vertex",)),
+}
+
+
 # --- Query embedding cache -----------------------------------------------------
 #
 # A single turn asks for the *same* embedding three times: LTM recall, training-example
@@ -68,14 +91,17 @@ def _embed_cache_put(key, values: List[float]):
 
 
 async def get_embedding_vector(
-    api_key: str,
+    routes: Sequence[EmbeddingRoute],
     text: str,
     task_type: str = "RETRIEVAL_QUERY",
     output_dimensionality: int = 256,
     timeout: float = 5.0,
 ) -> Optional[List[float]]:
-    """Returns the embedding for `text`, or None on any failure."""
-    if not text or not text.strip():
+    """Returns the embedding for `text` from the first route that answers, or None.
+
+    `timeout` applies to each route in turn, not to the whole call.
+    """
+    if not routes or not text or not text.strip():
         return None
 
     cache_key = None
@@ -104,9 +130,12 @@ async def get_embedding_vector(
 
     values: Optional[List[float]] = None
     try:
-        values = await _fetch_embedding_vector(
-            api_key, text, task_type, output_dimensionality, timeout
-        )
+        for route in routes:
+            values = await _fetch_embedding_vector(
+                route, text, task_type, output_dimensionality, timeout
+            )
+            if values is not None:
+                break
         if cache_key is not None and values is not None:
             _embed_cache_put(cache_key, values)
         return values
@@ -121,34 +150,73 @@ async def get_embedding_vector(
 
 
 async def _fetch_embedding_vector(
-    api_key: str,
+    route: EmbeddingRoute,
     text: str,
     task_type: str,
     output_dimensionality: int,
     timeout: float,
 ) -> Optional[List[float]]:
+    fetch = _fetch_openrouter if route.provider == "openrouter" else _fetch_google
+    try:
+        values = await asyncio.wait_for(
+            fetch(route, text, task_type, output_dimensionality), timeout=timeout
+        )
+    except Exception:
+        return None
+    # A row of any other length breaks `reshape(len(rows), -1)` for every row stored
+    # beside it. A longer one is cut to size: Gemini's leading dimensions *are* the
+    # smaller embedding (Matryoshka), which is all `outputDimensionality` does.
+    if not isinstance(values, list) or len(values) < output_dimensionality:
+        return None
+    return values[:output_dimensionality]
+
+
+async def _fetch_google(route: EmbeddingRoute, text: str, task_type: str, dims: int):
     payload = {
         "model": "models/gemini-embedding-001",
         "content": {"parts": [{"text": text}]},
         "taskType": task_type,
-        "outputDimensionality": output_dimensionality,
+        "outputDimensionality": dims,
     }
-    try:
-        client = get_google_rest_client()
-        response = await asyncio.wait_for(
-            client.post(
-                "/v1beta/models/gemini-embedding-001:embedContent",
-                content=json.dumps(payload),
-                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            ),
-            timeout=timeout,
-        )
-        # None is the whole failure contract: every caller treats it as "skip this
-        # recall", and a transient 5xx is the common case. Nothing is printed -- the
-        # text is conversation content and does not belong in the host's journal.
-        if response.status_code != 200:
-            return None
-        body = json.loads(response.content)
-        return body.get("embedding", {}).get("values")
-    except Exception:
+    response = await get_google_rest_client().post(
+        "/v1beta/models/gemini-embedding-001:embedContent",
+        content=json.dumps(payload),
+        headers={"x-goog-api-key": route.api_key, "Content-Type": "application/json"},
+    )
+    # None is the whole failure contract: every caller treats it as "skip this
+    # recall", and a transient 5xx is the common case. Nothing is printed -- the
+    # text is conversation content and does not belong in the host's journal.
+    if response.status_code != 200:
         return None
+    return json.loads(response.content).get("embedding", {}).get("values")
+
+
+async def _fetch_openrouter(route: EmbeddingRoute, text: str, task_type: str, dims: int):
+    task = _OPENROUTER_TASKS.get(task_type)
+    if task is None:
+        return None
+    input_type, hosts = task
+    provider: dict = {"only": hosts}
+    if route.data_collection:
+        provider["data_collection"] = route.data_collection
+    payload = {
+        "model": _OPENROUTER_EMBEDDING_MODEL,
+        "input": text,
+        "dimensions": dims,
+        "input_type": input_type,
+        "provider": provider,
+    }
+    response = await get_shared_client().post(
+        _OPENROUTER_EMBEDDINGS_URL,
+        content=json.dumps(payload),
+        headers={
+            "Authorization": f"Bearer {route.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://discord.com",
+            "X-Title": "MimicAI Discord Bot",
+        },
+    )
+    if response.status_code != 200:
+        return None
+    data = json.loads(response.content).get("data") or []
+    return data[0].get("embedding") if data else None

@@ -117,7 +117,7 @@ def calculate_similarities(prompt_emb: List[float], b64_embs: List[str]) -> np.n
 #: why a missing key read as a broken feature: the commonest cause by far is running
 #: /profile in a DM, where there is no guild whose key could be billed.
 NO_EMBEDDING_KEY_MSG = (
-    "No usable API key for this action. Add a personal Gemini key in "
+    "No usable API key for this action. Add a personal Gemini or OpenRouter key in "
     "`/settings` -> API Keys, or run this from a server that has one assigned."
 )
 EMBEDDING_FAILED_MSG = (
@@ -691,16 +691,16 @@ class MemoryManager:
 
         Pass `owner_id` from anything a user drives directly against a profile's own
         data -- it is what lets the profile owner's personal key stand in when there
-        is no guild key, which is every DM. See `_embedding_api_key`.
+        is no guild key, which is every DM. See `_embedding_routes`.
         """
         if not text or not text.strip():
             return None
 
-        api_key = self.cog.storage_manager._embedding_api_key(guild_id, owner_id)
-        if not api_key:
+        routes = self.cog.storage_manager._embedding_routes(guild_id, owner_id)
+        if not routes:
             return None
 
-        return await get_embedding_vector(api_key, text, task_type=task_type, output_dimensionality=256, timeout=5.0)
+        return await get_embedding_vector(routes, text, task_type=task_type, output_dimensionality=256, timeout=5.0)
 
     async def _generate_ltm_data_from_history(self, hist:list, user_dn:str, gen_config_params: Dict[str, Any], guild_id: Optional[int], bot_dn: str = "Bot", profile_owner_id: int = None, profile_name: str = None, warning_channel: Optional[discord.abc.Messageable] = None) -> Optional[str]:
         """Summarises a slice of history into a long-term memory.
@@ -918,7 +918,7 @@ class MemoryManager:
         if len(training_shard) >= limit:
             return False, f"**Limit Reached.**\n\nYou have reached the maximum of **{limit}** training examples."
 
-        if not self.cog.storage_manager._embedding_api_key(guild_id, profile_owner_id):
+        if not self.cog.storage_manager._embedding_routes(guild_id, profile_owner_id):
             return False, NO_EMBEDDING_KEY_MSG
         emb = await self._get_embedding(usr_in, guild_id, task_type="RETRIEVAL_DOCUMENT",
                                         owner_id=profile_owner_id)
@@ -939,7 +939,7 @@ class MemoryManager:
 
         # Checked before the shard is even loaded: a missing key is the likeliest
         # failure here and has nothing to do with whether the example exists.
-        if not self.cog.storage_manager._embedding_api_key(guild_id, profile_owner_id):
+        if not self.cog.storage_manager._embedding_routes(guild_id, profile_owner_id):
             return False, NO_EMBEDDING_KEY_MSG
 
         owner_id_str = str(profile_owner_id)

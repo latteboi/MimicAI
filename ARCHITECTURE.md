@@ -109,6 +109,7 @@ cogs/
     media_service.py       TTS and image-generation queue workers
     tools_service.py       web grounding, URL context, anti-repetition critic
     help_service.py        RAG over bundled documentation
+    profile_generation.py  /profile generate: draft, parse, model choice, save on accept
   listeners/               gateway events; inherited by MimicCog
   gui/                     Discord UI views and modals
   utils/                   constants, helpers, content, fuzzy, http_client, memory_tuning,
@@ -517,6 +518,13 @@ Long-term memories and training examples are stored with their vectors inline, a
 Vectors are **256-dimensional**, truncated from the embedding model's native output using
 Matryoshka Representation Learning. The quality loss is small; the disk and RAM saving is
 not.
+
+Every vector is Google's `gemini-embedding-001`, asked for on a Gemini key or, failing that,
+through OpenRouter on an OpenRouter key (`StorageManager._embedding_routes`, then
+`services/api/embeddings.py`). One archive can hold both only because they are the same
+vectors, so OpenRouter is sent `dimensions` and `input_type`, and a stored document goes to
+Vertex alone -- AI Studio drops the task type. A server's OpenRouter route carries its
+`data_collection`. A longer vector is cut to 256 and a shorter one refused, before either is stored.
 
 Similarity is computed by decoding the whole candidate set into one stacked `(N, dims)`
 matrix and issuing **a single BLAS call**:

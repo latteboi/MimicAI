@@ -1277,12 +1277,25 @@ DEFAULT_TRAINING_ANALYST_PROMPT = (
 )
 
 DEFAULT_PROFILE_GENERATOR_PROMPT = (
-    "You are a creative assistant specializing in character design for roleplaying.\n"
-    "Based on the following prompt, generate a detailed character profile: '{prompt}'\n\n"
+    "You are a creative assistant specialising in character design for roleplaying.\n"
+    "Design an original character from this concept: '{prompt}'\n\n"
+    "Favour concrete, specific detail over genre cliche: a particular history, habits, contradictions and a voice of their own.\n\n"
     "Your response MUST be plain text formatted with specific section headers. Do not use JSON or markdown.\n"
-    "The required headers are exactly: [SECTION:persona_backstory], [SECTION:persona_personality_traits], [SECTION:persona_likes], [SECTION:persona_dislikes], and [SECTION:ai_instructions].\n"
-    "Each header must be on its own line. For each section, provide unrestricted, concise, structured, and low-verbose text. Each specific instruction or piece of information should be on its own line.\n\n"
+    "The required headers are exactly, in this order: [SECTION:display_name], [SECTION:library_intro], [SECTION:placeholder_emoji], "
+    "[SECTION:persona_backstory], [SECTION:persona_personality_traits], [SECTION:persona_likes], [SECTION:persona_dislikes], "
+    "[SECTION:persona_appearance] and [SECTION:ai_instructions].\n"
+    "Each header must be on its own line.\n"
+    "display_name is the name the character goes by, at most 20 characters.\n"
+    "library_intro is two or three sentences introducing the character to someone browsing a library of characters, at most 300 characters.\n"
+    "placeholder_emoji is exactly one emoji that suits the character.\n"
+    "For every other section, provide unrestricted, concise, structured, and low-verbose text. Each specific instruction or piece of information should be on its own line.\n\n"
     "Example:\n"
+    "[SECTION:display_name]\n"
+    "Vesper Crane\n"
+    "[SECTION:library_intro]\n"
+    "An exiled archivist from a city of eternal twilight who trades forbidden knowledge for favours. Guarded, dry, and more hopeful than she admits.\n"
+    "[SECTION:placeholder_emoji]\n"
+    "🕯️\n"
     "[SECTION:persona_backstory]\n"
     "Born in a city of eternal twilight.\n"
     "Exiled for forbidden knowledge.\n"
@@ -1294,11 +1307,20 @@ DEFAULT_PROFILE_GENERATOR_PROMPT = (
     "Rainy nights.\n"
     "Strong coffee.\n"
     "Unsolvable mysteries.\n"
+    "[SECTION:persona_dislikes]\n"
+    "Small talk.\n"
+    "Being pitied.\n"
+    "[SECTION:persona_appearance]\n"
+    "Tall and gaunt, with ink-stained fingers.\n"
+    "A threadbare grey coat she never takes off.\n"
     "[SECTION:ai_instructions]\n"
     "Always speak in short, declarative sentences.\n"
     "Never use emojis.\n"
     "Often end responses with a question."
 )
+
+#: The Public Library listing's creator-written introduction (`config["library_intro"]`).
+LIBRARY_INTRO_MAX_CHARS = 300
 
 DEFAULT_TRAINING_DATA_INJECTION = (
     "<training_data>\nExamples of your own past speech. They are not part of the current conversation -- match the style, personality and voice they show, not their content.\n\n{examples_block}\n</training_data>"
@@ -1657,8 +1679,8 @@ CONTENT_RATING_BLURBS = {
     ),
     CONTENT_RATING_ADULT: (
         "This profile is rated for adult audiences. It runs only in age-restricted "
-        "channels, and can be shared privately but not published to the Public "
-        "Library or used in Global Chat."
+        "channels, and cannot be shared, published to the Public Library, or used in "
+        "Global Chat."
     ),
     CONTENT_RATING_EXEMPT: (
         "This profile has been exempted from content classification by the bot "
@@ -1680,7 +1702,7 @@ CONTENT_RATING_CAPABILITIES = {
     CONTENT_RATING_UNRATED:  {"age_restricted_only": False, "share": False, "publish": False, "global_chat": False},
     CONTENT_RATING_PENDING:  {"age_restricted_only": False, "share": False, "publish": False, "global_chat": False},
     CONTENT_RATING_GENERAL:  {"age_restricted_only": False, "share": True,  "publish": True,  "global_chat": True},
-    CONTENT_RATING_ADULT:    {"age_restricted_only": True,  "share": True,  "publish": False, "global_chat": False},
+    CONTENT_RATING_ADULT:    {"age_restricted_only": True,  "share": False, "publish": False, "global_chat": False},
     CONTENT_RATING_EXEMPT:   {"age_restricted_only": False, "share": True,  "publish": True,  "global_chat": True},
 }
 
@@ -1697,9 +1719,10 @@ CONTENT_CAPABILITY_LABELS = {
 CONTENT_CAPABILITY_DENIALS = {
     ("share", CONTENT_RATING_UNRATED): "Submit this profile for a content rating first.",
     ("share", CONTENT_RATING_PENDING): "Waiting on the content rating verdict.",
+    ("share", CONTENT_RATING_ADULT): "Adult profiles cannot be shared, privately or publicly.",
     ("publish", CONTENT_RATING_UNRATED): "Submit this profile for a content rating first.",
     ("publish", CONTENT_RATING_PENDING): "Waiting on the content rating verdict.",
-    ("publish", CONTENT_RATING_ADULT): "Only General profiles can be published. Adult profiles can still be shared privately.",
+    ("publish", CONTENT_RATING_ADULT): "Adult profiles cannot be shared, privately or publicly.",
     ("global_chat", CONTENT_RATING_UNRATED): "Submit this profile for a content rating first.",
     ("global_chat", CONTENT_RATING_PENDING): "Waiting on the content rating verdict.",
     ("global_chat", CONTENT_RATING_ADULT): "A Global Chat can be opened in any channel, and none of them is guaranteed age-restricted, so Adult profiles cannot be used here.",
@@ -1866,6 +1889,8 @@ SYSTEM_XML_TAGS = [
     "backstory", "personality_traits", "likes", "dislikes", "appearance",
     # In-character /speak (generation/speak.py).
     "rewrite_request", "source_text",
+    # Refining a generated profile (services/profile_generation.py).
+    "previous_draft", "revision_request",
 ]
 _tags_pattern = "|".join(SYSTEM_XML_TAGS)
 

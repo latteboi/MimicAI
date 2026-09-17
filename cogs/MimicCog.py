@@ -1,7 +1,7 @@
 from .utils.constants import (
     ALLOWED_MODELS, CHANNEL_MODEL_CACHE_MAX_SIZE, COG_LOCK_FILE_PATH, DATA_DIR,
     CAST_POLICY_OPEN, DEFAULT_CAST_POLICY,
-    DEFAULT_PROFILE_GENERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS, DEFAULT_SYSTEM_INSTRUCTION,
+    DEFAULT_SYSTEM_INSTRUCTION,
     FALLBACK_MODEL_NAME, LOCK_REFRESH_INTERVAL_SECONDS, LOCK_STALE_THRESHOLD_SECONDS,
     MAX_MULTI_PROFILES, MOD_DATA_DIR, PRIMARY_MODEL_NAME, PUBLIC_PROFILES_DIR,
     GAME_CACHE_MAX_SIZE, PURGED_MESSAGE_ID_CACHE_MAX_SIZE,
@@ -12,10 +12,11 @@ from .utils.constants import (
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
     IMPORT_FILE_TOO_LARGE,
 )
-from .services.api_service import OpenRouterModel, GoogleGenAIModel
+from .services.profile_generation import ProfileGenerationError, generate_draft
 from .listeners.event_listeners import EventListeners
 from .gui.base_components import ActionTextInputModal, DropdownContentView, InviteView
 from .gui.gui_data import PrivacyDashboardView, ImportPassphraseModal, BulkExportView
+from .gui.gui_generate import GeneratedProfileView
 from .gui.gui_hub import HubHomeView
 from .gui.gui_sessions import (
     GlobalChatPlayView, GlobalChatHistoryView, WhisperHistoryView, SessionSwapListView,
@@ -59,7 +60,6 @@ import time
 import math
 import platform
 from collections import OrderedDict
-import re
 import pathlib
 from .utils.helpers import (_resolve_safety_settings, _scrub_response_text, resolve_thinking_params,
                             suppress_link_previews, voice_sample_mime_type)
@@ -228,6 +228,10 @@ class MimicCog(EventListeners, commands.Cog):
         # lockstep with pending_classifications above, so it is bounded by the same
         # thing: the number of jobs actually running.
         self.classification_events: Dict[Tuple[int, str], asyncio.Event] = {}
+        # (owner_id, profile_name) -> the PostEditRatingView offering its owner the choice,
+        # which resolve_stale_rating leaves alone until it is settled. Views remove
+        # themselves; the LRU only bounds what a crash mid-view could strand.
+        self.rating_prompts_open: LRUCache = LRUCache(max_size=256)
 
         # LRU rather than plain dicts: keyed by (channel_id, owner_id, profile_name), these
         # otherwise grow for the life of the process. The two are written together and read
@@ -372,7 +376,7 @@ class MimicCog(EventListeners, commands.Cog):
         
         await interaction.followup.send(f"Successfully created new profile '{profile_name}'.\nUse `/profile manage profile_name:{profile_name}` to start editing it.", ephemeral=True)
 
-    @profile_group.command(name="generate", description="Uses AI to generate a new profile from a concept.")
+    @profile_group.command(name="generate", description="Uses AI to draft a new profile from a concept, for you to review before saving.")
     @app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
     @app_commands.describe(
         prompt="The character concept (e.g., 'A cynical noir detective').",
@@ -402,86 +406,17 @@ class MimicCog(EventListeners, commands.Cog):
             await interaction.followup.send(f"You have reached the maximum of {limit} personal profiles.", ephemeral=True)
             return
 
-        api_key = self.storage_manager._get_api_key_for_user(interaction.user.id)
-        is_or = False
-        
-        if not api_key:
-            api_key = self.storage_manager._get_api_key_for_user(interaction.user.id, "openrouter")
-            is_or = True
-            
-        if not api_key:
-            await interaction.followup.send("A personal API key is not configured, so I cannot generate a profile. Please configure one in your `/settings` DM.", ephemeral=True)
+        # A draft, not a profile: GeneratedProfileView shows it and writes it on Save.
+        concept = prompt.strip()
+        try:
+            draft, model_used = await generate_draft(self, interaction.user.id, concept)
+        except ProfileGenerationError as e:
+            await interaction.followup.send(
+                f"❌ **Generation Failed:** {suppress_link_previews(str(e))}", ephemeral=True)
             return
 
-        generation_prompt = self.global_prompts.get("PROFILE_GENERATOR", DEFAULT_PROFILE_GENERATOR_PROMPT).format(prompt=prompt)
-
-        status = "api_error"
-        try:
-            if is_or:
-                model_name = 'google/gemini-2.5-flash-lite'
-                # `{}` reads as "high" in every adapter, and this is a single
-                # form-filling pass on a Lite model. Shared `utility` default.
-                model = OpenRouterModel(api_key=api_key, model_name=model_name, system_instruction=None,
-                                        thinking_params=resolve_thinking_params(None, "utility"))
-            else:
-                model_name = 'gemini-2.5-flash-lite'
-                model = GoogleGenAIModel(api_key=api_key, model_name=model_name, safety_settings=DEFAULT_SAFETY_SETTINGS)
-                
-            gen_config = {"temperature": 0.3}
-            response = await model.generate_content_async([generation_prompt], generation_config=gen_config)
-            
-            if not response or not response.candidates:
-                raise ValueError("AI returned an empty response, possibly due to a safety filter.")
-
-            response_text = getattr(response, 'text', "").strip()
-            
-            # Parse the text using the custom delimiters
-            sections = re.split(r'\[SECTION:([\w_]+)\]', response_text)
-            
-            parsed_data = {}
-            # Start from index 1 to get the first key, then step by 2
-            for i in range(1, len(sections), 2):
-                key = sections[i]
-                value = sections[i+1].strip()
-                parsed_data[key] = value
-
-            generated_data = {
-                "persona": {
-                    "backstory": parsed_data.get("persona_backstory", ""),
-                    "personality_traits": parsed_data.get("persona_personality_traits", ""),
-                    "likes": parsed_data.get("persona_likes", ""),
-                    "dislikes": parsed_data.get("persona_dislikes", "")
-                },
-                "ai_instructions": parsed_data.get("ai_instructions", "")
-            }
-
-            if not generated_data["persona"]["personality_traits"]:
-                 raise ValueError("AI failed to generate content for the 'personality traits' section.")
-
-            new_profile = self.profile_manager._get_or_create_user_profile(interaction.user.id, profile_name)
-            if not new_profile:
-                await interaction.followup.send("Failed to create the profile structure.", ephemeral=True)
-                return
-
-            # Encrypt and save the generated data
-            encrypted_persona = {key: [self.storage_manager._encrypt_data(line) for line in value.splitlines()] for key, value in generated_data['persona'].items()}
-            encrypted_instructions = self.storage_manager._encrypt_data(generated_data['ai_instructions'])
-
-            prompts = new_profile.get('prompts', {})
-            prompts['persona'] = encrypted_persona
-            
-            if not isinstance(prompts.get('ai_instructions'), list):
-                prompts['ai_instructions'] = ["", "", "", ""]
-            prompts['ai_instructions'][0] = encrypted_instructions
-            
-            self.profile_manager._save_profile_prompts(interaction.user.id, profile_name, prompts)
-
-            await interaction.followup.send(f"✅ Successfully generated and created new profile '{profile_name}'.\nUse `/profile manage profile_name:{profile_name}` to view or edit it.", ephemeral=True)
-
-        except json.JSONDecodeError:
-            await interaction.followup.send("❌ **Generation Failed:** The AI returned an invalid data format. Please try again.", ephemeral=True)
-        except Exception as e:
-            await interaction.followup.send(f"❌ **Generation Failed:** An error occurred: {suppress_link_previews(str(e))}", ephemeral=True)
+        view = GeneratedProfileView(self, interaction, profile_name, concept, draft, model_used)
+        await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
 
     @profile_group.command(name="manage", description="Manage all settings for a specific profile from a unified dashboard.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -538,6 +473,10 @@ class MimicCog(EventListeners, commands.Cog):
 
         embed = await self.profile_manager._build_profile_manage_embed(interaction, profile_name)
         view = ProfileManageView(self, interaction, profile_name, is_view_borrowed)
+        # On open rather than on every repaint: it hashes the whole persona, and the
+        # repaint straight after an edit is the post-edit prompt's decision to make.
+        # This catches imports, restores and prompts that were ignored.
+        asyncio.create_task(self.profile_manager.resolve_stale_rating(interaction.user.id, profile_name))
 
         if repaint:
             await interaction.edit_original_response(content=None, embed=embed, view=view)

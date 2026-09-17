@@ -773,6 +773,11 @@ PROFILE_ACTIONS = (
     # so both stay owner-only rather than being silently wrong under /mod.
     _Action("share", "home", "Share Profile", "Share this profile with others or publish it.",
             _method("_handle_share"), _own_not_mod),
+    # No bulk form, which is also what keeps it out of /settings -> Defaults: one intro
+    # stamped across forty characters describes none of them.
+    _Action("library_intro", "home", "Library Intro",
+            "Write the introduction shown on this profile's Public Library listing.",
+            _method("_act_library_intro"), _own),
     # These two were `_own` on the row and scope="all" in bulk, so a borrower could
     # set their placeholder emoji on forty profiles at once and on none individually
     # -- the same drift, running backwards, that co-declaring bulk beside single was
@@ -1403,6 +1408,10 @@ class ProfileManageView(BlockedGuard, ui.View):
         await self.original_interaction.edit_original_response(
             content=None, embed=view.get_embed(), view=view)
 
+    async def _act_library_intro(self, interaction):
+        await interaction.response.send_modal(
+            LibraryIntroModal(self.cog, self.user_id, self.profile_name))
+
     async def _handle_appearance(self, interaction):
         modal = AppearanceModal(self.cog, self.original_interaction, self.profile_name, target_user_id=self.user_id)
         await interaction.response.send_modal(modal)
@@ -1499,12 +1508,20 @@ class ProfileManageView(BlockedGuard, ui.View):
         await interaction.response.send_modal(modal)
 
     async def _handle_share(self, interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
         view = HubShareManagerView(self.cog, interaction)
-        view.selected_profiles = [self.profile_name]
-        view.setup_items()
-        desc = "Manage how you share your profiles."
-        embed = discord.Embed(title="Share Manager", description=desc, color=discord.Color.teal())
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await view.load_profiles()
+        if self.profile_name in view.personal_profiles:
+            view.selected_profiles = [self.profile_name]
+            view.setup_items()
+        embed = view.build_embed()
+        if self.profile_name not in view.personal_profiles:
+            # Not offered, so not preselected; say why rather than open on nothing.
+            _allowed, reason = self.cog.profile_manager.content_capability(
+                self.user_id, self.profile_name, "share")
+            embed.add_field(name=f"'{self.profile_name}' cannot be shared"[:256],
+                            value=reason or "Not available.", inline=False)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     async def _handle_delete(self, interaction):
         async def confirm_delete(i: discord.Interaction):
@@ -4744,6 +4761,56 @@ class AppearanceModal(ui.Modal):
         # appearance edit invalidates a rating exactly as a persona edit does.
         await maybe_prompt_rating_after_edit(self.cog, interaction, owner_id, self.profile_name)
 
+class LibraryIntroModal(ui.Modal):
+    """The creator's introduction on a Public Library listing, `config["library_intro"]`.
+
+    Written by the owner, never derived: the persona and instructions are the creator's
+    private prompt text, and a listing that summarised them would publish them. Opened
+    from the dashboard, from the owner's own listing and from the share manager.
+    """
+
+    def __init__(self, cog: 'MimicCog', owner_id: int, profile_name: str, on_saved=None):
+        super().__init__(title=f"Library Intro: '{profile_name[:20]}'")
+        self.cog = cog
+        self.owner_id = owner_id
+        self.profile_name = profile_name
+        #: Awaited with the modal's interaction after a change is written, to repaint.
+        self.on_saved = on_saved
+        config = cog.profile_manager._get_profile_config(owner_id, profile_name, False) or {}
+        self.intro_input = ui.TextInput(
+            label="Intro (blank to remove)", style=discord.TextStyle.paragraph,
+            required=False, max_length=LIBRARY_INTRO_MAX_CHARS,
+            default=config.get("library_intro"),
+            placeholder="Two or three sentences for someone browsing the Public Library.")
+        self.add_item(self.intro_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        intro = (self.intro_input.value or "").strip()
+        pm = self.cog.profile_manager
+        config = pm._get_profile_config(self.owner_id, self.profile_name, False)
+        if config is None:
+            await interaction.followup.send("❌ Profile not found.", ephemeral=True)
+            return
+        if intro == (config.get("library_intro") or ""):
+            await interaction.followup.send("The intro is unchanged.", ephemeral=True)
+            return
+
+        if intro:
+            config["library_intro"] = intro
+        else:
+            config.pop("library_intro", None)
+        pm._save_profile_config(self.owner_id, self.profile_name, config, False)
+        # Config, not prompts, so the prompts hook does not see it -- the same as
+        # appearance. Invalidate only; the stale rating is offered below.
+        pm._invalidate_content_rating(self.owner_id, self.profile_name)
+
+        if self.on_saved:
+            await self.on_saved(interaction)
+        await interaction.followup.send(
+            "Library intro updated." if intro else "Library intro removed.", ephemeral=True)
+        await maybe_prompt_rating_after_edit(self.cog, interaction, self.owner_id, self.profile_name)
+
 def ProfileNeuroModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     state = current_params.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
     fields = [] if values_only else [
@@ -5711,8 +5778,8 @@ class ContentSafetyView(BlockedGuard, ui.View):
 
         if self.stale:
             if self.distributed:
-                note = ("This profile has been edited since it was rated, and other people "
-                        "are using it. It will be re-checked automatically.")
+                note = ("This profile has been edited since it was rated, and it is listed in "
+                        "the Public Library or borrowed, so it will be re-checked automatically.")
             else:
                 note = ("This profile has been edited since it was rated, so the rating no "
                         "longer describes it. Submit it again when you want to share it.")
@@ -5841,63 +5908,159 @@ class ContentSafetyView(BlockedGuard, ui.View):
 
 
 class PostEditRatingView(BlockedGuard, ui.View):
-    """The ephemeral prompt shown after editing a profile that was already rated.
+    """The ephemeral choice shown after an edit makes a profile's rating out of date.
 
-    An edit invalidates the rating, and there are exactly two sensible responses:
-    stop claiming a verdict that no longer describes the profile, or get a new one.
-    Choosing for the user is wrong in both directions -- silently dropping a shared
-    profile to Unrated pulls it out from under its borrowers, and silently
-    re-classifying spends their API quota on an edit they may still be in the middle
-    of. So the choice is theirs, taken at the one moment they have the context to
-    make it.
+    There are two sensible responses: stop claiming a verdict that no longer describes
+    the profile, or get a new one. Choosing for the user is wrong in both directions --
+    silently dropping a shared profile to Unrated takes it out of the Library, and
+    silently re-classifying spends an API call on an edit they may still be in the middle
+    of. So the choice is theirs, at the one moment they have the context to make it.
 
-    Ephemeral and self-timing-out: ignoring it leaves the rating stale, and
-    resolve_stale_rating settles it on the next dashboard open or session start.
+    While it is open, `cog.rating_prompts_open` holds the profile, so resolve_stale_rating
+    (a dashboard open, a session start) cannot decide first -- it used to, and a queued
+    re-check then overwrote the owner's "Set to Unrated". Left alone, the prompt settles
+    the rating the way resolve_stale_rating would, and says so on the message.
     """
 
-    def __init__(self, cog: 'MimicCog', user_id: int, profile_name: str, distributed: bool):
-        super().__init__(timeout=180)
+    TIMEOUT_SECONDS = 180
+
+    def __init__(self, cog: 'MimicCog', user_id: int, profile_name: str, verdict: str,
+                 listed: bool, borrowers: int):
+        super().__init__(timeout=self.TIMEOUT_SECONDS)
         self.cog = cog
         self.user_id = user_id
         self.profile_name = profile_name
-        self.distributed = distributed
+        self.verdict = verdict
+        self.listed = listed
+        self.borrowers = borrowers
+        self.key = (int(user_id), profile_name)
+        #: The prompt's own message, for rewriting it when nobody presses anything.
+        self.message: Optional[discord.WebhookMessage] = None
 
-    def get_content(self) -> str:
-        base = (f"**'{self.profile_name}' has been edited since it was rated.**\n"
-                f"Its current rating no longer describes it.")
-        if self.distributed:
-            base += ("\n\nOther people are using this profile, so leaving it rated means "
-                     "leaving them a verdict that is out of date.")
-        return base
+    def _unrated_consequences(self, done: bool) -> str:
+        text = ("It keeps working in your own servers, but cannot be shared, published or used "
+                "in Global Chat until you submit it again.")
+        if self.listed:
+            text += (" It has been taken out of the Public Library." if done
+                     else " It is also taken out of the Public Library.")
+        if self.borrowers:
+            text += " Anyone who already borrowed it keeps it, but cannot use it in Global Chat."
+        return text
 
-    @ui.button(label="Re-check the rating", style=discord.ButtonStyle.success)
-    async def recheck(self, i: discord.Interaction, _: ui.Button):
-        await i.response.defer()
-        pm = self.cog.profile_manager
-        pm.schedule_content_classification(self.user_id, self.profile_name)
-        await i.edit_original_response(
-            content=f"Re-checking the rating for '{self.profile_name}'…", view=None)
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"⚠️ Rating Out of Date: {self.profile_name}"[:256],
+            description=(f"You edited **{self.profile_name}** after it was rated "
+                         f"**{CONTENT_RATING_LABELS[self.verdict]}**, so that rating no longer "
+                         f"describes it."),
+            color=discord.Color.orange())
+
+        # Said as it is. This read "Other people are using this profile" whenever the
+        # profile was merely listed, borrowed by nobody.
+        reach = []
+        if self.listed:
+            reach.append("It is listed in the Public Library.")
+        if self.borrowers:
+            reach.append(f"{self.borrowers} {'user has' if self.borrowers == 1 else 'users have'} "
+                         f"borrowed it.")
+        if reach:
+            embed.add_field(name="Who Relies on This Rating", value=" ".join(reach), inline=False)
+
+        embed.add_field(name="Your Options", value=(
+            "**Re-check Rating**: get a new verdict for the profile as it is now. This makes "
+            "one API call.\n"
+            f"**Set to Unrated**: {self._unrated_consequences(done=False)}"), inline=False)
+
+        minutes = self.TIMEOUT_SECONDS // 60
+        embed.set_footer(text=(
+            f"If you do not choose within {minutes} minutes, "
+            + ("it is re-checked automatically, since it is listed or borrowed."
+               if self.listed or self.borrowers else "it is set to Unrated.")))
+        return embed
+
+    def _outcome_embed(self, text: str) -> discord.Embed:
+        return discord.Embed(title=f"Content Rating: {self.profile_name}"[:256], description=text,
+                             color=discord.Color.blurple())
+
+    def _release(self):
+        if self.cog.rating_prompts_open.get(self.key) is self:
+            self.cog.rating_prompts_open.pop(self.key, None)
+
+    async def close(self, text: str):
+        """Stops the prompt and rewrites its message, for when it is settled elsewhere."""
         self.stop()
-        # This prompt used to end here, so the one place the user was told a
-        # re-check had started was also the last thing they heard about it. Waiting
-        # costs nothing -- the view is already stopped and the message is already
-        # theirs -- and it turns a dead end into the answer.
-        await pm.await_classification(self.user_id, self.profile_name)
-        verdict, _rating = pm._content_rating_state(self.user_id, self.profile_name)
-        await i.edit_original_response(
-            content=(f"'{self.profile_name}' is now **{CONTENT_RATING_LABELS[verdict]}**."),
+        self._release()
+        if self.message is not None:
+            try:
+                await self.message.edit(embed=self._outcome_embed(text), view=None)
+            except Exception:
+                pass  # expired or dismissed; there is nothing left to tell
+
+    @ui.button(label="Re-check Rating", style=discord.ButtonStyle.success)
+    async def recheck(self, i: discord.Interaction, _: ui.Button):
+        self.stop()
+        pm = self.cog.profile_manager
+        await i.response.edit_message(
+            embed=self._outcome_embed(f"Re-checking the rating for **{self.profile_name}**…"),
             view=None)
+        try:
+            pm.schedule_content_classification(self.user_id, self.profile_name)
+            finished = await pm.await_classification(self.user_id, self.profile_name)
+            if not finished:
+                text = ("Still checking. The verdict will show on the **Content Safety** page "
+                        "when it lands.")
+            elif await pm.rating_is_stale(self.user_id, self.profile_name):
+                # A failed job leaves a real verdict where it was, so the old rating is
+                # still standing. This used to announce it as the new one.
+                text = ("The re-check did not reach a verdict, usually because no API key was "
+                        "available (check `/settings`). The rating is still out of date. Try "
+                        "again from **Content Safety**.")
+            else:
+                verdict, _rating = await asyncio.to_thread(
+                    pm._content_rating_state, self.user_id, self.profile_name)
+                text = (f"**{self.profile_name}** is now rated "
+                        f"**{CONTENT_RATING_LABELS[verdict]}**.")
+                if self.listed and not CONTENT_RATING_CAPABILITIES[verdict]["publish"]:
+                    text += " It has been taken out of the Public Library."
+        finally:
+            self._release()
+        await i.edit_original_response(embed=self._outcome_embed(text), view=None)
 
     @ui.button(label="Set to Unrated", style=discord.ButtonStyle.secondary)
     async def unrate(self, i: discord.Interaction, _: ui.Button):
-        await i.response.defer()
-        await asyncio.to_thread(
-            self.cog.profile_manager.drop_to_unrated, self.user_id, self.profile_name)
-        await i.edit_original_response(
-            content=(f"'{self.profile_name}' is now **Unrated**. It works exactly as before, "
-                     f"but cannot be shared or used in Global Chat until you submit it again."),
-            view=None)
+        if self.key in self.cog.pending_classifications:
+            # Its verdict would land on top of Unrated and undo this.
+            await i.response.send_message(
+                "A re-check of this profile is already running. Wait for it to finish.",
+                ephemeral=True)
+            return
         self.stop()
+        await i.response.defer()
+        try:
+            await asyncio.to_thread(
+                self.cog.profile_manager.drop_to_unrated, self.user_id, self.profile_name)
+        finally:
+            self._release()
+        await i.edit_original_response(
+            embed=self._outcome_embed(f"**{self.profile_name}** is now **Unrated**. "
+                                      + self._unrated_consequences(done=True)),
+            view=None)
+
+    async def on_timeout(self):
+        self._release()
+        try:
+            outcome = await self.cog.profile_manager.resolve_stale_rating(
+                self.user_id, self.profile_name)
+        except Exception as e:
+            print(f"Post-edit rating timeout failed for {self.user_id}/{self.profile_name}: {e}")
+            outcome = None
+        if outcome == "reclassify":
+            text = "No choice was made, so the rating is being re-checked automatically."
+        elif outcome == "unrated":
+            text = f"No choice was made, so **{self.profile_name}** is now **Unrated**."
+        else:
+            text = "No choice was made, and the rating no longer needed settling."
+        await self.close(text)
 
 
 async def maybe_prompt_rating_after_edit(cog, interaction: discord.Interaction,
@@ -5909,13 +6072,28 @@ async def maybe_prompt_rating_after_edit(cog, interaction: discord.Interaction,
     persona hash, so it is only ever called from an interactive edit path.
     """
     pm = cog.profile_manager
+    key = (int(user_id), profile_name)
+    view = None
     try:
         if not await pm.rating_is_stale(user_id, profile_name):
             return
-        distributed = await asyncio.to_thread(pm.is_profile_distributed, user_id, profile_name)
-        view = PostEditRatingView(cog, user_id, profile_name, distributed)
-        await interaction.followup.send(view.get_content(), view=view, ephemeral=True)
+        verdict, _rating = await asyncio.to_thread(pm._content_rating_state, user_id, profile_name)
+        listed, borrowers = await asyncio.to_thread(pm.distribution_of, user_id, profile_name)
+        view = PostEditRatingView(cog, user_id, profile_name, verdict, listed, borrowers)
+
+        # One prompt per profile: a second edit inside the window replaces the first,
+        # whose buttons would otherwise act on a hold it no longer owns.
+        previous = cog.rating_prompts_open.get(key)
+        cog.rating_prompts_open[key] = view
+        if previous is not None:
+            await previous.close("Replaced by the prompt for your latest edit.")
+
+        view.message = await interaction.followup.send(
+            embed=view.build_embed(), view=view, ephemeral=True, wait=True)
     except Exception as e:
         # Never cost the user their edit. The rating stays stale and
         # resolve_stale_rating settles it the next time the profile is opened.
+        if view is not None:
+            view.stop()
+            view._release()
         print(f"Post-edit rating prompt failed for {user_id}/{profile_name}: {e}")

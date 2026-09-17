@@ -598,10 +598,10 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         await self.cog._open_profile_manage(interaction, name, repaint=True)
 
     async def _act_create(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(_NewProfileModal(self, generate=False))
+        await interaction.response.send_modal(NewProfileModal(self.cog, generate=False))
 
     async def _act_generate(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(_NewProfileModal(self, generate=True))
+        await interaction.response.send_modal(NewProfileModal(self.cog, generate=True))
 
     async def update_display(self):
         """Paints onto the command interaction's own deferred response.
@@ -626,19 +626,19 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             pass
 
 
-class _NewProfileModal(ui.Modal):
+class NewProfileModal(ui.Modal):
     """Collects a name (and a concept) and hands off to the real slash command.
 
     `/profile create` and `/profile generate` carry name validation, the profile and
     key-access limits, and in the generate case ninety lines of prompt assembly and
-    parsing. Calling their callbacks directly means the wizard cannot drift from what
-    those commands do -- including their error messages, which are the ones the rest of
-    the documentation describes.
+    parsing. Calling their callbacks directly means the wizard -- and the Public
+    Library's Generate button -- cannot drift from what those commands do, including
+    their error messages, which are the ones the rest of the documentation describes.
     """
 
-    def __init__(self, view: StartWizardView, *, generate: bool):
+    def __init__(self, cog: 'MimicCog', *, generate: bool = False):
         super().__init__(title="Generate a Character" if generate else "New Character")
-        self.parent_view = view
+        self.cog = cog
         self.generate = generate
         self.name_input = ui.TextInput(
             label="Name", placeholder="e.g. detective", max_length=32, required=True)
@@ -651,7 +651,7 @@ class _NewProfileModal(ui.Modal):
             self.add_item(self.concept_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        cog = self.parent_view.cog
+        cog = self.cog
         name = (self.name_input.value or "").strip()
         if self.generate:
             await cog.profile_generate_slash.callback(

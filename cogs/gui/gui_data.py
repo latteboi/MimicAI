@@ -39,7 +39,7 @@ class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
         # shares with the bot, which says nothing about whether that server has a key
         # assigned -- so in a DM it reliably picked a keyless guild and reported the
         # miss as a broken embedding. The owner's own key is the answer instead.
-        if not self.cog.storage_manager._embedding_api_key(i.guild_id, self.profile_owner_id):
+        if not self.cog.storage_manager._embedding_routes(i.guild_id, self.profile_owner_id):
             await i.followup.send(NO_EMBEDDING_KEY_MSG, ephemeral=True)
             return
 
@@ -101,7 +101,7 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
 
         summary = self.summary_field.value
         
-        if not self.cog.storage_manager._embedding_api_key(self.guild_id, self.profile_owner_id):
+        if not self.cog.storage_manager._embedding_routes(self.guild_id, self.profile_owner_id):
             await i.followup.send(NO_EMBEDDING_KEY_MSG, ephemeral=True)
             return
 

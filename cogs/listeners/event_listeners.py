@@ -17,7 +17,7 @@ from ..utils import mem_probe
 from ..utils.content import WELCOME_MESSAGE, WELCOME_CHANNEL_HINTS
 from ..utils.helpers import _format_history_entry, _get_user_hash
 from ..utils.attachment_limits import over_attachment_limit
-from ..utils.fuzzy import rank_keyed
+from ..utils.fuzzy import MAX_CHOICES, rank_keyed
 
 
 class EventListeners:
@@ -535,18 +535,19 @@ class EventListeners:
                             # have stranded the task for the life of the process. On timeout the
                             # regeneration is dropped rather than run against a live round --
                             # the same outcome as the user pulling the reaction back off.
-                            if not await self.session_manager._wait_for_session_flags(
-                                session, SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS
-                            ):
-                                print(f"Regeneration for message {payload.message_id} timed out waiting for the channel; dropped.")
-                                return
+                            async with self.session_manager.regeneration_turn(
+                                session, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS
+                            ) as channel_free:
+                                if not channel_free:
+                                    print(f"Regeneration for message {payload.message_id} timed out waiting for the channel; dropped.")
+                                    return
 
-                            if was_busy:
-                                asyncio.create_task(_ack_regen_reaction(False))
+                                if was_busy:
+                                    asyncio.create_task(_ack_regen_reaction(False))
 
-                            still_exists = any(t.get("turn_id") == turn_id_to_find for t in session.get("unified_log", []))
-                            if still_exists:
-                                await self.generation_service._execute_regeneration(payload, session, turn_id_to_find, reacted_to_participant)
+                                still_exists = any(t.get("turn_id") == turn_id_to_find for t in session.get("unified_log", []))
+                                if still_exists:
+                                    await self.generation_service._execute_regeneration(payload, session, turn_id_to_find, reacted_to_participant)
                         finally:
                             # Deregistered when the work is actually over, not before it
                             # starts. This used to pop the handle immediately after the
@@ -1256,18 +1257,17 @@ class EventListeners:
             # profile privately.
             #
             # The rating check reads the profile body (and the source's, for a
-            # borrow), so it runs on the <=25 ranked survivors in the shared loop
-            # below rather than over the whole index on every keystroke.
+            # borrow), so it walks the ranked list only until 25 pass, in a thread.
             user_id = interaction.user.id
             index = self.profile_manager._get_user_index(user_id)
 
             for p_name in index.get("personal", []):
                 pending.append((p_name, p_name))
-                meta[p_name] = {"kind": "personal", "pid": None, "needs_global_chat": True}
+                meta[p_name] = {"kind": "personal", "pid": None}
 
             for b_name in index.get("borrowed", []):
                 pending.append((b_name, b_name))
-                meta[b_name] = {"kind": "borrowed", "pid": None, "needs_global_chat": True}
+                meta[b_name] = {"kind": "borrowed", "pid": None}
 
         else:
             user_id = interaction.user.id
@@ -1299,13 +1299,28 @@ class EventListeners:
         # survivors reach here, so the per-candidate config reads below are bounded at
         # 25 no matter how many profiles the account holds.
         user_id = interaction.user.id
-        for name, _ in rank_keyed(current, pending, limit=25):
+        if cmd_name == "global_chat":
+            ranked = [name for name, _ in rank_keyed(current, pending, limit=len(pending))]
+
+            def usable_in_global_chat():
+                # Filtered before the cut to 25, not after it: cutting first hid every
+                # rated profile ranked below 25 unrated ones, so a blank query on a
+                # large account could offer nothing at all.
+                usable = []
+                for name in ranked:
+                    if self.profile_manager.content_capability(user_id, name, "global_chat")[0]:
+                        usable.append(name)
+                        if len(usable) == MAX_CHOICES:
+                            break
+                return usable
+
+            survivors = await asyncio.to_thread(usable_in_global_chat)
+        else:
+            survivors = [name for name, _ in rank_keyed(current, pending, limit=MAX_CHOICES)]
+
+        for name in survivors:
             m = meta[name]
             kind = m["kind"]
-
-            if m.get("needs_global_chat") and not self.profile_manager.content_capability(
-                    user_id, name, "global_chat")[0]:
-                continue
 
             if kind == "system":
                 app = self.profile_manager._get_user_appearance(

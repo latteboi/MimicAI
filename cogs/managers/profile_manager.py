@@ -759,6 +759,38 @@ class ProfileManager:
                 return desc["id"]
         return None
 
+    def _delist_unless_publishable(self, owner_id: int, profile_name: str) -> bool:
+        """Takes a profile out of the Public Library once its rating no longer allows it.
+
+        Called by every write that can leave a listed profile Unrated or Adult. Nothing
+        else re-reads the rating of a listing, so without this the Library went on
+        offering a profile its own rating said could not be shared. True if an entry
+        was removed. Pending is left listed: it is a verdict on its way, and the write
+        that lands it comes back through here. Existing borrows are untouched: they read
+        the source profile, never this index. Blocking; the callers run in a thread.
+        """
+        verdict, _ = self._content_rating_state(owner_id, profile_name)
+        if verdict == CONTENT_RATING_PENDING or CONTENT_RATING_CAPABILITIES[verdict]["publish"]:
+            return False
+        pid = self._get_pid_from_name(owner_id, profile_name)
+        if not pid:
+            return False
+        entry_ids = [d["id"] for d in self._iter_public_entries(owner_id, include_orphaned=True)
+                     if d["original_pid"] == pid]
+        for entry_id in entry_ids:
+            self.cog.public_profiles.pop(entry_id, None)
+        if entry_ids:
+            self._save_public_index()
+        return bool(entry_ids)
+
+    def distribution_of(self, owner_id: int, profile_name: str) -> Tuple[bool, int]:
+        """(listed in the Public Library, number of users borrowing it), for copy that
+        has to say which. `is_profile_distributed` is the yes/no form."""
+        eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
+        pid = self._get_pid_from_name(eff_owner, eff_name)
+        borrowers = {borrower_id for borrower_id, _ in self._borrowers_of(eff_owner, pid)} if pid else set()
+        return self._is_profile_public(owner_id, profile_name), len(borrowers)
+
     def _is_profile_public(self, user_id: int, profile_name: str) -> bool:
         index = self._get_user_index(user_id)
         is_borrowed = profile_name in index.get("borrowed", [])
@@ -1920,6 +1952,11 @@ class ProfileManager:
         avatar = config.get("custom_avatar_url")
         if avatar:
             parts.append(f"avatar_url: {avatar}")
+        # Shown to everyone browsing the Public Library, which is the audience the
+        # rating answers to -- so an intro written after the verdict makes it stale.
+        intro = config.get("library_intro")
+        if intro:
+            parts.append(f"library_intro:\n{intro}")
 
         persona = prompts.get("persona", {}) or {}
         for key in self.cog.persona_modal_sections_order:
@@ -2517,6 +2554,7 @@ class ProfileManager:
         config["content_rating"] = rating
         self._save_profile_config(owner_id, profile_name, config, False)
         self._invalidate_content_rating(owner_id, profile_name)
+        self._delist_unless_publishable(owner_id, profile_name)
         return True
 
     async def rating_is_stale(self, owner_id: int, profile_name: str) -> bool:
@@ -2568,10 +2606,15 @@ class ProfileManager:
           only path that spends a call without being asked to, and it is bounded by
           the number of profiles that are actually shared.
         """
-        if not await self.rating_is_stale(owner_id, profile_name):
+        eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
+        if (int(eff_owner), eff_name) in self.cog.rating_prompts_open:
+            # The owner is looking at PostEditRatingView, which settles this itself
+            # when they choose or it times out. Deciding here as well meant a session
+            # start could queue a re-check that then overwrote their "Set to Unrated".
             return None
 
-        eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
+        if not await self.rating_is_stale(owner_id, profile_name):
+            return None
 
         distributed = await asyncio.to_thread(
             self.is_profile_distributed, eff_owner, eff_name)
@@ -2652,6 +2695,7 @@ class ProfileManager:
             }
         self._save_profile_config(owner_id, profile_name, config, False)
         self._invalidate_content_rating(owner_id, profile_name)
+        self._delist_unless_publishable(owner_id, profile_name)
         return True
 
     def clear_adult_verdict(self, owner_id: int, profile_name: str, moderator_id: int) -> bool:
@@ -2766,6 +2810,7 @@ class ProfileManager:
 
         self._save_profile_config(owner_id, profile_name, config, False)
         self._invalidate_content_rating(owner_id, profile_name)
+        self._delist_unless_publishable(owner_id, profile_name)
         return True
 
     def is_profile_distributed(self, owner_id: int, profile_name: str) -> bool:
@@ -2875,6 +2920,7 @@ class ProfileManager:
         }
         self._save_profile_config(owner_id, profile_name, config, False)
         self._invalidate_content_rating(owner_id, profile_name)
+        self._delist_unless_publishable(owner_id, profile_name)
         return True
 
     def schedule_content_classification(self, owner_id: int, profile_name: str):
@@ -3595,7 +3641,7 @@ class ProfileManager:
         if verdict == "adult" and declared:
             embed.description = ((embed.description or "") +
                                  "\n\U0001f51e **Declared as adult content by you.** This profile is "
-                                 "limited to age-restricted channels and cannot be published. "
+                                 "limited to age-restricted channels and cannot be shared or published. "
                                  "Withdraw the declaration from Content Safety to have it "
                                  "classified normally.").strip()
         elif verdict == "adult":
@@ -3609,9 +3655,9 @@ class ProfileManager:
                                  "or contact the bot operator to dispute the "
                                  "result.").strip()
 
-        # Re-check off the turn path: the edit hooks cover the normal cases, this
-        # catches imports and anything they miss.
-        asyncio.create_task(self.resolve_stale_rating(user_id, profile_name))
+        # No stale-rating check here: this renders on every dashboard repaint, including
+        # the one straight after an edit, where it raced the post-edit prompt and
+        # decided before the owner could. `_open_profile_manage` runs it on open.
 
         if is_public:
             embed.description = ((embed.description or "") +
@@ -4003,7 +4049,8 @@ class ProfileManager:
         return True
     
 
-    async def _accept_share_request(self, interaction: discord.Interaction, sharer_id: int, target_pid: Optional[str], fallback_name: str, desired_name: str, is_public_borrow: bool = False):
+    async def _accept_share_request(self, interaction: discord.Interaction, sharer_id: int, target_pid: Optional[str], fallback_name: str, desired_name: str, is_public_borrow: bool = False) -> bool:
+        """Creates the borrow. True if it was made; otherwise the reason has been sent."""
         def _sync_prepare():
             current_name = self._get_name_from_pid(sharer_id, target_pid) if target_pid else fallback_name
             if not current_name: current_name = fallback_name
@@ -4012,6 +4059,18 @@ class ProfileManager:
             if not owner_profile_data:
                 return None
 
+            # Checked here, when the borrow is made, as well as where the share was
+            # offered: a request or code can wait while the rating changes under it,
+            # and a Library listing can outlive the rating it was published on.
+            verdict, _ = self._content_rating_state(sharer_id, current_name)
+            capability = "publish" if is_public_borrow else "share"
+            if not CONTENT_RATING_CAPABILITIES[verdict][capability]:
+                if is_public_borrow:
+                    # A listing left over from before its rating changed; nobody else
+                    # should have to find that out by trying.
+                    self._delist_unless_publishable(sharer_id, current_name)
+                return current_name, verdict
+
             index = self._get_user_index(interaction.user.id)
             current_borrowed = len(index.get("borrowed", {})) if isinstance(index.get("borrowed"), dict) else len(index.get("borrowed", []))
             return current_name, owner_profile_data, index, current_borrowed
@@ -4019,13 +4078,20 @@ class ProfileManager:
         prep = await asyncio.to_thread(_sync_prepare)
         if prep is None:
             await interaction.followup.send("The shared profile seems to no longer exist.", ephemeral=True)
-            return
+            return False
+        if len(prep) == 2:
+            refused_name, verdict = prep
+            reason = ("Adult profiles cannot be shared." if verdict == CONTENT_RATING_ADULT
+                      else "It is not rated for sharing right now. Its owner needs to have it rated first.")
+            await interaction.followup.send(
+                f"❌ **'{refused_name}' cannot be borrowed.** {reason}", ephemeral=True)
+            return False
         current_name, owner_profile_data, index, current_borrowed = prep
 
         limit = defaultConfig.LIMIT_BORROWED
         if current_borrowed >= limit:
             await interaction.followup.send(f"Limit Reached. You have {current_borrowed}/{limit} borrowed profiles.", ephemeral=True)
-            return
+            return False
 
         # Collected inside the threaded save, read after it: what the borrow arrived
         # with is not what the library showed, and the user is owed the difference.
@@ -4121,12 +4187,13 @@ class ProfileManager:
             await interaction.followup.send(
                 "That profile could not be traced back to its owner, so it cannot be "
                 "borrowed. Ask them to re-share it.", ephemeral=True)
-            return
+            return False
 
         if not is_public_borrow:
             await self._reject_share_request(interaction, sharer_id, target_pid, fallback_name, notify_sharer=True, accepted=True)
 
         await self._report_borrow_adjustments(interaction, desired_name, adjustments)
+        return True
 
     async def _report_borrow_adjustments(self, interaction: discord.Interaction,
                                          profile_name: str,
@@ -4234,6 +4301,15 @@ class ProfileManager:
 
             if not os.path.exists(src_dir):
                 return False, "Source profile data no longer exists."
+
+            # A clone hands another user the whole persona, so it is sharing, and is
+            # gated as sharing is -- again here because the code can outlive the rating.
+            source_name = self._get_name_from_pid(owner_id, source_pid)
+            if not source_name:
+                return False, "Source profile data no longer exists."
+            allowed, reason = self.content_capability(owner_id, source_name, "share")
+            if not allowed:
+                return False, f"❌ **This profile cannot be cloned.** {reason}"
 
             index = self._get_user_index(recipient_id)
             if len(index.get("personal", [])) >= defaultConfig.LIMIT_PROFILES:

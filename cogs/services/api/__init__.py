@@ -8,7 +8,7 @@ key-cooldown bookkeeping. Everything here is the shape of one provider's HTTP:
     openrouter.py  the OpenRouter adapter
     ollama.py      the Ollama adapter
     google_rest.py the Google adapter, plus inline-blob and TTS handling
-    embeddings.py  query embeddings and their cache
+    embeddings.py  embeddings, direct or through OpenRouter, and their cache
 
 The dependency direction is one way: rest_view and streaming know nothing about
 providers, and no adapter imports another.

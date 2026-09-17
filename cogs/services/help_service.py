@@ -228,15 +228,15 @@ class HelpService:
 
         self.cog.doc_vectors = []
 
-        api_key = self.cog.storage_manager._get_api_key_for_user(int(defaultConfig.DISCORD_OWNER_ID), "gemini")
-        if not api_key:
-            print("Warning: No Bot Owner Google API Key found. Skipping documentation vector generation.")
+        routes = self.cog.storage_manager._embedding_routes(None, int(defaultConfig.DISCORD_OWNER_ID))
+        if not routes:
+            print("Warning: The bot owner has no Google or OpenRouter API key. Skipping documentation vector generation.")
             return
 
         cache_to_save = []
         for chunk in chunks:
             try:
-                emb = await get_embedding_vector(api_key, chunk, task_type="RETRIEVAL_DOCUMENT", output_dimensionality=256, timeout=5.0)
+                emb = await get_embedding_vector(routes, chunk, task_type="RETRIEVAL_DOCUMENT", output_dimensionality=256, timeout=5.0)
                 if emb is None:
                     continue
                 b64_emb = encode_embedding_b64(emb)

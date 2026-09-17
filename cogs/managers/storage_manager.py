@@ -9,7 +9,7 @@ import shutil
 import asyncio
 from collections import OrderedDict
 from discord.ext import tasks
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from cryptography.exceptions import InvalidTag
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
@@ -19,7 +19,8 @@ import base64
 import orjson as json
 
 from ..utils.constants import SERVERS_DIR, CLEANUP_STATE_FILE
-from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
+from ..utils.data_policy import is_paid_gemini_slot, openrouter_data_collection, training_opt_in
+from ..services.api.embeddings import EmbeddingRoute
 
 # The member cache may legitimately shrink between runs -- people do leave servers --
 # so the guard has to allow a real decline while refusing a collapse. A run that sees
@@ -658,8 +659,9 @@ class StorageManager:
 
         return None
 
-    def _embedding_api_key(self, guild_id: Optional[int], owner_id: Optional[int] = None) -> Optional[str]:
-        """The key an embedding should be billed to: the guild's, else the owner's own.
+    def _embedding_routes(self, guild_id: Optional[int], owner_id: Optional[int] = None) -> List[EmbeddingRoute]:
+        """The keys an embedding may be billed to, in the order they are tried: the guild's,
+        else the owner's own. Empty when there are none.
 
         `_get_api_key_for_guild` alone was the whole resolver, which made every
         embedding fail wherever there is no guild -- and `/profile` is not
@@ -673,14 +675,31 @@ class StorageManager:
         There is deliberately no instance-owner fallback here -- unlike
         `_classifier_api_key`, this runs because a user asked for it, so "add a key"
         is an answerable error rather than a silent bill to whoever hosts the bot.
+
+        Each payer offers its Gemini key, then its OpenRouter key (the same model -- see
+        cogs/services/api/embeddings). A failed request moves on to the next route but
+        never to the other payer: a server's key having a bad minute is no reason to
+        bill the profile owner. The Gemini tier is gated in `_get_api_key_for_guild`;
+        a guild's OpenRouter key carries that server's `data_collection`. An owner's own
+        key carries only their own input -- what they typed into a management screen, or
+        the bot owner's documentation -- which nothing gates.
         """
         if guild_id:
-            key = self._get_api_key_for_guild(guild_id)
-            if key:
-                return key
+            routes = []
+            gemini = self._get_api_key_for_guild(guild_id)
+            if gemini:
+                routes.append(EmbeddingRoute("gemini", gemini))
+            openrouter = self._get_api_key_for_guild(guild_id, "openrouter")
+            if openrouter:
+                policy = openrouter_data_collection(
+                    self.cog.server_manager._get_server_index(str(guild_id)))
+                routes.append(EmbeddingRoute("openrouter", openrouter, policy))
+            if routes:
+                return routes
         if owner_id:
-            return self._get_api_key_for_user(owner_id)
-        return None
+            return [EmbeddingRoute(provider, key) for provider in ("gemini", "openrouter")
+                    if (key := self._get_api_key_for_user(owner_id, provider))]
+        return []
 
     async def _perform_data_cleanup(self):
         await asyncio.to_thread(self._sync_perform_data_cleanup)
