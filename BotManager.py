@@ -240,8 +240,9 @@ async def main():
 
 # --- Run the bot ---
 if __name__ == "__main__":
+    from cogs.utils.event_loop import run
     try:
-        asyncio.run(main())
+        run(main())
     except KeyboardInterrupt:
         print("\nKeyboard interrupt received. Initiating shutdown.")
     except Exception:

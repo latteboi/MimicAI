@@ -24,17 +24,32 @@ from typing import NamedTuple, Optional
 import httpx
 
 # Deliberately below httpx's defaults (100/20). Each idle keepalive connection
-# holds a TLS session and its buffers, and the bot never has enough concurrent
-# work on 0.25 vCPU to profit from a larger pool.
+# holds a TLS session and its buffers, and what is left on this client --
+# attachments, avatars, link fetches, Ollama, catalogue syncs -- is short and rare
+# enough not to need more. Model calls to OpenRouter have their own client below.
 _LIMITS = httpx.Limits(
     max_connections=20,
     max_keepalive_connections=5,
     keepalive_expiry=30.0,
 )
 
+# httpx's defaults, the same as the Google client. A model call holds its connection
+# for the whole generation, ten seconds and more, so on the pool above twenty replies
+# in flight had every other request -- the next reply, an attachment the turn needed
+# -- waiting for a slot, and failing at the call's 120 s timeout. A waiting call costs
+# its socket and buffers, not CPU; how many run at once is the generation gate's to
+# bound (services/generation/gate), not the pool's. Twenty kept alive, so a busy spell
+# reuses connections rather than paying a TLS handshake per reply.
+_OPENROUTER_LIMITS = httpx.Limits(
+    max_connections=100,
+    max_keepalive_connections=20,
+    keepalive_expiry=30.0,
+)
+
 _DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 _shared_client: Optional[httpx.AsyncClient] = None
+_openrouter_client: Optional[httpx.AsyncClient] = None
 
 
 def get_shared_client() -> httpx.AsyncClient:
@@ -51,6 +66,22 @@ async def close_shared_client():
     if _shared_client is not None and not _shared_client.is_closed:
         await _shared_client.aclose()
     _shared_client = None
+
+
+def get_openrouter_client() -> httpx.AsyncClient:
+    """The client for model calls to OpenRouter: text, images, speech and embeddings.
+    Its own pool, so a busy spell of replies cannot starve the shared client."""
+    global _openrouter_client
+    if _openrouter_client is None or _openrouter_client.is_closed:
+        _openrouter_client = httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, limits=_OPENROUTER_LIMITS)
+    return _openrouter_client
+
+
+async def close_openrouter_client():
+    global _openrouter_client
+    if _openrouter_client is not None and not _openrouter_client.is_closed:
+        await _openrouter_client.aclose()
+    _openrouter_client = None
 
 
 #: Read size for `get_capped`, as `streaming._DOWNLOAD_CHUNK_BYTES`.

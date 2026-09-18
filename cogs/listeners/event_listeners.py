@@ -1112,8 +1112,9 @@ class EventListeners:
         except Exception as e:
             print(f"Could not save OpenRouter usage counts on unload: {e}")
 
-        from ..utils.http_client import close_shared_client
+        from ..utils.http_client import close_openrouter_client, close_shared_client
         await close_shared_client()
+        await close_openrouter_client()
 
         self.bot.tree.remove_command(self.trace_ctx_menu.name, type=self.trace_ctx_menu.type)
         

@@ -14,7 +14,7 @@ import orjson as json
 from collections import OrderedDict
 from typing import Any, List, NamedTuple, Optional, Sequence
 
-from ...utils.http_client import get_shared_client
+from ...utils.http_client import get_openrouter_client
 from .google_rest import get_google_rest_client
 
 
@@ -206,7 +206,7 @@ async def _fetch_openrouter(route: EmbeddingRoute, text: str, task_type: str, di
         "input_type": input_type,
         "provider": provider,
     }
-    response = await get_shared_client().post(
+    response = await get_openrouter_client().post(
         _OPENROUTER_EMBEDDINGS_URL,
         content=json.dumps(payload),
         headers={

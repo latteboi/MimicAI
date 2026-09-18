@@ -30,7 +30,7 @@ from ...utils.constants import (
     ERR_REASON_NO_AUDIO, ERR_REASON_NOTHING_TO_SPEAK, ERR_REASON_SPEECH_TIMED_OUT,
     OPENROUTER_DATA_POLICY_BLOCKED,
 )
-from ...utils.http_client import get_shared_client
+from ...utils.http_client import get_openrouter_client
 from .streaming import (
     _DOWNLOAD_CHUNK_BYTES, _FILE_BLOB_TOKEN, _aiter_streamed_body, _close_body_segments,
     _plan_streamed_body,
@@ -213,7 +213,7 @@ class OpenRouterSpeechModel:
         path = None
         written = 0
         try:
-            async with get_shared_client().stream(
+            async with get_openrouter_client().stream(
                     "POST", _SPEECH_URL, content=body, headers=headers, timeout=_TIMEOUT) as response:
                 content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
                 # A refusal is a small JSON body, sometimes under a 200. Anything else under

@@ -15,7 +15,7 @@ from ...utils.constants import OPENROUTER_DATA_POLICY_BLOCKED, THINKING_BUDGET_M
 from ...utils.helpers import (
     resolve_openrouter_image_detail, resolve_openrouter_service_tier,
 )
-from ...utils.http_client import get_shared_client
+from ...utils.http_client import get_openrouter_client
 from .output_cap import output_cap, refused_output_cap
 from .rest_view import _BlobRef, _RestView
 from .streaming import _FILE_BLOB_TOKEN, _aiter_streamed_body, _plan_streamed_body
@@ -193,7 +193,7 @@ class OpenRouterModel:
         }
 
         try:
-            client = get_shared_client()
+            client = get_openrouter_client()
             if blob_files:
                 # Explicit Content-Length keeps httpx off chunked encoding, so the
                 # request on the wire matches the buffered one this replaces.

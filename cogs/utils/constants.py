@@ -713,7 +713,11 @@ MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL = {
 
 COGS_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-DATA_DIR = os.path.join(COGS_BASE, "data")
+#: MIMIC_DATA_DIR moves everything the bot stores, its instance lock included, so a
+#: second copy can run beside the live one without touching its data or its lock --
+#: prod_tests/load_sessions.py runs in a temporary one. Unset is the historical location.
+_DATA_DIR_OVERRIDE = os.getenv("MIMIC_DATA_DIR")
+DATA_DIR = _DATA_DIR_OVERRIDE or os.path.join(COGS_BASE, "data")
 MOD_DATA_DIR = os.path.join(DATA_DIR, "mod")
 
 MODELS_DATA_DIR = os.path.join(DATA_DIR, "models")
@@ -812,7 +816,7 @@ GUILD_BLOCK_LABELS = {
 BLACKLIST_EXEMPT_COMMANDS = frozenset({"privacy", "terms", "settings"})
 GLOBAL_PROMPTS_FILE_PATH = os.path.join(MOD_DATA_DIR, "system_prompts.json")
 
-COG_LOCK_FILE_PATH = os.path.join(COGS_BASE, "gemini_agent.lock")
+COG_LOCK_FILE_PATH = os.path.join(_DATA_DIR_OVERRIDE or COGS_BASE, "gemini_agent.lock")
 
 EMBEDDING_MODEL_NAME = 'models/gemini-embedding-001'
 DISCORD_MAX_MESSAGE_LENGTH = 2000
@@ -919,10 +923,21 @@ DELIVERY_GUARD_SECONDS = 180.0
 # beyond DELIVERY_GUARD_SECONDS, so an admin's /cancel always gets the first move.
 DELIVERY_HARD_TIMEOUT_SECONDS = 420.0
 # What a placeholder says during a slow step that is not writing a reply. Kept to these
-# two on purpose: every label is the bot narrating itself mid-scene, so only a web search
-# and an image, the waits a person would wonder about, are named.
+# three on purpose: every label is the bot narrating itself mid-scene, so only a web
+# search, an image and a queue, the waits a person would wonder about, are named.
 STATUS_SEARCHING_WEB = "Searching the web"
 STATUS_IMAGINING_IMAGE = "Imagining image"
+STATUS_QUEUED = "Queued ({position} of {waiting})"
+# Model calls in flight at once, bot-wide -- see services/generation/gate. Past this a
+# reply waits its turn, in order, rather than every reply in a busy minute starting at
+# once and the loop thread falling behind the gateway. Slots over the model's latency is
+# the most replies a second the bot will finish, and that should sit near what the CPU
+# can carry: 48 at ~8 s a call is 6 a second. prod_tests/load_sessions.py measured 100
+# two-character sessions peaking at 50 calls in flight; at 24 they queued for a CPU that
+# was 94% idle. Run it on the machine itself and it prints the count that fits there.
+# MIMIC_GENERATION_SLOTS overrides, read straight from the environment like
+# MIMIC_LOOP_PROBE: it tunes this machine, it is not a secret.
+GENERATION_SLOTS = max(1, int(os.getenv("MIMIC_GENERATION_SLOTS") or 48))
 # Every flag that means "this channel is mid-operation". A whisper claims the channel only
 # once all of them are clear; the check and the claim must be in the same synchronous step.
 SESSION_BUSY_FLAGS = ('is_running', 'is_regenerating', 'is_purging', 'is_whispering', 'is_memorising')

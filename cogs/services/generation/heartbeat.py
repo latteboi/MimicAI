@@ -4,7 +4,8 @@ import asyncio
 import discord
 from typing import Optional
 
-from ...utils.constants import PLACEHOLDER_EMOJI, DELIVERY_HARD_TIMEOUT_SECONDS
+from ...utils.constants import PLACEHOLDER_EMOJI, DELIVERY_HARD_TIMEOUT_SECONDS, STATUS_QUEUED
+from .gate import generation_gate
 
 
 class HeartbeatMixin:
@@ -260,6 +261,11 @@ class HeartbeatMixin:
         `status_label` names what is being made when it is not a reply
         (STATUS_IMAGINING_IMAGE), and holds through a fallback attempt, which is the same
         step.
+
+        The call waits for a slot in the generation gate first, and the placeholder says
+        so. The hard timeout runs from the slot, not from the start: time in the queue is
+        the bot being busy, not the model hanging. A call still queued after the same
+        span gives up instead, as a timeout, so a jammed gate cannot hold a turn forever.
         """
         # Hard Limits: 4 minutes for Main, 3 minutes for Fallback
         hard_timeout = 180.0 if is_fallback else 240.0
@@ -272,7 +278,14 @@ class HeartbeatMixin:
         state_container.setdefault('message_type', message_type)
         state_container.setdefault('custom_emoji', PLACEHOLDER_EMOJI)
 
-        gen_task = asyncio.create_task(model.generate_content_async(contents, generation_config=gen_config))
+        # A fallback's turn has already waited once, so it goes to the front.
+        ticket = generation_gate().ticket(front=is_fallback)
+
+        async def _gated_call():
+            async with ticket:
+                return await model.generate_content_async(contents, generation_config=gen_config)
+
+        gen_task = asyncio.create_task(_gated_call())
         start_time = time.time()
         last_interval = 0
 
@@ -280,14 +293,22 @@ class HeartbeatMixin:
             # The Absolute Watchdog Loop
             while not gen_task.done():
                 elapsed = time.time() - start_time
+                queued = ticket.position
 
-                if elapsed >= hard_timeout:
+                if queued:
+                    timed_out = elapsed >= hard_timeout
+                    timeout_reason = f"No free generation slot after {hard_timeout:.0f} seconds"
+                else:
+                    timed_out = time.time() - (ticket.admitted_at or start_time) >= hard_timeout
+                    timeout_reason = f"Generation timed out after {hard_timeout} seconds"
+
+                if timed_out:
                     gen_task.cancel()
                     try:
                         await gen_task
                     except (Exception, asyncio.CancelledError):
                         pass # Ignore exceptions from the forcibly killed task
-                    err = TimeoutError(f"Generation timed out after {hard_timeout} seconds")
+                    err = TimeoutError(timeout_reason)
                     err.state_container = state_container
                     raise err
 
@@ -306,7 +327,10 @@ class HeartbeatMixin:
                 if current_interval > last_interval:
                     last_interval = current_interval
 
-                    base_text = status_label or ("Using fallback model" if is_fallback else "Still generating")
+                    if queued:
+                        base_text = STATUS_QUEUED.format(position=queued, waiting=ticket.waiting)
+                    else:
+                        base_text = status_label or ("Using fallback model" if is_fallback else "Still generating")
                     text = self._status_line(base_text, elapsed)
 
                     msg_a_id = state_container.get('msg_a_id')

@@ -32,6 +32,7 @@ Everything is one process, one event loop.
 ```
 BotManager.py
   └── tune_allocator()          glibc M_ARENA_MAX / M_MMAP_THRESHOLD, before any import
+  └── event_loop.run()          uvloop when installed, asyncio otherwise
   └── commands.Bot              parent gateway connection, max_messages=None
        └── MimicCog             the god-cog: all shared state, all slash commands
             ├── managers        own persisted state
@@ -58,6 +59,22 @@ block for hundreds of milliseconds inside one synchronous step, and it is the bl
 drops a gateway heartbeat. The probe sleeps a fixed interval and reports the overshoot,
 with RSS sampled alongside. Off unless `MIMIC_LOOP_PROBE` is set — see the module docstring
 for the four environment variables.
+
+`prod_tests/load_sessions.py` is the capacity test, and not part of the suite. It builds the real
+cog over a temporary `MIMIC_DATA_DIR` (which moves the instance lock too, so it can run beside
+the live bot), feeds real `discord.Message` objects to `on_message`, and fakes only the
+network: OpenRouter and Google answer in-process after a delay, Discord's REST calls go to a
+stub. It reports CPU per reply, loop lag, RSS, the generation gate's peak and where the time
+went (`--profile`). Baseline on an M-series Mac, Python 3.13: 100 two-character sessions at
+8 s model latency and 30 s between posts ran at 4 replies a second, ~16 ms of CPU each, p99
+loop lag under 10 ms, under 100 MB peak, ~50 model calls in flight. No single step
+dominates the CPU. Profile reads, session tail writes, prompt building and the OpenRouter
+round trip each take 5–15 % of it. The e2-micro is slower per core, so run the test there
+for its own figure. It prints the `MIMIC_GENERATION_SLOTS` that fits.
+
+The loop is uvloop when it is installed (`cogs/utils/event_loop.py`, `MIMIC_UVLOOP=0` to
+turn it off). Nothing depends on which: `tests/test_event_loop.py` runs the bot's signal,
+executor and HTTP edges on both.
 
 Secrets are read once. `constants._get_gcp_client()` builds the Secret Manager client on
 first use and `_release_gcp_client()` drops it the moment `defaultConfig` is built, because
@@ -521,7 +538,7 @@ API accepts, so existing call sites read unchanged.
 
 If you are tempted to add an SDK for a new provider: write the adapter instead.
 
-### One shared HTTP client
+### Shared HTTP clients
 
 `cogs/utils/http_client.get_shared_client()` returns a single process-wide
 `httpx.AsyncClient`. Constructing one is expensive on the target — a fresh
@@ -531,6 +548,17 @@ for it twice: the transient buffers, and the heap fragmentation left behind by a
 and freeing at that rate. It also discarded connection reuse.
 
 Use the shared client. Do not construct `httpx.AsyncClient` in a request path.
+
+Model calls to OpenRouter -- text, images, speech, embeddings -- go through a second one,
+`get_openrouter_client()`, with httpx's default pool (100 connections, 20 kept alive).
+A model call holds its connection for the whole generation, so on the shared pool of 20
+a busy spell had the next reply and the attachments a turn needed waiting for a slot.
+How many model calls run at once is bounded by the generation gate
+(`services/generation/gate.py`, `GENERATION_SLOTS`), not by the pool: every
+`_generate_with_heartbeat` call takes a slot, in arrival order, and a reply past the
+limit waits with `Queued (n of m)` on its placeholder. The calls a turn makes around it
+(critic, recall, synopsis, Director) take none, so a turn holding a slot never waits on
+a second.
 
 ---
 

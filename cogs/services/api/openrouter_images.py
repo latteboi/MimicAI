@@ -25,7 +25,7 @@ import orjson as json
 
 from ...utils.blob_stream import InlineBlobExtractor
 from ...utils.constants import OPENROUTER_DATA_POLICY_BLOCKED
-from ...utils.http_client import get_shared_client
+from ...utils.http_client import get_openrouter_client
 from .google_rest import GoogleRESTResponse
 from .streaming import (
     _DOWNLOAD_CHUNK_BYTES, _FILE_BLOB_TOKEN, _aiter_streamed_body, _close_body_segments,
@@ -117,7 +117,7 @@ class OpenRouterImageModel:
         # divert it (cogs/utils/blob_stream).
         extractor = InlineBlobExtractor(key=b"b64_json", suffix=".img")
         try:
-            async with get_shared_client().stream(
+            async with get_openrouter_client().stream(
                     "POST", _IMAGES_URL, content=body, headers=headers, timeout=_TIMEOUT) as response:
                 if response.status_code != 200:
                     # Error bodies are small; read in one go.

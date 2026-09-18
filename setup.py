@@ -80,6 +80,8 @@ def setup_mimic():
     # This list is only a fallback for a checkout missing requirements.txt. That file
     # is the source of truth, so any change here has to be mirrored there.
     deps = ["discord.py", "orjson", "cryptography", "zstandard", "httpx", "numpy", "Pillow", "python-dotenv", "tzdata"]
+    if sys.platform != "win32":
+        deps.append("uvloop>=0.18")
     
     if os.path.exists("requirements.txt"):
         run_pip(venv_python, ["-r", "requirements.txt"])
