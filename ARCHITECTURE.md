@@ -391,6 +391,15 @@ the log.
 Prefixes are **case-sensitive**, because OpenRouter hosts models under lowercase creator
 namespaces like `google/gemini-2.5-flash` and the two must not collide.
 
+Every text request carries one output cap, `LIMIT_OUTPUT_TOKENS` (16,384): `max_tokens`
+to OpenRouter, `maxOutputTokens` to Google, `num_predict` to Ollama. It counts thinking,
+so a thinking budget is sent at no more than `THINKING_BUDGET_MAX`, which keeps room
+for the reply. OpenRouter checks a request's cost against the cap before running it,
+and without one it checks against the model's whole output ceiling. A model whose own
+ceiling is lower may reject the cap with a 400. `services/api/output_cap.py` then retries
+once without it and does not send it to that model again. Image requests are not
+capped, since the picture is the output, and a speech line keeps its own, lower cap.
+
 ### Providers that train on what they are sent
 
 Discord's Developer Policy forbids using message content to train AI models without
@@ -475,6 +484,21 @@ proof rules. The TTS category browses it, and the voice screen offers the chosen
 voices. Each speech adapter swaps a voice its model lacks for one it has — the Gemini
 default, or an OpenRouter model's first — so a fallback on the other provider still speaks.
 An OpenRouter model is sent the reply alone, as MP3: the Director's Desk reaches Google only.
+
+A text model can be **pinned to one endpoint** — a host at a tier, e.g.
+`google-vertex/global/priority` — from Set Models → Hosts & Tier (`OpenRouterHostView`,
+single profile only), which also holds the profile's tier as the default for unpinned models.
+Neither is offered on the Image or TTS tabs: only the chat adapter sends them. The endpoints come from `/models/{id}/endpoints`, asked on demand and kept ten
+minutes (`APIService.openrouter_endpoints`), never in the daily sync. A pin is stored sparse in
+`openrouter_endpoints`, keyed by model id because the factory never knows the slot, and pruned
+when its model leaves the profile. On the wire it is `provider.order` with fallbacks allowed,
+replacing `service_tier` for that model; the served host is recorded as `meta["served_by"]`.
+
+`/session audit` prices a turn from OpenRouter's invoice (`meta["cost"]`) where there is one,
+else from the rate table on `billable_output_tokens` — the reply plus Google's separately
+counted thinking (`meta["thinking_tokens"]`); OpenRouter's completion count already holds its
+reasoning. The simulator projects the next reply at the mean of the profile's last 20 on the
+same model (`recent_output_tokens`), falling back to any model, then to 300.
 
 A profile its owner can edit may carry up to three **voice samples** (`/profile
 voice_sample`), one per slot: the audio sealed beside the profile's shards, and a sealed

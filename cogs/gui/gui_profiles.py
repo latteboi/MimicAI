@@ -13,7 +13,7 @@ from ..utils.helpers import (
     _pf, _pi, _ps, _pb, is_real_model, image_model_caps, openrouter_image_ratios,
     resolve_critic_settings,
     google_thinking_caps, resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
-    describe_voice_samples,
+    describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
 )
 from ..utils.user_defaults import setting_label
 from ..utils.birthdays import MONTH_NAMES, format_birthday, parse_birthday, valid_birthday
@@ -31,6 +31,7 @@ from .base_components import (
 from ..services.api.openrouter_catalogue import (
     AUTHOR_PREFIX, BROWSE_CHEAPEST, BROWSE_POPULAR, BROWSE_TRENDING,
 )
+from ..services.api.openrouter_endpoints import option_description, option_label
 from ..utils.data_policy import may_pick_training_models
 from .gui_data import DataManageView
 from .gui_hub import HubShareManagerView
@@ -864,7 +865,8 @@ PROFILE_ACTIONS = (
                              "grounding_rag_model", "grounding_rag_fallback_model",
                              "critic_model", "critic_fallback_model",
                              "ltm_model", "ltm_fallback_model",
-                             "ollama_host_url", "openrouter_service_tier"))),
+                             "ollama_host_url", "openrouter_service_tier",
+                             "openrouter_endpoints"))),
     _Action("gen_params", "params", "Set Generation Parameters & STM", "Set Temp, Top P, Top K, and STM Length.",
             _modal("ProfileParamsModal"),
             bulk=_Bulk(_bulk_modal("ProfileParamsModal"), scope="all",
@@ -2867,8 +2869,27 @@ class ModelPickerMixin(ReportErrorMixin):
                 await i.response.send_message(OLLAMA_GUIDE_TEXT, ephemeral=True)
             add_button(self, "Guide", guide_cb, style=discord.ButtonStyle.secondary, row=row)
 
-        if self.view_mode == 'openrouter':
-            self._add_service_tier_button(row=row)
+        if self.view_mode == 'openrouter' and self._tier_applies():
+            self._add_openrouter_buttons(row=row)
+
+    #: Slots whose models go through an adapter other than chat: OpenRouter's image and
+    #: speech endpoints are adapters of their own and take neither a tier nor a pin, and
+    #: grounding is Google's. Only the chat adapter sends either.
+    _NON_CHAT_MODEL_KEYS = IMAGE_MODEL_KEYS | AUDIO_MODEL_KEYS | GOOGLE_ONLY_MODEL_KEYS
+
+    def _tier_applies(self) -> bool:
+        """Whether this tab holds a model the tier or a pin can reach.
+
+        On the Image and TTS tabs the tier button used to change a setting nothing on
+        those tabs ever sent.
+        """
+        return any(key not in self._NON_CHAT_MODEL_KEYS
+                   for key, _wording, _default in self._CATEGORY_KEYS[self.category])
+
+    def _add_openrouter_buttons(self, *, row: int):
+        """The OpenRouter tab's own buttons. The staging screens have only the tier; the
+        single-profile picker overrides this with Hosts & Tier, which holds both."""
+        self._add_service_tier_button(row=row)
 
     #: Button colour per tier. The *wording* is not repeated here -- it comes off
     #: OPENROUTER_SERVICE_TIERS, so the three screens and the constant cannot drift
@@ -2890,25 +2911,29 @@ class ModelPickerMixin(ReportErrorMixin):
         A button rather than a dropdown because all five rows are already spoken for --
         the category select, two model selects, and two rows of buttons -- and because
         it cycles through three states, which is what the API switch beside it already
-        does.
+        does. The single-profile picker keeps it on the Hosts screen instead, as the
+        tier every unpinned model is sent with.
 
         Profile-wide, not per slot, which is only safe because a model whose pool holds
         no endpoint at the requested tier routes normally at standard rates rather than
         failing: a profile on Flex with a critic nobody offers Flex for still gets its
-        critic. A provider *pin* would not be safe this way and is deliberately not
-        offered here.
+        critic. A provider *pin* would not be safe this way, which is why pins are per
+        model (OpenRouterHostView).
         """
-        cycle = self._tier_cycle()
-        current = self._current_service_tier()
-        style, wording = self.tier_wording(current)
+        style, wording = self.tier_wording(self._current_service_tier())
 
         async def tier_cb(i: discord.Interaction):
-            nxt = cycle[(cycle.index(current) + 1) % len(cycle)] if current in cycle else cycle[0]
-            self._set_service_tier(nxt)
+            self._set_service_tier(self._next_service_tier())
             self._build_view()
             await i.response.edit_message(**self._picker_render())
 
         add_button(self, f"Tier: {wording}", tier_cb, style=style, row=row)
+
+    def _next_service_tier(self):
+        """The value one press of a tier button moves to."""
+        cycle = self._tier_cycle()
+        current = self._current_service_tier()
+        return cycle[(cycle.index(current) + 1) % len(cycle)] if current in cycle else cycle[0]
 
     @classmethod
     def tier_wording(cls, value):
@@ -2974,6 +2999,10 @@ class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
         target_dict = self._get_current_profile_data()
         if target_dict is not None:
             target_dict[key] = value
+            # A pin goes when its model leaves the profile, and the key when no pin is
+            # left, so a model picked again months later does not quietly bring one back.
+            if "openrouter_endpoints" in target_dict:
+                prune_openrouter_endpoints(target_dict)
             self.cog.profile_manager._save_profile_config(self.user_id, self.profile_name, target_dict, self.is_borrowed)
             
             # Clear model cache for this user
@@ -3013,10 +3042,18 @@ class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
             state = data.get("show_fallback_indicator", True)
             e.add_field(name="Fallback Indicator",
                         value="**`ON`**" if state else "`OFF`", inline=True)
-        if self.view_mode == 'openrouter':
+        if self.view_mode == 'openrouter' and self._tier_applies():
             e.add_field(name="Service Tier",
                         value=f"`{self.tier_wording(self._current_service_tier())[1]}`",
                         inline=True)
+            pins = []
+            for _key, slot_wording, value in self._pinnable_slots():
+                tag = (resolve_openrouter_endpoint(data, self.strip_prefix(value))
+                       if str(value).startswith("OPENROUTER/") else None)
+                if tag:
+                    pins.append(f"{slot_wording}: `{tag}`")
+            if pins:
+                e.add_field(name="Pinned Hosts", value="\n".join(pins), inline=True)
 
         if self.category in THINKING_SLOT_KEYS:
             parts = []
@@ -3081,6 +3118,213 @@ class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
             add_button(self, "Thinking\u2026", think_cb, style=discord.ButtonStyle.secondary,
                        row=4)
 
+    def _pinnable_slots(self) -> List[tuple]:
+        """(config key, wording, stored value) for each slot on this tab a pin could reach."""
+        data = self._get_current_profile_data()
+        return [(key, wording, data.get(key, default))
+                for key, wording, default in self._CATEGORY_KEYS[self.category]
+                if key not in self._NON_CHAT_MODEL_KEYS]
+
+    def _add_openrouter_buttons(self, *, row: int):
+        """Opens OpenRouterHostView onto this message, as Thinking opens its picker.
+
+        The tier lives there too, as the one every unpinned model is sent with: one
+        button for both, because a pin names its own tier and the two answer the same
+        question. Lit when either is set, so neither is ever invisible from here.
+        """
+        data = self._get_current_profile_data()
+        slots = self._pinnable_slots()
+        models = list(dict.fromkeys(self.strip_prefix(value) for _key, _wording, value in slots
+                                    if str(value).startswith("OPENROUTER/")))
+        lit = bool(self._current_service_tier()) or any(
+            resolve_openrouter_endpoint(data, m) for m in models)
+
+        async def hosts_cb(i: discord.Interaction):
+            api = self.cog.api_service
+            listings = {m: api.cached_openrouter_endpoints(m) for m in models}
+            if all(v is not None for v in listings.values()):
+                view = OpenRouterHostView(self, listings)
+                await i.response.edit_message(**view._render())
+                return
+            # A listing is one request per model, but a slow one would outrun the three
+            # seconds an interaction gets to answer.
+            await i.response.defer()
+            fetched = await asyncio.gather(*(api.openrouter_endpoints(m) for m in models))
+            view = OpenRouterHostView(self, dict(zip(models, fetched)))
+            await i.edit_original_response(**view._render())
+
+        add_button(self, "Hosts & Tier\u2026", hosts_cb, row=row,
+                   style=discord.ButtonStyle.blurple if lit else discord.ButtonStyle.secondary)
+
+
+class OpenRouterHostView(BlockedGuard, ui.View):
+    """Which OpenRouter endpoint each model on one Set Models tab is sent to.
+
+    An endpoint is a host at a tier -- Gemini 3.8 Flash lists AI Studio and Vertex at
+    flex, standard and priority -- so one dropdown per slot offers every one of them,
+    plus Auto. Auto sends the profile's Default Tier, whose button lives here too: it is
+    what every unpinned model gets, and it still does what no pin can -- any host at a
+    tier, on every model, including ones never opened here. Opened from Set Models onto
+    the same message, with a Back that returns to it, as Thinking is. A slot holding a
+    Google or Ollama model gets a greyed dropdown saying why rather than none.
+
+    Single-profile only. The bulk picker and My Defaults have no one model to list the
+    hosts of, and a pin on a model the profile does not use is pruned on save anyway.
+    """
+
+    _AUTO = "__auto__"
+
+    def __init__(self, parent: 'SingleProfileModelView', listings: Dict[str, Any]):
+        super().__init__(timeout=300)
+        self.parent = parent
+        self.cog = parent.cog
+        self.user_id = parent.user_id
+        #: model id -> its endpoints, or None where OpenRouter could not be asked.
+        self.listings = listings
+        self._build_view()
+
+    def _render(self) -> Dict[str, Any]:
+        return {"content": None, "embed": self.embed(), "view": self}
+
+    def _set_pin(self, model_id: str, tag: Optional[str]):
+        data = self.parent._get_current_profile_data()
+        pins = data.get("openrouter_endpoints")
+        pins = dict(pins) if isinstance(pins, dict) else {}
+        if tag:
+            pins[model_id] = tag
+        else:
+            pins.pop(model_id, None)
+        # Through the picker's own save, which prunes and drops the cached model --
+        # a cached OpenRouterModel carries the endpoint it was built with.
+        self.parent._save_changes("openrouter_endpoints", pins)
+
+    @staticmethod
+    def _model_id(value) -> Optional[str]:
+        text = str(value or "")
+        return text[len("OPENROUTER/"):] if text.startswith("OPENROUTER/") else None
+
+    def _endpoint(self, model_id: str, tag: Optional[str]):
+        return next((e for e in self.listings.get(model_id) or () if e.tag == tag), None)
+
+    def _tier(self):
+        """(stored tier, its wording, its description) for the profile's Default Tier."""
+        value = self.parent._current_service_tier()
+        # Anything unrecognised is refused at the wire, so it reads as the default here.
+        value = value if value in OPENROUTER_SERVICE_TIER_VALUES else ""
+        wording = self.parent.tier_wording(value)[1]
+        desc = next((d for v, _l, d in OPENROUTER_SERVICE_TIERS if v == value),
+                    OPENROUTER_SERVICE_TIERS[0][2])
+        return value, wording, desc
+
+    def embed(self) -> discord.Embed:
+        data = self.parent._get_current_profile_data()
+        _tier, tier_wording, tier_desc = self._tier()
+        e = discord.Embed(title="OpenRouter Hosts & Tier", colour=discord.Colour.blurple())
+        e.description = (
+            "Send a model to one host at one tier. The pinned endpoint is tried first; if it "
+            "fails or has no capacity, OpenRouter routes the request as it otherwise would, "
+            "so a pin never costs a reply.\n"
+            "-# A pin names its own tier, so it overrides the Default Tier for that model. "
+            "Pins are per model: a primary and fallback on the same model share one.")
+        e.add_field(name="Default Tier", inline=False,
+                    value=f"`{tier_wording}` \u2014 {tier_desc}\n"
+                          "-# Every OpenRouter text model this profile leaves on Auto, on every tab.")
+        catalogue = self.parent._openrouter_catalogue()
+        for _key, wording, value in self.parent._pinnable_slots():
+            model_id = self._model_id(value)
+            if model_id is None:
+                e.add_field(name=wording, inline=False, value=(
+                    "No model set." if not is_real_model(value)
+                    else f"`{self.parent.display_model(value)}` is not an OpenRouter model, "
+                         "so there is no host to choose."))
+                continue
+            name = f"{wording} \u00b7 {catalogue.label(model_id)}"[:256]
+            tag = resolve_openrouter_endpoint(data, model_id)
+            listing = self.listings.get(model_id)
+            if listing is None:
+                body = "Could not get this model's hosts from OpenRouter."
+                if tag:
+                    body = f"Pinned: `{tag}`\n" + body
+            elif not tag:
+                body = (f"Auto \u2014 OpenRouter chooses among {len(listing)} "
+                        f"endpoint{'s' if len(listing) != 1 else ''}.")
+            else:
+                chosen = self._endpoint(model_id, tag)
+                body = (f"Pinned: **{option_label(chosen)}** (`{tag}`)\n{option_description(chosen)}"
+                        if chosen else
+                        f"Pinned: `{tag}`\n\u26a0 OpenRouter no longer lists this endpoint, "
+                        "so every request routes as if on Auto.")
+            e.add_field(name=name, value=body[:1024], inline=False)
+        e.set_footer(text=f"{self.parent.profile_name} \u00b7 changes save as you make them")
+        return e
+
+    def _add_slot_select(self, wording: str, value, row: int):
+        model_id = self._model_id(value)
+        listing = self.listings.get(model_id) if model_id else None
+        if not listing:
+            reason = ("not an OpenRouter model" if model_id is None
+                      else "OpenRouter listed no hosts" if listing == ()
+                      else "hosts unavailable")
+            add_select(self, [discord.SelectOption(label="Auto", value=self._AUTO)],
+                       self._noop, row=row, disabled=True,
+                       placeholder=f"{wording}: {reason}"[:150])
+            return
+
+        tag = resolve_openrouter_endpoint(self.parent._get_current_profile_data(), model_id)
+        tier, tier_wording, _desc = self._tier()
+        opts = [discord.SelectOption(
+            label=f"Auto ({tier_wording})" if tier else "Auto", value=self._AUTO, default=not tag,
+            description=("Any host, at the Default Tier." if tier
+                         else "Let OpenRouter choose, at standard rates."))]
+        if tag and self._endpoint(model_id, tag) is None:
+            opts.append(discord.SelectOption(label=f"Current: {tag}"[:100], value=tag, default=True,
+                                             description="No longer listed by OpenRouter."))
+        for endpoint in listing[:25 - len(opts)]:
+            opts.append(discord.SelectOption(label=option_label(endpoint), value=endpoint.tag,
+                                             description=option_description(endpoint),
+                                             default=endpoint.tag == tag))
+
+        async def callback(interaction: discord.Interaction):
+            chosen = interaction.data["values"][0]
+            self._set_pin(model_id, None if chosen == self._AUTO else chosen)
+            self._build_view()
+            await interaction.response.edit_message(**self._render())
+
+        add_select(self, opts, callback, row=row, placeholder=f"{wording} host...")
+
+    @staticmethod
+    async def _noop(interaction: discord.Interaction):
+        await interaction.response.defer()
+
+    def _build_view(self):
+        self.clear_items()
+        for row, (_key, wording, value) in enumerate(self.parent._pinnable_slots()):
+            self._add_slot_select(wording, value, row)
+
+        async def back_cb(i: discord.Interaction):
+            self.parent._build_view()
+            await i.response.edit_message(**self.parent._picker_render())
+        add_button(self, "\u2190 Back to Models", back_cb, row=4)
+
+        style, wording = self.parent.tier_wording(self.parent._current_service_tier())
+
+        async def tier_cb(i: discord.Interaction):
+            self.parent._set_service_tier(self.parent._next_service_tier())
+            self._build_view()
+            await i.response.edit_message(**self._render())
+        add_button(self, f"Default Tier: {wording}", tier_cb, style=style, row=4)
+
+        missing = [m for m, listing in self.listings.items() if listing is None]
+        if missing:
+            async def retry_cb(i: discord.Interaction):
+                await i.response.defer()
+                fetched = await asyncio.gather(
+                    *(self.cog.api_service.openrouter_endpoints(m) for m in missing))
+                self.listings.update(zip(missing, fetched))
+                self._build_view()
+                await i.edit_original_response(**self._render())
+            add_button(self, "Retry", retry_cb, row=4)
+
 
 class ThinkingPickerMixin:
     """Reasoning effort and budget, per model slot and per role, shared by both pickers.
@@ -3139,9 +3383,10 @@ class ThinkingPickerMixin:
         raw = str(self._slot_model(self.slot, role) or "")
         upper = raw.upper()
         if upper.startswith("OPENROUTER/") or ("/" in raw and not upper.startswith(("GOOGLE/", "OLLAMA/"))):
-            return ("takes both -- effort as `reasoning.effort` (Max and Extra High are "
-                    "the same ~95% allocation there) and the budget as "
-                    "`reasoning.max_tokens`, budget winning where both are set")
+            return ("takes both -- effort as `reasoning.effort`, a share of the "
+                    f"{defaultConfig.LIMIT_OUTPUT_TOKENS:,}-token output cap (Max and Extra "
+                    "High are the same ~95% there, leaving little for the reply) and the "
+                    "budget as `reasoning.max_tokens`, budget winning where both are set")
         if upper.startswith("OLLAMA/"):
             return ("takes effort only, coarsely (low/medium/high); a model not built "
                     "for thinking refuses it and the bot retries once without")
@@ -3245,7 +3490,7 @@ class _SlotThinkingBudgetModal(ui.Modal):
         for role, label in picker._ROLE_LABELS:
             _level_key, budget_key = picker._slot_keys(role)
             current = picker._current(budget_key)
-            placeholder = ("-1 dynamic \u00b7 0 disables \u00b7 128-32768 a token limit"
+            placeholder = (f"-1 dynamic \u00b7 0 disables \u00b7 128-{THINKING_BUDGET_MAX} a token limit"
                            if role == "primary"
                            else "blank follows the primary \u00b7 -1 dynamic \u00b7 0 disables")
             field = ui.TextInput(
@@ -3270,7 +3515,7 @@ class _SlotThinkingBudgetModal(ui.Modal):
                     "Enter -1 for dynamic, 0 to disable thinking, or a token count. "
                     "Leave a field blank to inherit.", ephemeral=True)
                 return
-            pending[budget_key] = min(value, 32768)
+            pending[budget_key] = min(value, THINKING_BUDGET_MAX)
 
         for key, value in pending.items():
             self.picker._write(key, value)
@@ -3575,7 +3820,7 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
             e.add_field(name="Fallback Indicator",
                         value=f"`{'Unchanged' if state is None else self._clean(state)}`",
                         inline=True)
-        if self.view_mode == 'openrouter':
+        if self.view_mode == 'openrouter' and self._tier_applies():
             e.add_field(name="Service Tier",
                         value=f"`{self._clean(self.models_state['openrouter_service_tier'])}`",
                         inline=True)
@@ -4094,6 +4339,8 @@ async def _apply_bulk_session(cog, user_id: int, session: _BulkSession) -> Dict[
             profile = cog.profile_manager._get_profile_config(user_id, name, is_borrowed)
             if profile:
                 profile.update(session.config)
+                if "openrouter_endpoints" in profile:
+                    prune_openrouter_endpoints(profile)
                 cog.profile_manager._save_profile_config(user_id, name, profile, is_borrowed)
                 touched = True
 

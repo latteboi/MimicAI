@@ -23,11 +23,12 @@ from ..utils.constants import (
 from ..utils.data_policy import openrouter_data_collection
 from ..managers.storage_manager import IOManager
 from ..utils.blob_stream import InlineBlobExtractor, is_blob_sentinel, sentinel_path
-from ..utils.helpers import (_resolve_safety_settings, is_real_model,
+from ..utils.helpers import (_resolve_safety_settings, billable_output_tokens, is_real_model,
                             google_thinking_caps, resolve_image_output_params,
                             resolve_image_tools, resolve_media_resolution,
                             resolve_native_tools, resolve_openrouter_image_detail,
-                            resolve_openrouter_service_tier, resolve_thinking_params)
+                            resolve_openrouter_endpoint, resolve_openrouter_service_tier,
+                            resolve_thinking_params)
 from ..utils.http_client import get_shared_client
 from ..utils.net_guard import safe_stream
 from ..utils.memory_tuning import maybe_trim_malloc
@@ -44,6 +45,7 @@ from .api.google_rest import (
 from .api.ollama import OllamaModel, OllamaResponse
 from .api.openrouter import OpenRouterModel
 from .api.openrouter_catalogue import BROWSE_POPULAR, OpenRouterCatalogue
+from .api.openrouter_endpoints import ENDPOINTS_URL, Endpoint, base_model_id, parse_endpoints
 from .api.openrouter_image_catalogue import OpenRouterImageCatalogue
 from .api.openrouter_images import OpenRouterImageModel
 from .api.openrouter_speech import OpenRouterSpeechModel
@@ -188,6 +190,9 @@ class APIService:
         #: host -> (answered, model names) from each Ollama host's last probe, oldest
         #: first. Shared by every picker -- see probe_ollama.
         self._ollama_probes: "OrderedDict[str, Tuple[bool, List[str]]]" = OrderedDict()
+        #: model id -> (monotonic time read, endpoints), oldest first. Read on demand by
+        #: the Hosts screen -- see openrouter_endpoints.
+        self._endpoint_listings: "OrderedDict[str, Tuple[float, Tuple[Endpoint, ...]]]" = OrderedDict()
 
     def _instantiate_model(self, raw_model_name: str, guild_id, user_id, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, profile_settings=None, openrouter_key_error: str = None, google_key_error: str = None, use_broad_openrouter_heuristic: bool = True, config_owner_id=None, policy_guild_id=None, conversation: bool = False, image_config=None, speech: bool = False):
         """One adapter for `raw_model_name`, keyed and policed for where it will run.
@@ -279,7 +284,8 @@ class APIService:
                     actual_name, api_key=api_key, system_instruction=system_instruction,
                     image_params=resolve_image_output_params(image_config, f"OPENROUTER/{actual_name}"))
                 return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
-            model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params, image_detail=image_detail, service_tier=service_tier, data_collection=data_collection)
+            model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params, image_detail=image_detail, service_tier=service_tier, data_collection=data_collection,
+                                    endpoint=resolve_openrouter_endpoint(p_settings, actual_name))
             return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
         elif is_ollama:
             if image_config is not None:
@@ -405,6 +411,46 @@ class APIService:
         while len(self._ollama_probes) > self._OLLAMA_PROBES_KEPT:
             self._ollama_probes.popitem(last=False)
         return answered, models
+
+    #: Endpoint listings kept, and for how long one is shown before it is asked again.
+    #: Short, because the screen quotes uptime; few, because pins are set on a handful.
+    _ENDPOINT_LISTINGS_KEPT = 32
+    _ENDPOINT_LISTING_TTL = 600.0
+    #: A model id as it may appear in the listing's path. A typed custom id can hold
+    #: anything, and this one is interpolated into a URL.
+    _LISTABLE_MODEL_ID = re.compile(r"[\w.-]+/[\w.-]+")
+
+    def cached_openrouter_endpoints(self, model_id: str) -> Optional[Tuple[Endpoint, ...]]:
+        """The last listing for `model_id` while it is still fresh, else None. Never asks."""
+        entry = self._endpoint_listings.get(base_model_id(model_id))
+        if entry is None or time.monotonic() - entry[0] > self._ENDPOINT_LISTING_TTL:
+            return None
+        return entry[1]
+
+    async def openrouter_endpoints(self, model_id: str) -> Optional[Tuple[Endpoint, ...]]:
+        """Every endpoint OpenRouter lists for one text model; None if it could not say.
+
+        One small request per model, asked when the Hosts screen opens rather than for
+        every model in the daily sync -- see api/openrouter_endpoints.
+        """
+        key = base_model_id(model_id)
+        cached = self.cached_openrouter_endpoints(key)
+        if cached is not None:
+            return cached
+        if not self._LISTABLE_MODEL_ID.fullmatch(key):
+            return None
+        try:
+            resp = await get_shared_client().get(ENDPOINTS_URL.format(key), timeout=10.0)
+        except httpx.HTTPError:
+            return None
+        endpoints = parse_endpoints(resp.content) if resp.status_code == 200 else None
+        if endpoints is None:
+            return None
+        self._endpoint_listings[key] = (time.monotonic(), endpoints)
+        self._endpoint_listings.move_to_end(key)
+        while len(self._endpoint_listings) > self._ENDPOINT_LISTINGS_KEPT:
+            self._endpoint_listings.popitem(last=False)
+        return endpoints
 
     def record_openrouter_use(self, model_id: str) -> None:
         """Counts a successful OpenRouter call for Most Popular, writing it now and then.
@@ -840,4 +886,4 @@ class APIService:
             return float(billed), True
         return self._calculate_turn_cost(meta.get("model", "") or "",
                                          meta.get("input_tokens", 0) or 0,
-                                         meta.get("output_tokens", 0) or 0), False
+                                         billable_output_tokens(meta)), False

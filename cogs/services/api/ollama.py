@@ -13,7 +13,7 @@ from typing import List
 
 import httpx
 
-from ...utils.constants import OLLAMA_LOCAL_URL, THINKING_LEVELS_TO_OLLAMA
+from ...utils.constants import OLLAMA_LOCAL_URL, THINKING_LEVELS_TO_OLLAMA, defaultConfig
 from ...utils.http_client import get_shared_client
 from .rest_view import _BlobRef, _RestView
 from .streaming import (
@@ -180,6 +180,9 @@ class OllamaModel:
             "options": {
                 "temperature": temp,
                 "top_p": top_p,
+                # The cap every provider gets (see output_cap). Ollama's own default is
+                # to generate without end, and it takes any value rather than refusing.
+                "num_predict": defaultConfig.LIMIT_OUTPUT_TOKENS,
             },
             "stream": True
         }

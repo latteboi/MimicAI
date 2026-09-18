@@ -947,16 +947,60 @@ def resolve_openrouter_service_tier(config: Optional[Dict[str, Any]]) -> Optiona
     return value if value in OPENROUTER_SERVICE_TIER_VALUES else None
 
 
+#: What a pinned OpenRouter endpoint tag may look like before it goes on the wire: a
+#: host slug and up to four variant segments (`google-vertex/global/priority`,
+#: `deepinfra/fp4`). Always used with fullmatch.
+OPENROUTER_ENDPOINT_TAG = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}(?:/[a-z0-9][a-z0-9._-]{0,63}){0,4}")
+
+
+def resolve_openrouter_endpoint(config: Optional[Dict[str, Any]], model_id: Optional[str]) -> Optional[str]:
+    """The endpoint this profile pins `model_id` to, or None for "let OpenRouter route".
+
+    Pins live in `openrouter_endpoints`, keyed by model id rather than by slot:
+    `_instantiate_model` is handed a model name and a config, never the slot it fills,
+    so a pin follows its model into every slot that holds it and stops applying the
+    moment a slot moves to another model. Validated like the tier, for the same reason.
+    """
+    pins = (config or {}).get("openrouter_endpoints")
+    if not isinstance(pins, dict) or not isinstance(model_id, str):
+        return None
+    tag = pins.get(model_id)
+    return tag if isinstance(tag, str) and OPENROUTER_ENDPOINT_TAG.fullmatch(tag) else None
+
+
+def prune_openrouter_endpoints(config: Dict[str, Any]) -> None:
+    """Drops pins for models no slot of `config` holds, in place; the key goes when empty.
+
+    An orphaned pin is inert, but without this they would pile up one per model a
+    profile was ever pinned on. Matched against every string value rather than a list of
+    slot keys, so a slot added later needs nothing here.
+    """
+    pins = config.get("openrouter_endpoints")
+    if not isinstance(pins, dict):
+        config.pop("openrouter_endpoints", None)
+        return
+    held = set()
+    for value in config.values():
+        if isinstance(value, str):
+            held.add(value[len("OPENROUTER/"):] if value.startswith("OPENROUTER/") else value)
+    kept = {model: tag for model, tag in pins.items() if model in held}
+    if kept:
+        config["openrouter_endpoints"] = kept
+    else:
+        config.pop("openrouter_endpoints", None)
+
+
 def record_billed_usage(meta: Dict[str, Any], response) -> None:
-    """Copy the provider's own cost and served tier onto a turn's `meta`.
+    """Copy what the provider reports about billing onto a turn's `meta`: its cost,
+    served tier and host, and any thinking tokens it counted apart from the reply.
 
     Written by every path that records a turn, read by `/session audit`. Only
-    OpenRouter reports either: it returns what it actually charged, which is the one
+    OpenRouter reports a cost, tier or host: it returns what it actually charged, the one
     figure that survives a flex discount, a `:floor` route or a cached-prompt rebate.
     The rate table `_calculate_turn_cost` reads is keyed on the listed model id and
     knows about none of them, so it is the estimate and this is the invoice.
 
-    Both keys stay absent when the provider sent nothing, so the audit can tell a
+    Each key stays absent when the provider sent nothing, so the audit can tell a
     billed figure from an estimated one instead of showing 0.00 as if it were free.
     """
     cost = getattr(response, "billed_cost", None)
@@ -965,6 +1009,28 @@ def record_billed_usage(meta: Dict[str, Any], response) -> None:
     tier = getattr(response, "service_tier", None)
     if tier:
         meta["service_tier"] = str(tier)
+    host = getattr(response, "served_by", None)
+    if isinstance(host, str) and host:
+        meta["served_by"] = host[:64]
+    # Google's alone: OpenRouter's completion count already includes reasoning, so a
+    # key of its own there would bill the same tokens twice. Sparse, like the rest.
+    thinking = getattr(response, "thinking_tokens", None)
+    if isinstance(thinking, int) and not isinstance(thinking, bool) and thinking > 0:
+        meta["thinking_tokens"] = thinking
+
+
+def billable_output_tokens(meta: Dict[str, Any]) -> int:
+    """The output tokens a turn was billed for: the reply plus thinking counted apart from it.
+
+    The one reading of a turn's output for pricing, so the audit's totals, its per-turn
+    estimate and its projection cannot disagree about whether thinking counts.
+    """
+    total = 0
+    for key in ("output_tokens", "thinking_tokens"):
+        value = meta.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            total += int(value)
+    return total
 
 
 def resolve_typing_cursor(config: Optional[Dict[str, Any]], fallback_emoji: str) -> Tuple[str, str]:

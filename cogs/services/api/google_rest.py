@@ -22,14 +22,16 @@ import httpx
 from ...utils.blob_stream import InlineBlobExtractor, TruncatedJSONError
 from ...utils.constants import (
     DEFAULT_SPEECH_VOICE, ERR_REASON_NO_AUDIO, ERR_REASON_SPEECH_PROHIBITED,
-    ERR_REASON_SPEECH_REFUSED, ERR_REASON_SPEECH_TIMED_OUT, THINKING_LEVELS_TO_GOOGLE,
-    THINKING_LEVELS_TO_GOOGLE_BINARY, TTS_VOICE_LOOKUP,
+    ERR_REASON_SPEECH_REFUSED, ERR_REASON_SPEECH_TIMED_OUT, THINKING_BUDGET_MAX,
+    THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY, TTS_VOICE_LOOKUP,
+    defaultConfig,
 )
 from ...utils.helpers import google_thinking_caps, resolve_media_resolution
 from ...utils.http_client import get_shared_client
 from ...utils.memory_tuning import maybe_trim_malloc
 from ...utils.net_guard import safe_stream
 from ...utils import mem_probe
+from .output_cap import RetryUncapped, output_cap, refused_output_cap
 from .rest_view import _BlobRef, _RestView, _to_camel, _wrap_rest
 from .streaming import (
     _DOWNLOAD_CHUNK_BYTES, _aiter_file_bytes, _stream_to_tempfile,
@@ -441,6 +443,7 @@ class GoogleRESTModel:
             # -1 is dynamic and always legal; a floor only bites a real token count.
             if 0 <= budget < caps["budget_floor"]:
                 budget = caps["budget_floor"]
+            budget = min(budget, THINKING_BUDGET_MAX)
             cfg["thinkingConfig"] = {"includeThoughts": include_thoughts, "thinkingBudget": budget}
 
         # How many tokens an input image or PDF is worth. Gated on the same utility
@@ -450,6 +453,12 @@ class GoogleRESTModel:
         # per-attachment interface to hang off.
         if self.media_resolution and not is_utility_model:
             cfg["mediaResolution"] = self.media_resolution
+
+        # Text models only -- see output_cap. An image model's output is the picture
+        # imageConfig sizes, and a speech line carries its own, tighter cap.
+        cap = None if is_utility_model or self.image_params else output_cap(self.model_name)
+        if cap:
+            cfg["maxOutputTokens"] = cap
 
         # Image output controls. Reached by an image model on purpose: such a model
         # rejects the *text* thinking config -- google_thinking_caps returns no mode for
@@ -540,6 +549,7 @@ class GoogleRESTModel:
             gen_cfg = self._build_generation_config(generation_config)
             if gen_cfg:
                 payload["generationConfig"] = gen_cfg
+            capped = "maxOutputTokens" in gen_cfg
 
             model_path = self.model_name if self.model_name.startswith("models/") else f"models/{self.model_name}"
 
@@ -568,6 +578,8 @@ class GoogleRESTModel:
                         # helpers._get_friendly_api_error matches on, so pass it through
                         # intact. Error bodies are small; read it in one go.
                         detail = (await response.aread()).decode('utf-8', 'replace')
+                        if capped and refused_output_cap(self.model_name, response.status_code, detail):
+                            raise RetryUncapped()
                         raise Exception(f"Google API Error {response.status_code}: {detail}")
 
                     async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK_BYTES):
@@ -577,6 +589,9 @@ class GoogleRESTModel:
         except httpx.RequestError as e:
             extractor.cleanup()
             raise Exception(f"Google API Network Error: {str(e)}")
+        except RetryUncapped:
+            extractor.cleanup()
+            return await self.generate_content_async(contents, generation_config, stream_state)
         except BaseException:
             # Covers CancelledError as well, which is exactly when a half-written
             # blob would otherwise be left behind.
@@ -619,6 +634,10 @@ class GoogleRESTResponse:
 
         self.input_tokens = (self.usage_metadata.prompt_token_count or 0) if self.usage_metadata else 0
         self.output_tokens = (self.usage_metadata.candidates_token_count or 0) if self.usage_metadata else 0
+        #: Reported apart from the reply and billed at the output rate. The candidate
+        #: count above leaves it out, so without this a thinking model's turns were
+        #: estimated at the price of their visible text alone.
+        self.thinking_tokens = (self.usage_metadata.thoughts_token_count or 0) if self.usage_metadata else 0
 
         if self.candidates and self.candidates[0].content and self.candidates[0].content.parts:
             for part in self.candidates[0].content.parts:
@@ -1050,5 +1069,6 @@ class GoogleSpeechModel:
         return await generate_google_tts_audio(
             self.api_key, self.model_name, directed_prompt or transcript,
             voice_name=voice, temperature=temperature,
-            max_output_tokens=_speech_token_cap(transcript, max_bytes),
+            max_output_tokens=min(_speech_token_cap(transcript, max_bytes),
+                                  defaultConfig.LIMIT_OUTPUT_TOKENS),
             language_code=language_code)

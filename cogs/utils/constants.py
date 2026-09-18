@@ -93,6 +93,12 @@ class DefaultConfigNamespace:
         # character reads, a reference picture, a `.mimic` import. Discord lets Nitro
         # upload 500 MB, and media is billed by its length as well as held on disk.
         self.LIMIT_ATTACHMENT_BYTES = 25 * 1024 * 1024
+        # Output tokens one text generation may produce, thinking included, on every
+        # provider -- see services/api/output_cap. OpenRouter checks what a request
+        # could cost before running it, and checks one that names no cap against the
+        # model's whole output ceiling (65,536 for Gemini Flash), so a low balance
+        # failed every turn however short the prompt.
+        self.LIMIT_OUTPUT_TOKENS = 16384
         self.CHATBOT_MEMORY_LENGTH = 20
         self.GEMINI_TEMPERATURE = 1.0
         self.GEMINI_TOP_P = 0.95
@@ -521,7 +527,8 @@ GOOGLE_ONLY_MODEL_KEYS = frozenset({
 #: Safe to set once for a whole profile, which is why it is not per slot: a model whose
 #: pool holds no endpoint at the requested tier routes normally at standard rates
 #: rather than failing. Only `provider.allow_fallbacks: false` turns that into an
-#: error, and nothing here sends a provider object.
+#: error, and nothing here sends it -- an endpoint pin (resolve_openrouter_endpoint) is a
+#: provider object with fallbacks allowed, and replaces the tier for its one model.
 OPENROUTER_SERVICE_TIERS = (
     ("", "Auto", "Let OpenRouter route. Standard rates."),
     ("flex", "Flex", "Cheaper endpoints, slower, may report no capacity."),
@@ -586,6 +593,12 @@ THINKING_SLOT_KEYS = {
                   'fallback': ('ltm_fallback_thinking_level',
                                'ltm_fallback_thinking_budget')},
 }
+
+#: The largest thinking budget sent. Every provider that takes a budget counts thinking
+#: towards LIMIT_OUTPUT_TOKENS, so a budget at the cap could spend all of it thinking
+#: and return no reply; this keeps room for one. A larger stored budget is kept and
+#: lowered at send, as a value a model ignores is kept.
+THINKING_BUDGET_MAX = defaultConfig.LIMIT_OUTPUT_TOKENS - 4096
 
 #: What a slot does when its keys are unset. Sparse storage is load-bearing here for
 #: the same reason it is in `index.json["defaults"]`: "unset" has to stay

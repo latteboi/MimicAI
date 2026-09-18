@@ -11,11 +11,12 @@ from typing import List
 
 import httpx
 
-from ...utils.constants import OPENROUTER_DATA_POLICY_BLOCKED
+from ...utils.constants import OPENROUTER_DATA_POLICY_BLOCKED, THINKING_BUDGET_MAX
 from ...utils.helpers import (
     resolve_openrouter_image_detail, resolve_openrouter_service_tier,
 )
 from ...utils.http_client import get_shared_client
+from .output_cap import output_cap, refused_output_cap
 from .rest_view import _BlobRef, _RestView
 from .streaming import _FILE_BLOB_TOKEN, _aiter_streamed_body, _plan_streamed_body
 
@@ -23,7 +24,8 @@ from .streaming import _FILE_BLOB_TOKEN, _aiter_streamed_body, _plan_streamed_bo
 
 class OpenRouterModel:
     def __init__(self, model_name, api_key, system_instruction=None, thinking_params=None,
-                 image_detail=None, service_tier=None, data_collection=None, **kwargs):
+                 image_detail=None, service_tier=None, data_collection=None, endpoint=None,
+                 **kwargs):
         self.model_name = model_name.replace("OPENROUTER/", "").replace("GOOGLE/", "")
         self.api_key = api_key
         self.system_instruction = system_instruction
@@ -35,6 +37,10 @@ class OpenRouterModel:
         #: "flex", "priority" or None. Resolved once in `_instantiate_model` from the
         #: profile, so every OpenRouter slot the profile uses asks for the same tier.
         self.service_tier = service_tier
+        #: An endpoint tag this model is pinned to (`google-vertex/global/priority`), or
+        #: None. Resolved per model by `_instantiate_model` -- see
+        #: resolve_openrouter_endpoint.
+        self.endpoint = endpoint
         #: "deny" keeps the request off hosts that may train on prompts; None sends no
         #: preference. Decided by the model factory from the data policy the request
         #: answers to -- a server's, or a Global Chat's -- see cogs/utils/data_policy.
@@ -140,6 +146,11 @@ class OpenRouterModel:
             "temperature": temp,
             "top_p": top_p,
         }
+        # See output_cap. Without one, OpenRouter checks the request's affordability
+        # against the model's whole output ceiling rather than anything it will produce.
+        cap = output_cap(self.model_name)
+        if cap:
+            payload["max_tokens"] = cap
 
         budget = int(self.thinking_params.get("thinking_budget", -1))
         level = self.thinking_params.get("thinking_level", "high").lower()
@@ -147,14 +158,21 @@ class OpenRouterModel:
         if include_thoughts or budget > 0 or level != "none":
             payload["reasoning"] = {"exclude": not include_thoughts}
             if budget > 0:
-                payload["reasoning"]["max_tokens"] = budget
+                payload["reasoning"]["max_tokens"] = min(budget, THINKING_BUDGET_MAX)
             elif level != "none":
                 payload["reasoning"]["effort"] = level
 
         # Set before the advanced splice, so an operator who puts `service_tier` in
         # the advanced params still wins over the picker rather than being overwritten
         # by it -- the same precedence every other key in that dict already has.
-        if self.service_tier:
+        #
+        # A pin's tag names its tier, so the profile-wide tier gives way to it rather
+        # than asking for a second one alongside. Fallbacks stay allowed: a pinned flex
+        # endpoint that reports no capacity routes on at standard rates, as an unpinned
+        # flex request would, instead of failing the turn.
+        if self.endpoint:
+            payload["provider"] = {"order": [self.endpoint], "allow_fallbacks": True}
+        elif self.service_tier:
             payload["service_tier"] = self.service_tier
 
         if advanced:
@@ -190,6 +208,10 @@ class OpenRouterModel:
             else:
                 response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers, timeout=120.0)
             if response.status_code != 200:
+                if cap and refused_output_cap(self.model_name, response.status_code, response.text):
+                    # Rebuilt from `contents`: the streamed-body planner consumed the payload.
+                    return await self.generate_content_async(
+                        contents, generation_config, safety_settings, stream_state)
                 err = Exception(f"OpenRouter API Error {response.status_code}: {response.text}")
                 # OpenRouter answers a request whose data policy no host can meet with
                 # "No endpoints found matching your data policy". Said plainly instead,
@@ -208,7 +230,7 @@ class OpenRouterModel:
 
             class OpenRouterThoughtResponse:
                 def __init__(self, content, reasoning, finish_reason, input_toks, output_toks,
-                             billed_cost=None, served_tier=None):
+                             billed_cost=None, served_tier=None, served_by=None):
                     self.text = content
                     self.thought = reasoning or ""
                     self.input_tokens = input_toks
@@ -221,6 +243,9 @@ class OpenRouterModel:
                     #: `/session audit` labels them differently.
                     self.billed_cost = billed_cost
                     self.service_tier = served_tier
+                    #: The host OpenRouter says served it ("Google AI Studio"), which
+                    #: is the only evidence a pin was honoured rather than fallen past.
+                    self.served_by = served_by
 
                     # One _RestView in place of four throwaway classes per response:
                     # it presents the same candidates[0].content.parts[].text surface
@@ -242,6 +267,7 @@ class OpenRouterModel:
                 usage_obj.get('completion_tokens', 0),
                 usage_obj.get('cost'),
                 data.get('service_tier'),
+                data.get('provider') if isinstance(data.get('provider'), str) else None,
             )
         except httpx.RequestError as e:
             raise Exception(f"OpenRouter Network Error: {str(e)}")

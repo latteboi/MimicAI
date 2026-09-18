@@ -6,8 +6,9 @@ import datetime
 import pathlib
 import time
 import asyncio
-from typing import TYPE_CHECKING, List, Dict, Any, Optional
-from ..utils.helpers import (_estimate_text_tokens, _get_user_hash, resolve_openrouter_service_tier,
+from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
+from ..utils.helpers import (_estimate_text_tokens, _get_user_hash, billable_output_tokens,
+                             resolve_openrouter_endpoint, resolve_openrouter_service_tier,
                              strip_history_envelope)
 from ..utils.data_policy import may_pick_training_models
 from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PAGE, add_button,
@@ -2207,6 +2208,57 @@ class SessionConfigView(BlockedGuard, ui.View):
                    style=discord.ButtonStyle.success, row=3)
 
 
+#: The audit's projection prices the next reply at the average of the profile's own last
+#: few in the session, and falls back to this when it has too few to average.
+ASSUMED_OUTPUT_TOKENS = 300
+OUTPUT_SAMPLE_SIZE = 20
+OUTPUT_SAMPLE_MIN = 3
+
+
+def _bare_model(name) -> str:
+    """A model id as a turn's `meta["model"]` records it: no routing prefix."""
+    text = str(name or "")
+    for prefix in ("models/", "OPENROUTER/", "GOOGLE/", "OLLAMA/"):
+        text = text.removeprefix(prefix)
+    return text
+
+
+def recent_output_tokens(log: List[Dict[str, Any]], speaker_pid, model) -> Tuple[Optional[int], int, bool]:
+    """(average billed output, replies averaged, whether all were on `model`) for one speaker.
+
+    The last OUTPUT_SAMPLE_SIZE replies on `model` when there are at least
+    OUTPUT_SAMPLE_MIN of them, else the last that many on any model -- verbosity and
+    thinking both change with the model, so its own replies are the better guide. None
+    when there are too few either way. A mean rather than a median: this prices a
+    turn, and a profile that is usually brief but sometimes long costs its mean.
+    Replies that recorded no output (failures, turns from before token counts) are
+    skipped. Walks back by index: the log is the session's whole history.
+    """
+    bare = _bare_model(model)
+    same: List[int] = []
+    any_model: List[int] = []
+    for idx in range(len(log) - 1, -1, -1):
+        turn = log[idx]
+        if turn.get("is_user") or turn.get("speaker_pid") != speaker_pid:
+            continue
+        meta = turn.get("meta")
+        if not isinstance(meta, dict):
+            continue
+        out = billable_output_tokens(meta)
+        if out <= 0:
+            continue
+        if len(any_model) < OUTPUT_SAMPLE_SIZE:
+            any_model.append(out)
+        if _bare_model(meta.get("model")) == bare:
+            same.append(out)
+            if len(same) == OUTPUT_SAMPLE_SIZE:
+                break
+    for sample, on_model in ((same, True), (any_model, False)):
+        if len(sample) >= OUTPUT_SAMPLE_MIN:
+            return round(sum(sample) / len(sample)), len(sample), on_model
+    return None, 0, False
+
+
 class SessionAuditView(BlockedGuard, ui.View):
     def __init__(self, cog, interaction: discord.Interaction, session: dict, channel_id: int):
         super().__init__(timeout=600)
@@ -2518,7 +2570,7 @@ class SessionAuditView(BlockedGuard, ui.View):
                     if not t.get("is_user"):
                         meta = t.get("meta") or {}
                         i_toks = meta.get("input_tokens", 0)
-                        o_toks = meta.get("output_tokens", 0)
+                        o_toks = billable_output_tokens(meta)
                         total_in += i_toks
                         total_out += o_toks
                         cost, billed = self.cog.api_service.turn_cost(meta)
@@ -2565,18 +2617,26 @@ class SessionAuditView(BlockedGuard, ui.View):
                     meta = target.get("meta") or {}
                     mod = meta.get("model", "Unknown")
                     i_tok = meta.get("input_tokens", 0)
-                    o_tok = meta.get("output_tokens", 0)
-                    r_tok = meta.get("reasoning_tokens", 0)
+                    o_tok = billable_output_tokens(meta)
+                    # Thinking as the provider counted it where it did (Google), else the
+                    # estimate from the visible summary. Either way, part of the output.
+                    think = meta.get("thinking_tokens") or 0
+                    r_split = (f"Thinking: `{think:,}`" if think
+                               else f"Reasoning: `{meta.get('reasoning_tokens', 0):,}`")
                     cost, billed = self.cog.api_service.turn_cost(meta)
                     # The served tier, not the requested one: OpenRouter routes a model
                     # with no endpoint at the asked-for tier normally, so the request is
                     # not evidence of what ran.
                     tier = meta.get("service_tier")
                     tier_line = f"├── Service Tier: `{tier}`\n" if tier else ""
+                    # Likewise the host that served it, which a pin only prefers.
+                    served_by = meta.get("served_by")
+                    if served_by:
+                        tier_line += f"├── Served By: `{served_by}`\n"
                     cost_line = (f"Turn Cost: `~${cost:.6f} USD` (estimated)" if not billed
                                  else f"Turn Cost: `${cost:.6f} USD` (billed)")
                     
-                    embed.add_field(name="Turn Telemetry", value=f"├── Speaker: `{target.get('profile_name')}`\n├── Mimic ID: `{target.get('speaker_pid')}`\n├── Timestamp: {self._turn_timestamp(target)}\n├── Model Used: `{mod}`\n{tier_line}├── Duration: `{meta.get('duration', 0.0)}s`\n├── Input Tokens: `{i_tok:,}`\n├── Output Tokens: `{o_tok:,}` (Reasoning: `{r_tok:,}`)\n└── {cost_line}", inline=False)
+                    embed.add_field(name="Turn Telemetry", value=f"├── Speaker: `{target.get('profile_name')}`\n├── Mimic ID: `{target.get('speaker_pid')}`\n├── Timestamp: {self._turn_timestamp(target)}\n├── Model Used: `{mod}`\n{tier_line}├── Duration: `{meta.get('duration', 0.0)}s`\n├── Input Tokens: `{i_tok:,}`\n├── Output Tokens: `{o_tok:,}` ({r_split})\n└── {cost_line}", inline=False)
                     
                     recalled = len(meta.get("ltms_recalled", []))
                     trained = meta.get("training_recalled", 0)
@@ -2615,16 +2675,33 @@ class SessionAuditView(BlockedGuard, ui.View):
                         hist_toks = _estimate_text_tokens(hist_str)
                         
                         total_est = sys_toks + hist_toks
-                        est_cost = self.cog.api_service._calculate_turn_cost(prim_mod, total_est, 300)
+                        avg_out, averaged, on_model = recent_output_tokens(log, bot_pid, prim_mod)
+                        out_est = avg_out if avg_out is not None else ASSUMED_OUTPUT_TOKENS
+                        if avg_out is None:
+                            out_note = (f"Assuming ~{ASSUMED_OUTPUT_TOKENS:,} output tokens; this "
+                                        f"profile has too few replies here to average")
+                        else:
+                            out_note = (f"Assuming ~{out_est:,} output tokens: the average of this "
+                                        f"profile's last {averaged} "
+                                        f"repl{'y' if averaged == 1 else 'ies'}"
+                                        + (" on this model" if on_model else ", on any model"))
+                        est_cost = self.cog.api_service._calculate_turn_cost(prim_mod, total_est, out_est)
                         
                         embed.add_field(name="Pre-Inference Budget Estimate (Per Turn)", value=f"├── Target: `{p_name}`\n├── Expected Model: `{prim_mod}`\n├── System & Instructions: `~{sys_toks:,} tokens`\n├── STM History Buffer: `~{hist_toks:,} tokens`\n└── **ESTIMATED INPUT TOTAL**: `~{total_est:,} tokens`", inline=False)
                         # The projection is the rate table, which only knows standard
                         # rates for a listed model id. Say so when the profile has asked
                         # for a tier, rather than quoting a number the turn will not cost.
                         tier = resolve_openrouter_service_tier(p_cfg)
-                        tier_note = (f"\n*(Priced at standard rates; this profile requests the "
-                                     f"`{tier}` tier, so the billed figure will differ.)*") if tier else ""
-                        embed.add_field(name="Financial Projection", value=f"Projected cost for next generation: `~${est_cost:.6f} USD`\n*(Assuming ~300 output tokens)*{tier_note}", inline=False)
+                        pinned = resolve_openrouter_endpoint(p_cfg, str(prim_mod or "").removeprefix("OPENROUTER/"))
+                        if pinned:
+                            tier_note = (f"\n*(Priced at standard rates; this profile pins this model to "
+                                         f"`{pinned}`, so the billed figure may differ.)*")
+                        elif tier:
+                            tier_note = (f"\n*(Priced at standard rates; this profile requests the "
+                                         f"`{tier}` tier, so the billed figure will differ.)*")
+                        else:
+                            tier_note = ""
+                        embed.add_field(name="Financial Projection", value=f"Projected cost for next generation: `~${est_cost:.6f} USD`\n*({out_note})*{tier_note}", inline=False)
                     except Exception as e:
                         embed.description = f"Simulation failed: {e}"
 
@@ -2652,7 +2729,7 @@ class SessionAuditView(BlockedGuard, ui.View):
                                 meta = t.get("meta") or {}
                                 m = meta.get("model", "Unknown")
                                 i_toks = meta.get("input_tokens", 0)
-                                o_toks = meta.get("output_tokens", 0)
+                                o_toks = billable_output_tokens(meta)
                                 
                                 total_in += i_toks
                                 total_out += o_toks

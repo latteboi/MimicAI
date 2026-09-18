@@ -258,7 +258,7 @@ class SettingsDefaultsView(ModelPickerMixin, SettingsBaseView):
             if self.view_mode == "ollama":
                 e.add_field(name="Ollama Host",
                             value=self._show(self.defaults.get("ollama_host_url")), inline=True)
-            if self.view_mode == "openrouter":
+            if self.view_mode == "openrouter" and self._tier_applies():
                 tier = self.defaults.get("openrouter_service_tier")
                 e.add_field(name="Service Tier",
                             value=("`Platform default`" if tier is None
