@@ -125,7 +125,7 @@ cogs/
     api_service.py         provider adapters + model instantiation/routing
     generation_service.py  _multi_profile_worker — the core turn-rotation engine
     generation/            mixins: heartbeat, prompt_builder, delivery, regeneration,
-                           speak, global_chat, whisper, triggers, image_round
+                           speak, global_chat, whisper, triggers, image_round, reply
     media_service.py       TTS and image-generation queue workers
     tools_service.py       web grounding, URL context, anti-repetition critic
     help_service.py        RAG over bundled documentation
@@ -143,7 +143,10 @@ independent components.
 
 `GenerationService` is assembled from mixins in `cogs/services/generation/`. The split is by
 generation *mode* — a whisper, a regeneration, a global chat and a multi-profile round each
-have their own history-assembly and delivery path — rather than by layer.
+have their own history-assembly and delivery path — rather than by layer. The one shared
+step is `reply.py`: the round worker and regeneration both generate through
+`_attempt_reply` (primary, then fallback), `_reply_text` and `reply_meta`, so a new
+model or trace field lands in both at once.
 
 ---
 

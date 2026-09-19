@@ -12,9 +12,8 @@ import datetime
 from zoneinfo import ZoneInfo
 from ..utils.constants import (
     defaultConfig, PLACEHOLDER_EMOJI, GAME_BEAT_STALE_SECONDS,
-    ERR_GENERAL_ERROR, ERR_REASON_EMPTY_RESPONSE, ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK,
     WHISPER_BUSY_WAIT_TIMEOUT_SECONDS,
-    WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED, WARN_VOICE_SYNTHESIS_FAILED,
+    WARN_VOICE_SYNTHESIS_FAILED,
     ERR_REASON_AUDIO_TOO_LARGE, ERR_REASON_AUDIO_NOT_UPLOADED,
     DEFAULT_KICKSTART_START, DEFAULT_KICKSTART_CONTINUE, DEFAULT_KICKSTART_IDLE,
     DEFAULT_WHISPER_RECAP, DEFAULT_DIRECTOR_USER_PROMPT,
@@ -26,19 +25,17 @@ from ..utils.constants import (
     GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB,
 )
 from ..utils.helpers import (
-    _add_inline_citations, _format_api_error, _format_citation_subtext,
-    _format_history_entry, _get_user_hash, _resolve_safety_settings, _scrub_response_text,
-    _split_into_sentences_with_abbreviations, generated_image_attachment, is_real_model,
+    _format_api_error, _format_citation_subtext,
+    _format_history_entry, _get_user_hash, _resolve_safety_settings,
+    _split_into_sentences_with_abbreviations, generated_image_attachment,
     resolve_critic_settings,
-    image_rag_enabled, is_gateway_shutdown, record_billed_usage, resolve_grounding_mode,
-    resolve_native_tools,
+    image_rag_enabled, is_gateway_shutdown, resolve_grounding_mode,
     resolve_thinking_params,
     resolve_typing_cursor,
 )
 from ..utils import mem_probe
 from ..managers.session_manager import intern_turn
 
-from .generation._shared import _strip_neuro_update_and_scrub
 from .generation.heartbeat import HeartbeatMixin
 from .generation.prompt_builder import PromptBuilderMixin
 from .generation.delivery import DeliveryMixin
@@ -51,12 +48,13 @@ from .generation.triggers import TriggerIntakeMixin
 from .generation.compaction import SessionCompactionMixin
 from .generation.ltm_capture import LtmCaptureMixin
 from .generation.turn_deletion import TurnDeletionMixin
+from .generation.reply import ReplyAttempt, ReplyMixin, reply_gen_config, reply_meta
 
 
 class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, RegenerationMixin,
                         SpeakAsMixin, GlobalChatMixin, WhisperMixin, ImageRoundMixin,
                         TriggerIntakeMixin, SessionCompactionMixin, LtmCaptureMixin,
-                        TurnDeletionMixin):
+                        TurnDeletionMixin, ReplyMixin):
     """Owns the core generation engine: the multi-participant turn-rotation worker
     (_multi_profile_worker, defined here) plus the heartbeat/prompt-building/delivery/
     regeneration/speak/global-chat/whisper mixins (each in cogs/services/generation/) that
@@ -835,7 +833,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         turn_grounding_sources.extend(grounding_sources)
                     sources_text_list = []
                     contents_for_api_call = [] 
-                    fallback_used = False
                     response_text = ""
                     was_blocked = False
                     placeholder_message = None
@@ -926,11 +923,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     profile_name = participant['profile_name']
                     channel = self.cog.bot.get_channel(channel_id)
                     session_key = (channel_id, owner_id, profile_name)
-                    model = None
+                    attempt = ReplyAttempt()
 
                     # [FIX] Initialize these before the try block to prevent UnboundLocalError
                     response = None
-                    fallback_used = False
                     response_text = ""
                     was_blocked = False
                     # Assigned from _construct_system_instructions well inside the try below,
@@ -1123,41 +1119,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             critic_constraints=critic_constraints,
                         )
 
-                        dynamic_safety_settings = _resolve_safety_settings(channel, p_settings)
-
-                        model = None
-                        warning_message = None
-
-                        # Pass thinking parameters to the model instance in the worker
-                        t_params_worker = resolve_thinking_params(p_settings, "response")
-                        # Carried across because this dict has always held it. Nothing
-                        # in any adapter reads it; removing it is a separate question
-                        # from routing the three that are read through one resolver.
-                        t_params_worker["thinking_persistence"] = p_settings.get("thinking_persistence", 10)
-                        
-                        # [NEW] Re-evaluate Tools for internal model reconstruction
-                        model_tools = resolve_native_tools(p_settings)
-
-                        # Provider resolution goes through APIService._instantiate_model, the one
-                        # factory. The worker used to inline its own copy of the prefix parsing,
-                        # and the two had already drifted: the factory reads a slash-free name
-                        # containing "anthropic" as OpenRouter, this copy did not. The fallback
-                        # path below already calls the factory, so the same configured model
-                        # resolved to a different provider on the primary and fallback attempts.
-                        try:
-                            model = self.cog.api_service._instantiate_model(
-                                primary_model, channel.guild.id, triggering_user_id,
-                                full_system_instruction, dynamic_safety_settings,
-                                t_params_worker, model_tools, p_settings,
-                                openrouter_key_error=f"API Configuration Error: OpenRouter API Key missing for this server. Cannot load model '{primary_model}'.",
-                                google_key_error=f"API Configuration Error: Google API Key missing for this server. Cannot load model '{primary_model}'.",
-                                config_owner_id=owner_id,
-                            )
-                        except ValueError as e:
-                            warning_message = str(e)
-                        except Exception as e:
-                            warning_message = f"Model Initialization Error: Failed to instantiate model '{primary_model}'. {e}"
-                        
                         session_key = (channel.id, owner_id, profile_name)
 
                         # Check if the last turn was from this model itself
@@ -1238,77 +1199,25 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         p_is_borrowed = profile_name in p_index.get("borrowed", [])
                         profile_settings = self.cog.profile_manager._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
                         
-                        adv_params = {
-                            "frequency_penalty": profile_settings.get("frequency_penalty"),
-                            "presence_penalty": profile_settings.get("presence_penalty"),
-                            "repetition_penalty": profile_settings.get("repetition_penalty"),
-                            "min_p": profile_settings.get("min_p"),
-                            "top_a": profile_settings.get("top_a")
-                        }
-                        adv_params = {k: v for k, v in adv_params.items() if v is not None}
+                        gen_config = reply_gen_config(profile_settings, temp, top_p, top_k)
 
-                        gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "_advanced_params": adv_params}
+                        all_participant_names = self._participant_names(session)
 
-                        status = "api_error"
-                        response = None
-                        fallback_used = False
-                        api_error_reason = None
-                        main_api_error = None
-                        
-                        all_participant_names = []
-                        for p_data_temp in session.get("profiles", []):
-                            p_owner_id_temp = p_data_temp['owner_id']
-                            p_name_temp = p_data_temp['profile_name']
-                            p_index_temp = self.cog.profile_manager._get_user_index(p_owner_id_temp)
-                            p_is_borrowed_temp = p_name_temp in p_index_temp.get("borrowed", [])
-                            p_effective_owner_id = p_owner_id_temp
-                            p_effective_profile_name = p_name_temp
-                            if p_is_borrowed_temp:
-                                borrowed_data = self.cog.profile_manager._get_profile_config(p_owner_id_temp, p_name_temp, True) or {}
-                                p_effective_owner_id = int(borrowed_data.get("original_owner_id", p_owner_id_temp))
-                                p_effective_profile_name = borrowed_data.get("original_profile_name", p_name_temp)
-                            display_name_temp = p_effective_profile_name
-                            appearance_data_temp = self.cog.profile_manager._get_user_appearance(p_effective_owner_id, p_effective_profile_name)
-                            if appearance_data_temp.get("custom_display_name"):
-                                display_name_temp = appearance_data_temp["custom_display_name"]
-                            all_participant_names.append(display_name_temp)
-                        
                         try:
                             # Waited on, never awaited directly: an await cancelled the send
                             # along with the turn, losing the id of a message Discord had
                             # already posted. The send records that id on the container itself.
                             await self._await_turn_feedback(state_container)
                             msg_a_id = state_container.get('msg_a_id')
-
-                            # A primary that could not even be constructed is an error like any other,
-                            # and has to reach the same handler. Reporting it here instead meant a
-                            # configured fallback -- quite possibly a different provider whose key is
-                            # present -- never got the chance it gets whenever the primary constructs
-                            # and then fails, so a missing OpenRouter key was fatal rather than a
-                            # reason to fall back. The pre-formatted text rides on the exception so
-                            # the handler reports the configuration error, not a truncation of it.
-                            if not model:
-                                init_error = RuntimeError(warning_message or 'Internal API Initialization Error')
-                                init_error.formatted_reason = warning_message or 'Internal API Initialization Error'
-                                raise init_error
-
-                            gen_task = asyncio.create_task(self._generate_with_heartbeat(
-                                model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
-                            ))
-
-                            with mem_probe.probe(f"  participant turn {i}", peak=False):
-                                response, state_container = await gen_task
-
-                            if not response or not response.candidates:
-                                raise ValueError("Response blocked or empty")
-                            
-                            raw_text_check = getattr(response, 'text', "").strip()
-                            temp_scrubbed = _strip_neuro_update_and_scrub(raw_text_check, all_participant_names)
-
-                            if not temp_scrubbed:
-                                raise ValueError("Empty Response (AI produced no text content)")
-
-                            status = "success"
+                            attempt = await self._attempt_reply(
+                                channel=channel, participant=participant, p_settings=p_settings,
+                                owner_id=owner_id, user_id=triggering_user_id,
+                                system_instruction=full_system_instruction, primary_model=primary_model,
+                                fallback_model_name=fallback_model_name, history=contents_for_api_call,
+                                gen_config=gen_config, msg_a_id=msg_a_id, app_name=app_name,
+                                app_avatar=app_avatar, state_container=state_container,
+                                participant_names=all_participant_names, log_context="multi_profile",
+                                probe_label=f"  participant turn {i}")
                         except asyncio.CancelledError:
                             await self._abandon_state_container(
                                 channel, state_container, session=session,
@@ -1317,138 +1226,14 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 contents_for_api_call.clear()
                                 del contents_for_api_call
                             raise
-                        except Exception as e:
-                            is_timeout_main = isinstance(e, TimeoutError)
-                            # An instantiation failure arrives already phrased for the
-                            # user; _format_api_error would truncate that to 80 chars and
-                            # lose the half naming the key that is missing.
-                            main_api_error = getattr(e, 'formatted_reason', None) or _format_api_error(e)
-                            if hasattr(e, 'state_container'): state_container = e.state_container
+                        response = attempt.response
 
-                            # is_real_model, not truthiness: an explicit "no fallback"
-                            # reads back as the string NONE, which is truthy and unequal
-                            # to the primary, so the retry was spent instantiating a model
-                            # by that name. Same three-way answer run_with_fallback uses.
-                            if not is_real_model(fallback_model_name) or primary_model == fallback_model_name:
-                                api_error_reason = main_api_error
-                            else:
-                                try:
-                                    fb_name = fallback_model_name
-                                    # The fallback slot's own effort, not the primary's.
-                                    # Unset still inherits the primary, so this changes
-                                    # nothing for a profile that never set one.
-                                    t_params_fb = resolve_thinking_params(p_settings, "response", "fallback")
-                                    t_params_fb["thinking_persistence"] = t_params_worker.get("thinking_persistence", 10)
-                                    fallback_instance = self.cog.api_service._instantiate_model(fb_name, channel.guild.id, triggering_user_id, full_system_instruction, dynamic_safety_settings, t_params_fb, model_tools, p_settings, config_owner_id=owner_id)
-                                    
-                                    response, state_container = await self._generate_with_heartbeat(
-                                        fallback_instance, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container
-                                    )
-                                        
-                                    if not response or not response.candidates:
-                                        raise ValueError("Response blocked or empty")
-                                    
-                                    fb_raw_check = getattr(response, 'text', "").strip()
-                                    temp_scrubbed = _strip_neuro_update_and_scrub(fb_raw_check, all_participant_names)
-
-                                    if not temp_scrubbed:
-                                        raise ValueError("Empty Response (AI produced no text content)")
-
-                                    fallback_used = True
-                                    self.cog._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile_fallback", model_used=fb_name, status="success")
-                                except asyncio.CancelledError:
-                                    await self._abandon_state_container(
-                                        channel, state_container, session=session,
-                                        bot_id=participant.get('bot_id'))
-                                    if 'contents_for_api_call' in locals():
-                                        contents_for_api_call.clear()
-                                        del contents_for_api_call
-                                    raise
-                                except Exception as retry_e:
-                                    is_timeout_fallback = isinstance(retry_e, TimeoutError)
-                                    if hasattr(retry_e, 'state_container'): state_container = retry_e.state_container
-                                    
-                                    if is_timeout_main and is_timeout_fallback:
-                                        api_error_reason = ERR_REASON_TIMEOUT_BOTH
-                                    else:
-                                        api_error_reason = _format_api_error(retry_e)
-                                    status = "api_error"
-                        finally:
-                            # `or primary_model`: this block now also runs when the primary
-                            # never constructed, and a log row naming no model at all says
-                            # less than one naming the model that could not be built.
-                            self.cog._log_api_call(user_id=triggering_user_id, guild_id=channel.guild.id, context="multi_profile", model_used=model or primary_model, status=status)
-
-                        was_blocked = False
-                        if not response or not response.candidates:
-                            reason = api_error_reason or "Unknown Error"
-                            is_safety = False
-                            if response and response.prompt_feedback and response.prompt_feedback.block_reason: 
-                                reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
-                                is_safety = True
-                            
-                            custom_main = p_settings.get("error_response", ERR_GENERAL_ERROR)
-                            response_text = custom_main
-                            
-                            if is_safety:
-                                turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=reason))
-                            elif "Rate Limit" in reason:
-                                turn_warnings.append(reason)
-                            else:
-                                if is_real_model(fallback_model_name) and primary_model != fallback_model_name:
-                                    turn_warnings.append(WARN_BOTH_MODELS_FAILED.format(reason=reason))
-                                else:
-                                    turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=reason))
-                            
-                            was_blocked = True
-                        else:
-                            try:
-                                # Use the filtered text attribute from the model wrapper to exclude thoughts
-                                raw_text = getattr(response, 'text', "")
-                                if hasattr(response, 'raw') and response.raw.candidates and hasattr(response.raw.candidates[0], 'grounding_metadata'):
-                                    raw_text = _add_inline_citations(raw_text, response.raw.candidates[0].grounding_metadata)
-                                raw_text = raw_text.strip()
-                                
-                                raw_text, parsed_neuro_state = self._extract_and_apply_neuro_state(raw_text, p_owner_id, p_name)
-
-                                response_text = _scrub_response_text(raw_text, participant_names=all_participant_names)
-                                
-                                # Extract Native grounding sources & URL context
-                                if response_text:
-                                    if hasattr(response, 'raw') and response.raw.candidates:
-                                        if hasattr(response.raw.candidates[0], 'grounding_metadata'):
-                                            metadata = response.raw.candidates[0].grounding_metadata
-                                            if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
-                                                for chunk in metadata.grounding_chunks:
-                                                    if hasattr(chunk, 'web'):
-                                                        turn_grounding_sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
-
-                                        if hasattr(response.raw.candidates[0], 'url_context_metadata'):
-                                            url_metadata = response.raw.candidates[0].url_context_metadata
-                                            if hasattr(url_metadata, 'url_metadata') and url_metadata.url_metadata is not None:
-                                                for u in url_metadata.url_metadata:
-                                                    if hasattr(u, 'retrieved_url') and u.retrieved_url:
-                                                        turn_grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
-
-                                    sources_text_list = _format_citation_subtext(turn_grounding_sources)
-                                
-                                # [UPDATED] Differentiated error messaging for spammed vs empty content
-                                if not response_text:
-                                    custom_main = p_settings.get("error_response", ERR_GENERAL_ERROR)
-                                    response_text = custom_main
-                                    warn_tmp = WARN_BOTH_MODELS_FAILED if fallback_used else WARN_MAIN_MODEL_FAILED
-                                    turn_warnings.append(warn_tmp.format(reason=ERR_REASON_EMPTY_RESPONSE))
-                                    was_blocked = True
-                                
-                            except ValueError:
-                                reason = response.candidates[0].finish_reason.name.replace('_', ' ').title()
-                                response_text = p_settings.get("error_response", ERR_GENERAL_ERROR)
-                                turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=reason))
-                                was_blocked = True
-
-                        if fallback_used and p_settings.get("show_fallback_indicator", True):
-                            turn_warnings.append(WARN_FALLBACK_USED)
-                            turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=main_api_error))
+                        reply = self._reply_text(attempt, p_settings, owner_id, profile_name, all_participant_names)
+                        response_text, was_blocked, parsed_neuro_state = reply.text, reply.blocked, reply.neuro_state
+                        turn_warnings.extend(reply.warnings)
+                        if reply.sources is not None:
+                            turn_grounding_sources.extend(reply.sources)
+                            sources_text_list = _format_citation_subtext(turn_grounding_sources)
                             
                         # --- Native Tool Extraction (Citations) ---
                         # Native citations are now handled inline directly in the text response above.
@@ -1528,34 +1313,14 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     turn_id = str(uuid.uuid4())
                     bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
                     
-                    # [NEW] Meta collection for App Context Menu tracing
-                    meta = {
-                        "duration": round(duration, 2),
-                        "model": model.model_name.replace("models/", "").replace("OPENROUTER/", "").replace("GOOGLE/", "") if hasattr(model, 'model_name') else (fallback_model_name or "Unknown"),
-                        "fallback": fallback_used,
-                        "input_tokens": getattr(response, 'input_tokens', 0) if response else 0,
-                        "output_tokens": getattr(response, 'output_tokens', 0) if response else 0,
-                        "reasoning_tokens": getattr(response, 'reasoning_tokens', 0) if response else 0,
-                        "training_recalled": len(training_examples_list) if training_examples_list else 0,
-                        "grounding_sources":[s.get('uri') for s in turn_grounding_sources if isinstance(s, dict) and s.get('uri')] if turn_grounding_sources else [],
-                        "ltms_recalled":[]
-                    }
-                    record_billed_usage(meta, response)
-                    if ltm_recall_text:
-                        lines = ltm_recall_text.split('\n')
-                        clean_lines = [l.strip() for l in lines if l.strip() and not l.startswith("<")]
-                        meta["ltms_recalled"] = [l[:100] + "..." if len(l) > 100 else l for l in clean_lines]
-                        
-                    if parsed_neuro_state:
-                        meta["neuro_state"] = parsed_neuro_state
-
                     # Anti-Repetition Critic. Recorded only when the critic was actually
                     # enabled for this profile, so an absent key reads as "off" rather
                     # than as an empty verdict -- the same contract as neuro_state. The
                     # text is capped because this rides in every turn of a 1000-turn log
                     # that is re-serialised, re-compressed and re-encrypted on flush.
+                    critic = None
                     if critic_settings and critic_settings["enabled"]:
-                        meta["critic"] = {
+                        critic = {
                             "mode": critic_settings["mode"],
                             "scope": critic_settings["scope"],
                             "strictness": critic_settings["strictness"],
@@ -1563,6 +1328,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             "source": critic_source,
                             "text": (critic_constraints or "")[:CRITIC_AUDIT_TEXT_MAX],
                         }
+                    meta = reply_meta(
+                        attempt, duration=duration, training_examples=training_examples_list,
+                        ltm_recall_text=ltm_recall_text, sources=turn_grounding_sources,
+                        neuro_state=parsed_neuro_state, critic=critic)
 
                     turn_object = {
                         "turn_id": turn_id,

@@ -89,7 +89,12 @@ def parse_endpoints(body: Optional[bytes]) -> Optional[Tuple[Endpoint, ...]]:
             return (1, 0.0, e.tag)
         return (0, e.prompt_1m + e.completion_1m, e.tag)
 
-    return tuple(sorted(out, key=cost))
+    # One per tag, the cheapest. OpenRouter can list a host twice under one tag
+    # (DeepSeek V4.1 Flash has two `baseten/fp8`, differing only in uptime), and a pin
+    # stores nothing but the tag, so the two are one choice -- and a dropdown offering
+    # both is refused outright by Discord for the repeated option value.
+    seen = set()
+    return tuple(e for e in sorted(out, key=cost) if not (e.tag in seen or seen.add(e.tag)))
 
 
 def option_label(endpoint: Endpoint) -> str:
