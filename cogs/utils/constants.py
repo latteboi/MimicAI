@@ -967,8 +967,10 @@ MAX_GROUNDING_SUMMARY_CHARACTERS = 2000 # Approx 500 tokens
 REGENERATE_EMOJI = "🔁"
 NEXT_SPEAKER_EMOJI = "⏯️"
 CONTINUE_ROUND_EMOJI = "🍿"
-MUTE_TURN_EMOJI = ["🔇", "🔕"]
-SKIP_PARTICIPANT_EMOJI = ["❌", "✖️"]
+# One emoji per control. A second spelling of the same control made "which ❌ skipped
+# it" a question, and only the reaction that skipped a profile can unskip it.
+MUTE_TURN_EMOJI = "🔇"
+SKIP_PARTICIPANT_EMOJI = "❌"
 TRAIN_INPUT_EMOJI = "1️⃣"
 TRAIN_OUTPUT_EMOJI = "2️⃣"
 # /train is switched off, not removed. It let whoever armed a channel store anyone's

@@ -5,6 +5,7 @@ import discord
 from typing import Optional
 
 from ...utils.constants import PLACEHOLDER_EMOJI, DELIVERY_HARD_TIMEOUT_SECONDS, STATUS_QUEUED
+from ...utils.loop_probe import note_reply
 from .gate import generation_gate
 
 
@@ -283,7 +284,9 @@ class HeartbeatMixin:
 
         async def _gated_call():
             async with ticket:
-                return await model.generate_content_async(contents, generation_config=gen_config)
+                response = await model.generate_content_async(contents, generation_config=gen_config)
+            note_reply()
+            return response
 
         gen_task = asyncio.create_task(_gated_call())
         start_time = time.time()

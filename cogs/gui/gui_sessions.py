@@ -6,6 +6,7 @@ import datetime
 import pathlib
 import time
 import asyncio
+import urllib.parse
 from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
 from ..utils.helpers import (_estimate_text_tokens, _get_user_hash, billable_output_tokens,
                              resolve_openrouter_endpoint, resolve_openrouter_service_tier,
@@ -2259,6 +2260,245 @@ def recent_output_tokens(log: List[Dict[str, Any]], speaker_pid, model) -> Tuple
     return None, 0, False
 
 
+def turn_timestamp(turn: dict) -> str:
+    """When a turn happened, as a Discord timestamp shown in the viewer's own timezone.
+
+    Only regenerations and system turns write a `timestamp`, which is why every user
+    message read `None`. A delivered turn carries its message ids, and a Discord id
+    encodes the moment its message was sent.
+    """
+    when = None
+    if turn.get("timestamp"):
+        try:
+            when = datetime.datetime.fromisoformat(str(turn["timestamp"]))
+        except ValueError:
+            pass
+    if when is None and turn.get("message_ids"):
+        try:
+            when = discord.utils.snowflake_time(int(turn["message_ids"][0]))
+        except (TypeError, ValueError):
+            pass
+    return f"<t:{int(when.timestamp())}:f>" if when else "`not recorded`"
+
+
+#: How the critic reached its verdict, for the inspector's second line. "cache" is a
+#: constraint carried over by `critic_persistence` from an earlier round, which is
+#: worth showing plainly: it is the one source that costs nothing *and* did not
+#: re-examine this turn's history.
+_CRITIC_SOURCE_LABELS = {
+    "lexical": "Local lexical scan (no API call)",
+    "model": "Critic model pass",
+    "cache": "Carried over from an earlier round",
+}
+
+
+def critic_field(meta: dict) -> Optional[str]:
+    """The critic's verdict for one turn, or None if it was not running.
+
+    Absent key means the profile had the critic off for that turn, or the turn
+    predates the audit record -- both render as nothing rather than as an empty
+    verdict, which is the same contract `neuro_state` has.
+    """
+    critic = meta.get("critic")
+    if not isinstance(critic, dict):
+        return None
+
+    mode = critic.get("mode", "unknown")
+    scope = critic.get("scope", "self")
+    strictness = critic.get("strictness", "normal")
+    lookback = critic.get("lookback", 0)
+    source = critic.get("source")
+    text = (critic.get("text") or "").strip()
+
+    lines = [
+        f"├── Configuration: `{mode}` / scope `{scope}` / `{strictness}` "
+        f"over `{lookback}` turns",
+        f"├── Verdict: `{_CRITIC_SOURCE_LABELS.get(source, 'Pass -- no repetition found')}`",
+    ]
+    if text:
+        # The constraint is already capped at CRITIC_AUDIT_TEXT_MAX on write. The
+        # trim here is for the field as a whole: the two lines above eat into the
+        # same 1024 characters Discord allows.
+        head = "\n".join(lines) + "\n└── Constraint injected:\n"
+        room = 1024 - len(head) - 10
+        body = text if len(text) <= room else text[:max(0, room - 3)] + "..."
+        return f"{head}```\n{body}\n```"
+    return "\n".join(lines[:-1] + [lines[-1].replace("├──", "└──")])
+
+
+def grounding_urls(meta: dict) -> List[str]:
+    """A turn's web sources, each once, in the order the model cited them."""
+    return list(dict.fromkeys(u for u in meta.get("grounding_sources") or [] if u))
+
+
+def add_generation_fields(embed: discord.Embed, cog, turn: dict) -> None:
+    """What one generated turn cost and what went into it.
+
+    The Turn Inspector in `/session audit` and the View Generation Trace context menu
+    both render a turn here. They used to render the same `meta` separately and had
+    drifted: the trace showed no tokens, cost, tier or critic, and the audit showed no
+    fallback, memory event or neuro state. A new `meta` key gets shown once, here.
+    """
+    meta = turn.get("meta") or {}
+    model = f"`{meta.get('model', 'Unknown')}`"
+    if meta.get("fallback"):
+        model += " *(fallback)*"
+    i_tok = meta.get("input_tokens", 0)
+    o_tok = billable_output_tokens(meta)
+    # Thinking as the provider counted it where it did (Google), else the
+    # estimate from the visible summary. Either way, part of the output.
+    think = meta.get("thinking_tokens") or 0
+    r_split = (f"Thinking: `{think:,}`" if think
+               else f"Reasoning: `{meta.get('reasoning_tokens', 0):,}`")
+    cost, billed = cog.api_service.turn_cost(meta)
+    # The served tier, not the requested one: OpenRouter routes a model
+    # with no endpoint at the asked-for tier normally, so the request is
+    # not evidence of what ran.
+    tier = meta.get("service_tier")
+    tier_line = f"├── Service Tier: `{tier}`\n" if tier else ""
+    # Likewise the host that served it, which a pin only prefers.
+    served_by = meta.get("served_by")
+    if served_by:
+        tier_line += f"├── Served By: `{served_by}`\n"
+    cost_line = (f"Turn Cost: `~${cost:.6f} USD` (estimated)" if not billed
+                 else f"Turn Cost: `${cost:.6f} USD` (billed)")
+
+    embed.add_field(name="Turn Telemetry", value=f"├── Profile: `{turn.get('profile_name')}`\n├── Mimic ID: `{turn.get('speaker_pid')}`\n├── Timestamp: {turn_timestamp(turn)}\n├── Model Used: {model}\n{tier_line}├── Duration: `{meta.get('duration', 0.0)}s`\n├── Input Tokens: `{i_tok:,}`\n├── Output Tokens: `{o_tok:,}` ({r_split})\n└── {cost_line}", inline=False)
+
+    recalled = len(meta.get("ltms_recalled") or [])
+    created = " · `new memory saved`" if meta.get("ltm_created") else ""
+    trained = meta.get("training_recalled", 0)
+    grounded = len(grounding_urls(meta))
+    embed.add_field(name="Context Injections", value=f"├── LTM Archive: `{recalled} memories`{created}\n├── Training Examples: `{trained} injected`\n└── Web Grounding: `{grounded} sources`", inline=False)
+
+    critic = critic_field(meta)
+    if critic:
+        embed.add_field(name="Anti-Repetition Critic", value=critic, inline=False)
+
+    neuro = meta.get("neuro_state")
+    if isinstance(neuro, dict) and neuro:
+        embed.add_field(name="Neuro Engine", value=(
+            f"├── Dopamine: `{neuro.get('dopamine', 0)}`\n"
+            f"├── Cortisol: `{neuro.get('cortisol', 0)}`\n"
+            f"├── Oxytocin: `{neuro.get('oxytocin', 0)}`\n"
+            f"└── Adrenaline: `{neuro.get('adrenaline', 0)}`"), inline=False)
+
+
+def last_user_message_id(log: list, before: int) -> Optional[int]:
+    """The id of the latest user message logged ahead of `log[before]`, if any.
+
+    Not "the message this replied to": a profile can speak after another profile, on a
+    timer or on a wakeword, and the log does not record which. The trace labels it
+    for what it is. Typed turns are skipped: a whisper is a user turn nobody else saw,
+    and the trace is open to anyone.
+    """
+    for idx in range(before - 1, -1, -1):
+        turn = log[idx]
+        if turn.get("is_user") and not turn.get("type") and turn.get("message_ids"):
+            try:
+                return int(turn["message_ids"][-1])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+class GenerationTraceView(BlockedGuard, ui.View):
+    """The "View Generation Trace" context menu: one generated turn, with its recalled
+    memories and web sources a button away.
+
+    The summary is `add_generation_fields`, which the audit's Turn Inspector also shows.
+    The memories page is the profile owner's alone: it is their profile's long-term
+    memory, not the conversation, and this menu is open to anyone who can right-click
+    the reply. Web sources come out of the public conversation, like the critic's
+    constraint that `/session audit` already shows to anyone in the channel.
+    """
+
+    #: Embed descriptions stop at 4096; the rest of a long list is counted, not cut.
+    _PAGE_ROOM = 3900
+
+    def __init__(self, cog, interaction: discord.Interaction, turn: dict,
+                 prompt_url: Optional[str] = None):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.original_interaction = interaction
+        self.turn = turn
+        self.prompt_url = prompt_url
+        owner = turn.get("owner_id")
+        self.is_owner = owner is not None and str(owner) == str(interaction.user.id)
+        self.page = "summary"
+        self._build_view()
+
+    @property
+    def _meta(self) -> dict:
+        return self.turn.get("meta") or {}
+
+    def _build_view(self):
+        self.clear_items()
+        memories = len(self._meta.get("ltms_recalled") or [])
+        sources = len(grounding_urls(self._meta))
+        pages = (
+            ("summary", "Summary", False),
+            ("memories", f"Memories ({memories})" + ("" if self.is_owner else " · owner only"),
+             not memories or not self.is_owner),
+            ("sources", f"Web Sources ({sources})", not sources),
+        )
+        for page, label, unavailable in pages:
+            current = page == self.page
+            add_button(self, label, self._page_callback(page), row=0,
+                       style=discord.ButtonStyle.primary if current else discord.ButtonStyle.secondary,
+                       disabled=current or unavailable)
+
+    def _page_callback(self, page: str):
+        async def callback(interaction: discord.Interaction):
+            # Re-checked on press: the button is disabled for anyone else, but a
+            # disabled flag is a rendering hint, not a permission.
+            if page == "memories" and not self.is_owner:
+                await interaction.response.send_message(
+                    "Only this profile's owner can see the memories it recalled.", ephemeral=True)
+                return
+            self.page = page
+            self._build_view()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        return callback
+
+    @classmethod
+    def _numbered(cls, lines: List[str]) -> str:
+        out, used = [], 0
+        for n, line in enumerate(lines, 1):
+            entry = f"{n}. {line}"
+            if used + len(entry) + 1 > cls._PAGE_ROOM:
+                out.append(f"*...and {len(lines) - n + 1} more.*")
+                break
+            out.append(entry)
+            used += len(entry) + 1
+        return "\n".join(out)
+
+    @staticmethod
+    def _source_link(url: str) -> str:
+        host = (urllib.parse.urlsplit(url).hostname or "link").removeprefix("www.")
+        # Google records a search result as its own redirect link, so the host names
+        # Google rather than the page, and the page's title is not stored with the turn.
+        label = "Google Search result" if host.endswith("vertexaisearch.cloud.google.com") else host
+        return f"[{label}]({url.replace('(', '%28').replace(')', '%29')})"
+
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(title=f"Generation Trace: {self.turn.get('profile_name', 'Unknown')}",
+                              color=discord.Color.blurple())
+        if self.page == "memories" and self.is_owner:
+            memories = [discord.utils.escape_markdown(str(m))
+                        for m in self._meta.get("ltms_recalled") or []]
+            embed.description = ("**Recalled memories**, as they were added to the prompt "
+                                 "(first 100 characters each):\n\n" + self._numbered(memories))
+        elif self.page == "sources":
+            links = [self._source_link(u) for u in grounding_urls(self._meta)]
+            embed.description = "**Web sources** the reply was grounded on:\n\n" + self._numbered(links)
+        else:
+            if self.prompt_url:
+                embed.description = f"[Latest user message before this reply]({self.prompt_url})"
+            add_generation_fields(embed, self.cog, self.turn)
+        return embed
+
+
 class SessionAuditView(BlockedGuard, ui.View):
     def __init__(self, cog, interaction: discord.Interaction, session: dict, channel_id: int):
         super().__init__(timeout=600)
@@ -2288,27 +2528,6 @@ class SessionAuditView(BlockedGuard, ui.View):
         self._build_view()
 
     _SYSTEM_KIND_LABELS = {"synopsis": "Synopsis", "director": "Director's Note", "note": "System note"}
-
-    @staticmethod
-    def _turn_timestamp(turn: dict) -> str:
-        """When a turn happened, as a Discord timestamp shown in the viewer's own timezone.
-
-        Only regenerations and system turns write a `timestamp`, which is why every user
-        message read `None`. A delivered turn carries its message ids, and a Discord id
-        encodes the moment its message was sent.
-        """
-        when = None
-        if turn.get("timestamp"):
-            try:
-                when = datetime.datetime.fromisoformat(str(turn["timestamp"]))
-            except ValueError:
-                pass
-        if when is None and turn.get("message_ids"):
-            try:
-                when = discord.utils.snowflake_time(int(turn["message_ids"][0]))
-            except (TypeError, ValueError):
-                pass
-        return f"<t:{int(when.timestamp())}:f>" if when else "`not recorded`"
 
     @staticmethod
     def _system_kind(turn: dict) -> Optional[str]:
@@ -2474,16 +2693,6 @@ class SessionAuditView(BlockedGuard, ui.View):
 
         return PageJumpModal(self.num_pages, _jump, zero_indexed=True)
 
-    #: How the critic reached its verdict, for the inspector's second line. "cache" is a
-    #: constraint carried over by `critic_persistence` from an earlier round, which is
-    #: worth showing plainly: it is the one source that costs nothing *and* did not
-    #: re-examine this turn's history.
-    _CRITIC_SOURCE_LABELS = {
-        "lexical": "Local lexical scan (no API call)",
-        "model": "Critic model pass",
-        "cache": "Carried over from an earlier round",
-    }
-
     def _add_system_turn_fields(self, embed: discord.Embed, turn: dict, log: list) -> None:
         """The inspector for a turn nobody spoke: what it is, when, and whether the model
         is given it -- which, for a synopsis, is the question that matters."""
@@ -2491,7 +2700,7 @@ class SessionAuditView(BlockedGuard, ui.View):
         kind = self._system_kind(turn)
         content = turn.get("content") or ""
         lines = [f"├── Kind: `{self._SYSTEM_KIND_LABELS[kind]}`",
-                 f"├── Timestamp: {self._turn_timestamp(turn)}"]
+                 f"├── Timestamp: {turn_timestamp(turn)}"]
         synopsis_on = self.cog.session_manager.compaction_enabled(self.session)
 
         if kind == "synopsis":
@@ -2520,39 +2729,6 @@ class SessionAuditView(BlockedGuard, ui.View):
         text = text.replace("```", "'''")
         body = text if len(text) <= 1000 else text[:997] + "..."
         embed.add_field(name="Text", value=f"```\n{body}\n```" if body else "`(empty)`", inline=False)
-
-    def _critic_field(self, meta: dict) -> Optional[str]:
-        """The critic's verdict for one turn, or None if it was not running.
-
-        Absent key means the profile had the critic off for that turn, or the turn
-        predates the audit record -- both render as nothing rather than as an empty
-        verdict, which is the same contract `neuro_state` has.
-        """
-        critic = meta.get("critic")
-        if not isinstance(critic, dict):
-            return None
-
-        mode = critic.get("mode", "unknown")
-        scope = critic.get("scope", "self")
-        strictness = critic.get("strictness", "normal")
-        lookback = critic.get("lookback", 0)
-        source = critic.get("source")
-        text = (critic.get("text") or "").strip()
-
-        lines = [
-            f"├── Configuration: `{mode}` / scope `{scope}` / `{strictness}` "
-            f"over `{lookback}` turns",
-            f"├── Verdict: `{self._CRITIC_SOURCE_LABELS.get(source, 'Pass -- no repetition found')}`",
-        ]
-        if text:
-            # The constraint is already capped at CRITIC_AUDIT_TEXT_MAX on write. The
-            # trim here is for the field as a whole: the two lines above eat into the
-            # same 1024 characters Discord allows.
-            head = "\n".join(lines) + "\n└── Constraint injected:\n"
-            room = 1024 - len(head) - 10
-            body = text if len(text) <= room else text[:max(0, room - 3)] + "..."
-            return f"{head}```\n{body}\n```"
-        return "\n".join(lines[:-1] + [lines[-1].replace("├──", "└──")])
 
     def _build_embed(self) -> discord.Embed:
         try:
@@ -2608,45 +2784,13 @@ class SessionAuditView(BlockedGuard, ui.View):
 
                     embed.add_field(
                         name="Payload Data",
-                        value=(f"├── Speaker: `{speaker_name}`\n├── Speaker ID: `{speaker_id}`\n"
-                               f"├── Mimic ID: `{mimic_id}`\n├── Timestamp: {self._turn_timestamp(target)}\n"
+                        value=(f"├── User: `{speaker_name}`\n├── User ID: `{speaker_id}`\n"
+                               f"├── Mimic ID: `{mimic_id}`\n├── Timestamp: {turn_timestamp(target)}\n"
                                f"└── Input Tokens: `{input_tokens:,}`"),
                         inline=False
                     )
                 else:
-                    meta = target.get("meta") or {}
-                    mod = meta.get("model", "Unknown")
-                    i_tok = meta.get("input_tokens", 0)
-                    o_tok = billable_output_tokens(meta)
-                    # Thinking as the provider counted it where it did (Google), else the
-                    # estimate from the visible summary. Either way, part of the output.
-                    think = meta.get("thinking_tokens") or 0
-                    r_split = (f"Thinking: `{think:,}`" if think
-                               else f"Reasoning: `{meta.get('reasoning_tokens', 0):,}`")
-                    cost, billed = self.cog.api_service.turn_cost(meta)
-                    # The served tier, not the requested one: OpenRouter routes a model
-                    # with no endpoint at the asked-for tier normally, so the request is
-                    # not evidence of what ran.
-                    tier = meta.get("service_tier")
-                    tier_line = f"├── Service Tier: `{tier}`\n" if tier else ""
-                    # Likewise the host that served it, which a pin only prefers.
-                    served_by = meta.get("served_by")
-                    if served_by:
-                        tier_line += f"├── Served By: `{served_by}`\n"
-                    cost_line = (f"Turn Cost: `~${cost:.6f} USD` (estimated)" if not billed
-                                 else f"Turn Cost: `${cost:.6f} USD` (billed)")
-                    
-                    embed.add_field(name="Turn Telemetry", value=f"├── Speaker: `{target.get('profile_name')}`\n├── Mimic ID: `{target.get('speaker_pid')}`\n├── Timestamp: {self._turn_timestamp(target)}\n├── Model Used: `{mod}`\n{tier_line}├── Duration: `{meta.get('duration', 0.0)}s`\n├── Input Tokens: `{i_tok:,}`\n├── Output Tokens: `{o_tok:,}` ({r_split})\n└── {cost_line}", inline=False)
-                    
-                    recalled = len(meta.get("ltms_recalled", []))
-                    trained = meta.get("training_recalled", 0)
-                    grounded = len(meta.get("grounding_sources", []))
-                    
-                    embed.add_field(name="Context Injections", value=f"├── LTM Archive: `{recalled} memories`\n├── Training Examples: `{trained} injected`\n└── Web Grounding: `{grounded} sources`", inline=False)
-
-                    critic_field = self._critic_field(meta)
-                    if critic_field:
-                        embed.add_field(name="Anti-Repetition Critic", value=critic_field, inline=False)
+                    add_generation_fields(embed, self.cog, target)
 
             elif self.mode == "simulator":
                 if not self.simulate_profile_key:

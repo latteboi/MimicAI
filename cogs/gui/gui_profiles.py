@@ -2887,9 +2887,37 @@ class ModelPickerMixin(ReportErrorMixin):
                    for key, _wording, _default in self._CATEGORY_KEYS[self.category])
 
     def _add_openrouter_buttons(self, *, row: int):
-        """The OpenRouter tab's own buttons. The staging screens have only the tier; the
-        single-profile picker overrides this with Hosts & Tier, which holds both."""
+        """The OpenRouter tab's own buttons. My Defaults has only the tier; both model
+        pickers override this with Hosts & Tier, which holds both."""
         self._add_service_tier_button(row=row)
+
+    def _pinnable_openrouter_models(self) -> List[str]:
+        """The OpenRouter model ids on this tab's pinnable slots, once each."""
+        return list(dict.fromkeys(self.strip_prefix(value)
+                                  for _key, _wording, value in self._pinnable_slots()
+                                  if str(value).startswith("OPENROUTER/")))
+
+    def _add_hosts_button(self, *, row: int, view_cls, lit: bool):
+        """Opens `view_cls` (a Hosts & Tier screen) onto this message, as Thinking opens its
+        picker. Lit when a tier or a pin is set, so neither is ever invisible from here."""
+        models = self._pinnable_openrouter_models()
+
+        async def hosts_cb(i: discord.Interaction):
+            api = self.cog.api_service
+            listings = {m: api.cached_openrouter_endpoints(m) for m in models}
+            if all(v is not None for v in listings.values()):
+                view = view_cls(self, listings)
+                await i.response.edit_message(**view._render())
+                return
+            # A listing is one request per model, but a slow one would outrun the three
+            # seconds an interaction gets to answer.
+            await i.response.defer()
+            fetched = await asyncio.gather(*(api.openrouter_endpoints(m) for m in models))
+            view = view_cls(self, dict(zip(models, fetched)))
+            await i.edit_original_response(**view._render())
+
+        add_button(self, "Hosts & Tier…", hosts_cb, row=row,
+                   style=discord.ButtonStyle.blurple if lit else discord.ButtonStyle.secondary)
 
     #: Button colour per tier. The *wording* is not repeated here -- it comes off
     #: OPENROUTER_SERVICE_TIERS, so the three screens and the constant cannot drift
@@ -2911,8 +2939,8 @@ class ModelPickerMixin(ReportErrorMixin):
         A button rather than a dropdown because all five rows are already spoken for --
         the category select, two model selects, and two rows of buttons -- and because
         it cycles through three states, which is what the API switch beside it already
-        does. The single-profile picker keeps it on the Hosts screen instead, as the
-        tier every unpinned model is sent with.
+        does. Both model pickers keep it on their Hosts screen instead, as the tier
+        every unpinned model is sent with; this button is My Defaults'.
 
         Profile-wide, not per slot, which is only safe because a model whose pool holds
         no endpoint at the requested tier routes normally at standard rates rather than
@@ -3126,35 +3154,16 @@ class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
                 if key not in self._NON_CHAT_MODEL_KEYS]
 
     def _add_openrouter_buttons(self, *, row: int):
-        """Opens OpenRouterHostView onto this message, as Thinking opens its picker.
+        """Hosts & Tier, onto OpenRouterHostView.
 
         The tier lives there too, as the one every unpinned model is sent with: one
         button for both, because a pin names its own tier and the two answer the same
-        question. Lit when either is set, so neither is ever invisible from here.
+        question.
         """
         data = self._get_current_profile_data()
-        slots = self._pinnable_slots()
-        models = list(dict.fromkeys(self.strip_prefix(value) for _key, _wording, value in slots
-                                    if str(value).startswith("OPENROUTER/")))
         lit = bool(self._current_service_tier()) or any(
-            resolve_openrouter_endpoint(data, m) for m in models)
-
-        async def hosts_cb(i: discord.Interaction):
-            api = self.cog.api_service
-            listings = {m: api.cached_openrouter_endpoints(m) for m in models}
-            if all(v is not None for v in listings.values()):
-                view = OpenRouterHostView(self, listings)
-                await i.response.edit_message(**view._render())
-                return
-            # A listing is one request per model, but a slow one would outrun the three
-            # seconds an interaction gets to answer.
-            await i.response.defer()
-            fetched = await asyncio.gather(*(api.openrouter_endpoints(m) for m in models))
-            view = OpenRouterHostView(self, dict(zip(models, fetched)))
-            await i.edit_original_response(**view._render())
-
-        add_button(self, "Hosts & Tier\u2026", hosts_cb, row=row,
-                   style=discord.ButtonStyle.blurple if lit else discord.ButtonStyle.secondary)
+            resolve_openrouter_endpoint(data, m) for m in self._pinnable_openrouter_models())
+        self._add_hosts_button(row=row, view_cls=OpenRouterHostView, lit=lit)
 
 
 class OpenRouterHostView(BlockedGuard, ui.View):
@@ -3168,14 +3177,20 @@ class OpenRouterHostView(BlockedGuard, ui.View):
     the same message, with a Back that returns to it, as Thinking is. A slot holding a
     Google or Ollama model gets a greyed dropdown saying why rather than none.
 
-    Single-profile only. The bulk picker and My Defaults have no one model to list the
-    hosts of, and a pin on a model the profile does not use is pruned on save anyway.
+    The bulk picker opens BulkOpenRouterHostView, which stages rather than writes. My
+    Defaults has neither: it holds no model to list the hosts of, only the tier.
     """
 
     _AUTO = "__auto__"
+    #: Offered by the bulk screen only: "leave each profile's pin for this model alone".
+    _UNCHANGED = "__unchanged__"
+    #: What the Default Tier reaches, under its field.
+    _TIER_REACH = "Every OpenRouter text model this profile leaves on Auto, on every tab."
+
+    _TIMEOUT = 300
 
     def __init__(self, parent: 'SingleProfileModelView', listings: Dict[str, Any]):
-        super().__init__(timeout=300)
+        super().__init__(timeout=self._TIMEOUT)
         self.parent = parent
         self.cog = parent.cog
         self.user_id = parent.user_id
@@ -3186,17 +3201,54 @@ class OpenRouterHostView(BlockedGuard, ui.View):
     def _render(self) -> Dict[str, Any]:
         return {"content": None, "embed": self.embed(), "view": self}
 
-    def _set_pin(self, model_id: str, tag: Optional[str]):
+    # --- where the single-profile screen and the bulk one differ ---------------------
+
+    def _chosen(self, model_id: str) -> str:
+        """The dropdown value shown chosen for `model_id`: its pinned tag, or Auto."""
+        return (resolve_openrouter_endpoint(self.parent._get_current_profile_data(), model_id)
+                or self._AUTO)
+
+    def _choose(self, model_id: str, chosen: str):
+        """Records one dropdown choice: here, by writing the profile's pin."""
         data = self.parent._get_current_profile_data()
         pins = data.get("openrouter_endpoints")
         pins = dict(pins) if isinstance(pins, dict) else {}
-        if tag:
-            pins[model_id] = tag
-        else:
+        if chosen == self._AUTO:
             pins.pop(model_id, None)
+        else:
+            pins[model_id] = chosen
         # Through the picker's own save, which prunes and drops the cached model --
         # a cached OpenRouterModel carries the endpoint it was built with.
         self.parent._save_changes("openrouter_endpoints", pins)
+
+    def _head_options(self, chosen: str, tier, tier_wording: str) -> List[discord.SelectOption]:
+        """The options above the hosts."""
+        if tier is None:
+            description = "Any host, at each profile's own tier."
+        elif tier:
+            description = "Any host, at the Default Tier."
+        else:
+            description = "Let OpenRouter choose, at standard rates."
+        return [discord.SelectOption(label=f"Auto ({tier_wording})" if tier else "Auto",
+                                     value=self._AUTO, default=chosen == self._AUTO,
+                                     description=description)]
+
+    def _no_host(self, value) -> tuple:
+        """(embed text, dropdown reason) for a slot holding no OpenRouter model."""
+        if not is_real_model(value):
+            return "No model set.", "not an OpenRouter model"
+        return (f"`{self.parent.display_model(value)}` is not an OpenRouter model, "
+                "so there is no host to choose.", "not an OpenRouter model")
+
+    def _intro(self) -> str:
+        return ("Send a model to one host at one tier. The pinned endpoint is tried first; if it "
+                "fails or has no capacity, OpenRouter routes the request as it otherwise would, "
+                "so a pin never costs a reply.\n"
+                "-# A pin names its own tier, so it overrides the Default Tier for that model. "
+                "Pins are per model: a primary and fallback on the same model share one.")
+
+    def _footer(self) -> str:
+        return f"{self.parent.profile_name} · changes save as you make them"
 
     @staticmethod
     def _model_id(value) -> Optional[str]:
@@ -3209,6 +3261,9 @@ class OpenRouterHostView(BlockedGuard, ui.View):
     def _tier(self):
         """(stored tier, its wording, its description) for the profile's Default Tier."""
         value = self.parent._current_service_tier()
+        if value is None:
+            # The bulk screen's "not part of the changeset".
+            return None, self.parent.tier_wording(None)[1], "Each profile keeps the tier it has."
         # Anything unrecognised is refused at the wire, so it reads as the default here.
         value = value if value in OPENROUTER_SERVICE_TIER_VALUES else ""
         wording = self.parent.tier_wording(value)[1]
@@ -3216,35 +3271,32 @@ class OpenRouterHostView(BlockedGuard, ui.View):
                     OPENROUTER_SERVICE_TIERS[0][2])
         return value, wording, desc
 
+    def _tag(self, chosen: str) -> Optional[str]:
+        """The pinned tag a dropdown value names, or None for Auto and Unchanged."""
+        return None if chosen in (self._AUTO, self._UNCHANGED) else chosen
+
     def embed(self) -> discord.Embed:
-        data = self.parent._get_current_profile_data()
         _tier, tier_wording, tier_desc = self._tier()
         e = discord.Embed(title="OpenRouter Hosts & Tier", colour=discord.Colour.blurple())
-        e.description = (
-            "Send a model to one host at one tier. The pinned endpoint is tried first; if it "
-            "fails or has no capacity, OpenRouter routes the request as it otherwise would, "
-            "so a pin never costs a reply.\n"
-            "-# A pin names its own tier, so it overrides the Default Tier for that model. "
-            "Pins are per model: a primary and fallback on the same model share one.")
+        e.description = self._intro()
         e.add_field(name="Default Tier", inline=False,
-                    value=f"`{tier_wording}` \u2014 {tier_desc}\n"
-                          "-# Every OpenRouter text model this profile leaves on Auto, on every tab.")
+                    value=f"`{tier_wording}` \u2014 {tier_desc}\n-# {self._TIER_REACH}")
         catalogue = self.parent._openrouter_catalogue()
         for _key, wording, value in self.parent._pinnable_slots():
             model_id = self._model_id(value)
             if model_id is None:
-                e.add_field(name=wording, inline=False, value=(
-                    "No model set." if not is_real_model(value)
-                    else f"`{self.parent.display_model(value)}` is not an OpenRouter model, "
-                         "so there is no host to choose."))
+                e.add_field(name=wording, inline=False, value=self._no_host(value)[0])
                 continue
             name = f"{wording} \u00b7 {catalogue.label(model_id)}"[:256]
-            tag = resolve_openrouter_endpoint(data, model_id)
+            chosen = self._chosen(model_id)
+            tag = self._tag(chosen)
             listing = self.listings.get(model_id)
             if listing is None:
                 body = "Could not get this model's hosts from OpenRouter."
                 if tag:
                     body = f"Pinned: `{tag}`\n" + body
+            elif chosen == self._UNCHANGED:
+                body = "Unchanged \u2014 each profile keeps whatever host it has for this model."
             elif not tag:
                 body = (f"Auto \u2014 OpenRouter chooses among {len(listing)} "
                         f"endpoint{'s' if len(listing) != 1 else ''}.")
@@ -3255,14 +3307,14 @@ class OpenRouterHostView(BlockedGuard, ui.View):
                         f"Pinned: `{tag}`\n\u26a0 OpenRouter no longer lists this endpoint, "
                         "so every request routes as if on Auto.")
             e.add_field(name=name, value=body[:1024], inline=False)
-        e.set_footer(text=f"{self.parent.profile_name} \u00b7 changes save as you make them")
+        e.set_footer(text=self._footer())
         return e
 
     def _add_slot_select(self, wording: str, value, row: int):
         model_id = self._model_id(value)
         listing = self.listings.get(model_id) if model_id else None
         if not listing:
-            reason = ("not an OpenRouter model" if model_id is None
+            reason = (self._no_host(value)[1] if model_id is None
                       else "OpenRouter listed no hosts" if listing == ()
                       else "hosts unavailable")
             add_select(self, [discord.SelectOption(label="Auto", value=self._AUTO)],
@@ -3270,12 +3322,10 @@ class OpenRouterHostView(BlockedGuard, ui.View):
                        placeholder=f"{wording}: {reason}"[:150])
             return
 
-        tag = resolve_openrouter_endpoint(self.parent._get_current_profile_data(), model_id)
+        chosen = self._chosen(model_id)
+        tag = self._tag(chosen)
         tier, tier_wording, _desc = self._tier()
-        opts = [discord.SelectOption(
-            label=f"Auto ({tier_wording})" if tier else "Auto", value=self._AUTO, default=not tag,
-            description=("Any host, at the Default Tier." if tier
-                         else "Let OpenRouter choose, at standard rates."))]
+        opts = self._head_options(chosen, tier, tier_wording)
         if tag and self._endpoint(model_id, tag) is None:
             opts.append(discord.SelectOption(label=f"Current: {tag}"[:100], value=tag, default=True,
                                              description="No longer listed by OpenRouter."))
@@ -3285,8 +3335,7 @@ class OpenRouterHostView(BlockedGuard, ui.View):
                                              default=endpoint.tag == tag))
 
         async def callback(interaction: discord.Interaction):
-            chosen = interaction.data["values"][0]
-            self._set_pin(model_id, None if chosen == self._AUTO else chosen)
+            self._choose(model_id, interaction.data["values"][0])
             self._build_view()
             await interaction.response.edit_message(**self._render())
 
@@ -3652,6 +3701,17 @@ class SingleProfileThinkingView(BlockedGuard, ThinkingPickerMixin, ui.View):
 _BULK_TIMEOUT = 840
 
 
+def _keep_wizard_alive(wizard) -> None:
+    """Resets the bulk wizard's timer from a view occupying its message -- see
+    `_BulkSubView.interaction_check`."""
+    refresh = getattr(wizard, "_refresh_timeout", None)
+    if callable(refresh):
+        try:
+            refresh()
+        except Exception:
+            pass
+
+
 class _BulkSubView(BlockedGuard, ReportErrorMixin, ui.View):
     """A wizard step that borrows the wizard's message instead of opening its own.
 
@@ -3684,12 +3744,7 @@ class _BulkSubView(BlockedGuard, ReportErrorMixin, ui.View):
         """
         if not await super().interaction_check(interaction):
             return False
-        refresh = getattr(self.wizard, "_refresh_timeout", None)
-        if callable(refresh):
-            try:
-                refresh()
-            except Exception:
-                pass
+        _keep_wizard_alive(self.wizard)
         return True
 
     def _add_back(self, row: int, label: str = "◀ Back"):
@@ -3744,11 +3799,44 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
                 self.models_state[key] = self.session.config[key]
         if "show_fallback_indicator" in self.session.config:
             self.show_fallback_indicator = self.session.config["show_fallback_indicator"]
+        #: model id -> the host tag staged for it, or None to stage its pin's removal.
+        #: Absent is Unchanged. Kept apart from `models_state` because the changeset
+        #: merges it into each profile's pins rather than replacing them.
+        self.staged_pins: Dict[str, Optional[str]] = dict(self.session.pins)
 
         self._build_view()
 
     def _ollama_host_url(self) -> str:
         return self.models_state.get("ollama_host_url")
+
+    def _pinnable_slots(self) -> List[tuple]:
+        """(config key, wording, staged value or None) for each slot on this tab a pin
+        could reach."""
+        return [(key, wording, self.models_state[key])
+                for key, wording, _default in self._CATEGORY_KEYS[self.category]
+                if key not in self._NON_CHAT_MODEL_KEYS]
+
+    def _staged_pins(self) -> Dict[str, Optional[str]]:
+        """The pins to stage: those whose model is staged on a chat slot, on any tab.
+
+        A pin is chosen for a staged model, so it goes when that model is swapped out --
+        otherwise it would land on every selected profile that holds the old model on a
+        slot this changeset leaves alone.
+        """
+        held = set()
+        for slots in self._CATEGORY_KEYS.values():
+            for key, _wording, _default in slots:
+                value = self.models_state.get(key)
+                if key not in self._NON_CHAT_MODEL_KEYS and str(value).startswith("OPENROUTER/"):
+                    held.add(self.strip_prefix(value))
+        return {m: tag for m, tag in self.staged_pins.items() if m in held}
+
+    def _add_openrouter_buttons(self, *, row: int):
+        """Hosts & Tier, onto BulkOpenRouterHostView, as the single-profile picker does."""
+        staged = self._staged_pins()
+        lit = self._current_service_tier() is not None or any(
+            m in staged for m in self._pinnable_openrouter_models())
+        self._add_hosts_button(row=row, view_cls=BulkOpenRouterHostView, lit=lit)
 
     def _tier_cycle(self) -> tuple:
         """The mixin's three states plus `None`, so a tier chosen by mistake can be
@@ -3820,19 +3908,27 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
             e.add_field(name="Fallback Indicator",
                         value=f"`{'Unchanged' if state is None else self._clean(state)}`",
                         inline=True)
+        staged_pins = self._staged_pins()
         if self.view_mode == 'openrouter' and self._tier_applies():
             e.add_field(name="Service Tier",
                         value=f"`{self._clean(self.models_state['openrouter_service_tier'])}`",
                         inline=True)
+            pins = [f"{wording}: `{staged_pins[self.strip_prefix(value)] or 'Auto'}`"
+                    for _key, wording, value in self._pinnable_slots()
+                    if str(value).startswith("OPENROUTER/")
+                    and self.strip_prefix(value) in staged_pins]
+            if pins:
+                e.add_field(name="Pinned Hosts", value="\n".join(pins), inline=True)
         self._add_openrouter_details(e, [(wording, self.models_state[key])
                                          for key, wording, _default in self._CATEGORY_KEYS[self.category]])
 
         pending = self._pending()
         if pending:
-            body = "\n".join(f"• {k.replace('_', ' ').title()}: `{self._clean(v)}`"
-                             for k, v in pending.items())
-            e.add_field(name=f"Staged from this picker ({len(pending)})",
-                        value=body[:1024], inline=False)
+            lines = [f"• {k.replace('_', ' ').title()}: `{self._clean(v)}`"
+                     for k, v in pending.items()]
+            lines += [f"• Host Pin ({model}): `{tag or 'Auto'}`" for model, tag in staged_pins.items()]
+            e.add_field(name=f"Staged from this picker ({len(lines)})",
+                        value="\n".join(lines)[:1024], inline=False)
 
         e.set_footer(text=f"{len(self.wizard.selected_profiles)} profile(s) selected · "
                           f"nothing is written until Apply")
@@ -3845,7 +3941,7 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
 
         self._add_category_select(0)
 
-        # As in the single-profile picker. Here the bottom row then holds API, Service
+        # As in the single-profile picker. Here the bottom row then holds API, Hosts &
         # Tier, Fallback Indicator, Back and Stage -- exactly Discord's five.
         browsing = self._shows_openrouter_browse()
         if browsing:
@@ -3884,8 +3980,64 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
             await interaction.response.send_message(
                 "Choose at least one model first.", ephemeral=True)
             return
-        self.wizard._stage_change("models", config=pending)
+        self.wizard._stage_change("models", config=pending, pins=self._staged_pins())
         await self.wizard.refresh(interaction)
+
+
+class BulkOpenRouterHostView(OpenRouterHostView):
+    """OpenRouterHostView for the bulk picker: stages pins and the tier, writes nothing.
+
+    A pin belongs to a model, and the selected profiles can each hold a different one on
+    a slot this changeset leaves alone -- so only a slot with a model staged on it has
+    one host list to offer. Each dropdown adds Unchanged above Auto and the hosts: Auto
+    stages the pin's removal, Unchanged leaves each profile's pin for that model as it
+    is. `_apply_bulk_session` merges what is staged, so a profile keeps its pins on
+    every other model.
+    """
+
+    _TIMEOUT = _BULK_TIMEOUT
+    _TIER_REACH = "Every OpenRouter text model a selected profile leaves on Auto, on every tab."
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # This screen occupies the wizard's message, as a sub-view does.
+        if not await super().interaction_check(interaction):
+            return False
+        _keep_wizard_alive(self.parent.wizard)
+        return True
+
+    def _chosen(self, model_id: str) -> str:
+        pins = self.parent.staged_pins
+        if model_id not in pins:
+            return self._UNCHANGED
+        return pins[model_id] or self._AUTO
+
+    def _choose(self, model_id: str, chosen: str):
+        pins = self.parent.staged_pins
+        if chosen == self._UNCHANGED:
+            pins.pop(model_id, None)
+        else:
+            pins[model_id] = None if chosen == self._AUTO else chosen
+
+    def _head_options(self, chosen: str, tier, tier_wording: str) -> List[discord.SelectOption]:
+        auto = super()._head_options(chosen, tier, tier_wording)
+        auto[0].description = f"Unpins it. {auto[0].description}"[:100]
+        return [discord.SelectOption(label="Unchanged", value=self._UNCHANGED,
+                                     default=chosen == self._UNCHANGED,
+                                     description="Each profile keeps its own host for this model.")] + auto
+
+    def _no_host(self, value) -> tuple:
+        if value is None:
+            return ("Unchanged. Stage a model on this slot to pin its host: the selected "
+                    "profiles may each hold a different one.", "stage a model to pin its host")
+        return super()._no_host(value)
+
+    def _intro(self) -> str:
+        return (super()._intro() + "\n-# Only a slot with a model staged on it can be "
+                "pinned here, and a pin on any other model a profile has is kept.")
+
+    def _footer(self) -> str:
+        return (f"{len(self.parent.wizard.selected_profiles)} profile(s) selected · "
+                "nothing is written until Apply")
 
 
 class ThinkingApplyView(ThinkingPickerMixin, _BulkSubView):
@@ -4262,13 +4414,17 @@ class _BulkSession:
     selection that contains borrowed profiles.
     """
 
-    __slots__ = ("scope", "targets", "config", "prompts", "declaration", "staged")
+    __slots__ = ("scope", "targets", "config", "prompts", "pins", "declaration", "staged")
 
     def __init__(self):
         self.scope = "personal"
         self.targets: Set[str] = set()
         self.config: Dict[str, Any] = {}
         self.prompts: Dict[str, Any] = {}
+        # OpenRouter host pins, model id -> tag, or None to remove that model's pin.
+        # Not in `config`: a profile's pins are one dict, and replacing it would drop
+        # its pins on every model this changeset does not name.
+        self.pins: Dict[str, Optional[str]] = {}
         # Not a config key: the 18+ declaration is a content_rating record with its own
         # writer and its own refusals, applied separately below.
         self.declaration: Optional[bool] = None
@@ -4279,11 +4435,12 @@ class _BulkSession:
 
     @property
     def has_changes(self) -> bool:
-        return bool(self.config or self.prompts or self.declaration is not None)
+        return bool(self.config or self.prompts or self.pins or self.declaration is not None)
 
     def clear_changes(self):
         self.config.clear()
         self.prompts.clear()
+        self.pins.clear()
         self.declaration = None
         self.staged.clear()
 
@@ -4335,10 +4492,19 @@ async def _apply_bulk_session(cog, user_id: int, session: _BulkSession) -> Dict[
                     cog.profile_manager._save_profile_prompts(user_id, name, prompts)
                     touched = True
 
-        if session.config:
+        if session.config or session.pins:
             profile = cog.profile_manager._get_profile_config(user_id, name, is_borrowed)
             if profile:
                 profile.update(session.config)
+                if session.pins:
+                    pins = profile.get("openrouter_endpoints")
+                    pins = dict(pins) if isinstance(pins, dict) else {}
+                    for model_id, tag in session.pins.items():
+                        if tag:
+                            pins[model_id] = tag
+                        else:
+                            pins.pop(model_id, None)
+                    profile["openrouter_endpoints"] = pins
                 if "openrouter_endpoints" in profile:
                     prune_openrouter_endpoints(profile)
                 cog.profile_manager._save_profile_config(user_id, name, profile, is_borrowed)
@@ -5257,12 +5423,17 @@ class BulkManageView(BaseBulkProfileView):
     # --- Changeset ---------------------------------------------------------
 
     def _stage_change(self, action_value: str, config: Optional[Dict] = None,
-                      prompts: Optional[Dict] = None, declaration: Optional[bool] = None):
+                      prompts: Optional[Dict] = None, declaration: Optional[bool] = None,
+                      pins: Optional[Dict] = None):
         """Merges one action's output into the changeset and returns to the action list."""
         if config:
             self.session.config.update(config)
         if prompts:
             self.session.prompts.update(prompts)
+        if pins is not None:
+            # Replaced, not merged: the model picker opens seeded with every staged pin,
+            # so it hands back the whole set, less any whose model it has since swapped.
+            self.session.pins = dict(pins)
         if declaration is not None:
             self.session.declaration = declaration
         action = PROFILE_ACTIONS_BY_VALUE.get(action_value)
@@ -5337,6 +5508,8 @@ class BulkManageView(BaseBulkProfileView):
         """
         lines = [f"• {k.replace('_', ' ').title()} → `{_describe_value(v)}`"
                  for k, v in self.session.config.items()]
+        lines += [f"• Host Pin ({_describe_value(model)}) → `{tag or 'Auto'}`"
+                  for model, tag in self.session.pins.items()]
         lines += [f"• {k.replace('_', ' ').title()} → *replaced*" for k in self.session.prompts]
         if self.session.declaration is not None:
             state = "declared" if self.session.declaration else "withdrawn"

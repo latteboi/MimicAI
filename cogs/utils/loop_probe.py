@@ -27,6 +27,14 @@ discord.py actually does about a blocked loop, rather than to a round number:
 
 A window with no stall in it prints nothing at all. Silence is the report.
 
+The summary line also carries the window's CPU: its share of one core, and that
+divided by the model replies finished in it (`note_reply`). That quotient is the
+all-in cost of a reply -- the gateway, discord.py's REST calls, child bots, flushes
+and background calls included -- which is the figure prod_tests/load_sessions.py
+cannot measure, and the one GENERATION_SLOTS should be sized from. In a quiet window
+it also carries the idle baseline divided by few replies, so read it from a busy one;
+MIMIC_LOOP_PROBE_ALWAYS prints every window.
+
 Off unless MIMIC_LOOP_PROBE is set. The point of the deployment target is not to
 pay for what is not being used, and a permanent 10 Hz wakeup is a cost even when
 it is a small one.
@@ -70,6 +78,7 @@ _state: Dict[str, Any] = {
     "max_lag_at": 0.0,
     "rss_peak": 0,
     "window": [],
+    "replies": 0,
 }
 
 
@@ -112,6 +121,20 @@ def _percentile(sorted_vals: List[float], pct: float) -> float:
     return sorted_vals[max(0, min(idx, len(sorted_vals) - 1))]
 
 
+def note_reply() -> None:
+    """Counts one finished model reply: every call through `_generate_with_heartbeat`
+    that returned -- a reply, whisper, regeneration or image. A dict increment, paid
+    whether or not the probe is on."""
+    _state["replies"] += 1
+
+
+def _cpu_report(cpu: float, elapsed: float, replies: int) -> str:
+    share = f"cpu {cpu / elapsed * 100:.1f}% of a core" if elapsed > 0 else "cpu ?"
+    if not replies:
+        return f", {share}, no replies"
+    return f", {share}, {replies} replies at {cpu / replies * 1000:.0f} ms each"
+
+
 def snapshot() -> Dict[str, Any]:
     """The counters so far, for anything that wants to report them in-process."""
     return {
@@ -130,6 +153,9 @@ async def _probe(interval: float, threshold: float, critical: float,
                  summary_every: float, always: bool) -> None:
     window_started = time.monotonic()
     window_stalls = 0
+    # process_time counts every thread, so the I/O executor's work lands here too.
+    window_cpu = time.process_time()
+    window_replies = _state["replies"]
 
     while True:
         t0 = time.perf_counter()
@@ -173,6 +199,10 @@ async def _probe(interval: float, threshold: float, critical: float,
         window_started = now
         stalled = window_stalls
         window_stalls = 0
+        # Taken every window, printed or not, so a line always covers its own window.
+        cpu_now = time.process_time()
+        cpu_used, window_cpu = cpu_now - window_cpu, cpu_now
+        replies, window_replies = _state["replies"] - window_replies, _state["replies"]
         if not window:
             continue
 
@@ -196,6 +226,7 @@ async def _probe(interval: float, threshold: float, critical: float,
             f"max {_ms(window[-1])}, "
             f"stalls>={_ms(threshold)} {stalled} here, {_state['stalls']} total"
             f"{', ' + str(_state['critical']) + ' CRITICAL' if _state['critical'] else ''}"
+            f"{_cpu_report(cpu_used, elapsed, replies)}"
             f"{mem}",
             flush=True,
         )

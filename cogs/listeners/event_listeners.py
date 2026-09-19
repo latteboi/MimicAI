@@ -418,6 +418,19 @@ class EventListeners:
         except Exception:
             pass
 
+    async def _message_is_gone(self, channel_id: int, message_id: int) -> bool:
+        """True only when Discord says the message no longer exists; any other failure is not proof."""
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            return False
+        try:
+            await channel.fetch_message(message_id)
+        except discord.NotFound:
+            return True
+        except discord.HTTPException:
+            return False
+        return False
+
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         # Regeneration, /train capture and the purge controls all hang off this, and
@@ -441,8 +454,8 @@ class EventListeners:
         is_regen = (emoji_str == REGENERATE_EMOJI)
         is_next = (emoji_str == NEXT_SPEAKER_EMOJI)
         is_continue = (emoji_str == CONTINUE_ROUND_EMOJI)
-        is_mute = (emoji_str in MUTE_TURN_EMOJI)
-        is_skip = (emoji_str in SKIP_PARTICIPANT_EMOJI)
+        is_mute = (emoji_str == MUTE_TURN_EMOJI)
+        is_skip = (emoji_str == SKIP_PARTICIPANT_EMOJI)
 
         if not any([is_regen, is_next, is_continue, is_mute, is_skip]):
             return
@@ -561,8 +574,22 @@ class EventListeners:
                     return
                 
                 if is_skip:
+                    # One ❌ per skip. A second -- on another message, or from another
+                    # administrator -- does nothing, so it comes back off, and only the
+                    # first one's removal unskips (is_skip_reaction). Unless
+                    # the first one's message is gone and its delete event was missed:
+                    # then nothing could ever unskip, so this press takes its place.
+                    anchor = reacted_to_participant.get("skip_reaction")
+                    if reacted_to_participant.get("is_skipped") and anchor:
+                        stale = anchor[0] != payload.message_id and await self._message_is_gone(
+                            payload.channel_id, anchor[0])
+                        if not stale or reacted_to_participant.get("skip_reaction") is not anchor:
+                            asyncio.create_task(self._pull_back_reaction(payload))
+                            return
+
                     reacted_to_participant["is_skipped"] = True
-                    
+                    reacted_to_participant["skip_reaction"] = [payload.message_id, payload.user_id]
+
                     # Optimistically acknowledge reaction immediately
                     async def _ack_skip():
                         try:
@@ -647,8 +674,8 @@ class EventListeners:
                     entry[slot_key] = None
             return
 
-        is_mute = (emoji_str in MUTE_TURN_EMOJI)
-        is_skip = (emoji_str in SKIP_PARTICIPANT_EMOJI)
+        is_mute = (emoji_str == MUTE_TURN_EMOJI)
+        is_skip = (emoji_str == SKIP_PARTICIPANT_EMOJI)
         is_regen = (emoji_str == REGENERATE_EMOJI)
         is_next = (emoji_str == NEXT_SPEAKER_EMOJI)
         is_continue = (emoji_str == CONTINUE_ROUND_EMOJI)
@@ -717,8 +744,10 @@ class EventListeners:
             elif is_skip and turn_object.get("is_user") is False:
                 speaker_pid = turn_object.get("speaker_pid")
                 participant = next((p for p in session['profiles'] if self.profile_manager._get_pid_from_name_any(p['owner_id'], p['profile_name']) == speaker_pid), None)
-                if participant:
+                if participant and self.session_manager.is_skip_reaction(
+                        participant, payload.message_id, payload.user_id):
                     participant["is_skipped"] = False
+                    participant.pop("skip_reaction", None)
                     self.session_manager._save_multi_profile_sessions()
                     try:
                         channel = self.bot.get_channel(payload.channel_id)
@@ -857,6 +886,11 @@ class EventListeners:
             return
 
         deleted_message_id = payload.message_id
+        # Before the purged-id check: the bot's own deletions (/purge, /delete, the
+        # whole-turn cascade, regeneration) take a ❌ with them as surely as anyone's.
+        if self.session_manager.release_skips(
+                self.multi_profile_channels.get(payload.channel_id), {deleted_message_id}):
+            self.session_manager._save_multi_profile_sessions()
         if deleted_message_id in self.purged_message_ids:
             self.purged_message_ids.pop(deleted_message_id, None)
             return
@@ -929,6 +963,10 @@ class EventListeners:
             return
 
         message_ids = set(payload.message_ids)
+        # Before the purged ids are dropped, as in on_raw_message_delete.
+        if self.session_manager.release_skips(
+                self.multi_profile_channels.get(payload.channel_id), message_ids):
+            self.session_manager._save_multi_profile_sessions()
 
         # Ids we deleted ourselves were already reconciled by /purge itself. Drop them
         # and act only on the remainder.

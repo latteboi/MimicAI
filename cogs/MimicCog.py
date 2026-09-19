@@ -20,7 +20,7 @@ from .gui.gui_generate import GeneratedProfileView
 from .gui.gui_hub import HubHomeView
 from .gui.gui_sessions import (
     GlobalChatPlayView, GlobalChatHistoryView, WhisperHistoryView, SessionSwapListView,
-    SessionView, SessionConfigView, SessionAuditView
+    SessionView, SessionConfigView, SessionAuditView, GenerationTraceView, last_user_message_id
 )
 from .gui.gui_settings import (SettingsHomeView, ParentPresenceView, ShutdownConfirmView,
                                 build_about_embed)
@@ -737,7 +737,8 @@ class MimicCog(EventListeners, commands.Cog):
         if session_config:
             # Wake it up as a dehydrated shell
             session = {
-                "type": "multi", "profiles": session_config.get("profiles", []),
+                # Copies: see _load_multi_profile_sessions.
+                "type": "multi", "profiles": [dict(p) for p in session_config.get("profiles", [])],
                 "unified_log": [], "is_hydrated": False,
                 "owner_id": session_config.get("owner_id", interaction.user.id),
                 "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
@@ -1752,57 +1753,25 @@ class MimicCog(EventListeners, commands.Cog):
                     unified_log = disk_log
                     break
                     
-        if not unified_log:
+        if not isinstance(unified_log, list) or not unified_log:
             await interaction.followup.send("Could not find session data for this channel.", ephemeral=True)
             return
-            
-        target_turn = next((t for t in unified_log if message.id in t.get("message_ids", [])), None)
-        
+
+        idx = next((i for i, t in enumerate(unified_log) if message.id in t.get("message_ids", [])), None)
+        target_turn = unified_log[idx] if idx is not None else None
+
         if not target_turn or target_turn.get("is_user") is not False:
             await interaction.followup.send("This command can only be used on generated bot messages.", ephemeral=True)
             return
-            
-        meta = target_turn.get("meta")
-        if not meta:
+
+        if not target_turn.get("meta"):
             await interaction.followup.send("No generation trace data is available for this older message.", ephemeral=True)
             return
-            
-        embed = discord.Embed(title="Generation Trace", color=discord.Color.blurple())
-        
-        model_str = f"`{meta.get('model', 'Unknown')}`"
-        if meta.get("fallback"):
-            model_str += " *(Fallback)*"
-        embed.add_field(name="Model", value=model_str, inline=True)
-        
-        embed.add_field(name="Duration", value=f"`{meta.get('duration', 0.0)}s`", inline=True)
-        
-        if meta.get("ltm_created"):
-            embed.add_field(name="Memory Event", value="`Memory Created`", inline=True)
-            
-        ltm_count = len(meta.get("ltms_recalled", []))
-        embed.add_field(name="Memories Recalled", value=f"`{ltm_count}`", inline=True)
-            
-        train_count = meta.get("training_recalled", 0)
-        embed.add_field(name="Training Examples Recalled", value=f"`{train_count}`", inline=True)
-            
-        urls = meta.get("grounding_sources", [])
-        if urls:
-            unique_urls = set([u for u in urls if u])
-            embed.add_field(name="Web Grounding", value=f"`Yes ({len(unique_urls)} Sources)`", inline=True)
-        else:
-            embed.add_field(name="Web Grounding", value="`No`", inline=True)
-            
-        neuro_state = meta.get("neuro_state")
-        if neuro_state:
-            neuro_str = (
-                f"Dopamine (D): `{neuro_state.get('dopamine', 0)}`\n"
-                f"Cortisol (C): `{neuro_state.get('cortisol', 0)}`\n"
-                f"Oxytocin (O): `{neuro_state.get('oxytocin', 0)}`\n"
-                f"Adrenaline (A): `{neuro_state.get('adrenaline', 0)}`"
-            )
-            embed.add_field(name="Neuro Engine", value=neuro_str, inline=False)
-            
-        await interaction.followup.send(embed=embed, ephemeral=True)
+
+        prompt_id = last_user_message_id(unified_log, idx)
+        prompt_url = message.channel.get_partial_message(prompt_id).jump_url if prompt_id else None
+        view = GenerationTraceView(self, interaction, target_turn, prompt_url)
+        await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
 
     @profile_group.command(name="global_chat", description="Have a persistent, private conversation with a profile.")
     @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)

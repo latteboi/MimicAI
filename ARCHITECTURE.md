@@ -57,8 +57,11 @@ four times.
 thread is actually held. The bot averages a fraction of a percent of a CPU and can still
 block for hundreds of milliseconds inside one synchronous step, and it is the block that
 drops a gateway heartbeat. The probe sleeps a fixed interval and reports the overshoot,
-with RSS sampled alongside. Off unless `MIMIC_LOOP_PROBE` is set — see the module docstring
-for the four environment variables.
+with RSS sampled alongside. Its summary line also gives the window's CPU per model reply
+(`note_reply`, counted in `_generate_with_heartbeat`). This all-in figure includes the gateway
+and discord.py, which the load test below cannot count, so `GENERATION_SLOTS` is sized from
+it. Off unless `MIMIC_LOOP_PROBE` is set — see the module docstring for its environment
+variables.
 
 `prod_tests/load_sessions.py` is the capacity test, and not part of the suite. It builds the real
 cog over a temporary `MIMIC_DATA_DIR` (which moves the instance lock too, so it can run beside
@@ -503,8 +506,10 @@ default, or an OpenRouter model's first — so a fallback on the other provider 
 An OpenRouter model is sent the reply alone, as MP3: the Director's Desk reaches Google only.
 
 A text model can be **pinned to one endpoint** — a host at a tier, e.g.
-`google-vertex/global/priority` — from Set Models → Hosts & Tier (`OpenRouterHostView`,
-single profile only), which also holds the profile's tier as the default for unpinned models.
+`google-vertex/global/priority` — from Set Models → Hosts & Tier (`OpenRouterHostView`),
+which also holds the profile's tier as the default for unpinned models. Bulk Manage stages the
+same through `BulkOpenRouterHostView`, for slots with a model staged on them only, and apply
+merges those pins into each profile's rather than replacing them (`_BulkSession.pins`).
 Neither is offered on the Image or TTS tabs: only the chat adapter sends them. The endpoints come from `/models/{id}/endpoints`, asked on demand and kept ten
 minutes (`APIService.openrouter_endpoints`), never in the daily sync. A pin is stored sparse in
 `openrouter_endpoints`, keyed by model id because the factory never knows the slot, and pruned

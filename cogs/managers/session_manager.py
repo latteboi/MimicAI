@@ -14,7 +14,7 @@ import pathlib
 import datetime
 import collections
 import discord
-from typing import Dict, List, Any, Optional, Union, Tuple
+from typing import Dict, List, Any, Optional, Set, Union, Tuple
 from cryptography.fernet import InvalidToken
 import orjson as json
 
@@ -749,7 +749,11 @@ class SessionManager:
                         continue
 
                     owner_id = session_data.get("owner_id")
-                    profiles_data = session_data.get("profiles",[])
+                    # Copies, not the cached index's own entries. Sharing them meant a
+                    # skip, a chance edit or this repair also changed the cached index,
+                    # so _save_multi_profile_sessions compared the two, saw no
+                    # difference and wrote nothing -- lost on the next restart.
+                    profiles_data = [dict(p) for p in session_data.get("profiles", [])]
                     if self._repair_participant_identity(profiles_data):
                         repaired_any = True
 
@@ -883,7 +887,7 @@ class SessionManager:
                     # has landed in the index but not yet in this cast entry.
                     pid = p.get("pid") or self.cog.profile_manager._get_pid_from_name_any(
                         p["owner_id"], p["profile_name"])
-                    profiles_to_save.append({
+                    entry = {
                         "pid": pid,
                         "profile_name": p["profile_name"],
                         "owner_id": p["owner_id"],
@@ -892,7 +896,14 @@ class SessionManager:
                         "ephemeral": p.get("ephemeral", False),
                         "chance": p.get("chance", 100),
                         "wakewords": p.get("wakewords",[])
-                    })
+                    }
+                    # Sparse, so an unskipped cast writes exactly what it always has. Kept
+                    # across a restart because the ❌ that did it stays on its message.
+                    if p.get("is_skipped"):
+                        entry["is_skipped"] = True
+                        if p.get("skip_reaction"):
+                            entry["skip_reaction"] = list(p["skip_reaction"])
+                    profiles_to_save.append(entry)
 
                 blueprint = {
                     "owner_id": session_data.get("owner_id"),
@@ -1751,6 +1762,35 @@ class SessionManager:
         # excluding them used to leave nobody and the press did nothing.
         others = [p for p in profiles if (p['owner_id'], p['profile_name']) != last_key]
         return random.choice(others or profiles)
+
+    @staticmethod
+    def is_skip_reaction(participant: Dict, message_id: int, user_id: int) -> bool:
+        """Whether pulling this ❌ off unskips `participant`.
+
+        Only the ❌ that did the skipping undoes it, recorded as `skip_reaction`
+        ([message_id, user_id]). Any other is one the listener took back off, and its
+        removal event arrives here too: matching on the message alone would let another
+        administrator's pulled-back ❌ unskip. A participant with none recorded is not
+        skipped, so removing a stray ❌ just takes the bot's copy off.
+        """
+        anchor = participant.get("skip_reaction")
+        return anchor is None or list(anchor) == [message_id, user_id]
+
+    @staticmethod
+    def release_skips(session: Optional[Dict], message_ids: Set[int]) -> int:
+        """Unskips every participant whose ❌ was on one of these deleted messages.
+
+        The reaction went with its message, so nothing left in the channel shows the
+        skip or can undo it. Returns how many were released.
+        """
+        released = 0
+        for p in (session or {}).get("profiles") or []:
+            anchor = p.get("skip_reaction")
+            if anchor and anchor[0] in message_ids:
+                p["is_skipped"] = False
+                p.pop("skip_reaction", None)
+                released += 1
+        return released
 
     @staticmethod
     def note_reaction_queued(session: Dict, key: Tuple[int, str]) -> None:

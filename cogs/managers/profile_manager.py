@@ -3671,12 +3671,6 @@ class ProfileManager:
         # the one straight after an edit, where it raced the post-edit prompt and
         # decided before the owner could. `_open_profile_manage` runs it on open.
 
-        if is_public:
-            embed.description = ((embed.description or "") +
-                                 "\n\U0001f310 **Published to the Public Library.** The 18+ declaration is "
-                                 "withheld while listed, and bulk rating changes skip this profile. "
-                                 "Unpublish via `/profile hub` to change it.").strip()
-
         embed.add_field(name="\u200b", value="\u200b", inline=False)
 
         def clean_m(m_str):
