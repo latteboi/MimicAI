@@ -9,8 +9,9 @@ import asyncio
 import urllib.parse
 from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
 from ..utils.helpers import (_estimate_text_tokens, _get_user_hash, billable_output_tokens,
-                             resolve_openrouter_endpoint, resolve_openrouter_service_tier,
-                             strip_history_envelope)
+                             clean_model_name, resolve_openrouter_endpoint,
+                             resolve_openrouter_service_tier,
+                             strip_history_envelope, turn_posted_at)
 from ..utils.data_policy import may_pick_training_models
 from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PAGE, add_button,
                               paged_nav_options,
@@ -2263,22 +2264,21 @@ def recent_output_tokens(log: List[Dict[str, Any]], speaker_pid, model) -> Tuple
 def turn_timestamp(turn: dict) -> str:
     """When a turn happened, as a Discord timestamp shown in the viewer's own timezone.
 
-    Only regenerations and system turns write a `timestamp`, which is why every user
-    message read `None`. A delivered turn carries its message ids, and a Discord id
-    encodes the moment its message was sent.
+    `turn_posted_at` is the shared answer, so the viewer, the log's order and a
+    regeneration cannot disagree about when a turn happened. A regenerated turn keeps
+    that moment and records the rewrite as `edited_at`, which is shown beside it: the
+    two are different facts and the reply is still where it was in the channel.
     """
-    when = None
-    if turn.get("timestamp"):
-        try:
-            when = datetime.datetime.fromisoformat(str(turn["timestamp"]))
-        except ValueError:
-            pass
-    if when is None and turn.get("message_ids"):
-        try:
-            when = discord.utils.snowflake_time(int(turn["message_ids"][0]))
-        except (TypeError, ValueError):
-            pass
-    return f"<t:{int(when.timestamp())}:f>" if when else "`not recorded`"
+    when = turn_posted_at(turn)
+    if not when:
+        return "`not recorded`"
+    shown = f"<t:{int(when.timestamp())}:f>"
+    try:
+        edited = datetime.datetime.fromisoformat(str(turn["edited_at"]))
+        shown += f" (regenerated <t:{int(edited.timestamp())}:R>)"
+    except (KeyError, TypeError, ValueError):
+        pass
+    return shown
 
 
 #: How the critic reached its verdict, for the inspector's second line. "cache" is a
@@ -2370,6 +2370,19 @@ def add_generation_fields(embed: discord.Embed, cog, turn: dict) -> None:
     trained = meta.get("training_recalled", 0)
     grounded = len(grounding_urls(meta))
     embed.add_field(name="Context Injections", value=f"├── LTM Archive: `{recalled} memories`{created}\n├── Training Examples: `{trained} injected`\n└── Web Grounding: `{grounded} sources`", inline=False)
+
+    # Only on a turn that ran into it. A reply whose model read the attachment itself has
+    # nothing to say here, and the field would otherwise read as a fault on every turn.
+    dropped = meta.get("media_dropped")
+    if dropped:
+        describer = meta.get("media_described_by")
+        lines = [f"├── {str(dropped).capitalize()} not readable by this model"]
+        if describer:
+            lines.append(f"├── Described by: `{clean_model_name(describer)}`")
+            lines.append(f"└── Description Tokens: `{meta.get('media_description_tokens', 0):,}`")
+        else:
+            lines.append("└── Sent as a note naming the file")
+        embed.add_field(name="Unreadable Attachments", value="\n".join(lines), inline=False)
 
     critic = critic_field(meta)
     if critic:

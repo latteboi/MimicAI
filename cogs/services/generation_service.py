@@ -34,7 +34,7 @@ from ..utils.helpers import (
     resolve_typing_cursor,
 )
 from ..utils import mem_probe
-from ..managers.session_manager import intern_turn
+from ..managers.session_manager import intern_turn, log_user_turn
 
 from .generation.heartbeat import HeartbeatMixin
 from .generation.prompt_builder import PromptBuilderMixin
@@ -48,13 +48,14 @@ from .generation.triggers import TriggerIntakeMixin
 from .generation.compaction import SessionCompactionMixin
 from .generation.ltm_capture import LtmCaptureMixin
 from .generation.turn_deletion import TurnDeletionMixin
+from .generation.describe import MediaDescriptionMixin
 from .generation.reply import ReplyAttempt, ReplyMixin, reply_gen_config, reply_meta
 
 
 class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, RegenerationMixin,
                         SpeakAsMixin, GlobalChatMixin, WhisperMixin, ImageRoundMixin,
                         TriggerIntakeMixin, SessionCompactionMixin, LtmCaptureMixin,
-                        TurnDeletionMixin, ReplyMixin):
+                        TurnDeletionMixin, MediaDescriptionMixin, ReplyMixin):
     """Owns the core generation engine: the multi-participant turn-rotation worker
     (_multi_profile_worker, defined here) plus the heartbeat/prompt-building/delivery/
     regeneration/speak/global-chat/whisper mixins (each in cogs/services/generation/) that
@@ -579,11 +580,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 # Runs for an empty order too: a message nobody answers is still part of
                 # the conversation the next round reads.
                 (is_image_gen_round, image_gen_prompt, starting_profile_override,
-                 round_author_name, triggering_user_id) = await self._collect_round_triggers(
+                 round_author_name, triggering_user_id,
+                 batch_start_index) = await self._collect_round_triggers(
                     session, session_type, channel_id, all_triggers_for_round,
                     new_round_turn_data, pending_url_fetches, recent_processed_ids,
                     is_image_gen_round, image_gen_prompt, starting_profile_override,
-                    round_author_name, triggering_user_id,
+                    round_author_name, triggering_user_id, batch_start_index,
                 )
 
                 seen_blocked = set()
@@ -1791,7 +1793,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     }
                                     if url_text_batch:
                                         new_turn_object["url_context"] = url_text_batch
-                                    session.setdefault("unified_log", []).append(intern_turn(new_turn_object))
+                                    # Before the reply that was still being delivered when
+                                    # this was sent, which is the order the channel shows.
+                                    insert_index = log_user_turn(
+                                        session, new_turn_object, trigger.created_at)
+                                    batch_start_index = min(batch_start_index, insert_index)
                                     # Into the round's turn data as well, or its pictures reach
                                     # no one: the log keeps text only, and the characters still
                                     # to speak take their media from here.

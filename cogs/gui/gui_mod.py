@@ -818,6 +818,7 @@ MOD_PROMPT_CATEGORIES = [
         ("Web Grounding (Text)", "WEB_GROUNDING_TEXT", DEFAULT_WEB_GROUNDING_TEXT),
         ("Web Grounding (Visual)", "WEB_GROUNDING_VISUAL", DEFAULT_WEB_GROUNDING_VISUAL),
         ("Grounding RAG Payload", "GROUNDING_RAG_PAYLOAD", DEFAULT_GROUNDING_RAG_PAYLOAD),
+        ("Attachment Describer (Simulated vision)", "MEDIA_DESCRIPTION", DEFAULT_MEDIA_DESCRIPTION),
         ("Anti-Repetition Critic", "ANTI_REPETITION", DEFAULT_ANTI_REPETITION_PROMPT),
         ("Content Classifier (18+ gating)", "CONTENT_CLASSIFIER", DEFAULT_CONTENT_CLASSIFIER_PROMPT),
     ]),

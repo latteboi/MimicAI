@@ -381,8 +381,14 @@ HELP_CATEGORIES = {
         "Attachments the Bot Can Read": (
             "Profiles can read images, audio and video attached to your messages, provided the model behind them supports it. Replying to a "
             "message with an image pulls that image into context too.\n\n"
-            "Many OpenRouter and Ollama models are text-only. Attaching media to one of those fails at the provider and surfaces as "
-            "'Unsupported File Format (Model lacks Vision/Audio support)'. Switch the profile's model, or leave the attachment off."
+            "Many OpenRouter and Ollama models are text-only. If the profile's fallback model can read the file, it answers that turn. If "
+            "neither can, the attachment is left out and the character is told the filename and that it cannot read it -- it replies to "
+            "what you wrote rather than falling silent for the round, and a note under the reply says the attachment was not read.\n\n"
+            "**Simulated vision** (`/profile manage` -> **Params** -> Unreadable Attachments) changes what it is told. On `Simulated`, a "
+            "cheap model reads the file first -- Amazon Nova Lite on OpenRouter, falling back to Gemini 2.5 Flash Lite -- and its "
+            "description goes into that profile's prompt only, so a text-only character can still discuss the picture while nobody else at "
+            "the table sees the description. One call per round however many characters need it. With a key for neither provider it "
+            "behaves as `Off`."
         ),
         "Anti-Repetition Critic": (
             "`/profile manage` -> **Tools** -> Configure Anti-Repetition Critic.\n\n"
@@ -1107,7 +1113,8 @@ DEFAULT_HELP_DOCS = {
         "Vision Processing: Models with native vision support can analyse image attachments. Replying to a message containing an image pulls that image into the profile's context.\n"
         "Audio & Video: Capable models can process direct audio and video files.\n"
         "File size: Nothing over 25 MB is downloaded -- not an image, audio, video or text attachment, a reference picture for !image, or a `.mimic` import. The character is told a larger attachment was sent and not read, and a larger import is refused. Media is billed by its length, so the limit bounds what one file can cost as well as the memory it takes.\n"
-        "Limitations & Errors: If you attach media to a profile powered by a text-only model -- which many OpenRouter and Ollama models are -- the API call fails and the bot reports 'Unsupported File Format (Model lacks Vision/Audio support)'.\n"
+        "Text-only models: Many OpenRouter and Ollama models cannot read attachments at all. The profile's fallback model is tried first, and answers if it can read the file. If neither model can, the attachment is dropped and the character is told the filename and that it cannot read it, so it answers the message instead of failing the turn; a note under the reply says so.\n"
+        "Unreadable Attachments (`/profile manage` -> Params -> Unreadable Attachments): what that character is told. `Off` (the default) names the file and nothing more, and costs nothing. `Simulated` has gemini-2.5-flash-lite read the file at high resolution first and writes the description into that profile's prompt alone -- other participants never see it, exactly as with grounding and URL context. One describe call per round, shared by every character that needs it, and it requires a Google key: without one, or if the description is refused, the profile behaves as `Off`.\n"
         "Media Input Resolution: `/profile manage` -> Params -> Set Media Input Resolution controls how many tokens the model spends reading an image or PDF you send. On Gemini 3 that is roughly 280 (Low), 560 (Medium), 1120 (High, the model default) and 2240 (Ultra High) tokens per image, charged per attachment per participant per round. This is the opposite direction from the image size under Set Image Output, which is what an image model draws. Google honours it exactly; OpenRouter maps it onto the nearest of its two `detail` steps; Ollama has no equivalent and ignores it.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Unsupported File Format.' Fix: The profile's model cannot read that media type. Switch to a vision-capable model, or omit the attachment.\n"

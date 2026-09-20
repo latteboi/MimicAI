@@ -711,6 +711,60 @@ MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL = {
     'MEDIA_RESOLUTION_ULTRA_HIGH': 'high',
 }
 
+#: What a profile does with an attachment none of its models can read. Reached only once
+#: the primary *and* the fallback have refused it -- a profile whose fallback has vision
+#: never arrives here, and keeps answering with the fallback as it always did.
+#:
+#:   off       -- the attachment is dropped and the model is told it exists and cannot be
+#:                read. The filename is in the turn either way: it is written there when
+#:                the message is taken in, for every model, seeing or not.
+#:   simulated -- MEDIA_DESCRIBER_MODEL describes it first and the description is written
+#:                into the prompt, the way the grounding summariser's search results are.
+#:                One call per round however many blind profiles are seated, and none at
+#:                all when the round's attachments were already described.
+UNREADABLE_MEDIA_MODES = (
+    ('off', 'Off', 'Name the file and say it cannot be read. No extra call.'),
+    ('simulated', 'Simulated', 'A cheap model describes it first. One call per round.'),
+)
+UNREADABLE_MEDIA_VALUES = frozenset(v for v, _l, _d in UNREADABLE_MEDIA_MODES)
+#: The floor, and what a profile that has never been configured does.
+UNREADABLE_MEDIA_DEFAULT = 'off'
+
+#: Who describes an attachment in `simulated`. Hardcoded, on the `utility` thinking slot,
+#: for the reason the Director's Note and the profile generator are: a one-shot internal
+#: pass with no character in it to configure. Deliberately not FALLBACK_MODEL_NAME, which
+#: the configurable utility slots default to -- this is transcription, not judgement, and
+#: both of these are a fraction of its price.
+#:
+#: Nova Lite leads at $0.06/$0.24 per 1M tokens against 2.5 Flash Lite's $0.10/$0.40, and
+#: it puts the pass on the provider most servers here actually hold a key for. The two are
+#: on different providers on purpose: the fallback answers when there is no OpenRouter key
+#: at all, and when the first will not describe a file the second may -- it is the Google
+#: model, whose safety settings `_resolve_safety_settings` stands down for an
+#: age-restricted channel. A profile with neither key falls to `off`, which is a complete
+#: behaviour rather than an error state.
+MEDIA_DESCRIBER_MODEL = 'OPENROUTER/amazon/nova-lite-v1'
+MEDIA_DESCRIBER_FALLBACK = 'GOOGLE/gemini-2.5-flash-lite'
+#: What the describer says when nothing reached it, and the only answer this pass treats
+#: as a failure rather than as a description. A model asked to describe files it was never
+#: sent does not say so -- it invents a plausible set, and the character then discusses an
+#: image nobody posted. That is exactly what a shape bug in the request looks like from
+#: the outside, so the prompt is given a way to say it and the code acts on it.
+MEDIA_DESCRIPTION_NONE = "(no attachment)"
+#: HIGH (1120 tokens an image) rather than the model default, which on pre-Gemini-3
+#: models is far less. This pass is the profile's only look at the picture; paying for
+#: the detail once is the point of it.
+MEDIA_DESCRIBER_RESOLUTION = 'MEDIA_RESOLUTION_HIGH'
+#: Descriptions kept between rounds, keyed by the attachment's CDN path. Bounded because
+#: every dict keyed by something a user controls has to be: a busy session would
+#: otherwise hold every image it has ever been shown. Sized for a few rounds of a full
+#: ROUND_MEDIA_MAX batch, so a regeneration moments later still finds its description.
+MEDIA_DESCRIPTION_CACHE_MAX = 64
+#: A description is standing text in someone's prompt, so it is capped like one. Long
+#: enough for a page of small print or a busy photograph, short enough that ten of them
+#: do not crowd out the conversation they arrived in.
+MEDIA_DESCRIPTION_MAX_CHARS = 2000
+
 COGS_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 #: MIMIC_DATA_DIR moves everything the bot stores, its instance lock included, so a
@@ -1395,6 +1449,33 @@ DEFAULT_WEB_GROUNDING_VISUAL = (
     "- If a web search IS needed, respond with 'yes' on the first line. Then, on the second line and below, use your Google Search (Grounding) tool to find a concise, hyper-detailed visual breakdown of every precise identifying characteristic, intricate physical attribute, and stylistic nuance found that will help the artist create the image. Focus ONLY on the visuals. Avoid unnecessary commentary and non-visual elements."
 )
 
+#: The describe pass for `simulated`. Written for a reader who cannot see the file and
+#: has to answer questions about it in character, which is why it asks for the plain
+#: content rather than a critique: a character told "a moody, evocative portrait" can
+#: only repeat the adjectives back, while one told who is in it, what they are wearing
+#: and what is written on the sign can actually talk about it.
+#:
+#: It describes and never advises, because its output lands in a prompt as text the
+#: character reads -- anything phrased as an instruction would be followed, which is the
+#: standing hazard of putting a model's words into another model's context.
+DEFAULT_MEDIA_DESCRIPTION = (
+    "You are describing an attachment for someone who cannot open it and who will have "
+    "to discuss it from your description alone.\n\n"
+    "Report what is actually there, in plain prose, under 200 words per file:\n"
+    "- Images: the subject, the setting, who or what is in it and what they are doing, "
+    "notable objects, the style (photo, screenshot, drawing, meme), and every word of "
+    "any legible text, quoted exactly.\n"
+    "- Audio: what is said, verbatim where it can be made out, plus who is speaking, "
+    "the tone, and any music or background noise.\n"
+    "- Screenshots and documents: transcribe the text. Layout only where it carries "
+    "meaning.\n\n"
+    "Describe only. Do not interpret the sender's motives, do not judge the content, do "
+    "not address the reader, and do not give instructions of any kind. If a file is "
+    "unreadable or blank, say exactly that and nothing more.\n\n"
+    "Number each file to match the order it was given in.\n\n"
+    "If no file reaches you at all, reply with exactly: (no attachment)"
+)
+
 DEFAULT_NEURO_INSTRUCTION = (
     "<neuro_endocrine_engine>\n"
     "You possess a simulated neuro-endocrine system that dictates your emotional state. "
@@ -1781,6 +1862,11 @@ WARN_VOICE_SYNTHESIS_FAILED = "**Text-To-Speech Failed** ({reason})"
 WARN_URL_FETCHING_FAILED = "**URL Fetching Failed** ({reason})"
 WARN_GROUNDING_FAILED = "**Grounding Failed** ({reason})"
 WARN_IMAGE_GEN_FAILED = "**Image Generation Failed** ({reason})"
+#: Shown under a reply that answered an attachment neither of the profile's models could
+#: read. Always shown, not gated on `show_fallback_indicator`: it explains a gap the
+#: reader can see for themselves -- a character that said nothing about the picture.
+WARN_MEDIA_UNREADABLE = "**Attachment Not Read** (no model here reads {kinds})"
+WARN_MEDIA_DESCRIBED = "**Attachment Described** ({model})"
 
 ERR_GENERAL_ERROR = "An error has occurred."
 ERR_SAFETY_BLOCK = "**Safety Filter** ({reason})"
@@ -1790,6 +1876,22 @@ ERR_UNKNOWN = "**Unknown Error**"
 ERR_REASON_UNSUPPORTED_IMAGE = "Images Unsupported"
 ERR_REASON_UNSUPPORTED_AUDIO = "Audio Unsupported"
 ERR_REASON_UNSUPPORTED_VIDEO = "Video Unsupported"
+
+#: modality -> the substrings a provider's refusal carries when the model cannot take
+#: that kind of input. One table, because two things read it and they must not drift:
+#: API_ERROR_MAPPINGS below phrases the refusal for the user, and
+#: `helpers.unreadable_media_modality` decides whether the attachment can be dropped and
+#: the turn retried without it. A second copy of these strings would mean an error the
+#: user is told is a vision problem that the retry does not recognise as one.
+UNREADABLE_MEDIA_KEYS = {
+    # "support image" also catches OpenRouter's own phrasing, which refuses with
+    # "No endpoints found that support image input" rather than naming the model.
+    'image': ("image input", "support image"),
+    'audio': ("audio input", "support audio"),
+    'video': ("video input", "support video"),
+}
+#: How a dropped attachment's kind reads in a warning and in the note the model is given.
+UNREADABLE_MEDIA_LABELS = {'image': "images", 'audio': "audio", 'video': "video"}
 ERR_REASON_EMPTY_RESPONSE = "AI produced no text content"
 ERR_REASON_REPETITIVE_CONTENT = "Model Collapse"
 ERR_REASON_PROVIDER_ERROR = "Provider Error"
@@ -1834,13 +1936,35 @@ ATTACHMENT_SKIPPED_NOTE = "[Attachment not read, over the {limit} MB limit: {fil
 #: Their messages still say "[Attached Image: ...]", and without this the character would
 #: answer as if it had seen them.
 ROUND_MEDIA_SKIPPED_NOTE = "[Older attachments from this round not shown, over the limit of {limit}: {count}]"
+
+#: Sent in place of an attachment that both of a profile's models refused. The last
+#: sentence is the whole point of the note: the turn already says "[Attached Image:
+#: cat.png]", and a model handed that with no image obligingly describes a cat it has
+#: never seen. Naming the file is not the problem -- being left to guess what is in it is.
+MEDIA_UNREADABLE_NOTE = (
+    "[The attachment above was not sent to you: your model cannot read {kinds}. You know "
+    "the filename and nothing else about it. Do not describe it or imply you have seen "
+    "it -- respond to the text, or ask what it shows.]"
+)
+#: The same note for `simulated`, where a description follows in <attachment_description>.
+#: It says where the description came from because a character that treats a second-hand
+#: account as its own eyes will confidently answer questions the description cannot
+#: settle -- what is in the corner, what the small print says.
+MEDIA_DESCRIBED_NOTE = (
+    "[Your model cannot read {kinds}, so the attachment above was read for you and "
+    "described below. You are working from that description, not from the file itself.]"
+)
 IMPORT_FILE_TOO_LARGE = "❌ That file is over the {limit} MB import limit."
 
 API_ERROR_MAPPINGS = {
     ("empty response",): "Empty Response (AI failed to output text content)",
-    ("image input", "support image"): "Unsupported File Format (Model lacks Vision support)",
-    ("audio input", "support audio"): "Unsupported File Format (Model lacks Audio support)",
-    ("video input", "support video"): "Unsupported File Format (Model lacks Video support)",
+    # Keyed from UNREADABLE_MEDIA_KEYS so the phrasing and the retry always agree about
+    # what a refusal of this kind looks like. These three come before "no endpoints
+    # found": OpenRouter refuses a text-only model with both phrases at once, and the
+    # first match wins, so the specific reading has to be reached first.
+    UNREADABLE_MEDIA_KEYS['image']: "Unsupported File Format (Model lacks Vision support)",
+    UNREADABLE_MEDIA_KEYS['audio']: "Unsupported File Format (Model lacks Audio support)",
+    UNREADABLE_MEDIA_KEYS['video']: "Unsupported File Format (Model lacks Video support)",
     ("ollama network error",): "Ollama Unreachable (Ensure Ollama is running)",
     ("402",): "Insufficient Credits",
     ("401",): "Invalid API Key",
@@ -1912,7 +2036,7 @@ SYSTEM_XML_TAGS = [
     "scene_prompt", "neuro_endocrine_engine", "neuro_update", "persona_profile",
     "technical_manual", "training_data", "context_rules", "image_context",
     "system_note", "reply_context", "negative_constraints", "content_policy",
-    "session_synopsis", "game_context", "birthday_context",
+    "session_synopsis", "game_context", "birthday_context", "attachment_description",
     # Persona assembly (prompt_builder._construct_system_instructions).
     "character_instructions", "instructions",
     "backstory", "personality_traits", "likes", "dislikes", "appearance",

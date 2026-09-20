@@ -39,10 +39,12 @@ from ..utils.constants import (
     CONTENT_RATING_EMOJI,
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
     NEW_PROFILE_SPEECH_TEMPERATURE, SPEECH_LANGUAGE_NAMES,
-    IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_SLOT_FILES, VOICE_SAMPLE_SLOT_KEY, VOICE_SAMPLE_SLOTS, )
+    IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_SLOT_FILES, VOICE_SAMPLE_SLOT_KEY, VOICE_SAMPLE_SLOTS,
+    UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_MODES, )
 from ..utils.helpers import (image_rag_enabled, is_real_model, resolve_critic_settings,
                             resolve_grounding_mode, resolve_image_output_params,
-                            resolve_image_tools, resolve_url_mode, suppress_link_previews,
+                            resolve_image_tools, resolve_unreadable_media_mode,
+                            resolve_url_mode, suppress_link_previews,
                             describe_voice_samples)
 from ..utils.discord_cdn import signed_attachment_url, unsigned_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
@@ -1840,6 +1842,9 @@ class ProfileManager:
                 # request, and no sampling overrides, unless the profile asks.
                 "image_grounding_mode": "",
                 "image_temperature": "", "image_top_p": "", "image_top_k": "",
+                # What happens to an attachment neither of this profile's models can
+                # read. The floor, and free: see UNREADABLE_MEDIA_MODES.
+                "unreadable_media_mode": UNREADABLE_MEDIA_DEFAULT,
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
                 "thinking_level": "low", "thinking_budget": -1,
                 "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": DEFAULT_SPEECH_VOICE,
@@ -1908,6 +1913,9 @@ class ProfileManager:
                 # request, and no sampling overrides, unless the profile asks.
                 "image_grounding_mode": "",
                 "image_temperature": "", "image_top_p": "", "image_top_k": "",
+                # What happens to an attachment neither of this profile's models can
+                # read. The floor, and free: see UNREADABLE_MEDIA_MODES.
+                "unreadable_media_mode": UNREADABLE_MEDIA_DEFAULT,
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
                 "thinking_level": "low", "thinking_budget": -1,
                 "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": DEFAULT_SPEECH_VOICE,
@@ -3766,6 +3774,10 @@ class ProfileManager:
         _MODE_DISPLAY = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}
         grounding_display = _MODE_DISPLAY.get(resolve_grounding_mode(config), "`OFF`")
         url_ctx = _MODE_DISPLAY.get(resolve_url_mode(config), "`OFF`")
+        # Resolved, not read: the stored value can be anything an import wrote, and this
+        # line has to say what the profile will actually do with an attachment.
+        unreadable_media = ("**`SIMULATED`**"
+                            if resolve_unreadable_media_mode(config) == "simulated" else "`OFF`")
 
         timezone = config.get("timezone", "UTC")
         typing = "**`ON`**" if config.get("realistic_typing_enabled", False) else "`OFF`"
@@ -3783,6 +3795,7 @@ class ProfileManager:
             f"Image Gen: {img_gen}\n"
             f"Grounding: {grounding_display}\n"
             f"URL Context: {url_ctx}\n"
+            f"Unreadable Media: {unreadable_media}\n"
             f"Response Mode: `{resp_mode}`\n"
             f"Timezone: `{timezone}`\n"
             f"Realistic Typing: {typing}\n"

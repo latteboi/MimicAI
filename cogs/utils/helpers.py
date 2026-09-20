@@ -30,6 +30,8 @@ from .constants import (
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
     MEDIA_RESOLUTION_VALUES, MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL,
     OPENROUTER_SERVICE_TIER_VALUES,
+    UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_KEYS, UNREADABLE_MEDIA_LABELS,
+    UNREADABLE_MEDIA_VALUES,
 )
 
 
@@ -426,6 +428,33 @@ def _format_history_entry(display_name: str, timestamp: Union[datetime.datetime,
         time_str = timestamp.strftime("[%a, %d %b %Y, %I:%M %p UTC]")
 
     return f"<{display_name}> [ID: {entity_id}] {time_str}:\n{content}\n</{display_name}>\n\n"
+
+
+def turn_posted_at(turn: Dict[str, Any]) -> Optional[datetime.datetime]:
+    """When a turn happened, in UTC, or None when nothing in it says.
+
+    The single answer to that question: the log's order, the session viewer and a
+    regeneration all have to agree on it. A turn records a `timestamp` only when
+    something other than a Discord message decided its moment -- a system note, a
+    whisper, the synopsis. A delivered turn carries the ids of the messages it posted
+    instead, and a Discord id encodes the moment its message went up, which is exactly
+    the order the channel shows. The first id, not the last: a reply split across
+    several messages happened when it started arriving.
+    """
+    stamp = turn.get("timestamp")
+    if stamp:
+        try:
+            return datetime.datetime.fromisoformat(str(stamp))
+        except (TypeError, ValueError):
+            pass
+    ids = turn.get("message_ids")
+    if ids:
+        try:
+            return discord.utils.snowflake_time(int(ids[0]))
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+    return None
+
 
 def _add_inline_citations(text: str, grounding_metadata) -> str:
     if not grounding_metadata: return text
@@ -921,6 +950,83 @@ def resolve_media_resolution(config: Optional[Dict[str, Any]]) -> str:
     """
     value = str((config or {}).get("media_input_resolution") or "").upper()
     return value if value in MEDIA_RESOLUTION_VALUES else ""
+
+
+def resolve_unreadable_media_mode(config: Optional[Dict[str, Any]]) -> str:
+    """What this profile does with an attachment none of its models can read.
+
+    Validated rather than trusted, like every other stored mode: an imported profile or
+    a shard written before this setting existed can carry anything, and the answer
+    decides whether a paid describe pass runs.
+    """
+    value = str((config or {}).get("unreadable_media_mode") or "").lower()
+    return value if value in UNREADABLE_MEDIA_VALUES else UNREADABLE_MEDIA_DEFAULT
+
+
+def clean_model_name(name: Optional[str]) -> str:
+    """A model id as the UI shows it: without the routing prefix that picked its provider.
+
+    One spelling of this, because three places show a model to a user -- the turn's
+    trace, the warning under a reply, and the describe line -- and a model named one way
+    in one of them and another way in the next reads as two different models.
+    """
+    return (name or "").replace("models/", "").replace("OPENROUTER/", "").replace("GOOGLE/", "")
+
+
+def unreadable_media_modality(error: Exception) -> Optional[str]:
+    """'image', 'audio' or 'video' when `error` is a model refusing to read that, else None.
+
+    Normalised the way `_describe_api_error` normalises before its own table lookup --
+    lowercased, with URLs stripped -- because these are the same substrings read for the
+    same provider messages, and a refusal the user is told is a vision problem has to be
+    the one the retry recognises as droppable.
+    """
+    text = re.sub(r'https?://[^\s]+', '', str(error)).lower()
+    for modality, keys in UNREADABLE_MEDIA_KEYS.items():
+        if any(key in text for key in keys):
+            return modality
+    return None
+
+
+def split_media_parts(history: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Any]]:
+    """`history` with every attachment taken out, and the attachments that were in it.
+
+    A copy: the caller's history belongs to a request that has already been made, and a
+    retry that mutated it would leave the trace and any later attempt looking at
+    something neither of them sent. Only the `parts` lists are rebuilt -- the parts
+    themselves are shared, since a media part is read and never written.
+
+    A part is an attachment when it is a dict carrying a `mime_type` (the `{url,
+    mime_type}` shape the round builds and the `{mime_type, data}` shape a legacy path
+    still hands over) or an object with `inline_data`, which is what every adapter
+    tests for when it converts them onto the wire.
+    """
+    def is_media(part: Any) -> bool:
+        if isinstance(part, dict):
+            return "mime_type" in part
+        return hasattr(part, "inline_data")
+
+    stripped, removed = [], []
+    for turn in history:
+        parts = turn.get("parts") or []
+        kept = [p for p in parts if not is_media(p)]
+        removed.extend(p for p in parts if is_media(p))
+        stripped.append({**turn, "parts": kept} if len(kept) != len(parts) else turn)
+    return stripped, removed
+
+
+def media_kinds(parts: List[Any]) -> str:
+    """How a batch of attachments reads in a warning: "images", "images and audio"."""
+    kinds = []
+    for part in parts:
+        mime = part.get("mime_type", "") if isinstance(part, dict) else getattr(
+            getattr(part, "inline_data", None), "mime_type", "")
+        label = UNREADABLE_MEDIA_LABELS.get(str(mime).split("/")[0])
+        if label and label not in kinds:
+            kinds.append(label)
+    if not kinds:
+        return "attachments"
+    return kinds[0] if len(kinds) == 1 else ", ".join(kinds[:-1]) + f" and {kinds[-1]}"
 
 
 def resolve_openrouter_image_detail(config: Optional[Dict[str, Any]]) -> Optional[str]:

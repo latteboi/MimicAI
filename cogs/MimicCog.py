@@ -4,7 +4,7 @@ from .utils.constants import (
     DEFAULT_SYSTEM_INSTRUCTION,
     FALLBACK_MODEL_NAME, LOCK_REFRESH_INTERVAL_SECONDS, LOCK_STALE_THRESHOLD_SECONDS,
     MAX_MULTI_PROFILES, MOD_DATA_DIR, PRIMARY_MODEL_NAME, PUBLIC_PROFILES_DIR,
-    GAME_CACHE_MAX_SIZE, PURGED_MESSAGE_ID_CACHE_MAX_SIZE,
+    GAME_CACHE_MAX_SIZE, MEDIA_DESCRIPTION_CACHE_MAX, PURGED_MESSAGE_ID_CACHE_MAX_SIZE,
     PURGE_BUSY_WAIT_TIMEOUT_SECONDS, SERVERS_DIR,
     SESSIONS_GLOBAL_DIR, SESSION_BUSY_FLAGS, TRAIN_ARMED_CACHE_MAX_SIZE, TRAIN_INPUT_EMOJI,
     TRAIN_COMMAND_ENABLED, TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check,
@@ -238,6 +238,12 @@ class MimicCog(EventListeners, commands.Cog):
         # together; if they fall out of step the worst case is a miss, which rebuilds.
         self.channel_models: LRUCache = LRUCache(max_size=CHANNEL_MODEL_CACHE_MAX_SIZE)
         self.channel_model_last_profile_key: LRUCache = LRUCache(max_size=CHANNEL_MODEL_CACHE_MAX_SIZE)
+
+        # Simulated vision's descriptions, keyed by the attachments they describe -- so a
+        # round's picture is read once however many blind characters are seated, and a
+        # regeneration moments later does not buy a second look at it. See
+        # services/generation/describe.py.
+        self.media_descriptions: LRUCache = LRUCache(max_size=MEDIA_DESCRIPTION_CACHE_MAX)
 
         self.max_history_items = defaultConfig.CHATBOT_MEMORY_LENGTH
         

@@ -9,7 +9,7 @@ from ...utils.constants import (
     PLACEHOLDER_EMOJI,
     DEFAULT_KICKSTART_START, DEFAULT_KICKSTART_IDLE, DEFAULT_IMAGE_PRESENT, DEFAULT_WHISPER_RECAP,
 )
-from ...utils.helpers import _format_history_entry, is_citation_subtext
+from ...utils.helpers import _format_history_entry, is_citation_subtext, turn_posted_at
 from ...utils.attachment_limits import over_attachment_limit
 from .reply import reply_gen_config, reply_meta
 
@@ -327,6 +327,13 @@ class RegenerationMixin:
             state_container['msg_b_id'] = None
 
             sent_timestamp = datetime.datetime.now(datetime.timezone.utc)
+            # A regeneration rewrites what the turn says, not when it was said. The turn
+            # keeps its original moment -- the message is edited in place, so it is still
+            # sitting where it was in the channel -- and records the regeneration
+            # separately as `edited_at`. Stamping the turn "now" put an older turn's
+            # clock ahead of every turn after it, in a transcript the model reads back
+            # and the session viewer shows.
+            original_timestamp = turn_posted_at(target_turn) or sent_timestamp
             # Through the accessor, not the raw cache. _get_user_appearance resolves the
             # effective profile first and populates the entry from config when it is
             # cold; reading self.cog.user_appearances directly did neither, so a
@@ -335,7 +342,7 @@ class RegenerationMixin:
             # bare profile name instead of the character's display name.
             app_data = self.cog.profile_manager._get_user_appearance(owner_id, profile_name)
             new_history_line = _format_history_entry(
-                app_data.get("custom_display_name") or profile_name, sent_timestamp, reply.text,
+                app_data.get("custom_display_name") or profile_name, original_timestamp, reply.text,
                 p_settings.get("timezone", "UTC"),
                 entity_id=self.cog.profile_manager._get_profile_id(owner_id, profile_name))
 
@@ -345,7 +352,10 @@ class RegenerationMixin:
                 session.setdefault("unified_log", []).append(final_target_turn)
 
             final_target_turn["content"] = new_history_line
-            final_target_turn["timestamp"] = sent_timestamp.isoformat()
+            # Written out rather than left to the message id it was read from, so the
+            # turn's moment survives its messages being deleted from under it.
+            final_target_turn["timestamp"] = original_timestamp.isoformat()
+            final_target_turn["edited_at"] = sent_timestamp.isoformat()
             final_target_turn["message_ids"] = list(surviving_message_ids)
             final_target_turn["meta"] = reply_meta(
                 attempt, duration=time.monotonic() - t_start, training_examples=training_examples,

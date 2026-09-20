@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from ...utils.helpers import _format_history_entry, _get_user_hash
 from ...utils.attachment_limits import over_attachment_limit, skipped_attachment_note
 from ...utils.http_client import get_shared_client
-from ...managers.session_manager import intern_turn
+from ...managers.session_manager import intern_turn, log_user_turn
 from ...utils.constants import ROUND_MEDIA_MAX, ROUND_MEDIA_SKIPPED_NOTE
 
 
@@ -80,15 +80,16 @@ class TriggerIntakeMixin:
         self, session, session_type, channel_id, all_triggers_for_round,
         new_round_turn_data, pending_url_fetches, recent_processed_ids,
         is_image_gen_round, image_gen_prompt, starting_profile_override,
-        round_author_name, triggering_user_id,
+        round_author_name, triggering_user_id, batch_start_index,
     ):
         """Normalises the round's batched triggers into history turns.
 
         Appends to new_round_turn_data, pending_url_fetches and recent_processed_ids in
-        place, and returns the five round-scoped values a trigger can change:
+        place, and returns the six round-scoped values a trigger can change:
         (is_image_gen_round, image_gen_prompt, starting_profile_override,
-        round_author_name, triggering_user_id). They are passed in as well as returned
-        so a round whose triggers set none of them keeps the caller's values.
+        round_author_name, triggering_user_id, batch_start_index). They are passed in as
+        well as returned so a round whose triggers set none of them keeps the caller's
+        values.
 
         The long parameter list is the real coupling this step has to the round, not a
         shape worth hiding: it was previously all ambient locals in the worker frame.
@@ -273,7 +274,12 @@ class TriggerIntakeMixin:
                             del turn["url_context"]
                     turn_object["url_context"] = url_text_content
 
-                session.setdefault("unified_log", []).append(intern_turn(turn_object))
+                # Where the channel shows it, which for a message sent while the previous
+                # round's last character was still generating is above that reply, not
+                # below it. The reserve has to follow it back, or the round's own user
+                # message is the one turn the STM window may drop.
+                insert_index = log_user_turn(session, turn_object, created_at)
+                batch_start_index = min(batch_start_index, insert_index)
 
                 if pending_url_fetches and pending_url_fetches[-1]["turn_data_index"] == len(new_round_turn_data):
                     pending_url_fetches[-1]["turn_object"] = turn_object
@@ -330,4 +336,4 @@ class TriggerIntakeMixin:
                     round_author_name = user_obj.display_name
 
         return (is_image_gen_round, image_gen_prompt, starting_profile_override,
-                round_author_name, triggering_user_id)
+                round_author_name, triggering_user_id, batch_start_index)

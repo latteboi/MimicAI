@@ -10,10 +10,11 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional
 from ..utils.content import OLLAMA_GUIDE_TEXT
 from ..utils.helpers import (
-    _pf, _pi, _ps, _pb, is_real_model, image_model_caps, openrouter_image_ratios,
-    resolve_critic_settings,
+    _pf, _pi, _ps, _pb, clean_model_name, is_real_model, image_model_caps,
+    openrouter_image_ratios, resolve_critic_settings,
     google_thinking_caps, resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
+    resolve_unreadable_media_mode,
 )
 from ..utils.user_defaults import setting_label
 from ..utils.birthdays import MONTH_NAMES, format_birthday, parse_birthday, valid_birthday
@@ -593,6 +594,12 @@ def _render_media_resolution(ctx):
     return "Media Input Resolution", f"Resolution: `{label}`", True
 
 
+def _render_unreadable_media(ctx):
+    mode = resolve_unreadable_media_mode(ctx["config"])
+    label = next((l for v, l, _d in UNREADABLE_MEDIA_MODES if v == mode), "Off")
+    return "Unreadable Attachments", f"Mode: `{label}`", True
+
+
 #: Discord's cap on the options in one select.
 _SELECT_MAX_OPTIONS = 25
 
@@ -916,6 +923,32 @@ PROFILE_ACTIONS = (
                        scope="all", label="Set Media Input Resolution",
                        description="Stage the input media resolution.",
                        keys=("media_input_resolution",))),
+    _Action("unreadable_media", "params", "Unreadable Attachments",
+            "What this profile does with an image or audio file its models cannot read.",
+            _open_screen("unreadable_media"), render=_render_unreadable_media,
+            screen=_Screen(
+                _Choice("unreadable_media_mode", "Unreadable Attachments",
+                        tuple((label, value, desc) for value, label, desc in UNREADABLE_MEDIA_MODES),
+                        read=lambda c: resolve_unreadable_media_mode(c),
+                        placeholder="What to do with an unreadable attachment..."),
+                note="Reached only when **both** this profile's models refuse the file, so "
+                     "a profile whose fallback can see images never gets here. Either way "
+                     "the character is told the filename and that it cannot read the file, "
+                     "instead of falling silent for the round.\n\n"
+                     "`Simulated` has "
+                     f"`{clean_model_name(MEDIA_DESCRIBER_MODEL)}` read it first, or "
+                     f"`{clean_model_name(MEDIA_DESCRIBER_FALLBACK)}` if that one cannot, "
+                     "and writes the description into this profile's prompt only -- nobody "
+                     "else at the table sees it. One call per round however many "
+                     "characters need it. With a key for neither, the profile behaves as "
+                     "`Off`."),
+            bulk=_Bulk(_bulk_choice(
+                           "Select unreadable-attachment handling...",
+                           [(label, value, desc) for value, label, desc in UNREADABLE_MEDIA_MODES],
+                           to_payload=lambda v: {"unreadable_media_mode": v}),
+                       scope="all", label="Set Unreadable Attachments",
+                       description="Stage what happens to an unreadable attachment.",
+                       keys=("unreadable_media_mode",))),
     # --- Media (what a profile draws and how it sounds; the models stay in Set Models) ---
     _Action("image_toggle", "media", "Image Generation", "Allow this profile to generate images via !image/!imagine.",
             _open_screen("image_toggle"), render=_render_image_toggle,

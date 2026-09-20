@@ -25,6 +25,7 @@ from ..utils.constants import (
     ROUND_EXEMPT_USER_TURNS, ROUND_EXEMPT_USER_CHARS, SESSION_BUSY_FLAGS,
 )
 from ..utils.discord_cdn import unsigned_attachment_url
+from ..utils.helpers import turn_posted_at
 from .storage_manager import (IOManager, _delete_file_shard, _get_compressor,
                               _get_decompressor, seal_blob, unseal_blob)
 
@@ -61,6 +62,52 @@ def intern_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
         if type(value) is str:
             turn[field] = sys.intern(value)
     return turn
+
+
+def log_user_turn(session: Dict[str, Any], turn: Dict[str, Any],
+                  posted_at: Optional[datetime.datetime]) -> int:
+    """Put a user's turn in the log where the channel shows it. Returns its index.
+
+    A profile's turn is written the moment its generation finishes, but its message is
+    only posted afterwards -- speech synthesis, chunking, a child bot's round trip --
+    while a message someone sends during that generation waits on the task queue and is
+    only written at the next intake. Appending both left the log claiming the reply came
+    first, against the clock each turn carries in its own content line, and against what
+    the channel plainly showed. A regeneration then answered the turn's position rather
+    than the message sitting directly above it on screen.
+
+    So the turn steps back over any reply that had not been posted yet when it was sent.
+    Only over a turn that posted a message, though: that is the one kind whose moment is
+    a moment in the channel. A reply whose delivery failed has nothing to compare, and
+    hopping it would reorder history on a guess; a synopsis records when it was *written*,
+    which is round end and so later than any interjection -- dating it that way would file
+    every one of them above the synopsis and into the history it stands in for. Another
+    user's turn is a wall too: those are already in the order they were queued.
+    """
+    unified_log = session.setdefault("unified_log", [])
+    index = len(unified_log)
+    if posted_at is not None:
+        while index > 0:
+            previous = unified_log[index - 1]
+            if previous.get("is_user") is True or not previous.get("message_ids"):
+                break
+            was = turn_posted_at(previous)
+            if was is None or was <= posted_at:
+                break
+            index -= 1
+
+    unified_log.insert(index, intern_turn(turn))
+
+    # An insert below the boundary would leave the sealed cold segment no longer a
+    # prefix of the log. Pulling the boundary back to it restores that -- the turns
+    # past it stay in the cold file and are ignored on the next load, which reads
+    # cold[:cold_len] + tail -- and keeps this a tail write. A full rewrite instead
+    # would be the round's whole log re-serialised, compressed and encrypted, on an
+    # e2-micro, every time somebody typed while a character was thinking.
+    cold_len = session.get("_log_cold_len", 0)
+    if isinstance(cold_len, int) and index < cold_len:
+        session["_log_cold_len"] = index
+    return index
 
 
 class SessionManager:

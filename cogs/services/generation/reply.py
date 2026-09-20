@@ -7,6 +7,7 @@ profile's fallback thinking level never reached a regenerated reply, and it rout
 fallback with a narrower provider guess than the worker's. Both recorded the primary as
 the model that answered when the fallback had.
 """
+import asyncio
 import contextlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -14,11 +15,14 @@ from typing import Any, Dict, List, Optional
 from ...utils import mem_probe
 from ...utils.constants import (
     ERR_GENERAL_ERROR, ERR_REASON_EMPTY_RESPONSE, ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK,
-    WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED,
+    MEDIA_DESCRIBED_NOTE, MEDIA_UNREADABLE_NOTE, WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED,
+    WARN_MAIN_MODEL_FAILED, WARN_MEDIA_DESCRIBED, WARN_MEDIA_UNREADABLE,
 )
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _resolve_safety_settings, _scrub_response_text,
-    is_real_model, record_billed_usage, resolve_native_tools, resolve_thinking_params,
+    clean_model_name, is_real_model, media_kinds, record_billed_usage, resolve_native_tools,
+    resolve_thinking_params, resolve_unreadable_media_mode, split_media_parts,
+    unreadable_media_modality,
 )
 from ._shared import _strip_neuro_update_and_scrub
 
@@ -43,6 +47,13 @@ class ReplyAttempt:
     main_error: Optional[str] = None
     error: Optional[str] = None
     status: str = "api_error"
+    #: Set when the attachments were taken out and the turn retried without them: what
+    #: kind they were ("images"), and who described them first, if anyone did.
+    media_dropped: Optional[str] = None
+    media_described_by: Optional[str] = None
+    #: Merged into the turn's trace. Carries what the describe pass cost, which belongs
+    #: on the turn that paid for it rather than inside the reply's own token counts.
+    extra_meta: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def has_fallback(self) -> bool:
@@ -55,7 +66,7 @@ class ReplyAttempt:
         """The model that answered, as the trace shows it."""
         name = (getattr(self.answered_by or self.primary, 'model_name', None)
                 or (self.fallback_name if self.fallback_used else self.primary_name) or "Unknown")
-        return name.replace("models/", "").replace("OPENROUTER/", "").replace("GOOGLE/", "")
+        return clean_model_name(name)
 
 
 @dataclass
@@ -113,6 +124,13 @@ def reply_meta(attempt: ReplyAttempt, *, duration: float, training_examples, ltm
         meta["neuro_state"] = neuro_state
     if critic:
         meta["critic"] = critic
+    # Sparse, like everything else here: a turn that read its attachments itself says
+    # nothing at all about them.
+    if attempt.media_dropped:
+        meta["media_dropped"] = attempt.media_dropped
+    if attempt.media_described_by:
+        meta["media_described_by"] = attempt.media_described_by
+    meta.update(attempt.extra_meta)
     return meta
 
 
@@ -149,9 +167,10 @@ class ReplyMixin:
                 name, channel.guild.id, user_id, system_instruction, safety_settings,
                 thinking, tools, p_settings, config_owner_id=owner_id, **key_errors)
 
-        async def generate(model, is_fallback: bool):
+        async def generate(model, is_fallback: bool, contents: Optional[List] = None):
             attempt.response, _ = await self._generate_with_heartbeat(
-                model, history, gen_config, channel, participant, msg_a_id, is_fallback=is_fallback,
+                model, history if contents is None else contents, gen_config, channel,
+                participant, msg_a_id, is_fallback=is_fallback,
                 app_name=app_name, app_avatar=app_avatar, existing_state=state_container)
             if not attempt.response or not attempt.response.candidates:
                 raise ValueError("Response blocked or empty")
@@ -187,11 +206,17 @@ class ReplyMixin:
         except Exception as e:
             timed_out = isinstance(e, TimeoutError)
             attempt.main_error = getattr(e, 'formatted_reason', None) or _format_api_error(e)
+            # Which model refused to read the attachment, if that is what happened. The
+            # primary is preferred: it is the character's own voice, and the fallback is
+            # only standing in because of a file neither of them was asked about.
+            blind_model = attempt.primary if unreadable_media_modality(e) else None
+            fallback_model = None
             if not attempt.has_fallback:
                 attempt.error = attempt.main_error
             else:
                 try:
-                    await generate(build(fallback_model_name, "fallback"), True)
+                    fallback_model = build(fallback_model_name, "fallback")
+                    await generate(fallback_model, True)
                     attempt.fallback_used = True
                     if log_context:
                         self.cog._log_api_call(user_id=user_id, guild_id=channel.guild.id,
@@ -200,6 +225,18 @@ class ReplyMixin:
                 except Exception as retry_e:
                     attempt.error = (ERR_REASON_TIMEOUT_BOTH if timed_out and isinstance(retry_e, TimeoutError)
                                      else _format_api_error(retry_e))
+                    if blind_model is None and unreadable_media_modality(retry_e):
+                        blind_model = fallback_model
+
+            # Both models have now refused the attachment -- if the fallback had read it,
+            # its answer would be sitting in `attempt` and this would not run. Only now is
+            # the profile's unreadable-media setting reached: a profile whose fallback has
+            # vision never sees it, and keeps answering with the fallback as it always did.
+            if blind_model is not None and attempt.answered_by is None:
+                await self._retry_without_media(
+                    attempt, generate, blind_model, history, p_settings=p_settings,
+                    channel=channel, owner_id=owner_id, user_id=user_id,
+                    is_fallback=blind_model is fallback_model)
         finally:
             if log_context:
                 # `or primary_model`: a row naming the model that could not be built says
@@ -207,6 +244,67 @@ class ReplyMixin:
                 self.cog._log_api_call(user_id=user_id, guild_id=channel.guild.id, context=log_context,
                                        model_used=attempt.primary or primary_model, status=attempt.status)
         return attempt
+
+    async def _retry_without_media(self, attempt: ReplyAttempt, generate, model, history: List,
+                                   *, p_settings: Dict, channel, owner_id: int, user_id: int,
+                                   is_fallback: bool) -> None:
+        """Run the turn again with the attachments taken out, and say so in their place.
+
+        The reply used to be abandoned here: the profile posted its `error_response` and
+        dropped out of the round because somebody attached a picture, while every other
+        character in the session carried on. A conversation is not the attachment, and a
+        character that cannot see one can still answer what was said -- so the file comes
+        out, something goes in to say it was there, and the turn is asked again.
+
+        What goes in depends on the profile's `unreadable_media_mode`. `off` names the
+        kind and forbids guessing; `simulated` buys a description first and hands that
+        over instead, falling back to `off` when there is no description to be had -- no
+        Google key, a refusal, a timeout. The filename is in the turn's own text either
+        way, written there when the message was taken in, for every model.
+
+        The history is rebuilt rather than edited: the request that failed is what the
+        trace and any later attempt refer to, and it has to keep saying what was sent.
+        """
+        blind_history, media = split_media_parts(history)
+        if not media:
+            return
+
+        kinds = media_kinds(media)
+        parts: List[Any] = [MEDIA_UNREADABLE_NOTE.format(kinds=kinds)]
+        described_by = None
+        if resolve_unreadable_media_mode(p_settings) == "simulated":
+            description, describer = await self._describe_media(
+                media, channel=channel, p_settings=p_settings, owner_id=owner_id,
+                user_id=user_id, meta=attempt.extra_meta)
+            if description:
+                described_by = describer
+                parts = [MEDIA_DESCRIBED_NOTE.format(kinds=kinds),
+                         f"<attachment_description>\n{description}\n</attachment_description>"]
+
+        # Onto the last user turn, where the attachments themselves were, so the note sits
+        # against the message it is about rather than at the top of a scene.
+        if blind_history and blind_history[-1].get("role") == "user":
+            blind_history[-1] = {**blind_history[-1],
+                                 "parts": list(blind_history[-1].get("parts") or []) + parts}
+        else:
+            blind_history.append({"role": "user", "parts": parts})
+
+        try:
+            await generate(model, is_fallback, contents=blind_history)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # The refusal already in `attempt.error` is kept: it is the one that explains
+            # the turn, and this second failure is usually the same model saying so twice.
+            print(f"Retry without attachments failed: {type(e).__name__}: {e}")
+            return
+
+        attempt.media_dropped = kinds
+        attempt.media_described_by = described_by
+        attempt.error = None
+        attempt.fallback_used = is_fallback
+        if not is_fallback:
+            attempt.status = "success"
 
     def _reply_text(self, attempt: ReplyAttempt, p_settings: Dict, owner_id: int,
                     profile_name: str, participant_names: List[str]) -> ReplyText:
@@ -256,4 +354,13 @@ class ReplyMixin:
         if attempt.fallback_used and p_settings.get("show_fallback_indicator", True):
             reply.warnings.append(WARN_FALLBACK_USED)
             reply.warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=attempt.main_error))
+        # Always shown, unlike the fallback indicator: this one explains a gap the reader
+        # can see without being told -- a character who said nothing about the picture
+        # they were just sent. Described wins over dropped, because it is the truer of
+        # the two and saying both in one breath reads as a contradiction.
+        if attempt.media_described_by:
+            reply.warnings.append(WARN_MEDIA_DESCRIBED.format(
+                model=clean_model_name(attempt.media_described_by)))
+        elif attempt.media_dropped:
+            reply.warnings.append(WARN_MEDIA_UNREADABLE.format(kinds=attempt.media_dropped))
         return reply
