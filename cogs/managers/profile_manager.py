@@ -41,8 +41,9 @@ from ..utils.constants import (
     NEW_PROFILE_SPEECH_TEMPERATURE, SPEECH_LANGUAGE_NAMES,
     IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_SLOT_FILES, VOICE_SAMPLE_SLOT_KEY, VOICE_SAMPLE_SLOTS,
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_MODES, )
-from ..utils.helpers import (image_rag_enabled, is_real_model, resolve_critic_settings,
-                            resolve_grounding_mode, resolve_image_output_params,
+from ..utils.helpers import (image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
+                            ltm_auto_recall_enabled, resolve_critic_settings,
+                            grounding_mode_display, resolve_image_output_params,
                             resolve_image_tools, resolve_unreadable_media_mode,
                             resolve_url_mode, suppress_link_previews,
                             describe_voice_samples)
@@ -1831,6 +1832,11 @@ class ProfileManager:
                 "primary_model": PRIMARY_MODEL_NAME, "fallback_model": FALLBACK_MODEL_NAME,
                 "timezone": "UTC",
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
+                # Written explicitly, and False, where absence means on: recall has been
+                # unconditional for the life of the setting, so every profile already on
+                # disk has no key and must keep recalling. See ltm_auto_recall_enabled.
+                "ltm_recall_enabled": False,
+                "ltm_recall_tool_enabled": False,
                 "image_generation_enabled": False, "image_generation_model": DEFAULT_IMAGE_MODEL,
                 # Empty means "send no such field" -- see
                 # MediaService.resolve_image_output_params. Not defaulted to a ratio,
@@ -1859,9 +1865,12 @@ class ProfileManager:
             # tuning a standing preference could be overwriting.
             apply_defaults(config, self._get_user_defaults(user_id), borrowed=False)
 
+            # No "ltm_summarization_instructions": a seeded copy of the default freezes
+            # this profile on whichever wording shipped today, so /mod's override and
+            # every later improvement would govern nothing but profiles made after it.
+            # Absent resolves live -- see resolve_ltm_summarization_instructions.
             prompts = {
                 "persona": {}, "ai_instructions": ["", "", "", ""], "image_generation_prompt": None,
-                "ltm_summarization_instructions": self.cog.storage_manager._encrypt_data(self._default_ltm_summarization_instructions())
             }
 
             unified_profile = {
@@ -1902,6 +1911,11 @@ class ProfileManager:
                 "primary_model": "GOOGLE/gemini-2.5-flash-lite", "fallback_model": "GOOGLE/gemini-2.5-flash-lite",
                 "timezone": "UTC", "generation_metadata_enabled": False,
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
+                # Written explicitly, and False, where absence means on: recall has been
+                # unconditional for the life of the setting, so every profile already on
+                # disk has no key and must keep recalling. See ltm_auto_recall_enabled.
+                "ltm_recall_enabled": False,
+                "ltm_recall_tool_enabled": False,
                 "image_generation_enabled": False, "image_generation_model": DEFAULT_IMAGE_MODEL,
                 # Empty means "send no such field" -- see
                 # MediaService.resolve_image_output_params. Not defaulted to a ratio,
@@ -1933,7 +1947,7 @@ class ProfileManager:
                 },
                 "ai_instructions": [self.cog.storage_manager._encrypt_data("Answer questions concisely using the provided documentation. If you do not know the answer, state that you do not know."), "", "", ""],
                 "image_generation_prompt": None,
-                "ltm_summarization_instructions": self.cog.storage_manager._encrypt_data(self._default_ltm_summarization_instructions())
+                # Unseeded, as above.
             }
 
             unified_profile = {
@@ -3425,8 +3439,7 @@ class ProfileManager:
         realistic_typing = profile_data.get("realistic_typing_enabled", False)
         timezone_str = profile_data.get("timezone", "UTC")
         
-        grounding_mode = resolve_grounding_mode(profile_data)
-        grounding_display = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(grounding_mode, "OFF")
+        grounding_display = grounding_mode_display(profile_data)
 
         stm_length = profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
         ltm_ctx = profile_data.get("ltm_context_size", 3)
@@ -3771,9 +3784,11 @@ class ProfileManager:
             img_gen += f" `{img_detail}`"
 
 
-        _MODE_DISPLAY = {"off": "`OFF`", "native": "**`NATIVE`**", "rag": "**`RAG`**"}
-        grounding_display = _MODE_DISPLAY.get(resolve_grounding_mode(config), "`OFF`")
-        url_ctx = _MODE_DISPLAY.get(resolve_url_mode(config), "`OFF`")
+        # URL context still has one vocabulary; grounding's stored and shown names
+        # differ for two modes, so it goes through its own resolver.
+        grounding_display = grounding_mode_display(config)
+        url_ctx = {"off": "`OFF`", "native": "**`NATIVE`**",
+                   "rag": "**`RAG`**"}.get(resolve_url_mode(config), "`OFF`")
         # Resolved, not read: the stored value can be anything an import wrote, and this
         # line has to say what the profile will actually do with an attachment.
         unreadable_media = ("**`SIMULATED`**"
@@ -3848,16 +3863,25 @@ class ProfileManager:
         ltm_ctx = config.get("ltm_context_size", 3)
         ltm_rel = config.get("ltm_relevance_threshold", 0.75)
         ltm_status = "**`ON`**" if config.get("ltm_creation_enabled", False) else "`OFF`"
+        # Resolved, not read: absent means on, so a profile written before the toggle
+        # existed must not render as though its memory had been switched off.
+        auto_recall_status = "**`ON`**" if ltm_auto_recall_enabled(config) else "`OFF`"
+        # Shown beside the threshold because it changes what that number means: with
+        # Memory Search on, the automatic pass runs at LTM_AUTO_THRESHOLD_WITH_TOOL
+        # instead, and the stored value applies again the moment this goes off.
+        recall_status = "**`ON`**" if config.get("ltm_recall_tool_enabled", False) else "`OFF`"
         ltm_inv = config.get("ltm_creation_interval", 10)
         ltm_s_ctx = config.get("ltm_summarization_context", 10)
 
         ltm_val = (
             f"Auto-Creation: {ltm_status}\n"
+            f"Auto-Recall: {auto_recall_status}\n"
             f"Count: `{ltm_count}`\n"
             f"Creation Interval: `{ltm_inv}`\n"
             f"Summ Context: `{ltm_s_ctx}`\n"
             f"Context Size: `{ltm_ctx}`\n"
-            f"Relevance Threshold: `{ltm_rel}`"
+            f"Relevance Threshold: `{ltm_rel}`\n"
+            f"Memory Search: {recall_status}"
         )
         embed.add_field(name="Long-Term Memories", value=ltm_val, inline=True)
 
@@ -3871,13 +3895,39 @@ class ProfileManager:
 
         /mod's "LTM Summarization" entry writes global_prompts, which nothing read
         before -- summarisation resolves the prompt per-profile. This makes the
-        global the source of that per-profile default, so it governs newly created
-        profiles, the GUI's reset-to-default, and any profile whose stored value is
-        blank. A profile that already has its own text keeps it; changing the global
-        does not rewrite existing profiles.
+        global the source of that per-profile default, so it governs every profile
+        that has not been given text of its own.
         """
         return self.cog.global_prompts.get(
             "LTM_SUMMARIZATION_INSTRUCTIONS", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS)
+
+    def resolve_ltm_summarization_instructions(self, owner_id: Optional[int],
+                                               profile_name: Optional[str]) -> str:
+        """Profile prompt, else /mod's instance-wide override, else the shipped default.
+
+        The same resolution `resolve_critic_instructions` does, and for the reason its
+        docstring gives -- except that this one has history to undo. Profiles used to be
+        created with the default *copied* into their prompts, so a better default would
+        have reached new profiles only, and every character anyone already had would
+        have stayed on the text that shipped the day it was made. Nothing seeds it any
+        more, and a stored value that is byte-for-byte one of those seeded copies is
+        treated as the absence it always was. Text an owner actually wrote is untouched,
+        because it cannot match.
+        """
+        default = self._default_ltm_summarization_instructions()
+        if not owner_id or not profile_name:
+            return default
+
+        source_owner_id, source_profile_name = self._resolve_effective_profile(owner_id, profile_name)
+        prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
+        encrypted = prompts.get("ltm_summarization_instructions")
+        if not encrypted:
+            return default
+        # A stored-but-blank value must not yield a blank system instruction.
+        stored = self.cog.storage_manager._decrypt_data(encrypted).strip()
+        if not stored or is_shipped_ltm_prompt(stored, default):
+            return default
+        return stored
 
     def _default_critic_instructions(self) -> str:
         """The Anti-Repetition Critic prompt a profile gets when it has none of its own."""

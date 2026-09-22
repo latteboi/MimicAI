@@ -24,7 +24,7 @@ import httpx
 import orjson as json
 
 from ...utils.blob_stream import InlineBlobExtractor
-from ...utils.constants import OPENROUTER_DATA_POLICY_BLOCKED
+from ...utils.constants import IMAGE_PROMPT_EMPTY, OPENROUTER_DATA_POLICY_BLOCKED
 from ...utils.http_client import get_openrouter_client
 from .google_rest import GoogleRESTResponse
 from .streaming import (
@@ -40,6 +40,33 @@ _TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 
 #: The image's type when OpenRouter leaves `media_type` out: whatever format was asked for.
 _FORMAT_MIMES = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp"}
+
+#: What a host refusing to draw something says. OpenRouter passes the host's own words
+#: and the host's own status code through -- 400 from one, 403 from another -- so the
+#: words are the only thing left to key off.
+_REFUSAL_MARKERS = ("flagged", "content policy", "content_policy", "moderation",
+                    "safety system", "blocked this request", "prohibited")
+
+
+def _content_refusal(status: int, detail: str) -> Optional[str]:
+    """The host's own sentence when it refused to draw this, else None.
+
+    A 429 is traffic and a 5xx is the host being unwell; neither is a decision about the
+    request, so only the rest of the 4xx range is read for one.
+    """
+    if status == 429 or not 400 <= status < 500:
+        return None
+    message = ""
+    try:
+        parsed = json.loads(detail)
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+            message = parsed["error"].get("message") or ""
+    except Exception:
+        pass
+    text = message if isinstance(message, str) and message else detail
+    if not any(marker in text.lower() for marker in _REFUSAL_MARKERS):
+        return None
+    return " ".join(text.split())[:300]
 
 
 class OpenRouterImageModel:
@@ -83,7 +110,18 @@ class OpenRouterImageModel:
 
         if self.system_instruction and self.system_instruction.strip():
             texts.insert(0, self.system_instruction.strip())
-        payload = {"model": self.model_name, "prompt": "\n\n".join(texts), "n": 1}
+        prompt = "\n\n".join(texts)
+        if not prompt:
+            # Refused before it is sent: the endpoint answers an empty prompt with a
+            # schema error, and `run_with_fallback` would then hand the fallback model
+            # the same empty prompt to be refused by. Nothing upstream should reach here
+            # -- `helpers.image_command_prompt` is where a request with nothing to draw
+            # stops -- so this is the guard that says so rather than a 400.
+            error = ValueError(f"OpenRouter image request carried no prompt ({self.model_name})")
+            error.formatted_reason = IMAGE_PROMPT_EMPTY
+            error.retryable = False
+            raise error
+        payload = {"model": self.model_name, "prompt": prompt, "n": 1}
         for stored, wire in (("aspect_ratio", "aspect_ratio"), ("image_size", "resolution"),
                              ("quality", "quality"), ("output_format", "output_format")):
             if self.image_params.get(stored):
@@ -126,6 +164,14 @@ class OpenRouterImageModel:
                     # Said plainly, and carried whole: _format_api_error cuts at 80 characters.
                     if "data policy" in detail.lower():
                         err.formatted_reason = OPENROUTER_DATA_POLICY_BLOCKED
+                    elif refusal := _content_refusal(response.status_code, detail):
+                        # The host judged the request rather than failed at it, so the
+                        # fallback model is a second opinion on a decision -- and usually
+                        # the same one, more strictly. Google's image block already ends
+                        # the attempt this way by returning no candidates instead of
+                        # raising; `retryable = False` is how a raised one says the same.
+                        err.formatted_reason = refusal
+                        err.retryable = False
                     raise err
                 async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK_BYTES):
                     extractor.feed(chunk)

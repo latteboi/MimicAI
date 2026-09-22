@@ -28,6 +28,21 @@ _UPLOAD_CHUNK_BYTES = 256 * 1024
 _DOWNLOAD_CHUNK_BYTES = 64 * 1024
 
 
+def _discard_staged(staged_files: List[str]) -> None:
+    """Unlinks the files an adapter downloaded for one request, and empties the list.
+
+    Only those: a local path handed in by the caller -- a generated image the round still
+    needs -- is never in here. Shared by the adapters because each has two places to call
+    it from, the parts loop and the request, and a copy per site drifts.
+    """
+    for path in staged_files:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    staged_files.clear()
+
+
 async def _aiter_file_bytes(path: str, chunk_size: int = _UPLOAD_CHUNK_BYTES):
     """Yields `path` in chunks for use as an httpx request body.
 

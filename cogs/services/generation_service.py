@@ -15,7 +15,7 @@ from ..utils.constants import (
     WHISPER_BUSY_WAIT_TIMEOUT_SECONDS,
     WARN_VOICE_SYNTHESIS_FAILED,
     ERR_REASON_AUDIO_TOO_LARGE, ERR_REASON_AUDIO_NOT_UPLOADED,
-    DEFAULT_KICKSTART_START, DEFAULT_KICKSTART_CONTINUE, DEFAULT_KICKSTART_IDLE,
+    DEFAULT_KICKSTART_START,
     DEFAULT_WHISPER_RECAP, DEFAULT_DIRECTOR_USER_PROMPT,
     DEFAULT_IMAGE_GROUNDING, DEFAULT_IMAGE_PRESENT,
     DEFAULT_IMAGE_PRESENT_OTHER, DEFAULT_IMAGE_FAILED,
@@ -28,8 +28,9 @@ from ..utils.helpers import (
     _format_api_error, _format_citation_subtext,
     _format_history_entry, _get_user_hash, _resolve_safety_settings,
     _split_into_sentences_with_abbreviations, generated_image_attachment,
-    resolve_critic_settings,
-    image_rag_enabled, is_gateway_shutdown, resolve_grounding_mode,
+    ltm_auto_threshold, resolve_critic_settings,
+    image_command_prompt, image_rag_enabled, is_gateway_shutdown, kickstart_note,
+    resolve_grounding_mode,
     resolve_thinking_params,
     resolve_typing_cursor,
 )
@@ -992,7 +993,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                         # _get_relevant_ltm_for_prompt uses this only as len(history) for the recall
                         # cooldown, so unified_log is the direct and more accurate equivalent.
-                        ltm_recall_text = await self.cog.memory_manager._get_relevant_ltm_for_prompt(session_key, session.get("unified_log", []), owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id)
+                        ltm_recall_text = await self.cog.memory_manager._get_relevant_ltm_for_prompt(session_key, session.get("unified_log", []), owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id,
+                                                                                                   threshold=ltm_auto_threshold(p_settings))
 
                         # [NEW] Check Image Gen intent vs Profile Toggle
                         turn_is_image_gen = False
@@ -1049,7 +1051,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             dynamic_context_for_turn = session["unified_log"][-1].get("content", "")
 
                         # Parallelise Training Examples, LTM retrieval, and Help Context
-                        ltm_task = self.cog.memory_manager._get_relevant_ltm_for_prompt(session_key, contents_for_api_call, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id)
+                        ltm_task = self.cog.memory_manager._get_relevant_ltm_for_prompt(session_key, contents_for_api_call, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id,
+                                                                       threshold=ltm_auto_threshold(p_settings))
                         training_task = self.cog.memory_manager._get_relevant_training_examples(owner_id, profile_name, dynamic_context_for_turn, channel.guild.id)
                         
                         help_task = None
@@ -1119,18 +1122,17 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             owner_id, profile_name, channel.id, is_multi_profile=True,
                             training_examples_list=training_examples_list, recalled_ltm=ltm_recall_text,
                             critic_constraints=critic_constraints,
+                            # This path runs _attempt_reply, which has the function loop.
+                            with_loop=True,
                         )
 
                         session_key = (channel.id, owner_id, profile_name)
 
-                        # Check if the last turn was from this model itself
-                        if contents_for_api_call and contents_for_api_call[-1].get('role', contents_for_api_call[-1].get('role', 'user')) == 'model':
-                            last_model_text = "".join(p if isinstance(p, str) else p.get('text', '') for p in contents_for_api_call[-1].get('parts', []))
-                            if "<private_response>" in last_model_text:
-                                pseudo_user_turn = {'role': 'user', 'parts': [self.cog.global_prompts.get("KICKSTART_CONTINUE", DEFAULT_KICKSTART_CONTINUE)]}
-                            else:
-                                pseudo_user_turn = {'role': 'user', 'parts': [self.cog.global_prompts.get("KICKSTART_IDLE", DEFAULT_KICKSTART_IDLE)]}
-                            contents_for_api_call.append(pseudo_user_turn)
+                        # The history ends on this character's own turn when nobody has
+                        # answered it -- which note that earns is `kickstart_note`.
+                        follow_up = kickstart_note(contents_for_api_call, self.cog.global_prompts)
+                        if follow_up:
+                            contents_for_api_call.append({'role': 'user', 'parts': [follow_up]})
 
                         # Collect all supplementary context to inject into the final user turn
                         supplementary_parts = []
@@ -1738,19 +1740,21 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     trigger = trigger[1]
 
                                 if isinstance(trigger, discord.Message):
-                                    content_lower = trigger.clean_content.lower()
-                                    image_prefixes = ("!image", "!imagine")
-                                    if content_lower.startswith(image_prefixes):
-                                        used_prefix = next((p for p in image_prefixes if content_lower.startswith(p)), "!image")
+                                    # None when there is nothing to draw, which queues no
+                                    # image round: the message still reaches the round as
+                                    # an ordinary turn.
+                                    batched_image_prompt = image_command_prompt(trigger.clean_content)
+                                    if batched_image_prompt:
                                         session['pending_image_gen_data'] = {
-                                            'prompt': trigger.clean_content[len(used_prefix):].strip(),
+                                            'prompt': batched_image_prompt,
                                             'anchor_message': trigger
                                         }
 
                                     author_name = trigger.author.display_name
                                     reply_context = await self._resolve_reply_context(trigger)
-                                    content, batch_msg_media = await self._compose_user_turn(
+                                    batch_turn = await self._compose_user_turn(
                                         trigger.clean_content, trigger.attachments, reply_context)
+                                    content, batch_msg_media = batch_turn.content, batch_turn.media_parts
                                     
                                     # [NEW] Batch URL Context Logic
                                     any_url_enabled_batch = False

@@ -14,9 +14,10 @@ from ..utils.constants import (
     defaultConfig, IMAGE_QUEUE_PRIORITY,
     DEFAULT_IMAGE_PRESENT, DEFAULT_IMAGE_FAILED, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING,
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
-    IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS, STATUS_IMAGINING_IMAGE,
+    IMAGE_COMMAND_PREFIXES, IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS, STATUS_IMAGINING_IMAGE,
+    TEXT_ATTACHMENT_EXTENSIONS,
 )
-from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, generated_image_attachment, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor
+from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, generated_image_attachment, image_command_prefix, image_command_prompt, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor
 from ..utils.attachment_limits import over_attachment_limit, skipped_attachment_note
 from ..utils.http_client import get_capped
 from ..utils.memory_tuning import maybe_trim_malloc
@@ -393,7 +394,7 @@ class MediaService:
                             if hasattr(text_response, 'raw') and text_response.raw.candidates and hasattr(text_response.raw.candidates[0], 'grounding_metadata'):
                                 raw_text = _add_inline_citations(raw_text, text_response.raw.candidates[0].grounding_metadata)
 
-                            raw_text, _ = self.cog.generation_service._extract_and_apply_neuro_state(raw_text, package['effective_profile_owner_id'], package['effective_profile_name'])
+                            raw_text, _ = self.cog.generation_service._extract_and_apply_neuro_state(raw_text, package['effective_profile_owner_id'], package['effective_profile_name'], response=text_response)
 
                             response_text = _scrub_response_text(raw_text.strip(), participant_names=[package['bot_display_name']])
 
@@ -675,8 +676,7 @@ class MediaService:
 
     async def _process_text_attachments(self, attachments: List[Any], client: httpx.AsyncClient) -> str:
         text_blocks = []
-        text_extensions = ('.txt', '.log', '.md', '.csv', '.json', '.py', '.js', '.html', '.css', '.xml')
-        
+
         count = 0
         for att in attachments:
             if count >= 2: break
@@ -690,7 +690,7 @@ class MediaService:
                 filename = att.filename
                 content_type = (att.content_type or '').lower()
                 
-            is_text = content_type.startswith("text/") or filename.lower().endswith(text_extensions)
+            is_text = content_type.startswith("text/") or filename.lower().endswith(TEXT_ATTACHMENT_EXTENSIONS)
             if not is_text or not url:
                 continue
                 
@@ -771,9 +771,8 @@ class MediaService:
                 qsize = self.cog.image_request_queue.qsize()
                 await message.reply(f"Your image generation request has been queued. You are #{qsize + 1} in line.", delete_after=10)
             
-            image_prefixes = ("!image", "!imagine")
-            used_prefix = next((p for p in image_prefixes if prompt_content.lower().startswith(p)), "!image")
-            prompt_text = prompt_content[len(used_prefix):].strip()
+            used_prefix = image_command_prefix(prompt_content) or IMAGE_COMMAND_PREFIXES[0]
+            prompt_text = image_command_prompt(prompt_content)
             if not prompt_text:
                 await message.reply(f"Please provide a prompt after `{used_prefix}`.", delete_after=10)
                 return

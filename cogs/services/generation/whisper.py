@@ -214,7 +214,8 @@ class WhisperMixin:
                 response_text = _add_inline_citations(response_text, response.raw.candidates[0].grounding_metadata)
             response_text = response_text.strip()
 
-        response_text, _ = self._extract_and_apply_neuro_state(response_text, owner_id, profile_name)
+        response_text, _ = self._extract_and_apply_neuro_state(response_text, owner_id, profile_name,
+                                                               response=response)
 
         # PREVENT GLOBAL XML SCRUBBER FROM DELETING THE RESPONSE
         response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
@@ -456,7 +457,8 @@ class WhisperMixin:
             return
 
         response_text = getattr(response, 'text', "...").strip()
-        response_text, _ = self._extract_and_apply_neuro_state(response_text, owner_id, profile_name)
+        response_text, _ = self._extract_and_apply_neuro_state(response_text, owner_id, profile_name,
+                                                               response=response)
 
         response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
 

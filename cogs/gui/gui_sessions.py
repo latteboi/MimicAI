@@ -2388,6 +2388,20 @@ def add_generation_fields(embed: discord.Embed, cog, turn: dict) -> None:
     if critic:
         embed.add_field(name="Anti-Repetition Critic", value=critic, inline=False)
 
+    # Only on a turn that made one, like the field above: a declaration is offered on
+    # every turn and reached for on very few, so a permanent "0 calls" line would be
+    # noise on almost all of them. What it answers is whether the character actually
+    # asks, what it asks, and whether its own archive can answer -- the three things
+    # that decide whether a recall threshold is set anywhere near right.
+    called = meta.get("function_calls")
+    if called:
+        lines = [f"\u251c\u2500\u2500 `{entry}`" for entry in called]
+        lines[-1] = lines[-1].replace("\u251c\u2500\u2500", "\u2514\u2500\u2500", 1)
+        if meta.get("function_calls_truncated"):
+            lines.append("\u2514\u2500\u2500 *budget reached; the last answer was not sent back*")
+            lines[-2] = lines[-2].replace("\u2514\u2500\u2500", "\u251c\u2500\u2500", 1)
+        embed.add_field(name="Function Calls", value="\n".join(lines), inline=False)
+
     neuro = meta.get("neuro_state")
     if isinstance(neuro, dict) and neuro:
         embed.add_field(name="Neuro Engine", value=(
@@ -2500,7 +2514,9 @@ class GenerationTraceView(BlockedGuard, ui.View):
         if self.page == "memories" and self.is_owner:
             memories = [discord.utils.escape_markdown(str(m))
                         for m in self._meta.get("ltms_recalled") or []]
-            embed.description = ("**Recalled memories**, as they were added to the prompt "
+            # "reached the character", not "added to the prompt": a memory fetched by
+            # Memory Search arrives as a function result and is never in the prompt at all.
+            embed.description = ("**Recalled memories**, as they reached the character "
                                  "(first 100 characters each):\n\n" + self._numbered(memories))
         elif self.page == "sources":
             links = [self._source_link(u) for u in grounding_urls(self._meta)]

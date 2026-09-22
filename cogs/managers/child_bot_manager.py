@@ -18,8 +18,8 @@ from ..utils.constants import (
     IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS,
 )
 from ..utils.helpers import (_resolve_safety_settings, _split_into_sentences_with_abbreviations,
-                             apply_typing_cursor, image_rag_enabled, typing_cursor_cost,
-                             upload_too_large)
+                             apply_typing_cursor, image_command_prompt, image_rag_enabled,
+                             typing_cursor_cost, upload_too_large)
 from ..utils.attachment_limits import over_attachment_limit
 from ..utils.discord_cdn import signed_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
@@ -1079,9 +1079,7 @@ class ChildBotManager:
             else:
                 await self.execute_typing(bot_id, {"channel_id": channel_id})
 
-            image_prefixes = ("!image", "!imagine")
-            used_prefix = next((p for p in image_prefixes if message_data.get("content", "").lower().startswith(p)), "!image")
-            prompt_text = message_data.get("content", "")[len(used_prefix):].strip()
+            prompt_text = image_command_prompt(message_data.get("content", ""))
             if not prompt_text:
                 return
 

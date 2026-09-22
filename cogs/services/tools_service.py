@@ -6,15 +6,100 @@ import discord
 from typing import List, Dict, Any, Optional, Tuple
 
 from ..utils.constants import (
-    FALLBACK_MODEL_NAME, MAX_URL_CONTEXT_CHARACTERS, MAX_URL_FETCH_BYTES, WARN_URL_FETCHING_FAILED,
+    FALLBACK_MODEL_NAME, GROUNDING_RESEARCHER_MODEL,
+    MAX_GROUNDING_SUMMARY_CHARACTERS, MAX_URL_CONTEXT_CHARACTERS,
+    MAX_URL_FETCH_BYTES, WARN_URL_FETCHING_FAILED,
     WARN_GROUNDING_FAILED, DEFAULT_WEB_GROUNDING_VISUAL,
-    DEFAULT_WEB_GROUNDING_TEXT, PATTERN_HTML_CONTAINERS, PATTERN_HTML_TAGS,
+    DEFAULT_WEB_GROUNDING_TEXT, DEFAULT_WEB_SEARCH_RESEARCH,
+    PATTERN_HTML_CONTAINERS, PATTERN_HTML_TAGS,
     PATTERN_HTML_BLANKLINES, DEFAULT_GROUNDING_RAG_PAYLOAD,
 )
 from ..utils.helpers import (_format_api_error, _truncate_text_by_char, is_real_model,
                             resolve_thinking_params)
 from ..utils.net_guard import UnsafeURL, safe_stream
 from .api_service import GoogleGenAIModel
+
+
+#: The researcher's verdict, read off its first line. "yes" has to be the first word
+#: there, which is what the prompt asks for; anything the model decorates it with --
+#: a full stop, bold markers, an em dash and a comment -- no longer discards a search
+#: that has already been run and billed. A line that merely contains "yes" further
+#: along ("no, yes would need a search") is not a verdict and must not match.
+_GROUNDING_DECISION = re.compile(r'^[\s*_`"\'>-]*yes\b', re.IGNORECASE)
+
+
+#: The native search tool, as Google's REST body spells it. One object, because it is
+#: constant and both grounding paths send exactly it.
+_GOOGLE_SEARCH_TOOL = {"google_search": {}}
+
+#: What the researcher is sampled at. Low, in both paths: this call reports what a
+#: search returned, and creativity here is the failure mode, not the feature.
+_GROUNDING_GEN_CONFIG = {"temperature": 0.1, "top_p": 0.95}
+
+
+def _is_rerouted(raw: str) -> bool:
+    """True when `raw` names a model the grounding phase cannot honour.
+
+    The native Google Search tool has no OpenRouter equivalent in our adapter, so
+    anything routed there -- or to any other provider -- cannot serve this phase and is
+    answered by the standard Google fallback.
+    """
+    return bool(raw) and "/" in raw and not raw.upper().startswith("GOOGLE/")
+
+
+def _resolve_google_name(raw: str) -> str:
+    """The bare Google model id `raw` resolves to.
+
+    GoogleGenAIModel is constructed directly by both grounding paths rather than
+    through _instantiate_model, so the provider prefix has to come off on every branch
+    -- including the reroute one, whose default carries one.
+
+    The default is GROUNDING_RESEARCHER_MODEL and not FALLBACK_MODEL_NAME: this slot
+    must actually run the search tool, and the generic fallback does not. See that
+    constant -- it is the whole bug, and both modes hit it.
+    """
+    name = GROUNDING_RESEARCHER_MODEL if (not raw or _is_rerouted(raw)) else raw
+    return name[7:] if name.upper().startswith("GOOGLE/") else name
+
+
+def grounding_models(p_cfg: Optional[Dict[str, Any]]) -> Tuple[str, Optional[str]]:
+    """The profile's grounding summariser slot, as two bare Google ids.
+
+    Resolved before the retry rather than inside it, so run_with_fallback's "skip a
+    fallback equal to the primary" rule sees the model that will actually be called.
+    Two different OpenRouter ids both answer as the Google default, and retrying that
+    is one more call to be refused the same way.
+    """
+    p_cfg = p_cfg or {}
+    raw_primary = p_cfg.get("grounding_rag_model", GROUNDING_RESEARCHER_MODEL)
+    raw_fallback = p_cfg.get("grounding_rag_fallback_model")
+    primary = _resolve_google_name(raw_primary)
+    fallback = _resolve_google_name(raw_fallback) if is_real_model(raw_fallback) else None
+    for raw, resolved, slot in ((raw_primary, primary, "primary"),
+                                (raw_fallback, fallback, "fallback")):
+        if resolved and _is_rerouted(raw):
+            print(f"Grounding summariser: {slot} '{raw}' cannot serve the native "
+                  f"search tool; using '{resolved}' instead.")
+    return primary, fallback
+
+
+def grounding_sources(response) -> List[Dict[str, str]]:
+    """The web pages a grounded response cites, as {'uri', 'title'}.
+
+    An empty list is the signal both callers act on: a search that cited nothing was
+    answered from the model's own weights, which is the one thing this whole phase
+    exists to avoid.
+    """
+    sources: List[Dict[str, str]] = []
+    candidates = getattr(getattr(response, "raw", None), "candidates", None) or []
+    if not candidates or not getattr(response, "candidates", None):
+        return sources
+    metadata = getattr(candidates[0], "grounding_metadata", None)
+    for chunk in (getattr(metadata, "grounding_chunks", None) or ()):
+        web = getattr(chunk, "web", None)
+        if web is not None:
+            sources.append({"uri": web.uri, "title": web.title})
+    return sources
 
 
 # One httpx.AsyncClient for URL context fetching instead of one per call. Building a
@@ -273,7 +358,7 @@ class ToolsService:
         # configured grounding model. Reassigned to the model actually used below --
         # this used to stay hardcoded, so anyone who changed grounding_rag_model had
         # every grounding call attributed to flash-lite in their usage stats.
-        model_name = FALLBACK_MODEL_NAME
+        model_name = _resolve_google_name(GROUNDING_RESEARCHER_MODEL)
         try:
             history_for_decision = conversation_history
 
@@ -330,12 +415,7 @@ class ToolsService:
             payload_template = self.cog.global_prompts.get("GROUNDING_RAG_PAYLOAD", DEFAULT_GROUNDING_RAG_PAYLOAD)
             user_prompt = payload_template.format(transcript=history_transcript, query=user_query)
 
-            # [FIXED] Use universal dict configuration for Google GenAI v2 Tools
-            grounding_tool = {"google_search": {}}
-
             # [NEW] Utility Routing Logic for Grounding RAG
-            rag_model_raw = FALLBACK_MODEL_NAME
-            rag_fallback_raw = None
             # Bound up front rather than only inside the session branch: the grounding
             # phase runs without a resolvable session often enough, and an empty config
             # is exactly the "use the slot default" case the resolver is built for.
@@ -350,42 +430,8 @@ class ToolsService:
                         p_idx = self.cog.profile_manager._get_user_index(first_p["owner_id"])
                         is_b = first_p["profile_name"] in p_idx.get("borrowed", [])
                         p_cfg = self.cog.profile_manager._get_profile_config(first_p["owner_id"], first_p["profile_name"], is_b) or {}
-                        rag_model_raw = p_cfg.get("grounding_rag_model", FALLBACK_MODEL_NAME)
-                        rag_fallback_raw = p_cfg.get("grounding_rag_fallback_model")
 
-            gen_config = {"temperature": 0.1, "top_p": 0.95}
-
-            def _is_rerouted(raw: str) -> bool:
-                """True when `raw` names a model this phase cannot honour.
-
-                The native Google Search tool has no OpenRouter equivalent in our
-                adapter, so anything routed there -- or to any other provider -- cannot
-                serve this phase and is answered by the standard Google fallback.
-                """
-                return bool(raw) and "/" in raw and not raw.upper().startswith("GOOGLE/")
-
-            def _resolve_google_name(raw: str) -> str:
-                """The bare Google model id this raw name resolves to.
-
-                GoogleGenAIModel is constructed directly here rather than through
-                _instantiate_model, so the provider prefix has to come off on every
-                branch -- including the reroute one, whose default carries one.
-                """
-                name = FALLBACK_MODEL_NAME if (not raw or _is_rerouted(raw)) else raw
-                return name[7:] if name.upper().startswith("GOOGLE/") else name
-
-            # Resolved before the retry rather than inside it, so run_with_fallback's
-            # "skip a fallback equal to the primary" rule sees the model that will
-            # actually be called. Two different OpenRouter ids both answer as the Google
-            # default, and retrying that is one more call to be refused the same way.
-            rag_primary = _resolve_google_name(rag_model_raw)
-            rag_fallback = _resolve_google_name(rag_fallback_raw) if is_real_model(rag_fallback_raw) else None
-
-            for raw, resolved, slot in ((rag_model_raw, rag_primary, "primary"),
-                                        (rag_fallback_raw, rag_fallback, "fallback")):
-                if resolved and _is_rerouted(raw):
-                    print(f"Grounding summariser: {slot} '{raw}' cannot serve the native "
-                          f"search tool; using '{resolved}' instead.")
+            rag_primary, rag_fallback = grounding_models(p_cfg)
 
             # Set inside the attempt so the log names the model the call was actually
             # made against -- including which of the two it ended up on.
@@ -405,9 +451,10 @@ class ToolsService:
                     safety_settings=safety_settings,
                     thinking_params=resolve_thinking_params(
                         p_cfg, "grounding", "fallback" if is_fallback else "primary"),
-                    tools=[grounding_tool]
+                    tools=[_GOOGLE_SEARCH_TOOL]
                 )
-                return await model.generate_content_async([user_prompt], generation_config=gen_config)
+                return await model.generate_content_async(
+                    [user_prompt], generation_config=_GROUNDING_GEN_CONFIG)
 
             grounding_response, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
                 rag_primary, rag_fallback, _attempt, label="Grounding summariser")
@@ -419,16 +466,23 @@ class ToolsService:
             rag_text = grounding_response.text
 
             lines = rag_text.strip().split('\n')
-            decision = lines[0].strip().lower()
+            # Normalised, not compared raw. The search has already been made and paid
+            # for by the time this line is read, and an exact `== 'yes'` threw the whole
+            # result away over a full stop, a bold marker, or "yes -- searching now".
+            decision = _GROUNDING_DECISION.match(lines[0])
 
-            if decision != 'yes':
+            if not decision:
                 return None, [], False, None
 
             summary = "\n".join(lines[1:]).strip()
             if not summary:
                 return None, [], False, None
 
-            truncated_summary = _truncate_text_by_char(summary, MAX_URL_CONTEXT_CHARACTERS)
+            # The grounding budget, not the URL-context one. This used to truncate at
+            # MAX_URL_CONTEXT_CHARACTERS -- 16000, so never -- while the constant written
+            # for this call sat unread, and a thousand-word block landed in a roleplay
+            # turn and flattened the character's voice under it.
+            truncated_summary = _truncate_text_by_char(summary, MAX_GROUNDING_SUMMARY_CHARACTERS)
 
             if is_for_image:
                 summary_context = f"<external_context>\n{truncated_summary}\n</external_context>"
@@ -440,13 +494,7 @@ class ToolsService:
                     f"</external_context>"
                 )
 
-            sources = []
-            if grounding_response.candidates and hasattr(grounding_response.raw.candidates[0], 'grounding_metadata'):
-                metadata = grounding_response.raw.candidates[0].grounding_metadata
-                if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
-                    for chunk in metadata.grounding_chunks:
-                        if hasattr(chunk, 'web'):
-                            sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
+            sources = grounding_sources(grounding_response)
 
             if not sources:
                 warning_str = WARN_GROUNDING_FAILED.format(reason="The AI hallucinated a response without retrieving valid web citations.")
@@ -460,3 +508,85 @@ class ToolsService:
             return None, [], False, warning_str
         finally:
             self.cog._log_api_call(user_id=0, guild_id=guild_id, context="grounding_combined", model_used=model_name, status=status)
+
+    async def search_for_tool(self, query: str, *, guild_id: Optional[int],
+                              owner_id: Optional[int], profile_name: str,
+                              safety_settings: Optional[Dict] = None) -> Dict[str, Any]:
+        """The `search_web` function's answer, as the object handed back to the model.
+
+        The same Google model, the same native search tool and the same slot settings as
+        `_get_hybrid_grounding_context` -- and none of its transcript. The character has
+        already decided what it wants to know and written the query, so this call sends
+        one line where the legacy mode sends the conversation, and the research prompt
+        may not re-open a decision the turn has already paid for.
+
+        Every failure is answered rather than raised. The model is mid-reply waiting on
+        this, and "the search failed" is something a character can work around while a
+        dropped turn is not -- the same rule `recall` follows, for the same reason.
+        """
+        if not query:
+            return {"error": "search_web needs a `query` string."}
+        api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id or 0)
+        if not api_key:
+            return {"error": "Web search is unavailable: no Google API key for this server."}
+
+        index = self.cog.profile_manager._get_user_index(owner_id) if owner_id else {}
+        is_borrowed = profile_name in (index.get("borrowed") or [])
+        p_cfg = (self.cog.profile_manager._get_profile_config(
+            owner_id, profile_name, is_borrowed) or {}) if owner_id else {}
+
+        primary, fallback = grounding_models(p_cfg)
+        instructions = self.cog.global_prompts.get("WEB_SEARCH_RESEARCH",
+                                                   DEFAULT_WEB_SEARCH_RESEARCH)
+        status = "api_error"
+        model_name = primary
+        try:
+            async def _attempt(name, is_fallback):
+                nonlocal model_name
+                model_name = name
+                model = GoogleGenAIModel(
+                    api_key=api_key,
+                    model_name=name,
+                    system_instruction=instructions,
+                    safety_settings=safety_settings,
+                    thinking_params=resolve_thinking_params(
+                        p_cfg, "grounding", "fallback" if is_fallback else "primary"),
+                    tools=[_GOOGLE_SEARCH_TOOL],
+                )
+                return await model.generate_content_async(
+                    [query], generation_config=_GROUNDING_GEN_CONFIG)
+
+            response, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
+                primary, fallback, _attempt, label="Web search")
+            status = "success"
+
+            sources = grounding_sources(response)
+            summary = (getattr(response, "text", "") or "").strip()
+            if not summary:
+                return {"note": "That search returned nothing."}
+            # No sources means the model answered from its own weights without
+            # searching, which is the one outcome this whole phase exists to prevent --
+            # and handing it back as a result would launder a guess into a fact the
+            # character then states with a citation-shaped confidence. The `note` is
+            # deliberately something the character can act on.
+            #
+            # Printed, not silent. "Answered without searching" and "searched and found
+            # nothing" are the same empty result to every caller, and they want opposite
+            # responses -- the first is a model or prompt problem on a slot the operator
+            # chose, the second is the truth about the query. The legacy path surfaces
+            # the same condition as a channel warning; this one has a character waiting,
+            # so it goes to the log instead.
+            if not sources:
+                print(f"Web search: {model_name} answered without citing a search "
+                      f"({query[:60]!r}) -- dropped: {summary[:100]!r}")
+                return {"note": "That search found nothing on the web. Say you do not "
+                                "know rather than guessing."}
+            return {"summary": _truncate_text_by_char(summary, MAX_GROUNDING_SUMMARY_CHARACTERS),
+                    "sources": sources}
+        except Exception as e:  # noqa: BLE001 -- see docstring
+            print(f"search_web failed: {_format_api_error(e)}")
+            return {"error": "That search failed."}
+        finally:
+            self.cog._log_api_call(user_id=0, guild_id=guild_id or 0,
+                                   context="grounding_search_tool",
+                                   model_used=model_name, status=status)

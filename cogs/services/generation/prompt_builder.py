@@ -8,11 +8,16 @@ from typing import Any, Optional, Dict, List, Sequence, Tuple
 from ...utils.constants import (
     defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
     DEFAULT_SYSTEM_INSTRUCTION, DEFAULT_CONTEXT_RULES, DEFAULT_NEURO_INSTRUCTION,
+    DEFAULT_NEURO_INSTRUCTION_TOOL, DEFAULT_RECALL_INSTRUCTION,
+    DEFAULT_SEARCH_INSTRUCTION,
+    NEURO_AXES, NEURO_TOOL_NAME,
     DEFAULT_TRAINING_DATA_INJECTION, DEFAULT_TIME_CONTEXT, DEFAULT_NEGATIVE_CONSTRAINTS,
     DEFAULT_CONTENT_POLICY, DEFAULT_BIRTHDAY_CONTEXT,
 )
 from ...utils.birthdays import describe_birthday
-from ...utils.helpers import Timeout, _get_user_hash, default_profile_avatar_url
+from ...utils.helpers import (Timeout, _get_user_hash, default_profile_avatar_url,
+                             provider_speaks_beside_tools, provider_takes_functions,
+                             resolve_grounding_mode)
 
 #: The most users whose birthdays one prompt carries. A history window rarely holds more
 #: people than this, and the bound keeps a crowded channel from growing every prompt.
@@ -21,7 +26,8 @@ BIRTHDAY_USERS_MAX = 10
 
 class PromptBuilderMixin:
     """Persona/system-instruction assembly and the neuro-state extraction that
-    reads the model's <neuro_update> block back out of its response text.
+    reads the model's state back out of its reply -- from a `set_mood` call where the
+    provider carries one, and from a <neuro_update> block where it does not.
     """
 
     def _resolve_appearance_data(self, owner_id: int, profile_name: str) -> Tuple[str, str]:
@@ -123,12 +129,17 @@ class PromptBuilderMixin:
                 lines.append(line)
         return lines
 
-    def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None, present_users: Optional[Sequence[Tuple[int, str]]] = None) -> Tuple[str, bool, bool, float, float, int, str, str]:
+    def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None, present_users: Optional[Sequence[Tuple[int, str]]] = None, with_loop: bool = False) -> Tuple[str, bool, bool, float, float, int, str, str]:
         """The system instruction for one profile's generation, plus its sampling values.
 
         `present_users` is (user id, display name) for the people in the conversation, whose
         birthdays the character may know. A session derives them from its own log, so only
         a caller with no session -- Global Chat -- passes them.
+
+        `with_loop` says the caller runs a function loop and so will actually declare
+        the answering functions -- `recall` and `search_web`. It defaults to False
+        because most callers do not: the reply path and regeneration are the two that
+        do. See the two blocks it gates.
         """
         persona_data: Dict[str, List[str]] = {}
         # profile_owner_id is Optional, but profile_data is read unconditionally below.
@@ -211,6 +222,28 @@ class PromptBuilderMixin:
                                 + "\n\n".join(decrypted_parts).strip()
                                 + "\n</character_instructions>")
 
+        # Stable, so it sits with the persona rather than among the per-turn blocks:
+        # it never changes, and anything volatile placed ahead of it would invalidate
+        # the cached prefix it belongs to.
+        #
+        # `with_loop` and not merely the profile's toggle. Only a caller with a
+        # function loop declares `recall`, and telling a character it can search an
+        # archive it has no way to reach is worse than saying nothing -- it produces
+        # exactly the "let me check my memories" reply this block exists to stop.
+        if with_loop and profile_data.get("ltm_recall_tool_enabled"):
+            stable_parts.append(self.cog.global_prompts.get(
+                "RECALL_INSTRUCTION", DEFAULT_RECALL_INSTRUCTION))
+
+        # The same three tests `resolve_function_tools` applies to `search_web`, in the
+        # same order. CLAUDE.md's rule, and it is this pair that it was written about:
+        # disagree, and a character is told to call a declaration it was never sent, so
+        # it narrates the search it cannot run and the turn ends with nothing looked up.
+        if (with_loop and resolve_grounding_mode(profile_data) == "tool"
+                and provider_takes_functions(profile_data.get("primary_model"),
+                                             profile_data.get("fallback_model"))):
+            stable_parts.append(self.cog.global_prompts.get(
+                "SEARCH_INSTRUCTION", DEFAULT_SEARCH_INSTRUCTION))
+
         if is_multi_profile:
             # Standing context, not a history turn: the synopsis summarises turns that
             # have already left the STM window, so competing for a slot inside that
@@ -231,7 +264,22 @@ class PromptBuilderMixin:
                 volatile_parts.append(f"<game_context>\n{game_block}\n</game_context>")
 
         if neuro_enabled:
-            neuro_block = self.cog.global_prompts.get("NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION).format(
+            # Which spelling of the block to send: the one asking for a `set_mood` call,
+            # or the one asking for a `<neuro_update>` tag. Keyed off the models rather
+            # than a setting, because it is a provider capability and not a preference --
+            # and an operator who has overridden NEURO_ENGINE keeps their own text
+            # whichever provider answers, since the override names one prompt only.
+            #
+            # This test must stay the same one `resolve_function_tools` applies to the
+            # declaration. They are two halves of one decision, and disagreeing would
+            # tell a character to call a function that was never declared -- which it
+            # cannot do, so the mood would silently stop moving entirely.
+            tool_form = (provider_speaks_beside_tools(primary_model, fallback_model)
+                         and "NEURO_ENGINE" not in self.cog.global_prompts)
+            neuro_block = (
+                DEFAULT_NEURO_INSTRUCTION_TOOL if tool_form else
+                self.cog.global_prompts.get("NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION)
+            ).format(
                 d=neuro_state.get('dopamine', 50),
                 c=neuro_state.get('cortisol', 20),
                 o=neuro_state.get('oxytocin', 50),
@@ -308,7 +356,44 @@ class PromptBuilderMixin:
         final_system_instruction = current_instructions_str if current_instructions_str.strip() else DEFAULT_SYSTEM_INSTRUCTION
         return final_system_instruction, False, grounding_enabled, temperature, top_p, top_k, primary_model, fallback_model
 
-    def _extract_and_apply_neuro_state(self, raw_text: str, owner_id: int, profile_name: str) -> Tuple[str, Optional[Dict[str, int]]]:
+    def _neuro_state_from_calls(self, function_calls) -> Dict[str, int]:
+        """The `set_mood` arguments, clamped. Empty when no such call was made.
+
+        Clamped rather than refused because 0-100 is prose in the declaration: both
+        providers' schemas say "integer", not "integer in a range", so the bound has to
+        be applied here or not at all.
+
+        An axis that is absent or unreadable is left out, which reads as "did not
+        move". That is the same outcome the tag parser gave a pair it could not split,
+        with the difference that matters: here it can only happen to an axis the model
+        genuinely omitted, because a malformed *argument set* was already dropped whole
+        in `from_openrouter_message` and said so.
+        """
+        state: Dict[str, int] = {}
+        for call in function_calls or ():
+            if call.name != NEURO_TOOL_NAME:
+                continue
+            for axis in NEURO_AXES:
+                raw = call.args.get(axis)
+                # bool is an int in Python, and `set_mood(dopamine=True)` is a model
+                # error rather than 1 on a 0-100 scale.
+                if isinstance(raw, bool):
+                    continue
+                try:
+                    value = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                state[axis] = max(0, min(100, value))
+        return state
+
+    def _neuro_state_from_text(self, raw_text: str) -> Tuple[str, Dict[str, int]]:
+        """The `<neuro_update>` path: state read out of the reply, and the reply without it.
+
+        Still live for Ollama, whose adapter cannot carry a declaration, and as the
+        backstop for a model that was offered `set_mood` and emitted the tag anyway --
+        which is why the scrub runs whether or not a call came back. A tag that is
+        parsed but not scrubbed is said out loud in Discord.
+        """
         xml_pattern = r'<neuro_update>\s*(.*?)\s*</neuro_update>'
         data_str = None
         clean_text = raw_text
@@ -326,12 +411,12 @@ class PromptBuilderMixin:
                         data_str = match.group(0)
                         clean_text = re.sub(relaxed_pattern, '', raw_text, flags=re.IGNORECASE)
         except TimeoutError:
-            return raw_text.strip(), None
+            return raw_text.strip(), {}
 
         if not data_str:
-            return raw_text.strip(), None
+            return raw_text.strip(), {}
 
-        new_state = {}
+        new_state: Dict[str, int] = {}
         # Normalise separators for splitting
         normalised_data = data_str.replace('|', ':').replace(' ', '')
         kv_pairs = normalised_data.split(':')
@@ -349,7 +434,24 @@ class PromptBuilderMixin:
             except (ValueError, IndexError):
                 continue
 
-        clean_text = clean_text.strip()
+        return clean_text.strip(), new_state
+
+    def _extract_and_apply_neuro_state(self, raw_text: str, owner_id: int, profile_name: str,
+                                       response=None) -> Tuple[str, Optional[Dict[str, int]]]:
+        """The reply with any state marker removed, and the state it left behind.
+
+        `response` is the adapter response the text came from, when the caller still has
+        it. A `set_mood` call on it wins over anything in the text, because it cannot
+        have been mangled on the way: it arrives as arguments rather than as characters
+        the model had to spell correctly inside its own prose.
+
+        The text is scrubbed either way. A model offered the tool can still emit the
+        tag -- prompts are advice -- and an unscrubbed tag is `D:80|C:20|O:55|A:30`
+        appearing in the channel under the character's name.
+        """
+        clean_text, text_state = self._neuro_state_from_text(raw_text)
+        new_state = self._neuro_state_from_calls(getattr(response, "function_calls", None)) or text_state
+
         final_state = None
         if new_state:
             index = self.cog.profile_manager._get_user_index(owner_id)

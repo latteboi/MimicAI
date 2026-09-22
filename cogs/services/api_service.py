@@ -23,10 +23,11 @@ from ..utils.constants import (
 from ..utils.data_policy import openrouter_data_collection
 from ..managers.storage_manager import IOManager
 from ..utils.blob_stream import InlineBlobExtractor, is_blob_sentinel, sentinel_path
-from ..utils.helpers import (_resolve_safety_settings, billable_output_tokens, is_real_model,
+from ..utils.helpers import (_format_api_error, _resolve_safety_settings,
+                            billable_output_tokens, is_real_model,
                             google_thinking_caps, resolve_image_output_params,
                             resolve_image_tools, resolve_media_resolution,
-                            resolve_native_tools, resolve_openrouter_image_detail,
+                            resolve_function_tools, resolve_native_tools, resolve_openrouter_image_detail,
                             resolve_openrouter_endpoint, resolve_openrouter_service_tier,
                             resolve_thinking_params)
 from ..utils.http_client import get_shared_client
@@ -43,6 +44,7 @@ from .api.google_rest import (
     generate_google_tts_audio, get_google_rest_client, materialise_inline_data,
 )
 from .api.ollama import OllamaModel, OllamaResponse
+from .api.function_calls import as_google_tool
 from .api.openrouter import OpenRouterModel
 from .api.openrouter_catalogue import BROWSE_POPULAR, OpenRouterCatalogue
 from .api.openrouter_endpoints import ENDPOINTS_URL, Endpoint, base_model_id, parse_endpoints
@@ -72,6 +74,11 @@ _GOOGLE_RETRY_DELAY = re.compile(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"')
 # Quoted either way: OpenRouter's error body arrives as JSON text, or as the repr of a dict
 # when the error came inside a 200.
 _OPENROUTER_RATE_LIMIT_RESET = re.compile(r'''["']X-RateLimit-Reset["']\s*:\s*["']?(\d+)''', re.IGNORECASE)
+# What an upstream host asks for when the 429 is its own rather than OpenRouter's, which
+# is most of them on a free model: `retry_after_seconds`, and the same number again in a
+# `Retry-After` header OpenRouter passes through. Either spelling, whichever comes first.
+_UPSTREAM_RETRY_AFTER = re.compile(
+    r'''["'](?:retry_after_seconds|Retry-After)["']\s*:\s*["']?(\d+(?:\.\d+)?)''', re.IGNORECASE)
 
 
 def _rate_limit_rest_seconds(error: BaseException, now: Optional[float] = None) -> Optional[float]:
@@ -89,6 +96,11 @@ def _rate_limit_rest_seconds(error: BaseException, now: Optional[float] = None) 
         # Milliseconds since the epoch; seconds are accepted too.
         reset_at = reset / 1000 if reset > 10_000_000_000 else reset
         rest = reset_at - (time.time() if now is None else now)
+    elif match := _UPSTREAM_RETRY_AFTER.search(err_str):
+        # Floored at the default, never shortened by it: the host is answering for
+        # itself, and the pool behind a free model is shared with everyone else asking
+        # the same question. A hint longer than the default is taken at its word.
+        rest = max(float(match.group(1)), _RATE_LIMIT_REST_DEFAULT)
     return min(max(rest, _RATE_LIMIT_REST_MIN), _RATE_LIMIT_REST_MAX)
 
 
@@ -194,7 +206,7 @@ class APIService:
         #: the Hosts screen -- see openrouter_endpoints.
         self._endpoint_listings: "OrderedDict[str, Tuple[float, Tuple[Endpoint, ...]]]" = OrderedDict()
 
-    def _instantiate_model(self, raw_model_name: str, guild_id, user_id, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, profile_settings=None, openrouter_key_error: str = None, google_key_error: str = None, use_broad_openrouter_heuristic: bool = True, config_owner_id=None, policy_guild_id=None, conversation: bool = False, image_config=None, speech: bool = False):
+    def _instantiate_model(self, raw_model_name: str, guild_id, user_id, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, profile_settings=None, openrouter_key_error: str = None, google_key_error: str = None, use_broad_openrouter_heuristic: bool = True, config_owner_id=None, policy_guild_id=None, conversation: bool = False, image_config=None, speech: bool = False, function_tools=None):
         """One adapter for `raw_model_name`, keyed and policed for where it will run.
 
         `guild_id` picks whose key pays: the server's, or `user_id`'s own when None. A
@@ -209,6 +221,16 @@ class APIService:
 
         `config_owner_id` is the owner of the config that chose this model. Ollama is
         refused unless that is the bot owner, and refused when it is not given.
+
+        `tools` are the Google-only native tools (`google_search`, `url_context`) and go
+        nowhere else. `function_tools` are portable declarations, in the neutral spelling
+        `api.function_calls` documents, and reach every provider that can carry one --
+        which is why they are two arguments rather than one list to be sorted out
+        downstream. Ollama takes neither: see `resolve_function_tools`.
+
+        `function_tools` sits last, away from the `tools` it belongs beside, because a
+        dozen callers pass the first eight arguments positionally: inserting a parameter
+        in the middle silently rebinds `profile_settings` at every one of them.
 
         `image_config` makes it an image model: the profile's image output and sampling
         keys, resolved here for the model named. Every image path builds through here
@@ -285,7 +307,8 @@ class APIService:
                     image_params=resolve_image_output_params(image_config, f"OPENROUTER/{actual_name}"))
                 return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
             model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params, image_detail=image_detail, service_tier=service_tier, data_collection=data_collection,
-                                    endpoint=resolve_openrouter_endpoint(p_settings, actual_name))
+                                    endpoint=resolve_openrouter_endpoint(p_settings, actual_name),
+                                    tools=function_tools)
             return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
         elif is_ollama:
             if image_config is not None:
@@ -319,7 +342,14 @@ class APIService:
                                          tools=resolve_image_tools(image_config, raw_model_name),
                                          image_params=resolve_image_output_params(image_config, raw_model_name))
             else:
-                model = GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instruction, safety_settings=safety_settings, thinking_params=t_params, tools=tools, media_resolution=media_res)
+                # The native tools and the declarations ride in the same `tools` array
+                # here -- Google takes one list holding both kinds -- which is exactly
+                # the merge the two arguments exist to keep out of the callers.
+                google_tools = list(tools or ())
+                declared = as_google_tool(function_tools)
+                if declared:
+                    google_tools.append(declared)
+                model = GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instruction, safety_settings=safety_settings, thinking_params=t_params, tools=google_tools or None, media_resolution=media_res)
             return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
 
     async def run_with_fallback(self, primary: str, fallback: Optional[str], attempt,
@@ -362,8 +392,11 @@ class APIService:
                     raise
                 last_error = e
                 if not is_fallback and len(attempts) > 1:
+                    # The phrased reason, not the exception: a provider's error body is a
+                    # JSON document, and a journal on a 1 GB box is not where it belongs.
                     print(f"{label}: primary '{name}' failed "
-                          f"({type(e).__name__}: {e}); retrying on '{attempts[1][0]}'.")
+                          f"({type(e).__name__}: {_format_api_error(e)}); "
+                          f"retrying on '{attempts[1][0]}'.")
         raise last_error
 
     def get_top_models(self, provider: str, target_config_key: str,
@@ -545,9 +578,10 @@ class APIService:
         t_params = resolve_thinking_params(p_sett_thinking, "response")
 
         model_tools = resolve_native_tools(p_sett_thinking)
+        fn_tools = resolve_function_tools(p_sett_thinking)
 
         try:
-            model_instance = self._instantiate_model(model_to_create, guild_id, profile_owner_id_for_instructions, current_instructions, dynamic_safety_settings, t_params, model_tools, p_sett_thinking, config_owner_id=profile_owner_id_for_instructions)
+            model_instance = self._instantiate_model(model_to_create, guild_id, profile_owner_id_for_instructions, current_instructions, dynamic_safety_settings, t_params, model_tools, p_sett_thinking, config_owner_id=profile_owner_id_for_instructions, function_tools=fn_tools)
             model_init_error = False
         except Exception as e1:
             print(f"Err '{model_to_create}' key {model_cache_key}: {e1}. Fallback.")
@@ -558,7 +592,7 @@ class APIService:
             # the primary was tuned for. Unset still inherits the primary.
             t_params_fb = resolve_thinking_params(p_sett_thinking, "response", "fallback")
             try:
-                model_instance = self._instantiate_model(model_to_create, guild_id, profile_owner_id_for_instructions, current_instructions, dynamic_safety_settings, t_params_fb, model_tools, p_sett_thinking, config_owner_id=profile_owner_id_for_instructions)
+                model_instance = self._instantiate_model(model_to_create, guild_id, profile_owner_id_for_instructions, current_instructions, dynamic_safety_settings, t_params_fb, model_tools, p_sett_thinking, config_owner_id=profile_owner_id_for_instructions, function_tools=fn_tools)
                 model_init_error = False
             except Exception as e2:
                 return None, True, temperature, top_p, top_k, f"Model Initialization Error: Failed to load Primary ('{primary_model}') and Fallback ('{fallback_model}') models. Check your API key.", fallback_model
@@ -604,7 +638,7 @@ class APIService:
             if not primary_model.upper().startswith(("OPENROUTER/", "OLLAMA/")) and "/" not in primary_model:
                 model_tools = resolve_native_tools(profile_data)
                     
-            model = self._instantiate_model(primary_model, None, user_id, system_instructions, safety_settings, t_params, model_tools, profile_data,
+            model = self._instantiate_model(primary_model, None, user_id, system_instructions, safety_settings, t_params, model_tools, profile_data, function_tools=resolve_function_tools(profile_data),
                                             config_owner_id=source_owner_id, policy_guild_id=policy_guild_id,
                                             conversation=True)
             

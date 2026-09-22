@@ -11,21 +11,29 @@ from typing import List
 
 import httpx
 
-from ...utils.constants import OPENROUTER_DATA_POLICY_BLOCKED, THINKING_BUDGET_MAX
-from ...utils.helpers import (
-    resolve_openrouter_image_detail, resolve_openrouter_service_tier,
+from ...utils.constants import (
+    DOCUMENT_MIME_TYPES, OPENROUTER_AUDIO_FORMATS, OPENROUTER_DATA_POLICY_BLOCKED,
+    THINKING_BUDGET_MAX,
 )
-from ...utils.http_client import get_openrouter_client
+from ...utils.helpers import (
+    refuse_unreadable_modality, resolve_openrouter_image_detail,
+    resolve_openrouter_service_tier,
+)
+from ...utils.http_client import get_openrouter_client, get_shared_client
+from .function_calls import (as_openai_tools, from_openrouter_message,
+                             has_function_parts, openai_messages)
 from .output_cap import output_cap, refused_output_cap
 from .rest_view import _BlobRef, _RestView
-from .streaming import _FILE_BLOB_TOKEN, _aiter_streamed_body, _plan_streamed_body
-
+from .streaming import (
+    _FILE_BLOB_TOKEN, _aiter_streamed_body, _discard_staged, _plan_streamed_body,
+    _stream_to_tempfile,
+)
 
 
 class OpenRouterModel:
     def __init__(self, model_name, api_key, system_instruction=None, thinking_params=None,
                  image_detail=None, service_tier=None, data_collection=None, endpoint=None,
-                 **kwargs):
+                 tools=None, **kwargs):
         self.model_name = model_name.replace("OPENROUTER/", "").replace("GOOGLE/", "")
         self.api_key = api_key
         self.system_instruction = system_instruction
@@ -45,6 +53,11 @@ class OpenRouterModel:
         #: preference. Decided by the model factory from the data policy the request
         #: answers to -- a server's, or a Global Chat's -- see cogs/utils/data_policy.
         self.data_collection = data_collection
+        #: Function declarations in the neutral spelling, or None. Google-only tools
+        #: (`google_search`, `url_context`) never reach here: the resolver keeps them
+        #: apart, because this adapter would send them as a function named
+        #: "google_search" that no host implements and every host would try to call.
+        self.tools = tools
 
     async def generate_content_async(self, contents, generation_config=None, safety_settings=None, stream_state=None):
         messages = []
@@ -53,14 +66,55 @@ class OpenRouterModel:
         # it here: OpenRouter needs the bytes inline, but nothing needs five copies
         # of them in the heap at once.
         blob_files: List[str] = []
+        # The subset of `blob_files` this call downloaded, and so owns. A local path the
+        # caller handed in -- a generated image the round still needs -- is not ours to
+        # delete. Mirrors the same pair in the Ollama adapter.
+        staged_files: List[str] = []
         if self.system_instruction:
             messages.append({"role": "system", "content": self.system_instruction})
 
+        try:
+            await self._collect_parts(contents, messages, blob_files, staged_files)
+        except BaseException:
+            _discard_staged(staged_files)
+            raise
+
+        if self.image_detail:
+            for message in messages:
+                body = message.get("content")
+                if not isinstance(body, list):
+                    continue
+                for part in body:
+                    if part.get("type") == "image_url":
+                        part["image_url"]["detail"] = self.image_detail
+
+        return await self._dispatch(contents, messages, blob_files, staged_files,
+                                    generation_config, safety_settings, stream_state)
+
+    async def _collect_parts(self, contents, messages, blob_files: List[str],
+                             staged_files: List[str]) -> None:
+        """Turns `contents` into OpenAI-shaped messages, appended to `messages`.
+
+        Split out of `generate_content_async` so that a part this adapter cannot send --
+        an ogg, a video -- can raise from inside the loop and still have its predecessors'
+        staged files cleaned up by the caller.
+        """
         for content in contents:
             if isinstance(content, str):
                 content = {'role': 'user', 'parts': [content]}
 
             role = "assistant" if content.get('role', 'user') == "model" else "user"
+
+            # A tool loop's bookkeeping does not fit the content-part shape: OpenAI
+            # carries a call on the assistant *message* and each result as a message of
+            # its own, so this turn becomes one or more whole messages rather than a
+            # list of parts. Handled before the parts loop so the two cannot interleave.
+            raw_parts = content.get('parts', [])
+            if has_function_parts(raw_parts):
+                spoken = "".join(p for p in raw_parts if isinstance(p, str))
+                messages.extend(openai_messages(raw_parts, spoken))
+                continue
+
             message_parts = []
 
             for p in content.get('parts', []):
@@ -105,6 +159,33 @@ class OpenRouterModel:
                                     "url": f"data:{mime_type};base64,{token}"}})
                             except Exception as e:
                                 print(f"Error referencing local image for OpenRouter: {e}")
+                    elif mime_type.startswith("audio/"):
+                        # `input_audio` carries the bytes themselves -- there is no URL
+                        # form of it, which is why audio alone is staged to disk here
+                        # while a remote image is handed over as a link. An unsendable
+                        # format raises rather than being dropped -- see
+                        # helpers.refuse_unreadable_modality for why that is the fix.
+                        audio_format = OPENROUTER_AUDIO_FORMATS.get(mime_type)
+                        if not audio_format:
+                            refuse_unreadable_modality(mime_type)
+                        path = await self._stage_blob(url, staged_files)
+                        blob_files.append(path)
+                        message_parts.append({"type": "input_audio", "input_audio": {
+                            "data": _FILE_BLOB_TOKEN.format(len(blob_files) - 1),
+                            "format": audio_format}})
+                    elif mime_type in DOCUMENT_MIME_TYPES:
+                        path = await self._stage_blob(url, staged_files)
+                        blob_files.append(path)
+                        message_parts.append({"type": "file", "file": {
+                            "filename": os.path.basename(url.split("?", 1)[0]) or "document.pdf",
+                            "file_data": f"data:{mime_type};base64,{_FILE_BLOB_TOKEN.format(len(blob_files) - 1)}"}})
+                    else:
+                        # Video, and anything else that reached a media part. OpenRouter
+                        # has no content part for it on any model, so there is nothing to
+                        # send and nothing for the gateway to refuse -- this has to be the
+                        # refusal, or the turn goes out with the file silently missing and
+                        # the character answers as if it had read one.
+                        refuse_unreadable_modality(mime_type)
 
             if message_parts:
                 if len(message_parts) == 1 and message_parts[0]["type"] == "text":
@@ -112,15 +193,23 @@ class OpenRouterModel:
                 else:
                     messages.append({"role": role, "content": message_parts})
 
-        if self.image_detail:
-            for message in messages:
-                body = message.get("content")
-                if not isinstance(body, list):
-                    continue
-                for part in body:
-                    if part.get("type") == "image_url":
-                        part["image_url"]["detail"] = self.image_detail
+    async def _stage_blob(self, url: str, staged_files: List[str]) -> str:
+        """A local path for `url`, downloading it first when it is remote.
 
+        A path this call created is recorded in `staged_files` so the caller unlinks it;
+        one that was already local is not, because the round still owns it.
+        """
+        if url.startswith(('http://', 'https://')):
+            path = await _stream_to_tempfile(url, get_shared_client())
+            staged_files.append(path)
+            return path
+        if os.path.exists(url):
+            return url
+        raise Exception(f"OpenRouter could not read the attachment at {url}")
+
+    async def _dispatch(self, contents, messages, blob_files: List[str], staged_files: List[str],
+                        generation_config=None, safety_settings=None, stream_state=None):
+        """Builds the request body around `messages` and makes the call."""
         temp = 1.0
         top_p = 1.0
         advanced = {}
@@ -151,6 +240,10 @@ class OpenRouterModel:
         cap = output_cap(self.model_name)
         if cap:
             payload["max_tokens"] = cap
+
+        declared = as_openai_tools(self.tools)
+        if declared:
+            payload["tools"] = declared
 
         budget = int(self.thinking_params.get("thinking_budget", -1))
         level = self.thinking_params.get("thinking_level", "high").lower()
@@ -230,8 +323,12 @@ class OpenRouterModel:
 
             class OpenRouterThoughtResponse:
                 def __init__(self, content, reasoning, finish_reason, input_toks, output_toks,
-                             billed_cost=None, served_tier=None, served_by=None):
+                             billed_cost=None, served_tier=None, served_by=None,
+                             function_calls=None):
                     self.text = content
+                    #: Normalised the same way GoogleRESTResponse normalises its own,
+                    #: so a dispatcher never branches on which provider answered.
+                    self.function_calls = function_calls or []
                     self.thought = reasoning or ""
                     self.input_tokens = input_toks
                     self.output_tokens = output_toks
@@ -268,8 +365,11 @@ class OpenRouterModel:
                 usage_obj.get('cost'),
                 data.get('service_tier'),
                 data.get('provider') if isinstance(data.get('provider'), str) else None,
+                function_calls=from_openrouter_message(msg_obj),
             )
         except httpx.RequestError as e:
             raise Exception(f"OpenRouter Network Error: {str(e)}")
         except asyncio.CancelledError:
             raise
+        finally:
+            _discard_staged(staged_files)

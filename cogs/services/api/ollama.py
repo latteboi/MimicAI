@@ -14,10 +14,12 @@ from typing import List
 import httpx
 
 from ...utils.constants import OLLAMA_LOCAL_URL, THINKING_LEVELS_TO_OLLAMA, defaultConfig
+from ...utils.helpers import refuse_unreadable_modality
 from ...utils.http_client import get_shared_client
 from .rest_view import _BlobRef, _RestView
 from .streaming import (
-    _FILE_BLOB_TOKEN, _aiter_streamed_body, _plan_streamed_body, _stream_to_tempfile,
+    _FILE_BLOB_TOKEN, _aiter_streamed_body, _discard_staged, _plan_streamed_body,
+    _stream_to_tempfile,
 )
 
 
@@ -154,6 +156,17 @@ class OllamaModel:
                             match = re.match(r'data:image/[^;]+;base64,(.+)', url)
                             if match:
                                 images.append(match.group(1))
+                    else:
+                        # `/api/chat` carries an `images` array and nothing else -- there
+                        # is no audio, video or document channel on any Ollama model. The
+                        # file used to be dropped here without a word, which left the
+                        # character holding an `[Attached ...]` tag for something it had
+                        # never been shown; raising routes it to the media-free retry and,
+                        # on `simulated`, to the describer. The staged files go first:
+                        # this is the one raise in the loop, and the `finally` that would
+                        # otherwise clean them up is further down, inside the request.
+                        _discard_staged(staged_files)
+                        refuse_unreadable_modality(mime_type)
 
             msg_obj = {"role": role, "content": "\n".join(text_parts)}
             if images:
@@ -310,11 +323,7 @@ class OllamaModel:
                 # Only the ones this call downloaded. A local path handed in by the
                 # caller -- a generated image the round still needs -- is not ours
                 # to delete.
-                for path in staged_files:
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
+                _discard_staged(staged_files)
 
         # Outside the global lock, because the retry takes it again. Rebuilt from
         # `contents` rather than resent, since the streamed-body planner consumes the

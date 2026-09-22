@@ -29,8 +29,11 @@ _TAB_TITLES = {
     "persona": "Persona (identity)",
     "params": "Params (model and sampling)",
     "tools": "Tools (external systems and per-turn behaviour)",
-    "media": "Media (image generation and voice)",
-    "memory": "Memory (long-term memory and training examples)",
+    "images": "Images (what the character draws)",
+    "audio": "Audio (how the character sounds)",
+    "memory": "Memory (what the character remembers, and how it recalls it)",
+    "training": "Training (example replies that shape how it writes)",
+    "misc": "Misc (sharing, the library intro, error wording and the typing placeholder)",
 }
 
 # Dashboards whose views are built imperatively. Kept as (heading, [(tab, [actions])]).
@@ -67,13 +70,19 @@ _STATIC_DASHBOARDS = [
                 "Assign this key to... (Personal, and any server you administrate)",
                 "Save Assignments (an assignment is not stored until this is clicked)",
             ]),
+            ("About Me", [
+                "The user's own timezone and birthday, not a character's",
+            ]),
             ("Defaults", [
                 "Standing preferences applied to profiles created or borrowed LATER",
-                "Category dropdown: Response, Image, TTS, Grounding, Critic, LTM, Behaviour",
-                "Each model slot: Platform default, or a specific model per provider",
-                "Behaviour: typing cursor, reasoning effort, realistic typing, LTM "
-                "auto-creation, short-term memory length, timezone",
-                "Saved on selection -- there is no Save button on this tab",
+                "The same tabs and settings as `/profile manage`: Params, Tools, Images, "
+                "Audio, Memory, Training, Misc. Choosing a row opens the form "
+                "`/profile bulk manage` opens for it",
+                "Set Models gives every slot a Platform default option, which clears it",
+                "Anything left on Platform default follows the bot's own value, "
+                "including if that value changes later",
+                "Clear... takes a setting, or everything, back to Platform default",
+                "Saved as chosen -- there is no Save button on this tab",
                 "Does not change existing profiles; /profile bulk manage does that",
             ]),
             ("Child Bots", [

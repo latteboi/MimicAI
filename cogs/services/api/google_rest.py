@@ -31,6 +31,7 @@ from ...utils.http_client import get_shared_client
 from ...utils.memory_tuning import maybe_trim_malloc
 from ...utils.net_guard import safe_stream
 from ...utils import mem_probe
+from .function_calls import from_google_parts, google_part
 from .output_cap import RetryUncapped, output_cap, refused_output_cap
 from .rest_view import _BlobRef, _RestView, _to_camel, _wrap_rest
 from .streaming import (
@@ -259,6 +260,14 @@ class GoogleRESTModel:
         for p in raw_parts:
             if isinstance(p, str):
                 parts.append({"text": p})
+            elif isinstance(p, dict) and ('function_call' in p or 'function_response' in p):
+                # A tool loop's own bookkeeping, echoed back so the model sees the call
+                # it made and the answer it got. Translated rather than passed through:
+                # the neutral spelling is shared with OpenRouter, which needs whole
+                # messages for the same two things.
+                translated = google_part(p)
+                if translated:
+                    parts.append(translated)
             elif isinstance(p, dict) and 'mime_type' in p and 'data' in p:
                 parts.append({
                     "inlineData": {
@@ -645,6 +654,13 @@ class GoogleRESTResponse:
                     self.thought += part.text or ""
                 elif part.text:
                     self.text += part.text
+
+        #: Every function the model asked for, normalised. Empty on all but the
+        #: handful of calls that declared one, and read without knowing the provider
+        #: -- OpenRouterModel presents the same attribute.
+        self.function_calls = from_google_parts(
+            self.candidates[0].content.parts
+            if self.candidates and self.candidates[0].content else None)
 
         self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
 

@@ -7,9 +7,11 @@ from typing import Dict, List, Optional
 
 from ...utils.constants import (
     PLACEHOLDER_EMOJI,
-    DEFAULT_KICKSTART_START, DEFAULT_KICKSTART_IDLE, DEFAULT_IMAGE_PRESENT, DEFAULT_WHISPER_RECAP,
+    DEFAULT_KICKSTART_START, DEFAULT_IMAGE_PRESENT, DEFAULT_WHISPER_RECAP,
 )
-from ...utils.helpers import _format_history_entry, is_citation_subtext, turn_posted_at
+from ...utils.helpers import (_format_history_entry, image_command_prefix,
+                             is_citation_subtext, kickstart_note, ltm_auto_threshold,
+                             turn_posted_at)
 from ...utils.attachment_limits import over_attachment_limit
 from .reply import reply_gen_config, reply_meta
 
@@ -121,11 +123,8 @@ class RegenerationMixin:
                 lines = last_user_turn.get("content", "").split('\n')
                 body = "\n".join(l for l in lines
                                  if not re.match(r'^<.+> \[[^\]]+\]:', l) and not l.startswith("</")).strip()
-                for prefix in ("!image", "!imagine"):
-                    if body.lower().startswith(prefix):
-                        body = body[len(prefix):].strip()
-                        break
-                prompt_text = body
+                prefix = image_command_prefix(body)
+                prompt_text = body[len(prefix):].strip() if prefix else body
             template = self.cog.global_prompts.get("IMAGE_PRESENT", DEFAULT_IMAGE_PRESENT)
             return [template.format(prompt=prompt_text)] + [
                 {"url": a.url, "mime_type": a.content_type} for a in original_attachments]
@@ -253,9 +252,12 @@ class RegenerationMixin:
             )
             pending_whispers = self.cog.session_manager._get_pending_whispers_for_participant(earlier, bot_pid)
 
-            # Pseudo-turn injection to ensure history ends with a 'user' role
-            if history and history[-1].get('role', 'user') == 'model':
-                history.append({'role': 'user', 'parts': [self.cog.global_prompts.get("KICKSTART_IDLE", DEFAULT_KICKSTART_IDLE)]})
+            # Pseudo-turn injection to ensure history ends with a 'user' role. The same
+            # note a live round would get for the same silence -- `kickstart_note` owns
+            # which one that is, so a regenerate cannot answer it differently.
+            follow_up = kickstart_note(history, self.cog.global_prompts)
+            if follow_up:
+                history.append({'role': 'user', 'parts': [follow_up]})
             elif not history:
                 history.append({'role': 'user', 'parts': [self.cog.global_prompts.get("KICKSTART_START", DEFAULT_KICKSTART_START)]})
 
@@ -270,7 +272,8 @@ class RegenerationMixin:
             ltm_recall_text, training_examples = await asyncio.gather(
                 self.cog.memory_manager._get_relevant_ltm_for_prompt(
                     (channel.id, owner_id, profile_name), history, owner_id, profile_name,
-                    trigger_content, "User", channel.guild.id, payload.user_id),
+                    trigger_content, "User", channel.guild.id, payload.user_id,
+                    threshold=ltm_auto_threshold(p_settings)),
                 self.cog.memory_manager._get_relevant_training_examples(
                     owner_id, profile_name, trigger_content, channel.guild.id),
             )
@@ -278,7 +281,8 @@ class RegenerationMixin:
              primary_model, fallback_model_name) = await asyncio.to_thread(
                 self._construct_system_instructions,
                 owner_id, profile_name, channel.id, is_multi_profile=True,
-                training_examples_list=training_examples, recalled_ltm=ltm_recall_text
+                training_examples_list=training_examples, recalled_ltm=ltm_recall_text,
+                with_loop=True,  # reaches _attempt_reply, so the answering functions are declared
             )
 
             app_name, app_avatar = self._resolve_appearance_data(owner_id, profile_name)

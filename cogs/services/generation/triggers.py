@@ -1,13 +1,31 @@
 import uuid
 import discord
 import datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
-from ...utils.helpers import _format_history_entry, _get_user_hash
+from ...utils.helpers import (
+    _format_history_entry, _get_user_hash, attachment_mime, attachment_tag,
+    image_command_prefix, image_command_prompt, is_media_attachment,
+)
 from ...utils.attachment_limits import over_attachment_limit, skipped_attachment_note
 from ...utils.http_client import get_shared_client
 from ...managers.session_manager import intern_turn, log_user_turn
-from ...utils.constants import ROUND_MEDIA_MAX, ROUND_MEDIA_SKIPPED_NOTE
+from ...utils.constants import (
+    defaultConfig, ROUND_MEDIA_MAX, ROUND_MEDIA_SKIPPED_NOTE,
+)
+
+
+class UserTurn(NamedTuple):
+    """What one user message contributes to a round.
+
+    `text_attachments` is already inside `content` and is handed back separately for the
+    one caller that needs it on its own: an `!image` prompt, which is built from the
+    message before the turn is, and which reads a .txt because Discord caps a message at
+    2,000 characters. Returned rather than re-read, so the file is downloaded once.
+    """
+    content: str
+    media_parts: List[Dict[str, str]]
+    text_attachments: str
 
 
 class TriggerIntakeMixin:
@@ -17,7 +35,7 @@ class TriggerIntakeMixin:
 
     async def _compose_user_turn(self, typed: str, attachments: Sequence[Any],
                                  reply_context: Optional[str] = None, *,
-                                 edited: bool = False) -> Tuple[str, List[Dict[str, str]]]:
+                                 edited: bool = False) -> UserTurn:
         """A user message's turn content, and the media parts to send with it.
 
         The one builder for what a user's message says in `unified_log`: a new message, one
@@ -45,21 +63,39 @@ class TriggerIntakeMixin:
         media_parts = []
         att_tags = []
         for attachment in attachments:
-            is_dict = isinstance(attachment, dict)
-            ctype = (attachment.get('content_type') if is_dict else attachment.content_type) or ""
-            if not ctype.startswith(("image/", "audio/", "video/")):
+            if not is_media_attachment(attachment):
                 continue
             if over_attachment_limit(attachment):
                 att_tags.append(skipped_attachment_note(attachment))
                 continue
-            url = attachment.get('url') if is_dict else attachment.url
-            fname = (attachment.get('filename') if is_dict else attachment.filename) or 'attachment.png'
-            media_parts.append({"url": url, "mime_type": ctype})
-            att_tags.append(f"[Attached Image: {fname}]")
+            url = attachment.get('url') if isinstance(attachment, dict) else attachment.url
+            # The bare type, without Discord's `; charset=` parameters: it goes on the wire
+            # as a part's mimeType, and every provider matches it against a fixed table.
+            media_parts.append({"url": url, "mime_type": attachment_mime(attachment)})
+            att_tags.append(attachment_tag(attachment))
 
         if att_tags:
             content = f"{' '.join(att_tags)}\n{content}".strip()
-        return content, media_parts
+        return UserTurn(content, media_parts, text_att_content)
+
+    @staticmethod
+    def _extend_image_prompt(typed: str, text_attachments: str) -> str:
+        """An `!image` prompt with the text file attached to it folded in.
+
+        Discord caps a message at 2,000 characters for anyone without Nitro, which is not
+        much of a scene description, so a .txt stands in for the rest. It *appends* rather
+        than replaces: `!image in watercolour` plus a file of scene notes has to keep the
+        steer as well as the detail, and silently dropping what someone typed is the
+        worse failure of the two.
+
+        Capped at `LIMIT_IMAGE_PROMPT_CHARS`. The file itself is read to 40,000
+        characters, which is sized for a character to *read*; an image model attends to a
+        fraction of that and bills for all of it.
+        """
+        if not text_attachments:
+            return typed
+        joined = "\n\n".join(part for part in (typed, text_attachments) if part)
+        return joined[:defaultConfig.LIMIT_IMAGE_PROMPT_CHARS]
 
     @staticmethod
     def _round_media(new_round_turn_data) -> Tuple[List[Dict[str, str]], Optional[str]]:
@@ -181,17 +217,22 @@ class TriggerIntakeMixin:
                 recent_processed_ids.append(check_id)
             # ---------------------------
 
+            # Whether this trigger is the one that opened the image round, so the text file
+            # it carried can be folded into the prompt once `_compose_user_turn` below has
+            # read it. Reset per trigger: only the first `!image` in a batch starts a round.
+            image_prompt_from_this_trigger = False
+
             if (message_trigger or message_payload) and not is_image_gen_round:
                 trigger_content = message_payload['content'] if message_payload else message_trigger.clean_content
-                content_lower = trigger_content.lower()
 
-                image_prefixes = ("!image", "!imagine")
-                if any(content_lower.startswith(p) for p in image_prefixes):
-                    # Detection is now prefix-based only
+                # Detection is prefix-based only. The round opens on the prefix rather
+                # than on the prompt because a prompt this message does not carry may
+                # still arrive in a text file attached to it, folded in below -- which is
+                # also where a round that turns out to have nothing to draw is closed.
+                if image_command_prefix(trigger_content):
                     is_image_gen_round = True
-                    used_prefix = next((p for p in image_prefixes if content_lower.startswith(p)), "!image")
-                    image_gen_prompt = trigger_content[len(used_prefix):].strip()
-                    image_gen_anchor_message = message_trigger or message_payload
+                    image_gen_prompt = image_command_prompt(trigger_content) or ""
+                    image_prompt_from_this_trigger = True
 
             if message_trigger or message_payload:
                 is_child_mention = message_payload is not None
@@ -214,8 +255,19 @@ class TriggerIntakeMixin:
                 typed_text = trigger_obj['content'] if is_child_mention else trigger_obj.clean_content
 
                 raw_att_list = trigger_obj['attachments'] if is_child_mention else trigger_obj.attachments
-                content, own_media_parts = await self._compose_user_turn(
-                    typed_text, raw_att_list, reply_context)
+                user_turn = await self._compose_user_turn(typed_text, raw_att_list, reply_context)
+                content, own_media_parts = user_turn.content, user_turn.media_parts
+
+                if image_prompt_from_this_trigger:
+                    image_gen_prompt = self._extend_image_prompt(
+                        image_gen_prompt, user_turn.text_attachments)
+                    if not image_gen_prompt:
+                        # `!image` with nothing after it and no text file to fold in. An
+                        # empty prompt is a schema error on OpenRouter's Image API and
+                        # then the same empty prompt again on the fallback model, so no
+                        # image round opens and the message is an ordinary turn.
+                        is_image_gen_round = False
+                        image_prompt_from_this_trigger = False
 
                 # [NEW] URL Context Logic: Enforce Profile Setting & Separation
                 any_url_enabled = False

@@ -1,6 +1,7 @@
 import os
 import re
 import zlib
+import hashlib
 import asyncio
 import platform
 import discord
@@ -11,6 +12,8 @@ from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple, Any, Optional, Union
 import orjson as json
 from .constants import (
+    ATTACHMENT_TAG, ATTACHMENT_TAG_DEFAULT, ATTACHMENT_TAG_KINDS,
+    DOCUMENT_MIME_TYPES, TEXT_ATTACHMENT_EXTENSIONS,
     DISCORD_MAX_MESSAGE_LENGTH, API_ERROR_MAPPINGS, VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_TYPES,
     HARM_CATEGORIES, HarmBlockThreshold, HarmCategory,
     PATTERN_SYSTEM_XML_BLOCKS, PATTERN_SYSTEM_XML_ORPHANS,
@@ -18,7 +21,7 @@ from .constants import (
     PATTERN_TIMESTAMP_HEADER, PATTERN_METADATA, PATTERN_MESSAGE_LINK,
     PATTERN_SPEAKER_CLOSE,
     PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK,
-    IMAGE_MODEL_CAPS, IMAGE_MODEL_CAPS_DEFAULT, IMAGE_THINKING_LEVELS,
+    IMAGE_COMMAND_PREFIXES, IMAGE_MODEL_CAPS, IMAGE_MODEL_CAPS_DEFAULT, IMAGE_THINKING_LEVELS,
     OPENROUTER_IMAGE_CAPS_UNKNOWN, IMAGE_MIME_SUFFIXES, IMAGE_SUFFIX_MIMES,
     IMAGE_GROUNDING_TOOL_MODES, DEFAULT_TYPING_CURSOR,
     CRITIC_MODES, CRITIC_SCOPES, CRITIC_STRICTNESS_LEVELS, CRITIC_STRICTNESS_MIN_GRAM,
@@ -29,6 +32,11 @@ from .constants import (
     THINKING_LEVELS, THINKING_SLOT_KEYS, THINKING_SLOT_DEFAULTS,
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
     MEDIA_RESOLUTION_VALUES, MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL,
+    GROUNDING_MODE_LABELS,
+    DEFAULT_KICKSTART_CONTINUE, DEFAULT_KICKSTART_IDLE,
+    LTM_AUTO_THRESHOLD_WITH_TOOL, NEURO_AXES, NEURO_TOOL_DECLARATION, NEURO_TOOL_NAME,
+    RECALL_TOOL_DECLARATION, SEARCH_TOOL_DECLARATION,
+    SUPERSEDED_LTM_SUMMARIZATION_HASHES,
     OPENROUTER_SERVICE_TIER_VALUES,
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_KEYS, UNREADABLE_MEDIA_LABELS,
     UNREADABLE_MEDIA_VALUES,
@@ -240,6 +248,53 @@ def _is_history_effectively_empty(history: list) -> bool:
         if isinstance(turn, dict) and turn.get('role') == 'model':
             return False
     return True
+
+#: How many of a character's own turns in a row are answered with "Continue" before the
+#: note turns to "Idle", and how long the whole cycle is: one Continue, then two Idles,
+#: repeating. See `kickstart_note`.
+KICKSTART_FOLLOW_UP_CYCLE = 3
+
+
+def kickstart_note(history: List[Dict[str, Any]],
+                   global_prompts: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """The pseudo-user turn to append when a history ends on the character's own turn.
+
+    An adapter needs the last turn to be the user's, so a character speaking into
+    silence -- a proactive round, a regenerate, a cast that has run past everyone --
+    gets one written for it. Which one is what the character is told about that silence,
+    and the wording of all three is the operator's (`/mod` -> Kickstart).
+
+    Every follow-up used to be **Idle** ("no response from anyone, or no user is
+    present"), which is a true sentence and a terrible note to receive twice: told it is
+    alone, a character writes *about* being alone, and three turns later the room has
+    become the subject. **Continue** ("continue the public conversation") is the same
+    invitation without the premise. So the run alternates -- the first unanswered turn
+    is a lull in a conversation that is still going, and the two after it are the
+    silence it actually is -- and it cycles rather than latching, so a character left
+    alone all evening is periodically asked to carry on rather than told forty times
+    over that nobody is there.
+
+    The run length is `len(parts)` on the trailing model entry: `_build_history_for_participant`
+    merges consecutive same-role turns and contributes exactly one part per turn, so it
+    is how many times in a row this character has spoken with nobody -- no user, no
+    other participant -- answering. A turn from anyone else ends the entry, and the
+    history no longer ends on a model role at all.
+
+    Returns None when the history does not end on a model turn, which is the caller's
+    "append nothing".
+    """
+    if not history or history[-1].get('role', 'user') != 'model':
+        return None
+    prompts = global_prompts or {}
+    parts = history[-1].get('parts') or []
+    text = "".join(p if isinstance(p, str) else p.get('text', '') if isinstance(p, dict) else ''
+                   for p in parts)
+    # A private reply nobody else saw leaves the public conversation exactly where it
+    # was, however long the run: what it is owed is Continue, not a note about silence.
+    if "<private_response>" in text or len(parts) % KICKSTART_FOLLOW_UP_CYCLE == 1:
+        return prompts.get("KICKSTART_CONTINUE", DEFAULT_KICKSTART_CONTINUE)
+    return prompts.get("KICKSTART_IDLE", DEFAULT_KICKSTART_IDLE)
+
 
 def _sanitise_filename(name: str) -> str:
     """Removes any special characters or directory traversal dots/slashes."""
@@ -648,7 +703,12 @@ def _describe_api_error(error: Exception) -> str:
                     host = (err.get("metadata") or {}).get("provider_name") or "The model's host"
                     return f"**OpenRouter Rate Limit:** {host} is turning requests away. Try again shortly."
                 return f"**OpenRouter Rate Limit:** {msg}"
-            return "Provider Error" if msg == "Provider returned error" else f"OpenRouter: {msg}"
+            # Collapsed to one line: a schema error arrives as a pretty-printed JSON
+            # document inside `message`, which is a wall in the journal and a wall in
+            # the channel. Cut wide, since the rest is a host's own sentence.
+            msg = " ".join(msg.split())
+            return ("Provider Error" if msg == "Provider returned error"
+                    else _cut_outside_links(f"OpenRouter: {msg}", 300))
         except Exception: pass
 
     error_str_clean = re.sub(r'https?://[^\s]+', '', error_str).lower()
@@ -673,6 +733,55 @@ def upload_too_large(error: BaseException) -> bool:
     lose both. No other refusal says anything about the attachment.
     """
     return isinstance(error, discord.HTTPException) and (error.status == 413 or error.code == 40005)
+
+
+def attachment_mime(attachment: Any) -> str:
+    """An attachment's type, lowercased and without its parameters.
+
+    Takes a `discord.Attachment` or the dict a child bot's payload carries, because every
+    caller here is reached from both and each used to unpack the two shapes by hand.
+    Discord sends `text/plain; charset=utf-8`, so the parameters have to come off before
+    anything compares the type.
+    """
+    raw = attachment.get("content_type") if isinstance(attachment, dict) else getattr(attachment, "content_type", None)
+    return (raw or "").split(";", 1)[0].strip().lower()
+
+
+def attachment_filename(attachment: Any) -> str:
+    name = attachment.get("filename") if isinstance(attachment, dict) else getattr(attachment, "filename", None)
+    return name or "attachment"
+
+
+def is_media_attachment(attachment: Any) -> bool:
+    """Whether this goes to a model as a media part rather than being read as text.
+
+    The single test, because the intake, the child-bot payload builder and the reply
+    scanner all ask it: a type one of them forwards and another drops is a file the
+    character is told about and never shown.
+    """
+    mime = attachment_mime(attachment)
+    return mime.startswith(("image/", "audio/", "video/")) or mime in DOCUMENT_MIME_TYPES
+
+
+def is_text_attachment(attachment: Any) -> bool:
+    """Whether this is read as text and folded into the turn that carried it."""
+    mime = attachment_mime(attachment)
+    if mime in DOCUMENT_MIME_TYPES:
+        # A PDF is `application/`, never `text/`, but say so rather than rely on that:
+        # it goes to the model whole, and reading it as text as well would send it twice.
+        return False
+    return mime.startswith("text/") or attachment_filename(attachment).lower().endswith(TEXT_ATTACHMENT_EXTENSIONS)
+
+
+def attachment_tag(attachment: Any) -> str:
+    """What a turn says to announce the file it carried: `[Attached Audio: note.ogg]`.
+
+    The kind is read from the mime rather than assumed. Every attachment was announced as
+    an Image, so a character sent a voice message was told it had been sent a picture --
+    and on a model that could not hear it, that tag was the whole of what it got.
+    """
+    kind = ATTACHMENT_TAG_KINDS.get(attachment_mime(attachment).split("/", 1)[0], ATTACHMENT_TAG_DEFAULT)
+    return ATTACHMENT_TAG.format(kind=kind, filename=attachment_filename(attachment))
 
 
 def voice_sample_mime_type(content_type: Optional[str], filename: Optional[str]) -> Optional[str]:
@@ -810,6 +919,29 @@ def resolve_image_output_params(image_config, raw_name: Optional[str]) -> dict:
                 continue
 
     return out
+
+
+def image_command_prefix(content: Optional[str]) -> Optional[str]:
+    """Which IMAGE_COMMAND_PREFIXES prefix `content` opens with, or None for neither."""
+    lowered = (content or "").lower()
+    return next((p for p in IMAGE_COMMAND_PREFIXES if lowered.startswith(p)), None)
+
+
+def image_command_prompt(content: Optional[str]) -> Optional[str]:
+    """What an image command asks to be drawn, or None when there is nothing to draw.
+
+    Nothing to draw is None rather than "": a bare `!image` is a slip, not a request,
+    and an empty prompt is refused by OpenRouter's Image API as a schema error and then
+    sent to the fallback model unchanged, so it costs two calls to answer nobody. Every
+    entry point asks this one question, so none of them can be the one that forgets.
+
+    A session round may still fold an attached text file in afterwards
+    (`_extend_image_prompt`), which is why it asks again after that rather than here.
+    """
+    prefix = image_command_prefix(content)
+    if prefix is None:
+        return None
+    return (content or "")[len(prefix):].strip() or None
 
 
 def image_suffix_for_mime(mime_type: Optional[str]) -> str:
@@ -971,6 +1103,26 @@ def clean_model_name(name: Optional[str]) -> str:
     in one of them and another way in the next reads as two different models.
     """
     return (name or "").replace("models/", "").replace("OPENROUTER/", "").replace("GOOGLE/", "")
+
+
+def refuse_unreadable_modality(mime_type: str) -> None:
+    """Raises the refusal a provider would have raised, for a file an adapter cannot send.
+
+    OpenRouter has no content part for video and Ollama has none for anything but images,
+    so for those there is no request to make and no gateway message to read: this has to
+    be the refusal. The text carries the phrase `UNREADABLE_MEDIA_KEYS` matches, because
+    that is what `unreadable_media_modality` reads to decide the media-free retry, and
+    what `_format_api_error` turns into "Unsupported File Format" for the reader. A part
+    dropped without one is a file the character is never told it missed -- it keeps the
+    `[Attached ...]` tag and answers as though it had read the thing.
+    """
+    modality = mime_type.split("/", 1)[0]
+    # 'image' for anything else, because the reply path knows only these three labels and
+    # the recovery is identical for all of them -- `_retry_without_media` strips every
+    # attachment whichever is named. Unreachable from the intake, which admits only
+    # image, audio, video and the document types an adapter handles by name.
+    key = UNREADABLE_MEDIA_KEYS.get(modality, UNREADABLE_MEDIA_KEYS['image'])[0]
+    raise Exception(f"No endpoints found that support {key} for {mime_type}")
 
 
 def unreadable_media_modality(error: Exception) -> Optional[str]:
@@ -1217,6 +1369,42 @@ def image_rag_enabled(image_config) -> bool:
     return (image_config or {}).get("image_grounding_mode") == "rag"
 
 
+def is_shipped_ltm_prompt(text: str, live_default: str) -> bool:
+    """Whether `text` is a default nobody authored, rather than an owner's own prompt.
+
+    True for the wording in force right now, and for any default this project has
+    shipped before -- profiles created while the default was seeded carry an encrypted
+    copy of whichever one was current that day, and a copy is not an authorship claim.
+    Hashes rather than the old strings themselves, so retiring a prompt costs one line
+    and never leaves a superseded default sitting in the file to be edited by mistake.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    if stripped == (live_default or "").strip():
+        return True
+    return hashlib.sha256(stripped.encode("utf-8")).hexdigest() in SUPERSEDED_LTM_SUMMARIZATION_HASHES
+
+
+def clip_to_sentence(text: str, limit: int) -> str:
+    """`text` cut to `limit` characters, at a sentence end where there is one.
+
+    A stored memory is embedded whole, so a hard cut mid-clause embeds half a thought
+    and matches accordingly. Falls back to the hard cut only when nothing in range ends
+    a sentence.
+    """
+    stripped = (text or "").strip()
+    if len(stripped) <= limit:
+        return stripped
+    window = stripped[:limit]
+    end = max(window.rfind(". "), window.rfind("! "), window.rfind("? "),
+              window.rfind("."), window.rfind("!"), window.rfind("?"))
+    # Half the limit, so a single runaway sentence is not cut down to its first clause.
+    if end >= limit // 2:
+        return window[:end + 1].strip()
+    return window.rstrip()
+
+
 def is_real_model(name: Optional[str]) -> bool:
     """False for the empty, missing and explicit "no fallback" values.
 
@@ -1249,7 +1437,13 @@ def is_gateway_shutdown(exc: BaseException) -> bool:
 
 
 def resolve_grounding_mode(config: Optional[Dict[str, Any]]) -> str:
-    """One of "off", "rag", "native" -- the only three values the rest of the code sees.
+    """One of "off", "rag", "tool", "native" -- the only values the rest of the code sees.
+
+    "tool" is the dashboard's **RAG**: the character calls `search_web` when it wants
+    one. "rag" is **Legacy RAG**: a gate model reads the transcript before every round
+    and decides. The stored spelling is the older one because renaming it on disk would
+    have to walk every profile, so the display names and the stored names differ here
+    and only here -- `_grounding_display` in gui_profiles is the other side of it.
 
     The setting has had three encodings: a bool, then "on"/"on+", then today's
     RAG/NATIVE. Nothing normalises it on write, so all three are still on disk and
@@ -1263,7 +1457,18 @@ def resolve_grounding_mode(config: Optional[Dict[str, Any]]) -> str:
         return "rag" if raw else "off"
     if raw in ("on", "on+"):
         return "rag"
-    return raw if raw in ("off", "rag", "native") else "off"
+    return raw if raw in ("off", "rag", "tool", "native") else "off"
+
+
+def grounding_mode_display(config: Optional[Dict[str, Any]]) -> str:
+    """A profile's grounding mode as the dashboard shows it, markdown and all.
+
+    One function for every surface, because the stored name and the shown name differ
+    for two of the four modes and a second copy of that mapping is how "RAG" came to
+    mean two things at once.
+    """
+    label = GROUNDING_MODE_LABELS.get(resolve_grounding_mode(config), "Off")
+    return "`OFF`" if label == "Off" else f"**`{label.upper()}`**"
 
 
 def resolve_url_mode(config: Optional[Dict[str, Any]]) -> str:
@@ -1288,6 +1493,127 @@ def resolve_native_tools(config: Optional[Dict[str, Any]]) -> Optional[List[Dict
     if resolve_url_mode(config) == "native":
         tools.append({"url_context": {}})
     return tools or None
+
+
+def provider_takes_functions(*raw_model_names: Optional[str]) -> bool:
+    """Whether every model named can carry a function declaration.
+
+    Every one, not any: the prompt that asks for a tool call is written once for the
+    turn, and `run_with_fallback` may answer it on the fallback. A profile whose
+    primary is OpenRouter and whose fallback is Ollama would otherwise be told to call
+    a function on the turns that fall through, and report its mood to nobody.
+
+    Ollama is the only provider excluded, and only because its adapter streams -- see
+    `resolve_function_tools`. An empty name is the "use the slot default" case, which
+    resolves to a Google model.
+    """
+    return not any((name or "").upper().startswith("OLLAMA/") for name in raw_model_names)
+
+
+def provider_speaks_beside_tools(*raw_model_names: Optional[str]) -> bool:
+    """Whether every model named will still say something while calling a function.
+
+    A *recording* declaration -- one whose result nobody needs -- is only free when the
+    model answers beside it. Where it does not, the turn comes back with no text and
+    has to be sent again just to get a reply, so the declaration costs a whole extra
+    request per seated character and buys nothing a `<neuro_update>` tag did not.
+
+    Measured, on one model through two routes (prod_tests/function_calls_live.py, 5
+    runs each). `gemini-2.5-flash` on Google's own endpoint answered beside `set_mood`
+    4 times in 5 and correctly left the call out of a flat turn 5 times in 5. The same
+    model through OpenRouter withheld its reply 5 times in 5 and called on every flat
+    turn as well -- the gateway's OpenAI-compatible layer reads a declared tool as a
+    much stronger instruction. So this is a property of the route, not the model, and
+    keying it on the prefix is the whole of it.
+
+    `recall` is not subject to this: its extra request fetches something, so it is a
+    cost with a return. Only fire-and-forget declarations are gated here.
+    """
+    if not provider_takes_functions(*raw_model_names):
+        return False
+    return not any((name or "").upper().startswith("OPENROUTER/")
+                   for name in raw_model_names)
+
+
+def resolve_function_tools(config: Optional[Dict[str, Any]], *,
+                           with_loop: bool = False) -> Optional[List[Dict]]:
+    """The function declarations this profile's turns should carry.
+
+    Deliberately separate from `resolve_native_tools`, because the two answer to
+    opposite constraints. `google_search` and `url_context` exist only on Google and
+    must never be rewritten for another provider; a function declaration is carried by
+    every provider that speaks tools at all. Returning them in one list would force a
+    choice between sending Google-only tools to OpenRouter as functions no host
+    implements, and withholding portable declarations from the provider most profiles
+    actually route to.
+
+    Ollama is absent on purpose: its adapter streams `/api/chat`, and a tool call
+    arrives there split across chunks with no accumulator written for it yet. A profile
+    on Ollama keeps the `<neuro_update>` tag, which is why that path is still live.
+
+    `with_loop` says whether the caller can answer a function and ask again. Only the
+    session reply path can, so it is the only one that may declare an *answering*
+    function: offering `recall` to a generation that cannot hand the memories back
+    leaves the model waiting for a result it will never see, and a turn whose whole
+    response was one unanswered call has no text to say.
+
+    A recording function needs no loop, but it does need a route that answers beside a
+    call -- see `provider_speaks_beside_tools`, where the measurement is. Where that is
+    not true the profile keeps the `<neuro_update>` tag, which costs one request rather
+    than two for the same state.
+    """
+    config = config or {}
+    models = (config.get("primary_model"), config.get("fallback_model"))
+    tools = []
+    if config.get("neuro_engine_enabled") and provider_speaks_beside_tools(*models):
+        tools.append(NEURO_TOOL_DECLARATION)
+    if with_loop and config.get("ltm_recall_tool_enabled") and provider_takes_functions(*models):
+        tools.append(RECALL_TOOL_DECLARATION)
+    # Grounding's "tool" mode is this declaration and nothing else -- there is no
+    # pre-pass to fall back on, so a profile whose slot cannot carry a function gets no
+    # grounding at all rather than a silent downgrade to the legacy call it did not ask
+    # for. `prompt_builder` gates its instruction block on the same two tests.
+    if with_loop and resolve_grounding_mode(config) == "tool" and provider_takes_functions(*models):
+        tools.append(SEARCH_TOOL_DECLARATION)
+    return tools or None
+
+
+def ltm_auto_recall_enabled(config: Optional[Dict[str, Any]]) -> bool:
+    """Whether the automatic long-term memory pass runs for this profile at all.
+
+    Absent means **on**, and that is the whole point of reading it through a function.
+    Recall has been unconditional for the life of the setting, so every profile written
+    before the toggle existed has no key -- and defaulting those to off would make a
+    character that has been remembering things for months quietly stop, with nothing
+    on screen saying why. New profiles are created with an explicit False instead, so
+    "off by default" is a property of the template rather than of absence.
+
+    The `recall` tool is a separate setting and is not consulted here: pull-only
+    retrieval -- the automatic pass off, Memory Search on -- is a legitimate and much
+    cheaper shape, and folding the two together would make it unreachable.
+    """
+    raw = (config or {}).get("ltm_recall_enabled")
+    return True if raw is None else bool(raw)
+
+
+def ltm_auto_threshold(config: Optional[Dict[str, Any]]) -> Optional[float]:
+    """The relevance threshold the automatic LTM pass should use for this profile.
+
+    None means "the profile's own setting", which is the answer whenever `recall` is
+    not actually available -- the toggle off, or a slot on Ollama, which cannot carry
+    the declaration. Narrowing the automatic pass on a turn that has no tool to make
+    up the difference is not a trade, it is just less memory.
+
+    The models are read from the config rather than passed, because every call site
+    has the config and only some of them have the names.
+    """
+    config = config or {}
+    if not config.get("ltm_recall_tool_enabled"):
+        return None
+    if not provider_takes_functions(config.get("primary_model"),
+                                    config.get("fallback_model")):
+        return None
+    return LTM_AUTO_THRESHOLD_WITH_TOOL
 
 
 def resolve_critic_settings(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:

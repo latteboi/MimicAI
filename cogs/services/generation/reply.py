@@ -15,16 +15,20 @@ from typing import Any, Dict, List, Optional
 from ...utils import mem_probe
 from ...utils.constants import (
     ERR_GENERAL_ERROR, ERR_REASON_EMPTY_RESPONSE, ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK,
+    LIMIT_FUNCTION_CALL_ROUNDS,
     MEDIA_DESCRIBED_NOTE, MEDIA_UNREADABLE_NOTE, WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED,
     WARN_MAIN_MODEL_FAILED, WARN_MEDIA_DESCRIBED, WARN_MEDIA_UNREADABLE,
 )
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _resolve_safety_settings, _scrub_response_text,
-    clean_model_name, is_real_model, media_kinds, record_billed_usage, resolve_native_tools,
+    clean_model_name, is_real_model, media_kinds, record_billed_usage,
+    resolve_function_tools, resolve_native_tools,
     resolve_thinking_params, resolve_unreadable_media_mode, split_media_parts,
     unreadable_media_modality,
 )
 from ._shared import _strip_neuro_update_and_scrub
+from .tool_loop import (FunctionContext, carry_forward, execute, exchange_turns,
+                        function_call_label, needs_continuation, split_calls)
 
 #: Sampling keys a profile may set beyond temperature, top_p and top_k. Sent only when set.
 _ADVANCED_SAMPLING_KEYS = ("frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a")
@@ -54,6 +58,15 @@ class ReplyAttempt:
     #: Merged into the turn's trace. Carries what the describe pass cost, which belongs
     #: on the turn that paid for it rather than inside the reply's own token counts.
     extra_meta: Dict[str, Any] = field(default_factory=dict)
+    #: Memories the character fetched by calling `recall`, as text. They reach the model
+    #: through a function response rather than the injected archive block, so nothing
+    #: downstream can recover them from the prompt -- and the trace is judged on them.
+    recalled_memories: List[str] = field(default_factory=list)
+    #: Pages the character's own `search_web` calls cited. The legacy grounding mode
+    #: collects its sources before the turn starts and the native one leaves them on the
+    #: final response; this mode's arrive mid-turn on a function result, so without this
+    #: a grounded reply would post with no citations under it and an empty audit line.
+    search_sources: List[Dict[str, str]] = field(default_factory=list)
 
     @property
     def has_fallback(self) -> bool:
@@ -101,6 +114,18 @@ def response_sources(candidate) -> List[Dict[str, str]]:
     return sources
 
 
+def _merge_sources(*groups: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Every source once, in the order first seen, keyed on the URI."""
+    seen, out = set(), []
+    for group in groups:
+        for source in group or ():
+            uri = source.get('uri')
+            if uri and uri not in seen:
+                seen.add(uri)
+                out.append(source)
+    return out
+
+
 def reply_meta(attempt: ReplyAttempt, *, duration: float, training_examples, ltm_recall_text,
                sources, neuro_state, critic: Optional[Dict] = None) -> Dict:
     """The trace a generated turn carries. Small: it rides in every turn of the log."""
@@ -117,9 +142,20 @@ def reply_meta(attempt: ReplyAttempt, *, duration: float, training_examples, ltm
         "ltms_recalled": [],
     }
     record_billed_usage(meta, response)
-    if ltm_recall_text:
-        lines = [l.strip() for l in ltm_recall_text.split('\n') if l.strip() and not l.startswith("<")]
-        meta["ltms_recalled"] = [l[:100] + "..." if len(l) > 100 else l for l in lines]
+    # Both halves of retrieval, in the order the character received them: what the
+    # automatic pass injected, then whatever it fetched by calling `recall`. Only the
+    # first used to be recorded, and a tool result never touches the prompt text -- so
+    # switching Memory Search on, which raises the automatic threshold, made the audit
+    # read `0 memories` on precisely the turns that had recalled the most.
+    lines = ([l.strip() for l in ltm_recall_text.split('\n')
+              if l.strip() and not l.startswith("<")] if ltm_recall_text else [])
+    lines.extend(m.strip() for m in attempt.recalled_memories if m and m.strip())
+    seen = set()
+    for line in lines:
+        clipped = line[:100] + "..." if len(line) > 100 else line
+        if clipped not in seen:
+            seen.add(clipped)
+            meta["ltms_recalled"].append(clipped)
     if neuro_state:
         meta["neuro_state"] = neuro_state
     if critic:
@@ -157,6 +193,9 @@ class ReplyMixin:
         attempt = ReplyAttempt(primary_name=primary_model, fallback_name=fallback_model_name)
         safety_settings = _resolve_safety_settings(channel, p_settings)
         tools = resolve_native_tools(p_settings)
+        # The one path with a function loop, so the one path that may declare a
+        # function whose answer the model has to be handed back.
+        fn_tools = resolve_function_tools(p_settings, with_loop=True)
 
         def build(name: str, role: str, **key_errors):
             thinking = resolve_thinking_params(p_settings, "response", role)
@@ -165,13 +204,63 @@ class ReplyMixin:
             thinking["thinking_persistence"] = p_settings.get("thinking_persistence", 10)
             return self.cog.api_service._instantiate_model(
                 name, channel.guild.id, user_id, system_instruction, safety_settings,
-                thinking, tools, p_settings, config_owner_id=owner_id, **key_errors)
+                thinking, tools, p_settings, config_owner_id=owner_id,
+                function_tools=fn_tools, **key_errors)
+
+        fn_ctx = FunctionContext(
+            owner_id=owner_id,
+            profile_name=(participant or {}).get('profile_name', ''),
+            author_dn=app_name,
+            guild_id=channel.guild.id if getattr(channel, 'guild', None) else None,
+            triggering_user_id=user_id,
+            # Already resolved for this reply, off the destination channel. `search_web`
+            # asks a second model on behalf of this turn and must be held to the same
+            # rules the turn is, not to Google's unset defaults.
+            safety_settings=safety_settings)
 
         async def generate(model, is_fallback: bool, contents: Optional[List] = None):
-            attempt.response, _ = await self._generate_with_heartbeat(
-                model, history if contents is None else contents, gen_config, channel,
-                participant, msg_a_id, is_fallback=is_fallback,
-                app_name=app_name, app_avatar=app_avatar, existing_state=state_container)
+            # A copy, because a function round appends to it: `history` is the caller's
+            # and is reused by the fallback attempt, which must start from the same
+            # conversation rather than inheriting the primary's abandoned lookups.
+            turn = list(history if contents is None else contents)
+            carried, ran, found, cited = [], [], [], []
+            for _round in range(LIMIT_FUNCTION_CALL_ROUNDS + 1):
+                attempt.response, _ = await self._generate_with_heartbeat(
+                    model, turn, gen_config, channel,
+                    participant, msg_a_id, is_fallback=is_fallback,
+                    app_name=app_name, app_avatar=app_avatar, existing_state=state_container)
+                if not attempt.response or not attempt.response.candidates:
+                    raise ValueError("Response blocked or empty")
+                answering, recording = split_calls(attempt.response)
+                # Not `if not answering`: a model that recorded its mood and said
+                # nothing has to be let go on, or the turn has no reply at all.
+                pending = needs_continuation(attempt.response, answering, recording)
+                if not pending:
+                    break
+                # Kept for the response that finally speaks -- see carry_forward.
+                carried.extend(recording)
+                results = await execute(self.cog, pending, fn_ctx)
+                for call, value in results:
+                    if call not in answering:
+                        continue
+                    ran.append(function_call_label(call, value))
+                    if isinstance(value, dict):
+                        found.extend(m for m in (value.get("memories") or ()) if isinstance(m, str))
+                        cited.extend(src for src in (value.get("sources") or ())
+                                     if isinstance(src, dict) and src.get("uri"))
+                turn.extend(exchange_turns(results, getattr(attempt.response, 'text', "") or ""))
+            else:
+                # Out of budget with a call still pending. The response below may
+                # therefore have no text, which raises like any other empty reply --
+                # but the audit should say why rather than leaving it as a mystery.
+                attempt.extra_meta["function_calls_truncated"] = True
+            carry_forward(attempt.response, carried)
+            if ran:
+                attempt.extra_meta["function_calls"] = ran
+            # Assigned, not extended: the fallback ran its own searches from the same
+            # history, and the trace describes the reply that was actually posted.
+            attempt.recalled_memories = found
+            attempt.search_sources = cited
             if not attempt.response or not attempt.response.candidates:
                 raise ValueError("Response blocked or empty")
             text = getattr(attempt.response, 'text', "").strip()
@@ -296,7 +385,8 @@ class ReplyMixin:
         except Exception as e:
             # The refusal already in `attempt.error` is kept: it is the one that explains
             # the turn, and this second failure is usually the same model saying so twice.
-            print(f"Retry without attachments failed: {type(e).__name__}: {e}")
+            # Phrased rather than raw, for the reason `run_with_fallback`'s line is.
+            print(f"Retry without attachments failed: {type(e).__name__}: {_format_api_error(e)}")
             return
 
         attempt.media_dropped = kinds
@@ -337,10 +427,16 @@ class ReplyMixin:
                 if hasattr(candidate, 'grounding_metadata'):
                     raw_text = _add_inline_citations(raw_text, candidate.grounding_metadata)
                 raw_text, reply.neuro_state = self._extract_and_apply_neuro_state(
-                    raw_text.strip(), owner_id, profile_name)
+                    raw_text.strip(), owner_id, profile_name, response=response)
                 text = _scrub_response_text(raw_text, participant_names=participant_names)
                 if text:
-                    reply.text, reply.sources = text, response_sources(candidate)
+                    # Both halves: what the answering response cited natively, and what
+                    # the character's own `search_web` calls brought back. Deduplicated
+                    # on the URI, because a Google slot in tool mode can cite the same
+                    # page through both routes in one turn.
+                    reply.text = text
+                    reply.sources = _merge_sources(response_sources(candidate),
+                                                   attempt.search_sources)
                 else:
                     template = WARN_BOTH_MODELS_FAILED if attempt.fallback_used else WARN_MAIN_MODEL_FAILED
                     reply.warnings.append(template.format(reason=ERR_REASON_EMPTY_RESPONSE))

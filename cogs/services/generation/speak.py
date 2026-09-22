@@ -11,7 +11,7 @@ from ...utils.constants import (
 )
 from ...utils.helpers import (
     _format_history_entry, _resolve_safety_settings, _scrub_response_text,
-    resolve_native_tools, resolve_thinking_params,
+    resolve_function_tools, resolve_native_tools, resolve_thinking_params,
 )
 from ...managers.session_manager import intern_turn
 
@@ -237,6 +237,7 @@ class SpeakAsMixin:
 
         safety_settings = _resolve_safety_settings(channel, p_settings)
         tools = resolve_native_tools(p_settings)
+        fn_tools = resolve_function_tools(p_settings)
 
         gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
         # Mutated in place by every attempt, so a fallback keeps ticking the card the
@@ -254,7 +255,7 @@ class SpeakAsMixin:
                 model_name, guild_id, owner_id, system_instruction, safety_settings,
                 resolve_thinking_params(p_settings, "response",
                                         "fallback" if is_fallback else "primary"),
-                tools, p_settings, config_owner_id=owner_id,
+                tools, p_settings, config_owner_id=owner_id, function_tools=fn_tools,
             )
             return await self._generate_with_heartbeat(
                 model, contents, gen_config, channel, None, None,
@@ -282,7 +283,7 @@ class SpeakAsMixin:
                                model_used=model_used, status="success")
 
         text = (getattr(response, 'text', "") or "").strip()
-        text, _ = self._extract_and_apply_neuro_state(text, owner_id, profile_name)
+        text, _ = self._extract_and_apply_neuro_state(text, owner_id, profile_name, response=response)
 
         # The model routinely echoes the tag it was addressed in. Both are in
         # SYSTEM_XML_TAGS, so PATTERN_SYSTEM_XML_BLOCKS would delete the entire reply

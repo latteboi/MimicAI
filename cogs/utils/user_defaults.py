@@ -71,6 +71,19 @@ DEFAULT_NEW_ONLY = frozenset({
     "error_response",
 })
 
+#: Switches that only make sense turned on together: {key: companion}.
+#:
+#: One entry, and it earns itself. A new profile is created with Auto-Recall off, and a
+#: standing default of "LTM Auto-Creation on" would otherwise produce a profile that
+#: writes a memory every ten messages and never reads one back -- an archive filling up
+#: behind a character that cannot see it, with nothing on any screen saying so. The
+#: single-profile toggle and the bulk row already pair the two (`_ltm_creation_payload`);
+#: this is the third writer, and the one nobody is watching when it runs.
+#:
+#: Only "on" propagates. Turning creation off says nothing about whether the memories
+#: already written are worth recalling.
+DEFAULT_COMPANIONS = {"ltm_creation_enabled": "ltm_recall_enabled"}
+
 # Built once from the action table. PROFILE_ACTIONS is fixed at import, so this cannot
 # change for the life of the process, and it is consulted on every profile creation.
 _CACHED_KEYS: Optional[Dict[str, str]] = None
@@ -147,7 +160,13 @@ def apply_defaults(config: Dict[str, Any], defaults: Optional[Dict[str, Any]], *
             continue
         config[key] = value
         applied.append(key)
-    return sorted(applied)
+        # A companion the user set for themselves wins; this only fills the gap the
+        # template left. See DEFAULT_COMPANIONS.
+        companion = DEFAULT_COMPANIONS.get(key)
+        if companion and value and companion not in cleaned:
+            config[companion] = True
+            applied.append(companion)
+    return sorted(set(applied))
 
 
 #: Prefix -> the provider name `_get_api_key_for_user` and the key slots use.
@@ -213,6 +232,8 @@ def model_slot_labels() -> Dict[str, str]:
 SETTING_LABELS = {
     "stm_length": "Short-Term Memory",
     "ltm_creation_enabled": "LTM Auto-Creation",
+    "ltm_recall_enabled": "LTM Auto-Recall",
+    "ltm_recall_tool_enabled": "Memory Search",
     "ltm_creation_interval": "LTM Creation Interval",
     "ltm_context_size": "LTM Recall Depth",
     "ltm_relevance_threshold": "LTM Relevance Threshold",

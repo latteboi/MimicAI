@@ -77,7 +77,8 @@ for its own figure. It prints the `MIMIC_GENERATION_SLOTS` that fits.
 
 The loop is uvloop when it is installed (`cogs/utils/event_loop.py`, `MIMIC_UVLOOP=0` to
 turn it off). Nothing depends on which: `tests/test_event_loop.py` runs the bot's signal,
-executor and HTTP edges on both.
+executor and HTTP edges on both. Falling back to asyncio is silent by nature, so the boot
+line names the reason — not installed, older than 0.18 (uvloop.run), or turned off.
 
 Secrets are read once. `constants._get_gcp_client()` builds the Secret Manager client on
 first use and `_release_gcp_client()` drops it the moment `defaultConfig` is built, because

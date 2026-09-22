@@ -15,7 +15,10 @@ from ..utils.constants import *
 from ..utils.member_probe import start_member_probe
 from ..utils import mem_probe
 from ..utils.content import WELCOME_MESSAGE, WELCOME_CHANNEL_HINTS
-from ..utils.helpers import _format_history_entry, _get_user_hash
+from ..utils.helpers import (
+    _format_history_entry, _get_user_hash, image_command_prompt, is_media_attachment,
+    is_text_attachment,
+)
 from ..utils.attachment_limits import over_attachment_limit
 from ..utils.fuzzy import MAX_CHOICES, rank_keyed
 
@@ -324,11 +327,12 @@ class EventListeners:
                             "payload": {"action": "start_typing", "channel_id": message.channel.id}
                         }))
 
-            content_lower = message.content.lower()
-            image_prefixes = ("!image", "!imagine")
-            is_image_request = content_lower.startswith(image_prefixes)
+            # A bare `!image` is not an image request: the image handler has nothing to
+            # draw and answers with silence, where an ordinary mention gets a reply.
+            is_image_request = image_command_prompt(message.content) is not None
 
-            attachments_data = [{"url": a.url, "filename": a.filename, "content_type": a.content_type, "size": a.size} for a in message.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/") or a.content_type.startswith("text/") or a.filename.lower().endswith(('.txt', '.log', '.md', '.csv', '.json', '.py', '.js', '.html', '.css', '.xml')))]
+            attachments_data = [{"url": a.url, "filename": a.filename, "content_type": a.content_type, "size": a.size}
+                                for a in message.attachments if is_media_attachment(a) or is_text_attachment(a)]
             
             reply_data = None
             if ref_msg:
@@ -1036,8 +1040,8 @@ class EventListeners:
             # and quoted reply survive the edit. Read from the message as it is now: an
             # attachment removed in the edit goes from the turn too.
             reply_context = await self.generation_service._resolve_reply_context(msg)
-            new_content, _ = await self.generation_service._compose_user_turn(
-                msg.clean_content, msg.attachments, reply_context, edited=True)
+            new_content = (await self.generation_service._compose_user_turn(
+                msg.clean_content, msg.attachments, reply_context, edited=True)).content
 
             # Format and inject, keeping the original timestamp
             original_ts = msg.created_at

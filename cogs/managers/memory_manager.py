@@ -48,10 +48,12 @@ else:
 
 from ..utils.constants import (
     defaultConfig, FALLBACK_MODEL_NAME, DEFAULT_SAFETY_SETTINGS,
-    MIN_HISTORY_FOR_LTM_CREATION,
+    MAX_LTM_SUMMARY_CHARACTERS, MIN_HISTORY_FOR_LTM_CREATION,
     DEFAULT_TRAINING_ANALYST_PROMPT,
+    RECALL_TOOL_MAX, RECALL_TOOL_THRESHOLD,
 )
 from ..utils.helpers import (Timeout, _format_api_error, _get_sanitized_history_and_author,
+                            clip_to_sentence, ltm_auto_recall_enabled,
                             resolve_thinking_params, suppress_link_previews)
 from .storage_manager import IOManager
 from ..services.api_service import get_embedding_vector
@@ -60,6 +62,23 @@ from ..services.api_service import get_embedding_vector
 def encode_embedding_b64(embedding: List[float]) -> str:
     if not embedding: return ""
     return base64.b64encode(np.array(embedding, dtype=np.float16).tobytes()).decode('ascii')
+
+
+#: How a summariser declines, in the forms it actually declines in. The prompt asks for
+#: NO_SUMMARY and nothing else; models add a full stop, bold it, write it with a space,
+#: or answer in plain words. Anchored, and the literal is the first thing required.
+PATTERN_LTM_ABSTAIN = re.compile(r'^\W*no[\s_-]*summary\b', re.IGNORECASE)
+
+
+def _is_abstention(text: str) -> bool:
+    """Whether the summariser declined to write a memory.
+
+    Matched against the start of the reply rather than the whole of it: "NO_SUMMARY --
+    nothing here was worth keeping" is a decline, and the exact-equality test this
+    replaces stored that sentence as a memory, embedded it, and injected it into every
+    later turn. No real memory can open this way, so a prefix test costs nothing.
+    """
+    return bool(PATTERN_LTM_ABSTAIN.match((text or "").strip()))
 
 def decode_embedding_b64(b64_str: str) -> np.ndarray:
     if not b64_str: return np.array([], dtype=np.float32)
@@ -434,7 +453,22 @@ class MemoryManager:
             import shutil
             shutil.copy2(src_path, new_path)
 
-    async def _get_relevant_ltm_for_prompt(self, session_key: Any, history: list, profile_owner_id: int, profile_name: str, msg_content: str, author_dn: str, guild_id: Optional[int], triggering_user_id: int) -> Optional[str]:
+    async def _search_ltm(self, session_key: Any, history: list, profile_owner_id: int,
+                          profile_name: str, msg_content: str, author_dn: str,
+                          guild_id: Optional[int], triggering_user_id: int, *,
+                          threshold: Optional[float] = None, size: Optional[int] = None,
+                          use_cooldown: bool = True) -> List[str]:
+        """The memories `msg_content` retrieves, as decrypted summaries.
+
+        Shared by the automatic pass and the `recall` function, which want the same
+        search on different terms. The keyword arguments are what differs: an explicit
+        recall judges against `RECALL_TOOL_THRESHOLD` rather than the profile's, asks
+        for more of them, and does not consult the repeat cooldown.
+
+        That last one matters. The cooldown exists to stop the same memory being
+        *re-injected unasked* every turn it happens to match. A character that has just
+        asked for something is entitled to be told, however recently it was last shown.
+        """
         index = self.cog.profile_manager._get_user_index(profile_owner_id)
         is_borrowed = profile_name in index.get("borrowed", [])
 
@@ -462,13 +496,15 @@ class MemoryManager:
             params_to_use = params_source
 
         if not params_source:
-            return None
+            return []
 
-        ltm_context_size = int(params_to_use.get("ltm_context_size", params_source.get("ltm_context_size", 3)))
-        ltm_relevance_threshold = float(params_to_use.get("ltm_relevance_threshold", params_source.get("ltm_relevance_threshold", 0.75)))
+        ltm_context_size = int(size if size is not None else params_to_use.get(
+            "ltm_context_size", params_source.get("ltm_context_size", 3)))
+        ltm_relevance_threshold = float(threshold if threshold is not None else params_to_use.get(
+            "ltm_relevance_threshold", params_source.get("ltm_relevance_threshold", 0.75)))
 
         if ltm_context_size == 0:
-            return None
+            return []
 
         # Redirect LTM loads to the borrower's local path if running in a borrowed session
         session_owner_id = None
@@ -490,17 +526,17 @@ class MemoryManager:
         # The early exit is kept so an empty shard still skips the embedding round trip.
         ltm_data = await asyncio.to_thread(self._load_ltm_shard, owner_id_str, ltm_profile_name)
         if not ltm_data:
-            return None
+            return []
         all_profile_ltms = ltm_data.get(context_type, [])
         if not all_profile_ltms:
-            return None
+            return []
 
         prompt_embedding = await self._get_embedding(msg_content, guild_id, task_type="RETRIEVAL_QUERY")
         if not prompt_embedding:
-            return None
+            return []
 
         current_turn = len(history)
-        session_cooldown_history = self.cog.ltm_recall_history.get(session_key, {})
+        session_cooldown_history = self.cog.ltm_recall_history.get(session_key, {}) if use_cooldown else {}
 
         ltm_shard_path = self.cog.storage_manager._get_shard_path("ltm", owner_id_str, ltm_profile_name)
         try:
@@ -588,23 +624,78 @@ class MemoryManager:
         final_memories = await asyncio.to_thread(_thread_search_ltm)
 
         if not final_memories:
-            return None
+            return []
 
-        if session_key not in self.cog.ltm_recall_history:
+        # Written under the same flag that reads it. An explicit recall passes no
+        # session_key -- it does not consult the cooldown -- and recording one anyway
+        # would file every deliberate lookup under the key None and then suppress those
+        # memories from the automatic pass of a session that never showed them.
+        if use_cooldown and session_key not in self.cog.ltm_recall_history:
             self.cog.ltm_recall_history[session_key] = {}
 
         recalled_summaries = []
         for mem_data in final_memories:
             ltm = mem_data["ltm"]
-            self.cog.ltm_recall_history[session_key][ltm['id']] = (current_turn, mem_data["original_sim"])
+            if use_cooldown:
+                self.cog.ltm_recall_history[session_key][ltm['id']] = (current_turn, mem_data["original_sim"])
 
             decrypted_sum = self.cog.storage_manager._decrypt_data(ltm.get('sum', ''))
             recalled_summaries.append(decrypted_sum)
 
         if not recalled_summaries:
+            return []
+
+        return recalled_summaries
+
+    async def recall_for_tool(self, profile_owner_id: int, profile_name: str, query: str,
+                              author_dn: str, guild_id: Optional[int],
+                              triggering_user_id: int) -> Dict[str, Any]:
+        """The `recall` function's answer, as the object handed back to the model.
+
+        No session key and no history: an explicit recall does not consult the repeat
+        cooldown, and those two arguments exist only to serve it.
+
+        A miss is answered rather than left empty. "I searched and there is nothing"
+        and "the search never ran" are the same silence to a model, and the second one
+        is what invites it to invent a memory instead.
+        """
+        summaries = await self._search_ltm(
+            None, [], profile_owner_id, profile_name, query, author_dn, guild_id,
+            triggering_user_id, threshold=RECALL_TOOL_THRESHOLD, size=RECALL_TOOL_MAX,
+            use_cooldown=False)
+        if not summaries:
+            return {"memories": [],
+                    "note": "Nothing in your long-term memories matches that."}
+        return {"memories": summaries}
+
+    async def _get_relevant_ltm_for_prompt(self, session_key: Any, history: list, profile_owner_id: int, profile_name: str, msg_content: str, author_dn: str, guild_id: Optional[int], triggering_user_id: int, *, threshold: Optional[float] = None) -> Optional[str]:
+        """The automatic pass: what this round retrieves, wrapped for injection.
+
+        `threshold` is raised to `LTM_AUTO_THRESHOLD_WITH_TOOL` by callers whose profile
+        also declares `recall`, so the unasked injection narrows to what retrieval is
+        sure of while everything below it stays reachable by asking. Left alone, the
+        profile's own setting applies and the behaviour is what it always was.
+
+        The Auto-Recall toggle is read here rather than at the three call sites, so a
+        fourth caller cannot be written that ignores it, and so the exit lands before
+        the shard read *and* the query embedding -- a profile with this off pays nothing
+        per turn rather than paying for a search whose result is discarded. `recall`
+        does not come through here and is deliberately unaffected: pull-only retrieval
+        is its own mode.
+        """
+        index = self.cog.profile_manager._get_user_index(profile_owner_id)
+        is_borrowed = profile_name in index.get("borrowed", [])
+        config = self.cog.profile_manager._get_profile_config(
+            profile_owner_id, profile_name, is_borrowed) or {}
+        if not ltm_auto_recall_enabled(config):
             return None
 
-        return "<archive_context>\n" + "\n".join(recalled_summaries) + "\n</archive_context>"
+        summaries = await self._search_ltm(
+            session_key, history, profile_owner_id, profile_name, msg_content,
+            author_dn, guild_id, triggering_user_id, threshold=threshold)
+        if not summaries:
+            return None
+        return "<archive_context>\n" + "\n".join(summaries) + "\n</archive_context>"
 
     async def _get_relevant_training_examples(self, profile_owner_id: int, profile_name: str, msg_content:str, guild_id: int)->List[str]:
         # [UPDATED] Check context size before disk or API activity
@@ -770,7 +861,11 @@ class MemoryManager:
         if len(convo) > 3000: # Slightly higher limit for formatted text
             convo = convo[-3000:]
 
-        instructions = self.cog.profile_manager._default_ltm_summarization_instructions()
+        # One resolver, shared with the screen that edits this prompt: a profile that
+        # never wrote one of its own follows the live default rather than a copy frozen
+        # into it the day it was created.
+        instructions = self.cog.profile_manager.resolve_ltm_summarization_instructions(
+            profile_owner_id, profile_name)
         # Bound unconditionally: it is only populated for a known profile, and the reads
         # below used to hedge on `'params_source' in locals()` -- which is correct and
         # invisible, so the next edit is one NameError away.
@@ -779,15 +874,6 @@ class MemoryManager:
             user_index = self.cog.profile_manager._get_user_index(profile_owner_id)
             is_borrowed = profile_name in user_index.get("borrowed", [])
             params_source = self.cog.profile_manager._get_profile_config(profile_owner_id, profile_name, is_borrowed) or {}
-
-            source_owner_id, source_profile_name = self.cog.profile_manager._resolve_effective_profile(profile_owner_id, profile_name)
-            prompts = self.cog.profile_manager._get_profile_prompts(source_owner_id, source_profile_name) or {}
-
-            encrypted_instructions = prompts.get("ltm_summarization_instructions")
-            if encrypted_instructions:
-                # A stored-but-blank value used to yield blank instructions.
-                instructions = (self.cog.storage_manager._decrypt_data(encrypted_instructions).strip()
-                                or self.cog.profile_manager._default_ltm_summarization_instructions())
 
         cfg = {"temperature": 0.2}
 
@@ -823,8 +909,13 @@ class MemoryManager:
                 if candidate.content and candidate.content.parts:
                     response_text = "".join(p.text for p in candidate.content.parts if hasattr(p, 'text')).strip()
 
-            if response_text and response_text.upper() != "NO_SUMMARY":
-                return response_text
+            # Normalised, not compared raw. "NO_SUMMARY." and "No summary needed." both
+            # used to pass this test and be stored, embedded and injected as a memory --
+            # a permanent entry whose whole content is the model declining to write one.
+            if response_text and not _is_abstention(response_text):
+                # The prompt asks for two sentences; nothing made that true. A model
+                # that writes six stores six, forever, and embeds as their average.
+                return clip_to_sentence(response_text, MAX_LTM_SUMMARY_CHARACTERS)
         except Exception as e:
             err_str = str(e)
             # A missing/misconfigured key is a configuration state, not a transient

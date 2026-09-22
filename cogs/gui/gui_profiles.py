@@ -10,9 +10,11 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional
 from ..utils.content import OLLAMA_GUIDE_TEXT
 from ..utils.helpers import (
-    _pf, _pi, _ps, _pb, clean_model_name, is_real_model, image_model_caps,
+    _pf, _pi, _ps, _pb, clean_model_name, is_real_model, is_shipped_ltm_prompt,
+    image_model_caps,
     openrouter_image_ratios, resolve_critic_settings,
-    google_thinking_caps, resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
+    google_thinking_caps, grounding_mode_display, ltm_auto_recall_enabled,
+    resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
     resolve_unreadable_media_mode,
 )
@@ -136,8 +138,21 @@ def ProfileBirthdayModal(cog, profile_name: str, current: Optional[Dict[str, int
         return {"prompts": {"birthday": parse_birthday(v["day"], v["month"], v["year"], allow_year=True)}}
     return ConfigModal(cog, profile_name, False, "Character Birthday", fields, parser, callback, target_user_id)
 
-#: Tab order for ProfileManageView's nav bar. "persona" is hidden for borrowed profiles.
-PROFILE_TABS = ("home", "persona", "params", "tools", "media", "memory")
+#: Tab order for ProfileManageView's nav bar. "persona" is hidden for borrowed profiles,
+#: and any tab whose every row is owner-only drops out on one the same way -- which is
+#: what hides "training" there, rather than a second rule naming it.
+#:
+#: "images" and "audio" were one "media" tab. Nothing a character draws shares a setting
+#: with how it sounds, and the combined tab ran to seven rows whose halves were reached
+#: by scrolling past each other. "misc" is the catch-all Home was becoming: Home is the
+#: operations on the profile itself, so the rows that are neither identity nor an
+#: operation sit apart from Delete rather than above it.
+PROFILE_TABS = ("home", "persona", "params", "tools", "images", "audio", "memory",
+                "training", "misc")
+
+#: Tab buttons to an action row, for both the dashboard's strip and the bulk wizard's.
+#: Discord's own limit, and the two strips share it so they cannot wrap differently.
+_TAB_BUTTONS_PER_ROW = 5
 
 
 class _Bulk:
@@ -464,7 +479,7 @@ def _bulk_modal(factory_name: str, *, action_key: str = "update_config",
             await wizard._stage_from_modal(i, action_value, config, prompts)
 
         current = seed(wizard.cog) if callable(seed) else ({} if seed is None else seed)
-        args = [wizard.cog, "BULK_APPLY", current]
+        args = [wizard.cog, "BULK_APPLY", wizard.modal_seed(current)]
         if pass_borrowed:
             args.append(False)
         await interaction.response.send_modal(
@@ -550,9 +565,12 @@ def _flag(value) -> str:
 
 
 def _mode_display(mode: str) -> str:
-    """Label for an already-resolved off/native/rag mode. The legacy encodings are
-    folded in by helpers.resolve_grounding_mode / resolve_url_mode, which every
-    reader of these two settings goes through."""
+    """Label for an already-resolved off/native/rag URL mode. The legacy encodings are
+    folded in by helpers.resolve_url_mode, which every reader of that setting goes
+    through.
+
+    Grounding has four modes whose stored and shown names disagree, so it goes through
+    `helpers.grounding_mode_display` instead and this is the URL setting's alone."""
     return {"off": _OFF, "native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(mode, _OFF)
 
 
@@ -664,7 +682,7 @@ def _render_image_toggle(ctx):
 
 
 def _render_grounding(ctx):
-    return "Grounding (Web Search)", _mode_display(_grounding_mode(ctx["config"])), True
+    return "Grounding (Web Search)", grounding_mode_display(ctx["config"]), True
 
 
 def _render_url(ctx):
@@ -744,8 +762,52 @@ def _render_neuro(ctx):
 
 
 
-def _render_ltm_creation(ctx):
-    return "LTM Auto-Creation", _flag(ctx["config"].get("ltm_creation_enabled", False)), True
+def _render_memory(ctx):
+    """The three memory switches and the numbers that govern them, in one field.
+
+    They were two fields and three screens, which is how a profile came to be able to
+    write memories with recall depth set to zero and nothing anywhere saying that the
+    archive it was filling could never be read back.
+    """
+    config = ctx["config"]
+    # Resolved, not read: absent means on, so a profile written before the toggle
+    # existed reads as what it actually does.
+    return "Memory", (
+        f"Auto-Creation: {_flag(config.get('ltm_creation_enabled', False))} "
+        f"· every `{config.get('ltm_creation_interval', 10)}` msgs\n"
+        f"Auto-Recall: {_flag(ltm_auto_recall_enabled(config))} "
+        f"· `{config.get('ltm_context_size', 3)}` @ `{config.get('ltm_relevance_threshold', 0.75)}`\n"
+        f"Memory Search: {_flag(config.get('ltm_recall_tool_enabled', False))}"
+    ), True
+
+
+def _ltm_creation_payload(on: bool) -> Dict[str, Any]:
+    """Auto-Creation, and Auto-Recall along with it when it goes on.
+
+    A profile that writes memories nothing will ever read back is not a mode anyone
+    chooses deliberately -- it is what you get by finding one of the two switches. The
+    reverse is not true: turning creation off leaves recall alone, because the archive
+    it has been reading is still there and still worth reading.
+    """
+    return ({"ltm_creation_enabled": True, "ltm_recall_enabled": True} if on
+            else {"ltm_creation_enabled": False})
+
+
+#: The consolidated memory row in bulk. Six options rather than three rows of two,
+#: because one `_Action` carries one select -- and the alternative, three rows on the
+#: dashboard and three in the wizard, is what this row was built to stop.
+#:
+#: "creation_on" carries recall with it, exactly as the toggle does. A bulk apply that
+#: disagreed with the single-profile screen about what a switch means is the drift the
+#: whole table exists to prevent.
+_MEMORY_BULK_PAYLOADS = {
+    "creation_on": {"ltm_creation_enabled": True, "ltm_recall_enabled": True},
+    "creation_off": {"ltm_creation_enabled": False},
+    "recall_on": {"ltm_recall_enabled": True},
+    "recall_off": {"ltm_recall_enabled": False},
+    "search_on": {"ltm_recall_tool_enabled": True},
+    "search_off": {"ltm_recall_tool_enabled": False},
+}
 
 
 
@@ -776,39 +838,8 @@ PROFILE_ACTIONS = (
             _method("_handle_rename")),
     _Action("duplicate", "home", "Duplicate Profile", "Create a new profile from a copy of this one.",
             _method("_handle_duplicate"), _own),
-    # Share and Copy-to-System act on behalf of the profile's owner -- _handle_share
-    # opens the invoker's own share manager and _handle_convert_copy reads i.user.id --
-    # so both stay owner-only rather than being silently wrong under /mod.
-    _Action("share", "home", "Share Profile", "Share this profile with others or publish it.",
-            _method("_handle_share"), _own_not_mod),
-    # No bulk form, which is also what keeps it out of /settings -> Defaults: one intro
-    # stamped across forty characters describes none of them.
-    _Action("library_intro", "home", "Library Intro",
-            "Write the introduction shown on this profile's Public Library listing.",
-            _method("_act_library_intro"), _own),
-    # These two were `_own` on the row and scope="all" in bulk, so a borrower could
-    # set their placeholder emoji on forty profiles at once and on none individually
-    # -- the same drift, running backwards, that co-declaring bulk beside single was
-    # introduced to stop. Both write local config (a borrow owns its config outright;
-    # only `prompts` resolve to the source), and both handlers already carried
-    # is_borrowed through to _get_profile_config and _write_profile_config. The gate
-    # was the only thing refusing, and it was refusing writes that work.
-    #
-    # Neither is identity. Appearance -- the webhook name and avatar everyone in the
-    # channel sees -- stays `_own` and stays inside the hidden persona tab: presenting
-    # someone else's character under a different face is a different act from picking
-    # the emoji that sits on your own screen while it types.
-    _Action("error_response", "home", "Custom Error Message", "Set the message shown when generation fails.",
-            _method("_act_error_response", wants_profile=True),
-            bulk=_Bulk(_bulk_method("_bulk_error_response"), scope="all",
-                       keys=("error_response",))),
-    _Action("generation_visual", "home", "Generation Visual", "Set custom placeholder emoji and child bot behavior.",
-            _open_screen("generation_visual"),
-            render=_render_generation_visual,
-            screen=_Screen(_Toggle("child_bot_placeholder", "Child Bot Placeholder"),
-                           modal="ProfileGenerationVisualModal", modal_label="Edit emoji…"),
-            bulk=_Bulk(_bulk_modal("ProfileGenerationVisualModal"), scope="all",
-                       keys=("placeholder_emoji", "child_bot_placeholder"))),
+    # Copy-to-System acts on behalf of the profile's owner -- _handle_convert_copy reads
+    # i.user.id -- so it stays owner-only rather than being silently wrong under /mod.
     _Action("convert_to_system", "home", "Copy to System Profile", "Create a global System Profile copy from this profile.",
             _method("_handle_convert_copy", True), _to_system),
     _Action("convert_to_personal", "home", "Copy to Personal Profile", "Create a Personal Profile copy from this System Profile.",
@@ -910,7 +941,7 @@ PROFILE_ACTIONS = (
                             "media_input_resolution": "" if v == _MEDIA_RES_DEFAULT else v},
                         placeholder="Input media resolution..."),
                 note="This is what the model spends reading media **you send it** -- the "
-                     "opposite direction from the image size on the Media tab, which is "
+                     "opposite direction from the image size on the Images tab, which is "
                      "about what an image model draws. Google honours it exactly; "
                      "OpenRouter gets the nearest of its two `detail` steps; Ollama has no "
                      "equivalent and ignores it."),
@@ -949,81 +980,37 @@ PROFILE_ACTIONS = (
                        scope="all", label="Set Unreadable Attachments",
                        description="Stage what happens to an unreadable attachment.",
                        keys=("unreadable_media_mode",))),
-    # --- Media (what a profile draws and how it sounds; the models stay in Set Models) ---
-    _Action("image_toggle", "media", "Image Generation", "Allow this profile to generate images via !image/!imagine.",
-            _open_screen("image_toggle"), render=_render_image_toggle,
-            screen=_Screen(_Toggle("image_generation_enabled", "Image Generation"),
-                           modal="ProfileImageGenSettingsModal", modal_label="Edit prompt…"),
-            bulk=_Bulk(_bulk_modal("ProfileImageGenSettingsModal", action_key="update_both"),
-                       scope="all", label="Configure Image Generation",
-                       description="Set up models, prompts, and toggles for multiple profiles.",
-                       keys=("image_generation_enabled",),
-                       prompt_keys=("image_generation_prompt",))),
-    _Action("image_output", "media", "Set Image Output",
-            "Set aspect ratio, resolution, quality, thinking level and search grounding.",
-            _method("_act_image_output", wants_profile=True),
-            bulk=_Bulk(_bulk_sub("ImageOutputApplyView"), scope="all", label="Set Image Output",
-                       description="Stage aspect ratio, resolution, quality, thinking level and grounding.",
-                       keys=IMAGE_OUTPUT_KEYS)),
-    _Action("image_sampling", "media", "Set Image Sampling",
-            "Temperature, Top P and Top K for the image model.",
-            _modal("ProfileImageSamplingModal"),
-            bulk=_Bulk(_bulk_modal("ProfileImageSamplingModal"), scope="all",
-                       label="Set Image Sampling",
-                       description="Stage temperature, Top P and Top K for the image slot.",
-                       keys=IMAGE_SAMPLING_KEYS)),
-    _Action("speech_settings", "media", "Set Speech Settings",
-            "Turn TTS on or off, and set its temperature and speed.",
-            _open_screen("speech_settings"), render=_render_speech,
-            screen=_Screen(_Toggle("speech_tts_enabled", "TTS"),
-                           modal="ProfileSpeechSettingsModal", modal_label="Edit temperature & speed…"),
-            bulk=_Bulk(_bulk_modal("ProfileSpeechSettingsModal"), scope="all",
-                       keys=("speech_tts_enabled", "speech_temperature", "speech_speed"))),
-    _Action("voice", "media", "Choose TTS Voice", "Pick a voice from the ones its speech model offers.",
-            _method("_act_voice", wants_profile=True),
-            bulk=_Bulk(_bulk_sub("VoiceApplyView"), scope="all", label="Choose TTS Voice",
-                       description="Stage a voice for the TTS model staged in Set Models.",
-                       keys=("speech_voice",), needs=("speech_model",))),
-    _Action("speech_language", "media", "Set TTS Language",
-            "Pin the language a Gemini voice speaks, or let it detect one.",
-            _open_screen("speech_language"), render=_render_speech_language,
-            screen=_Screen(
-                _Choice("speech_language", "Language", _SPEECH_LANGUAGE_CHOICES,
-                        read=lambda c: c.get("speech_language") or _SPEECH_LANGUAGE_AUTO,
-                        to_payload=_speech_language_payload, placeholder="Speech language..."),
-                note="-# Gemini voices only: OpenRouter's speech endpoint takes no language."),
-            bulk=_Bulk(_bulk_choice("Select speech language...", _SPEECH_LANGUAGE_CHOICES,
-                                    to_payload=_speech_language_payload),
-                       scope="all", label="Set TTS Language", keys=("speech_language",),
-                       description="Pin the language Gemini voices speak, or let them detect it.")),
-    # Owner-only, as it was: the Persona tab it moved from is hidden on a borrow, and that
-    # was the only thing keeping a borrower out of it.
-    _Action("tts_instructions", "media", "TTS Instructions", "Configure the 'Director's Desk' for vocal performance.",
-            _modal("ProfileDirectorDeskModal", pass_borrowed=False), _own,
-            bulk=_Bulk(_bulk_modal("ProfileDirectorDeskModal", pass_borrowed=False),
-                       scope="personal",
-                       keys=("speech_archetype", "speech_accent", "speech_pacing",
-                             "speech_dynamics", "speech_style"))),
-
     # --- Tools ---
-    _Action("grounding", "tools", "Grounding (Web Search)", "Choose Off, Native or RAG web search.",
+    _Action("grounding", "tools", "Grounding (Web Search)",
+            "Choose Off, RAG, Native or Legacy RAG web search.",
             _open_screen("grounding"), render=_render_grounding,
             # A select, not the old three-way cycle: going Off -> Native -> RAG -> Off
             # meant two clicks to reach RAG and no indication that Native is
             # Google-only until the turn failed.
+            #
+            # The stored value for RAG is "tool" and for Legacy RAG is "rag" -- see
+            # GROUNDING_MODE_LABELS. The names are the wrong way round on disk because
+            # renaming them there would mean rewriting every profile.
             screen=_Screen(_Choice(
                 "grounding_mode", "Grounding",
                 (("Off", "off", "No web search."),
+                 ("RAG", "tool", "The character searches when a reply needs a fact it lacks."),
                  ("Native", "native", "Provider-side Google Search. Google models only."),
-                 ("RAG", "rag", "Search, then summarise. Works on any provider.")),
+                 ("Legacy RAG", "rag", "A second model decides and searches before every round.")),
                 read=_grounding_mode, placeholder="Grounding mode..."),
-                note="-# OpenRouter and Ollama models must use **RAG**; Native is a Google-side tool. "
-                     "This grounds replies; images have their own setting in **Set Image Output**."),
+                note="-# **RAG** costs nothing on the turns nobody searches, and the researcher "
+                     "is sent one query rather than the conversation. **Legacy RAG** pays a call "
+                     "every round to ask whether a search is needed, and the answer is almost "
+                     "always no.\n"
+                     "-# **Native** is a Google-side tool; Ollama can carry neither it nor RAG, "
+                     "so an Ollama profile has **Legacy RAG** alone. This grounds replies; "
+                     "images have their own setting in **Set Image Output**."),
             bulk=_Bulk(_bulk_choice("Select Grounding Mode...",
-                                    [("Off", "off"), ("Native", "native"), ("RAG", "rag")],
+                                    [("Off", "off"), ("RAG", "tool"), ("Native", "native"),
+                                     ("Legacy RAG", "rag")],
                                     to_payload=lambda v: {"grounding_mode": v}),
                        scope="all", label="Set Grounding Mode", keys=("grounding_mode",),
-                       description="Choose Off, Native or RAG for every selected profile.")),
+                       description="Choose Off, RAG, Native or Legacy RAG for every selected profile.")),
     _Action("url_toggle", "tools", "URL Context Fetching", "Choose Off, Native or RAG link reading.",
             _open_screen("url_toggle"), render=_render_url,
             # url_fetching_enabled is the legacy flag the turn path still reads, so it
@@ -1143,6 +1130,64 @@ PROFILE_ACTIONS = (
                        scope="all", label="Set Help Mode", keys=("help_mode_enabled",),
                        description="Turn the documentation RAG on or off.")),
 
+    # --- Images (what a profile draws; the image models stay in Set Models) ---
+    _Action("image_toggle", "images", "Image Generation", "Allow this profile to generate images via !image/!imagine.",
+            _open_screen("image_toggle"), render=_render_image_toggle,
+            screen=_Screen(_Toggle("image_generation_enabled", "Image Generation"),
+                           modal="ProfileImageGenSettingsModal", modal_label="Edit prompt…"),
+            bulk=_Bulk(_bulk_modal("ProfileImageGenSettingsModal", action_key="update_both"),
+                       scope="all", label="Configure Image Generation",
+                       description="Set up models, prompts, and toggles for multiple profiles.",
+                       keys=("image_generation_enabled",),
+                       prompt_keys=("image_generation_prompt",))),
+    _Action("image_output", "images", "Set Image Output",
+            "Set aspect ratio, resolution, quality, thinking level and search grounding.",
+            _method("_act_image_output", wants_profile=True),
+            bulk=_Bulk(_bulk_sub("ImageOutputApplyView"), scope="all", label="Set Image Output",
+                       description="Stage aspect ratio, resolution, quality, thinking level and grounding.",
+                       keys=IMAGE_OUTPUT_KEYS)),
+    _Action("image_sampling", "images", "Set Image Sampling",
+            "Temperature, Top P and Top K for the image model.",
+            _modal("ProfileImageSamplingModal"),
+            bulk=_Bulk(_bulk_modal("ProfileImageSamplingModal"), scope="all",
+                       label="Set Image Sampling",
+                       description="Stage temperature, Top P and Top K for the image slot.",
+                       keys=IMAGE_SAMPLING_KEYS)),
+
+    # --- Audio (how a profile sounds; the speech models stay in Set Models) ---
+    _Action("speech_settings", "audio", "Set Speech Settings",
+            "Turn TTS on or off, and set its temperature and speed.",
+            _open_screen("speech_settings"), render=_render_speech,
+            screen=_Screen(_Toggle("speech_tts_enabled", "TTS"),
+                           modal="ProfileSpeechSettingsModal", modal_label="Edit temperature & speed…"),
+            bulk=_Bulk(_bulk_modal("ProfileSpeechSettingsModal"), scope="all",
+                       keys=("speech_tts_enabled", "speech_temperature", "speech_speed"))),
+    _Action("voice", "audio", "Choose TTS Voice", "Pick a voice from the ones its speech model offers.",
+            _method("_act_voice", wants_profile=True),
+            bulk=_Bulk(_bulk_sub("VoiceApplyView"), scope="all", label="Choose TTS Voice",
+                       description="Stage a voice for the TTS model staged in Set Models.",
+                       keys=("speech_voice",), needs=("speech_model",))),
+    _Action("speech_language", "audio", "Set TTS Language",
+            "Pin the language a Gemini voice speaks, or let it detect one.",
+            _open_screen("speech_language"), render=_render_speech_language,
+            screen=_Screen(
+                _Choice("speech_language", "Language", _SPEECH_LANGUAGE_CHOICES,
+                        read=lambda c: c.get("speech_language") or _SPEECH_LANGUAGE_AUTO,
+                        to_payload=_speech_language_payload, placeholder="Speech language..."),
+                note="-# Gemini voices only: OpenRouter's speech endpoint takes no language."),
+            bulk=_Bulk(_bulk_choice("Select speech language...", _SPEECH_LANGUAGE_CHOICES,
+                                    to_payload=_speech_language_payload),
+                       scope="all", label="Set TTS Language", keys=("speech_language",),
+                       description="Pin the language Gemini voices speak, or let them detect it.")),
+    # Owner-only, as it was: the Persona tab it moved from is hidden on a borrow, and that
+    # was the only thing keeping a borrower out of it.
+    _Action("tts_instructions", "audio", "TTS Instructions", "Configure the 'Director's Desk' for vocal performance.",
+            _modal("ProfileDirectorDeskModal", pass_borrowed=False), _own,
+            bulk=_Bulk(_bulk_modal("ProfileDirectorDeskModal", pass_borrowed=False),
+                       scope="personal",
+                       keys=("speech_archetype", "speech_accent", "speech_pacing",
+                             "speech_dynamics", "speech_style"))),
+
     # --- Behaviour (how the profile conducts itself) ---
 
     # --- Memory ---
@@ -1152,22 +1197,41 @@ PROFILE_ACTIONS = (
             bulk=_Bulk(_bulk_sub("BulkResetView"), scope="all", terminal=True,
                        label="Reset Profile Data",
                        description="Wipe long-term memories or training examples.")),
-    _Action("manage_training", "memory", "Manage Training Examples", "Add, list, edit, or delete training examples.",
-            _method("_act_manage_training", wants_profile=True), _own),
-    _Action("train_params", "memory", "Set Training Parameters", "Set training context size and relevance threshold.",
-            _modal("ProfileTrainingParamsModal", pass_borrowed=False), _own,
-            bulk=_Bulk(_bulk_modal("ProfileTrainingParamsModal", pass_borrowed=False),
-                       scope="personal",
-                       keys=("training_context_size", "training_relevance_threshold"))),
-    _Action("ltm_creation", "memory", "LTM Auto-Creation", "Automatically create memories from conversations.",
-            _open_screen("ltm_creation"), render=_render_ltm_creation,
-            screen=_Screen(_Toggle("ltm_creation_enabled", "Auto-Creation")),
+    # Writing memories, reading them back unasked, and looking one up on purpose: three
+    # halves of one feature that were three separate rows, so a profile could have any
+    # combination of them without ever seeing the other two. Five buttons -- three
+    # toggles, the numbers, and Back -- which is exactly Discord's row limit.
+    _Action("ltm_settings", "memory", "Memory Settings",
+            "Auto-creation, automatic recall, and the character's own memory search.",
+            _open_screen("ltm_settings"), render=_render_memory,
+            screen=_Screen(
+                _Toggle("ltm_creation_enabled", "Auto-Creation",
+                        to_payload=_ltm_creation_payload),
+                _Toggle("ltm_recall_enabled", "Auto-Recall", read=ltm_auto_recall_enabled),
+                _Toggle("ltm_recall_tool_enabled", "Memory Search"),
+                modal="ProfileLTMParamsModal", modal_label="Parameters…",
+                note="-# **Auto-Creation** writes a memory every so many messages. "
+                     "**Auto-Recall** matches the archive against what was just said and "
+                     "injects what fits, every turn, at no API cost beyond one embedding. "
+                     "Turning creation on turns recall on with it.\n"
+                     "-# **Memory Search** lets the character look something up on its own "
+                     "terms — the callback nobody restated, the name from three messages ago. "
+                     "It costs one extra request on the turns it searches, nothing on the "
+                     "turns it does not, and while it is on the automatic pass tightens to "
+                     "its surest matches."),
             bulk=_Bulk(_bulk_choice("Select action...",
-                                    [("Enable LTM Auto-Creation", "true"),
-                                     ("Disable LTM Auto-Creation", "false")],
-                                    to_payload=lambda v: {"ltm_creation_enabled": v == "true"}),
-                       scope="all", label="Set LTM Auto-Creation", keys=("ltm_creation_enabled",),
-                       description="Turn automatic memory creation on or off.")),
+                                    [("Enable LTM Auto-Creation", "creation_on"),
+                                     ("Disable LTM Auto-Creation", "creation_off"),
+                                     ("Enable Auto-Recall", "recall_on"),
+                                     ("Disable Auto-Recall", "recall_off"),
+                                     ("Enable Memory Search", "search_on"),
+                                     ("Disable Memory Search", "search_off")],
+                                    to_payload=lambda v: dict(_MEMORY_BULK_PAYLOADS[v])),
+                       scope="all", label="Set Memory Switches",
+                       keys=("ltm_creation_enabled", "ltm_recall_enabled",
+                             "ltm_recall_tool_enabled"),
+                       description="Turn auto-creation, automatic recall or memory search "
+                                   "on or off.")),
     _Action("ltm_params", "memory", "Set LTM Parameters", "Set frequency, context, and recall settings.",
             _modal("ProfileLTMParamsModal", pass_borrowed=False),
             bulk=_Bulk(_bulk_modal("ProfileLTMParamsModal", pass_borrowed=False), scope="all",
@@ -1182,6 +1246,56 @@ PROFILE_ACTIONS = (
                        prompt_keys=("ltm_summarization_instructions",),
                        warning="Every selected profile's **LTM summarisation prompt** is replaced. "
                                "Profiles using a customised prompt lose it.")),
+
+    # --- Training (tab hidden entirely for borrowed profiles: every row is owner-only) ---
+    _Action("manage_training", "training", "Manage Training Examples", "Add, list, edit, or delete training examples.",
+            _method("_act_manage_training", wants_profile=True), _own),
+    _Action("train_params", "training", "Set Training Parameters", "Set training context size and relevance threshold.",
+            _modal("ProfileTrainingParamsModal", pass_borrowed=False), _own,
+            bulk=_Bulk(_bulk_modal("ProfileTrainingParamsModal", pass_borrowed=False),
+                       scope="personal",
+                       keys=("training_context_size", "training_relevance_threshold"))),
+
+    # --- Misc (neither identity nor an operation on the profile) ---
+    #
+    # Home is what you do *to* a profile -- rename, duplicate, copy, rate, delete. These
+    # four are settings that belong to no other tab, and sitting among those operations
+    # they read as part of them: Library Intro one row above Delete Profile is a listing
+    # you are about to lose rather than a paragraph you are about to write.
+    #
+    # Share acts on behalf of the profile's owner -- _handle_share opens the invoker's
+    # own share manager -- so it stays owner-only rather than being silently wrong
+    # under /mod.
+    _Action("share", "misc", "Share Profile", "Share this profile with others or publish it.",
+            _method("_handle_share"), _own_not_mod),
+    # No bulk form, which is also what keeps it out of /settings -> Defaults: one intro
+    # stamped across forty characters describes none of them.
+    _Action("library_intro", "misc", "Library Intro",
+            "Write the introduction shown on this profile's Public Library listing.",
+            _method("_act_library_intro"), _own),
+    # These two were `_own` on the row and scope="all" in bulk, so a borrower could
+    # set their placeholder emoji on forty profiles at once and on none individually
+    # -- the same drift, running backwards, that co-declaring bulk beside single was
+    # introduced to stop. Both write local config (a borrow owns its config outright;
+    # only `prompts` resolve to the source), and both handlers already carried
+    # is_borrowed through to _get_profile_config and _write_profile_config. The gate
+    # was the only thing refusing, and it was refusing writes that work.
+    #
+    # Neither is identity. Appearance -- the webhook name and avatar everyone in the
+    # channel sees -- stays `_own` and stays inside the hidden persona tab: presenting
+    # someone else's character under a different face is a different act from picking
+    # the emoji that sits on your own screen while it types.
+    _Action("error_response", "misc", "Custom Error Message", "Set the message shown when generation fails.",
+            _method("_act_error_response", wants_profile=True),
+            bulk=_Bulk(_bulk_method("_bulk_error_response"), scope="all",
+                       keys=("error_response",))),
+    _Action("generation_visual", "misc", "Generation Visual", "Set custom placeholder emoji and child bot behavior.",
+            _open_screen("generation_visual"),
+            render=_render_generation_visual,
+            screen=_Screen(_Toggle("child_bot_placeholder", "Child Bot Placeholder"),
+                           modal="ProfileGenerationVisualModal", modal_label="Edit emoji…"),
+            bulk=_Bulk(_bulk_modal("ProfileGenerationVisualModal"), scope="all",
+                       keys=("placeholder_emoji", "child_bot_placeholder"))),
 )
 
 PROFILE_ACTIONS_BY_VALUE = {a.value: a for a in PROFILE_ACTIONS}
@@ -1229,7 +1343,12 @@ class ProfileManageView(BlockedGuard, ui.View):
 
         is_mod = getattr(self, 'is_mod_view', False)
 
-        valid_tabs = [t for t in PROFILE_TABS if t == "home" or t != "persona" or not self.is_borrowed]
+        # A tab with nothing on it is not offered: every row can be gated, so a tab can
+        # empty out entirely on a borrowed profile, and the button used to open a screen
+        # with no dropdown under it at all.
+        valid_tabs = [t for t in PROFILE_TABS
+                      if (t != "persona" or not self.is_borrowed)
+                      and any(a.tab == t and a.visible(self) for a in PROFILE_ACTIONS)]
         if self.current_tab not in valid_tabs and valid_tabs:
             self.current_tab = valid_tabs[0]
 
@@ -1242,12 +1361,12 @@ class ProfileManageView(BlockedGuard, ui.View):
                        placeholder=f"Select an action for {self.current_tab.title()}...", row=0)
 
         # --- 2. Navigation Buttons (Rows 1-2) ---
-        # Discord fits five components to an action row, and there are six tabs. They
-        # all used to be pinned to row 1, which was fine at five and raises
-        # "item would not fit at row 1" at six -- inside __init__, so the whole
-        # dashboard failed to open rather than degrading. Split evenly rather than
-        # 5 + 1, so the second row reads as a continuation instead of an orphan.
-        per_row = len(valid_tabs) if len(valid_tabs) <= 5 else (len(valid_tabs) + 1) // 2
+        # Discord fits five components to an action row and there are more tabs than
+        # that. All of them pinned to row 1 raises "item would not fit at row 1" inside
+        # __init__, so the whole dashboard failed to open rather than degrading. Rows
+        # are filled before a new one is started: an even split reads as a grid, which
+        # invites scanning two dimensions for a list that only has one.
+        per_row = _TAB_BUTTONS_PER_ROW
         for position, tab in enumerate(valid_tabs):
             btn = ui.Button(
                 label=tab.title(),
@@ -1259,14 +1378,19 @@ class ProfileManageView(BlockedGuard, ui.View):
             self.add_item(btn)
 
         if is_mod:
-            self._add_mod_back_button()
+            # Below the strip, never sharing its last row: a full row of tabs plus this
+            # button is six items, and Discord refuses the sixth inside __init__ -- the
+            # dashboard would not open at all for the tab count that happens to land on
+            # a boundary. Row 3 is free; the /mod nav bar sits on row 4.
+            self._add_mod_back_button(
+                min(3, 1 + (len(valid_tabs) + per_row - 1) // per_row))
             ModBaseView.attach_nav(
                 self, "profiles",
                 source=SimpleNamespace(cog=self.cog,
                                        original_interaction=self.original_interaction,
                                        target_user_id=self.mod_return_user_id))
 
-    def _add_mod_back_button(self):
+    def _add_mod_back_button(self, row: int = 2):
         """Back to the moderated user's profile list.
 
         The mod nav bar's own "Profiles" button is disabled here -- build_tab_nav_bar
@@ -1282,7 +1406,7 @@ class ProfileManageView(BlockedGuard, ui.View):
                                    target_user_id=self.mod_return_user_id)
             await view.update_display()
         add_button(self, "← Back to Profile List", back_cb, style=discord.ButtonStyle.secondary,
-                   row=2)
+                   row=row)
 
     def create_nav_callback(self, tab_name):
         async def callback(interaction: discord.Interaction):
@@ -1417,7 +1541,11 @@ class ProfileManageView(BlockedGuard, ui.View):
         await interaction.response.send_modal(modal)
 
     async def _act_ltm_summarization(self, interaction: discord.Interaction, profile: Dict[str, Any]):
-        instr = profile.get("ltm_summarization_instructions") or self.cog.profile_manager._default_ltm_summarization_instructions()
+        # Resolved, not read raw, exactly as the critic's box is: the text shown has to
+        # be what this profile actually summarises with today. Reading the stored value
+        # would show a seeded copy of a retired default to anyone who never edited it.
+        instr = self.cog.profile_manager.resolve_ltm_summarization_instructions(
+            self.user_id, self.profile_name)
         modal = ProfileLTMSummarizationModal(self.cog, self.profile_name, instr, target_user_id=self.user_id)
         await interaction.response.send_modal(modal)
 
@@ -1613,8 +1741,10 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
 
     Layout is forced by Discord's five-components-per-row: a select occupies a whole
     row, so the choices take rows 0..n and everything that is a button -- the toggles,
-    the Edit button, Back -- shares the row after them. No declared screen has more
-    than three choices or one toggle, which is what keeps that inside the five-row cap.
+    the Edit button, Back -- shares the row after them. No declared screen has more than
+    three choices, and the widest button row is Memory Settings at five (three toggles,
+    the parameters modal, Back) -- which is the cap, not a margin. A fourth toggle on
+    one screen, or a toggle added beside three choices, needs this to wrap first.
     """
 
     def __init__(self, parent: 'ProfileManageView', action: '_Action'):
@@ -1904,7 +2034,14 @@ def ProfileLTMSummarizationModal(cog, profile_name: str, current_instructions: s
         "placeholder": "The system will automatically append the conversation excerpt to these instructions."
     }]
     def parser(v):
-        ins = _ps(v["ltm_summarization_instructions"]) or cog.profile_manager._default_ltm_summarization_instructions()
+        default = cog.profile_manager._default_ltm_summarization_instructions()
+        ins = _ps(v["ltm_summarization_instructions"]) or ""
+        # Stored as absence when it is the default, rather than as a copy of it. Saving
+        # the text would pin this profile to today's wording, which is the thing
+        # resolve_ltm_summarization_instructions exists to undo -- and a box submitted
+        # unedited is by far the commonest way this screen is used.
+        if is_shipped_ltm_prompt(ins, default):
+            ins = ""
         return {"prompts": {"ltm_summarization_instructions": cog.storage_manager._encrypt_data(ins)}}
     return ConfigModal(cog, profile_name, False, "Set LTM Summarization Instructions", fields, parser, callback, target_user_id)
 
@@ -2316,7 +2453,7 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
             grounding = f"**Search grounding:** `{IMAGE_GROUNDING_LABELS.get(mode, 'off')}`"
             if mode in IMAGE_GROUNDING_TOOL_MODES and not caps["grounding"]:
                 grounding += (" — kept, but this model takes no search tool, so nothing is "
-                              "sent. RAG works with any image model.")
+                              "sent. Legacy RAG works with any image model.")
             lines.append(grounding)
             if caps["max_refs"]:
                 lines.append(f"**Reference images:** up to {caps['max_refs']} per request")
@@ -2512,7 +2649,7 @@ class ModelPickerMixin(ReportErrorMixin):
                       ("image_generation_fallback_model", "Image Fallback", NO_FALLBACK)),
         'tts':       (("speech_model", "Text-to-Speech", DEFAULT_SPEECH_MODEL),
                       ("speech_fallback_model", "TTS Fallback", NO_FALLBACK)),
-        'grounding': (("grounding_rag_model", "Grounding Summariser", FALLBACK_MODEL_NAME),
+        'grounding': (("grounding_rag_model", "Grounding Summariser", GROUNDING_RESEARCHER_MODEL),
                       ("grounding_rag_fallback_model", "Grounding Fallback", NO_FALLBACK)),
         'critic':    (("critic_model", "Anti-Repetition Critic", FALLBACK_MODEL_NAME),
                       ("critic_fallback_model", "Critic Fallback", NO_FALLBACK)),
@@ -2920,9 +3057,14 @@ class ModelPickerMixin(ReportErrorMixin):
                    for key, _wording, _default in self._CATEGORY_KEYS[self.category])
 
     def _add_openrouter_buttons(self, *, row: int):
-        """The OpenRouter tab's own buttons. My Defaults has only the tier; both model
-        pickers override this with Hosts & Tier, which holds both."""
-        self._add_service_tier_button(row=row)
+        """The OpenRouter tab's own buttons: Hosts & Tier, on every adopter.
+
+        Declared here and implemented nowhere, because the three screens differ in both
+        halves -- which Hosts view they open, and what counts as a pin being set on a
+        screen that stores, stages or defaults one. A fourth adopter that forgets it
+        raises on its first OpenRouter tab rather than quietly shipping no tier control.
+        """
+        raise NotImplementedError
 
     def _pinnable_openrouter_models(self) -> List[str]:
         """The OpenRouter model ids on this tab's pinnable slots, once each."""
@@ -2965,30 +3107,6 @@ class ModelPickerMixin(ReportErrorMixin):
 
     #: How `None` reads on a screen whose cycle includes it.
     _TIER_UNSET_WORDING = "Unchanged"
-
-    def _add_service_tier_button(self, *, row: int):
-        """The OpenRouter service tier, as a cycling button beside the API switch.
-
-        A button rather than a dropdown because all five rows are already spoken for --
-        the category select, two model selects, and two rows of buttons -- and because
-        it cycles through three states, which is what the API switch beside it already
-        does. Both model pickers keep it on their Hosts screen instead, as the tier
-        every unpinned model is sent with; this button is My Defaults'.
-
-        Profile-wide, not per slot, which is only safe because a model whose pool holds
-        no endpoint at the requested tier routes normally at standard rates rather than
-        failing: a profile on Flex with a critic nobody offers Flex for still gets its
-        critic. A provider *pin* would not be safe this way, which is why pins are per
-        model (OpenRouterHostView).
-        """
-        style, wording = self.tier_wording(self._current_service_tier())
-
-        async def tier_cb(i: discord.Interaction):
-            self._set_service_tier(self._next_service_tier())
-            self._build_view()
-            await i.response.edit_message(**self._picker_render())
-
-        add_button(self, f"Tier: {wording}", tier_cb, style=style, row=row)
 
     def _next_service_tier(self):
         """The value one press of a tier button moves to."""
@@ -3210,8 +3328,9 @@ class OpenRouterHostView(BlockedGuard, ui.View):
     the same message, with a Back that returns to it, as Thinking is. A slot holding a
     Google or Ollama model gets a greyed dropdown saying why rather than none.
 
-    The bulk picker opens BulkOpenRouterHostView, which stages rather than writes. My
-    Defaults has neither: it holds no model to list the hosts of, only the tier.
+    The bulk picker opens BulkOpenRouterHostView, which stages rather than writes, and
+    My Defaults opens DefaultsOpenRouterHostView, where a slot left on the platform
+    default names no model to list the hosts of.
     """
 
     _AUTO = "__auto__"
@@ -3388,6 +3507,11 @@ class OpenRouterHostView(BlockedGuard, ui.View):
             await i.response.edit_message(**self.parent._picker_render())
         add_button(self, "\u2190 Back to Models", back_cb, row=4)
 
+        # Profile-wide, not per slot, which is only safe because a model whose pool
+        # holds no endpoint at the requested tier routes normally at standard rates
+        # rather than failing: a profile on Flex with a critic nobody offers Flex for
+        # still gets its critic. A provider *pin* would not be safe that way, which is
+        # why the dropdowns above are per model.
         style, wording = self.parent.tier_wording(self.parent._current_service_tier())
 
         async def tier_cb(i: discord.Interaction):
@@ -3785,6 +3909,17 @@ class _BulkSubView(BlockedGuard, ReportErrorMixin, ui.View):
             await self.wizard.refresh(interaction)
         add_button(self, label, cb, style=discord.ButtonStyle.secondary, row=row)
 
+    def _staging_footer(self) -> str:
+        """What this picker is staging *for*, asked of the host rather than assumed.
+
+        Six sub-views wrote "N profile(s) selected - nothing is written until Apply" by
+        hand, which is true of the bulk wizard and false of `/settings` -> Defaults --
+        that screen hosts the same pickers against a standing preference, with no
+        selection and no Apply. A picker announcing a profile count of zero there is
+        worse than no footer: it reads as a selection the user failed to make.
+        """
+        return self.wizard.staging_footer()
+
     def embed(self) -> discord.Embed:
         raise NotImplementedError
 
@@ -3963,8 +4098,7 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
             e.add_field(name=f"Staged from this picker ({len(lines)})",
                         value="\n".join(lines)[:1024], inline=False)
 
-        e.set_footer(text=f"{len(self.wizard.selected_profiles)} profile(s) selected · "
-                          f"nothing is written until Apply")
+        e.set_footer(text=self._staging_footer())
         return e
 
     def _build_view(self):
@@ -4069,8 +4203,7 @@ class BulkOpenRouterHostView(OpenRouterHostView):
                 "pinned here, and a pin on any other model a profile has is kept.")
 
     def _footer(self) -> str:
-        return (f"{len(self.parent.wizard.selected_profiles)} profile(s) selected · "
-                "nothing is written until Apply")
+        return self.parent.wizard.staging_footer()
 
 
 class ThinkingApplyView(ThinkingPickerMixin, _BulkSubView):
@@ -4142,8 +4275,7 @@ class ThinkingApplyView(ThinkingPickerMixin, _BulkSubView):
             e.add_field(name=f"Staged from this picker ({len(self.staged)})",
                         value=body[:1024], inline=False)
 
-        e.set_footer(text=f"{len(self.wizard.selected_profiles)} profile(s) selected \u00b7 "
-                          f"nothing is written until Apply")
+        e.set_footer(text=self._staging_footer())
         return e
 
     def _build_view(self):
@@ -4244,7 +4376,8 @@ class ImageOutputApplyView(_MediaOptionsApplyView):
                          "request drops whatever its own model does not accept, so a profile on "
                          "a model with one fixed resolution simply ignores a staged one, a "
                          "Gemini model ignores a staged quality, and an OpenRouter model ignores "
-                         "a staged thinking level or web search. RAG applies to every model."))
+                         "a staged thinking level or web search. Legacy RAG applies to "
+                         "every model."))
         for key, label in (("image_aspect_ratio", "Aspect ratio"),
                            ("image_size", "Resolution"),
                            ("image_quality", "Quality"),
@@ -4256,8 +4389,7 @@ class ImageOutputApplyView(_MediaOptionsApplyView):
             else:
                 shown = "model default" if value == "" else (value or "unchanged")
             e.add_field(name=label, value=f"`{shown}`", inline=True)
-        e.set_footer(text=f"{len(self.wizard.selected_profiles)} profile(s) selected · "
-                          f"nothing is written until Apply")
+        e.set_footer(text=self._staging_footer())
         return e
 
     def _build_view(self):
@@ -4276,8 +4408,8 @@ class ImageOutputApplyView(_MediaOptionsApplyView):
         else:
             self._add_choice_select("image_thinking_level", "Thinking level...",
                                     IMAGE_THINKING_LEVELS, IMAGE_THINKING_NOTES, 2)
-        # On both pages: RAG reaches every model, and a web mode is dropped by one that
-        # takes no search tool, exactly as the embed says.
+        # On both pages: Legacy RAG reaches every model, and a web mode is dropped by
+        # one that takes no search tool, exactly as the embed says.
         self._add_choice_select("image_grounding_mode", "Search grounding...",
                                 ('rag',) + IMAGE_GROUNDING_TOOL_MODES, IMAGE_GROUNDING_NOTES, 3,
                                 auto_label="Off",
@@ -4329,8 +4461,7 @@ class VoiceApplyView(_MediaOptionsApplyView):
         e.add_field(name="Voice",
                     value=f"`{chosen or 'unchanged'}`" + (f" ({described})" if described else ""),
                     inline=True)
-        e.set_footer(text=f"{len(self.wizard.selected_profiles)} profile(s) selected · "
-                          f"nothing is written until Apply")
+        e.set_footer(text=self._staging_footer())
         return e
 
     def _build_view(self):
@@ -4856,8 +4987,7 @@ class BulkTimezoneView(_BulkSubView):
                          "region, jump between regions, or enter any IANA timezone ID by hand."))
         e.add_field(name="Region", value=PARTITION_NAMES[self.tz_page], inline=True)
         e.add_field(name="Chosen", value=f"`{self.selected_tz or 'nothing yet'}`", inline=True)
-        e.set_footer(text=f"{len(self.wizard.selected_profiles)} profile(s) selected · "
-                          f"nothing is written until Apply")
+        e.set_footer(text=self._staging_footer())
         return e
 
     def _build_view(self):
@@ -5324,7 +5454,97 @@ def _describe_value(value) -> str:
     return text if len(text) <= 60 else text[:57] + "…"
 
 
-class BulkManageView(BaseBulkProfileView):
+class _ActionStagingHost:
+    """What a `_Bulk.run` form is handed, and the half of it that is not the wizard's.
+
+    A bulk form's whole job is to collect a value and call `_stage_change`; it never
+    writes, and it never asks who the value is for. Two screens exploit that. The bulk
+    wizard stages against a selection of profiles and writes on Apply; `/settings` ->
+    Defaults stages against one user's standing preferences and writes immediately.
+    The forms cannot tell them apart, and must not have to -- a setting reachable on
+    one screen and not the other is the drift `_Bulk` was declared to stop.
+
+    So everything a form touches that differs between the two hosts is a method here.
+    Adopters provide `cog`, `user_id`, `session`, `current_action`, `original_interaction`,
+    `_build_view`, `embed`, `refresh` and `_stage_change`.
+    """
+
+    #: Said by a value picker that has taken over this host's message, in its footer.
+    _EXPIRED_NOTICE = "This panel has expired, so that change was not saved."
+
+    def staging_footer(self) -> str:
+        """What a picker occupying this host's message is collecting a value for."""
+        raise NotImplementedError
+
+    def modal_seed(self, current):
+        """The values a bulk modal opens on. Unchanged for a host staging against many
+        profiles, which hold their own; see `gui_defaults._SparseSeed` for the other."""
+        return current
+
+    async def _modal_reply(self, interaction: discord.Interaction, text: str):
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+
+    def _open_choice(self, action_value: str, placeholder: str,
+                     options: List[discord.SelectOption], on_pick):
+        """Routes to the value step for a row whose value comes from a fixed list."""
+        self._choice = {"action": action_value, "placeholder": placeholder,
+                        "options": options, "on_pick": on_pick, "chosen": None}
+        self.step = "choice"
+
+    async def _stage_from_modal(self, interaction: discord.Interaction, action_value: str,
+                                config: Dict, prompts: Dict):
+        """Stages a modal's payload and puts the panel back where the user left it.
+
+        ConfigModal and the persona/instruction modals defer with `thinking=True` before
+        handing over, which spends the response on a placeholder message -- so the panel
+        cannot be edited through that interaction at all. The placeholder is removed and
+        the panel refreshed through the host's own token instead. Modals that have not
+        responded (ActionTextInputModal) edit the message directly, one round trip fewer.
+        """
+        if not (config or prompts):
+            await self._modal_reply(interaction, "Nothing was entered, so nothing was staged.")
+            return
+
+        self._stage_change(action_value, config=config, prompts=prompts)
+        self._build_view()
+
+        if interaction.response.is_done():
+            try:
+                await self.original_interaction.edit_original_response(
+                    embed=self.embed(), view=self)
+            except discord.HTTPException:
+                # Sub-views keep this view's timer alive, so it can outlive the fifteen
+                # minutes the slash command's token lasts. Say so rather than leaving the
+                # change staged on a panel that will never show it again.
+                self.stop()
+                await interaction.followup.send(self._EXPIRED_NOTICE, ephemeral=True)
+                return
+            try:
+                await interaction.delete_original_response()
+            except discord.HTTPException:
+                pass
+        else:
+            await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def _bulk_error_response(self, interaction: discord.Interaction):
+        async def modal_callback(i: discord.Interaction, new_val: str):
+            await self._stage_from_modal(
+                i, "error_response",
+                {"error_response": new_val.strip() or "An error has occurred."}, {})
+
+        await interaction.response.send_modal(ActionTextInputModal(
+            title="Set Custom Error Message",
+            label="Error Message",
+            placeholder="Shown to users when generation fails...",
+            default="An error has occurred.",
+            required=False,
+            on_submit_callback=modal_callback))
+
+
+class BulkManageView(_ActionStagingHost, BaseBulkProfileView):
     """The bulk dashboard: one message, four steps, one changeset.
 
     The old shape was action-first and one-action-at-a-time: pick a setting, pick the
@@ -5473,56 +5693,6 @@ class BulkManageView(BaseBulkProfileView):
         self.session.staged[action_value] = action.bulk_label() if action else action_value
         self._choice = None
         self.step = "actions"
-
-    async def _stage_from_modal(self, interaction: discord.Interaction, action_value: str,
-                                config: Dict, prompts: Dict):
-        """Stages a modal's payload and puts the panel back where the user left it.
-
-        ConfigModal and the persona/instruction modals defer with `thinking=True` before
-        handing over, which spends the response on a placeholder message -- so the panel
-        cannot be edited through that interaction at all. The placeholder is removed and
-        the panel refreshed through the wizard's own token instead. Modals that have not
-        responded (ActionTextInputModal) edit the message directly, one round trip fewer.
-        """
-        if not (config or prompts):
-            await self._modal_reply(interaction, "Nothing was entered, so nothing was staged.")
-            return
-
-        self._stage_change(action_value, config=config, prompts=prompts)
-        self._build_view()
-
-        if interaction.response.is_done():
-            try:
-                await self.original_interaction.edit_original_response(
-                    embed=self.embed(), view=self)
-            except discord.HTTPException:
-                # Sub-views keep this view's timer alive, so it can outlive the fifteen
-                # minutes the slash command's token lasts. Say so rather than leaving the
-                # change staged on a panel that will never show it again.
-                self.stop()
-                await interaction.followup.send(
-                    "This bulk panel has expired, so that change could not be added to it. "
-                    "Nothing was written — run `/profile bulk manage` again.", ephemeral=True)
-                return
-            try:
-                await interaction.delete_original_response()
-            except discord.HTTPException:
-                pass
-        else:
-            await interaction.response.edit_message(embed=self.embed(), view=self)
-
-    async def _modal_reply(self, interaction: discord.Interaction, text: str):
-        if interaction.response.is_done():
-            await interaction.followup.send(text, ephemeral=True)
-        else:
-            await interaction.response.send_message(text, ephemeral=True)
-
-    def _open_choice(self, action_value: str, placeholder: str,
-                     options: List[discord.SelectOption], on_pick):
-        """Routes to the value step for a row whose value comes from a fixed list."""
-        self._choice = {"action": action_value, "placeholder": placeholder,
-                        "options": options, "on_pick": on_pick, "chosen": None}
-        self.step = "choice"
 
     def _warnings(self) -> List[str]:
         out = []
@@ -5758,13 +5928,14 @@ class BulkManageView(BaseBulkProfileView):
         """The wizard's own tab strip: Inherit and Actions both draw it. Returns the first
         row below it.
 
-        Five buttons fit a row, and there are six tabs. Pinned to one row, a sixth raises
-        "item would not fit" and the wizard cannot open, so they wrap as ProfileManageView's
-        do, split evenly.
+        Five buttons fit a row and there are more tabs than that. Pinned to one row, the
+        sixth raises "item would not fit" and the wizard cannot open, so they wrap as
+        ProfileManageView's do -- filling each row before starting the next, so the two
+        strips are the same shape.
         """
         if not tabs:
             return row
-        per_row = len(tabs) if len(tabs) <= 5 else (len(tabs) + 1) // 2
+        per_row = _TAB_BUTTONS_PER_ROW
         for position, tab in enumerate(tabs):
             add_button(self, tab.title(), self._pick_tab(tab), row=row + position // per_row,
                        disabled=(tab == self.current_tab),
@@ -5873,6 +6044,14 @@ class BulkManageView(BaseBulkProfileView):
     async def refresh(self, interaction: discord.Interaction):
         self._build_view()
         await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    _EXPIRED_NOTICE = ("This bulk panel has expired, so that change could not be added to "
+                       "it. Nothing was written — run `/profile bulk manage` again.")
+
+    def staging_footer(self) -> str:
+        """What a sub-view of this wizard is staging for. See `_BulkSubView`."""
+        return (f"{len(self.selected_profiles)} profile(s) selected · "
+                f"nothing is written until Apply")
 
     async def start(self, interaction: discord.Interaction):
         await interaction.response.send_message(embed=self.embed(), view=self, ephemeral=True)
@@ -5995,20 +6174,6 @@ class BulkManageView(BaseBulkProfileView):
             pass
 
     # --- Bespoke rows ------------------------------------------------------
-
-    async def _bulk_error_response(self, interaction: discord.Interaction):
-        async def modal_callback(i: discord.Interaction, new_val: str):
-            await self._stage_from_modal(
-                i, "error_response",
-                {"error_response": new_val.strip() or "An error has occurred."}, {})
-
-        await interaction.response.send_modal(ActionTextInputModal(
-            title="Set Custom Error Message",
-            label="Error Message",
-            placeholder="Shown to users when generation fails...",
-            default="An error has occurred.",
-            required=False,
-            on_submit_callback=modal_callback))
 
     async def _bulk_edit_persona(self, interaction: discord.Interaction):
         async def modal_callback(i: discord.Interaction, persona_data: Dict[str, List[str]]):

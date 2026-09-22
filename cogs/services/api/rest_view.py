@@ -38,6 +38,12 @@ class _EnumStr(str):
 # Attribute names whose values are enums in the SDK and plain strings over REST.
 _ENUM_ATTRS = frozenset({"finish_reason", "block_reason"})
 
+# Attribute names whose dict value is data, not another view. A function call's
+# `args` is the model's own arguments object: its keys are named by whoever wrote
+# the declaration, so mapping them through _to_camel would rename them, and a
+# dispatcher wants a dict it can `**` into a handler rather than an attribute view.
+_RAW_DICT_ATTRS = frozenset({"args"})
+
 
 class _RestView:
     """Attribute view over one parsed REST JSON object.
@@ -52,6 +58,7 @@ class _RestView:
     misses one of these looks like a model that "doesn't support images":
 
         candidates[0].content.parts[].text / .thought
+        candidates[0].content.parts[].function_call.name / .args
         candidates[0].content.parts[].inline_data.data / .mime_type
         candidates[0].finish_reason.name
         candidates[0].grounding_metadata.grounding_chunks[].web.uri / .title
@@ -143,7 +150,7 @@ class _BlobRef:
 
 def _wrap_rest(name: str, value):
     if isinstance(value, dict):
-        return _RestView(value)
+        return value if name in _RAW_DICT_ATTRS else _RestView(value)
     if isinstance(value, list):
         return [_wrap_rest(name, v) for v in value]
     if isinstance(value, str):

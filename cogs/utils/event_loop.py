@@ -10,29 +10,44 @@ per child bot is not nothing. Nothing in the codebase depends on which loop it i
 Optional, never required: absent, or on Windows, the bot runs on asyncio as it always
 did. MIMIC_UVLOOP=0 turns it off without uninstalling it, for telling whether a
 problem is the loop's.
+
+Falling back is silent by nature -- the bot runs either way -- so the boot line says
+which reason it was. A box that has been running since before uvloop was a dependency,
+and one carrying a distribution package too old to use, both read as "asyncio" and are
+fixed by different commands.
 """
 
 import asyncio
 import os
 import platform
 import sys
-from typing import Any, Coroutine, Optional
+from typing import Any, Coroutine, Optional, Tuple
 
 _OFF = ("0", "false", "no", "off")
 
 
-def _uvloop() -> Optional[Any]:
+def _uvloop_choice() -> Tuple[Optional[Any], str]:
+    """The uvloop module to run on and why, or None and why not, in the words the
+    boot line prints."""
     if (os.getenv("MIMIC_UVLOOP") or "1").strip().lower() in _OFF:
-        return None
+        return None, "turned off by MIMIC_UVLOOP"
     if platform.system() == "Windows":
-        return None
+        return None, "no uvloop build exists for Windows"
     try:
         import uvloop  # type: ignore
     except ImportError:
-        return None
-    # uvloop.run arrived in 0.18; an older install is treated as absent rather than
-    # half-used through the deprecated policy API.
-    return uvloop if hasattr(uvloop, "run") else None
+        return None, "uvloop is not installed (pip install -r requirements.txt)"
+    version = getattr(uvloop, "__version__", "?")
+    if not hasattr(uvloop, "run"):
+        # uvloop.run arrived in 0.18; an older install is treated as absent rather than
+        # half-used through the deprecated policy API. Debian's own package is one of
+        # them, so this is what a distribution install reads as.
+        return None, f"uvloop {version} is older than 0.18 (pip install -U uvloop)"
+    return uvloop, f"uvloop {version}"
+
+
+def _uvloop() -> Optional[Any]:
+    return _uvloop_choice()[0]
 
 
 def loop_name() -> str:
@@ -40,11 +55,12 @@ def loop_name() -> str:
 
 
 def run(main: Coroutine) -> Any:
-    """asyncio.run, on uvloop when it is available. Prints what it chose, and the
-    Python it chose it on, so the journal answers both without a shell on the box."""
-    uvloop = _uvloop()
+    """asyncio.run, on uvloop when it is available. Prints what it chose and why, and
+    the Python it chose it on, so the journal answers all three without a shell on the
+    box."""
+    uvloop, reason = _uvloop_choice()
     print(f"Python {platform.python_version()} ({sys.implementation.name}), "
-          f"event loop: {'uvloop ' + uvloop.__version__ if uvloop else 'asyncio'}", flush=True)
+          f"event loop: {reason if uvloop else 'asyncio -- ' + reason}", flush=True)
     if uvloop:
         return uvloop.run(main)
     return asyncio.run(main)

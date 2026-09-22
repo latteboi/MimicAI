@@ -15,7 +15,8 @@ from ...utils.constants import (
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_history_entry,
     _get_user_hash, _resolve_safety_settings, _scrub_response_text, default_profile_avatar_url,
-    resolve_grounding_mode, resolve_native_tools, resolve_thinking_params, suppress_link_previews,
+    resolve_function_tools, resolve_grounding_mode, resolve_native_tools,
+    resolve_thinking_params, suppress_link_previews,
 )
 from ._shared import _strip_neuro_update_and_scrub
 
@@ -285,7 +286,13 @@ class GlobalChatMixin:
             grounding_mode = resolve_grounding_mode(profile_data)
 
             global_rag_sources = []
-            if grounding_mode == "rag":
+            # Both RAG spellings run the gate model here, and only here. Global Chat is
+            # one-shot: `resolve_function_tools` is called without `with_loop`, so
+            # `search_web` is never declared on this path and a profile set to RAG would
+            # otherwise silently stop grounding the moment it left a session. The legacy
+            # call is what this surface has always run, and one embed per user gesture is
+            # not the per-round cost that made it worth replacing.
+            if grounding_mode in ("rag", "tool"):
                 g_hist = []
                 stm_length = int(profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
                 g_stm_capped = min(10, stm_length)
@@ -407,6 +414,7 @@ class GlobalChatMixin:
                         fallback_instance = self.cog.api_service._instantiate_model(
                             fb_name, None, host_user_id,
                             sys_instr, d_safe, t_params_f, model_tools, p_data_f,
+                            function_tools=resolve_function_tools(p_data_f),
                             openrouter_key_error="No OR key for fallback",
                             google_key_error="No Google key for fallback",
                             config_owner_id=source_id_f, policy_guild_id=interaction.guild_id,
@@ -479,7 +487,8 @@ class GlobalChatMixin:
                 raw_text = _add_inline_citations(raw_text, response.raw.candidates[0].grounding_metadata)
             raw_text = raw_text.strip()
 
-            raw_text, _ = self._extract_and_apply_neuro_state(raw_text, host_user_id, profile_name)
+            raw_text, _ = self._extract_and_apply_neuro_state(raw_text, host_user_id, profile_name,
+                                                              response=response)
 
             # Apply filters. Every speaker's name is XML-tag-wrapped in the history the
             # model sees (_format_history_entry), so a hallucinated continuation as one of

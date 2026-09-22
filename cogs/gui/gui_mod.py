@@ -815,15 +815,22 @@ MOD_PROMPT_CATEGORIES = [
         ("Image: Grounding Preamble", "IMAGE_GROUNDING", DEFAULT_IMAGE_GROUNDING),
     ]),
     ("Grounding & Critics", [
-        ("Web Grounding (Text)", "WEB_GROUNDING_TEXT", DEFAULT_WEB_GROUNDING_TEXT),
-        ("Web Grounding (Visual)", "WEB_GROUNDING_VISUAL", DEFAULT_WEB_GROUNDING_VISUAL),
-        ("Grounding RAG Payload", "GROUNDING_RAG_PAYLOAD", DEFAULT_GROUNDING_RAG_PAYLOAD),
+        # RAG (tool mode): what the character is told, and what the researcher is told.
+        ("Web Search \u00b7 Character Brief", "SEARCH_INSTRUCTION", DEFAULT_SEARCH_INSTRUCTION),
+        ("Web Search \u00b7 Researcher", "WEB_SEARCH_RESEARCH", DEFAULT_WEB_SEARCH_RESEARCH),
+        # Legacy RAG: the gate that decides and searches in front of every round.
+        ("Legacy RAG (Text)", "WEB_GROUNDING_TEXT", DEFAULT_WEB_GROUNDING_TEXT),
+        ("Legacy RAG (Visual)", "WEB_GROUNDING_VISUAL", DEFAULT_WEB_GROUNDING_VISUAL),
+        ("Legacy RAG Payload", "GROUNDING_RAG_PAYLOAD", DEFAULT_GROUNDING_RAG_PAYLOAD),
         ("Attachment Describer (Simulated vision)", "MEDIA_DESCRIPTION", DEFAULT_MEDIA_DESCRIPTION),
         ("Anti-Repetition Critic", "ANTI_REPETITION", DEFAULT_ANTI_REPETITION_PROMPT),
         ("Content Classifier (18+ gating)", "CONTENT_CLASSIFIER", DEFAULT_CONTENT_CLASSIFIER_PROMPT),
     ]),
     ("Memory & Training", [
         ("LTM Summarization", "LTM_SUMMARIZATION_INSTRUCTIONS", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS),
+        # Read by prompt_builder since Memory Search shipped, but never listed here, so
+        # the one prompt an operator would most want to retune was unreachable.
+        ("Memory Search \u00b7 Character Brief", "RECALL_INSTRUCTION", DEFAULT_RECALL_INSTRUCTION),
         ("Training Analyst", "TRAINING_ANALYST", DEFAULT_TRAINING_ANALYST_PROMPT),
     ]),
     ("Bot Utilities", [

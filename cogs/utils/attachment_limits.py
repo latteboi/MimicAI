@@ -7,7 +7,8 @@ it downloads, for media that arrives with no stated size.
 """
 from typing import Any, Optional
 
-from .constants import ATTACHMENT_SKIPPED_NOTE, defaultConfig
+from .constants import ATTACHMENT_SKIPPED_NOTE, DOCUMENT_MIME_TYPES, defaultConfig
+from .helpers import attachment_mime
 
 _MB = 1024 * 1024
 
@@ -21,9 +22,22 @@ def attachment_size(attachment: Any) -> Optional[int]:
     return size if isinstance(size, int) else None
 
 
+def attachment_limit_bytes(attachment: Any) -> int:
+    """The largest this particular file may be.
+
+    A document gets the lower cap. It is the one attachment whose cost does not scale
+    with its length -- OpenRouter bills a PDF by the page it parses, and the round hands
+    the same file to every seated character -- so a size that is trivial to upload can be
+    expensive to read, several times over.
+    """
+    if attachment_mime(attachment) in DOCUMENT_MIME_TYPES:
+        return defaultConfig.LIMIT_DOCUMENT_BYTES
+    return defaultConfig.LIMIT_ATTACHMENT_BYTES
+
+
 def over_attachment_limit(attachment: Any) -> bool:
     size = attachment_size(attachment)
-    return size is not None and size > defaultConfig.LIMIT_ATTACHMENT_BYTES
+    return size is not None and size > attachment_limit_bytes(attachment)
 
 
 def skipped_attachment_note(attachment: Any) -> str:
@@ -34,6 +48,8 @@ def skipped_attachment_note(attachment: Any) -> str:
     else:
         filename = getattr(attachment, "filename", None)
     return ATTACHMENT_SKIPPED_NOTE.format(
-        limit=defaultConfig.LIMIT_ATTACHMENT_BYTES // _MB,
+        # The cap this file was actually judged against, which is the lower one for a
+        # document. Quoting 25 MB at someone whose 6 MB PDF was refused reads as a bug.
+        limit=attachment_limit_bytes(attachment) // _MB,
         filename=filename or "attachment",
         size=f"{(attachment_size(attachment) or 0) / _MB:.1f}")
