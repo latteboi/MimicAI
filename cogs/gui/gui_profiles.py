@@ -1924,7 +1924,7 @@ class EditUserProfilePersonaModal(ui.Modal):
             self.user_id, self.profile_name, updated_persona_data, i.channel_id
         )
         scope = f"your profile '{self.profile_name}'"
-        message = f"Persona sections for {scope} {'updated' if success else 'update failed (max profiles reached or other issue)'}."
+        message = f"Persona sections for {scope} {'updated' if success else 'update failed -- that profile could not be written'}."
 
         await i.followup.send(message, ephemeral=True)
         if success:
@@ -1970,7 +1970,7 @@ class EditUserProfileAIInstructionsModal(ui.Modal):
             self.user_id, self.profile_name, instr_list, i.channel_id
         )
         scope=f"your profile '{self.profile_name}'"
-        message = f"AI Instructions for {scope} {'updated' if success else 'update failed (max profiles reached or other issue)'}."
+        message = f"AI Instructions for {scope} {'updated' if success else 'update failed -- that profile could not be written'}."
 
         await i.followup.send(message,ephemeral=True)
         if success:

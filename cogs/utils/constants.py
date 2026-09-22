@@ -2108,8 +2108,6 @@ DEFAULT_CONTEXT_RULES = (
     "\n"
     "Your ID is {profile_id_placeholder}.\n"
     "Each participant has an immutable, unique ID.\n"
-    "<whisper_context> or <private_whisper> means a user is speaking privately to you.\n"
-    "<private_response> is your past private reply to a whisper.\n"
     "Always respond as yourself.\n"
     "\n"
     "Reply with the spoken message only. Do not write your own name header, the "

@@ -3988,12 +3988,31 @@ class ProfileManager:
         return True
     
 
+    def _may_edit_prompts(self, user_id: int, profile_name: str) -> bool:
+        """Whether this user may write this profile's persona and instructions.
+
+        Their own personal profile, or -- for the bot owner -- a System profile,
+        whose shard sits in their tree but whose name is in "system" and never in
+        "personal": the bare personal test that used to gate the two updaters
+        rejected every persona and instruction edit on a System profile, including
+        the bot owner's, the only person the dashboard offers the form to.
+
+        Anyone else is refused here rather than by _save_profile_prompts, which
+        drops a cross-tree write silently and would leave the caller reporting a
+        success that never happened. A borrow is excluded too -- its prompts are
+        the source's, which is why the persona tab is `_own`.
+        """
+        index = self._get_user_index(user_id)
+        if profile_name in index.get("personal", []):
+            return True
+        return (user_id == int(defaultConfig.DISCORD_OWNER_ID)
+                and self._is_system_name(user_id, profile_name))
+
     async def update_user_profile_persona(self, user_id: int, profile_name: str, persona_data: Dict[str, List[str]], channel_id_context: int) -> bool:
         if not self.cog.has_lock: return False
 
         def _sync_update():
-            index = self._get_user_index(user_id)
-            if profile_name not in index.get("personal", []): return None
+            if not self._may_edit_prompts(user_id, profile_name): return None
 
             prompts = self._get_profile_prompts(user_id, profile_name) or {}
             prompts["persona"] = persona_data
@@ -4008,12 +4027,11 @@ class ProfileManager:
             self._invalidate_channel_model_cache((channel_id_context, user_id))
         return True
 
-    async def update_user_profile_ai_instructions(self, user_id: int, profile_name: str, instructions: str, channel_id_context: int) -> bool:
+    async def update_user_profile_ai_instructions(self, user_id: int, profile_name: str, instructions: List[str], channel_id_context: int) -> bool:
         if not self.cog.has_lock: return False
 
         def _sync_update():
-            index = self._get_user_index(user_id)
-            if profile_name not in index.get("personal", []): return None
+            if not self._may_edit_prompts(user_id, profile_name): return None
 
             prompts = self._get_profile_prompts(user_id, profile_name) or {}
             prompts["ai_instructions"] = instructions
