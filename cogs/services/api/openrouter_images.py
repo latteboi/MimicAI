@@ -137,8 +137,6 @@ class OpenRouterImageModel:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://discord.com",
-            "X-Title": "MimicAI Discord Bot",
         }
         segments = None
         if blob_files:

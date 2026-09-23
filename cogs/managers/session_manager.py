@@ -1041,11 +1041,28 @@ class SessionManager:
 
         return (persona, ai_instructions, grounding_enabled, float(temperature), float(top_p), int(top_k), int(training_context_size), float(training_relevance_threshold), primary_model, fallback_model)
 
+    def _active_profile_name(self, user_id: int, stored: Optional[str]) -> Optional[str]:
+        """The current name of the profile a `user_active_profiles` entry points at, or None.
+
+        Entries are written as PIDs and read back through the user's index, so renaming a
+        profile leaves it active wherever it was: stored as the name, a rename left every
+        such channel pointing at a profile that no longer existed, which answered with an
+        empty persona. A PID the index no longer holds -- the profile was deleted -- is
+        None, and the caller falls back to the user's first profile. An entry written as
+        a name before this is returned as it is; names are lower case, so none reads as a PID.
+        """
+        if not stored:
+            return None
+        if not self.cog.profile_manager._is_pid(stored):
+            return stored
+        return self.cog.profile_manager._get_name_from_pid(user_id, stored, include_borrowed=True)
+
     def _get_active_user_profile_name_for_channel(self, user_id: int, channel_id: int) -> Optional[str]:
         channel = self.cog.bot.get_channel(channel_id)
         server_id_str = str(channel.guild.id) if channel and getattr(channel, 'guild', None) else "dm"
         server_index = self.cog.server_manager._get_server_index(server_id_str)
-        active = server_index.get("user_active_profiles", {}).get(str(user_id), {}).get(str(channel_id))
+        active = self._active_profile_name(
+            user_id, server_index.get("user_active_profiles", {}).get(str(user_id), {}).get(str(channel_id)))
         if active: return active
 
         index = self.cog.profile_manager._get_user_index(user_id)
@@ -1089,8 +1106,12 @@ class SessionManager:
                 return None
 
             server_index = self.cog.server_manager._get_server_index(server_id_str)
-            old_profile_name = server_index.get("user_active_profiles", {}).get(str(user_id), {}).get(str(channel_id))
-            server_index.setdefault("user_active_profiles", {}).setdefault(str(user_id), {})[str(channel_id)] = profile_name
+            old_profile_name = self._active_profile_name(
+                user_id, server_index.get("user_active_profiles", {}).get(str(user_id), {}).get(str(channel_id)))
+            # The PID, not the name -- see _active_profile_name. A pre-PID index has
+            # none, and its folder is named after the profile anyway.
+            stored = self.cog.profile_manager._get_pid_from_name(user_id, profile_name) or profile_name
+            server_index.setdefault("user_active_profiles", {}).setdefault(str(user_id), {})[str(channel_id)] = stored
             self.cog.server_manager._save_server_index(server_id_str, server_index)
 
             effective_owner_id = user_id
@@ -1098,10 +1119,8 @@ class SessionManager:
             active_appearance = None
             if interaction_for_feedback:
                 if is_borrowed:
-                    b_config = self.cog.profile_manager._get_profile_config(user_id, profile_name, True)
-                    if b_config:
-                        effective_owner_id = int(b_config.get("original_owner_id", user_id))
-                        effective_profile_name = b_config.get("original_profile_name", profile_name)
+                    effective_owner_id, effective_profile_name = \
+                        self.cog.profile_manager._resolve_effective_profile(user_id, profile_name)
 
                 owner_config = self.cog.profile_manager._get_profile_config(effective_owner_id, effective_profile_name)
                 if owner_config and (owner_config.get("custom_display_name") or owner_config.get("custom_avatar_url")):

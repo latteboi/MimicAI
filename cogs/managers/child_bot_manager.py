@@ -54,12 +54,27 @@ class ChildBotManager:
         # from. See _profiles_scan_signature for why this is safe to trust.
         self._child_bot_scan_signature: Optional[Tuple] = None
 
-    def _find_borrowed_name_for_owner(self, author_id: int, original_owner_id: int, original_profile_name: str) -> Optional[str]:
-        """Finds the name under which author_id has borrowed original_owner_id's original_profile_name profile, if any."""
+    def _is_borrow_of(self, borrower_id: int, borrow_name: str, owner_id: int, source_pid: Optional[str]) -> bool:
+        """Whether borrower_id's borrow `borrow_name` was made from owner_id's profile `source_pid`.
+
+        By PID. The borrow's `original_profile_name` is a snapshot, so matching it against
+        the bot's profile name stopped finding every borrow once the author renamed the
+        profile, and found a borrow of a different profile once the old name was reused.
+        """
+        if not source_pid:
+            return False
+        b_data = self.cog.profile_manager._get_profile_config(borrower_id, borrow_name, True) or {}
+        try:
+            same_owner = int(b_data.get("original_owner_id", 0)) == int(owner_id)
+        except (TypeError, ValueError):
+            return False
+        return same_owner and (b_data.get("original_pid") or b_data.get("original_profile_id")) == source_pid
+
+    def _find_borrowed_name_for_owner(self, author_id: int, original_owner_id: int, source_pid: Optional[str]) -> Optional[str]:
+        """The name under which author_id has borrowed original_owner_id's profile `source_pid`, if any."""
         author_index = self.cog.profile_manager._get_user_index(author_id)
         for b_name in author_index.get("borrowed", []):
-            b_data = self.cog.profile_manager._get_profile_config(author_id, b_name, True) or {}
-            if int(b_data.get("original_owner_id", 0)) == original_owner_id and b_data.get("original_profile_name") == original_profile_name:
+            if self._is_borrow_of(author_id, b_name, original_owner_id, source_pid):
                 return b_name
         return None
 
@@ -949,7 +964,7 @@ class ChildBotManager:
             guild = self.cog.bot.get_guild(guild_id) if guild_id else None
             if guild and not guild.get_member(original_owner_id):
                 author_id = message_payload.get("author_id")
-                borrowed_name = self._find_borrowed_name_for_owner(author_id, original_owner_id, original_profile_name)
+                borrowed_name = self._find_borrowed_name_for_owner(author_id, original_owner_id, bot_config.get('pid'))
 
                 if borrowed_name:
                     effective_owner_id = author_id
@@ -961,8 +976,7 @@ class ChildBotManager:
                         for p in session.get("profiles", []):
                             p_index = self.cog.profile_manager._get_user_index(p['owner_id'])
                             if p['profile_name'] in p_index.get("borrowed", []):
-                                b_data = self.cog.profile_manager._get_profile_config(p['owner_id'], p['profile_name'], True) or {}
-                                if int(b_data.get("original_owner_id", 0)) == original_owner_id and b_data.get("original_profile_name") == original_profile_name:
+                                if self._is_borrow_of(p['owner_id'], p['profile_name'], original_owner_id, bot_config.get('pid')):
                                     effective_owner_id = p['owner_id']
                                     effective_profile_name = p['profile_name']
                                     found_in_session = True
@@ -1054,7 +1068,7 @@ class ChildBotManager:
             guild = self.cog.bot.get_guild(guild_id) if guild_id else None
             if guild and not guild.get_member(original_owner_id):
                 author_id = message_data.get("author_id")
-                borrowed_name = self._find_borrowed_name_for_owner(author_id, original_owner_id, original_profile_name)
+                borrowed_name = self._find_borrowed_name_for_owner(author_id, original_owner_id, bot_config.get('pid'))
                 if borrowed_name:
                     owner_id = author_id
                     profile_name = borrowed_name
@@ -1089,12 +1103,8 @@ class ChildBotManager:
             dynamic_safety_settings = _resolve_safety_settings(
                 self.cog.bot.get_channel(channel_id), profile_data)
 
-            source_owner_id = owner_id
-            source_profile_name = profile_name
-            if is_borrowed:
-                borrowed_data = self.cog.profile_manager._get_profile_config(owner_id, profile_name, True) or {}
-                source_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
-                source_profile_name = borrowed_data.get("original_profile_name", profile_name)
+            source_owner_id, source_profile_name = \
+                self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)
 
             source_prompts = self.cog.profile_manager._get_profile_prompts(source_owner_id, source_profile_name) or {}
             persona = source_prompts.get("persona", {})

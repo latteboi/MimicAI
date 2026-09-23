@@ -2,22 +2,25 @@ import re
 import datetime
 import itertools
 import discord
-from zoneinfo import ZoneInfo
 from typing import Any, Optional, Dict, List, Sequence, Tuple
 
 from ...utils.constants import (
     defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
-    DEFAULT_SYSTEM_INSTRUCTION, DEFAULT_CONTEXT_RULES, DEFAULT_NEURO_INSTRUCTION,
-    DEFAULT_NEURO_INSTRUCTION_TOOL, DEFAULT_RECALL_INSTRUCTION,
-    DEFAULT_SEARCH_INSTRUCTION,
-    NEURO_AXES, NEURO_TOOL_NAME,
-    DEFAULT_TRAINING_DATA_INJECTION, DEFAULT_TIME_CONTEXT, DEFAULT_NEGATIVE_CONSTRAINTS,
+    DEFAULT_SYSTEM_INSTRUCTION, DEFAULT_SESSION_RULES, DEFAULT_NEURO_INSTRUCTION,
+    NEURO_AXES,
+    DEFAULT_TRAINING_DATA_INJECTION, DEFAULT_CURRENT_TIME, DEFAULT_NEGATIVE_CONSTRAINTS,
     DEFAULT_CONTENT_POLICY, DEFAULT_BIRTHDAY_CONTEXT,
 )
-from ...utils.birthdays import describe_birthday
-from ...utils.helpers import (Timeout, _get_user_hash, default_profile_avatar_url,
-                             provider_speaks_beside_tools, provider_takes_functions,
-                             resolve_grounding_mode)
+from ...utils.birthdays import birthday_offset, describe_birthday
+from ...utils.helpers import (TURN_TIME_FORMAT, Timeout, _get_user_hash,
+                              default_profile_avatar_url)
+from ._shared import NEURO_BARE_PATTERN, NEURO_TAG_PATTERN
+
+#: One axis as a model writes it inside the tag: a letter or the whole name, `:` or `=`,
+#: then the number. Found one at a time, so the separators between them are free.
+_NEURO_AXIS = re.compile(r'\b(dopamine|cortisol|oxytocin|adrenaline|[DCOA])\s*[:=]\s*(\d{1,3})\b',
+                         re.IGNORECASE)
+_AXIS_BY_KEY = {**{axis: axis for axis in NEURO_AXES}, **{axis[0]: axis for axis in NEURO_AXES}}
 
 #: The most users whose birthdays one prompt carries. A history window rarely holds more
 #: people than this, and the bound keeps a crowded channel from growing every prompt.
@@ -26,8 +29,7 @@ BIRTHDAY_USERS_MAX = 10
 
 class PromptBuilderMixin:
     """Persona/system-instruction assembly and the neuro-state extraction that
-    reads the model's state back out of its reply -- from a `set_mood` call where the
-    provider carries one, and from a <neuro_update> block where it does not.
+    reads the model's state back out of the <neuro_update> tag at the end of its reply.
     """
 
     def _resolve_appearance_data(self, owner_id: int, profile_name: str) -> Tuple[str, str]:
@@ -96,21 +98,48 @@ class PromptBuilderMixin:
 
     def _birthday_lines(self, profile_owner_id: Optional[int], profile_name: str,
                         profile_today: datetime.date,
-                        users: Sequence[Tuple[int, str]]) -> List[str]:
+                        users: Sequence[Tuple[int, str]],
+                        cast: Sequence[Tuple[int, str]] = ()) -> List[str]:
         """What the model is told about birthdays within a day of today, if anything.
 
-        The character's own is read from the source profile's prompts, so a borrow keeps
-        the original's, and judged on the character's clock. Each user's comes from their
-        About Me and is judged on theirs: a birthday is the date where its owner is.
+        The character's own is its source profile's, so a borrow keeps the original's, and
+        is judged on the character's clock. Each user's comes from their About Me and is
+        judged on theirs: a birthday is the date where its owner is.
+
+        `cast` is (owner id, profile name) for every seat in the session, this one included.
+        The rest of the cast is told a character's birthday as well: told only to the
+        character, its birthday lines reach everyone else with nothing to explain them.
         """
+        from ...utils.helpers import _resolve_zoneinfo
+        pm = self.cog.profile_manager
         lines = []
         if profile_owner_id is not None:
-            prompts = self.cog.profile_manager._get_profile_prompts(profile_owner_id, profile_name) or {}
-            own = describe_birthday(prompts.get("birthday"), profile_today)
+            own = describe_birthday(pm.character_birthday(profile_owner_id, profile_name), profile_today)
             if own:
                 lines.append(own)
 
-        from ...utils.helpers import _resolve_zoneinfo
+        utc_today = datetime.datetime.now(datetime.timezone.utc).date()
+        for owner_id, name in cast:
+            if (owner_id, name) == (profile_owner_id, profile_name):
+                continue
+            birthday = pm.character_birthday(owner_id, name)
+            # Settled on the UTC date first, so a character with no birthday this week
+            # costs no config read.
+            if birthday_offset(birthday, utc_today, reach=2) is None:
+                continue
+            is_borrowed = name in pm._get_user_index(owner_id).get("borrowed", [])
+            config = pm._get_profile_config(owner_id, name, is_borrowed) or {}
+            try:
+                tz, _ = _resolve_zoneinfo(config.get("timezone") or "UTC")
+            except Exception:
+                tz = datetime.timezone.utc
+            # Named as its turns are headed: the name it speaks under, and its PID.
+            shown = self._resolve_appearance_data(owner_id, name)[0]
+            line = describe_birthday(birthday, datetime.datetime.now(tz).date(),
+                                     f"{shown} [ID: {pm._get_profile_id(owner_id, name)}]")
+            if line:
+                lines.append(line)
+
         seen = set()
         for user_id, display_name in users:
             if user_id in seen:
@@ -129,17 +158,16 @@ class PromptBuilderMixin:
                 lines.append(line)
         return lines
 
-    def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None, present_users: Optional[Sequence[Tuple[int, str]]] = None, with_loop: bool = False) -> Tuple[str, bool, bool, float, float, int, str, str]:
+    def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None, present_users: Optional[Sequence[Tuple[int, str]]] = None, functions: Sequence[Any] = ()) -> Tuple[str, bool, bool, float, float, int, str, str]:
         """The system instruction for one profile's generation, plus its sampling values.
 
         `present_users` is (user id, display name) for the people in the conversation, whose
         birthdays the character may know. A session derives them from its own log, so only
         a caller with no session -- Global Chat -- passes them.
 
-        `with_loop` says the caller runs a function loop and so will actually declare
-        the answering functions -- `recall` and `search_web`. It defaults to False
-        because most callers do not: the reply path and regeneration are the two that
-        do. See the two blocks it gates.
+        `functions` are the ones the caller's model declares -- the tuple
+        `tool_loop.functions_for` gave it, handed to the model factory as well -- and
+        each is described here. Empty for a caller that sends this to no model.
         """
         persona_data: Dict[str, List[str]] = {}
         # profile_owner_id is Optional, but profile_data is read unconditionally below.
@@ -169,12 +197,12 @@ class PromptBuilderMixin:
 
         # Assembled most-stable-first, and that is a cost decision rather than a
         # stylistic one. Providers cache on a shared prefix, so the first block that
-        # changes invalidates every token after it -- and <time_context> is formatted to
+        # changes invalidates every token after it -- and <current_time> is formatted to
         # the minute. With the persona and the character instructions sitting *behind*
         # it, as they used to, the largest and most stable part of every prompt was
         # re-billed uncached on every turn that crossed a minute boundary.
         #
-        # <context_rules> and <content_policy> stay at the very end despite being stable
+        # <session_rules> and <content_policy> stay at the very end despite being stable
         # themselves: they are the output-format and hard-content rules and they want
         # recency, and by that point a volatile block already sits in front of them --
         # so nothing past `stable_parts` was ever going to cache anyway.
@@ -222,27 +250,13 @@ class PromptBuilderMixin:
                                 + "\n\n".join(decrypted_parts).strip()
                                 + "\n</character_instructions>")
 
-        # Stable, so it sits with the persona rather than among the per-turn blocks:
-        # it never changes, and anything volatile placed ahead of it would invalidate
-        # the cached prefix it belongs to.
-        #
-        # `with_loop` and not merely the profile's toggle. Only a caller with a
-        # function loop declares `recall`, and telling a character it can search an
-        # archive it has no way to reach is worse than saying nothing -- it produces
-        # exactly the "let me check my memories" reply this block exists to stop.
-        if with_loop and profile_data.get("ltm_recall_tool_enabled"):
-            stable_parts.append(self.cog.global_prompts.get(
-                "RECALL_INSTRUCTION", DEFAULT_RECALL_INSTRUCTION))
-
-        # The same three tests `resolve_function_tools` applies to `search_web`, in the
-        # same order. CLAUDE.md's rule, and it is this pair that it was written about:
-        # disagree, and a character is told to call a declaration it was never sent, so
-        # it narrates the search it cannot run and the turn ends with nothing looked up.
-        if (with_loop and resolve_grounding_mode(profile_data) == "tool"
-                and provider_takes_functions(profile_data.get("primary_model"),
-                                             profile_data.get("fallback_model"))):
-            stable_parts.append(self.cog.global_prompts.get(
-                "SEARCH_INSTRUCTION", DEFAULT_SEARCH_INSTRUCTION))
+        # Stable, so they sit with the persona rather than among the per-turn blocks:
+        # they never change, and anything volatile placed ahead of them would
+        # invalidate the cached prefix they belong to. Exactly the functions the
+        # caller's model declares, from the one tuple both were handed -- a character
+        # told about a function it was never sent narrates a search it cannot run.
+        for function in functions:
+            stable_parts.append(function.instruction(self.cog.global_prompts))
 
         if is_multi_profile:
             # Standing context, not a history turn: the synopsis summarises turns that
@@ -264,22 +278,7 @@ class PromptBuilderMixin:
                 volatile_parts.append(f"<game_context>\n{game_block}\n</game_context>")
 
         if neuro_enabled:
-            # Which spelling of the block to send: the one asking for a `set_mood` call,
-            # or the one asking for a `<neuro_update>` tag. Keyed off the models rather
-            # than a setting, because it is a provider capability and not a preference --
-            # and an operator who has overridden NEURO_ENGINE keeps their own text
-            # whichever provider answers, since the override names one prompt only.
-            #
-            # This test must stay the same one `resolve_function_tools` applies to the
-            # declaration. They are two halves of one decision, and disagreeing would
-            # tell a character to call a function that was never declared -- which it
-            # cannot do, so the mood would silently stop moving entirely.
-            tool_form = (provider_speaks_beside_tools(primary_model, fallback_model)
-                         and "NEURO_ENGINE" not in self.cog.global_prompts)
-            neuro_block = (
-                DEFAULT_NEURO_INSTRUCTION_TOOL if tool_form else
-                self.cog.global_prompts.get("NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION)
-            ).format(
+            neuro_block = self.cog.global_prompts.get("NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION).format(
                 d=neuro_state.get('dopamine', 50),
                 c=neuro_state.get('cortisol', 20),
                 o=neuro_state.get('oxytocin', 50),
@@ -290,23 +289,24 @@ class PromptBuilderMixin:
         # Always sent. `time_tracking_enabled` used to switch this block off; that mode is
         # retired and the key is no longer read, so a profile still carrying False gets
         # its clock like every other.
-        time_template = self.cog.global_prompts.get("TIME_CONTEXT", DEFAULT_TIME_CONTEXT)
+        time_template = self.cog.global_prompts.get("TIME_CONTEXT", DEFAULT_CURRENT_TIME)
         try:
             from ...utils.helpers import _resolve_zoneinfo
             tz, _ = _resolve_zoneinfo(timezone_str)
             now = datetime.datetime.now(tz)
-            time_str = now.strftime("%A, %d %B %Y, %I:%M %p (%Z)")
         except Exception as e:
             print(f"Error processing timezone '{timezone_str}': {e}. Defaulting to UTC.")
             now = datetime.datetime.now(datetime.timezone.utc)
-            time_str = now.strftime("%A, %d %B %Y, %I:%M %p (UTC)")
-        volatile_parts.append(time_template.format(time_str=time_str))
+        volatile_parts.append(time_template.format(time_str=now.strftime(TURN_TIME_FORMAT)))
 
-        # Beside <time_context>, which already changes every minute, so it costs no
+        # Beside <current_time>, which already changes every minute, so it costs no
         # prompt caching the clock was not already costing.
         if present_users is None:
             present_users = self._users_in_history_window(session, profile_data) if session else []
-        birthday_lines = self._birthday_lines(profile_owner_id, profile_name_to_use, now.date(), present_users)
+        cast = [(seat.get("owner_id"), seat.get("profile_name"))
+                for seat in (session or {}).get("profiles") or []]
+        birthday_lines = self._birthday_lines(profile_owner_id, profile_name_to_use, now.date(),
+                                              present_users, cast)
         if birthday_lines:
             birthday_template = self.cog.global_prompts.get("BIRTHDAY_CONTEXT", DEFAULT_BIRTHDAY_CONTEXT)
             volatile_parts.append(birthday_template.format(birthdays="\n".join(birthday_lines)))
@@ -329,7 +329,7 @@ class PromptBuilderMixin:
             constraints_block = self.cog.global_prompts.get("NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS)
             volatile_parts.append(constraints_block.format(constraints=critic_constraints))
 
-        rule_block = self.cog.global_prompts.get("CONTEXT_RULES", DEFAULT_CONTEXT_RULES)
+        rule_block = self.cog.global_prompts.get("CONTEXT_RULES", DEFAULT_SESSION_RULES)
 
         # [NEW] Dynamically inject the profile's ID into the context rules
         profile_id_val = self.cog.profile_manager._get_profile_id(profile_owner_id, profile_name_to_use)
@@ -356,60 +356,32 @@ class PromptBuilderMixin:
         final_system_instruction = current_instructions_str if current_instructions_str.strip() else DEFAULT_SYSTEM_INSTRUCTION
         return final_system_instruction, False, grounding_enabled, temperature, top_p, top_k, primary_model, fallback_model
 
-    def _neuro_state_from_calls(self, function_calls) -> Dict[str, int]:
-        """The `set_mood` arguments, clamped. Empty when no such call was made.
-
-        Clamped rather than refused because 0-100 is prose in the declaration: both
-        providers' schemas say "integer", not "integer in a range", so the bound has to
-        be applied here or not at all.
-
-        An axis that is absent or unreadable is left out, which reads as "did not
-        move". That is the same outcome the tag parser gave a pair it could not split,
-        with the difference that matters: here it can only happen to an axis the model
-        genuinely omitted, because a malformed *argument set* was already dropped whole
-        in `from_openrouter_message` and said so.
-        """
-        state: Dict[str, int] = {}
-        for call in function_calls or ():
-            if call.name != NEURO_TOOL_NAME:
-                continue
-            for axis in NEURO_AXES:
-                raw = call.args.get(axis)
-                # bool is an int in Python, and `set_mood(dopamine=True)` is a model
-                # error rather than 1 on a 0-100 scale.
-                if isinstance(raw, bool):
-                    continue
-                try:
-                    value = int(raw)
-                except (TypeError, ValueError):
-                    continue
-                state[axis] = max(0, min(100, value))
-        return state
-
     def _neuro_state_from_text(self, raw_text: str) -> Tuple[str, Dict[str, int]]:
-        """The `<neuro_update>` path: state read out of the reply, and the reply without it.
+        """The state the reply's `<neuro_update>` tag reports, and the reply without it.
 
-        Still live for Ollama, whose adapter cannot carry a declaration, and as the
-        backstop for a model that was offered `set_mood` and emitted the tag anyway --
-        which is why the scrub runs whether or not a call came back. A tag that is
-        parsed but not scrubbed is said out loud in Discord.
+        The one way the engine reports, whichever provider answered. Read axis by axis,
+        so whatever separator a model chooses survives and a whole name reads as its
+        letter -- splitting on `|` and `:` lost the lot to `D:70, C:15`. A tag that was
+        there and yielded no axis is logged: otherwise it is a character whose mood
+        silently never moves.
+
+        Falls back to a bare `D:70|C:15|O:60|A:25` for a model that drops the tag. The
+        marker is scrubbed either way; one left in is said out loud in Discord.
         """
-        xml_pattern = r'<neuro_update>\s*(.*?)\s*</neuro_update>'
         data_str = None
         clean_text = raw_text
 
         try:
             with Timeout(seconds=1, error_message="Neuro extraction timed out"):
-                match = re.search(xml_pattern, raw_text, flags=re.IGNORECASE | re.DOTALL)
+                match = NEURO_TAG_PATTERN.search(raw_text)
                 if match:
                     data_str = match.group(1)
-                    clean_text = re.sub(xml_pattern, '', raw_text, flags=re.IGNORECASE | re.DOTALL)
+                    clean_text = NEURO_TAG_PATTERN.sub('', raw_text)
                 else:
-                    relaxed_pattern = r'(?:D:\d{1,3}\s*\|\s*C:\d{1,3}\s*\|\s*O:\d{1,3}\s*\|\s*A:\d{1,3})'
-                    match = re.search(relaxed_pattern, raw_text, flags=re.IGNORECASE)
+                    match = NEURO_BARE_PATTERN.search(raw_text)
                     if match:
                         data_str = match.group(0)
-                        clean_text = re.sub(relaxed_pattern, '', raw_text, flags=re.IGNORECASE)
+                        clean_text = NEURO_BARE_PATTERN.sub('', raw_text)
         except TimeoutError:
             return raw_text.strip(), {}
 
@@ -417,40 +389,24 @@ class PromptBuilderMixin:
             return raw_text.strip(), {}
 
         new_state: Dict[str, int] = {}
-        # Normalise separators for splitting
-        normalised_data = data_str.replace('|', ':').replace(' ', '')
-        kv_pairs = normalised_data.split(':')
-
-        # Iterating pairs (K, V)
-        for i in range(0, len(kv_pairs) - 1, 2):
-            k = kv_pairs[i].strip().upper()
-            try:
-                v = int(kv_pairs[i+1].strip())
-                v = max(0, min(100, v))
-                if k == 'D': new_state['dopamine'] = v
-                elif k == 'C': new_state['cortisol'] = v
-                elif k == 'O': new_state['oxytocin'] = v
-                elif k == 'A': new_state['adrenaline'] = v
-            except (ValueError, IndexError):
-                continue
+        for key, value in _NEURO_AXIS.findall(data_str):
+            axis = _AXIS_BY_KEY.get(key.lower())
+            if axis:
+                new_state[axis] = max(0, min(100, int(value)))
+        if not new_state:
+            print(f"Neuro engine: a <neuro_update> tag carried no readable axis: {data_str[:80]!r}")
 
         return clean_text.strip(), new_state
 
-    def _extract_and_apply_neuro_state(self, raw_text: str, owner_id: int, profile_name: str,
-                                       response=None) -> Tuple[str, Optional[Dict[str, int]]]:
-        """The reply with any state marker removed, and the state it left behind.
+    def _extract_and_apply_neuro_state(self, raw_text: str, owner_id: int,
+                                       profile_name: str) -> Tuple[str, Optional[Dict[str, int]]]:
+        """The reply with its state marker removed, and the state it left behind.
 
-        `response` is the adapter response the text came from, when the caller still has
-        it. A `set_mood` call on it wins over anything in the text, because it cannot
-        have been mangled on the way: it arrives as arguments rather than as characters
-        the model had to spell correctly inside its own prose.
-
-        The text is scrubbed either way. A model offered the tool can still emit the
-        tag -- prompts are advice -- and an unscrubbed tag is `D:80|C:20|O:55|A:30`
-        appearing in the channel under the character's name.
+        An axis the tag leaves out keeps its stored value: a partial update means "the
+        rest did not move". Nothing is written when nothing was reported, which is most
+        turns.
         """
-        clean_text, text_state = self._neuro_state_from_text(raw_text)
-        new_state = self._neuro_state_from_calls(getattr(response, "function_calls", None)) or text_state
+        clean_text, new_state = self._neuro_state_from_text(raw_text)
 
         final_state = None
         if new_state:

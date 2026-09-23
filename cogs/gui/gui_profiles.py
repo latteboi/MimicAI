@@ -1704,7 +1704,7 @@ class ProfileManageView(BlockedGuard, ui.View):
                     pid = self.profile_name
 
                 if not self.is_borrowed:
-                    self.cog.profile_manager._cascade_delete_borrowed_profiles(self.user_id, pid, self.profile_name)
+                    self.cog.profile_manager._cascade_delete_borrowed_profiles(self.user_id, pid)
 
                 # Shard first, index second -- the same rule creation follows, and for
                 # the same reason. Writing the index first meant a crash before the
@@ -5093,7 +5093,7 @@ def _unlink_profiles(cog, user_id: int, names: List[str]) -> List[str]:
             else:
                 index["personal"].remove(name)
                 pid = name
-            cog.profile_manager._cascade_delete_borrowed_profiles(user_id, pid, name)
+            cog.profile_manager._cascade_delete_borrowed_profiles(user_id, pid)
         else:
             continue
         doomed.append(os.path.join(cog.USERS_DIR, user_id_str, "profiles", pid))

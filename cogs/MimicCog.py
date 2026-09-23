@@ -10,7 +10,7 @@ from .utils.constants import (
     TRAIN_COMMAND_ENABLED, TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check,
     is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
-    IMPORT_FILE_TOO_LARGE,
+    IMPORT_FILE_TOO_LARGE, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE,
 )
 from .services.profile_generation import ProfileGenerationError, generate_draft
 from .listeners.event_listeners import EventListeners
@@ -711,6 +711,11 @@ class MimicCog(EventListeners, commands.Cog):
                     "to let anyone edit it.", ephemeral=True)
                 return
 
+        block = self._session_key_block(interaction.guild, interaction.user.id)
+        if block:
+            await interaction.response.send_message(block, ephemeral=True)
+            return
+
         # Invalidate previous session configuration view for this user
         if interaction.user.id in self.active_session_config_views:
             try:
@@ -720,6 +725,22 @@ class MimicCog(EventListeners, commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
         await self._open_session_config(interaction)
+
+    def _session_key_block(self, guild: Optional[discord.Guild], user_id: int) -> Optional[str]:
+        """Why nobody can set up a session in this server, or None when they can.
+
+        One answer for `/session config`, `/session swap` and `/start`'s cast step: a
+        cast seated on a server with no key could never say anything, and the round
+        worker would only say so once. The bot owner is let through, because the
+        Ollama profiles only they may run need no server key.
+        """
+        if guild is None or self.storage_manager.guild_has_text_key(guild.id):
+            return None
+        if self.profile_manager.may_use_ollama(user_id):
+            return None
+        if self.storage_manager.gemini_blocked_for_guild(guild.id):
+            return GEMINI_FREE_TIER_BLOCKED
+        return NO_SERVER_KEY_GATE.format(server=guild.name)
 
     def _ensure_session_shell(self, interaction: discord.Interaction) -> Dict[str, Any]:
         """The channel's live session, waking a suspended one from its blueprint.
@@ -846,6 +867,11 @@ class MimicCog(EventListeners, commands.Cog):
         deferring twice raises. Everything below responds through `followup`, which is
         valid for either interaction.
         """
+        block = self._session_key_block(interaction.guild, interaction.user.id)
+        if block:
+            await interaction.followup.send(block, ephemeral=True)
+            return
+
         session = self.multi_profile_channels.get(interaction.channel_id)
 
         if not profile_name and not slot:

@@ -6,6 +6,7 @@ from typing import Optional
 
 from ...utils.constants import PLACEHOLDER_EMOJI, DELIVERY_HARD_TIMEOUT_SECONDS, STATUS_QUEUED
 from ...utils.loop_probe import note_reply
+from . import latency
 from .gate import generation_gate
 
 
@@ -256,7 +257,7 @@ class HeartbeatMixin:
                 pass
             raise
 
-    async def _generate_with_heartbeat(self, model, contents, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name='Bot', app_avatar=None, existing_state=None, message_type="text", status_label=None):
+    async def _generate_with_heartbeat(self, model, contents, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name='Bot', app_avatar=None, existing_state=None, message_type="text", status_label=None, slow_after=None, on_slow=None):
         """Runs one generation, writing a running timer onto its placeholder every ten seconds.
 
         `status_label` names what is being made when it is not a reply
@@ -267,6 +268,11 @@ class HeartbeatMixin:
         so. The hard timeout runs from the slot, not from the start: time in the queue is
         the bot being busy, not the model hanging. A call still queued after the same
         span gives up instead, as a timeout, so a jammed gate cannot hold a turn forever.
+
+        `on_slow()` is called once, when the call has held its slot for `slow_after`
+        seconds without answering; the call carries on. A primary that is being raced by
+        its fallback (`state_container['fallback_racing']`) stops writing the placeholder,
+        which is the fallback's to tick from then on.
         """
         # Hard Limits: 4 minutes for Main, 3 minutes for Fallback
         hard_timeout = 180.0 if is_fallback else 240.0
@@ -285,6 +291,8 @@ class HeartbeatMixin:
         async def _gated_call():
             async with ticket:
                 response = await model.generate_content_async(contents, generation_config=gen_config)
+                if ticket.admitted_at is not None:
+                    latency.record(getattr(model, 'model_name', None), time.time() - ticket.admitted_at)
             note_reply()
             return response
 
@@ -302,8 +310,12 @@ class HeartbeatMixin:
                     timed_out = elapsed >= hard_timeout
                     timeout_reason = f"No free generation slot after {hard_timeout:.0f} seconds"
                 else:
-                    timed_out = time.time() - (ticket.admitted_at or start_time) >= hard_timeout
-                    timeout_reason = f"Generation timed out after {hard_timeout} seconds"
+                    held = time.time() - (ticket.admitted_at or start_time)
+                    timed_out = held >= hard_timeout
+                    timeout_reason = f"Generation timed out after {hard_timeout:.0f} seconds"
+                    if on_slow is not None and slow_after is not None and held >= slow_after:
+                        on_slow, _slow = None, on_slow
+                        _slow()
 
                 if timed_out:
                     gen_task.cancel()
@@ -312,8 +324,15 @@ class HeartbeatMixin:
                     except (Exception, asyncio.CancelledError):
                         pass # Ignore exceptions from the forcibly killed task
                     err = TimeoutError(timeout_reason)
+                    # Said as it happened: the generic phrasing claims two minutes, and
+                    # this is four for a primary and three for a fallback.
+                    err.formatted_reason = timeout_reason.replace("Generation timed out after", "No reply after")
                     err.state_container = state_container
                     raise err
+
+                if not is_fallback and state_container.get('fallback_racing'):
+                    await asyncio.sleep(1)
+                    continue
 
                 # Periodic typing pulse for Child Bots without a placeholder (Discord typing expires in 9s)
                 if participant and participant.get('method') == 'child_bot':

@@ -256,10 +256,11 @@ class ProfileManager:
         index = self._get_user_index(user_id)
         is_borrowed = profile_name in index.get("borrowed", [])
         if is_borrowed:
-            config = self._get_profile_config(user_id, profile_name, True) or {}
-            orig_owner = config.get("original_owner_id", user_id)
-            orig_name = config.get("original_profile_name", profile_name)
-            return self._get_pid_from_name_any(int(orig_owner), orig_name)
+            source = self._borrow_source(user_id, profile_name)
+            if source is None:
+                return self._get_pid_from_name_any(user_id, profile_name)
+            owner, pid, name = source
+            return pid or self._get_pid_from_name_any(owner, name)
         else:
             return self._get_pid_from_name_any(user_id, profile_name)
 
@@ -685,8 +686,10 @@ class ProfileManager:
         # as the literal string "Unknown" and sit in the hub forever.
         resolved = self._get_name_from_pid(owner_id, pid)
         orphaned = resolved is None
-        if not name or name == "Unknown":
-            name = resolved
+        # The live name first: the stored one is a snapshot from publishing, so a profile
+        # renamed since was listed under a name its owner no longer uses. The snapshot
+        # only labels a tombstone.
+        name = resolved or (name if name and name != "Unknown" else None)
 
         if not published_at:
             # Sorting fallback for entries that predate published_at. The profile
@@ -1372,6 +1375,11 @@ class ProfileManager:
         data["profiles_stamp"] = self._profiles_dir_stamp(user_id_str)
         IOManager.write_json(data, path)
         self.cog.user_indices[user_id_str] = data
+        # The appearance cache is keyed by name, and every rename, delete and creation
+        # ends here. Kept past one, a name handed to a different profile -- a rename's
+        # old name reused, a deleted profile's name taken -- wore the previous holder's
+        # face until the LRU let it go. Rebuilt from config on the next read.
+        self.cog.user_appearances.pop(user_id_str, None)
         # Every path that adds or removes a borrow ends here, which is why the
         # reverse index is maintained here rather than at each of them.
         try:
@@ -1450,7 +1458,7 @@ class ProfileManager:
         off the user's active profile.
 
         Not to be confused with a profile's `timezone`, which is the character's
-        clock and stays where it is: that one is what `<time_context>` and a
+        clock and stays where it is: that one is what `<current_time>` and a
         speaker's own history line are built from.
         """
         return self.get_user_about(user_id).get("timezone") or "UTC"
@@ -1566,6 +1574,30 @@ class ProfileManager:
             p_data["config"] = data
         self._save_profile(user_id, profile_name, p_data, is_borrowed)
 
+    def _borrow_source(self, user_id: int, profile_name: str) -> Optional[Tuple[int, Optional[str], str]]:
+        """(owner, PID, current name) of the profile this borrow was made from, or None
+        when the borrow's config names no owner.
+
+        Found through `original_pid`. `original_profile_name` is a snapshot taken when the
+        borrow was made: once the author renamed the profile it named nothing, and once
+        the old name was reused it named a different character, which the borrow then
+        spoke as. The name comes fresh from the owner's index; a source no longer in it
+        is answered with its PID as the name, which no profile name can equal (names are
+        lower case), so it resolves to that source's own folder or to nothing.
+
+        PID None is a borrow predating `original_pid` that `_migrate_borrow_pointers`
+        could not stamp: the snapshot is the only pointer it has.
+        """
+        config = self._get_profile_config(user_id, profile_name, True) or {}
+        owner = config.get("original_owner_id")
+        if not owner:
+            return None
+        owner = int(owner)
+        pid = config.get("original_pid") or config.get("original_profile_id")
+        if not pid or pid == _UNKNOWN_SOURCE_PID:
+            return owner, None, config.get("original_profile_name", profile_name)
+        return owner, pid, self._get_name_from_pid(owner, pid) or pid
+
     def _resolve_effective_profile(self, user_id: int, profile_name: str) -> Tuple[int, str]:
         index = self._get_user_index(user_id)
 
@@ -1574,10 +1606,10 @@ class ProfileManager:
         # user's personal profile sharing a name with a System profile resolved to
         # the System profile and never ran.
         if profile_name in index.get("borrowed", []):
-            b_config = self._get_profile_config(user_id, profile_name, True) or {}
-            eff_owner = int(b_config.get("original_owner_id", user_id))
-            eff_name = b_config.get("original_profile_name", profile_name)
-            return eff_owner, eff_name
+            source = self._borrow_source(user_id, profile_name)
+            if source is None:
+                return user_id, profile_name
+            return source[0], source[2]
         if profile_name in index.get("personal", []):
             return user_id, profile_name
 
@@ -1773,6 +1805,23 @@ class ProfileManager:
         if p_data is not None:
             return p_data.get("prompts", {})
         return None
+
+    def character_birthday(self, user_id: int, profile_name: str) -> Any:
+        """The stored birthday of the character this name speaks as, unvalidated, or None.
+
+        Not `_get_profile_prompts` alone: that reads a borrow's own shard, and a borrow is
+        written with empty prompts, so every borrowed character went without its birthday.
+        A borrow's is its source's, read by PID -- see `_borrow_source`. A personal or
+        System profile reads its own.
+        """
+        index = self._get_user_index(user_id)
+        if profile_name in index.get("borrowed", []):
+            source = self._borrow_source(user_id, profile_name)
+            if source is None or source[1] is None:
+                return None
+            data = self._get_profile_by_pid(source[0], source[1]) or {}
+            return (data.get("prompts") or {}).get("birthday")
+        return (self._get_profile_prompts(user_id, profile_name) or {}).get("birthday")
 
     def _save_profile_prompts(self, user_id: int, profile_name: str, data: Dict[str, Any]):
         """Persists prompts and invalidates any cached content rating.
@@ -2301,7 +2350,7 @@ class ProfileManager:
 
         return removed_count
 
-    def _cascade_delete_borrowed_profiles(self, original_owner_id: int, deleted_pid: str, original_profile_name: str):
+    def _cascade_delete_borrowed_profiles(self, original_owner_id: int, deleted_pid: str):
         """Instantly removes all borrowed variants linked to a deleted personal profile across the entire system."""
         owner_str = str(original_owner_id)
 
@@ -2312,7 +2361,10 @@ class ProfileManager:
                 if info == f"{owner_str}:{deleted_pid}":
                     public_ids_to_del.append(pub_id)
             elif isinstance(info, dict) and str(info.get("owner_id")) == owner_str:
-                if info.get("original_pid") == deleted_pid or info.get("original_profile_name") == original_profile_name:
+                # By PID alone. Matching the name as well removed the listing of any
+                # other profile of this owner's that had once been called the same --
+                # a snapshot that outlives a rename -- when this one was deleted.
+                if (info.get("original_pid") or info.get("original_profile_id")) == deleted_pid:
                     public_ids_to_del.append(pub_id)
 
         if public_ids_to_del:
@@ -4349,12 +4401,21 @@ class ProfileManager:
         if not active_profile_name: return True
 
         if active_profile_name in index.get("borrowed", []):
-            borrowed_data = self._get_profile_config(user_id, active_profile_name, True) or {}
-            owner_id = int(borrowed_data.get("original_owner_id", 0))
-            owner_profile_name = borrowed_data.get("original_profile_name", active_profile_name)
-            
-            owner_index = self._get_user_index(owner_id)
-            if owner_profile_name not in owner_index.get("personal", []):
+            # Whether the source still exists, asked of its PID. This asked whether the
+            # borrow's snapshot name was among the author's *personal* profiles, and
+            # deleted the borrow -- memories and all -- when it was not: so every borrow
+            # went on its holder's next message once the author renamed the source, and
+            # every borrow of a System profile, whose name is never a personal one.
+            source = self._borrow_source(user_id, active_profile_name)
+            if source is None:
+                source_exists = False
+            elif source[1] is not None:
+                source_exists = self._get_name_from_pid(source[0], source[1]) is not None
+            else:
+                owner_index = self._get_user_index(source[0])
+                source_exists = (source[2] in owner_index.get("personal", [])
+                                 or source[2] in owner_index.get("system", {}))
+            if not source_exists:
                 if isinstance(index["borrowed"], dict):
                     pid = index["borrowed"].pop(active_profile_name, active_profile_name)
                 else:
@@ -4373,7 +4434,7 @@ class ProfileManager:
                 try:
                     p_dir = os.path.join(self.cog.USERS_DIR, str(user_id), "profiles", pid)
                     shutil.rmtree(p_dir, ignore_errors=True)
-                    await channel.send(f"<@{user_id}>, the borrowed profile '{active_profile_name}' is broken because the original was deleted or renamed. It has been removed from your list and your active profile in this channel has been reset.")
+                    await channel.send(f"<@{user_id}>, the borrowed profile '{active_profile_name}' is broken because the original was deleted. It has been removed from your list and your active profile in this channel has been reset.")
                 except discord.Forbidden:
                     pass
                 return False

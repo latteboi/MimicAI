@@ -787,8 +787,8 @@ class ModProfilesView(ModBaseView):
 # can hold (25 options), and the list is still growing.
 MOD_PROMPT_CATEGORIES = [
     ("Core Instructions", [
-        ("Context Rules", "CONTEXT_RULES", DEFAULT_CONTEXT_RULES),
-        ("Time Context", "TIME_CONTEXT", DEFAULT_TIME_CONTEXT),
+        ("Session Rules", "CONTEXT_RULES", DEFAULT_SESSION_RULES),
+        ("Current Time", "TIME_CONTEXT", DEFAULT_CURRENT_TIME),
         ("Birthday Context", "BIRTHDAY_CONTEXT", DEFAULT_BIRTHDAY_CONTEXT),
         ("Negative Constraints", "NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS),
         ("Training Data Injection", "TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION),

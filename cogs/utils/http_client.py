@@ -48,6 +48,16 @@ _OPENROUTER_LIMITS = httpx.Limits(
 
 _DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
+#: How OpenRouter files every call, and on the client so no call site can leave it
+#: off. The referer *is* the app there -- the title only names the app the referer
+#: picked -- and `https://discord.com` filed MimicAI, from every host's key, under
+#: an untitled app other clients send too. See openrouter.ai/docs/app-attribution.
+OPENROUTER_APP_HEADERS = {
+    "HTTP-Referer": "https://mimic-ai.org",
+    "X-OpenRouter-Title": "MimicAI",
+    "X-OpenRouter-Categories": "roleplay",
+}
+
 _shared_client: Optional[httpx.AsyncClient] = None
 _openrouter_client: Optional[httpx.AsyncClient] = None
 
@@ -70,10 +80,12 @@ async def close_shared_client():
 
 def get_openrouter_client() -> httpx.AsyncClient:
     """The client for model calls to OpenRouter: text, images, speech and embeddings.
-    Its own pool, so a busy spell of replies cannot starve the shared client."""
+    Its own pool, so a busy spell of replies cannot starve the shared client, and it
+    carries `OPENROUTER_APP_HEADERS` on every request."""
     global _openrouter_client
     if _openrouter_client is None or _openrouter_client.is_closed:
-        _openrouter_client = httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, limits=_OPENROUTER_LIMITS)
+        _openrouter_client = httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT, limits=_OPENROUTER_LIMITS,
+                                               headers=OPENROUTER_APP_HEADERS)
     return _openrouter_client
 
 

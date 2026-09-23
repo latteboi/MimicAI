@@ -856,7 +856,11 @@ class HubShareManagerView(HubBaseView):
                 if isinstance(info, str) and ":" in info:
                     if info == f"{self.user_id}:{target_pid}":
                         ids_to_del.append(pid)
-                elif isinstance(info, dict) and str(info.get("owner_id")) == user_id_str and info.get("original_profile_name") == name:
+                # By PID, as the string form above: the entry's name is a snapshot from
+                # publishing, so a profile renamed since could not be unpublished, and
+                # a later profile given the old name unpublished the renamed one.
+                elif (isinstance(info, dict) and str(info.get("owner_id")) == user_id_str
+                      and (info.get("original_pid") or info.get("original_profile_id")) == target_pid):
                     ids_to_del.append(pid)
                     
             for pid in ids_to_del:

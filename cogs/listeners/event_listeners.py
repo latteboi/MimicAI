@@ -304,15 +304,12 @@ class EventListeners:
                 mentioned_child_ids.append(ref_author_id)
 
         if mentioned_child_ids:
-            if not self.storage_manager._get_api_key_for_guild(message.guild.id):
-                for bot_id in mentioned_child_ids:
-                    asyncio.create_task(self.manager_queue.put({
-                        "action": "send_to_child", "bot_id": bot_id,
-                        "payload": {
-                            "action": "send_message", "channel_id": message.channel.id,
-                            "content": "An API key has not been configured for this server. You can use the `/settings` command in the parent bot's DM to set one."
-                        }
-                    }))
+            # Any key the server has, not Gemini's alone -- and a child bot whose own
+            # profile runs on the bot owner's Ollama needs none.
+            if not self.storage_manager.guild_has_text_key(message.guild.id) and not any(
+                    self._child_bot_runs_on_ollama(bot_id) for bot_id in mentioned_child_ids):
+                await self.generation_service._notify_no_server_key(
+                    message.channel, message.author.id, bot_id=mentioned_child_ids[0])
                 return
 
             for bot_id in mentioned_child_ids:
@@ -383,6 +380,17 @@ class EventListeners:
                 session['worker_task'] = task
                 self.background_tasks.add(task)
             return
+
+    def _child_bot_runs_on_ollama(self, bot_id: str) -> bool:
+        """Whether this child bot's profile answers on Ollama, which no server key gates."""
+        bot_config = self.child_bots.get(bot_id)
+        if not bot_config:
+            return False
+        owner_id, profile_name = bot_config['owner_id'], bot_config['profile_name']
+        is_borrowed = profile_name in self.profile_manager._get_user_index(owner_id).get("borrowed", [])
+        config = self.profile_manager._get_profile_config(owner_id, profile_name, is_borrowed) or {}
+        return (str(config.get("primary_model", "")).upper().startswith("OLLAMA/")
+                and self.profile_manager.may_use_ollama(owner_id))
 
     def _reaction_user_is_admin(self, payload: discord.RawReactionActionEvent) -> bool:
         """Administrator (or bot owner) test for a raw reaction.

@@ -11,9 +11,10 @@ from ...utils.constants import (
 )
 from ...utils.helpers import (
     _format_history_entry, _resolve_safety_settings, _scrub_response_text,
-    resolve_function_tools, resolve_native_tools, resolve_thinking_params,
+    resolve_native_tools, resolve_thinking_params,
 )
 from ...managers.session_manager import intern_turn
+from . import tool_loop
 
 
 class SpeakAsMixin:
@@ -93,8 +94,8 @@ class SpeakAsMixin:
 
         if is_borrowed:
             borrowed_data = self.cog.profile_manager._get_profile_config(user_id, profile_name, True) or {}
-            effective_owner_id = int(borrowed_data.get("original_owner_id", user_id))
-            effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
+            effective_owner_id, effective_profile_name = \
+                self.cog.profile_manager._resolve_effective_profile(user_id, profile_name)
             profile_data_source = self.cog.profile_manager._get_profile_config(effective_owner_id, effective_profile_name, False) or {}
             own_config = borrowed_data
         else:
@@ -188,7 +189,7 @@ class SpeakAsMixin:
         last part of the final user turn.
 
         That position is the feature. Every block in the system instruction says "you
-        are mid-scene, continue the conversation", and <context_rules> closes with
+        are mid-scene, continue the conversation", and <session_rules> says
         "Always respond as yourself"; a rewrite directive placed anywhere earlier loses
         to them and the model answers the transcript instead of re-voicing the line.
 
@@ -227,17 +228,24 @@ class SpeakAsMixin:
         else:
             contents.append({'role': 'user', 'parts': [directive]})
 
+        # One tuple for the prompt and both models -- see tool_loop.
+        functions = tool_loop.functions_for(p_settings, has_server=bool(guild_id))
         try:
             system_instruction, _, _, temp, top_p, top_k, primary_model, fallback_model = await asyncio.to_thread(
                 self._construct_system_instructions,
                 owner_id, profile_name, channel.id, is_multi_profile=bool(session),
+                functions=functions,
             )
         except Exception as e:
             return None, f"Could not build the character's prompt: {e}"
 
         safety_settings = _resolve_safety_settings(channel, p_settings)
         tools = resolve_native_tools(p_settings)
-        fn_tools = resolve_function_tools(p_settings)
+        fn_ctx = tool_loop.FunctionContext(
+            owner_id=owner_id, profile_name=profile_name,
+            author_dn=ctx["speaker_display_name"], guild_id=guild_id or None,
+            triggering_user_id=getattr(ctx.get("author"), "id", owner_id),
+            safety_settings=safety_settings)
 
         gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
         # Mutated in place by every attempt, so a fallback keeps ticking the card the
@@ -255,12 +263,18 @@ class SpeakAsMixin:
                 model_name, guild_id, owner_id, system_instruction, safety_settings,
                 resolve_thinking_params(p_settings, "response",
                                         "fallback" if is_fallback else "primary"),
-                tools, p_settings, config_owner_id=owner_id, function_tools=fn_tools,
+                tools, p_settings, config_owner_id=owner_id, functions=functions,
             )
-            return await self._generate_with_heartbeat(
-                model, contents, gen_config, channel, None, None,
-                is_fallback=is_fallback, message_type="embed",
-                existing_state=state_container)
+
+            async def send(turn, cfg):
+                reply, _ = await self._generate_with_heartbeat(
+                    model, turn, cfg, channel, None, None,
+                    is_fallback=is_fallback, message_type="embed",
+                    existing_state=state_container)
+                return reply
+
+            looped = await tool_loop.run(self.cog, model, contents, gen_config, fn_ctx, send)
+            return looped.response, state_container
 
         status = "api_error"
         try:
@@ -283,7 +297,7 @@ class SpeakAsMixin:
                                model_used=model_used, status="success")
 
         text = (getattr(response, 'text', "") or "").strip()
-        text, _ = self._extract_and_apply_neuro_state(text, owner_id, profile_name, response=response)
+        text, _ = self._extract_and_apply_neuro_state(text, owner_id, profile_name)
 
         # The model routinely echoes the tag it was addressed in. Both are in
         # SYSTEM_XML_TAGS, so PATTERN_SYSTEM_XML_BLOCKS would delete the entire reply

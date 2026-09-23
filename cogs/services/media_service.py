@@ -19,6 +19,8 @@ from ..utils.constants import (
 )
 from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, generated_image_attachment, image_command_prefix, image_command_prompt, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor
 from ..utils.attachment_limits import over_attachment_limit, skipped_attachment_note
+from .generation import tool_loop
+from .generation.reply import _merge_sources
 from ..utils.http_client import get_capped
 from ..utils.memory_tuning import maybe_trim_malloc
 
@@ -366,10 +368,25 @@ class MediaService:
                         }
 
                         text_failure_reason = None
+                        looped = None
+                        fn_ctx = tool_loop.FunctionContext(
+                            owner_id=owner_id, profile_name=profile_name, author_dn=app_name,
+                            guild_id=package['guild_id'], triggering_user_id=package['author_id'],
+                            safety_settings=_resolve_safety_settings(channel, profile_settings))
+
+                        async def send(turn, cfg, _model=text_model, _state=state_container,
+                                       _participant=participant, _msg_a_id=msg_a_id,
+                                       _app_name=app_name, _app_avatar=app_avatar):
+                            reply, _ = await self.cog.generation_service._generate_with_heartbeat(
+                                _model, turn, cfg, channel, _participant, _msg_a_id, is_fallback=False,
+                                app_name=_app_name, app_avatar=_app_avatar, existing_state=_state,
+                                message_type=_state['message_type'])
+                            return reply
+
                         try:
-                            text_response, state_container = await self.cog.generation_service._generate_with_heartbeat(
-                                text_model, contents_for_api_call, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type=state_container['message_type']
-                            )
+                            looped = await tool_loop.run(self.cog, text_model, contents_for_api_call,
+                                                         gen_config, fn_ctx, send)
+                            text_response = looped.response
                         except Exception as e:
                             if 'state_container' in locals() and state_container and state_container.get('sending_task'):
                                 state_container['sending_task'].cancel()
@@ -394,7 +411,7 @@ class MediaService:
                             if hasattr(text_response, 'raw') and text_response.raw.candidates and hasattr(text_response.raw.candidates[0], 'grounding_metadata'):
                                 raw_text = _add_inline_citations(raw_text, text_response.raw.candidates[0].grounding_metadata)
 
-                            raw_text, _ = self.cog.generation_service._extract_and_apply_neuro_state(raw_text, package['effective_profile_owner_id'], package['effective_profile_name'], response=text_response)
+                            raw_text, _ = self.cog.generation_service._extract_and_apply_neuro_state(raw_text, package['effective_profile_owner_id'], package['effective_profile_name'])
 
                             response_text = _scrub_response_text(raw_text.strip(), participant_names=[package['bot_display_name']])
 
@@ -419,6 +436,10 @@ class MediaService:
                                             for u in url_metadata.url_metadata:
                                                 if hasattr(u, 'retrieved_url') and u.retrieved_url:
                                                     grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
+
+                                # What the character looked up itself, cited like the rest.
+                                if looped is not None:
+                                    grounding_sources = _merge_sources(grounding_sources, looped.sources)
 
                                 sources_text_list = _format_citation_subtext(grounding_sources)
 
@@ -728,15 +749,8 @@ class MediaService:
         return "\n\n".join(text_blocks)
 
     def _get_image_gen_system_instruction(self, owner_id: int, profile_name: str) -> Optional[str]:
-        index = self.cog.profile_manager._get_user_index(owner_id)
-        is_borrowed = profile_name in index.get("borrowed", [])
-
-        effective_owner_id = owner_id
-        effective_profile_name = profile_name
-        if is_borrowed:
-            borrowed_data = self.cog.profile_manager._get_profile_config(owner_id, profile_name, True) or {}
-            effective_owner_id = int(borrowed_data.get("original_owner_id", owner_id))
-            effective_profile_name = borrowed_data.get("original_profile_name", profile_name)
+        effective_owner_id, effective_profile_name = \
+            self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)
 
         source_prompts = self.cog.profile_manager._get_profile_prompts(effective_owner_id, effective_profile_name)
 
@@ -796,13 +810,9 @@ class MediaService:
             dynamic_safety_settings = _resolve_safety_settings(message.channel, profile_data)
 
             # Get appearance text
-            source_owner_id = effective_profile_owner_id
-            source_profile_name = effective_profile_name
-            if is_borrowed:
-                borrowed_data = self.cog.profile_manager._get_profile_config(effective_profile_owner_id, effective_profile_name, True) or {}
-                source_owner_id = int(borrowed_data.get("original_owner_id", effective_profile_owner_id))
-                source_profile_name = borrowed_data.get("original_profile_name", effective_profile_name)
-            
+            source_owner_id, source_profile_name = self.cog.profile_manager._resolve_effective_profile(
+                effective_profile_owner_id, effective_profile_name)
+
             source_prompts = self.cog.profile_manager._get_profile_prompts(source_owner_id, source_profile_name) or {}
             persona = source_prompts.get("persona", {})
             appearance_lines_encrypted = persona.get("appearance", [])

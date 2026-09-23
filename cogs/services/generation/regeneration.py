@@ -10,10 +10,11 @@ from ...utils.constants import (
     DEFAULT_KICKSTART_START, DEFAULT_IMAGE_PRESENT, DEFAULT_WHISPER_RECAP,
 )
 from ...utils.helpers import (_format_history_entry, image_command_prefix,
-                             is_citation_subtext, kickstart_note, ltm_auto_threshold,
+                             is_citation_subtext, kickstart_note,
                              turn_posted_at)
 from ...utils.attachment_limits import over_attachment_limit
 from .reply import reply_gen_config, reply_meta
+from .tool_loop import functions_for, ltm_auto_threshold
 
 
 def _is_image(attachment) -> bool:
@@ -277,12 +278,14 @@ class RegenerationMixin:
                 self.cog.memory_manager._get_relevant_training_examples(
                     owner_id, profile_name, trigger_content, channel.guild.id),
             )
+            # One tuple for the prompt and both models -- see tool_loop.
+            functions = functions_for(p_settings)
             (system_instruction, _, _, temp, top_p, top_k,
              primary_model, fallback_model_name) = await asyncio.to_thread(
                 self._construct_system_instructions,
                 owner_id, profile_name, channel.id, is_multi_profile=True,
                 training_examples_list=training_examples, recalled_ltm=ltm_recall_text,
-                with_loop=True,  # reaches _attempt_reply, so the answering functions are declared
+                functions=functions,
             )
 
             app_name, app_avatar = self._resolve_appearance_data(owner_id, profile_name)
@@ -311,7 +314,8 @@ class RegenerationMixin:
                 primary_model=primary_model, fallback_model_name=fallback_model_name,
                 history=history, gen_config=reply_gen_config(p_settings, temp, top_p, top_k),
                 msg_a_id=payload.message_id, app_name=app_name, app_avatar=app_avatar,
-                state_container=state_container, participant_names=participant_names)
+                state_container=state_container, participant_names=participant_names,
+                functions=functions)
 
             # The post-generation phase, as the worker and global chat both run it, so the
             # message does not sit frozen on the last "Still generating" tick through the

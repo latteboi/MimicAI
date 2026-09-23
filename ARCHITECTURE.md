@@ -147,7 +147,9 @@ generation *mode* — a whisper, a regeneration, a global chat and a multi-profi
 have their own history-assembly and delivery path — rather than by layer. The one shared
 step is `reply.py`: the round worker and regeneration both generate through
 `_attempt_reply` (primary, then fallback), `_reply_text` and `reply_meta`, so a new
-model or trace field lands in both at once.
+model or trace field lands in both at once. A primary slower than its own recent median
+allows (`generation/latency.py`) has the fallback started beside it rather than after its
+hard timeout; the first to answer is the reply.
 
 ---
 
@@ -560,7 +562,8 @@ Use the shared client. Do not construct `httpx.AsyncClient` in a request path.
 
 Model calls to OpenRouter -- text, images, speech, embeddings -- go through a second one,
 `get_openrouter_client()`, with httpx's default pool (100 connections, 20 kept alive).
-A model call holds its connection for the whole generation, so on the shared pool of 20
+It also carries `OPENROUTER_APP_HEADERS`, the referer and title that file every call
+under MimicAI on OpenRouter, so no call site sets them. A model call holds its connection for the whole generation, so on the shared pool of 20
 a busy spell had the next reply and the attachments a turn needed waiting for a slot.
 How many model calls run at once is bounded by the generation gate
 (`services/generation/gate.py`, `GENERATION_SLOTS`), not by the pool: every
@@ -621,12 +624,12 @@ what is true for the whole scene. It is assembled in three bands:
 
 | Band | Blocks | Why there |
 |---|---|---|
-| stable | `scene_prompt`, `persona_profile`, `character_instructions` | changes rarely, so it is the cacheable prefix |
-| volatile | `session_synopsis`, `game_context`, `neuro_endocrine_engine`, `time_context`, `birthday_context`, `training_data`, `archive_context`, `negative_constraints` | changes per turn or per minute |
-| trailing | `context_rules`, `content_policy` | output-format and hard-content rules, last for recency |
+| stable | `scene_prompt`, `persona_profile`, `character_instructions`, `memory_search`, `web_search` | changes rarely, so it is the cacheable prefix |
+| volatile | `session_synopsis`, `game_context`, `neuro_endocrine_engine`, `current_time`, `birthday_context`, `training_data`, `archive_context`, `negative_constraints` | changes per turn or per minute |
+| trailing | `session_rules`, `content_policy` | output-format and hard-content rules, last for recency |
 
 Providers cache on a shared prefix, so **the first block that changes invalidates every
-token after it**. `<time_context>` is formatted to the minute; with the persona behind it
+token after it**. `<current_time>` is formatted to the minute; with the persona behind it
 the largest stable part of every prompt was re-billed uncached every time the clock ticked.
 A new block goes in `volatile_parts` unless it is genuinely per-profile-stable.
 

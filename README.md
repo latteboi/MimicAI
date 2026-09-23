@@ -34,9 +34,33 @@ rest with a key only your instance holds.
 
 ## Gallery
 
-<img width="609" height="422" alt="Screenshot 2026-04-06 at 9 36 53 am" src="https://github.com/user-attachments/assets/412d00b3-3760-41c7-992b-c903a39d1fcf" />
-<img width="604" height="377" alt="Screenshot 2026-04-06 at 9 38 34 am" src="https://github.com/user-attachments/assets/ec0a7b6e-291c-4dc5-9f6a-607c31b962d7" />
-<img width="586" height="872" alt="Screenshot 2026-04-06 at 9 35 25 am" src="https://github.com/user-attachments/assets/496362be-e1f7-4f58-9dd1-ccab4fa8833c" />
+**Web search, in character.** Each character searches when a reply needs something current,
+and cites its sources under the message.
+
+<!-- SCREENSHOT 1: 01-web-search.png -->
+
+**A cast in one channel.** `/session config` seats a child bot and two webhook profiles —
+then they argue.
+
+<!-- SCREENSHOT 2: 02-cast.png -->
+
+**Memory past a reset.** `/refresh` clears the channel's conversation; what the character
+remembers long-term survives it.
+
+<!-- SCREENSHOT 3: 03-memory.png -->
+
+**Images and whispers.** `!imagine` draws, and the character comments on its own picture. A
+`/whisper` to another participant stays between the two of you.
+
+<!-- SCREENSHOT 4: 04-images-and-whispers.png -->
+
+**A voice.** With text-to-speech on for the session, replies arrive with an audio clip.
+
+<!-- SCREENSHOT 5: 05-voice.png -->
+
+**Getting started.** The greeting on joining a server, and `/start`'s live checklist.
+
+<!-- SCREENSHOT 6: 06-getting-started.png -->
 
 ---
 

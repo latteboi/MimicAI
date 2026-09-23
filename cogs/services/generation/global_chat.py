@@ -15,9 +15,10 @@ from ...utils.constants import (
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _format_citation_subtext, _format_history_entry,
     _get_user_hash, _resolve_safety_settings, _scrub_response_text, default_profile_avatar_url,
-    resolve_function_tools, resolve_grounding_mode, resolve_native_tools,
+    resolve_grounding_mode, resolve_native_tools,
     resolve_thinking_params, suppress_link_previews,
 )
+from . import tool_loop
 from ._shared import _strip_neuro_update_and_scrub
 
 #: Speakers named on the card before the rest collapse into "+n". Four fits the footer
@@ -146,15 +147,8 @@ class GlobalChatMixin:
         t1_start_mono = time.monotonic()
         t1_start_utc = datetime.datetime.now(datetime.timezone.utc)
 
-        index = self.cog.profile_manager._get_user_index(host_user_id)
-        is_borrowed = profile_name in index.get("borrowed", [])
-
-        source_owner_id = host_user_id
-        source_profile_name = profile_name
-        if is_borrowed:
-            borrowed_data = self.cog.profile_manager._get_profile_config(host_user_id, profile_name, True) or {}
-            source_owner_id = int(borrowed_data.get("original_owner_id", host_user_id))
-            source_profile_name = borrowed_data.get("original_profile_name", profile_name)
+        source_owner_id, source_profile_name = \
+            self.cog.profile_manager._resolve_effective_profile(host_user_id, profile_name)
 
         profile_data = self.cog.profile_manager._get_profile_config(source_owner_id, source_profile_name, False)
 
@@ -199,7 +193,8 @@ class GlobalChatMixin:
             # The people writing in this round: whose birthdays the character may know.
             present_users = [(t["user_id"], t["display_name"]) for t in queued_turns]
             model, temp, top_p, top_k, warning_message, fallback_model_name = await self.cog.api_service._get_or_create_model_for_global_chat(
-                host_user_id, profile_name, policy_guild_id=interaction.guild_id, present_users=present_users)
+                host_user_id, profile_name, policy_guild_id=interaction.guild_id, present_users=present_users,
+                search_key=user_api_key)
 
             # Resolve primary model and safety settings
             profile_data = self.cog.profile_manager._get_profile_config(source_owner_id, source_profile_name, False) or {}
@@ -286,13 +281,10 @@ class GlobalChatMixin:
             grounding_mode = resolve_grounding_mode(profile_data)
 
             global_rag_sources = []
-            # Both RAG spellings run the gate model here, and only here. Global Chat is
-            # one-shot: `resolve_function_tools` is called without `with_loop`, so
-            # `search_web` is never declared on this path and a profile set to RAG would
-            # otherwise silently stop grounding the moment it left a session. The legacy
-            # call is what this surface has always run, and one embed per user gesture is
-            # not the per-round cost that made it worth replacing.
-            if grounding_mode in ("rag", "tool"):
+            # Legacy RAG only. RAG ("tool") is the character's own `search_web`, which
+            # this path declares and answers through `tool_loop.run` like every other --
+            # running the gate here as well would search twice.
+            if grounding_mode == "rag":
                 g_hist = []
                 stm_length = int(profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
                 g_stm_capped = min(10, stm_length)
@@ -345,11 +337,31 @@ class GlobalChatMixin:
             state_container = None
 
             app_name, app_avatar = self._resolve_appearance_data(host_user_id, profile_name)
+            # No server: `recall` is not offered here, and a search bills the host's key.
+            fn_ctx = tool_loop.FunctionContext(
+                owner_id=host_user_id, profile_name=profile_name, author_dn=app_name,
+                guild_id=None,
+                triggering_user_id=queued_turns[-1]["user_id"] if queued_turns else host_user_id,
+                safety_settings=_resolve_safety_settings(None, profile_data),
+                search_key=user_api_key)
+            looped = None
+
+            def sender(chat_model, is_fallback):
+                async def send(turn, cfg):
+                    nonlocal state_container
+                    reply, state_container = await self._generate_with_heartbeat(
+                        chat_model, turn, cfg, interaction.channel, None, placeholder_msg.id,
+                        is_fallback=is_fallback, app_name=app_name, app_avatar=app_avatar,
+                        message_type="embed",
+                        existing_state=state_container or {"custom_emoji": custom_emoji,
+                                                           "placeholder_msg": placeholder_msg})
+                    return reply
+                return send
 
             try:
-                response, state_container = await self._generate_with_heartbeat(
-                    model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=False, app_name=app_name, app_avatar=app_avatar, message_type="embed", existing_state={"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg}
-                )
+                looped = await tool_loop.run(self.cog, model, contents_for_api_call, gen_config,
+                                             fn_ctx, sender(model, False))
+                response = looped.response
                 if not response or not response.candidates:
                     raise ValueError("Response blocked or empty")
 
@@ -381,20 +393,16 @@ class GlobalChatMixin:
                         # Global Chat card can be opened in any channel and none is
                         # guaranteed age-restricted, which is the same reason
                         # content_capability refuses an Adult profile here.
-                        sys_instr, _, _, _, _, _, _, _ = await asyncio.to_thread(
-                            self._construct_system_instructions, host_user_id, profile_name, 0,
-                            present_users=present_users)
-
-                        user_index_f = self.cog.profile_manager._get_user_index(host_user_id)
-                        is_borrowed_f = profile_name in user_index_f.get("borrowed", [])
-                        source_id_f = host_user_id
-                        source_name_f = profile_name
-                        if is_borrowed_f:
-                            bd = self.cog.profile_manager._get_profile_config(host_user_id, profile_name, True) or {}
-                            source_id_f = int(bd.get("original_owner_id", host_user_id))
-                            source_name_f = bd.get("original_profile_name", profile_name)
+                        source_id_f, source_name_f = \
+                            self.cog.profile_manager._resolve_effective_profile(host_user_id, profile_name)
 
                         p_data_f = self.cog.profile_manager._get_profile_config(source_id_f, source_name_f, False) or {}
+                        # One tuple for this prompt and this model -- see tool_loop.
+                        functions_f = tool_loop.functions_for(p_data_f, has_server=False,
+                                                              can_search=bool(user_api_key))
+                        sys_instr, _, _, _, _, _, _, _ = await asyncio.to_thread(
+                            self._construct_system_instructions, host_user_id, profile_name, 0,
+                            present_users=present_users, functions=functions_f)
 
                         d_safe = _resolve_safety_settings(None, p_data_f)
 
@@ -414,16 +422,16 @@ class GlobalChatMixin:
                         fallback_instance = self.cog.api_service._instantiate_model(
                             fb_name, None, host_user_id,
                             sys_instr, d_safe, t_params_f, model_tools, p_data_f,
-                            function_tools=resolve_function_tools(p_data_f),
+                            functions=functions_f,
                             openrouter_key_error="No OR key for fallback",
                             google_key_error="No Google key for fallback",
                             config_owner_id=source_id_f, policy_guild_id=interaction.guild_id,
                             conversation=True,
                         )
 
-                        response, state_container = await self._generate_with_heartbeat(
-                            fallback_instance, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=True, app_name=app_name, app_avatar=app_avatar, existing_state=state_container, message_type="embed"
-                        )
+                        looped = await tool_loop.run(self.cog, fallback_instance, contents_for_api_call,
+                                                     gen_config, fn_ctx, sender(fallback_instance, True))
+                        response = looped.response
                         status = "blocked_by_safety" if not response or not response.candidates else "success"
                         if status == "success":
                             fb_raw_check = getattr(response, 'text', "").strip()
@@ -449,11 +457,15 @@ class GlobalChatMixin:
             finally:
                 self.cog._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat", model_used=model, status=status)
 
-            if not response or not response.candidates:
+            # `status` first: a failed fallback leaves the last response it received in
+            # `response`, and one with candidates but no text passed the test alone --
+            # so two empty answers posted an empty reply instead of the error text.
+            if status != "success" or not response or not response.candidates:
                 reason = api_error_reason or "Unknown Error"
                 is_safety = False
-                if response and hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
-                    reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
+                block_reason = getattr(getattr(response, 'prompt_feedback', None), 'block_reason', None)
+                if block_reason:
+                    reason = block_reason.name.replace('_', ' ').title()
                     is_safety = True
 
                 custom_main = profile_data.get("error_response", ERR_GENERAL_ERROR)
@@ -487,8 +499,7 @@ class GlobalChatMixin:
                 raw_text = _add_inline_citations(raw_text, response.raw.candidates[0].grounding_metadata)
             raw_text = raw_text.strip()
 
-            raw_text, _ = self._extract_and_apply_neuro_state(raw_text, host_user_id, profile_name,
-                                                              response=response)
+            raw_text, _ = self._extract_and_apply_neuro_state(raw_text, host_user_id, profile_name)
 
             # Apply filters. Every speaker's name is XML-tag-wrapped in the history the
             # model sees (_format_history_entry), so a hallucinated continuation as one of
@@ -501,6 +512,9 @@ class GlobalChatMixin:
             if response_text:
                 grounding_sources = []
                 grounding_sources.extend(global_rag_sources)
+                # What the character looked up itself, cited like the rest.
+                if looped is not None:
+                    grounding_sources.extend(looped.sources)
                 if hasattr(response, 'raw') and response.raw.candidates:
                     if hasattr(response.raw.candidates[0], 'grounding_metadata'):
                         metadata = response.raw.candidates[0].grounding_metadata

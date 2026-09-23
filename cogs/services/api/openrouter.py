@@ -20,7 +20,7 @@ from ...utils.helpers import (
     resolve_openrouter_service_tier,
 )
 from ...utils.http_client import get_openrouter_client, get_shared_client
-from .function_calls import (as_openai_tools, from_openrouter_message,
+from .function_calls import (as_openai_tools, calls_forbidden, from_openrouter_message,
                              has_function_parts, openai_messages)
 from .output_cap import output_cap, refused_output_cap
 from .rest_view import _BlobRef, _RestView
@@ -244,6 +244,8 @@ class OpenRouterModel:
         declared = as_openai_tools(self.tools)
         if declared:
             payload["tools"] = declared
+            if calls_forbidden(generation_config):
+                payload["tool_choice"] = "none"
 
         budget = int(self.thinking_params.get("thinking_budget", -1))
         level = self.thinking_params.get("thinking_level", "high").lower()
@@ -279,11 +281,7 @@ class OpenRouterModel:
             provider["data_collection"] = self.data_collection
             payload["provider"] = provider
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "HTTP-Referer": "https://discord.com",
-            "X-Title": "MimicAI Discord Bot"
-        }
+        headers = {"Authorization": f"Bearer {self.api_key}"}
 
         try:
             client = get_openrouter_client()

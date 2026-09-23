@@ -136,6 +136,8 @@ class OverrideConfirmView(BlockedGuard, ui.View):
             if scope != "personal":
                 server_index = self.cog.server_manager._get_server_index(scope)
                 server_index.setdefault("assigned_keys", {})[self.provider] = {"user_id": self.user_id, "slot": self.slot_id}
+                # A server that loses this key later is told again, once.
+                server_index.pop(NO_KEY_NOTICE_FLAG, None)
                 self.cog.server_manager._save_server_index(scope, server_index)
                 self.cog.server_key_pointers[(int(scope), self.provider)] = (self.user_id, self.slot_id)
                 
@@ -596,6 +598,8 @@ class SettingsAPIView(SettingsBaseView):
             if scope != "personal":
                 server_index = self.cog.server_manager._get_server_index(scope)
                 server_index.setdefault("assigned_keys", {})[provider] = {"user_id": self.user_id, "slot": self.selected_slot}
+                # A server that loses this key later is told again, once.
+                server_index.pop(NO_KEY_NOTICE_FLAG, None)
                 self.cog.server_manager._save_server_index(scope, server_index)
                 self.cog.server_key_pointers[(int(scope), provider)] = (self.user_id, self.selected_slot)
                 

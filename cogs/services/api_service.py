@@ -27,7 +27,7 @@ from ..utils.helpers import (_format_api_error, _resolve_safety_settings,
                             billable_output_tokens, is_real_model,
                             google_thinking_caps, resolve_image_output_params,
                             resolve_image_tools, resolve_media_resolution,
-                            resolve_function_tools, resolve_native_tools, resolve_openrouter_image_detail,
+                            resolve_native_tools, resolve_openrouter_image_detail,
                             resolve_openrouter_endpoint, resolve_openrouter_service_tier,
                             resolve_thinking_params)
 from ..utils.http_client import get_shared_client
@@ -45,6 +45,7 @@ from .api.google_rest import (
 )
 from .api.ollama import OllamaModel, OllamaResponse
 from .api.function_calls import as_google_tool
+from .generation.tool_loop import declarations, declared_on, functions_for
 from .api.openrouter import OpenRouterModel
 from .api.openrouter_catalogue import BROWSE_POPULAR, OpenRouterCatalogue
 from .api.openrouter_endpoints import ENDPOINTS_URL, Endpoint, base_model_id, parse_endpoints
@@ -206,7 +207,7 @@ class APIService:
         #: the Hosts screen -- see openrouter_endpoints.
         self._endpoint_listings: "OrderedDict[str, Tuple[float, Tuple[Endpoint, ...]]]" = OrderedDict()
 
-    def _instantiate_model(self, raw_model_name: str, guild_id, user_id, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, profile_settings=None, openrouter_key_error: str = None, google_key_error: str = None, use_broad_openrouter_heuristic: bool = True, config_owner_id=None, policy_guild_id=None, conversation: bool = False, image_config=None, speech: bool = False, function_tools=None):
+    def _instantiate_model(self, raw_model_name: str, guild_id, user_id, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, profile_settings=None, openrouter_key_error: str = None, google_key_error: str = None, use_broad_openrouter_heuristic: bool = True, config_owner_id=None, policy_guild_id=None, conversation: bool = False, image_config=None, speech: bool = False, functions=()):
         """One adapter for `raw_model_name`, keyed and policed for where it will run.
 
         `guild_id` picks whose key pays: the server's, or `user_id`'s own when None. A
@@ -223,14 +224,15 @@ class APIService:
         refused unless that is the bot owner, and refused when it is not given.
 
         `tools` are the Google-only native tools (`google_search`, `url_context`) and go
-        nowhere else. `function_tools` are portable declarations, in the neutral spelling
-        `api.function_calls` documents, and reach every provider that can carry one --
-        which is why they are two arguments rather than one list to be sorted out
-        downstream. Ollama takes neither: see `resolve_function_tools`.
+        nowhere else. `functions` are the character's own -- the `tool_loop.functions_for`
+        tuple the caller also handed the prompt builder -- declared on every provider that
+        can carry one, which is why they are a separate argument rather than one list to
+        be sorted out downstream. Ollama takes neither. The model keeps the tuple as
+        `model.functions`, and `tool_loop.run` answers exactly that set.
 
-        `function_tools` sits last, away from the `tools` it belongs beside, because a
-        dozen callers pass the first eight arguments positionally: inserting a parameter
-        in the middle silently rebinds `profile_settings` at every one of them.
+        `functions` sits last, away from the `tools` it belongs beside, because a dozen
+        callers pass the first eight arguments positionally: inserting a parameter in the
+        middle silently rebinds `profile_settings` at every one of them.
 
         `image_config` makes it an image model: the profile's image output and sampling
         keys, resolved here for the model named. Every image path builds through here
@@ -308,7 +310,8 @@ class APIService:
                 return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
             model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params, image_detail=image_detail, service_tier=service_tier, data_collection=data_collection,
                                     endpoint=resolve_openrouter_endpoint(p_settings, actual_name),
-                                    tools=function_tools)
+                                    tools=declarations(functions))
+            model.functions = tuple(functions)
             return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
         elif is_ollama:
             if image_config is not None:
@@ -346,10 +349,11 @@ class APIService:
                 # here -- Google takes one list holding both kinds -- which is exactly
                 # the merge the two arguments exist to keep out of the callers.
                 google_tools = list(tools or ())
-                declared = as_google_tool(function_tools)
+                declared = as_google_tool(declarations(functions))
                 if declared:
                     google_tools.append(declared)
                 model = GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instruction, safety_settings=safety_settings, thinking_params=t_params, tools=google_tools or None, media_resolution=media_res)
+                model.functions = tuple(functions)
             return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
 
     async def run_with_fallback(self, primary: str, fallback: Optional[str], attempt,
@@ -535,11 +539,17 @@ class APIService:
                 guild_id
             )
 
+        p_settings = self.cog.profile_manager._get_profile_config(profile_owner_id_for_instructions, profile_name_for_instructions, is_borrowed) or {}
+        # One tuple for the prompt and the model, so the character is told about
+        # exactly what it is sent. Every caller of this runs `tool_loop.run`.
+        functions = functions_for(p_settings, has_server=bool(guild_id))
+
         current_instructions, error_in_instr_constr, _, temperature, top_p, top_k, primary_model, fallback_model = self.cog.generation_service._construct_system_instructions(
             profile_owner_id_for_instructions,
             profile_name_for_instructions,
             channel_id,
-            training_examples_list=training_examples_list
+            training_examples_list=training_examples_list,
+            functions=functions,
         )
         
         # Either provider will do: this used to test the Gemini slot alone, so an
@@ -555,33 +565,42 @@ class APIService:
         recreate_model = True
         if model_cache_key in self.cog.channel_models and not training_examples_list:
             last_profile_key = self.cog.channel_model_last_profile_key.get(model_cache_key)
-            if last_profile_key == current_profile_key_for_model:
+            # A model declaring other functions than the prompt just described is not
+            # the same model, whatever the key says: the character would be told about
+            # one set and sent another.
+            cached_functions = declared_on(self.cog.channel_models[model_cache_key][0])
+            if last_profile_key == current_profile_key_for_model and cached_functions == functions:
                  recreate_model = False 
             
         if recreate_model and model_cache_key in self.cog.channel_models:
             del self.cog.channel_models[model_cache_key]
             self.cog.channel_model_last_profile_key.pop(model_cache_key, None)
         
-        if model_cache_key in self.cog.channel_models and not recreate_model: 
+        if model_cache_key in self.cog.channel_models and not recreate_model:
             model_instance, model_init_error_state, cached_model_name = self.cog.channel_models[model_cache_key]
+            # The instruction built above, not the one the model was cached with. That
+            # one carried the <current_time> and <birthday_context> of whenever the entry
+            # was made, so a whisper answered on a clock frozen at the first whisper and
+            # never learnt of a birthday that came round, or was set, after it. Every
+            # adapter reads this attribute when it builds a request.
+            if model_instance is not None:
+                model_instance.system_instruction = current_instructions
             return model_instance, model_init_error_state, temperature, top_p, top_k, warning_message, fallback_model
 
         model_instance, model_init_error = None, True
         
-        profile_data_for_safety = self.cog.profile_manager._get_profile_config(profile_owner_id_for_instructions, profile_name_for_instructions, is_borrowed) or {}
-        dynamic_safety_settings = _resolve_safety_settings(channel, profile_data_for_safety)
+        dynamic_safety_settings = _resolve_safety_settings(channel, p_settings)
 
         model_to_create = primary_model
         
         # Extract parameters once for either provider
-        p_sett_thinking = self.cog.profile_manager._get_profile_config(profile_owner_id_for_instructions, profile_name_for_instructions, is_borrowed) or {}
+        p_sett_thinking = p_settings
         t_params = resolve_thinking_params(p_sett_thinking, "response")
 
         model_tools = resolve_native_tools(p_sett_thinking)
-        fn_tools = resolve_function_tools(p_sett_thinking)
 
         try:
-            model_instance = self._instantiate_model(model_to_create, guild_id, profile_owner_id_for_instructions, current_instructions, dynamic_safety_settings, t_params, model_tools, p_sett_thinking, config_owner_id=profile_owner_id_for_instructions, function_tools=fn_tools)
+            model_instance = self._instantiate_model(model_to_create, guild_id, profile_owner_id_for_instructions, current_instructions, dynamic_safety_settings, t_params, model_tools, p_sett_thinking, config_owner_id=profile_owner_id_for_instructions, functions=functions)
             model_init_error = False
         except Exception as e1:
             print(f"Err '{model_to_create}' key {model_cache_key}: {e1}. Fallback.")
@@ -592,7 +611,7 @@ class APIService:
             # the primary was tuned for. Unset still inherits the primary.
             t_params_fb = resolve_thinking_params(p_sett_thinking, "response", "fallback")
             try:
-                model_instance = self._instantiate_model(model_to_create, guild_id, profile_owner_id_for_instructions, current_instructions, dynamic_safety_settings, t_params_fb, model_tools, p_sett_thinking, config_owner_id=profile_owner_id_for_instructions, function_tools=fn_tools)
+                model_instance = self._instantiate_model(model_to_create, guild_id, profile_owner_id_for_instructions, current_instructions, dynamic_safety_settings, t_params_fb, model_tools, p_sett_thinking, config_owner_id=profile_owner_id_for_instructions, functions=functions)
                 model_init_error = False
             except Exception as e2:
                 return None, True, temperature, top_p, top_k, f"Model Initialization Error: Failed to load Primary ('{primary_model}') and Fallback ('{fallback_model}') models. Check your API key.", fallback_model
@@ -602,7 +621,9 @@ class APIService:
         self.cog.channel_model_last_profile_key[model_cache_key] = current_profile_key_for_model
         return model_instance, final_error_state, temperature, top_p, top_k, warning_message, fallback_model
 
-    async def _get_or_create_model_for_global_chat(self, user_id: int, profile_name: str, policy_guild_id: Optional[int] = None, present_users: Optional[List[Tuple[int, str]]] = None) -> Tuple[Optional[Any], float, float, int, Optional[str], Optional[str]]:
+    async def _get_or_create_model_for_global_chat(self, user_id: int, profile_name: str, policy_guild_id: Optional[int] = None, present_users: Optional[List[Tuple[int, str]]] = None, search_key: Optional[str] = None) -> Tuple[Optional[Any], float, float, int, Optional[str], Optional[str]]:
+        """`search_key` is the host's Google key as the caller has cleared it for this
+        conversation, or None; without one the character is not offered `search_web`."""
         source_owner_id, source_profile_name = self.cog.profile_manager._resolve_effective_profile(user_id, profile_name)
         
         profile_data = self.cog.profile_manager._get_profile_config(source_owner_id, source_profile_name, False)
@@ -616,8 +637,10 @@ class APIService:
         fallback_model = profile_data.get("fallback_model", FALLBACK_MODEL_NAME)
         
         warning_message = None
+        # No server, so no `recall`: memories are filed per server. See tool_loop.
+        functions = functions_for(profile_data, has_server=False, can_search=bool(search_key))
         system_instructions, _, _, _, _, _, _, _ = self.cog.generation_service._construct_system_instructions(
-            user_id, profile_name, 0, present_users=present_users or [])
+            user_id, profile_name, 0, present_users=present_users or [], functions=functions)
         
         user_api_key = self.cog.storage_manager._get_api_key_for_user(user_id, "gemini")
         or_key = self.cog.storage_manager._get_api_key_for_user(user_id, "openrouter")
@@ -638,7 +661,7 @@ class APIService:
             if not primary_model.upper().startswith(("OPENROUTER/", "OLLAMA/")) and "/" not in primary_model:
                 model_tools = resolve_native_tools(profile_data)
                     
-            model = self._instantiate_model(primary_model, None, user_id, system_instructions, safety_settings, t_params, model_tools, profile_data, function_tools=resolve_function_tools(profile_data),
+            model = self._instantiate_model(primary_model, None, user_id, system_instructions, safety_settings, t_params, model_tools, profile_data, functions=functions,
                                             config_owner_id=source_owner_id, policy_guild_id=policy_guild_id,
                                             conversation=True)
             

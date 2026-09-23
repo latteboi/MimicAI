@@ -21,6 +21,23 @@ import json
 from typing import Any, Dict, List, NamedTuple, Optional
 
 
+#: The generation-config key that forbids calls on one request while keeping the
+#: declarations -- OpenRouter's `tool_choice: "none"`, Google's function-calling mode
+#: NONE. Declarations stay because the conversation being sent already holds calls and
+#: their results, which some hosts refuse to read without them.
+_FUNCTION_CALLING = "function_calling"
+
+
+def forbid_calls(generation_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """A copy of `generation_config` for a request that must answer in words."""
+    return {**(generation_config or {}), _FUNCTION_CALLING: "none"}
+
+
+def calls_forbidden(generation_config: Any) -> bool:
+    """Whether this request was made by `forbid_calls`."""
+    return isinstance(generation_config, dict) and generation_config.get(_FUNCTION_CALLING) == "none"
+
+
 class FunctionCall(NamedTuple):
     """One call the model asked for.
 

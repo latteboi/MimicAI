@@ -13,8 +13,10 @@ from ...utils.constants import (
 )
 from ...utils.helpers import (
     _add_inline_citations, _format_citation_subtext, _format_history_entry,
-    _get_user_hash, _scrub_response_text,
+    _get_user_hash, _resolve_safety_settings, _scrub_response_text,
 )
+from . import tool_loop
+from .reply import _merge_sources
 from ...gui.gui_sessions import WhisperActionView
 from ...managers.session_manager import intern_turn
 
@@ -101,6 +103,16 @@ class WhisperMixin:
         finally:
             session['is_whispering'] = False
 
+    def _whisper_function_context(self, interaction: discord.Interaction, owner_id: int, profile_name: str,
+                                  display_name: str, p_settings: Dict) -> tool_loop.FunctionContext:
+        """Who a whispered reply's function calls run for: the character answering, on
+        behalf of the person whispering, under the channel's safety settings."""
+        return tool_loop.FunctionContext(
+            owner_id=owner_id, profile_name=profile_name, author_dn=display_name,
+            guild_id=interaction.guild.id if interaction.guild else None,
+            triggering_user_id=interaction.user.id,
+            safety_settings=_resolve_safety_settings(interaction.channel, p_settings))
+
     async def _run_whisper_turn(self, interaction: discord.Interaction, session: Dict, target_participant: Dict, whisper_message: str, waiting_msg: Optional[discord.Message] = None):
         """The whisper turn proper. Only called with the channel already claimed by
         _execute_whisper -- never call this directly."""
@@ -151,6 +163,7 @@ class WhisperMixin:
 
         status = "api_error"
         response = None
+        looped = None
 
         # Resolve appearance and identity for placeholder
         effective_owner_id, effective_profile_name = self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)
@@ -178,9 +191,19 @@ class WhisperMixin:
                 raise ValueError("Could not initialize the AI model.")
 
             t_start = time.time()
-            response, state_container = await self._generate_with_heartbeat(
-                model, contents_for_api_call, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=False, message_type="embed", existing_state={"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg}
-            )
+            state_container = {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg}
+
+            async def send(turn, cfg):
+                reply, _ = await self._generate_with_heartbeat(
+                    model, turn, cfg, interaction.channel, None, placeholder_msg.id,
+                    is_fallback=False, message_type="embed", existing_state=state_container)
+                return reply
+
+            looped = await tool_loop.run(
+                self.cog, model, contents_for_api_call, gen_config,
+                self._whisper_function_context(interaction, owner_id, profile_name, display_name, p_settings),
+                send)
+            response = looped.response
             status = "blocked_by_safety" if not response or not response.candidates else "success"
         except asyncio.CancelledError:
             return
@@ -214,8 +237,7 @@ class WhisperMixin:
                 response_text = _add_inline_citations(response_text, response.raw.candidates[0].grounding_metadata)
             response_text = response_text.strip()
 
-        response_text, _ = self._extract_and_apply_neuro_state(response_text, owner_id, profile_name,
-                                                               response=response)
+        response_text, _ = self._extract_and_apply_neuro_state(response_text, owner_id, profile_name)
 
         # PREVENT GLOBAL XML SCRUBBER FROM DELETING THE RESPONSE
         response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
@@ -263,6 +285,10 @@ class WhisperMixin:
                         for u in url_metadata.url_metadata:
                             if hasattr(u, 'retrieved_url') and u.retrieved_url:
                                 grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
+
+            # What the character looked up itself, cited like the rest.
+            if looped is not None:
+                grounding_sources = _merge_sources(grounding_sources, looped.sources)
 
             sources_text_list = _format_citation_subtext(grounding_sources)
             if sources_text_list:
@@ -438,10 +464,19 @@ class WhisperMixin:
         status = "api_error"
         response = None
         t_start = time.time()
+        state_container = {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg}
+
+        async def send(turn, cfg):
+            reply, _ = await self._generate_with_heartbeat(
+                model, turn, cfg, interaction.channel, None, placeholder_msg.id,
+                is_fallback=False, message_type="embed", existing_state=state_container)
+            return reply
+
         try:
-            response, state_container = await self._generate_with_heartbeat(
-                model, participant_history, gen_config, interaction.channel, None, placeholder_msg.id, is_fallback=False, message_type="embed", existing_state={"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg}
-            )
+            response = (await tool_loop.run(
+                self.cog, model, participant_history, gen_config,
+                self._whisper_function_context(interaction, owner_id, profile_name, display_name, p_settings),
+                send)).response
             status = "success"
         except asyncio.CancelledError: return
         except Exception: status = "api_error"
@@ -457,8 +492,7 @@ class WhisperMixin:
             return
 
         response_text = getattr(response, 'text', "...").strip()
-        response_text, _ = self._extract_and_apply_neuro_state(response_text, owner_id, profile_name,
-                                                               response=response)
+        response_text, _ = self._extract_and_apply_neuro_state(response_text, owner_id, profile_name)
 
         response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
 

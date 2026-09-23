@@ -31,7 +31,7 @@ from ...utils.http_client import get_shared_client
 from ...utils.memory_tuning import maybe_trim_malloc
 from ...utils.net_guard import safe_stream
 from ...utils import mem_probe
-from .function_calls import from_google_parts, google_part
+from .function_calls import calls_forbidden, from_google_parts, google_part
 from .output_cap import RetryUncapped, output_cap, refused_output_cap
 from .rest_view import _BlobRef, _RestView, _to_camel, _wrap_rest
 from .streaming import (
@@ -554,6 +554,11 @@ class GoogleRESTModel:
             tools = self._build_tools()
             if tools:
                 payload["tools"] = tools
+                # Only where functions are declared: the mode governs them alone, and
+                # a request carrying nothing but google_search has none to forbid.
+                if calls_forbidden(generation_config) and any(
+                        isinstance(t, dict) and "functionDeclarations" in t for t in tools):
+                    payload["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
 
             gen_cfg = self._build_generation_config(generation_config)
             if gen_cfg:

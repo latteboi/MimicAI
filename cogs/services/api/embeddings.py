@@ -212,8 +212,6 @@ async def _fetch_openrouter(route: EmbeddingRoute, text: str, task_type: str, di
         headers={
             "Authorization": f"Bearer {route.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://discord.com",
-            "X-Title": "MimicAI Discord Bot",
         },
     )
     if response.status_code != 200:

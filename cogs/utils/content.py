@@ -426,7 +426,7 @@ HELP_CATEGORIES = {
         "Time Awareness": (
             "Every profile knows the time. `/profile manage` -> **Tools** -> Set Timezone gives it an IANA timezone "
             "(`Australia/Sydney`, `Europe/London`); until you set one it runs on UTC.\n\n"
-            "The profile's local time is injected as `<time_context>`, and every message in history carries a timestamp. Together these give the "
+            "The profile's local time is injected as `<current_time>`, and every message in history carries a timestamp. Together these give the "
             "character a real sense of when things happened -- that it is late at night where it is, or that you have not spoken in three days. "
             "Your own messages are timestamped in the timezone you set in `/settings` -> About Me."
         ),
@@ -520,7 +520,8 @@ HELP_CATEGORIES = {
         "When a Profile Says Nothing": (
             "In order of likelihood:\n\n"
             "**No API key reaches this server.** An administrator must assign a key to it via `/settings` -> API Keys. Check that "
-            "**Save Assignments** was clicked.\n\n"
+            "**Save Assignments** was clicked. The bot says so once, pinging whoever ran into it, and is silent after that; "
+            "`/session config` and `/session swap` refuse until a key is assigned.\n\n"
             "**The profile is rated Adult 18+ and the channel is not age-restricted.** It is blocked before generation. Mark the channel NSFW "
             "in Discord's settings, or use a different profile.\n\n"
             "**Response Mode is set to Mention or Reply.** The profile is waiting to be addressed that way.\n\n"
@@ -538,7 +539,11 @@ HELP_CATEGORIES = {
             "• **404 Model Not Found** -- the model has been deprecated or renamed by the provider. Pick a current one.\n"
             "• **Capability Mismatch** -- no endpoint on OpenRouter serves that model with the features requested.\n"
             "• **Ollama Unreachable** -- the Ollama server is not running, or the host URL no longer matches your tunnel.\n"
-            "• **Empty Response** -- the model returned nothing, usually a safety block. The fallback model is tried automatically.\n\n"
+            "• **Empty Response** / **AI produced no text content** -- the model returned nothing, usually a safety block. "
+            "*stopped: Length* or *Max Tokens* after it means the model's thinking used up its whole output allowance; lower its "
+            "thinking effort. The fallback model is tried automatically.\n"
+            "• **No reply after N s, so the fallback was started** -- the primary was far slower than it usually is, so the fallback "
+            "was started beside it and answered first.\n\n"
             "You can set what users see on failure at `/profile manage` -> Misc -> Custom Error Message."
         ),
         "When a Character Feels Wrong": (
@@ -884,6 +889,7 @@ DEFAULT_HELP_DOCS = {
         "- 413 (File Too Large): An attachment exceeded what the provider accepts.\n"
         "- Empty Response: The model returned no text, most often a silent safety block.\n"
         "Failover Protocol: When a request fails, the bot temporarily marks the key as cooling down and immediately redirects the payload to your designated Fallback Model. Setting a cheap, reliable fallback at `/profile manage` -> Params -> Set Models is what keeps a profile alive through an outage.\n"
+        "Stalls: A primary model that has not answered in three times its usual time (at least 45 seconds, at most 3 minutes; 90 seconds for a model the bot has not timed yet) has the Fallback Model started beside it. Whichever answers first is posted and the other is cancelled, so a hung host costs a minute or two rather than four. Both requests may be billed.\n"
         "Custom wording: `/profile manage` -> Misc -> Custom Error Message sets what users see when generation fails.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'The bot keeps replying with my error message.' Fix: Both the primary and fallback models failed. Check the key is valid and has quota, and that the model names are current."
@@ -1050,7 +1056,7 @@ DEFAULT_HELP_DOCS = {
     ),
     "memory/context_metadata_and_xml.txt": (
         "Concept: MimicAI uses an XML partitioning protocol to keep background technical context isolated from conversational chat. Models separate tagged system data from user speech far more reliably than they separate prose from prose.\n"
-        "Common tags: `<persona_profile>` and `<character_instructions>` the character itself; `<archive_context>` recalled long-term memories; `<external_context>` web search summaries; `<document_context>` text fetched from URLs; `<time_context>` the profile's local time; `<whisper_context>` and `<private_response>` hidden exchanges; `<internal_note>` system prompts that steer a round; `<scene_prompt>` the session master prompt; `<training_data>` matched style examples; `<content_policy>` the general-audience note.\n"
+        "Common tags: `<persona_profile>` and `<character_instructions>` the character itself; `<archive_context>` recalled long-term memories; `<external_context>` web search summaries; `<document_context>` text fetched from URLs; `<current_time>` the profile's local time; `<whisper_context>` and `<private_response>` hidden exchanges; `<internal_note>` system prompts that steer a round; `<scene_prompt>` the session master prompt; `<training_data>` matched style examples; `<content_policy>` the general-audience note.\n"
         "Identity Headers: Every message in history is prefixed `<Name> [ID: PID] [Timestamp]:`. The PID guarantees two characters with the same name are never conflated, and the timestamp gives the model real chronological awareness.\n"
         "Scrubbing: These tags are stripped from model output before delivery, so they never appear in chat.\n"
         "Troubleshooting / Symptoms:\n"

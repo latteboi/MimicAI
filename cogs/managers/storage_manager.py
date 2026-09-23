@@ -591,6 +591,20 @@ class StorageManager:
         slot = (self._get_user_keys_data(user_id).get("slots") or {}).get(slot_id)
         return bool(slot and slot.get("key")) and not self._gemini_slot_allowed_in_guild(guild_id, user_id, slot_id)
 
+    def guild_has_text_key(self, guild_id: Optional[int]) -> bool:
+        """Whether a key a conversation here could run on reaches this server.
+
+        Gemini as `_get_api_key_for_guild` allows it -- a free-tier key the data policy
+        holds back is no key here -- or OpenRouter. The standalone child-bot path asked
+        about Gemini alone, so a server with only an OpenRouter key was told it had none.
+        Ollama is not a server key: whether it answers depends on whose profile speaks,
+        so a caller that can seat one asks `may_use_ollama` beside this.
+        """
+        if not guild_id:
+            return False
+        return bool(self._get_api_key_for_guild(guild_id, "gemini")
+                    or self._get_api_key_for_guild(guild_id, "openrouter"))
+
     def personal_gemini_is_paid(self, user_id: int) -> bool:
         """Whether the Gemini key on this user's Personal scope is billing-enabled."""
         user_data = self._get_user_keys_data(user_id)

@@ -9,6 +9,7 @@ import discord
 import traceback
 import collections
 import datetime
+from typing import Optional
 from zoneinfo import ZoneInfo
 from ..utils.constants import (
     defaultConfig, PLACEHOLDER_EMOJI, GAME_BEAT_STALE_SECONDS,
@@ -22,13 +23,13 @@ from ..utils.constants import (
     DEFAULT_SPEECH_VOICE, TTS_SYNTHESIS_PREAMBLE, CRITIC_AUDIT_TEXT_MAX,
     LOG_TRIM_TARGET, LOG_TRIM_HIGH_WATER,
     CONTENT_RATING_ADULT, CONTENT_RATING_EMOJI, CONTENT_RATING_LABELS,
-    GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB,
+    GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB, NO_KEY_NOTICE_FLAG, NO_SERVER_KEY_NOTICE,
 )
 from ..utils.helpers import (
     _format_api_error, _format_citation_subtext,
     _format_history_entry, _get_user_hash, _resolve_safety_settings,
     _split_into_sentences_with_abbreviations, generated_image_attachment,
-    ltm_auto_threshold, resolve_critic_settings,
+    resolve_critic_settings,
     image_command_prompt, image_rag_enabled, is_gateway_shutdown, kickstart_note,
     resolve_grounding_mode,
     resolve_thinking_params,
@@ -39,6 +40,7 @@ from ..managers.session_manager import intern_turn, log_user_turn
 
 from .generation.heartbeat import HeartbeatMixin
 from .generation.prompt_builder import PromptBuilderMixin
+from .generation.tool_loop import functions_for, ltm_auto_threshold
 from .generation.delivery import DeliveryMixin
 from .generation.regeneration import RegenerationMixin
 from .generation.speak import SpeakAsMixin
@@ -160,6 +162,66 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         if isinstance(first, tuple) and len(first) > 2 and first[0] in cls.SPEAKER_NAMING_TRIGGERS:
             return first[2]
         return None
+
+    @staticmethod
+    def _first_human_author(triggers) -> Optional[int]:
+        """The id of whoever sent the round's first message or reaction, or None.
+
+        None for a round nobody started -- proactivity, the Director, a game beat.
+        """
+        for trigger in triggers or ():
+            if isinstance(trigger, tuple):
+                if len(trigger) < 2 or trigger[0] not in ('reply', 'reaction', 'reaction_single', 'child_mention'):
+                    continue
+                trigger = trigger[1]
+            if isinstance(trigger, discord.Message):
+                return trigger.author.id
+            if isinstance(trigger, discord.RawReactionActionEvent):
+                return trigger.user_id
+            if isinstance(trigger, dict) and trigger.get('author_id'):
+                return int(trigger['author_id'])
+        return None
+
+    async def _notify_no_server_key(self, channel, user_id: Optional[int],
+                                    bot_id: Optional[str] = None) -> None:
+        """Tells a server once that it has no key, addressed to whoever ran into it.
+
+        Once per server rather than once per message: every line anyone typed in a
+        channel with no key used to get the same paragraph back, and nothing else was
+        going to change until an administrator acted on the first one. Recorded in the
+        server index, so a restart does not send it again; `NO_KEY_NOTICE_FLAG` is
+        cleared when a key is next assigned there.
+
+        Nothing is spent on a round nobody started: the notice waits for a person to
+        address. `bot_id` sends it as that child bot, the one that was spoken to.
+        """
+        guild = getattr(channel, 'guild', None)
+        if guild is None or not user_id:
+            return
+        server_id = str(guild.id)
+        index = self.cog.server_manager._get_server_index(server_id)
+        if index.get(NO_KEY_NOTICE_FLAG):
+            return
+        # Claimed before the first await, so two channels cannot both send it.
+        index[NO_KEY_NOTICE_FLAG] = True
+        await asyncio.to_thread(self.cog.server_manager._save_server_index, server_id, index)
+
+        mention = f"<@{user_id}>"
+        # A free-tier Gemini key held back by the server's data policy is not a missing
+        # key, and saying so would send someone to add one they have.
+        text = (f"{mention} {GEMINI_FREE_TIER_BLOCKED}"
+                if self.cog.storage_manager.gemini_blocked_for_guild(guild.id)
+                else NO_SERVER_KEY_NOTICE.format(mention=mention, server=guild.name))
+        if bot_id:
+            await self.cog.manager_queue.put({
+                "action": "send_to_child", "bot_id": bot_id,
+                "payload": {"action": "send_message", "channel_id": channel.id, "content": text}})
+            return
+        try:
+            await channel.send(text, allowed_mentions=discord.AllowedMentions(
+                everyone=False, roles=False, users=[discord.Object(id=int(user_id))]))
+        except discord.HTTPException:
+            pass
 
     def _select_round_speakers(self, session, initial_trigger, triggers, game_beat_participant,
                                game_beat_cast, starting_profile_override):
@@ -470,15 +532,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         break
                 
                 if not has_gemini and not has_openrouter and not has_ollama:
-                    # A free-tier Gemini key held back by the server's data policy is not
-                    # a missing key, and saying so would send someone to add one they have.
-                    notice = (GEMINI_FREE_TIER_BLOCKED
-                              if self.cog.storage_manager.gemini_blocked_for_guild(channel.guild.id)
-                              else "An API key has not been configured for this server. You can use the `/settings` command in my DM to set one.")
-                    try:
-                        await channel.send(notice)
-                    except discord.Forbidden: pass
-                    
+                    await self._notify_no_server_key(
+                        channel, self._first_human_author(all_triggers_for_round))
+
                     # Mark triggers as done to prevent queue stalling
                     for trigger in all_triggers_for_round:
                         if trigger is not None: session['task_queue'].task_done()
@@ -514,9 +570,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         target_index = self.cog.profile_manager._get_user_index(target_id)
                         target_appearance_name = target_profile
                         if target_profile in target_index.get("borrowed", []):
-                            borrowed_data = self.cog.profile_manager._get_profile_config(target_id, target_profile, True) or {}
-                            target_appearance_name = borrowed_data.get("original_profile_name", target_profile)
-                        
+                            target_appearance_name = self.cog.profile_manager._resolve_effective_profile(
+                                target_id, target_profile)[1]
+
                         target_display_name = target_appearance_name
                         if str(target_id) in self.cog.user_appearances and target_appearance_name in self.cog.user_appearances[str(target_id)]:
                             appearance = self.cog.user_appearances[str(target_id)][target_appearance_name]
@@ -879,13 +935,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     if not api_key and not or_key and not is_ollama:
                         await self._abandon_state_container(channel, state_container, session=session)
                         if i == 0:
-                            notice = (GEMINI_FREE_TIER_BLOCKED
-                                      if self.cog.storage_manager.gemini_blocked_for_guild(channel.guild.id)
-                                      else "An API key must be configured on this server for sessions.")
-                            try:
-                                await channel.send(notice)
-                            except discord.Forbidden:
-                                pass
+                            # Not `triggering_user_id`: that falls back to the session's
+                            # owner for a round nobody started.
+                            await self._notify_no_server_key(
+                                channel, self._first_human_author(all_triggers_for_round))
                         break
 
                     # Ensure custom_main is safely bound early for error fallback
@@ -1117,13 +1170,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # itself, so the critic has to have run by now. It reads only
                         # contents_for_api_call and the log tail, both of which are built
                         # above, so moving it ahead of this call costs nothing.
+                        # One tuple for the prompt and both models -- see tool_loop.
+                        functions = functions_for(p_settings)
                         full_system_instruction, _, grounding_enabled, temp, top_p, top_k, primary_model, fallback_model_name = await asyncio.to_thread(
                             self._construct_system_instructions,
                             owner_id, profile_name, channel.id, is_multi_profile=True,
                             training_examples_list=training_examples_list, recalled_ltm=ltm_recall_text,
-                            critic_constraints=critic_constraints,
-                            # This path runs _attempt_reply, which has the function loop.
-                            with_loop=True,
+                            critic_constraints=critic_constraints, functions=functions,
                         )
 
                         session_key = (channel.id, owner_id, profile_name)
@@ -1221,7 +1274,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 gen_config=gen_config, msg_a_id=msg_a_id, app_name=app_name,
                                 app_avatar=app_avatar, state_container=state_container,
                                 participant_names=all_participant_names, log_context="multi_profile",
-                                probe_label=f"  participant turn {i}")
+                                probe_label=f"  participant turn {i}", functions=functions)
                         except asyncio.CancelledError:
                             await self._abandon_state_container(
                                 channel, state_container, session=session,
@@ -1366,7 +1419,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     #: whether Discord took it.
                     audio_carriers = []
                     
-                    if profile_settings.get("speech_tts_enabled", False) and session.get("audio_mode", "off") == "on":
+                    # Not for a reply that failed: that is the profile's error text, and
+                    # voicing it bought a second paid call and held the failure back for
+                    # the half-minute synthesis takes.
+                    if (profile_settings.get("speech_tts_enabled", False) and session.get("audio_mode", "off") == "on"
+                            and not was_blocked):
                         s_voice = profile_settings.get("speech_voice", DEFAULT_SPEECH_VOICE)
                         s_model = profile_settings.get("speech_model")
                         if s_model and "none" not in s_model.lower():

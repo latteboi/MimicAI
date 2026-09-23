@@ -45,11 +45,12 @@ class _Step:
     `probe` reads the state dict assembled once per repaint rather than touching disk
     itself, so adding a step costs no extra reads unless it needs something new.
 
-    `context` is "dm", "guild" or "any". `requires` names a boolean key in the same
+    `context` is "dm", "guild" or "any". `requires` names boolean keys in the same
     state dict, so a gate that is not a fixed property of the user -- seating is open
     to administrators *or* to anyone in an Open casting channel -- is probed at repaint
     like every other fact here rather than baked into the table. Both describe where the
-    step's *action* can run; a step that cannot run here is still drawn, with the reason.
+    step's *action* can run; a step that cannot run here is still drawn, with the reason
+    of the first gate that is shut.
 
     `actions` names methods on the view. Kept as names so this table stays readable as
     data, and so a step with no action -- the last one, which is just "talk" -- simply
@@ -66,7 +67,7 @@ class _Step:
         self.help_ref = help_ref
         self.probe = probe
         self.context = context
-        self.requires = requires
+        self.requires = (requires,) if isinstance(requires, str) else tuple(requires or ())
         self.actions = actions
         self.done_detail = done_detail
 
@@ -80,9 +81,7 @@ class _Step:
             return False
         if self.context == "guild" and not state["in_guild"]:
             return False
-        if self.requires and not state.get(self.requires):
-            return False
-        return True
+        return all(state.get(gate) for gate in self.requires)
 
     def blocker(self, state: Dict[str, Any]) -> str:
         """Why this step is not actionable here. Only read when `available` is False."""
@@ -90,8 +89,9 @@ class _Step:
             return "in a DM with me"
         if self.context == "guild" and not state["in_guild"]:
             return "in a server channel"
-        if self.requires:
-            return _GATE_REASONS.get(self.requires, "not available here")
+        for gate in self.requires:
+            if not state.get(gate):
+                return _GATE_REASONS.get(gate, "not available here")
         return "not available here"
 
 
@@ -99,6 +99,7 @@ class _Step:
 # step table rather than inside `_Step` so a new gate is one line in each of two
 # places that sit together, and never a message assembled in the renderer.
 _GATE_REASONS = {
+    "server_key": "needs an API key assigned to this server",
     "can_cast": "needs administrator, or Open casting",
 }
 
@@ -122,7 +123,7 @@ WIZARD_STEPS = (
                                  if s["written_name"] else "ready")),
     _Step("seat", "Seat it in this channel",
           ("5. Sessions", "Starting and Shaping a Session"),
-          lambda s: s["seated"], context="guild", requires="can_cast",
+          lambda s: s["seated"], context="guild", requires=("server_key", "can_cast"),
           actions=("_act_cast",),
           done_detail=lambda s: f"{s['seated_count']} in the cast"),
     _Step("speak", "Say something to it",
@@ -260,6 +261,8 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
         # not reachable from here and stays admin-only regardless.
         "can_cast": bool(guild is not None
                          and (is_admin or state["cast_policy"] == CAST_POLICY_OPEN)),
+        # `/session config`'s other gate, mirrored for the same reason.
+        "server_key": guild is not None and cog._session_key_block(guild, user_id) is None,
         "guild": guild,
         "channel": interaction.channel,
         "has_written": bool(state["written_name"]),
@@ -584,6 +587,10 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
                 "You must be a server administrator to configure sessions. An "
                 "administrator can set this channel's session to **Open casting** to let "
                 "anyone edit it.", ephemeral=True)
+            return
+        block = self.cog._session_key_block(self.state["guild"], interaction.user.id)
+        if block:
+            await interaction.response.send_message(block, ephemeral=True)
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
         await self.cog._open_session_config(interaction)

@@ -511,7 +511,8 @@ class ToolsService:
 
     async def search_for_tool(self, query: str, *, guild_id: Optional[int],
                               owner_id: Optional[int], profile_name: str,
-                              safety_settings: Optional[Dict] = None) -> Dict[str, Any]:
+                              safety_settings: Optional[Dict] = None,
+                              api_key: Optional[str] = None) -> Dict[str, Any]:
         """The `search_web` function's answer, as the object handed back to the model.
 
         The same Google model, the same native search tool and the same slot settings as
@@ -523,10 +524,13 @@ class ToolsService:
         Every failure is answered rather than raised. The model is mid-reply waiting on
         this, and "the search failed" is something a character can work around while a
         dropped turn is not -- the same rule `recall` follows, for the same reason.
+
+        `api_key` is a key the caller has already cleared for this conversation -- Global
+        Chat's host's, where there is no server key to use. Otherwise the server's.
         """
         if not query:
             return {"error": "search_web needs a `query` string."}
-        api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id or 0)
+        api_key = api_key or self.cog.storage_manager._get_api_key_for_guild(guild_id or 0)
         if not api_key:
             return {"error": "Web search is unavailable: no Google API key for this server."}
 

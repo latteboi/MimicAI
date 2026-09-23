@@ -34,8 +34,6 @@ from .constants import (
     MEDIA_RESOLUTION_VALUES, MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL,
     GROUNDING_MODE_LABELS,
     DEFAULT_KICKSTART_CONTINUE, DEFAULT_KICKSTART_IDLE,
-    LTM_AUTO_THRESHOLD_WITH_TOOL, NEURO_AXES, NEURO_TOOL_DECLARATION, NEURO_TOOL_NAME,
-    RECALL_TOOL_DECLARATION, SEARCH_TOOL_DECLARATION,
     SUPERSEDED_LTM_SUMMARIZATION_HASHES,
     OPENROUTER_SERVICE_TIER_VALUES,
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_KEYS, UNREADABLE_MEDIA_LABELS,
@@ -459,6 +457,10 @@ def _resolve_zoneinfo(tz_str: Optional[str]) -> Tuple[ZoneInfo, str]:
                 return ZoneInfo(canonical), canonical
         return ZoneInfo("UTC"), "UTC"
 
+#: How a time is written in a turn's header and in `<current_time>` alike.
+TURN_TIME_FORMAT = "%a, %d %b %Y, %I:%M %p %Z"
+
+
 def _format_history_entry(display_name: str, timestamp: Union[datetime.datetime, str], content: str, timezone_str: str = "UTC", *, entity_id: str) -> str:
     """One turn's stored form: the identity header the model reads, plus the content.
 
@@ -478,7 +480,7 @@ def _format_history_entry(display_name: str, timestamp: Union[datetime.datetime,
     try:
         target_tz, _ = _resolve_zoneinfo(timezone_str)
         local_time = timestamp.astimezone(target_tz)
-        time_str = local_time.strftime("[%a, %d %b %Y, %I:%M %p %Z]")
+        time_str = f"[{local_time.strftime(TURN_TIME_FORMAT)}]"
     except Exception:
         time_str = timestamp.strftime("[%a, %d %b %Y, %I:%M %p UTC]")
 
@@ -1498,84 +1500,14 @@ def resolve_native_tools(config: Optional[Dict[str, Any]]) -> Optional[List[Dict
 def provider_takes_functions(*raw_model_names: Optional[str]) -> bool:
     """Whether every model named can carry a function declaration.
 
-    Every one, not any: the prompt that asks for a tool call is written once for the
-    turn, and `run_with_fallback` may answer it on the fallback. A profile whose
-    primary is OpenRouter and whose fallback is Ollama would otherwise be told to call
-    a function on the turns that fall through, and report its mood to nobody.
+    Every one, not any: the prompt describing a function is written once for the turn,
+    and the fallback may be the model that answers it.
 
-    Ollama is the only provider excluded, and only because its adapter streams -- see
-    `resolve_function_tools`. An empty name is the "use the slot default" case, which
-    resolves to a Google model.
+    Ollama is the only provider excluded, and only because its adapter streams -- a call
+    arrives split across chunks with no accumulator written for it. An empty name is
+    the "use the slot default" case, which resolves to a Google model.
     """
     return not any((name or "").upper().startswith("OLLAMA/") for name in raw_model_names)
-
-
-def provider_speaks_beside_tools(*raw_model_names: Optional[str]) -> bool:
-    """Whether every model named will still say something while calling a function.
-
-    A *recording* declaration -- one whose result nobody needs -- is only free when the
-    model answers beside it. Where it does not, the turn comes back with no text and
-    has to be sent again just to get a reply, so the declaration costs a whole extra
-    request per seated character and buys nothing a `<neuro_update>` tag did not.
-
-    Measured, on one model through two routes (prod_tests/function_calls_live.py, 5
-    runs each). `gemini-2.5-flash` on Google's own endpoint answered beside `set_mood`
-    4 times in 5 and correctly left the call out of a flat turn 5 times in 5. The same
-    model through OpenRouter withheld its reply 5 times in 5 and called on every flat
-    turn as well -- the gateway's OpenAI-compatible layer reads a declared tool as a
-    much stronger instruction. So this is a property of the route, not the model, and
-    keying it on the prefix is the whole of it.
-
-    `recall` is not subject to this: its extra request fetches something, so it is a
-    cost with a return. Only fire-and-forget declarations are gated here.
-    """
-    if not provider_takes_functions(*raw_model_names):
-        return False
-    return not any((name or "").upper().startswith("OPENROUTER/")
-                   for name in raw_model_names)
-
-
-def resolve_function_tools(config: Optional[Dict[str, Any]], *,
-                           with_loop: bool = False) -> Optional[List[Dict]]:
-    """The function declarations this profile's turns should carry.
-
-    Deliberately separate from `resolve_native_tools`, because the two answer to
-    opposite constraints. `google_search` and `url_context` exist only on Google and
-    must never be rewritten for another provider; a function declaration is carried by
-    every provider that speaks tools at all. Returning them in one list would force a
-    choice between sending Google-only tools to OpenRouter as functions no host
-    implements, and withholding portable declarations from the provider most profiles
-    actually route to.
-
-    Ollama is absent on purpose: its adapter streams `/api/chat`, and a tool call
-    arrives there split across chunks with no accumulator written for it yet. A profile
-    on Ollama keeps the `<neuro_update>` tag, which is why that path is still live.
-
-    `with_loop` says whether the caller can answer a function and ask again. Only the
-    session reply path can, so it is the only one that may declare an *answering*
-    function: offering `recall` to a generation that cannot hand the memories back
-    leaves the model waiting for a result it will never see, and a turn whose whole
-    response was one unanswered call has no text to say.
-
-    A recording function needs no loop, but it does need a route that answers beside a
-    call -- see `provider_speaks_beside_tools`, where the measurement is. Where that is
-    not true the profile keeps the `<neuro_update>` tag, which costs one request rather
-    than two for the same state.
-    """
-    config = config or {}
-    models = (config.get("primary_model"), config.get("fallback_model"))
-    tools = []
-    if config.get("neuro_engine_enabled") and provider_speaks_beside_tools(*models):
-        tools.append(NEURO_TOOL_DECLARATION)
-    if with_loop and config.get("ltm_recall_tool_enabled") and provider_takes_functions(*models):
-        tools.append(RECALL_TOOL_DECLARATION)
-    # Grounding's "tool" mode is this declaration and nothing else -- there is no
-    # pre-pass to fall back on, so a profile whose slot cannot carry a function gets no
-    # grounding at all rather than a silent downgrade to the legacy call it did not ask
-    # for. `prompt_builder` gates its instruction block on the same two tests.
-    if with_loop and resolve_grounding_mode(config) == "tool" and provider_takes_functions(*models):
-        tools.append(SEARCH_TOOL_DECLARATION)
-    return tools or None
 
 
 def ltm_auto_recall_enabled(config: Optional[Dict[str, Any]]) -> bool:
@@ -1594,26 +1526,6 @@ def ltm_auto_recall_enabled(config: Optional[Dict[str, Any]]) -> bool:
     """
     raw = (config or {}).get("ltm_recall_enabled")
     return True if raw is None else bool(raw)
-
-
-def ltm_auto_threshold(config: Optional[Dict[str, Any]]) -> Optional[float]:
-    """The relevance threshold the automatic LTM pass should use for this profile.
-
-    None means "the profile's own setting", which is the answer whenever `recall` is
-    not actually available -- the toggle off, or a slot on Ollama, which cannot carry
-    the declaration. Narrowing the automatic pass on a turn that has no tool to make
-    up the difference is not a trade, it is just less memory.
-
-    The models are read from the config rather than passed, because every call site
-    has the config and only some of them have the names.
-    """
-    config = config or {}
-    if not config.get("ltm_recall_tool_enabled"):
-        return None
-    if not provider_takes_functions(config.get("primary_model"),
-                                    config.get("fallback_model")):
-        return None
-    return LTM_AUTO_THRESHOLD_WITH_TOOL
 
 
 def resolve_critic_settings(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:

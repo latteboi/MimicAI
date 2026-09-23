@@ -94,8 +94,11 @@ def _occurrence(birthday: Dict[str, int], year: int) -> datetime.date:
     return datetime.date(year, month, day)
 
 
-def birthday_offset(value: Any, today: datetime.date) -> Optional[int]:
+def birthday_offset(value: Any, today: datetime.date, reach: int = 1) -> Optional[int]:
     """-1 if the birthday was yesterday, 0 today, 1 tomorrow; None for any other day.
+
+    `reach` widens the window: a birthday within a day on its owner's clock is within two
+    on any other, so `reach=2` rules a date out before that clock is looked up.
 
     Checked against the occurrences either side of the new year, so a 31 December birthday
     is still yesterday on 1 January.
@@ -105,7 +108,7 @@ def birthday_offset(value: Any, today: datetime.date) -> Optional[int]:
         return None
     for year in (today.year - 1, today.year, today.year + 1):
         offset = (_occurrence(birthday, year) - today).days
-        if -1 <= offset <= 1:
+        if -reach <= offset <= reach:
             return offset
     return None
 

@@ -19,6 +19,7 @@ from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PA
                               bulk_select_options, resolve_bulk_select)
 from ..services.generation.compaction import resolve_compaction_settings
 from ..services.generation.global_chat import build_global_chat_embed
+from ..services.generation.tool_loop import functions_for
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -2397,8 +2398,13 @@ def add_generation_fields(embed: discord.Embed, cog, turn: dict) -> None:
     if called:
         lines = [f"\u251c\u2500\u2500 `{entry}`" for entry in called]
         lines[-1] = lines[-1].replace("\u251c\u2500\u2500", "\u2514\u2500\u2500", 1)
-        if meta.get("function_calls_truncated"):
-            lines.append("\u2514\u2500\u2500 *budget reached; the last answer was not sent back*")
+        # `_capped` since the last request forbids calls: the character answered with
+        # what it had. `_truncated` is what turns logged before that carry.
+        note = ("*budget reached; answered without asking again*" if meta.get("function_calls_capped")
+                else "*budget reached; the last answer was not sent back*"
+                if meta.get("function_calls_truncated") else None)
+        if note:
+            lines.append(f"\u2514\u2500\u2500 {note}")
             lines[-2] = lines[-2].replace("\u2514\u2500\u2500", "\u251c\u2500\u2500", 1)
         embed.add_field(name="Function Calls", value="\n".join(lines), inline=False)
 
@@ -2829,11 +2835,14 @@ class SessionAuditView(BlockedGuard, ui.View):
                         o_id_str, p_name = self.simulate_profile_key.split(":", 1)
                         o_id = int(o_id_str)
                         
-                        sys_instr, _, _, _, _, _, prim_mod, _ = self.cog.generation_service._construct_system_instructions(o_id, p_name, self.channel_id, is_multi_profile=True)
-                        
                         p_idx = self.cog.profile_manager._get_user_index(o_id)
                         is_b = p_name in p_idx.get("borrowed", [])
                         p_cfg = self.cog.profile_manager._get_profile_config(o_id, p_name, is_b) or {}
+                        # With the function blocks the reply would carry, or the estimate
+                        # is short by them on every profile that has one.
+                        sys_instr, _, _, _, _, _, prim_mod, _ = self.cog.generation_service._construct_system_instructions(
+                            o_id, p_name, self.channel_id, is_multi_profile=True,
+                            functions=functions_for(p_cfg))
                         sys_toks = _estimate_text_tokens(sys_instr)
 
                         # The window the next reply would actually get. The last N raw
