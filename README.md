@@ -62,6 +62,22 @@ remembers long-term survives it.
 
 <img width="972" height="609" alt="06-getting-started" src="https://github.com/user-attachments/assets/4fe9b6fb-f4c9-4baa-8db5-6cd74ee4486c" />
 
+**Thinking, shown.** With Thought Summary on, each reply carries the model's reasoning as an
+attached file.
+
+<!-- SCREENSHOT 7: 07-thinking-and-reasoning.png -->
+
+**A follow-up, and its trace.** Left hanging, a character with Proactivity on keeps talking.
+**View Generation Trace** on any reply shows its model, cost, recalled memories and the
+neuro engine's four levels at that moment.
+
+<!-- SCREENSHOT 8: 08-follow_up-generation_trace-and-neuro_engine.png -->
+
+**A table game.** `/play eights` deals the cast into Mimic Eights; each character plays its
+own hand, and the table reacts when someone wins.
+
+<!-- SCREENSHOT 9: 09-mimic_eights.png -->
+
 ---
 
 ## Features
@@ -90,7 +106,13 @@ on its own.
 Alongside the main session loop: `/whisper` for a private, ephemeral exchange with one
 participant, `/speak` to post as one of your profiles — either verbatim, or re-voiced
 in character with a private preview before it goes out — `/trigger` to force a round,
-and `/session audit` for token telemetry and diagnostics.
+and `/session audit` for token telemetry and diagnostics. The **View Generation Trace**
+context menu opens the same telemetry for a single reply.
+
+`/play eights` seats the cast, and any people who join, at a table of **Mimic Eights**, a
+Crazy Eights variant for two to six players. Moves cost no model call: each character's
+temperament and neuro state weight what it plays, and it speaks only when something happens
+to it and once more at the end.
 
 ### Memory
 
@@ -120,7 +142,9 @@ neuro-endocrine engine that carries four emotional variables between turns.
 
 ### Ownership and safety
 
-`/export` and `/import` move profiles and memories between instances as plaintext.
+`/export` and `/import` move profiles and memories as encrypted `.mimic` files. A standard
+export imports only on the instance that made it; a passphrase export moves to a
+self-hosted one. The official instance imports nothing from other instances.
 `/privacy` covers data deletion. Server administrators get channel suspension and purge;
 the bot owner gets a `/mod` dashboard with a blacklist, an automatic moderator, and a
 content classifier that confines profiles declared 18+ to age-restricted channels.

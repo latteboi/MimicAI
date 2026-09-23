@@ -500,10 +500,12 @@ HELP_CATEGORIES = {
             "an appearance edit may not appear immediately."
         ),
         "Export, Import and Deletion": (
-            "**`/export`** (DM only) writes selected profiles and their memories to a plaintext `.mimic` file. **`/import`** reads one back, "
-            "validating the schema and renaming around any name collisions.\n\n"
-            "The export is *plaintext*: it is decrypted on the way out so that it can be moved between instances, which also means anyone "
-            "holding the file can read the personas and memories in it. Treat it accordingly.\n\n"
+            "**`/export`** (DM only) writes selected profiles, and optionally their memories and training examples, to an encrypted "
+            "`.mimic` file. **`/import`** reads one back, renaming around any name collisions.\n\n"
+            "**Standard Export** is sealed with this instance's own key, so only this instance can import it. **Export for Self-Hosted** "
+            "is sealed with a passphrase you choose instead, and any self-hosted instance can import it given that passphrase -- which "
+            "makes the passphrase the only thing protecting it. The official MimicAI bot imports only its own Standard Exports: files "
+            "from other instances and passphrase files are refused there, and plaintext files are refused everywhere.\n\n"
             "**`/privacy`** covers the other direction -- reviewing and deleting your data, up to removing your account's data entirely."
         ),
     },
@@ -821,6 +823,7 @@ DEFAULT_HELP_DOCS = {
         "Concept: You hold four key slots -- Google Gemini 1 and 2, OpenRouter 1 and 2. Select a slot, click 'Submit Key' to store a key in it, then use the assignment dropdown to choose where that slot applies.\n"
         "Scopes: 'Personal' applies the key to your own Global Chat (`/profile global_chat`) wherever you run it -- a server channel or a DM -- and to your own profiles' background work. A server entry applies it to every session in that server, and only appears for servers where you hold administrator permission.\n"
         "Important: An assignment is not saved until 'Save Assignments' is clicked. Selecting scopes in the dropdown alone changes nothing.\n"
+        "Pages: The dropdown lists 21 servers at a time, with Previous, Next and a jump-to-page entry at the top. Ticks on every page are kept until Save Assignments, and the panel lists what saving will add and remove.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I added a key but the bot still will not respond in my server.' Fix: Storing a key and assigning it are two separate steps. Select the slot, tick the server in the assignment dropdown, then click Save Assignments.\n"
         "- Symptom: 'The server I want is not in the assignment dropdown.' Fix: Only servers where you have administrator permission are listed. Ask an administrator of that server to assign their own key.\n"
@@ -1182,12 +1185,13 @@ DEFAULT_HELP_DOCS = {
     ),
     "features/data_portability.txt": (
         "Commands: `/export`, `/import`, `/privacy` (DM only)\n"
-        "Export: Writes selected profiles and their memories to a plaintext `.mimic` file. The data is decrypted on the way out so it can move between instances -- which also means anyone holding the file can read the personas and memories in it.\n"
-        "Import: Takes a `.mimic` file of up to 25 MB, validates the schema, resolves name collisions by renaming, re-encrypts the content and files it into your account.\n"
+        "Export: Writes selected profiles, and optionally their memories and training examples, to an encrypted `.mimic` file. Standard Export is sealed with this instance's own key and imports only on this instance. Export for Self-Hosted is sealed with a passphrase you choose, for moving to a self-hosted instance.\n"
+        "Import: Takes a `.mimic` file of up to 25 MB, decrypts it (asking for the passphrase if it has one), resolves name collisions by renaming, re-encrypts the content and files it into your account. The official MimicAI bot imports only its own Standard Exports, never files from other instances or passphrase files. Plaintext and legacy exports are refused everywhere.\n"
         "Privacy: `/privacy` covers reviewing and deleting your stored data, including full account data deletion.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Export or import is not available.' Fix: Both are DM-only. Run them in a direct message with the bot.\n"
-        "- Symptom: 'Imported profiles came in with different names.' Fix: A name already existed in your account. Imports rename around collisions rather than overwriting."
+        "- Symptom: 'Imported profiles came in with different names.' Fix: A name already existed in your account. Imports rename around collisions rather than overwriting.\n"
+        "- Symptom: 'Import rejected: the file belongs to a different MimicAI instance.' Fix: A Standard Export imports only where it was made. To move to a self-hosted instance, export again with Export for Self-Hosted and enter the passphrase on import. The official bot cannot import from other instances at all."
     ),
 }
 

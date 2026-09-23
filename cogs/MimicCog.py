@@ -556,7 +556,7 @@ class MimicCog(EventListeners, commands.Cog):
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="export", description="Export selected profiles and memories to a plaintext file (DM Only).")
+    @app_commands.command(name="export", description="Export selected profiles and memories to an encrypted .mimic file (DM Only).")
     @app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
     @app_commands.dm_only()
     async def export_command(self, interaction: discord.Interaction):

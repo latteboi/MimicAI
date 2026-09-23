@@ -3206,7 +3206,7 @@ class ProfileManager:
         if passphrase:
             msg += " Your data has been securely encrypted with your passphrase for self-hosted migration."
         else:
-            msg += " Your data is securely encrypted with the official instance master key."
+            msg += " Your data is encrypted with this instance's master key, so only this instance can import it."
             
         await interaction.followup.send(msg, file=discord_file, ephemeral=True)
 
