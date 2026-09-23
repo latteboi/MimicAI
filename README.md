@@ -65,18 +65,18 @@ remembers long-term survives it.
 **Thinking, shown.** With Thought Summary on, each reply carries the model's reasoning as an
 attached file.
 
-<img width="969" height="784" alt="07-thinking-and-reasoning" src="https://github.com/user-attachments/assets/ad53ad12-71f4-4441-9214-85227d0491cd" />
+<img width="969" height="784" alt="07-thinking-and-reasoning" src="https://github.com/user-attachments/assets/235ae4d6-7ac2-4f91-b537-30ac1e4a5a39" />
 
 **A follow-up, and its trace.** Left hanging, a character with Proactivity on keeps talking.
 **View Generation Trace** on any reply shows its model, cost, recalled memories and the
 neuro engine's four levels at that moment.
 
-<img width="1272" height="884" alt="08-follow_up-generation_trace-and-neuro_engine" src="https://github.com/user-attachments/assets/652b6ea9-afc8-4fb0-a105-ab6454e2ef41" />
+<img width="1272" height="884" alt="08-follow_up-generation_trace-and-neuro_engine" src="https://github.com/user-attachments/assets/ab0a86da-e9c7-40eb-909a-27fb40d39317" />
 
 **A table game.** `/play eights` deals the cast into Mimic Eights; each character plays its
 own hand, and the table reacts when someone wins.
 
-<img width="1256" height="563" alt="09-mimic_eights" src="https://github.com/user-attachments/assets/04d2dfb5-9bec-4f55-a73e-06e7edacf97b" />
+<img width="1256" height="563" alt="09-mimic_eights" src="https://github.com/user-attachments/assets/0bf810ea-1571-4f18-a720-12940c9f0504" />
 
 ---
 
