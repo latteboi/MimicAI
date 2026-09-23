@@ -5,7 +5,7 @@ a DM (`/settings` is dm_only), and a channel's cast is configured by a server
 administrator (`/session config` is guild_only, and admin unless the channel is on Open
 casting). So this is context-aware
 rather than linear. Steps that cannot run where you are stay **visible and greyed**,
-because a member who cannot see step 4 has no way to learn why the bot is silent.
+because a member who cannot see step 5 has no way to learn why the bot is silent.
 
 **No progress is stored.** Every step's completion is probed from state that already
 exists -- assigned keys, the profile index, the channel's session -- which means the
@@ -30,7 +30,7 @@ import discord
 from discord import ui
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from ..utils.constants import CAST_POLICY_OPEN, DEFAULT_CAST_POLICY, defaultConfig
+from ..utils.constants import CAST_POLICY_OPEN, DEFAULT_CAST_POLICY, MODEL_PROVIDERS, defaultConfig
 from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
 from ..utils.content import HELP_CATEGORIES, WIZARD_COPY, WIZARD_TOUR
 from .base_components import BlockedGuard, DropdownContentView, TimeoutCleanupMixin, add_button
@@ -110,6 +110,13 @@ WIZARD_STEPS = (
           lambda s: s["has_key"], context="dm",
           actions=("_act_open_keys",),
           done_detail=lambda s: s["key_detail"]),
+    # Before the character: a new profile and a generated draft both start on it.
+    _Step("provider", "Choose a provider",
+          ("1. Getting Started", "API Keys and Where They Apply"),
+          lambda s: bool(s["provider"]),
+          actions=("_act_prefer_gemini", "_act_prefer_openrouter"),
+          done_detail=lambda s: f"{MODEL_PROVIDERS.get(s['provider'], s['provider'])} "
+                                f"· change it in `/settings` → About Me"),
     _Step("profile", "Get a character",
           ("1. Getting Started", "Profile Classes (PIDs)"),
           lambda s: bool(s["personal"] or s["borrowed"]),
@@ -235,6 +242,7 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
         usable_key = has_key and (guild is None or personal_assigned or server_has_key)
 
         return {"personal": personal, "borrowed": borrowed, "written_name": written_name,
+                "provider": (index.get("about") or {}).get("provider"),
                 "has_key": usable_key, "key_detail": key_detail,
                 "server_has_key": server_has_key, "server_key_held": server_key_held,
                 "admin_guilds": admin_guilds, "seated_disk": seated_disk,
@@ -320,8 +328,8 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
                           else "not an admin anywhere yet")
             return (f"📍 **You're in** a direct message with me\n"
                     f"👤 **You** are in {len(self.cog.bot.guilds)} server(s) I'm in, {admin_line}\n\n"
-                    "This is the only place API keys can be entered. Steps 1–3 work here; "
-                    "for 4 and 5, run `/start` again in a channel.")
+                    "This is the only place API keys can be entered. Steps 1–4 work here; "
+                    "for 5 and 6, run `/start` again in a channel.")
 
         guild, channel = s["guild"], s["channel"]
         where = f"📍 **You're in** #{getattr(channel, 'name', 'this channel')} · **{guild.name}**\n"
@@ -488,6 +496,8 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
 
     _ACTION_LABELS = {
         "_act_open_keys": ("Open API Keys", discord.ButtonStyle.success),
+        "_act_prefer_gemini": ("Google", discord.ButtonStyle.primary),
+        "_act_prefer_openrouter": ("OpenRouter", discord.ButtonStyle.primary),
         "_act_library": ("🏛️ Browse Library", discord.ButtonStyle.success),
         "_act_generate": ("✨ Generate one", discord.ButtonStyle.primary),
         "_act_create": ("📝 Blank", discord.ButtonStyle.secondary),
@@ -567,6 +577,20 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         view = SettingsAPIView(self.cog, interaction)
         await view.update_display()
 
+    async def _act_prefer_gemini(self, interaction: discord.Interaction):
+        await self._prefer(interaction, "gemini")
+
+    async def _act_prefer_openrouter(self, interaction: discord.Interaction):
+        await self._prefer(interaction, "openrouter")
+
+    async def _prefer(self, interaction: discord.Interaction, provider: str):
+        """Asked here, stored by the setter About Me uses, and changed there afterwards."""
+        await interaction.response.defer()
+        self.cog.profile_manager.set_provider_preference(self.user_id, provider)
+        await self._refresh_state(interaction)
+        self._build_view()
+        await interaction.edit_original_response(**self.render())
+
     async def _act_library(self, interaction: discord.Interaction):
         from .gui_hub import HubPublicLibraryView
         await interaction.response.defer(thinking=True, ephemeral=True)
@@ -599,7 +623,7 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         name = (self.state["personal"] or self.state["borrowed"] or [None])[0]
         if not name:
             await interaction.response.send_message(
-                "Make a character first — step 2.", ephemeral=True)
+                "Make a character first — step 3.", ephemeral=True)
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
         await self.cog._open_profile_manage(interaction, name, repaint=True)

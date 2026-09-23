@@ -12,10 +12,12 @@ description -- a profile whose describe pass fails is a profile in `off` mode, w
 complete behaviour rather than an error state.
 """
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote
 
 from ...utils.constants import (
     DEFAULT_MEDIA_DESCRIPTION, MEDIA_DESCRIBER_FALLBACK, MEDIA_DESCRIBER_MODEL,
-    MEDIA_DESCRIBER_RESOLUTION, MEDIA_DESCRIPTION_MAX_CHARS, MEDIA_DESCRIPTION_NONE,
+    MEDIA_DESCRIBER_PAID, MEDIA_DESCRIBER_RESOLUTION, GREEDY_SAMPLING,
+    MEDIA_DESCRIPTION_MAX_CHARS, MEDIA_DESCRIPTION_NONE,
 )
 from ...utils.helpers import _resolve_safety_settings, resolve_thinking_params
 
@@ -36,6 +38,18 @@ def _media_key(part: Any) -> Optional[str]:
         if url:
             return str(url).split("?", 1)[0]
     return None
+
+
+def _file_name(part: Any, n: int) -> str:
+    """What the character's turn calls this attachment, or `File n` when nothing does.
+
+    Discord's CDN keeps the uploaded name as the url's last segment -- the same name the
+    `[Attached Image: cat.png]` tag carries -- so a description headed with it is one the
+    character can match to the tag without counting.
+    """
+    url = part.get("url") if isinstance(part, dict) else None
+    name = unquote(str(url).split("?", 1)[0].rsplit("/", 1)[-1]) if url else ""
+    return name or f"File {n}"
 
 
 def _batch_key(parts: List[Any]) -> Optional[str]:
@@ -84,13 +98,16 @@ class MediaDescriptionMixin:
             return cache[key]
 
         instruction = self.cog.global_prompts.get("MEDIA_DESCRIPTION", DEFAULT_MEDIA_DESCRIPTION)
-        # One turn carrying the request and the files, never the files alongside it.
-        # Every adapter reads `contents` as a list of turns and asks each item for its
-        # `parts`; a bare media dict passed as an item has no `parts`, so it arrives as
-        # an empty turn and the file is dropped without a word. The model is then asked
-        # to describe attachments it was never sent, and obligingly invents some.
-        contents = [{"role": "user",
-                     "parts": ["Describe the attached files."] + list(media_parts)}]
+        # One turn carrying the files, never the files alongside it. Every adapter reads
+        # `contents` as a list of turns and asks each item for its `parts`; a bare media
+        # dict passed as an item has no `parts`, so it arrives as an empty turn and the
+        # file is dropped without a word. The model is then asked to describe
+        # attachments it was never sent, and obligingly invents some. No other text: the
+        # system instruction is the whole request, and several files each follow their
+        # name, which is how the prompt tells the model to head each description.
+        parts = list(media_parts) if len(media_parts) == 1 else [
+            item for n, part in enumerate(media_parts, 1) for item in (_file_name(part, n), part)]
+        contents = [{"role": "user", "parts": parts}]
 
         async def run(name: str, _is_fallback: bool):
             model = self.cog.api_service._instantiate_model(
@@ -111,26 +128,27 @@ class MediaDescriptionMixin:
                 profile_settings={"media_input_resolution": MEDIA_DESCRIBER_RESOLUTION},
                 config_owner_id=owner_id)
             response = await model.generate_content_async(
-                contents, generation_config={"temperature": 0.2, "top_p": 0.95})
+                contents, generation_config=dict(GREEDY_SAMPLING))
             answer = (getattr(response, "text", "") or "").strip()
             if not answer or answer.lower().startswith(MEDIA_DESCRIPTION_NONE):
-                # Retried on the other model, unlike the other utility passes, which
-                # treat an empty answer as a decision about the content and stop. These
-                # two sit on different providers behind different filters, and the second
-                # is the Google one whose safety settings this channel has already stood
-                # down -- a file the first will not describe is what the second is for.
+                # Retried on the next model, unlike the other utility passes, which
+                # treat an empty answer as a decision about the content and stop. The
+                # last sits on another provider behind another filter: the Google one
+                # whose safety settings this channel has already stood down -- a file
+                # the first will not describe is what the last is for.
                 raise ValueError("The describer returned no description")
             return response, answer
 
         try:
             (response, text), used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                MEDIA_DESCRIBER_MODEL, MEDIA_DESCRIBER_FALLBACK, run, label="Attachment describer")
+                MEDIA_DESCRIBER_MODEL, (MEDIA_DESCRIBER_PAID, MEDIA_DESCRIBER_FALLBACK), run,
+                label="Attachment describer")
         except Exception as e:
             print(f"Attachment describer: {type(e).__name__}: {e}")
             self._log_description_call(channel, user_id, MEDIA_DESCRIBER_MODEL, "api_error")
             return None, None
 
-        text = text[:MEDIA_DESCRIPTION_MAX_CHARS]
+        text = text[:MEDIA_DESCRIPTION_MAX_CHARS * len(media_parts)]
         if isinstance(meta, dict):
             tokens = ((getattr(response, "input_tokens", 0) or 0)
                       + (getattr(response, "output_tokens", 0) or 0))

@@ -9,15 +9,17 @@ the model that answered when the fallback had.
 """
 import asyncio
 import contextlib
+import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ...utils import mem_probe
 from ...utils.constants import (
     ERR_GENERAL_ERROR, ERR_REASON_EMPTY_RESPONSE, ERR_REASON_EMPTY_STOPPED, ERR_REASON_STALLED,
     ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK, MEDIA_DESCRIBED_NOTE, MEDIA_UNREADABLE_NOTE,
-    WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_MODEL_FAILED, WARN_FALLBACK_USED,
-    WARN_MAIN_MODEL_FAILED, WARN_MEDIA_DESCRIBED, WARN_MEDIA_UNREADABLE,
+    WARN_ALL_MODELS_FAILED, WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_MODEL_FAILED,
+    WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED, WARN_MEDIA_DESCRIBED, WARN_MEDIA_UNREADABLE,
+    WARN_FINAL_FALLBACK_USED, WARN_FINAL_MODEL_FAILED,
 )
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _resolve_safety_settings, _scrub_response_text,
@@ -26,12 +28,17 @@ from ...utils.helpers import (
     resolve_thinking_params, resolve_unreadable_media_mode, split_media_parts,
     unreadable_media_modality,
 )
+from ..api_service import MissingKeyError
 from ._shared import _strip_neuro_update_and_scrub
 from . import latency, tool_loop
 from .tool_loop import FunctionContext
 
 #: Sampling keys a profile may set beyond temperature, top_p and top_k. Sent only when set.
 _ADVANCED_SAMPLING_KEYS = ("frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a")
+
+#: The tags a whispered reply comes back wrapped in, echoing its history. Stripped before
+#: the scrub, which drops these blocks contents and all -- the whole reply, in a whisper.
+_PRIVATE_WRAPPERS = re.compile(r'</?(?:private_response|whisper_context|private_context)>', re.IGNORECASE)
 
 
 @dataclass
@@ -67,6 +74,14 @@ class ReplyAttempt:
     #: final response; this mode's arrive mid-turn on a function result, so without this
     #: a grounded reply would post with no citations under it and an empty audit line.
     search_sources: List[Dict[str, str]] = field(default_factory=list)
+    #: A whisper's reply, whose wrapper tags are the character's own words -- `_PRIVATE_WRAPPERS`.
+    private: bool = False
+    #: Each standby that was tried and failed, as (rank, reason): rank 0 is the Fallback,
+    #: 1 the Final Fallback. One skipped for want of a key after a real failure is left
+    #: out, as `run_with_fallback` leaves it out of the error it raises.
+    fallback_errors: List[Tuple[int, str]] = field(default_factory=list)
+    #: Which standby answered, when one did.
+    fallback_rank: int = 0
 
     @property
     def has_fallback(self) -> bool:
@@ -96,6 +111,9 @@ class _Run:
     looped: Any = None
     error: Optional[BaseException] = None
     task: Optional[asyncio.Future] = None
+    #: The fallback run's: see ReplyAttempt.fallback_errors and fallback_rank.
+    errors: List[Tuple[int, str]] = field(default_factory=list)
+    rank: int = 0
 
 
 async def _first_answer(runs: List[_Run], failed: List[_Run]) -> Optional[_Run]:
@@ -140,27 +158,39 @@ def _empty_response_error(response) -> ValueError:
     return error
 
 
+#: What failed, by standby rank: the Fallback, then the Final Fallback.
+_STANDBY_FAILED = (WARN_FALLBACK_MODEL_FAILED, WARN_FINAL_MODEL_FAILED)
+
+
 def _failure_warnings(attempt: "ReplyAttempt", fallback_reason: Optional[str] = None) -> List[str]:
     """The lines under a reply that has no text: each model that was tried, and why.
 
-    One line when there was no fallback, or when both failed alike. Two when they failed
+    One line when there was no fallback, or when every model failed alike -- Main &
+    Fallback, or Main, Fallback & Final Fallback. One per model when they failed
     differently. It used to be one line always, and it named the primary alone whenever
     the fallback's failure left the primary's response behind -- so a fallback that had
     been tried and had failed was never mentioned at all.
 
-    `fallback_reason` is for a fallback that answered with nothing to post.
+    `fallback_reason` is for a standby that answered with nothing to post.
     """
     def line(template: str, reason: str) -> str:
         # A rate limit arrives as a whole bolded sentence of its own.
         return reason if "Rate Limit" in reason else template.format(reason=reason)
 
     main = attempt.main_error or attempt.error or "Unknown Error"
-    if fallback_reason is None and not attempt.has_fallback:
-        return [line(WARN_MAIN_MODEL_FAILED, attempt.error or main)]
-    last = fallback_reason or attempt.error or main
-    if last in (main, ERR_REASON_TIMEOUT_BOTH):
-        return [line(WARN_BOTH_MODELS_FAILED, last)]
-    return [line(WARN_MAIN_MODEL_FAILED, main), line(WARN_FALLBACK_MODEL_FAILED, last)]
+    standby = list(attempt.fallback_errors)
+    if fallback_reason is not None:
+        standby.append((attempt.fallback_rank, fallback_reason))
+    if not standby:
+        if not attempt.has_fallback:
+            return [line(WARN_MAIN_MODEL_FAILED, attempt.error or main)]
+        standby = [(0, attempt.error or main)]
+    if attempt.error == ERR_REASON_TIMEOUT_BOTH or all(r == main for _, r in standby):
+        reason = attempt.error if attempt.error == ERR_REASON_TIMEOUT_BOTH else main
+        final = any(rank for rank, _ in standby)
+        return [line(WARN_ALL_MODELS_FAILED if final else WARN_BOTH_MODELS_FAILED, reason)]
+    return [line(WARN_MAIN_MODEL_FAILED, main)] + [
+        line(_STANDBY_FAILED[min(rank, 1)], reason) for rank, reason in standby]
 
 
 @dataclass
@@ -265,7 +295,9 @@ class ReplyMixin:
                              msg_a_id, app_name: str, app_avatar, state_container: Dict,
                              participant_names: List[str], log_context: Optional[str] = None,
                              probe_label: Optional[str] = None,
-                             functions: Sequence[Any] = ()) -> ReplyAttempt:
+                             functions: Sequence[Any] = (), private: bool = False,
+                             conversation: bool = False,
+                             function_context: Optional[FunctionContext] = None) -> ReplyAttempt:
         """Generates with the primary, then the fallback if the primary fails.
 
         A primary that has not answered in `latency.race_after` seconds has the fallback
@@ -278,9 +310,28 @@ class ReplyMixin:
 
         `functions` is the tuple the caller built `system_instruction` with; both models
         declare it, and `tool_loop.run` answers it.
+
+        The fallback run walks the profile's Fallback, then the Final Fallback on the
+        provider the primary is not on -- `model_chain`, which every utility pass uses too.
+        `attempt.fallback_name` ends up naming whichever of them answered.
+
+        Session replies, their regeneration, whispers (`private`) and Global Chat all run
+        this. `conversation` is Global Chat's: every model on `user_id`'s own key, policed
+        as a conversation in the server the card is open in (`_instantiate_model`), under
+        the safety settings of no channel, since the card can be opened in any. It brings
+        its own `function_context`, which bills a search to that same key.
         """
-        attempt = ReplyAttempt(primary_name=primary_model, fallback_name=fallback_model_name)
-        safety_settings = _resolve_safety_settings(channel, p_settings)
+        _, chain = self.cog.api_service.model_chain(
+            {**p_settings, "primary_model": primary_model, "fallback_model": fallback_model_name},
+            "primary_model", owner_id)
+        fallback_names = [name for name in dict.fromkeys(chain) if name != primary_model]
+        attempt = ReplyAttempt(primary_name=primary_model,
+                               fallback_name=fallback_names[0] if fallback_names else None,
+                               private=private)
+        server_id = getattr(getattr(channel, 'guild', None), 'id', None)
+        guild_id = None if conversation else server_id
+        policy = {"policy_guild_id": server_id, "conversation": True} if conversation else {}
+        safety_settings = _resolve_safety_settings(None if conversation else channel, p_settings)
         tools = resolve_native_tools(p_settings)
 
         def build(name: str, role: str, **key_errors):
@@ -289,15 +340,15 @@ class ReplyMixin:
             # reads it.
             thinking["thinking_persistence"] = p_settings.get("thinking_persistence", 10)
             return self.cog.api_service._instantiate_model(
-                name, channel.guild.id, user_id, system_instruction, safety_settings,
+                name, guild_id, user_id, system_instruction, safety_settings,
                 thinking, tools, p_settings, config_owner_id=owner_id,
-                functions=functions, **key_errors)
+                functions=functions, **policy, **key_errors)
 
-        fn_ctx = FunctionContext(
+        fn_ctx = function_context or FunctionContext(
             owner_id=owner_id,
             profile_name=(participant or {}).get('profile_name', ''),
             author_dn=app_name,
-            guild_id=channel.guild.id if getattr(channel, 'guild', None) else None,
+            guild_id=server_id,
             triggering_user_id=user_id,
             # Already resolved for this reply, off the destination channel. `search_web`
             # asks a second model on behalf of this turn and must be held to the same
@@ -322,6 +373,8 @@ class ReplyMixin:
             run.looped = await tool_loop.run(self.cog, run.model, history if contents is None else contents,
                                               gen_config, fn_ctx, send)
             text = getattr(run.response, 'text', "").strip()
+            if private:
+                text = _PRIVATE_WRAPPERS.sub('', text)
             if not _strip_neuro_update_and_scrub(text, participant_names):
                 raise _empty_response_error(run.response)
 
@@ -362,6 +415,25 @@ class ReplyMixin:
             except Exception as e:
                 run.error = e
                 return False
+
+        async def go_chain(run: _Run) -> bool:
+            """The fallback run: each fallback name in turn, until one answers."""
+            for n, name in enumerate(fallback_names):
+                earlier = run.error
+                if await go(run, make=lambda: build(name, "fallback")):
+                    attempt.fallback_name = name
+                    run.rank = n
+                    return True
+                # A provider nobody here holds a key for says nothing about the turn; the
+                # failure before it does.
+                if earlier is not None and isinstance(run.error, MissingKeyError):
+                    run.error = earlier
+                    continue
+                run.errors.append((n, _reason(run.error)))
+                if n + 1 < len(fallback_names):
+                    print(f"Reply fallback '{name}' failed ({_reason(run.error)}); "
+                          f"trying '{fallback_names[n + 1]}'.")
+            return False
 
         init_error = None
         try:
@@ -415,8 +487,7 @@ class ReplyMixin:
 
                 if winner is None and attempt.has_fallback:
                     fallback = _Run(True)
-                    fallback.task = asyncio.ensure_future(
-                        go(fallback, make=lambda: build(fallback_model_name, "fallback")))
+                    fallback.task = asyncio.ensure_future(go_chain(fallback))
 
                 if winner is None:
                     winner = await _first_answer([r for r in (primary, fallback)
@@ -426,7 +497,7 @@ class ReplyMixin:
             if raced_after is not None:
                 who = "the primary" if winner is primary else "the fallback" if winner is fallback else "neither"
                 print(f"Fallback race: '{primary_model}' gave no reply in {raced_after:.0f}s, "
-                      f"so '{fallback_model_name}' was started beside it; {who} answered first.")
+                      f"so '{fallback_names[0]}' was started beside it; {who} answered first.")
 
             if winner is primary:
                 attempt.status = "success"
@@ -437,15 +508,18 @@ class ReplyMixin:
                 # been too slow, and that is what the indicator says.
                 attempt.main_error = (ERR_REASON_STALLED.format(seconds=f"{raced_after:.0f}")
                                       if primary.error is None else _reason(primary.error))
+                attempt.fallback_rank, attempt.fallback_errors = winner.rank, list(winner.errors)
                 settle(winner, True)
                 if log_context:
-                    self.cog._log_api_call(user_id=user_id, guild_id=channel.guild.id,
+                    self.cog._log_api_call(user_id=user_id, guild_id=guild_id,
                                            context=f"{log_context}_fallback",
-                                           model_used=fallback_model_name, status="success")
+                                           model_used=attempt.fallback_name, status="success")
             else:
                 for run in failed:
                     settle(run, False)
                 attempt.main_error = _reason(primary.error)
+                if fallback is not None:
+                    attempt.fallback_errors = list(fallback.errors)
                 if fallback is None:
                     attempt.error = attempt.main_error
                 elif isinstance(primary.error, TimeoutError) and isinstance(fallback.error, TimeoutError):
@@ -483,7 +557,7 @@ class ReplyMixin:
             if log_context:
                 # `or primary_model`: a row naming the model that could not be built says
                 # more than one naming none.
-                self.cog._log_api_call(user_id=user_id, guild_id=channel.guild.id, context=log_context,
+                self.cog._log_api_call(user_id=user_id, guild_id=guild_id, context=log_context,
                                        model_used=attempt.primary or primary_model, status=attempt.status)
         return attempt
 
@@ -545,6 +619,9 @@ class ReplyMixin:
         attempt.media_dropped = kinds
         attempt.media_described_by = described_by
         attempt.error = None
+        # The refusals were of the attachment, which is gone; the reply stands as the
+        # indicator's alone, as it did before the chain had a third model.
+        attempt.fallback_errors, attempt.fallback_rank = [], 0
         attempt.fallback_used = is_fallback
         if not is_fallback:
             attempt.status = "success"
@@ -580,6 +657,8 @@ class ReplyMixin:
                 candidate = candidates[0] if candidates else None
                 # The filtered text attribute, which leaves the thoughts out.
                 raw_text = getattr(response, 'text', "")
+                if attempt.private:
+                    raw_text = _PRIVATE_WRAPPERS.sub('', raw_text)
                 if hasattr(candidate, 'grounding_metadata'):
                     raw_text = _add_inline_citations(raw_text, candidate.grounding_metadata)
                 raw_text, reply.neuro_state = self._extract_and_apply_neuro_state(
@@ -607,8 +686,11 @@ class ReplyMixin:
                 reply.blocked = True
 
         if attempt.fallback_used and not fallback_named and p_settings.get("show_fallback_indicator", True):
-            reply.warnings.append(WARN_FALLBACK_USED)
+            reply.warnings.append(WARN_FINAL_FALLBACK_USED if attempt.fallback_rank else WARN_FALLBACK_USED)
             reply.warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=attempt.main_error))
+            # The Final answering means the Fallback failed first; that says why.
+            reply.warnings.extend(_STANDBY_FAILED[min(rank, 1)].format(reason=reason)
+                                  for rank, reason in attempt.fallback_errors)
         # Always shown, unlike the fallback indicator: this one explains a gap the reader
         # can see without being told -- a character who said nothing about the picture
         # they were just sent. Described wins over dropped, because it is the truer of

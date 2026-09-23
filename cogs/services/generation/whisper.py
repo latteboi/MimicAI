@@ -1,22 +1,16 @@
-import re
-import time
 import uuid
-import base64
 import asyncio
 import discord
 import datetime
 from typing import Dict, Optional
 
 from ...utils.constants import (
-    defaultConfig, PLACEHOLDER_EMOJI, DEFAULT_WHISPER_INJECTION,
+    PLACEHOLDER_EMOJI, DEFAULT_WHISPER_INJECTION,
     SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS, WHISPER_WAITING_NOTICE,
 )
-from ...utils.helpers import (
-    _add_inline_citations, _format_citation_subtext, _format_history_entry,
-    _get_user_hash, _resolve_safety_settings, _scrub_response_text,
-)
+from ...utils.helpers import _format_citation_subtext, _format_history_entry, _get_user_hash
 from . import tool_loop
-from .reply import _merge_sources
+from .reply import ReplyText, reply_gen_config
 from ...gui.gui_sessions import WhisperActionView
 from ...managers.session_manager import intern_turn
 
@@ -103,15 +97,81 @@ class WhisperMixin:
         finally:
             session['is_whispering'] = False
 
-    def _whisper_function_context(self, interaction: discord.Interaction, owner_id: int, profile_name: str,
-                                  display_name: str, p_settings: Dict) -> tool_loop.FunctionContext:
-        """Who a whispered reply's function calls run for: the character answering, on
-        behalf of the person whispering, under the channel's safety settings."""
-        return tool_loop.FunctionContext(
-            owner_id=owner_id, profile_name=profile_name, author_dn=display_name,
-            guild_id=interaction.guild.id if interaction.guild else None,
-            triggering_user_id=interaction.user.id,
-            safety_settings=_resolve_safety_settings(interaction.channel, p_settings))
+    async def _whisper_reply(self, interaction: discord.Interaction, session: Dict,
+                             target_participant: Dict, p_settings: Dict, history,
+                             placeholder_msg, custom_emoji: str, display_name: str, avatar_url,
+                             log_context: str) -> ReplyText:
+        """One whispered reply, made the way a session reply is: `_attempt_reply`'s primary,
+        fallback race and Final Fallback, then `_reply_text`'s text, sources and warnings.
+
+        Whispers used to build one model and call it: no fallback at all, though they read
+        one, and a block reason of their own wording. Private by construction still -- the
+        placeholder is the whisperer's ephemeral embed, and the caller puts the warnings in
+        it rather than in the channel.
+        """
+        owner_id, profile_name = target_participant['owner_id'], target_participant['profile_name']
+        if not self.cog.profile_manager._check_unrestricted_safety_policy(owner_id, profile_name, interaction.channel):
+            return ReplyText(text="This character's content rating is Adult 18+, which only runs in "
+                                  "age-restricted channels.", blocked=True)
+
+        # One tuple for the prompt and both models -- see tool_loop.
+        functions = tool_loop.functions_for(p_settings)
+        (system_instruction, _, _, temp, top_p, top_k,
+         primary_model, fallback_model_name) = await asyncio.to_thread(
+            self._construct_system_instructions, owner_id, profile_name, interaction.channel_id,
+            is_multi_profile=True, functions=functions)
+
+        # Every name the history wraps a turn in: the whisperer, and each seated profile under
+        # both the name its private turns are logged as and the one it is shown as.
+        names = [interaction.user.name, *(p['profile_name'] for p in session.get("profiles", [])),
+                 *self._participant_names(session)]
+        state_container = {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg,
+                           "message_type": "embed"}
+        try:
+            attempt = await self._attempt_reply(
+                channel=interaction.channel,
+                # No `method`: the placeholder is this embed, never a child bot's message.
+                participant={"owner_id": owner_id, "profile_name": profile_name},
+                p_settings=p_settings, owner_id=owner_id, user_id=interaction.user.id,
+                system_instruction=system_instruction, primary_model=primary_model,
+                fallback_model_name=fallback_model_name, history=history,
+                gen_config=reply_gen_config(p_settings, temp, top_p, top_k),
+                msg_a_id=placeholder_msg.id, app_name=display_name, app_avatar=avatar_url,
+                state_container=state_container, participant_names=names,
+                log_context=log_context, functions=functions, private=True)
+        finally:
+            await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
+        return self._reply_text(attempt, p_settings, owner_id, profile_name, names)
+
+    @staticmethod
+    def _whisper_display(reply: ReplyText) -> str:
+        """The reply as the whisperer's embed shows it: the text, its sources, the warnings."""
+        text = reply.text
+        sources = _format_citation_subtext(reply.sources or [])
+        if sources:
+            text += "\n\n" + "\n".join(sources)
+        if reply.warnings:
+            text += "\n\n" + "\n".join(f"-# {i+1}. {w}" for i, w in enumerate(reply.warnings))
+        return text[:4096]
+
+    def _whisper_appearance(self, owner_id: int, profile_name: str, p_settings: Dict):
+        """(effective owner, effective name, display name, avatar url, placeholder emoji)."""
+        effective_owner_id, effective_profile_name = self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)
+        display_name = effective_profile_name
+        avatar_url = self.cog.bot.user.display_avatar.url
+        appearance = self.cog.profile_manager._get_user_appearance(effective_owner_id, effective_profile_name)
+        if appearance:
+            display_name = appearance.get("custom_display_name") or display_name
+            avatar_url = appearance.get("custom_avatar_url") or avatar_url
+        custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+        return effective_owner_id, effective_profile_name, display_name, avatar_url, custom_emoji
+
+    def _whisper_embed(self, interaction: discord.Interaction, description: str, display_name: str,
+                       avatar_url, whisper_message: str) -> discord.Embed:
+        embed = discord.Embed(description=description, color=discord.Color.dark_grey())
+        embed.set_author(name=display_name, icon_url=avatar_url)
+        embed.set_footer(text=f"{whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
+        return embed
 
     async def _run_whisper_turn(self, interaction: discord.Interaction, session: Dict, target_participant: Dict, whisper_message: str, waiting_msg: Optional[discord.Message] = None):
         """The whisper turn proper. Only called with the channel already claimed by
@@ -123,20 +183,11 @@ class WhisperMixin:
         user_index = self.cog.profile_manager._get_user_index(owner_id)
         is_borrowed = profile_name in user_index.get("borrowed", [])
         p_settings = self.cog.profile_manager._get_profile_config(owner_id, profile_name, is_borrowed) or {}
+        effective_owner_id, effective_profile_name, display_name, avatar_url, custom_emoji = \
+            self._whisper_appearance(owner_id, profile_name, p_settings)
 
-        # Get model and settings for the target profile
-        model, _, temp, top_p, top_k, _, fallback_model_name = await self.cog.api_service._get_or_create_model_for_channel(
-            interaction.channel_id, owner_id, interaction.guild.id,
-            profile_owner_override=owner_id, profile_name_override=profile_name
-        )
-        if not model:
-            await interaction.followup.send("Could not initialize the AI model for that profile.", ephemeral=True)
-            return
-
-        # Construct the prompt for the private response
         user_hash = _get_user_hash(interaction.user.id)
         whisper_content = _format_history_entry(interaction.user.name, interaction.created_at, whisper_message, entity_id=user_hash)
-
         api_whisper_prompt = self.cog.global_prompts.get("WHISPER_INJECTION", DEFAULT_WHISPER_INJECTION).format(whisper_content=whisper_content.strip())
 
         # Derived from unified_log, the single source of truth, rather than a shadow copy
@@ -155,150 +206,34 @@ class WhisperMixin:
         else:
             contents_for_api_call.append({'role': 'user', 'parts': [api_whisper_prompt]})
 
-        # Enable internal thoughts but keep summary display off (UI ignores it)
-        gen_config = {
-            "temperature": temp, "top_p": top_p, "top_k": top_k,
-            "thinking_config": {"include_thoughts": True}
-        }
-
-        status = "api_error"
-        response = None
-        looped = None
-
-        # Resolve appearance and identity for placeholder
-        effective_owner_id, effective_profile_name = self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)
-
-        custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
-
-        display_name = effective_profile_name
-        appearance = self.cog.profile_manager._get_user_appearance(effective_owner_id, effective_profile_name)
-        avatar_url = self.cog.bot.user.display_avatar.url
-        if appearance:
-            display_name = appearance.get("custom_display_name") or display_name
-            avatar_url = appearance.get("custom_avatar_url") or avatar_url
-
-        # --- SEND PLACEHOLDER EMBED ---
-        placeholder_embed = discord.Embed(description=f"{custom_emoji}", color=discord.Color.dark_grey())
-        placeholder_embed.set_author(name=display_name, icon_url=avatar_url)
-        placeholder_embed.set_footer(text=f"{whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
+        placeholder_embed = self._whisper_embed(interaction, custom_emoji, display_name, avatar_url, whisper_message)
         if waiting_msg is not None:
             placeholder_msg = await waiting_msg.edit(content=None, embed=placeholder_embed)
         else:
             placeholder_msg = await interaction.followup.send(embed=placeholder_embed, ephemeral=True, wait=True)
 
         try:
-            if not model:
-                raise ValueError("Could not initialize the AI model.")
-
-            t_start = time.time()
-            state_container = {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg}
-
-            async def send(turn, cfg):
-                reply, _ = await self._generate_with_heartbeat(
-                    model, turn, cfg, interaction.channel, None, placeholder_msg.id,
-                    is_fallback=False, message_type="embed", existing_state=state_container)
-                return reply
-
-            looped = await tool_loop.run(
-                self.cog, model, contents_for_api_call, gen_config,
-                self._whisper_function_context(interaction, owner_id, profile_name, display_name, p_settings),
-                send)
-            response = looped.response
-            status = "blocked_by_safety" if not response or not response.candidates else "success"
+            reply = await self._whisper_reply(
+                interaction, session, target_participant, p_settings, contents_for_api_call,
+                placeholder_msg, custom_emoji, display_name, avatar_url, "whisper")
         except asyncio.CancelledError:
             return
-        except Exception as e:
-            print(f"Whisper generation error: {e}")
-            status = "api_error"
-        finally:
-            if 'state_container' in locals() and state_container:
-                await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
-            self.cog._log_api_call(user_id=interaction.user.id, guild_id=interaction.guild.id, context="whisper", model_used=model, status=status)
 
-        response_text = "..."
-        if not response or not response.candidates:
-            reason = "Safety Filter"
-            if response and hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
-                reason = response.prompt_feedback.block_reason.name.replace('_', ' ').title()
-
-            p_index = self.cog.profile_manager._get_user_index(owner_id)
-            p_is_borrowed = profile_name in p_index.get("borrowed",[])
-            p_settings = self.cog.profile_manager._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
-
-            custom_main = p_settings.get("error_response", "An error has occurred.")
-
-            err_embed = placeholder_msg.embeds[0]
-            err_embed.description = f"{custom_main}\n\n-# Blocked due to: **{reason}**."
-            await placeholder_msg.edit(embed=err_embed)
+        if reply.blocked:
+            # Nothing is logged: the character said nothing, and the whisper is theirs to send again.
+            await placeholder_msg.edit(embed=self._whisper_embed(
+                interaction, self._whisper_display(reply), display_name, avatar_url, whisper_message))
             return
-        elif response.candidates:
-            response_text = getattr(response, 'text', "...")
-            if hasattr(response, 'raw') and response.raw.candidates and hasattr(response.raw.candidates[0], 'grounding_metadata'):
-                response_text = _add_inline_citations(response_text, response.raw.candidates[0].grounding_metadata)
-            response_text = response_text.strip()
 
-        response_text, _ = self._extract_and_apply_neuro_state(response_text, owner_id, profile_name)
-
-        # PREVENT GLOBAL XML SCRUBBER FROM DELETING THE RESPONSE
-        response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
-        response_text = re.sub(r'</?whisper_context>', '', response_text, flags=re.IGNORECASE)
-        response_text = re.sub(r'</?private_context>', '', response_text, flags=re.IGNORECASE)
-
-        # Every session participant's name is XML-tag-wrapped in the history this profile
-        # sees (_format_history_entry), plus the whisperer's own -- a hallucinated
-        # continuation as any of them leaves a bare closing tag with no [ID:...] header for
-        # PATTERN_SYSTEM_HEADER to catch, so the name scrubber is the only thing that can.
-        # Scrubbing only this profile's own name (as opposed to every session participant,
-        # per Chat Sessions) left every other name's closing tag in the clear.
-        # A whisper's own private_response turn is logged under the raw profile_name
-        # (below, and in _run_whisper_regeneration), not the appearance-resolved display
-        # name -- the two diverge whenever a custom display name is set, so both must be
-        # in the scrub list or a hallucinated close using the raw name survives.
-        whisper_participant_names = [interaction.user.name]
-        for p_data_temp in session.get("profiles", []):
-            whisper_participant_names.append(p_data_temp['profile_name'])
-            other_name, _ = self._resolve_appearance_data(p_data_temp['owner_id'], p_data_temp['profile_name'])
-            whisper_participant_names.append(other_name)
-
-        response_text = _scrub_response_text(response_text, participant_names=whisper_participant_names)
-
-        # [NEW] Safety Fallback for empty responses
-        if not response_text or not response_text.strip():
-            p_index = self.cog.profile_manager._get_user_index(owner_id)
-            p_is_borrowed = profile_name in p_index.get("borrowed", [])
-            p_settings = self.cog.profile_manager._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
-            response_text = p_settings.get("error_response", "...")
-
-        if response_text:
-            grounding_sources = []
-            if hasattr(response, 'raw') and response.raw.candidates:
-                if hasattr(response.raw.candidates[0], 'grounding_metadata'):
-                    metadata = response.raw.candidates[0].grounding_metadata
-                    if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
-                        for chunk in metadata.grounding_chunks:
-                            if hasattr(chunk, 'web'):
-                                grounding_sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
-
-                if hasattr(response.raw.candidates[0], 'url_context_metadata'):
-                    url_metadata = response.raw.candidates[0].url_context_metadata
-                    if hasattr(url_metadata, 'url_metadata') and url_metadata.url_metadata is not None:
-                        for u in url_metadata.url_metadata:
-                            if hasattr(u, 'retrieved_url') and u.retrieved_url:
-                                grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
-
-            # What the character looked up itself, cited like the rest.
-            if looped is not None:
-                grounding_sources = _merge_sources(grounding_sources, looped.sources)
-
-            sources_text_list = _format_citation_subtext(grounding_sources)
-            if sources_text_list:
-                response_text += "\n\n" + "\n".join(sources_text_list)
+        # Recorded with its citations, as a session turn is; the warnings are shown, never
+        # recorded -- the model would read them back as something the character said.
+        response_text = reply.text
+        sources = _format_citation_subtext(reply.sources or [])
+        if sources:
+            response_text += "\n\n" + "\n".join(sources)
 
         whisper_turn_id = str(uuid.uuid4())
-        user_hash = _get_user_hash(interaction.user.id)
-        whisper_content = _format_history_entry(interaction.user.name, interaction.created_at, whisper_message, entity_id=user_hash)
-
-        target_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
+        target_pid = bot_pid
 
         session.setdefault("unified_log", []).append(intern_turn({
             "turn_id": whisper_turn_id, "type": "whisper",
@@ -311,10 +246,6 @@ class WhisperMixin:
         response_turn_id = str(uuid.uuid4())
         profile_id = self.cog.profile_manager._get_profile_id(effective_owner_id, effective_profile_name)
         response_content = _format_history_entry(profile_name, datetime.datetime.now(datetime.timezone.utc), response_text, entity_id=profile_id)
-
-        p_index = self.cog.profile_manager._get_user_index(owner_id)
-        p_is_borrowed = profile_name in p_index.get("borrowed",[])
-        p_settings = self.cog.profile_manager._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
 
         resp_log = {
             "turn_id": response_turn_id, "type": "private_response",
@@ -337,17 +268,14 @@ class WhisperMixin:
         session_type = session.get("type", "multi")
         await self.cog.session_manager.flush_session((interaction.channel_id, None, None), session_type)
 
-        # Send the private response to the user
-        embed = discord.Embed(description=response_text, color=discord.Color.dark_grey())
-        embed.set_author(name=display_name, icon_url=avatar_url)
-        embed.set_footer(text=f"{whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
-
         # self.cog, not self. WhisperActionView reaches for cog.multi_profile_channels and
         # cog.generation_service; handed the GenerationService instead, every button press
         # raised AttributeError inside the callback and surfaced as "This interaction
         # failed" -- which is why Delete and Regenerate did nothing at all.
         view = WhisperActionView(self.cog, interaction, whisper_turn_id, response_turn_id, target_participant, whisper_message)
-        resp_msg = await placeholder_msg.edit(embed=embed, view=view)
+        resp_msg = await placeholder_msg.edit(
+            embed=self._whisper_embed(interaction, self._whisper_display(reply), display_name, avatar_url, whisper_message),
+            view=view)
 
         # Inject the message ID back into the log turn
         if resp_msg:
@@ -402,33 +330,14 @@ class WhisperMixin:
         """Only called with the channel already claimed by _execute_whisper_regeneration."""
         owner_id = target_participant['owner_id']
         profile_name = target_participant['profile_name']
-        participant_key = (owner_id, profile_name)
-
-        model, _, temp, top_p, top_k, _, fallback_model_name = await self.cog.api_service._get_or_create_model_for_channel(
-            interaction.channel_id, interaction.user.id, interaction.guild.id,
-            profile_owner_override=owner_id, profile_name_override=profile_name
-        )
-
-        # Resolve appearance
-        effective_owner_id, effective_profile_name = self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)
 
         user_index = self.cog.profile_manager._get_user_index(owner_id)
         is_borrowed = profile_name in user_index.get("borrowed", [])
         p_settings = self.cog.profile_manager._get_profile_config(owner_id, profile_name, is_borrowed) or {}
-        custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+        effective_owner_id, effective_profile_name, display_name, avatar_url, custom_emoji = \
+            self._whisper_appearance(owner_id, profile_name, p_settings)
 
-        display_name = effective_profile_name
-        appearance = self.cog.profile_manager._get_user_appearance(effective_owner_id, effective_profile_name)
-        avatar_url = self.cog.bot.user.display_avatar.url
-        if appearance:
-            display_name = appearance.get("custom_display_name") or display_name
-            avatar_url = appearance.get("custom_avatar_url") or avatar_url
-
-        # --- IMMEDIATE EDIT TO PLACEHOLDER ---
-        placeholder_embed = discord.Embed(description=f"{custom_emoji}", color=discord.Color.dark_grey())
-        placeholder_embed.set_author(name=display_name, icon_url=avatar_url)
-        placeholder_embed.set_footer(text=f"{whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
-
+        placeholder_embed = self._whisper_embed(interaction, custom_emoji, display_name, avatar_url, whisper_message)
         if answered:
             # The waiting notice already consumed the interaction response.
             await interaction.edit_original_response(content=None, embed=placeholder_embed, view=None)
@@ -459,60 +368,24 @@ class WhisperMixin:
             hide_folded=self.cog.session_manager.compaction_enabled(session),
         )
 
-        gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "thinking_config": {"include_thoughts": True}}
-
-        status = "api_error"
-        response = None
-        t_start = time.time()
-        state_container = {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg}
-
-        async def send(turn, cfg):
-            reply, _ = await self._generate_with_heartbeat(
-                model, turn, cfg, interaction.channel, None, placeholder_msg.id,
-                is_fallback=False, message_type="embed", existing_state=state_container)
-            return reply
-
         try:
-            response = (await tool_loop.run(
-                self.cog, model, participant_history, gen_config,
-                self._whisper_function_context(interaction, owner_id, profile_name, display_name, p_settings),
-                send)).response
-            status = "success"
-        except asyncio.CancelledError: return
-        except Exception: status = "api_error"
-        finally:
-            if 'state_container' in locals() and state_container:
-                await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
-            self.cog._log_api_call(user_id=interaction.user.id, guild_id=interaction.guild.id, context="whisper_regen", model_used=model, status=status)
-
-        if not response or not response.candidates:
-            err_embed = placeholder_embed.copy()
-            err_embed.description = "Regeneration failed."
-            await interaction.edit_original_response(embed=err_embed)
+            reply = await self._whisper_reply(
+                interaction, session, target_participant, p_settings, participant_history,
+                placeholder_msg, custom_emoji, display_name, avatar_url, "whisper_regen")
+        except asyncio.CancelledError:
             return
 
-        response_text = getattr(response, 'text', "...").strip()
-        response_text, _ = self._extract_and_apply_neuro_state(response_text, owner_id, profile_name)
+        if reply.blocked:
+            # The old reply stays in the log; this one only says why it was not replaced.
+            await interaction.edit_original_response(embed=self._whisper_embed(
+                interaction, ("Regeneration failed.\n\n" + self._whisper_display(reply))[:4096],
+                display_name, avatar_url, whisper_message))
+            return
 
-        response_text = re.sub(r'</?private_response>', '', response_text, flags=re.IGNORECASE)
-
-        # See _run_whisper_turn: both the raw profile_name and the appearance-resolved
-        # display name must be scrubbed, since private_response turns are logged under
-        # the former while this list would otherwise only carry the latter.
-        whisper_participant_names = [interaction.user.name]
-        for p_data_temp in session.get("profiles", []):
-            whisper_participant_names.append(p_data_temp['profile_name'])
-            other_name, _ = self._resolve_appearance_data(p_data_temp['owner_id'], p_data_temp['profile_name'])
-            whisper_participant_names.append(other_name)
-
-        response_text = _scrub_response_text(response_text, participant_names=whisper_participant_names)
-
-        # [NEW] Safety Fallback for empty responses
-        if not response_text or not response_text.strip():
-            p_index = self.cog.profile_manager._get_user_index(owner_id)
-            p_is_borrowed = profile_name in p_index.get("borrowed", [])
-            p_settings = self.cog.profile_manager._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
-            response_text = p_settings.get("error_response", "...")
+        response_text = reply.text
+        sources = _format_citation_subtext(reply.sources or [])
+        if sources:
+            response_text += "\n\n" + "\n".join(sources)
 
         # Update log
         profile_id = self.cog.profile_manager._get_profile_id(effective_owner_id, effective_profile_name)
@@ -530,11 +403,10 @@ class WhisperMixin:
         # holding a full unified_log that _evict_inactive_sessions then skipped --
         # its entire body is gated on is_hydrated, so the log never got released.
 
-        # Final Embed Update
-        final_embed = placeholder_embed.copy()
-        final_embed.description = response_text
         view = WhisperActionView(self.cog, interaction, whisper_turn_id, response_turn_id, target_participant, whisper_message)
-        await interaction.edit_original_response(embed=final_embed, view=view)
+        await interaction.edit_original_response(
+            embed=self._whisper_embed(interaction, self._whisper_display(reply), display_name, avatar_url, whisper_message),
+            view=view)
 
     async def _resolve_reply_context(self, message: discord.Message) -> Optional[str]:
         if not message.reference or not message.reference.message_id:

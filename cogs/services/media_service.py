@@ -69,6 +69,7 @@ class MediaService:
                                 voice_sample_of: Optional[tuple] = None,
                                 model_id: str = DEFAULT_SPEECH_MODEL, voice_name: str = DEFAULT_SPEECH_VOICE,
                                 temperature: float = 1.0, fallback_model_id: Optional[str] = None,
+                                final_fallback: bool = False,
                                 max_bytes: Optional[int] = None, speed: Optional[float] = None,
                                 language_code: Optional[str] = None) -> str:
         """Returns the path of an audio file of `transcript` spoken, and hands the file to the caller.
@@ -86,7 +87,7 @@ class MediaService:
         rather than at each caller: a preview speech model going 404 or 503 mid-session
         otherwise silences the whole round with nothing tried in its place.
 
-        A timeout is retried once per turn, across both models. The audio may already have
+        A timeout is retried once per turn, across the whole chain. The audio may already have
         been generated and billed, so a second timeout ends the turn's speech rather than
         paying for it again -- on the fallback included.
 
@@ -124,8 +125,14 @@ class MediaService:
                     timeout_retries -= 1
                     print(f"Text-to-speech: {name} timed out; retrying once for this turn.")
 
+        # The profile's two slots, then the Final Fallback on the other provider where
+        # `final_fallback` carries the profile's switch on.
+        model_id, fallbacks = self.cog.api_service.model_chain(
+            {"speech_model": model_id, "speech_fallback_model": fallback_model_id,
+             "final_fallback_enabled": final_fallback},
+            "speech_model", config_owner_id)
         path, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
-            model_id, fallback_model_id, _attempt, label="Text-to-speech")
+            model_id, fallbacks, _attempt, label="Text-to-speech")
         return path
 
     def _stitch_wav_segments(self, segments):
@@ -203,8 +210,9 @@ class MediaService:
                             # raises before rebinding it would otherwise leave the
                             # *previous* request's response to be closed here.
                             try:
-                                img_model_raw = package.get("image_generation_model", DEFAULT_IMAGE_MODEL)
-                                img_fallback_raw = package.get("image_generation_fallback_model")
+                                img_model_raw, img_fallbacks = self.cog.api_service.model_chain(
+                                    package, "image_generation_model",
+                                    package['effective_profile_owner_id'])
                                 # Built per attempt by the model factory, which keys it for the
                                 # provider the attempt names -- so a primary that cannot run here
                                 # still hands over to its fallback. Named by id until then.
@@ -247,7 +255,7 @@ class MediaService:
                                         )
 
                                     result, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                                        img_model_raw, img_fallback_raw, _attempt, label="Image generation")
+                                        img_model_raw, img_fallbacks, _attempt, label="Image generation")
                                     response, state_container = result
                                     status = "blocked_by_safety" if not response.candidates else "success"
                                 except Exception as e:
@@ -602,8 +610,9 @@ class MediaService:
                 # raises before rebinding it would otherwise leave the
                 # *previous* request's response to be closed here.
                 try:
-                    img_model_raw = request_data.get("image_generation_model", DEFAULT_IMAGE_MODEL)
-                    img_fallback_raw = request_data.get("image_generation_fallback_model")
+                    img_model_raw, img_fallbacks = self.cog.api_service.model_chain(
+                        request_data, "image_generation_model",
+                        request_data['effective_profile_owner_id'])
                     # Built per attempt by the model factory, which keys it for the provider
                     # the attempt names -- so a primary that cannot run here still hands
                     # over to its fallback. Named by id until then, for the log.
@@ -623,7 +632,7 @@ class MediaService:
                         # The request's placeholder, made when it was queued, is the only
                         # thing in the channel while this runs, and nothing else ticks it.
                         generation = self.cog.api_service.run_with_fallback(
-                            img_model_raw, img_fallback_raw, _attempt, label="Image generation")
+                            img_model_raw, img_fallbacks, _attempt, label="Image generation")
                         status_channel = self.cog.bot.get_channel(request_data['channel_id'])
                         if status_channel:
                             placeholder = request_data.get("placeholder_message")
@@ -900,6 +909,7 @@ class MediaService:
                 "grounding_sources": grounding_sources,
                 "image_generation_model": profile_data.get("image_generation_model", DEFAULT_IMAGE_MODEL),
                 "image_generation_fallback_model": profile_data.get("image_generation_fallback_model"),
+                "final_fallback_enabled": profile_data.get("final_fallback_enabled"),
                 # Carried rather than re-read off the profile in the worker: the request
                 # may sit in the queue behind others while its owner edits the profile,
                 # and the image should come back the shape it was asked for.

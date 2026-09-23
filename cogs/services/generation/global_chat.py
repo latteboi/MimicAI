@@ -7,19 +7,15 @@ import datetime
 from typing import Dict, List, Optional
 
 from ...utils.constants import (
-    defaultConfig, PRIMARY_MODEL_NAME, STM_LIMIT_MAX, PLACEHOLDER_EMOJI,
-    ERR_GENERAL_ERROR, ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK,
-    WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED,
+    defaultConfig, STM_LIMIT_MAX, PLACEHOLDER_EMOJI,
     GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB,
 )
 from ...utils.helpers import (
-    _add_inline_citations, _format_api_error, _format_citation_subtext, _format_history_entry,
-    _get_user_hash, _resolve_safety_settings, _scrub_response_text, default_profile_avatar_url,
-    resolve_grounding_mode, resolve_native_tools,
-    resolve_thinking_params, suppress_link_previews,
+    _format_citation_subtext, _format_history_entry, _get_user_hash, _resolve_safety_settings,
+    default_profile_avatar_url, resolve_grounding_mode, suppress_link_previews,
 )
 from . import tool_loop
-from ._shared import _strip_neuro_update_and_scrub
+from .reply import _merge_sources, reply_gen_config
 
 #: Speakers named on the card before the rest collapse into "+n". Four fits the footer
 #: and the field title at any sensible display-name length.
@@ -167,10 +163,15 @@ class GlobalChatMixin:
                 f"**'{profile_name}' cannot be used in Global Chat.**\n{deny_reason}", ephemeral=True)
             return
 
+        # The host's own copy from here on, as a session reads a seated borrow's: a borrow
+        # owns its config, and its models and sampling are what the host set on it.
+        is_borrowed = profile_name in self.cog.profile_manager._get_user_index(host_user_id).get("borrowed", [])
+        profile_data = self.cog.profile_manager._get_profile_config(host_user_id, profile_name, is_borrowed) or {}
+
         user_api_key = self.cog.storage_manager._get_api_key_for_user(host_user_id, "gemini")
         or_key = self.cog.storage_manager._get_api_key_for_user(host_user_id, "openrouter")
-        has_ollama = (profile_data.get("primary_model", "").upper().startswith("OLLAMA/")
-                      and self.cog.profile_manager.may_use_ollama(source_owner_id))
+        has_ollama = (str(profile_data.get("primary_model") or "").upper().startswith("OLLAMA/")
+                      and self.cog.profile_manager.may_use_ollama(host_user_id))
 
         # The host's own key, carrying a conversation others can be let into wherever the
         # card was opened: a free Gemini tier answers to that server's policy, and is
@@ -192,22 +193,17 @@ class GlobalChatMixin:
         try:
             # The people writing in this round: whose birthdays the character may know.
             present_users = [(t["user_id"], t["display_name"]) for t in queued_turns]
-            model, temp, top_p, top_k, warning_message, fallback_model_name = await self.cog.api_service._get_or_create_model_for_global_chat(
-                host_user_id, profile_name, policy_guild_id=interaction.guild_id, present_users=present_users,
-                search_key=user_api_key)
-
-            # Resolve primary model and safety settings
-            profile_data = self.cog.profile_manager._get_profile_config(source_owner_id, source_profile_name, False) or {}
-            primary_model = profile_data.get("primary_model", PRIMARY_MODEL_NAME)
-
-            if warning_message:
-                try: await interaction.user.send(warning_message)
-                except discord.Forbidden: pass
-
-            if not model:
-                error_msg = warning_message or "Could not initialize the AI model for this profile."
-                await interaction.followup.send(error_msg, ephemeral=True)
-                return
+            # No server, so no `recall`: memories are filed per server. One tuple for the
+            # prompt and every model -- see tool_loop.
+            functions = tool_loop.functions_for(profile_data, has_server=False,
+                                                can_search=bool(user_api_key))
+            # Channel 0 resolves to no channel, so the builder takes the not-age-restricted
+            # branch and always injects <content_policy>: the card can be opened in any
+            # channel, which is why content_capability refuses an Adult profile here.
+            (system_instruction, _, _, temp, top_p, top_k,
+             primary_model, fallback_model_name) = await asyncio.to_thread(
+                self._construct_system_instructions, host_user_id, profile_name, 0,
+                present_users=present_users, functions=functions)
 
             session_data = self.cog.global_chat_sessions.get(model_cache_key)
             if not session_data:
@@ -324,18 +320,6 @@ class GlobalChatMixin:
             else:
                 contents_for_api_call.append(user_content_obj_for_turn)
 
-            gen_config = {
-                "temperature": temp, "top_p": top_p, "top_k": top_k,
-                "thinking_config": {"include_thoughts": True}
-            }
-
-            status = "api_error"
-            response = None
-            fallback_used = False
-            api_error_reason = None
-            main_api_error = None
-            state_container = None
-
             app_name, app_avatar = self._resolve_appearance_data(host_user_id, profile_name)
             # No server: `recall` is not offered here, and a search bills the host's key.
             fn_ctx = tool_loop.FunctionContext(
@@ -344,195 +328,53 @@ class GlobalChatMixin:
                 triggering_user_id=queued_turns[-1]["user_id"] if queued_turns else host_user_id,
                 safety_settings=_resolve_safety_settings(None, profile_data),
                 search_key=user_api_key)
-            looped = None
+            chat_participant_names = [app_name] + [t['display_name'] for t in queued_turns]
+            state_container = {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg,
+                               "message_type": "embed"}
 
-            def sender(chat_model, is_fallback):
-                async def send(turn, cfg):
-                    nonlocal state_container
-                    reply, state_container = await self._generate_with_heartbeat(
-                        chat_model, turn, cfg, interaction.channel, None, placeholder_msg.id,
-                        is_fallback=is_fallback, app_name=app_name, app_avatar=app_avatar,
-                        message_type="embed",
-                        existing_state=state_container or {"custom_emoji": custom_emoji,
-                                                           "placeholder_msg": placeholder_msg})
-                    return reply
-                return send
-
+            # The session reply's own path -- primary, fallback race, Final Fallback, the
+            # warnings -- on the host's key. It used to be a copy of it with the fallback
+            # retried by hand and no Final, and it drifted the way copies do.
             try:
-                looped = await tool_loop.run(self.cog, model, contents_for_api_call, gen_config,
-                                             fn_ctx, sender(model, False))
-                response = looped.response
-                if not response or not response.candidates:
-                    raise ValueError("Response blocked or empty")
-
-                raw_text_check = getattr(response, 'text', "").strip()
-                temp_scrubbed = _strip_neuro_update_and_scrub(raw_text_check, [app_name] + [t['display_name'] for t in queued_turns])
-
-                if not temp_scrubbed:
-                    raise ValueError("Empty Response (AI produced no text content)")
-
-                status = "success"
+                attempt = await self._attempt_reply(
+                    channel=interaction.channel,
+                    # No `method`: the placeholder is the card, never a child bot's message.
+                    participant={"owner_id": host_user_id, "profile_name": profile_name},
+                    p_settings=profile_data, owner_id=host_user_id, user_id=host_user_id,
+                    system_instruction=system_instruction, primary_model=primary_model,
+                    fallback_model_name=fallback_model_name, history=contents_for_api_call,
+                    gen_config=reply_gen_config(profile_data, temp, top_p, top_k),
+                    msg_a_id=placeholder_msg.id, app_name=app_name, app_avatar=app_avatar,
+                    state_container=state_container, participant_names=chat_participant_names,
+                    log_context="global_chat", functions=functions, conversation=True,
+                    function_context=fn_ctx)
             except asyncio.CancelledError:
-                if state_container and state_container.get('sending_task'):
+                if state_container.get('sending_task'):
                     state_container['sending_task'].cancel()
-                msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
-                await self._safe_delete_placeholder(interaction.channel, msg_b_to_delete)
+                await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
                 return
-            except Exception as e:
-                is_timeout_main = isinstance(e, TimeoutError)
-                main_api_error = _format_api_error(e)
-                if hasattr(e, 'state_container'): state_container = e.state_container
 
-                if not fallback_model_name or primary_model == fallback_model_name:
-                    api_error_reason = main_api_error
-                else:
-                    try:
-                        # channel_id 0 resolves to no channel, so the builder takes the
-                        # not-age-restricted branch and always injects <content_policy>.
-                        # That is the intended answer, not an accident of the sentinel: a
-                        # Global Chat card can be opened in any channel and none is
-                        # guaranteed age-restricted, which is the same reason
-                        # content_capability refuses an Adult profile here.
-                        source_id_f, source_name_f = \
-                            self.cog.profile_manager._resolve_effective_profile(host_user_id, profile_name)
+            reply = self._reply_text(attempt, profile_data, host_user_id, profile_name,
+                                     chat_participant_names)
+            turn_warnings.extend(reply.warnings)
 
-                        p_data_f = self.cog.profile_manager._get_profile_config(source_id_f, source_name_f, False) or {}
-                        # One tuple for this prompt and this model -- see tool_loop.
-                        functions_f = tool_loop.functions_for(p_data_f, has_server=False,
-                                                              can_search=bool(user_api_key))
-                        sys_instr, _, _, _, _, _, _, _ = await asyncio.to_thread(
-                            self._construct_system_instructions, host_user_id, profile_name, 0,
-                            present_users=present_users, functions=functions_f)
-
-                        d_safe = _resolve_safety_settings(None, p_data_f)
-
-                        # Only ever handed to the fallback instance below, so it
-                        # resolves as the fallback role.
-                        t_params_f = resolve_thinking_params(p_data_f, "response", "fallback")
-
-                        model_tools = resolve_native_tools(p_data_f)
-
-                        # One factory call in place of three hand-rolled provider branches.
-                        # Those branches also left the generation call below nested inside the
-                        # Google branch, so an OpenRouter or Ollama fallback model was built and
-                        # then never used: the fallback silently did nothing and the turn
-                        # reported that both models had failed. Collapsing the branches puts
-                        # the call back on the single path every provider reaches.
-                        fb_name = fallback_model_name
-                        fallback_instance = self.cog.api_service._instantiate_model(
-                            fb_name, None, host_user_id,
-                            sys_instr, d_safe, t_params_f, model_tools, p_data_f,
-                            functions=functions_f,
-                            openrouter_key_error="No OR key for fallback",
-                            google_key_error="No Google key for fallback",
-                            config_owner_id=source_id_f, policy_guild_id=interaction.guild_id,
-                            conversation=True,
-                        )
-
-                        looped = await tool_loop.run(self.cog, fallback_instance, contents_for_api_call,
-                                                     gen_config, fn_ctx, sender(fallback_instance, True))
-                        response = looped.response
-                        status = "blocked_by_safety" if not response or not response.candidates else "success"
-                        if status == "success":
-                            fb_raw_check = getattr(response, 'text', "").strip()
-                            temp_scrubbed = _strip_neuro_update_and_scrub(fb_raw_check, [app_name] + [t['display_name'] for t in queued_turns])
-
-                            if not temp_scrubbed:
-                                raise ValueError("Empty Response (AI produced no text content)")
-
-                            fallback_used = True
-                            self.cog._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat_fallback", model_used=fb_name, status="success")
-                    except asyncio.CancelledError:
-                        return
-                    except Exception as retry_e:
-                        print(f"Global Chat fallback retry failed: {retry_e}")
-                        is_timeout_fallback = isinstance(retry_e, TimeoutError)
-                        if hasattr(retry_e, 'state_container'): state_container = retry_e.state_container
-
-                        if is_timeout_main and is_timeout_fallback:
-                            api_error_reason = ERR_REASON_TIMEOUT_BOTH
-                        else:
-                            api_error_reason = _format_api_error(retry_e)
-                        status = "api_error"
-            finally:
-                self.cog._log_api_call(user_id=host_user_id, guild_id=None, context="global_chat", model_used=model, status=status)
-
-            # `status` first: a failed fallback leaves the last response it received in
-            # `response`, and one with candidates but no text passed the test alone --
-            # so two empty answers posted an empty reply instead of the error text.
-            if status != "success" or not response or not response.candidates:
-                reason = api_error_reason or "Unknown Error"
-                is_safety = False
-                block_reason = getattr(getattr(response, 'prompt_feedback', None), 'block_reason', None)
-                if block_reason:
-                    reason = block_reason.name.replace('_', ' ').title()
-                    is_safety = True
-
-                custom_main = profile_data.get("error_response", ERR_GENERAL_ERROR)
-
-                if is_safety:
-                    turn_warnings.append(ERR_SAFETY_BLOCK.format(reason=reason))
-                elif "Rate Limit" in reason:
-                    turn_warnings.append(reason)
-                else:
-                    if fallback_model_name and primary_model != fallback_model_name:
-                        turn_warnings.append(WARN_BOTH_MODELS_FAILED.format(reason=reason))
-                    else:
-                        turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=reason))
-
+            if reply.blocked:
                 err_embed = placeholder_msg.embeds[0]
-                err_embed.description = custom_main
+                err_embed.description = reply.text
                 await placeholder_msg.edit(embed=err_embed)
 
-                if state_container and state_container.get('sending_task'):
+                if state_container.get('sending_task'):
                     state_container['sending_task'].cancel()
-                msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
-                await self._safe_delete_placeholder(interaction.channel, msg_b_to_delete)
-                if state_container:
-                    state_container['msg_b_id'] = None
+                await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
+                state_container['msg_b_id'] = None
 
                 await self._dispatch_warnings(interaction.channel, 'webhook', None, turn_warnings, host_user_id, profile_name)
                 return
 
-            raw_text = getattr(response, 'text', "")
-            if hasattr(response, 'raw') and response.raw.candidates and hasattr(response.raw.candidates[0], 'grounding_metadata'):
-                raw_text = _add_inline_citations(raw_text, response.raw.candidates[0].grounding_metadata)
-            raw_text = raw_text.strip()
-
-            raw_text, _ = self._extract_and_apply_neuro_state(raw_text, host_user_id, profile_name)
-
-            # Apply filters. Every speaker's name is XML-tag-wrapped in the history the
-            # model sees (_format_history_entry), so a hallucinated continuation as one of
-            # the queued users leaves a bare closing tag that only the name scrubber can
-            # catch -- scrubbing just the bot's own name left every other name's closing
-            # tag in the clear.
-            chat_participant_names = [app_name] + [t['display_name'] for t in queued_turns]
-            response_text = _scrub_response_text(raw_text, participant_names=chat_participant_names)
-
-            if response_text:
-                grounding_sources = []
-                grounding_sources.extend(global_rag_sources)
-                # What the character looked up itself, cited like the rest.
-                if looped is not None:
-                    grounding_sources.extend(looped.sources)
-                if hasattr(response, 'raw') and response.raw.candidates:
-                    if hasattr(response.raw.candidates[0], 'grounding_metadata'):
-                        metadata = response.raw.candidates[0].grounding_metadata
-                        if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks is not None:
-                            for chunk in metadata.grounding_chunks:
-                                if hasattr(chunk, 'web'):
-                                    grounding_sources.append({'uri': chunk.web.uri, 'title': chunk.web.title})
-
-                    if hasattr(response.raw.candidates[0], 'url_context_metadata'):
-                        url_metadata = response.raw.candidates[0].url_context_metadata
-                        if hasattr(url_metadata, 'url_metadata') and url_metadata.url_metadata is not None:
-                            for u in url_metadata.url_metadata:
-                                if hasattr(u, 'retrieved_url') and u.retrieved_url:
-                                    grounding_sources.append({'uri': u.retrieved_url, 'title': 'URL Context'})
-
-                sources_text_list = _format_citation_subtext(grounding_sources)
-                if sources_text_list:
-                    response_text += "\n\n" + "\n".join(sources_text_list)
+            response_text = reply.text
+            sources_text_list = _format_citation_subtext(_merge_sources(global_rag_sources, reply.sources))
+            if sources_text_list:
+                response_text += "\n\n" + "\n".join(sources_text_list)
 
             current_log = session_data.get('unified_log', [])
             if len(current_log) > STM_LIMIT_MAX * 2:
@@ -555,13 +397,8 @@ class GlobalChatMixin:
 
             text_for_embed = response_text
 
-            if fallback_used and profile_data.get("show_fallback_indicator", True):
-                turn_warnings.append(WARN_FALLBACK_USED)
-                turn_warnings.append(WARN_MAIN_MODEL_FAILED.format(reason=main_api_error))
-
-            if state_container:
-                await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
-                state_container['msg_b_id'] = None
+            await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
+            state_container['msg_b_id'] = None
 
             await self._update_sending_placeholder(interaction.channel, 'webhook', None, state_container, t1_start_mono)
 
@@ -571,7 +408,7 @@ class GlobalChatMixin:
                 self.cog, host_user_id, profile_name, session_data,
                 description=text_for_embed, incoming=queued_turns)
 
-            if state_container and state_container.get('sending_task'):
+            if state_container.get('sending_task'):
                 state_container['sending_task'].cancel()
 
             await placeholder_msg.edit(embed=embed)

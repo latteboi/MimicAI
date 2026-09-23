@@ -9,10 +9,10 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..utils.constants import (DEFAULT_PROFILE_GENERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS,
-                               FALLBACK_MODEL_NAME, LIBRARY_INTRO_MAX_CHARS,
-                               PRIMARY_MODEL_NAME, defaultConfig)
-from ..utils.helpers import _format_api_error, is_real_model, resolve_thinking_params
-from ..utils.user_defaults import apply_defaults, model_provider
+                               LIBRARY_INTRO_MAX_CHARS, defaultConfig)
+from ..utils.helpers import _format_api_error, resolve_thinking_params
+from ..utils.user_defaults import (apply_defaults, model_chain, model_provider,
+                                   model_slot_defaults)
 
 #: A character is creative work. This was 0.3, a form-filling temperature, and every
 #: concept came back as the same genre-average character.
@@ -141,33 +141,27 @@ def build_prompt(template: str, concept: str, previous: Optional[Dict[str, Any]]
     return prompt
 
 
-def _through_openrouter(model: str) -> str:
-    return f"OPENROUTER/google/{model[7:]}" if model.startswith("GOOGLE/") else model
+def generator_models(cog, user_id: int) -> Tuple[str, Tuple[str, ...]]:
+    """(primary, fallbacks) for a draft: the chain the new profile itself would run on.
 
-
-def generator_models(cog, user_id: int) -> Tuple[str, Optional[str]]:
-    """(primary, fallback) for a draft: the models the new profile itself would run on.
-
-    Built the way `_get_or_create_user_profile` builds a config -- the shipped models
-    with the user's own defaults over them -- then rescued onto a provider the user
-    holds. The rescue cannot help someone whose only key is OpenRouter and who never
-    set a default, because the platform default is Google too, so they get the same
-    models through OpenRouter. This was a hardcoded `gemini-2.5-flash-lite` whatever the
-    user ran, and Ollama was unreachable.
+    Built the way `_get_or_create_user_profile` builds a config -- the shipped models on the
+    user's effective provider, their own defaults over them -- rescued onto a provider
+    they hold, then the Final Fallback behind. Only models on a provider the user holds
+    a key for are kept: a draft is billed to the user alone.
     """
     pm = cog.profile_manager
-    config = {"primary_model": PRIMARY_MODEL_NAME, "fallback_model": FALLBACK_MODEL_NAME}
+    provider = pm.effective_provider(user_id)
+    shipped = model_slot_defaults(provider)
+    config = {"primary_model": shipped["primary_model"], "fallback_model": shipped["fallback_model"]}
     apply_defaults(config, pm._get_user_defaults(user_id), borrowed=False)
     pm._rescue_unusable_models(user_id, config)
 
-    usable: List[str] = [m for m in (config.get("primary_model"), config.get("fallback_model"))
-                         if m and is_real_model(m)
-                         and pm._user_holds_provider_key(user_id, model_provider(m))]
-    if not usable and pm._user_holds_provider_key(user_id, "openrouter"):
-        usable = [_through_openrouter(PRIMARY_MODEL_NAME), _through_openrouter(FALLBACK_MODEL_NAME)]
+    primary, fallbacks = model_chain(config, "primary_model", provider)
+    usable: List[str] = [m for m in dict.fromkeys((primary, *fallbacks))
+                         if pm._user_holds_provider_key(user_id, model_provider(m))]
     if not usable:
         raise ProfileGenerationError(NO_KEY_MESSAGE)
-    return usable[0], (usable[1] if len(usable) > 1 else None)
+    return usable[0], tuple(usable[1:])
 
 
 async def generate_draft(cog, user_id: int, concept: str,
@@ -177,7 +171,7 @@ async def generate_draft(cog, user_id: int, concept: str,
 
     Raises ProfileGenerationError, and nothing else, for anything the user should be told.
     """
-    primary, fallback = generator_models(cog, user_id)
+    primary, fallbacks = generator_models(cog, user_id)
     template = cog.global_prompts.get("PROFILE_GENERATOR", DEFAULT_PROFILE_GENERATOR_PROMPT)
     try:
         prompt = build_prompt(template, concept, previous, request)
@@ -211,7 +205,7 @@ async def generate_draft(cog, user_id: int, concept: str,
 
     try:
         draft, used, _was_fallback = await cog.api_service.run_with_fallback(
-            primary, fallback, attempt, label="Profile generator")
+            primary, fallbacks, attempt, label="Profile generator")
     except ProfileGenerationError:
         raise
     except Exception as e:

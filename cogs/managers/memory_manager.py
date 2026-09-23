@@ -47,9 +47,9 @@ else:
 
 
 from ..utils.constants import (
-    defaultConfig, FALLBACK_MODEL_NAME, DEFAULT_SAFETY_SETTINGS,
+    defaultConfig, DEFAULT_SAFETY_SETTINGS,
     MAX_LTM_SUMMARY_CHARACTERS, MIN_HISTORY_FOR_LTM_CREATION,
-    DEFAULT_TRAINING_ANALYST_PROMPT,
+    DEFAULT_TRAINING_ANALYST_PROMPT, GREEDY_SAMPLING,
     RECALL_TOOL_MAX, RECALL_TOOL_THRESHOLD,
 )
 from ..utils.helpers import (Timeout, _format_api_error, _get_sanitized_history_and_author,
@@ -875,10 +875,10 @@ class MemoryManager:
             is_borrowed = profile_name in user_index.get("borrowed", [])
             params_source = self.cog.profile_manager._get_profile_config(profile_owner_id, profile_name, is_borrowed) or {}
 
-        cfg = {"temperature": 0.2}
+        cfg = dict(GREEDY_SAMPLING)
 
-        ltm_model_raw = params_source.get("ltm_model", FALLBACK_MODEL_NAME)
-        ltm_fallback_raw = params_source.get("ltm_fallback_model")
+        ltm_model_raw, ltm_fallbacks = self.cog.api_service.model_chain(
+            params_source, "ltm_model", profile_owner_id)
 
         effective_guild_id = guild_id or 0
 
@@ -900,7 +900,7 @@ class MemoryManager:
                     [f"<target_transcript>\n{convo}\n</target_transcript>"], generation_config=cfg)
 
             r, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                ltm_model_raw, ltm_fallback_raw, _attempt, label="LTM summariser")
+                ltm_model_raw, ltm_fallbacks, _attempt, label="LTM summariser")
             status = "blocked_by_safety" if not r.candidates else "success"
 
             response_text = ""

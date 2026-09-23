@@ -1182,6 +1182,7 @@ class ChildBotManager:
                 "grounding_sources": grounding_sources,
                 "image_generation_model": profile_data.get("image_generation_model", DEFAULT_IMAGE_MODEL),
                 "image_generation_fallback_model": profile_data.get("image_generation_fallback_model"),
+                "final_fallback_enabled": profile_data.get("final_fallback_enabled"),
                 "image_output": {k: profile_data.get(k)
                                  for k in IMAGE_OUTPUT_KEYS + IMAGE_SAMPLING_KEYS},
             }

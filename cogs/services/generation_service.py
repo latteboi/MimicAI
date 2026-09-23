@@ -1491,6 +1491,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     speed=profile_settings.get("speech_speed"),
                                     language_code=profile_settings.get("speech_language") or None,
                                     fallback_model_id=profile_settings.get("speech_fallback_model"),
+                                    final_fallback=profile_settings.get("final_fallback_enabled") is True,
                                     # Audio past it is paid for and then refused, so a model
                                     # billed by the second is capped here, not only checked below.
                                     max_bytes=channel.guild.filesize_limit,

@@ -2086,38 +2086,27 @@ class MimicCog(EventListeners, commands.Cog):
             
             d_safe = _resolve_safety_settings(interaction.channel, p_config)
             
-            primary_model = p_config.get("primary_model", "GOOGLE/gemini-2.5-flash-lite")
-            fallback_model_name = p_config.get("fallback_model", "GOOGLE/gemini-2.5-flash-lite")
             custom_error = p_config.get("error_response", "An error has occurred.")
-            
-            model_to_use = primary_model
-            model_instance = None
-            response_text = ""
-            
+
             # --- Execute Pipeline ---
-            try:
+            async def _ask(model_name, _is_fallback):
                 # Intentionally passing None for tools to strictly disable grounding/fetching overrides
-                model_instance = self.api_service._instantiate_model(model_to_use, guild_id, owner_id, sys_prompt, d_safe, t_params_worker, None, p_config, config_owner_id=owner_id)
+                model_instance = self.api_service._instantiate_model(model_name, guild_id, owner_id, sys_prompt, d_safe, t_params_worker, None, p_config, config_owner_id=owner_id)
                 resp = await model_instance.generate_content_async(contents_for_api_call, generation_config=gen_config)
-                
                 if not resp or not resp.candidates:
                     raise ValueError("Empty or blocked response")
-                    
-                response_text = getattr(resp, 'text', "")
+                return getattr(resp, 'text', "")
+
+            # Primary, Fallback, then the Final Fallback on the other provider -- the chain
+            # every other model call runs, in place of a primary-then-fallback of its own.
+            try:
+                response_text, _used, _was_fallback = await self.api_service.run_with_fallback(
+                    *self.api_service.model_chain(p_config, "primary_model", owner_id), _ask,
+                    label="/help ask")
             except Exception as e:
-                try:
-                    model_to_use = fallback_model_name
-                    model_instance = self.api_service._instantiate_model(model_to_use, guild_id, owner_id, sys_prompt, d_safe, t_params_worker, None, p_config, config_owner_id=owner_id)
-                    resp = await model_instance.generate_content_async(contents_for_api_call, generation_config=gen_config)
-                    
-                    if not resp or not resp.candidates:
-                        raise ValueError("Empty or blocked response")
-                        
-                    response_text = getattr(resp, 'text', "")
-                except Exception as fb_e:
-                    print(f"/help ask Fallback error: {fb_e}")
-                    response_text = f"{custom_error}\n\n-# (API Failure)"
-                    
+                print(f"/help ask failed: {e}")
+                response_text = f"{custom_error}\n\n-# (API Failure)"
+
             response_text = _scrub_response_text(response_text).strip()
             if not response_text:
                 response_text = custom_error

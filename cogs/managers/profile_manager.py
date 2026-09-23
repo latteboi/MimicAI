@@ -20,8 +20,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from ..utils.user_defaults import (
-    apply_defaults, model_provider, platform_model_defaults, sanitise_defaults,
-    setting_label)
+    apply_defaults, model_chain, model_provider, model_slot_defaults, other_provider,
+    platform_model_defaults, sanitise_defaults, setting_label, short_model_name)
 from ..utils.helpers import is_real_model
 from ..utils.constants import (
     USERS_DIR, PUBLIC_PROFILES_DIR, BORROW_INDEX_FILE, PROFILE_NAME_SIDECAR,
@@ -40,11 +40,12 @@ from ..utils.constants import (
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
     NEW_PROFILE_SPEECH_TEMPERATURE, SPEECH_LANGUAGE_NAMES,
     IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_SLOT_FILES, VOICE_SAMPLE_SLOT_KEY, VOICE_SAMPLE_SLOTS,
-    UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_MODES, )
+    UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_MODES, GREEDY_SAMPLING, )
 from ..utils.helpers import (image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
                             ltm_auto_recall_enabled, resolve_critic_settings,
                             grounding_mode_display, resolve_image_output_params,
-                            resolve_image_tools, resolve_unreadable_media_mode,
+                            resolve_image_tools, resolve_thinking_params,
+                            resolve_unreadable_media_mode,
                             resolve_url_mode, suppress_link_previews,
                             describe_voice_samples)
 from ..utils.discord_cdn import signed_attachment_url, unsigned_attachment_url
@@ -1463,6 +1464,33 @@ class ProfileManager:
         """
         return self.get_user_about(user_id).get("timezone") or "UTC"
 
+    def provider_preference(self, user_id: Optional[int]) -> Optional[str]:
+        """"gemini" or "openrouter" as the user chose in `/start` or About Me, else None.
+
+        Cheap enough for the turn path -- the index is cached -- which is why the chain
+        reads this and not `effective_provider`.
+        """
+        return self.get_user_about(user_id).get("provider") if user_id else None
+
+    def set_provider_preference(self, user_id: int, provider: str) -> None:
+        about = self.get_user_about(user_id)
+        about["provider"] = provider
+        self.save_user_about(user_id, about)
+
+    def effective_provider(self, user_id: int) -> str:
+        """The provider this user's new models ship on: the preferred one, unless they
+        hold a key for the other alone -- then that one, preference or not, since a
+        profile made on a provider they cannot reach says nothing at all.
+
+        Read on creation, borrow and generation only: it decrypts the key file.
+        """
+        preferred = self.provider_preference(user_id) or "gemini"
+        other = other_provider(preferred)
+        if (not self._user_holds_provider_key(user_id, preferred)
+                and self._user_holds_provider_key(user_id, other)):
+            return other
+        return preferred
+
     def _user_holds_provider_key(self, user_id: int, provider: str) -> bool:
         """Whether the user has a key of this provider in any of their four slots.
 
@@ -1511,9 +1539,12 @@ class ProfileManager:
         Google key is not rescued from OpenRouter onto a Google model they equally
         cannot run. If neither side is usable the author's value stays: there is no
         right answer, and churning it would only hide where the problem came from.
+
+        The target is the slot's shipped value on the user's effective provider, so an
+        OpenRouter-only borrower lands on the same Gemini models through OpenRouter.
         """
         rescued = []
-        for slot, platform_value in platform_model_defaults().items():
+        for slot, platform_value in model_slot_defaults(self.effective_provider(user_id)).items():
             value = config.get(slot)
             if not is_real_model(value):
                 continue
@@ -1907,6 +1938,12 @@ class ProfileManager:
                 "neuro_engine_enabled": False, "neuro_state": {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20},
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }
+
+            # Routed onto the user's provider: only the slots it moves are written, so a
+            # Google profile keeps absent slots absent and following the shipped value.
+            platform = platform_model_defaults()
+            config.update({k: v for k, v in model_slot_defaults(self.effective_provider(user_id)).items()
+                           if v != platform.get(k)})
 
             # The template above is what the bot ships; anything the user has set as
             # their own default wins over it. New profiles take every defaultable key,
@@ -2524,10 +2561,14 @@ class ProfileManager:
             parts.append(avatar_part)
 
         payload = [{"role": "user", "parts": parts}]
-        gen_cfg = {"temperature": 0.0, "top_k": 1, "top_p": 0.9}
+        gen_cfg = dict(GREEDY_SAMPLING)
 
+        # The attachment describer's chain, for the same reasons: the free model while
+        # the key owner's free quota lasts, the same model paid once it is spent, and
+        # Google when there is no OpenRouter key at all.
         attempts = [
-            ("openrouter", "amazon/nova-lite-v1", OpenRouterModel),
+            ("openrouter", "inclusionai/ling-3.0-flash-vl:free", OpenRouterModel),
+            ("openrouter", "inclusionai/ling-3.0-flash-vl", OpenRouterModel),
             ("gemini", "gemini-2.5-flash-lite", GoogleGenAIModel),
         ]
 
@@ -2548,7 +2589,10 @@ class ProfileManager:
                 continue
             status = "api_error"
             try:
-                kwargs = {"api_key": key, "model_name": model_name, "system_instruction": prompt_text}
+                # The utility slot, resolved: an adapter handed no thinking params
+                # reasons at "high", which a one-word verdict does not need.
+                kwargs = {"api_key": key, "model_name": model_name, "system_instruction": prompt_text,
+                          "thinking_params": resolve_thinking_params({}, "utility", "primary")}
                 if model_cls is GoogleGenAIModel:
                     kwargs["safety_settings"] = DEFAULT_SAFETY_SETTINGS
                 elif on_operator_key:
@@ -3746,39 +3790,24 @@ class ProfileManager:
 
         embed.add_field(name="\u200b", value="\u200b", inline=False)
 
-        def clean_m(m_str):
-            if not m_str: return "None"
-            return str(m_str)
+        # Each category's whole chain -- Primary, Fallback, then the Final Fallback on the
+        # other provider -- read from `model_chain`, the resolver its generation path calls,
+        # so this cannot name a model it skips or leave out one it tries. The Primary in bold on
+        # the label line, then each fallback on a subtext line of its own, as `GO/`/`OR/`/`OL/`
+        # and the bare model: the full ids ran three to a line and wrapped into a wall.
+        preferred = self.provider_preference(user_id)
+        response_config = {**config, "primary_model": prim_model, "fallback_model": fall_model}
+        model_lines = []
+        for label, key in (("Response", "primary_model"), ("Image", "image_generation_model"),
+                           ("Audio", "speech_model"), ("Grounding", "grounding_rag_model"),
+                           ("Critic", "critic_model"), ("LTM", "ltm_model")):
+            primary, fallbacks = model_chain(
+                response_config if key == "primary_model" else config, key, preferred)
+            rest = [m for m in dict.fromkeys(fallbacks) if m != primary]
+            model_lines.append(f"**{label}** \u2192 **`{short_model_name(primary)}`**")
+            model_lines.extend(f"-# \u21b3 `{short_model_name(m)}`" for m in rest)
 
-        #: label -> (primary key, its default). The fallback key comes from
-        #: UTILITY_FALLBACK_KEYS so this listing cannot name a different slot than the
-        #: one the generation paths actually retry onto.
-        utility_slots = (
-            ("Image", "image_generation_model", DEFAULT_IMAGE_MODEL),
-            ("Audio", "speech_model", DEFAULT_SPEECH_MODEL),
-            ("Grounding", "grounding_rag_model", FALLBACK_MODEL_NAME),
-            ("Critic", "critic_model", FALLBACK_MODEL_NAME),
-            ("LTM", "ltm_model", FALLBACK_MODEL_NAME),
-        )
-
-        # The response slot reads like the five utility rows: one line, the retry after
-        # an arrow. It had its own two-line "Primary/Fallback" shape, which named the
-        # same pairing twice over in a different vocabulary from every row beneath it.
-        if is_real_model(fall_model) and fall_model != prim_model:
-            model_lines = [f"Response: `{clean_m(prim_model)}` \u2192 `{clean_m(fall_model)}`"]
-        else:
-            model_lines = [f"Response: `{clean_m(prim_model)}`"]
-        for label, key, default in utility_slots:
-            primary = config.get(key) or default
-            fallback = config.get(UTILITY_FALLBACK_KEYS[key])
-            # The shipped default is no second model, and an arrow to nothing on five
-            # rows is noise -- so the fallback only shows once it is really set.
-            if is_real_model(fallback) and fallback != primary:
-                model_lines.append(f"{label}: `{clean_m(primary)}` \u2192 `{clean_m(fallback)}`")
-            else:
-                model_lines.append(f"{label}: `{clean_m(primary)}`")
-
-        embed.add_field(name="Models", value="\n".join(model_lines), inline=False)
+        embed.add_field(name="Models", value="\n".join(model_lines)[:1024], inline=False)
 
         stm_length = config.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
         gen_val = (

@@ -13,7 +13,7 @@ from discord.ext import tasks
 
 from ..utils.constants import (
     OLLAMA_LOCAL_URL, MODELS_DATA_DIR, PRICING_CACHE_FILE, IMAGE_MODELS, AUDIO_MODELS,
-    ALLOWED_MODELS, defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
+    ALLOWED_MODELS, defaultConfig,
     IMAGE_MODEL_KEYS, AUDIO_MODEL_KEYS, DEFAULT_SPEECH_VOICE,
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
     THINKING_LEVELS_TO_OLLAMA, GEMINI_FREE_TIER_BLOCKED, OLLAMA_OWNER_ONLY,
@@ -31,6 +31,7 @@ from ..utils.helpers import (_format_api_error, _resolve_safety_settings,
                             resolve_openrouter_endpoint, resolve_openrouter_service_tier,
                             resolve_thinking_params)
 from ..utils.http_client import get_shared_client
+from ..utils.user_defaults import model_chain
 from ..utils.net_guard import safe_stream
 from ..utils.memory_tuning import maybe_trim_malloc
 from ..utils import mem_probe
@@ -150,6 +151,15 @@ def _refusal(message: str) -> ValueError:
     error = ValueError(message)
     error.formatted_reason = message
     return error
+
+
+class MissingKeyError(ValueError):
+    """No key for this provider where the call would be billed, raised before any request.
+
+    Its own type so `run_with_fallback` can tell it apart: a Final Fallback on a
+    provider nobody here holds is skipped this way on every call, and its "key not found"
+    must not stand in for the failure that actually ended the chain.
+    """
 
 
 def _refuse_if_resting(cog, api_key: str, model_id: str) -> None:
@@ -287,7 +297,7 @@ class APIService:
 
         if is_openrouter:
             api_key = storage._get_api_key_for_guild(guild_id, "openrouter") if guild_id else storage._get_api_key_for_user(user_id, "openrouter")
-            if not api_key: raise ValueError(openrouter_key_error or "OpenRouter API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
+            if not api_key: raise MissingKeyError(openrouter_key_error or "OpenRouter API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
             _refuse_if_resting(self.cog, api_key, actual_name)
             data_collection = (openrouter_data_collection(
                 self.cog.server_manager._get_server_index(str(policy_guild)) if policy_guild else None)
@@ -331,7 +341,7 @@ class APIService:
                 if conversation and not storage.personal_gemini_allowed_in_conversation(user_id, policy_guild):
                     raise _refusal(GEMINI_FREE_TIER_BLOCKED)
                 api_key = storage._get_api_key_for_user(user_id)
-            if not api_key: raise ValueError(google_key_error or "Google API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
+            if not api_key: raise MissingKeyError(google_key_error or "Google API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
             _refuse_if_resting(self.cog, api_key, actual_name)
             if speech:
                 return _with_key_cooldown_tracking(
@@ -356,9 +366,13 @@ class APIService:
                 model.functions = tuple(functions)
             return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
 
-    async def run_with_fallback(self, primary: str, fallback: Optional[str], attempt,
+    async def run_with_fallback(self, primary: str, fallback, attempt,
                                 *, label: str = "utility"):
         """Runs one utility generation on `primary`, retrying once on `fallback`.
+
+        `fallback` is a name, None, or a tuple of names tried in order -- a category's
+        Fallback then its Final Fallback (see `model_chain`), or the attachment
+        describer's free model, then the same model paid, then Google.
 
         `attempt(model_name, is_fallback)` owns the construction and the response
         handling; this owns only which name to try and when to stop. That puts the five
@@ -377,16 +391,18 @@ class APIService:
         the same model as its primary, so the retry only becomes live once someone
         actually changes one of them.
 
-        Returns (result, model_used, used_fallback). If both fail the second error is
-        raised -- callers report the error they are handed, and the fallback's is the
-        one that actually ended the attempt.
+        Returns (result, model_used, used_fallback). If every model fails the last error
+        is raised -- callers report the error they are handed, and the last fallback's is
+        the one that actually ended the attempt. A MissingKeyError never replaces an
+        earlier error: it only says a provider was absent, not why the chain failed.
         """
         attempts = [(primary, False)]
-        if is_real_model(fallback) and fallback != primary:
-            attempts.append((fallback, True))
+        for name in (fallback if isinstance(fallback, tuple) else (fallback,)):
+            if is_real_model(name) and all(name != tried for tried, _ in attempts):
+                attempts.append((name, True))
 
         last_error = None
-        for name, is_fallback in attempts:
+        for i, (name, is_fallback) in enumerate(attempts):
             try:
                 return await attempt(name, is_fallback), name, is_fallback
             except asyncio.CancelledError:
@@ -394,14 +410,21 @@ class APIService:
             except Exception as e:
                 if getattr(e, "retryable", True) is False:
                     raise
-                last_error = e
-                if not is_fallback and len(attempts) > 1:
+                if last_error is None or not isinstance(e, MissingKeyError):
+                    last_error = e
+                if i + 1 < len(attempts):
                     # The phrased reason, not the exception: a provider's error body is a
                     # JSON document, and a journal on a 1 GB box is not where it belongs.
-                    print(f"{label}: primary '{name}' failed "
+                    print(f"{label}: {'fallback' if is_fallback else 'primary'} '{name}' failed "
                           f"({type(e).__name__}: {_format_api_error(e)}); "
-                          f"retrying on '{attempts[1][0]}'.")
+                          f"retrying on '{attempts[i + 1][0]}'.")
         raise last_error
+
+    def model_chain(self, config: Optional[Dict[str, Any]], primary_key: str,
+                    owner_id: Optional[int]) -> Tuple[str, Tuple[str, ...]]:
+        """`user_defaults.model_chain` under the provider preference of `config`'s owner."""
+        return model_chain(config, primary_key,
+                           self.cog.profile_manager.provider_preference(owner_id))
 
     def get_top_models(self, provider: str, target_config_key: str,
                        ollama_host: Optional[str] = None) -> List[str]:
@@ -620,60 +643,6 @@ class APIService:
         self.cog.channel_models[model_cache_key] = (model_instance, final_error_state, model_to_create)
         self.cog.channel_model_last_profile_key[model_cache_key] = current_profile_key_for_model
         return model_instance, final_error_state, temperature, top_p, top_k, warning_message, fallback_model
-
-    async def _get_or_create_model_for_global_chat(self, user_id: int, profile_name: str, policy_guild_id: Optional[int] = None, present_users: Optional[List[Tuple[int, str]]] = None, search_key: Optional[str] = None) -> Tuple[Optional[Any], float, float, int, Optional[str], Optional[str]]:
-        """`search_key` is the host's Google key as the caller has cleared it for this
-        conversation, or None; without one the character is not offered `search_web`."""
-        source_owner_id, source_profile_name = self.cog.profile_manager._resolve_effective_profile(user_id, profile_name)
-        
-        profile_data = self.cog.profile_manager._get_profile_config(source_owner_id, source_profile_name, False)
-        if not profile_data:
-            return None, 0.0, 0.0, 0, f"The source for your active global profile ('{profile_name}') could not be found.", None
-
-        temp = profile_data.get("temperature", defaultConfig.GEMINI_TEMPERATURE)
-        top_p = profile_data.get("top_p", defaultConfig.GEMINI_TOP_P)
-        top_k = profile_data.get("top_k", defaultConfig.GEMINI_TOP_K)
-        primary_model = profile_data.get("primary_model", PRIMARY_MODEL_NAME)
-        fallback_model = profile_data.get("fallback_model", FALLBACK_MODEL_NAME)
-        
-        warning_message = None
-        # No server, so no `recall`: memories are filed per server. See tool_loop.
-        functions = functions_for(profile_data, has_server=False, can_search=bool(search_key))
-        system_instructions, _, _, _, _, _, _, _ = self.cog.generation_service._construct_system_instructions(
-            user_id, profile_name, 0, present_users=present_users or [], functions=functions)
-        
-        user_api_key = self.cog.storage_manager._get_api_key_for_user(user_id, "gemini")
-        or_key = self.cog.storage_manager._get_api_key_for_user(user_id, "openrouter")
-        
-        if not user_api_key and not or_key and not primary_model.upper().startswith("OLLAMA/"):
-            return None, 0.0, 0.0, 0, "This feature requires a personal API key. Use `/settings` to add one.", None
-        
-        # Global chat runs in a DM, which can never be age-restricted -- and an
-        # adult-rated profile is refused from the feature outright. Passing the
-        # absent channel resolves to BLOCK_ONLY_HIGH, which is what this path
-        # already sent.
-        safety_settings = _resolve_safety_settings(None, profile_data)
-
-        try:
-            t_params = resolve_thinking_params(profile_data, "response")
-            
-            model_tools = None
-            if not primary_model.upper().startswith(("OPENROUTER/", "OLLAMA/")) and "/" not in primary_model:
-                model_tools = resolve_native_tools(profile_data)
-                    
-            model = self._instantiate_model(primary_model, None, user_id, system_instructions, safety_settings, t_params, model_tools, profile_data, functions=functions,
-                                            config_owner_id=source_owner_id, policy_guild_id=policy_guild_id,
-                                            conversation=True)
-            
-            return model, temp, top_p, top_k, warning_message, fallback_model
-        except ValueError as e:
-            # The factory's refusals -- a missing key, a data policy, Ollama -- are
-            # already phrased for the user.
-            return None, 0.0, 0.0, 0, str(e), None
-        except Exception as e:
-            print(f"Error creating model for global chat (user: {user_id}, profile: {profile_name}): {e}")
-            return None, 0.0, 0.0, 0, "A critical error occurred while creating the AI model.", None
-        
 
     async def _validate_api_keys(self, gemini_key: str, openrouter_key: str) -> Tuple[bool, str, str]:
         """Validates API keys against the REST API. Returns (is_valid, error_message, tier).

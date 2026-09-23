@@ -1,4 +1,4 @@
-from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_MODEL, STATUS_IMAGINING_IMAGE
+from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE, STATUS_IMAGINING_IMAGE
 from ...utils.helpers import _format_api_error, _resolve_safety_settings, image_suffix_for_mime
 from ...utils.memory_tuning import maybe_trim_malloc
 from ...utils import mem_probe
@@ -46,8 +46,8 @@ class ImageRoundMixin:
         image_state_container = None
         response = None
         try:
-            img_model_raw = gen_cfg.get("image_generation_model", DEFAULT_IMAGE_MODEL)
-            img_fallback_raw = gen_cfg.get("image_generation_fallback_model")
+            img_model_raw, img_fallbacks = self.cog.api_service.model_chain(
+                gen_cfg, "image_generation_model", gen_owner_id)
 
             system_instruction = self.cog.media_service._get_image_gen_system_instruction(gen_owner_id, gen_profile_name)
 
@@ -132,7 +132,7 @@ class ImageRoundMixin:
 
             with mem_probe.probe("  image gen: API call", peak=False):
                 result, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                    img_model_raw, img_fallback_raw, _attempt, label="Image generation")
+                    img_model_raw, img_fallbacks, _attempt, label="Image generation")
             response, image_state_container = result
             status = "blocked_by_safety" if not response.candidates else "success"
 

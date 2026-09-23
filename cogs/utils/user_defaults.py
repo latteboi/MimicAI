@@ -35,7 +35,14 @@ itself: `_Bulk.copyable` is False for it deliberately, and a content rating is n
 a default than it is a thing to propagate in bulk.
 """
 
-from typing import Any, Dict, List, Optional
+import functools
+from typing import Any, Dict, List, Optional, Tuple
+
+from .constants import (
+    GEMINI_NOT_ON_OPENROUTER, GOOGLE_ONLY_MODEL_KEYS, MODEL_PROVIDERS,
+    UTILITY_FALLBACK_KEYS, UTILITY_OPENROUTER_MODELS,
+)
+from .helpers import is_real_model
 
 #: Config keys that must never be defaulted regardless of what the table says.
 #:
@@ -187,6 +194,17 @@ def model_provider(value: Optional[str]) -> str:
     return "gemini"
 
 
+_SHORT_PREFIXES = {"gemini": "GO", "openrouter": "OR", "ollama": "OL"}
+
+
+def short_model_name(value: Optional[str]) -> str:
+    """`OR/nova-micro-v1` for `OPENROUTER/amazon/nova-micro-v1`: the profile dashboard's
+    spelling. Display only -- the vendor segment is gone, so it cannot be routed back."""
+    if not is_real_model(value):
+        return "None"
+    return f"{_SHORT_PREFIXES[model_provider(value)]}/{str(value).rsplit('/', 1)[-1]}"
+
+
 def platform_model_defaults() -> Dict[str, str]:
     """Every model slot mapped to the value a fresh profile ships with.
 
@@ -202,6 +220,109 @@ def platform_model_defaults() -> Dict[str, str]:
     except Exception as e:
         print(f"Failed to read the platform model defaults: {type(e).__name__}({e})")
     return out
+
+
+#: Every model category's primary slot -> its fallback slot, the response pair included.
+MODEL_SLOT_PAIRS = {"primary_model": "fallback_model", **UTILITY_FALLBACK_KEYS}
+
+
+def other_provider(provider: Optional[str]) -> str:
+    return "gemini" if provider == "openrouter" else "openrouter"
+
+
+def route_model(model: str, provider: str, primary_key: str) -> Optional[str]:
+    """A shipped Google model as `provider` serves it, or None where it does not."""
+    if provider == "gemini":
+        return model
+    bare = model[len("GOOGLE/"):] if model.startswith("GOOGLE/") else model
+    if primary_key in GOOGLE_ONLY_MODEL_KEYS or bare in GEMINI_NOT_ON_OPENROUTER:
+        return None
+    return f"OPENROUTER/google/{bare}"
+
+
+#: Categories OpenRouter ships models of its own for, instead of the Google pair routed there.
+_OPENROUTER_SHIPPED = {"critic_model": UTILITY_OPENROUTER_MODELS, "ltm_model": UTILITY_OPENROUTER_MODELS}
+
+
+def _served(primary_key: str, provider: str) -> List[str]:
+    """The category's shipped models `provider` serves, Primary first."""
+    if provider == "openrouter" and primary_key in _OPENROUTER_SHIPPED:
+        return list(_OPENROUTER_SHIPPED[primary_key])
+    shipped = platform_model_defaults()
+    names = (shipped.get(primary_key), shipped.get(MODEL_SLOT_PAIRS[primary_key]))
+    return [routed for name in names if is_real_model(name)
+            and (routed := route_model(name, provider, primary_key))]
+
+
+@functools.lru_cache(maxsize=None)
+def shipped_chain(primary_key: str, preferred: Optional[str]) -> Tuple[str, ...]:
+    """Primary, Fallback and Final Fallback, as a category ships them for this preference.
+
+    The preferred provider's models, then the other's. A provider serving fewer than two
+    -- OpenRouter has one Gemini speech model and no search tool -- gives its places to
+    the next in line, so the chain is as long as there are models to fill it. Cached: the
+    table is fixed at import and this is read on every utility call.
+    """
+    preferred = preferred if preferred in MODEL_PROVIDERS else "gemini"
+    chain: List[str] = []
+    for name in _served(primary_key, preferred) + _served(primary_key, other_provider(preferred)):
+        if name not in chain:
+            chain.append(name)
+    return tuple(chain[:3])
+
+
+def model_slot_defaults(preferred: Optional[str]) -> Dict[str, str]:
+    """Both slots of every category as they ship for this preference.
+
+    `platform_model_defaults()` for Google, which is what an unchosen preference means.
+    """
+    out: Dict[str, str] = {}
+    for primary_key, fallback_key in MODEL_SLOT_PAIRS.items():
+        chain = shipped_chain(primary_key, preferred)
+        out[primary_key] = chain[0]
+        if len(chain) > 1:
+            out[fallback_key] = chain[1]
+    return out
+
+
+def final_fallback_enabled(config: Optional[Dict[str, Any]]) -> bool:
+    """A profile's Final Fallback switch. Unset is off: the Final runs on the provider the
+    Primary is not on, which its owner may never have meant to spend on."""
+    return (config or {}).get("final_fallback_enabled") is True
+
+
+def final_fallback(primary_key: str, primary: str, fallback: Optional[str],
+                   preferred: Optional[str]) -> Optional[str]:
+    """The category's first shipped model on the provider `primary` is not on.
+
+    Keyed to the Primary rather than to the preference: a profile someone moved onto the
+    other provider by hand is still left with a way out when that provider fails.
+    """
+    side = model_provider(primary)
+    target = other_provider(side if side in MODEL_PROVIDERS else preferred)
+    return next((name for name in _served(primary_key, target)
+                 if name not in (primary, fallback)), None)
+
+
+def model_chain(config: Optional[Dict[str, Any]], primary_key: str,
+                preferred: Optional[str]) -> Tuple[str, Tuple[str, ...]]:
+    """(primary, fallbacks) for one category of one profile, as `run_with_fallback` takes them.
+
+    The profile's own Primary and Fallback, or the shipped ones where it set none, then the
+    Final Fallback where `config` turns it on. An explicit NO_FALLBACK stops at the Primary,
+    Final included: it has always meant "do not retry on anything". `config` must be the
+    profile's own, or carry its `final_fallback_enabled`: a partial one reads as off.
+    """
+    config = config or {}
+    shipped = shipped_chain(primary_key, preferred)
+    primary = config.get(primary_key) or shipped[0]
+    stored = config.get(MODEL_SLOT_PAIRS[primary_key])
+    if stored and not is_real_model(stored):
+        return primary, ()
+    fallback = stored or (shipped[1] if len(shipped) > 1 else None)
+    final = (final_fallback(primary_key, primary, fallback, preferred)
+             if final_fallback_enabled(config) else None)
+    return primary, tuple(name for name in (fallback, final) if name)
 
 
 def model_slot_labels() -> Dict[str, str]:
@@ -280,6 +401,7 @@ SETTING_LABELS = {
     "speech_speed": "Speech Speed",
     "speech_language": "Speech Language",
     "show_fallback_indicator": "Fallback Indicator",
+    "final_fallback_enabled": "Final Fallback",
     "openrouter_service_tier": "OpenRouter Service Tier",
     "openrouter_endpoints": "OpenRouter Host Pins",
     "child_bot_placeholder": "Child Bot Placeholder",

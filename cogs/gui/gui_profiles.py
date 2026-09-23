@@ -18,7 +18,7 @@ from ..utils.helpers import (
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
     resolve_unreadable_media_mode,
 )
-from ..utils.user_defaults import setting_label
+from ..utils.user_defaults import final_fallback_enabled, setting_label
 from ..utils.birthdays import MONTH_NAMES, format_birthday, parse_birthday, valid_birthday
 
 if TYPE_CHECKING:
@@ -689,6 +689,10 @@ def _render_url(ctx):
     return "URL Context", _mode_display(_url_mode(ctx["config"])), True
 
 
+def _render_final_fallback(ctx):
+    return "Final Fallback", _flag(final_fallback_enabled(ctx["config"])), True
+
+
 def _render_help_mode(ctx):
     return "Help Mode (Guide RAG)", _flag(ctx["config"].get("help_mode_enabled", False)), True
 
@@ -905,6 +909,23 @@ PROFILE_ACTIONS = (
                              "ltm_model", "ltm_fallback_model",
                              "ollama_host_url", "openrouter_service_tier",
                              "openrouter_endpoints"))),
+    # Unset is off. On, every category but grounding tries one more model after its
+    # Fallback, on the provider its Primary is not on -- `user_defaults.model_chain`.
+    _Action("final_fallback", "params", "Final Fallback",
+            "After the Fallback, try once more on the other provider.",
+            _open_screen("final_fallback"), render=_render_final_fallback,
+            screen=_Screen(_Toggle("final_fallback_enabled", "Final Fallback",
+                                   read=final_fallback_enabled),
+                           note="When the Primary and the Fallback both fail, try one more model "
+                                "on the other provider: Google when the Primary is on OpenRouter, "
+                                "OpenRouter when it is on Google. Off unless turned on here. "
+                                "Grounding has none -- only Google runs its search."),
+            bulk=_Bulk(_bulk_choice("Select action...",
+                                    [("Enable Final Fallback", "true"),
+                                     ("Disable Final Fallback", "false")],
+                                    to_payload=lambda v: {"final_fallback_enabled": v == "true"}),
+                       scope="all", label="Set Final Fallback", keys=("final_fallback_enabled",),
+                       description="Turn the Final Fallback on the other provider on or off.")),
     _Action("gen_params", "params", "Set Generation Parameters & STM", "Set Temp, Top P, Top K, and STM Length.",
             _modal("ProfileParamsModal"),
             bulk=_Bulk(_bulk_modal("ProfileParamsModal"), scope="all",
@@ -967,7 +988,8 @@ PROFILE_ACTIONS = (
                      "the character is told the filename and that it cannot read the file, "
                      "instead of falling silent for the round.\n\n"
                      "`Simulated` has "
-                     f"`{clean_model_name(MEDIA_DESCRIBER_MODEL)}` read it first, or "
+                     f"`{clean_model_name(MEDIA_DESCRIBER_PAID)}` read it first -- free "
+                     "while the key's free-model quota lasts, paid after -- or "
                      f"`{clean_model_name(MEDIA_DESCRIBER_FALLBACK)}` if that one cannot, "
                      "and writes the description into this profile's prompt only -- nobody "
                      "else at the table sees it. One call per round however many "
@@ -2646,15 +2668,15 @@ class ModelPickerMixin(ReportErrorMixin):
         'response':  (("primary_model", "Primary", PRIMARY_MODEL_NAME),
                       ("fallback_model", "Fallback", FALLBACK_MODEL_NAME)),
         'image':     (("image_generation_model", "Image Generation", DEFAULT_IMAGE_MODEL),
-                      ("image_generation_fallback_model", "Image Fallback", NO_FALLBACK)),
+                      ("image_generation_fallback_model", "Image Fallback", DEFAULT_IMAGE_FALLBACK_MODEL)),
         'tts':       (("speech_model", "Text-to-Speech", DEFAULT_SPEECH_MODEL),
-                      ("speech_fallback_model", "TTS Fallback", NO_FALLBACK)),
+                      ("speech_fallback_model", "TTS Fallback", DEFAULT_SPEECH_FALLBACK_MODEL)),
         'grounding': (("grounding_rag_model", "Grounding Summariser", GROUNDING_RESEARCHER_MODEL),
-                      ("grounding_rag_fallback_model", "Grounding Fallback", NO_FALLBACK)),
-        'critic':    (("critic_model", "Anti-Repetition Critic", FALLBACK_MODEL_NAME),
-                      ("critic_fallback_model", "Critic Fallback", NO_FALLBACK)),
-        'ltm':       (("ltm_model", "LTM Summariser", FALLBACK_MODEL_NAME),
-                      ("ltm_fallback_model", "LTM Fallback", NO_FALLBACK)),
+                      ("grounding_rag_fallback_model", "Grounding Fallback", GROUNDING_RESEARCHER_FALLBACK)),
+        'critic':    (("critic_model", "Anti-Repetition Critic", UTILITY_MODEL),
+                      ("critic_fallback_model", "Critic Fallback", FALLBACK_MODEL_NAME)),
+        'ltm':       (("ltm_model", "LTM Summariser", UTILITY_MODEL),
+                      ("ltm_fallback_model", "LTM Fallback", FALLBACK_MODEL_NAME)),
     }
 
     _CATEGORY_LABELS = (

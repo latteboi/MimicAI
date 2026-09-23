@@ -219,6 +219,24 @@ VOICE_SAMPLE_TYPES = {
 PRIMARY_MODEL_NAME = 'GOOGLE/gemini-3.5-flash-lite'
 FALLBACK_MODEL_NAME = 'GOOGLE/gemini-3.1-flash-lite'
 
+#: The critic's and the LTM summariser's shipped Primary on Google, ahead of
+#: FALLBACK_MODEL_NAME: the cheaper of the two first, for passes that run unattended on
+#: every round or every few messages. Also their Final Fallback behind Ling for anyone
+#: who prefers OpenRouter -- `user_defaults` takes the first Google model a category
+#: ships. A value, not an alias, for the reason GROUNDING_RESEARCHER_MODEL gives.
+UTILITY_MODEL = 'GOOGLE/gemini-2.5-flash-lite'
+
+#: Every model category runs Primary -> Fallback -> Final Fallback: the first two on
+#: the user's preferred provider, the last on the other one, so an outage or a spent key
+#: on one provider cannot silence the category. The table ships Google; a preference for
+#: OpenRouter routes the same Gemini models through it. `user_defaults.model_chain`.
+#: Stored as `index.json["about"]["provider"]`, absent until chosen, when Google is assumed.
+MODEL_PROVIDERS = {"gemini": "Google", "openrouter": "OpenRouter"}
+
+#: Gemini ids OpenRouter does not serve under `google/`, which a chain routed there skips.
+#: Read off /api/v1/models (and ?output_modalities=speech) on 2026-09-23.
+GEMINI_NOT_ON_OPENROUTER = frozenset({'gemini-2.5-flash-preview-tts', 'gemini-2.5-pro-preview-tts'})
+
 #: A value, deliberately not an alias for FALLBACK_MODEL_NAME: it was spelled that way
 #: while the two coincided, so bumping the fallback silently moved the researcher onto a
 #: model that cannot do the one thing this slot exists for.
@@ -231,6 +249,9 @@ FALLBACK_MODEL_NAME = 'GOOGLE/gemini-3.1-flash-lite'
 #: prod_tests/grounding_metadata_probe.py is the measurement; re-run it before moving
 #: this, and read it as a pair -- one no-citation run proves nothing.
 GROUNDING_RESEARCHER_MODEL = 'GOOGLE/gemini-2.5-flash-lite'
+#: Its Fallback, measured by the same probe to ground with an instruction attached.
+#: Grounding has no Final Fallback: no other provider runs Google's search tool.
+GROUNDING_RESEARCHER_FALLBACK = 'GOOGLE/gemini-3.5-flash-lite'
 
 #: Google models measured to ignore the search tool once a system instruction is
 #: attached. Not a capability table -- a tripwire for the slot above. Entry criterion is
@@ -272,8 +293,9 @@ GOOGLE_ONLY_MODEL_KEYS = frozenset({
     'grounding_rag_model', 'grounding_rag_fallback_model',
 })
 
-#: "Do not retry on anything". Offered by the utility fallback slots alone: the response
-#: fallback is what _instantiate_model retries onto, so it must name a real model.
+#: "Do not retry on anything" -- the Final Fallback included. Offered by the utility
+#: fallback slots alone: the response fallback is what _instantiate_model retries onto, so
+#: it must name a real model. An *absent* fallback slot is the shipped one, not this.
 NO_FALLBACK = 'NONE'
 
 #: utility primary key -> its fallback key. One table so the pickers, the bulk action
@@ -685,6 +707,8 @@ IMAGE_OUTPUT_KEYS = ('image_aspect_ratio', 'image_size', 'image_thinking_level',
 #: generation call sites -- which had already drifted, one defaulting to an unprefixed
 #: id its own builder prefixed.
 DEFAULT_IMAGE_MODEL = 'GOOGLE/gemini-2.5-flash-image'
+#: The same price per image as the Primary, on OpenRouter as on Google.
+DEFAULT_IMAGE_FALLBACK_MODEL = 'GOOGLE/gemini-3.1-flash-lite-image'
 
 # One priority band for the image queue, named so the PriorityQueue ordering stays
 # explicit; ties break on enqueue timestamp (FIFO).
@@ -770,6 +794,9 @@ TTS_SYNTHESIS_PREAMBLE = (
 )
 
 DEFAULT_SPEECH_MODEL = 'GOOGLE/gemini-2.5-flash-preview-tts'
+#: Takes the same voice names, so a line that falls back still sounds like the character.
+#: The only Gemini speech model OpenRouter serves, which makes it the Final Fallback too.
+DEFAULT_SPEECH_FALLBACK_MODEL = 'GOOGLE/gemini-3.1-flash-tts-preview'
 
 #: Written into every profile created from now on rather than made the fallback, because
 #: a profile with none still reads 1.0 -- existing profiles keep sounding as they do.
@@ -853,11 +880,33 @@ UNREADABLE_MEDIA_DEFAULT = 'off'
 #: Different providers on purpose. The fallback answers when there is no OpenRouter key
 #: at all, and when the first will not describe a file the second may: it is the Google
 #: model, whose safety settings `_resolve_safety_settings` stands down in an
-#: age-restricted channel. With neither key the profile falls to `off`, which is a
-#: complete behaviour rather than an error.
-MEDIA_DESCRIBER_MODEL = 'OPENROUTER/amazon/nova-lite-v1'
+#: age-restricted channel. It is also the only one of the three that hears audio. With
+#: neither key the profile falls to `off`, which is a complete behaviour rather than an
+#: error.
+#:
+#: The free model's limits are the key owner's whole account, shared with every other
+#: `:free` model they use: 20 a minute, and 50 a day until $10 of credit has ever been
+#: bought, 1,000 after. A 429 rests it on that key (`_rest_model_on_rate_limit`), so the
+#: paid model answers at once until the rest ends rather than after a refused call.
+MEDIA_DESCRIBER_MODEL = 'OPENROUTER/inclusionai/ling-3.0-flash-vl:free'
+
+MEDIA_DESCRIBER_PAID = 'OPENROUTER/inclusionai/ling-3.0-flash-vl'
 
 MEDIA_DESCRIBER_FALLBACK = 'GOOGLE/gemini-2.5-flash-lite'
+
+#: What the critic, the LTM summariser and session compaction ship on OpenRouter: the
+#: describer's two rather than Gemini routed through it. Each reads a transcript and
+#: reports on it, and runs unattended on every long conversation. Google keeps its Gemini
+#: pair, so each still runs two on the preferred provider and one on the other.
+#: `user_defaults._served`.
+UTILITY_OPENROUTER_MODELS = (MEDIA_DESCRIBER_MODEL, MEDIA_DESCRIBER_PAID)
+
+#: Greedy, for every pass that transcribes rather than writes -- the describer, the
+#: classifier, the critic, the LTM summariser and compaction: a second character reading a cached
+#: description should read what the first one did. `top_k` twice because the OpenRouter
+#: adapter reads it only from `_advanced_params`; Google reads the top-level key.
+GREEDY_SAMPLING = {"temperature": 0.0, "top_p": 0.1, "top_k": 1,
+                   "_advanced_params": {"top_k": 1}}
 
 #: The only answer this pass treats as a failure. A model asked to describe files it was
 #: never sent invents a plausible set, and the character then discusses an image nobody
@@ -874,9 +923,10 @@ MEDIA_DESCRIBER_RESOLUTION = 'MEDIA_RESOLUTION_HIGH'
 #: regeneration moments later still finds its description.
 MEDIA_DESCRIPTION_CACHE_MAX = 64
 
-#: Standing text in someone's prompt, so capped like one: enough for a busy photograph,
-#: little enough that ten do not crowd out the conversation they arrived in.
-MEDIA_DESCRIPTION_MAX_CHARS = 2000
+#: Standing text in someone's prompt, so capped like one. Per file, because the prompt's
+#: budget is: 500 words runs about 3,000 characters, some 750 tokens -- still a third of
+#: what the image itself would have cost a model that could read it.
+MEDIA_DESCRIPTION_MAX_CHARS = 3500
 
 # The round's attachments sent with each character's turn. The newest are kept.
 ROUND_MEDIA_MAX = 10
@@ -916,21 +966,27 @@ ATTACHMENT_TAG = "[Attached {kind}: {filename}]"
 #: a character told "a moody, evocative portrait" can only repeat the adjectives back.
 #: It describes and never advises, because the output lands in a prompt the character
 #: reads, where anything phrased as an instruction would be followed.
+#:
+#: This is the whole request: one file arrives alone, several each after their name.
+#: The word budget is the detail -- at 200 words a model stopped at the subject and the
+#: setting.
 DEFAULT_MEDIA_DESCRIPTION = (
-    "You are describing an attachment for someone who cannot open it and who will have "
-    "to discuss it from your description alone.\n\n"
-    "Report what is actually there, in plain prose, under 200 words per file:\n"
-    "- Images: the subject, the setting, who or what is in it and what they are doing, "
-    "notable objects, the style (photo, screenshot, drawing, meme), and every word of "
-    "any legible text, quoted exactly.\n"
-    "- Audio: what is said, verbatim where it can be made out, plus who is speaking, "
-    "the tone, and any music or background noise.\n"
-    "- Screenshots and documents: transcribe the text. Layout only where it carries "
-    "meaning.\n\n"
-    "Describe only. Do not interpret the sender's motives, do not judge the content, do "
-    "not address the reader, and do not give instructions of any kind. If a file is "
-    "unreadable or blank, say exactly that and nothing more.\n\n"
-    "Number each file to match the order it was given in.\n\n"
+    "Describe every element of each attached file for someone who cannot open it and "
+    "will discuss it from your description alone. Use under 500 words per file, in "
+    "plain prose with no markdown formatting.\n\n"
+    "For an image, describe what it shows, who is in it and what they are doing, where "
+    "it is, and when, as far as the picture shows it: time of day, season, era. Cover "
+    "the background, notable objects, colours, expressions, clothing, and what kind of "
+    "image it is (photo, screenshot, drawing, meme). Quote every word of legible text "
+    "exactly. For a screenshot or document, transcribe the text, and describe the "
+    "layout only where it carries meaning. For audio, transcribe what is said, then who "
+    "is speaking, their tone, and any music or background noise.\n\n"
+    "Describe only what is there. Do not guess at the sender's motives, do not judge "
+    "the content, do not address the reader, and do not give instructions of any kind. "
+    "If a file is unreadable or blank, say exactly that and nothing more.\n\n"
+    "When there is more than one file, each one follows its file name. Begin each "
+    "description with that name, and keep the order the files were given in, even "
+    "where two share a name.\n\n"
     "If no file reaches you at all, reply with exactly: (no attachment)"
 )
 
@@ -1630,7 +1686,7 @@ LOG_TRIM_HIGH_WATER = 400
 #
 # OPEN widens exactly one door: `/session config` for any member, and inside it the
 # **Cast** tab alone. Not `/session swap`, which stays admin-only whatever this says;
-# not the Config, Reactivity, Proactivity or Memory tabs; and not the `session` cast
+# not the Config, Reactivity, Proactivity or Compaction tabs; and not the `session` cast
 # source, which lists other members' seated characters for removal.
 CAST_POLICY_CLOSED = "closed"
 
@@ -1808,11 +1864,8 @@ COMPACTION_CHUNK_MIN = 5
 
 COMPACTION_MAX_CHUNK_RATIO = 0.8
 
-# Cheap and fast: this runs on every session that enables it, and its output is read far
-# more often than written. The Google fallback runs where there is no OpenRouter key.
-COMPACTION_MODEL_DEFAULT = "OPENROUTER/amazon/nova-micro-v1"
-
-COMPACTION_FALLBACK_MODEL_DEFAULT = "GOOGLE/gemini-2.5-flash-lite"
+# The summariser has no defaults of its own: an unset one runs the LTM summariser's chain,
+# which is the same job -- `SessionCompactionMixin._generate_synopsis`.
 
 DEFAULT_SESSION_SYNOPSIS_PROMPT = (
     "You are a continuity editor for an ongoing roleplay scene. You will be given a "
@@ -2217,12 +2270,16 @@ DEFAULT_PROFILE_GENERATOR_PROMPT = (
 PLEASE_TRY_AGAIN_ERROR_MESSAGE = 'There was an issue with your question please try again...'
 
 WARN_FALLBACK_USED = "**Fallback Model Used**"
+WARN_FINAL_FALLBACK_USED = "**Final Fallback Model Used**"
 
 WARN_MAIN_MODEL_FAILED = "**Main Model Failed** ({reason})"
 WARN_BOTH_MODELS_FAILED = "**Main & Fallback Model Failed** ({reason})"
-#: Beside WARN_MAIN_MODEL_FAILED when the two failed for different reasons, which
-#: WARN_BOTH_MODELS_FAILED can only say one of.
+#: Every model in the chain failed alike: Main, Fallback and the Final Fallback.
+WARN_ALL_MODELS_FAILED = "**Main, Fallback & Final Fallback Model Failed** ({reason})"
+#: Beside WARN_MAIN_MODEL_FAILED when the models failed for different reasons, which the
+#: combined lines can only say one of. One line per model tried.
 WARN_FALLBACK_MODEL_FAILED = "**Fallback Model Failed** ({reason})"
+WARN_FINAL_MODEL_FAILED = "**Final Fallback Model Failed** ({reason})"
 WARN_VOICE_SYNTHESIS_FAILED = "**Text-To-Speech Failed** ({reason})"
 WARN_URL_FETCHING_FAILED = "**URL Fetching Failed** ({reason})"
 WARN_GROUNDING_FAILED = "**Grounding Failed** ({reason})"

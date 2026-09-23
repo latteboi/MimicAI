@@ -17,7 +17,7 @@ from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PA
                               paged_nav_options,
                               add_select, build_pagination_controls,
                               bulk_select_options, resolve_bulk_select)
-from ..services.generation.compaction import resolve_compaction_settings
+from ..services.generation.compaction import compaction_model_config, resolve_compaction_settings
 from ..services.generation.global_chat import build_global_chat_embed
 from ..services.generation.tool_loop import functions_for
 
@@ -1071,8 +1071,8 @@ class CompactionSettingsModal(ui.Modal, title="Rolling Synopsis"):
     threshold_input = ui.TextInput(label=f"Compact after N turns ({COMPACTION_THRESHOLD_MIN}-{COMPACTION_THRESHOLD_MAX})", placeholder=f"Default: {COMPACTION_THRESHOLD_DEFAULT}", required=True, max_length=3)
     chunk_input = ui.TextInput(label="Turns to fold each time", placeholder=f"Default: {COMPACTION_CHUNK_DEFAULT}", required=True, max_length=3)
     length_input = ui.TextInput(label=f"Synopsis length in words ({COMPACTION_SYNOPSIS_WORDS_MIN}-{COMPACTION_SYNOPSIS_WORDS_MAX})", placeholder=f"Default: {COMPACTION_SYNOPSIS_WORDS_DEFAULT}", required=False, max_length=3)
-    model_input = ui.TextInput(label="Summariser Model", placeholder=f"Default: {COMPACTION_MODEL_DEFAULT}", required=False, max_length=100)
-    fallback_input = ui.TextInput(label="Fallback Model", placeholder=f"Default: {COMPACTION_FALLBACK_MODEL_DEFAULT}", required=False, max_length=100)
+    model_input = ui.TextInput(label="Summariser Model", required=False, max_length=100)
+    fallback_input = ui.TextInput(label="Fallback Model", required=False, max_length=100)
 
     def __init__(self, view: 'SessionConfigView'):
         super().__init__()
@@ -1083,8 +1083,14 @@ class CompactionSettingsModal(ui.Modal, title="Rolling Synopsis"):
         # Blank until a length is chosen, so an unset one keeps following the default.
         if "max_words" in (view.session.get("compaction") or {}):
             self.length_input.default = str(cfg["max_words"])
-        self.model_input.default = cfg["model"]
-        self.fallback_input.default = cfg["fallback_model"]
+        # Blank until chosen, like the length, and the placeholder names what blank runs:
+        # the LTM summariser's chain under the session owner's provider preference.
+        own = compaction_model_config(view.session)
+        self.model_input.default = own["ltm_model"]
+        self.fallback_input.default = own["ltm_fallback_model"]
+        primary, fallbacks = view.cog.api_service.model_chain({}, "ltm_model", view.session.get("owner_id"))
+        self.model_input.placeholder = f"Blank: {primary}"[:100]
+        self.fallback_input.placeholder = f"Blank: {fallbacks[0] if fallbacks else 'none'}"[:100]
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -1105,13 +1111,10 @@ class CompactionSettingsModal(ui.Modal, title="Rolling Synopsis"):
         # Unprefixed ids default to Google, matching the Director model field. Both
         # providers are valid here -- unlike image, speech and grounding, summarisation
         # is an ordinary text slot.
-        for field, key, default in (
-            (self.model_input, "model", COMPACTION_MODEL_DEFAULT),
-            (self.fallback_input, "fallback_model", COMPACTION_FALLBACK_MODEL_DEFAULT),
-        ):
+        for field, key in ((self.model_input, "model"), (self.fallback_input, "fallback_model")):
             raw = field.value.strip()
             if not raw:
-                cfg[key] = default
+                cfg.pop(key, None)
             elif raw.upper().startswith(("GOOGLE/", "OPENROUTER/", "OLLAMA/")):
                 cfg[key] = raw
             else:
@@ -1578,7 +1581,7 @@ class SessionConfigView(BlockedGuard, ui.View):
     #: Tabs a non-administrator may open when Open casting let them in here. Casting is
     #: the whole of what Open casting grants: a member seats and unseats characters, and
     #: everything else on this card -- the master prompt, TTS, reactivity, proactivity,
-    #: the memory and the session's own access policy -- is the channel's configuration
+    #: compaction and the session's own access policy -- is the channel's configuration
     #: and stays the administrators'.
     MEMBER_TABS = ("cast",)
 
@@ -1590,7 +1593,7 @@ class SessionConfigView(BlockedGuard, ui.View):
         setting somebody can change for them. It is the same choice `/start` makes for
         the steps it cannot run.
         """
-        tabs = ["cast", "config", "reactivity", "proactivity", "memory"]
+        tabs = ["cast", "config", "reactivity", "proactivity", "compaction"]
         is_admin = self._viewer_is_admin()
         for tab in tabs:
             locked = not is_admin and tab not in self.MEMBER_TABS
@@ -1647,7 +1650,7 @@ class SessionConfigView(BlockedGuard, ui.View):
             "config": self._render_config,
             "reactivity": self._render_reactivity,
             "proactivity": self._render_proactivity,
-            "memory": self._render_memory,
+            "compaction": self._render_compaction,
         }.get(self.current_tab)
         if renderer:
             renderer(embed)
@@ -2100,7 +2103,7 @@ class SessionConfigView(BlockedGuard, ui.View):
             on_off_style=True)
         self._add_modal_button("Edit Settings & AI Director", ProactivitySettingsModal)
 
-    def _render_memory(self, embed: discord.Embed):
+    def _render_compaction(self, embed: discord.Embed):
         """The rolling synopsis: how a long scene is folded down."""
         cfg = resolve_compaction_settings(self.session)
         enabled = cfg["enabled"]
@@ -2115,9 +2118,12 @@ class SessionConfigView(BlockedGuard, ui.View):
         embed.add_field(name="Trigger", value=f"Every `{cfg['threshold']}` turns", inline=True)
         embed.add_field(name="Fold Size", value=f"`{cfg['chunk']}` turns", inline=True)
         embed.add_field(name="Length", value=f"About `{cfg['max_words']}` words", inline=True)
+        primary, fallbacks = self.cog.api_service.model_chain(
+            compaction_model_config(self.session), "ltm_model", self.session.get("owner_id"))
         embed.add_field(
             name="Summariser",
-            value=f"`{cfg['model']}`\nFallback: `{cfg['fallback_model']}`",
+            value=f"`{primary}`" + ("\nFallbacks: " + " \u2192 ".join(f"`{m}`" for m in fallbacks)
+                                    if fallbacks else ""),
             inline=False,
         )
 

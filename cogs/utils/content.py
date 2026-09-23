@@ -59,7 +59,14 @@ HELP_CATEGORIES = {
             "to hosts that do not train on prompts, and a model no "
             "such host is known to serve is offered to the bot's owner alone. A server's administrators cannot change any of "
             "this; only the bot's owner can, one server at a time, from `/privacy`. Paid tier also escapes the rate limits that "
-            "throttle long-term memory, grounding and the content classifier, and image generation is blocked on free keys entirely."
+            "throttle long-term memory, grounding and the content classifier, and image generation is blocked on free keys entirely.\n\n"
+            "**Preferred provider** (`/start`, or `/settings` -> About Me): every model a character uses runs Primary -> Fallback on "
+            "this provider. A profile with its **Final Fallback** turned on (`/profile manage` -> Params, off unless you turn it on) "
+            "then tries once more on the other, so an outage or a spent key on one does not silence it. "
+            "New profiles start on it; holding a key for only the other provider overrides it for them. Both run the same Gemini "
+            "models, except that OpenRouter reads transcripts -- long-term memories, session compaction and the critic -- with Ling, the "
+            "attachment describer's model, free while your free quota lasts. Grounding is the exception: only Google runs "
+            "the search tool, so it has no Final Fallback."
         ),
         "Profile Classes (PIDs)": (
             "Every profile has an immutable 16-character **Profile ID**. Its first letter records the class:\n\n"
@@ -125,6 +132,10 @@ HELP_CATEGORIES = {
             "**Fallback** is not optional infrastructure you can ignore. If the primary request fails -- rate limit, timeout, safety block -- "
             "the payload is immediately re-sent to the fallback. Choose something cheap and fast; a profile with a good fallback stays alive "
             "through an outage that would otherwise silence it.\n\n"
+            "**Final Fallback** comes after both, on the provider your primary is not on, and is off unless you turn it on at "
+            "`/profile manage` -> Params -> Final Fallback. Its model is not chosen: it is the category's shipped model there. Every "
+            "category has one -- replies, image, TTS, critic, LTM -- except grounding. The profile dashboard's Models line shows it "
+            "when it is on. Setting a utility slot's fallback to *None* turns off the Final for that category as well.\n\n"
             "**Thinking** opens from the same screen, on whichever slot the category dropdown is showing -- choosing a model and choosing "
             "how hard it thinks are one decision. See *Thinking and Reasoning* below."
         ),
@@ -265,7 +276,7 @@ HELP_CATEGORIES = {
             "session -- it simply has nobody to answer.\n\n"
             "**Config** sets how the round runs: **Toggle Execution** switches between sequential and random turn order, **Edit Master Prompt** "
             "sets the scene every participant sees, **Set Response Limit** caps replies per round, and **Toggle TTS** turns on audio.\n\n"
-            "**Memory** holds the Rolling Synopsis: once a conversation reaches 50 public turns, the oldest 25 are folded into a running "
+            "**Compaction** holds the Rolling Synopsis: once a conversation reaches 50 public turns, the oldest 25 are folded into a running "
             "synopsis the whole cast is given, so a long scene keeps its thread. New sessions start with it on. **Edit Settings** sets when "
             "it folds and how long the synopsis is (100-800 words), and turning it off puts the folded turns back.\n\n"
             "`/session swap` changes the cast live without interrupting the conversation, including into a specific slot. In an empty channel it also starts the session outright -- naming the first profile is the fastest way in. Naming a profile "
@@ -397,7 +408,8 @@ HELP_CATEGORIES = {
             "neither can, the attachment is left out and the character is told the filename and that it cannot read it -- it replies to "
             "what you wrote rather than falling silent for the round, and a note under the reply says the attachment was not read.\n\n"
             "**Simulated vision** (`/profile manage` -> **Params** -> Unreadable Attachments) changes what it is told. On `Simulated`, a "
-            "cheap model reads the file first -- Amazon Nova Lite on OpenRouter, falling back to Gemini 2.5 Flash Lite -- and its "
+            "cheap model reads the file first -- Ling 3.0 Flash VL on OpenRouter, free while your free-model quota lasts and paid after, "
+            "falling back to Gemini 2.5 Flash Lite, which also hears audio -- and its "
             "description goes into that profile's prompt only, so a text-only character can still discuss the picture while nobody else at "
             "the table sees the description. One call per round however many characters need it. With a key for neither provider it "
             "behaves as `Off`."
@@ -607,6 +619,17 @@ WIZARD_COPY = {
         "Keys are entered in a DM. Paste the key into a slot, then point it at **Personal** and at "
         "any server you run — **an unassigned key does nothing.**"
     ),
+    "provider": (
+        "Which provider your characters' models run on first. Both reach the same Gemini models, except for "
+        "the passes that read a transcript: long-term memories, session compaction and the "
+        "anti-repetition critic run on Ling through OpenRouter.\n\n"
+        "Every model a character uses -- replies, images, voice, memory -- runs **Primary → Fallback** on "
+        "the provider you pick. Turn on a profile's **Final Fallback** (`/profile manage` → Params) and it "
+        "tries once more on the other one, so an outage or a key that runs dry there does not silence it.\n\n"
+        "New profiles start on it, and so do drafts from **Generate**. A model you pick yourself stays "
+        "picked. If you only hold a key for the other provider, new profiles use that one until you add "
+        "a key. Change it any time in `/settings` → About Me."
+    ),
     "profile": (
         "A **profile** is one character: a persona, a set of instructions, a model, and its own memory. "
         "Profiles belong to you, not to a server, so they follow you everywhere.\n\n"
@@ -703,15 +726,15 @@ DEFAULT_HELP_DOCS = {
     # --- GETTING STARTED ---
     "start/setup_wizard.txt": (
         "Command: `/start` opens a guided setup wizard. It is the first thing a new user should run.\n"
-        "Concept: Five steps -- connect an API key, get a character, give it a voice, seat it in a channel, say something to it. The wizard checks which are already done every time it is opened, so it can be closed and reopened freely and always resumes correctly. No progress is stored anywhere.\n"
+        "Concept: Six steps -- connect an API key, choose a provider, get a character, give it a voice, seat it in a channel, say something to it. The wizard checks which are already done every time it is opened, so it can be closed and reopened freely and always resumes correctly. No progress is stored anywhere.\n"
         "Context awareness: The wizard states where you are and what you can do there. API keys can only be entered in a DM. Seating a character in a channel requires server administrator permission. Steps that cannot be done from where you ran it are shown greyed out with the reason rather than hidden.\n"
-        "Non-administrators: You can complete steps 1-3 anywhere and build characters freely, but only an administrator can seat them in a channel. Profiles belong to you rather than to a server, so the fastest way to test your own is to create your own server -- you are its administrator -- and add the bot with `/invite`.\n"
+        "Non-administrators: You can complete steps 1-4 anywhere and build characters freely, but only an administrator can seat them in a channel. Profiles belong to you rather than to a server, so the fastest way to test your own is to create your own server -- you are its administrator -- and add the bot with `/invite`.\n"
         "Second track: A 'Using it' section covers talking to characters, `/whisper`, memory commands, images and voice, and what to do when something is wrong. These are not setup steps and have no completion state.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I do not know where to begin.' Fix: Run `/start`.\n"
         "- Symptom: 'Which API key should I get first?' or 'Do I have to pay to use this?' Fix: OpenRouter. One key reaches a few hundred models and some of them are free to run (Ling 3.0 Flash Fin, DeepSeek V4 0731, and OpenRouter's Free Models Router), and only models some host is known to serve without training on prompts are offered. Add a paid Google Gemini key afterwards for speech, native web grounding and Gemini's image models.\n"
         "- Symptom: 'The wizard says step 1 cannot be done here.' Fix: API keys are DM-only. Press 'Send me the DM version', then run `/start` in that DM.\n"
-        "- Symptom: 'Step 4 is locked.' Fix: Seating a cast needs server administrator permission. Ask an admin to run `/session config`, or make your own server to test in.\n"
+        "- Symptom: 'Step 5 is locked.' Fix: Seating a cast needs server administrator permission. Ask an admin to run `/session config`, or make your own server to test in.\n"
         "- Symptom: 'I finished a step but the wizard still shows it undone.' Fix: Press Refresh. The wizard reads live state and only re-reads it when asked.\n"
         "- Symptom: 'The wizard stopped responding to clicks.' Fix: It times out after fifteen minutes. Run `/start` again; it resumes exactly where you were because nothing was stored.\n"
         "- Symptom: 'The bot says an API key was not found.' Fix: Either no key is set, or a key was saved but never assigned. Run `/start`, which checks assignment rather than just presence.\n"
@@ -891,11 +914,11 @@ DEFAULT_HELP_DOCS = {
         "- 404 (Model Not Found): The selected model has been deprecated or renamed by the provider.\n"
         "- 413 (File Too Large): An attachment exceeded what the provider accepts.\n"
         "- Empty Response: The model returned no text, most often a silent safety block.\n"
-        "Failover Protocol: When a request fails, the bot temporarily marks the key as cooling down and immediately redirects the payload to your designated Fallback Model. Setting a cheap, reliable fallback at `/profile manage` -> Params -> Set Models is what keeps a profile alive through an outage.\n"
+        "Failover Protocol: When a request fails, the bot temporarily marks the key as cooling down and immediately redirects the payload to your designated Fallback Model, then -- if the profile has it turned on at Params -> Final Fallback -- to the Final Fallback on the other provider. Setting a cheap, reliable fallback at `/profile manage` -> Params -> Set Models is what keeps a profile alive through an outage.\n"
         "Stalls: A primary model that has not answered in three times its usual time (at least 45 seconds, at most 3 minutes; 90 seconds for a model the bot has not timed yet) has the Fallback Model started beside it. Whichever answers first is posted and the other is cancelled, so a hung host costs a minute or two rather than four. Both requests may be billed.\n"
         "Custom wording: `/profile manage` -> Misc -> Custom Error Message sets what users see when generation fails.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'The bot keeps replying with my error message.' Fix: Both the primary and fallback models failed. Check the key is valid and has quota, and that the model names are current."
+        "- Symptom: 'The bot keeps replying with my error message.' Fix: The primary and the fallback failed, and so did the Final Fallback if the profile has it on (it is skipped when nobody holds a key for its provider). Check the key is valid and has quota, and that the model names are current."
     ),
 
     # --- SESSIONS ---
@@ -909,7 +932,7 @@ DEFAULT_HELP_DOCS = {
         "Response Limit: Caps how many profiles reply in a single round, so a large cast does not answer every message all at once.\n"
         "Seating versus starting: choosing a profile on the Cast tab seats it immediately -- it appears on the Reactivity tab and can have its chance and wakewords set straight away, with no button press in between. It does not make the channel live. Until 'Start / Update Session' is pressed the session is a draft: the footer reads 'Draft', ordinary messages pass through untouched and the AI Director stays quiet. The button, on every tab, starts it -- saving the configuration, loading the transcript, and telling every child bot in the cast which channel it is in. Pressing it again on a live session re-saves and re-announces.\n"
         "An empty cast is allowed. A started session with nobody in it keeps its transcript, Master Prompt and settings and simply has no one to answer, which is what 'Clear Cast' leaves behind. `/suspend` is what ends a session outright.\n"
-        "Rolling Synopsis (Memory tab): once a conversation reaches 50 public turns, the oldest 25 are folded into one running synopsis that every participant is given with each reply, so a long scene keeps its thread after it scrolls out of Short-Term Memory. Sessions created now start with it on; a session made before keeps what it had. 'Edit Settings' sets when it folds, how many turns go each time, the synopsis length (100-800 words, 220 by default) and the summariser. Turning it off puts the folded turns back into the prompt and stops sending the synopsis. Whispers are never summarised, and a folded turn is only left out of the prompt -- the transcript, regeneration and `/session audit` still have it.\n"
+        "Rolling Synopsis (Compaction tab): once a conversation reaches 50 public turns, the oldest 25 are folded into one running synopsis that every participant is given with each reply, so a long scene keeps its thread after it scrolls out of Short-Term Memory. Sessions created now start with it on; a session made before keeps what it had. 'Edit Settings' sets when it folds, how many turns go each time, the synopsis length (100-800 words, 220 by default) and the summariser -- left blank, it runs the same models as the LTM Summariser. Turning it off puts the folded turns back into the prompt and stops sending the synopsis. Whispers are never summarised, and a folded turn is only left out of the prompt -- the transcript, regeneration and `/session audit` still have it.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I configured a session but nothing happens.' Fix: Press 'Start / Update Session'. Seating a cast does not start it -- check the footer, which reads 'Draft' until you do.\n"
         "- Symptom: 'A child bot is in the cast but ignores the channel.' Fix: Press 'Start / Update Session'. It re-announces the channel to every child bot in the cast, which a restored session does not do on its own.\n"
@@ -918,7 +941,7 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'My characters post under the bot's own name and avatar.' Fix: The bot needs Manage Webhooks in that channel; without it there is no way to give a character its own name and face. If it has the permission and someone deleted the webhook, it now notices and makes a new one on the next message rather than falling back forever. A character with no Appearance set still speaks under its own name, with one of Discord's default avatars.\n"
         "- Symptom: 'A character's avatar vanished a day after I set it.' Fix: Discord attachment links (an image uploaded to Discord, then 'Copy Link') expire after about a day. The bot now hands Discord the link without its expiry, so Discord keeps it working, as long as the message the image was posted in still exists. Links from other image hosts are unaffected.\n"
         "- Symptom: 'Only some of my cast replies each round.' Fix: That is the Response Limit. Raise it in the Config tab.\n"
-        "- Symptom: 'A long session forgot what happened early on.' Fix: Turn the Rolling Synopsis on in the Memory tab, or give it more words in Edit Settings. A profile with a short Short-Term Memory can still miss turns too recent to have been folded yet."
+        "- Symptom: 'A long session forgot what happened early on.' Fix: Turn the Rolling Synopsis on in the Compaction tab, or give it more words in Edit Settings. A profile with a short Short-Term Memory can still miss turns too recent to have been folded yet."
     ),
     "sessions/session_swap.txt": (
         "Command: `/session swap [profile_name] [use_child_bot] [slot]`\n"

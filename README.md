@@ -37,46 +37,46 @@ rest with a key only your instance holds.
 **Web search, in character.** Each character searches when a reply needs something current,
 and cites its sources under the message.
 
-<img width="1252" height="385" alt="01-web-search" src="https://github.com/user-attachments/assets/e64ed8e0-d60b-4a06-9e3a-0a213687764d" />
+<!-- SCREENSHOT 1: 01-web-search.png -->
 
 **A cast in one channel.** `/session config` seats a child bot and two webhook profiles —
 then they argue.
 
-<img width="1270" height="848" alt="02-cast" src="https://github.com/user-attachments/assets/dea317d0-8c6a-4f71-b1bd-6da23ed5f944" />
+<!-- SCREENSHOT 2: 02-cast.png -->
 
 **Memory past a reset.** `/refresh` clears the channel's conversation; what the character
 remembers long-term survives it.
 
-<img width="1035" height="331" alt="03-memory" src="https://github.com/user-attachments/assets/6f639fb1-8d10-423b-a4fb-07239b14d852" />
+<!-- SCREENSHOT 3: 03-memory.png -->
 
 **Images and whispers.** `!imagine` draws, and the character comments on its own picture. A
 `/whisper` to another participant stays between the two of you.
 
-<img width="1262" height="781" alt="04-images-and-whispers" src="https://github.com/user-attachments/assets/d63a0ddb-2cb3-40ab-af9c-922c7c389712" />
+<!-- SCREENSHOT 4: 04-images-and-whispers.png -->
 
 **A voice.** With text-to-speech on for the session, replies arrive with an audio clip.
 
-<img width="1281" height="806" alt="05-voice" src="https://github.com/user-attachments/assets/41bfef9f-07f3-415e-be74-152d9cbd61e4" />
+<!-- SCREENSHOT 5: 05-voice.png -->
 
 **Getting started.** The greeting on joining a server, and `/start`'s live checklist.
 
-<img width="972" height="609" alt="06-getting-started" src="https://github.com/user-attachments/assets/4fe9b6fb-f4c9-4baa-8db5-6cd74ee4486c" />
+<!-- SCREENSHOT 6: 06-getting-started.png -->
 
 **Thinking, shown.** With Thought Summary on, each reply carries the model's reasoning as an
 attached file.
 
-<img width="969" height="784" alt="07-thinking-and-reasoning" src="https://github.com/user-attachments/assets/235ae4d6-7ac2-4f91-b537-30ac1e4a5a39" />
+<!-- SCREENSHOT 7: 07-thinking-and-reasoning.png -->
 
 **A follow-up, and its trace.** Left hanging, a character with Proactivity on keeps talking.
 **View Generation Trace** on any reply shows its model, cost, recalled memories and the
 neuro engine's four levels at that moment.
 
-<img width="1272" height="884" alt="08-follow_up-generation_trace-and-neuro_engine" src="https://github.com/user-attachments/assets/ab0a86da-e9c7-40eb-909a-27fb40d39317" />
+<!-- SCREENSHOT 8: 08-follow_up-generation_trace-and-neuro_engine.png -->
 
 **A table game.** `/play eights` deals the cast into Mimic Eights; each character plays its
 own hand, and the table reacts when someone wins.
 
-<img width="1256" height="563" alt="09-mimic_eights" src="https://github.com/user-attachments/assets/0bf810ea-1571-4f18-a720-12940c9f0504" />
+<!-- SCREENSHOT 9: 09-mimic_eights.png -->
 
 ---
 

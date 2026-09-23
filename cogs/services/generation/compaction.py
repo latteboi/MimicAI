@@ -3,15 +3,35 @@ import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from ...utils.constants import (
-    COMPACTION_CHUNK_DEFAULT, COMPACTION_CHUNK_MIN, COMPACTION_FALLBACK_MODEL_DEFAULT,
-    COMPACTION_MAX_CHUNK_RATIO, COMPACTION_MODEL_DEFAULT, COMPACTION_SYNOPSIS_WORDS_DEFAULT,
-    COMPACTION_SYNOPSIS_WORDS_MAX, COMPACTION_SYNOPSIS_WORDS_MIN,
-    COMPACTION_THRESHOLD_DEFAULT, COMPACTION_THRESHOLD_MAX, COMPACTION_THRESHOLD_MIN,
-    DEFAULT_SESSION_SYNOPSIS_PROMPT, DEFAULT_SESSION_SYNOPSIS_USER_PROMPT,
-    SESSION_BUSY_FLAGS,
+    COMPACTION_CHUNK_DEFAULT, COMPACTION_CHUNK_MIN, COMPACTION_MAX_CHUNK_RATIO,
+    COMPACTION_SYNOPSIS_WORDS_DEFAULT, COMPACTION_SYNOPSIS_WORDS_MAX,
+    COMPACTION_SYNOPSIS_WORDS_MIN, COMPACTION_THRESHOLD_DEFAULT, COMPACTION_THRESHOLD_MAX,
+    COMPACTION_THRESHOLD_MIN, DEFAULT_SESSION_SYNOPSIS_PROMPT,
+    DEFAULT_SESSION_SYNOPSIS_USER_PROMPT, GREEDY_SAMPLING, SESSION_BUSY_FLAGS,
 )
 from ...utils.helpers import resolve_thinking_params
 from ...managers.session_manager import SessionManager, intern_turn
+
+#: What the settings modal wrote into every session it saved, typed or not: the shipped
+#: pair of the day, seeded rather than resolved. Read as unset, so those sessions follow
+#: the shipped chain like the rest instead of staying on nova-micro for good.
+_SEEDED_MODELS = {"model": "OPENROUTER/amazon/nova-micro-v1",
+                  "fallback_model": "GOOGLE/gemini-2.5-flash-lite"}
+
+
+def compaction_model_config(session: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """The session's own summariser choice as LTM slots, None where it made none.
+
+    Compaction is the LTM summariser's job on a whole scene, so it runs that category's
+    chain -- `model_chain(this, "ltm_model", ...)` -- under the session owner's preference.
+    With its Final Fallback always: it is billed to the server's key, which may hold
+    either provider, and there is no profile to hang the switch on.
+    """
+    raw = session.get("compaction") or {}
+    chosen = {key: (str(raw.get(key) or "").strip() or None) for key in _SEEDED_MODELS}
+    return {**{slot: None if chosen[key] == _SEEDED_MODELS[key] else chosen[key]
+               for key, slot in (("model", "ltm_model"), ("fallback_model", "ltm_fallback_model"))},
+            "final_fallback_enabled": True}
 
 
 def resolve_compaction_settings(session: Dict[str, Any]) -> Dict[str, Any]:
@@ -48,16 +68,11 @@ def resolve_compaction_settings(session: Dict[str, Any]) -> Dict[str, Any]:
         words = COMPACTION_SYNOPSIS_WORDS_DEFAULT
     words = max(COMPACTION_SYNOPSIS_WORDS_MIN, min(COMPACTION_SYNOPSIS_WORDS_MAX, words))
 
-    model = (raw.get("model") or COMPACTION_MODEL_DEFAULT).strip() or COMPACTION_MODEL_DEFAULT
-    fallback = (raw.get("fallback_model") or COMPACTION_FALLBACK_MODEL_DEFAULT).strip()
-
     return {
         "enabled": SessionManager.compaction_enabled(session),
         "threshold": threshold,
         "chunk": chunk,
         "max_words": words,
-        "model": model,
-        "fallback_model": fallback or COMPACTION_FALLBACK_MODEL_DEFAULT,
     }
 
 
@@ -231,12 +246,13 @@ class SessionCompactionMixin:
                 config_owner_id=session.get("owner_id"),
                 thinking_params=resolve_thinking_params(None, "utility"))
             return await model.generate_content_async(
-                [user_prompt], generation_config={"temperature": 0.2, "top_p": 0.95})
+                [user_prompt], generation_config=dict(GREEDY_SAMPLING))
 
         try:
             resp, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                settings["model"], settings["fallback_model"], _attempt,
-                label="Session synopsis")
+                *self.cog.api_service.model_chain(
+                    compaction_model_config(session), "ltm_model", session.get("owner_id")),
+                _attempt, label="Session synopsis")
         except Exception as e:
             print(f"[Compaction] Synopsis generation failed for channel {channel_id}: {e}")
             return None

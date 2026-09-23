@@ -6,7 +6,7 @@ import discord
 from typing import List, Dict, Any, Optional, Tuple
 
 from ..utils.constants import (
-    FALLBACK_MODEL_NAME, GROUNDING_RESEARCHER_MODEL,
+    GREEDY_SAMPLING, GROUNDING_RESEARCHER_FALLBACK, GROUNDING_RESEARCHER_MODEL,
     MAX_GROUNDING_SUMMARY_CHARACTERS, MAX_URL_CONTEXT_CHARACTERS,
     MAX_URL_FETCH_BYTES, WARN_URL_FETCHING_FAILED,
     WARN_GROUNDING_FAILED, DEFAULT_WEB_GROUNDING_VISUAL,
@@ -72,7 +72,8 @@ def grounding_models(p_cfg: Optional[Dict[str, Any]]) -> Tuple[str, Optional[str
     """
     p_cfg = p_cfg or {}
     raw_primary = p_cfg.get("grounding_rag_model", GROUNDING_RESEARCHER_MODEL)
-    raw_fallback = p_cfg.get("grounding_rag_fallback_model")
+    # Absent is the shipped Fallback. No Final: nothing but Google runs the search tool.
+    raw_fallback = p_cfg.get("grounding_rag_fallback_model") or GROUNDING_RESEARCHER_FALLBACK
     primary = _resolve_google_name(raw_primary)
     fallback = _resolve_google_name(raw_fallback) if is_real_model(raw_fallback) else None
     for raw, resolved, slot in ((raw_primary, primary, "primary"),
@@ -237,10 +238,11 @@ class ToolsService:
         except (KeyError, IndexError, ValueError):
             system_instruction = instructions
 
-        critic_model_raw = p_config.get("critic_model") or FALLBACK_MODEL_NAME
+        critic_model_raw, critic_fallbacks = self.cog.api_service.model_chain(
+            p_config, "critic_model", config_owner_id)
 
         try:
-            critic_cfg = {"temperature": 0.1, "top_p": 0.95}
+            critic_cfg = dict(GREEDY_SAMPLING)
 
             async def _attempt(model_name, is_fallback):
                 # Resolved inside the attempt so the retry gets the fallback slot's own
@@ -254,7 +256,7 @@ class ToolsService:
                     [f"Transcript:\n{transcript}"], generation_config=critic_cfg)
 
             resp, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                critic_model_raw, p_config.get("critic_fallback_model"), _attempt,
+                critic_model_raw, critic_fallbacks, _attempt,
                 label="Anti-repetition critic")
 
             if resp.text:

@@ -43,15 +43,16 @@ _STATIC_DASHBOARDS = [
         [
             ("Overview", [
                 "A context banner: where you are, your role there, whether that server has a key",
-                "A five-step checklist, probed live: key, character, voice, seat, speak",
+                "A six-step checklist, probed live: key, provider, character, voice, seat, speak",
                 "Steps that cannot be done from here are greyed with the reason, not hidden",
             ]),
             ("Step screens", [
                 "Step 1 Connect an API key (DM only; in a server, offers to DM you instead)",
-                "Step 2 Get a character: Browse Library, Generate one, or Blank",
-                "Step 3 Give it a voice: opens the profile dashboard",
-                "Step 4 Seat it in this channel: opens the cast editor (administrators)",
-                "Step 5 Say something to it: no button; just talk in the channel",
+                "Step 2 Choose a provider: Google or OpenRouter (changed later in /settings -> About Me)",
+                "Step 3 Get a character: Browse Library, Generate one, or Blank",
+                "Step 4 Give it a voice: opens the profile dashboard",
+                "Step 5 Seat it in this channel: opens the cast editor (administrators)",
+                "Step 6 Say something to it: no button; just talk in the channel",
                 "Read more on any step opens /guide at that step's page",
             ]),
             ("Using it", [
@@ -72,6 +73,8 @@ _STATIC_DASHBOARDS = [
             ]),
             ("About Me", [
                 "The user's own timezone and birthday, not a character's",
+                "Preferred provider: Google or OpenRouter, where every model runs Primary -> "
+                "Fallback, then the Final Fallback on the other where a profile turns it on",
             ]),
             ("Defaults", [
                 "Standing preferences applied to profiles created or borrowed LATER",
