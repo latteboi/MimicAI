@@ -41,28 +41,27 @@ _STATIC_DASHBOARDS = [
     (
         "`/start` (the guided setup wizard; works in a DM or a server)",
         [
-            ("Overview", [
+            ("Setup", [
                 "A context banner: where you are, your role there, whether that server has a key",
-                "A six-step checklist, probed live: key, provider, character, voice, seat, speak",
+                "A five-step checklist, probed live: provider, key, character, seat, speak",
+                "Under it, the current step's text and buttons; a dropdown jumps to any step",
                 "Steps that cannot be done from here are greyed with the reason, not hidden",
+                "Step 1 Choose a provider: OpenRouter (recommended) or Google (paid key)",
+                "Step 2 Add your API key: Get a key (link), Paste key (made your Personal key); "
+                "servers you administer, ticked in a paged dropdown and saved as ticked",
+                "Step 3 Get a character: Browse Library or Generate one",
+                "Step 4 Seat it in this channel: opens the cast editor (administrators, or Open casting)",
+                "Step 5 Say something to it: no button; just talk in the channel",
+                "Refresh re-probes; Guide opens /guide at the current step's page",
             ]),
-            ("Step screens", [
-                "Step 1 Connect an API key (DM only; in a server, offers to DM you instead)",
-                "Step 2 Choose a provider: Google or OpenRouter (changed later in /settings -> About Me)",
-                "Step 3 Get a character: Browse Library, Generate one, or Blank",
-                "Step 4 Give it a voice: opens the profile dashboard",
-                "Step 5 Seat it in this channel: opens the cast editor (administrators)",
-                "Step 6 Say something to it: no button; just talk in the channel",
-                "Read more on any step opens /guide at that step's page",
-            ]),
-            ("Using it", [
+            ("Using it (once setup is done)", [
                 "Just talk to it; Other ways to talk; Memory; Pictures and voice; "
                 "When something is wrong",
             ]),
         ],
     ),
     (
-        "`/settings` (DM only)",
+        "`/settings` (anywhere; answers only you)",
         [
             ("Home", ["Integration summary: key slots, child bots, server assignments"]),
             ("API Keys", [

@@ -351,10 +351,10 @@ GEMINI_FREE_TIER_BLOCKED = (
 )
 
 #: How a server gets a key, as it actually works: only an administrator of that server
-#: can assign one, keys are entered only in a DM, and a key saved but never assigned to
-#: the server -- or assigned without Save Assignments -- reaches nothing.
+#: can assign one, and a key saved but never assigned to the server -- or assigned
+#: without Save Assignments -- reaches nothing.
 _SERVER_KEY_HOW = (
-    "A server administrator can assign one from my DMs: run `/settings`, open **API Keys**, "
+    "A server administrator can assign one: run `/settings`, open **API Keys**, "
     "submit an OpenRouter key or a billing-enabled Google Gemini key, choose "
     "**Server: {server}** under *Assign this key to...*, and press **Save Assignments**."
 )

@@ -56,12 +56,16 @@ class OllamaHostModal(ui.Modal, title="Set Ollama Host URL"):
 class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
     key_input = ui.TextInput(label="API Key", placeholder="Paste your API key here...", required=True)
 
-    def __init__(self, cog: 'MimicCog', slot_id: str, provider: str, view: Optional[ui.View] = None):
+    def __init__(self, cog: 'MimicCog', slot_id: str, provider: str, view: Optional[ui.View] = None,
+                 assign_personal: bool = False):
         super().__init__()
         self.cog = cog
         self.slot_id = slot_id
         self.provider = provider
         self.view = view
+        # `/start` pastes a key to make it work, and a key nothing points at does
+        # nothing; `/settings` leaves where it goes to the dropdown.
+        self.assign_personal = assign_personal
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -92,6 +96,8 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
             "provider": self.provider,
             "tier": tier
         }
+        if self.assign_personal:
+            user_data.setdefault("personal_assignments", {})[self.provider] = self.slot_id
         self.cog.storage_manager._save_user_keys_data(interaction.user.id, user_data)
         
         self.cog.decrypted_key_cache[(interaction.user.id, self.slot_id)] = raw_key
@@ -102,59 +108,39 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
         # repair on the next hourly pass.
 
         msg = f"✅ {self.provider.title()} key saved to slot `{self.slot_id}` ({tier.title()} Tier)."
+        if self.assign_personal:
+            msg += "\nIt is now your **Personal** key."
         if self.provider == "gemini" and not is_paid_gemini_slot({"tier": tier}):
             msg += "\nGoogle may train on what a free-tier key is sent, so it is not used in servers or Global Chat."
 
         if self.view:
-            self.view.setup_items()
-            await self.view.update_display()
-            
+            await self.view._repaint()
+
         await interaction.followup.send(msg, ephemeral=True)
 
 class OverrideConfirmView(BlockedGuard, ui.View):
-    def __init__(self, cog: 'MimicCog', user_id: int, slot_id: str, provider: str, new_scopes: List[str], parent_view: ui.View):
+    """Asks before taking over assignments another key holds, then applies them through
+    the view that asked -- `/settings` -> API Keys or `/start`'s key step."""
+
+    def __init__(self, parent_view: "KeyScopeMixin", slot_id: str, new_scopes):
         super().__init__(timeout=120)
-        self.cog = cog
-        self.user_id = user_id
-        self.slot_id = slot_id
-        self.provider = provider
-        self.new_scopes = new_scopes
+        self.cog = parent_view.cog
         self.parent_view = parent_view
+        self.slot_id = slot_id
+        # A snapshot: the view that asked can go on changing ticks behind this prompt.
+        self.new_scopes = set(new_scopes)
+
+    @staticmethod
+    def prompt(conflicts: List[str]) -> str:
+        return ("⚠️ **Key Assignment Override**\nAssigning this key will overwrite existing "
+                "assignments for the following scopes:\n"
+                + "\n".join(f"- {c}" for c in conflicts) + "\n\nDo you want to proceed?")
 
     @ui.button(label="Yes, Override", style=discord.ButtonStyle.danger)
     async def confirm_override(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer(ephemeral=True)
-        user_data = self.cog.storage_manager._get_user_keys_data(self.user_id)
-        
-        if "personal" in self.new_scopes:
-            user_data.setdefault("personal_assignments", {})[self.provider] = self.slot_id
-        else:
-            if user_data.get("personal_assignments", {}).get(self.provider) == self.slot_id:
-                del user_data["personal_assignments"][self.provider]
-                
-        self.cog.storage_manager._save_user_keys_data(self.user_id, user_data)
-        
-        for scope in self.new_scopes:
-            if scope != "personal":
-                server_index = self.cog.server_manager._get_server_index(scope)
-                server_index.setdefault("assigned_keys", {})[self.provider] = {"user_id": self.user_id, "slot": self.slot_id}
-                # A server that loses this key later is told again, once.
-                server_index.pop(NO_KEY_NOTICE_FLAG, None)
-                self.cog.server_manager._save_server_index(scope, server_index)
-                self.cog.server_key_pointers[(int(scope), self.provider)] = (self.user_id, self.slot_id)
-                
-        for guild in self.cog.bot.guilds:
-            guild_id_str = str(guild.id)
-            if guild_id_str not in self.new_scopes:
-                server_index = self.cog.server_manager._get_server_index(guild_id_str)
-                assigned = server_index.get("assigned_keys", {}).get(self.provider)
-                if assigned and assigned.get("user_id") == self.user_id and assigned.get("slot") == self.slot_id:
-                    del server_index["assigned_keys"][self.provider]
-                    self.cog.server_manager._save_server_index(guild_id_str, server_index)
-                    self.cog.server_key_pointers.pop((guild.id, self.provider), None)
-
-        self.parent_view.setup_items()
-        await self.parent_view.update_display()
+        self.parent_view._apply_assignments(self.slot_id, self.new_scopes)
+        await self.parent_view._repaint()
         await interaction.edit_original_response(content="✅ Assignments saved successfully.", view=None)
 
     @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -442,26 +428,41 @@ def _fit_list(items: List[str], sep: str, limit: int) -> str:
     return sep.join(out)
 
 
-class SettingsAPIView(SettingsBaseView):
-    # The assignment dropdown is paged the way Set Models pages its models: page
-    # controls first, then the fixed Personal row, then one page of servers. It used to
-    # list the first 24 and stop, and touching it dropped any assignment beyond them.
+#: The four key slots, (slot id, label, provider): two per provider.
+KEY_SLOTS = (
+    ("google_key_1", "Google Gemini Key 1", "gemini"),
+    ("google_key_2", "Google Gemini Key 2", "gemini"),
+    ("openrouter_key_1", "OpenRouter Key 1", "openrouter"),
+    ("openrouter_key_2", "OpenRouter Key 2", "openrouter"),
+)
+SLOT_PROVIDER = {slot: provider for slot, _label, provider in KEY_SLOTS}
+
+
+class KeyScopeMixin:
+    """Where one key slot applies: Personal, and servers you administer.
+
+    One picker for `/settings` -> API Keys, which stages ticks until Save Assignments,
+    and `/start`'s key step, which applies each pick as it is made (`_scopes_picked`)
+    and always keeps Personal (`_OFFER_PERSONAL`). The dropdown is paged the way Set
+    Models pages its models: page controls first, then the fixed Personal row, then one
+    page of servers. It used to list the first 24 and stop, and touching it dropped any
+    assignment beyond them.
+
+    Needs `cog`, `user_id` and `update_display`; `_repaint` is what everything that
+    changes an assignment calls afterwards, so a host that shows more than the picker
+    overrides that.
+    """
+
     _SCOPE_NAV_VALUES = ("scope_prev", "scope_jump", "scope_next")
     #: 3 controls + Personal + 21 servers = Discord's 25.
     _SERVERS_PER_PAGE = 21
+    _OFFER_PERSONAL = True
 
-    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):
-        super().__init__(cog, interaction, "api")
+    def _init_scopes(self):
         self.selected_slot = None
-        # Staged across every page until Save Assignments; see _load_scopes.
+        # Staged across every page until saved; see _load_scopes.
         self.selected_scopes = set()
         self.scope_page = 0
-        self.slots_config = [
-            ("google_key_1", "Google Gemini Key 1", "gemini"),
-            ("google_key_2", "Google Gemini Key 2", "gemini"),
-            ("openrouter_key_1", "OpenRouter Key 1", "openrouter"),
-            ("openrouter_key_2", "OpenRouter Key 2", "openrouter")
-        ]
         self.admin_guilds = []
         for g in self.cog.bot.guilds:
             m = g.get_member(self.user_id)
@@ -469,7 +470,6 @@ class SettingsAPIView(SettingsBaseView):
                 self.admin_guilds.append(g)
         # Sorted, so a server stays on the same page and can be found by name.
         self.admin_guilds.sort(key=lambda g: g.name.casefold())
-        self.setup_items()
 
     def _saved_scopes(self, provider: str) -> set:
         """Where the selected slot is assigned now, as dropdown values."""
@@ -487,13 +487,12 @@ class SettingsAPIView(SettingsBaseView):
     def _load_scopes(self):
         """Resets the staged ticks to what is saved.
 
-        Called when a slot is chosen or deleted, never from `setup_items`: a page turn
+        Called when a slot is chosen or deleted, never from a rebuild: a page turn
         rebuilds the view, and reloading there would throw away ticks not yet saved.
         """
         self.selected_scopes = set()
         if self.selected_slot:
-            provider = next(p for s, l, p in self.slots_config if s == self.selected_slot)
-            self.selected_scopes = self._saved_scopes(provider)
+            self.selected_scopes = self._saved_scopes(SLOT_PROVIDER[self.selected_slot])
 
     def _scope_pages(self) -> int:
         return max(1, (len(self.admin_guilds) - 1) // self._SERVERS_PER_PAGE + 1)
@@ -507,6 +506,122 @@ class SettingsAPIView(SettingsBaseView):
         labels = ["Personal"] if "personal" in scopes else []
         return labels + [f"Server: {g.name}" for g in self.admin_guilds if str(g.id) in scopes]
 
+    def _add_scope_select(self, row: int, placeholder: str = "Assign this key to..."):
+        num_pages = self._scope_pages()
+        self.scope_page = max(0, min(self.scope_page, num_pages - 1))
+        options = paged_nav_options(self.scope_page, num_pages,
+                                    values=self._SCOPE_NAV_VALUES, nav_suffix=" of servers")
+        if self._OFFER_PERSONAL:
+            # "Personal" is not "in a DM": it is the key your own Global Chat and your
+            # profiles' background work run on, wherever you happen to run them.
+            options.append(discord.SelectOption(
+                label="Personal", value="personal",
+                description="Your Global Chat (anywhere) and your profiles' background work"[:100],
+                default=("personal" in self.selected_scopes)))
+        for g in self._page_guilds():
+            options.append(discord.SelectOption(label=f"Server: {g.name}"[:100], value=str(g.id),
+                                                default=(str(g.id) in self.selected_scopes)))
+        add_select(self, options, self.scope_select_callback, placeholder=placeholder,
+                   min_values=0, max_values=len(options), row=row)
+
+    async def scope_select_callback(self, interaction: discord.Interaction):
+        values = set(interaction.data['values'])
+        # A submission can only speak for the rows it showed, so it settles this page
+        # and leaves every other page's ticks alone. Ticks made alongside a page
+        # control count too.
+        on_page = {str(g.id) for g in self._page_guilds()}
+        if self._OFFER_PERSONAL:
+            on_page.add("personal")
+        self.selected_scopes = (self.selected_scopes - on_page) | (values & on_page)
+
+        prev_value, jump_value, next_value = self._SCOPE_NAV_VALUES
+        if jump_value in values:
+            async def on_jump(i: discord.Interaction, page: int):
+                self.scope_page = page
+                await i.response.defer()
+                await self._repaint()
+
+            await interaction.response.send_modal(
+                PageJumpModal(self._scope_pages(), on_jump, zero_indexed=True))
+        else:
+            if next_value in values:
+                self.scope_page += 1
+            elif prev_value in values:
+                self.scope_page -= 1
+            await interaction.response.defer()
+        await self._scopes_picked(interaction)
+        # Repainted through the original message, so the ticks just made reach the
+        # embed even while the jump prompt is open.
+        await self._repaint()
+
+    async def _scopes_picked(self, interaction: discord.Interaction):
+        """After a submission, its interaction already answered. Staging does nothing."""
+
+    async def _repaint(self):
+        self.setup_items()
+        await self.update_display()
+
+    def _assignment_conflicts(self, slot: str, scopes) -> List[str]:
+        """Scopes in `scopes` another key or user holds now, in the confirm prompt's words."""
+        provider = SLOT_PROVIDER[slot]
+        conflicts = []
+        if "personal" in scopes:
+            user_data = self.cog.storage_manager._get_user_keys_data(self.user_id)
+            curr_personal = user_data.get("personal_assignments", {}).get(provider)
+            if curr_personal and curr_personal != slot:
+                conflicts.append(f"Personal Scope (Currently uses {curr_personal})")
+        for g in self.admin_guilds:
+            if str(g.id) not in scopes:
+                continue
+            assigned = self.cog.server_manager._get_server_index(str(g.id)).get(
+                "assigned_keys", {}).get(provider)
+            if assigned and (assigned.get("user_id") != self.user_id or assigned.get("slot") != slot):
+                conflicts.append(f"Server: {g.name} (Currently assigned by another key/user)")
+        return conflicts
+
+    def _apply_assignments(self, slot: str, scopes):
+        """Makes `slot` apply exactly to `scopes`, among the scopes this view listed.
+
+        Only servers you administer are touched. The override prompt used to walk every
+        server the bot is in, so confirming one takeover also dropped this key from a
+        server you had since stopped administering, which no dropdown could show you.
+        """
+        provider = SLOT_PROVIDER[slot]
+        user_data = self.cog.storage_manager._get_user_keys_data(self.user_id)
+        personal = user_data.setdefault("personal_assignments", {})
+        if "personal" in scopes and personal.get(provider) != slot:
+            personal[provider] = slot
+            self.cog.storage_manager._save_user_keys_data(self.user_id, user_data)
+        elif "personal" not in scopes and personal.get(provider) == slot:
+            del personal[provider]
+            self.cog.storage_manager._save_user_keys_data(self.user_id, user_data)
+
+        mine = {"user_id": self.user_id, "slot": slot}
+        for guild in self.admin_guilds:
+            guild_id_str = str(guild.id)
+            server_index = self.cog.server_manager._get_server_index(guild_id_str)
+            assigned = server_index.get("assigned_keys", {}).get(provider)
+            if guild_id_str in scopes:
+                # `/start` applies on every pick: an unchanged server is not rewritten.
+                if assigned == mine and NO_KEY_NOTICE_FLAG not in server_index:
+                    continue
+                server_index.setdefault("assigned_keys", {})[provider] = dict(mine)
+                # A server that loses this key later is told again, once.
+                server_index.pop(NO_KEY_NOTICE_FLAG, None)
+                self.cog.server_manager._save_server_index(guild_id_str, server_index)
+                self.cog.server_key_pointers[(guild.id, provider)] = (self.user_id, slot)
+            elif assigned and assigned.get("user_id") == self.user_id and assigned.get("slot") == slot:
+                del server_index["assigned_keys"][provider]
+                self.cog.server_manager._save_server_index(guild_id_str, server_index)
+                self.cog.server_key_pointers.pop((guild.id, provider), None)
+
+
+class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):
+        super().__init__(cog, interaction, "api")
+        self._init_scopes()
+        self.setup_items()
+
     def setup_items(self):
         for item in self.children[:]:
             if item.row != 4: self.remove_item(item)
@@ -516,7 +631,7 @@ class SettingsAPIView(SettingsBaseView):
 
         # Row 0: Slot Selection
         slot_options = []
-        for slot_id, label, provider in self.slots_config:
+        for slot_id, label, provider in KEY_SLOTS:
             data = slots_data.get(slot_id)
             if data:
                 tier = data.get("tier", "free").title()
@@ -532,24 +647,7 @@ class SettingsAPIView(SettingsBaseView):
 
         # Row 1: Scope Multi-Select
         if self.selected_slot and self.selected_slot in slots_data:
-            num_pages = self._scope_pages()
-            self.scope_page = max(0, min(self.scope_page, num_pages - 1))
-            scope_options = paged_nav_options(self.scope_page, num_pages,
-                                              values=self._SCOPE_NAV_VALUES,
-                                              nav_suffix=" of servers")
-
-            # "Personal" is not "in a DM": it is the key your own Global Chat and your
-            # profiles' background work run on, wherever you happen to run them.
-            scope_options.append(discord.SelectOption(
-                label="Personal", value="personal",
-                description="Your Global Chat (anywhere) and your profiles' background work"[:100],
-                default=("personal" in self.selected_scopes)))
-            for g in self._page_guilds():
-                scope_options.append(discord.SelectOption(label=f"Server: {g.name}"[:100], value=str(g.id), default=(str(g.id) in self.selected_scopes)))
-
-            add_select(self, scope_options, self.scope_select_callback,
-                       placeholder="Assign this key to...", min_values=0,
-                       max_values=len(scope_options), row=1)
+            self._add_scope_select(row=1)
 
             # Row 2: Actions
             add_button(self, "Edit Key", self.edit_key_callback,
@@ -570,11 +668,11 @@ class SettingsAPIView(SettingsBaseView):
         if self.selected_slot:
             user_data = self.cog.storage_manager._get_user_keys_data(self.user_id)
             slot_data = user_data.get("slots", {}).get(self.selected_slot)
-            label = next(l for s, l, p in self.slots_config if s == self.selected_slot)
+            label = next(l for s, l, p in KEY_SLOTS if s == self.selected_slot)
             
             if slot_data:
                 tier = slot_data.get("tier", "free").title()
-                provider = next(p for s, l, p in self.slots_config if s == self.selected_slot)
+                provider = SLOT_PROVIDER[self.selected_slot]
                 value = f"**Status:** ✅ Set\n**Tier:** `{tier}`"
                 if provider == "gemini" and not is_paid_gemini_slot(slot_data):
                     # Assigning one to a server looks like it worked, and then nothing
@@ -614,44 +712,14 @@ class SettingsAPIView(SettingsBaseView):
         await interaction.response.defer()
         await self.update_display()
 
-    async def scope_select_callback(self, interaction: discord.Interaction):
-        values = set(interaction.data['values'])
-        # A submission can only speak for the rows it showed, so it settles this page
-        # and leaves every other page's ticks alone. Ticks made alongside a page
-        # control count too.
-        on_page = {"personal"} | {str(g.id) for g in self._page_guilds()}
-        self.selected_scopes = (self.selected_scopes - on_page) | (values & on_page)
-
-        prev_value, jump_value, next_value = self._SCOPE_NAV_VALUES
-        if jump_value in values:
-            async def on_jump(i: discord.Interaction, page: int):
-                self.scope_page = page
-                self.setup_items()
-                await i.response.defer()
-                await self.update_display()
-
-            await interaction.response.send_modal(
-                PageJumpModal(self._scope_pages(), on_jump, zero_indexed=True))
-        else:
-            if next_value in values:
-                self.scope_page += 1
-            elif prev_value in values:
-                self.scope_page -= 1
-            await interaction.response.defer()
-        # Repainted through the original message, so the ticks just made reach the
-        # embed even while the jump prompt is open.
-        self.setup_items()
-        await self.update_display()
-
     async def edit_key_callback(self, interaction: discord.Interaction):
-        provider = next(p for s, l, p in self.slots_config if s == self.selected_slot)
-        modal = SubmitAPIKeyModal(self.cog, self.selected_slot, provider, view=self)
+        modal = SubmitAPIKeyModal(self.cog, self.selected_slot, SLOT_PROVIDER[self.selected_slot], view=self)
         await interaction.response.send_modal(modal)
 
     async def delete_key_callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         user_data = self.cog.storage_manager._get_user_keys_data(self.user_id)
-        provider = next(p for s, l, p in self.slots_config if s == self.selected_slot)
+        provider = SLOT_PROVIDER[self.selected_slot]
         
         if self.selected_slot in user_data.get("slots", {}):
             del user_data["slots"][self.selected_slot]
@@ -677,63 +745,17 @@ class SettingsAPIView(SettingsBaseView):
         await interaction.followup.send("✅ Key and all its assignments deleted.", ephemeral=True)
 
     async def save_assignments_callback(self, interaction: discord.Interaction):
-        provider = next(p for s, l, p in self.slots_config if s == self.selected_slot)
-        user_data = self.cog.storage_manager._get_user_keys_data(self.user_id)
-        
-        conflicts = []
-        
-        if "personal" in self.selected_scopes:
-            curr_personal = user_data.get("personal_assignments", {}).get(provider)
-            if curr_personal and curr_personal != self.selected_slot:
-                conflicts.append(f"Personal Scope (Currently uses {curr_personal})")
-                
-        for scope in self.selected_scopes:
-            if scope != "personal":
-                server_index = self.cog.server_manager._get_server_index(scope)
-                assigned = server_index.get("assigned_keys", {}).get(provider)
-                if assigned and (assigned.get("user_id") != self.user_id or assigned.get("slot") != self.selected_slot):
-                    guild = self.cog.bot.get_guild(int(scope))
-                    g_name = guild.name if guild else scope
-                    conflicts.append(f"Server: {g_name} (Currently assigned by another key/user)")
-                    
+        conflicts = self._assignment_conflicts(self.selected_slot, self.selected_scopes)
         if conflicts:
-            conflict_str = "\n".join(f"- {c}" for c in conflicts)
-            msg = f"⚠️ **Key Assignment Override**\nAssigning this key will overwrite existing assignments for the following scopes:\n{conflict_str}\n\nDo you want to proceed?"
-            view = OverrideConfirmView(self.cog, self.user_id, self.selected_slot, provider, list(self.selected_scopes), self)
-            await interaction.response.send_message(msg, view=view, ephemeral=True)
+            await interaction.response.send_message(
+                OverrideConfirmView.prompt(conflicts),
+                view=OverrideConfirmView(self, self.selected_slot, self.selected_scopes),
+                ephemeral=True)
             return
-            
-        await interaction.response.defer(ephemeral=True)
-        
-        if "personal" in self.selected_scopes:
-            user_data.setdefault("personal_assignments", {})[provider] = self.selected_slot
-        else:
-            if user_data.get("personal_assignments", {}).get(provider) == self.selected_slot:
-                del user_data["personal_assignments"][provider]
-                
-        self.cog.storage_manager._save_user_keys_data(self.user_id, user_data)
-        
-        for scope in self.selected_scopes:
-            if scope != "personal":
-                server_index = self.cog.server_manager._get_server_index(scope)
-                server_index.setdefault("assigned_keys", {})[provider] = {"user_id": self.user_id, "slot": self.selected_slot}
-                # A server that loses this key later is told again, once.
-                server_index.pop(NO_KEY_NOTICE_FLAG, None)
-                self.cog.server_manager._save_server_index(scope, server_index)
-                self.cog.server_key_pointers[(int(scope), provider)] = (self.user_id, self.selected_slot)
-                
-        for guild in self.admin_guilds:
-            guild_id_str = str(guild.id)
-            if guild_id_str not in self.selected_scopes:
-                server_index = self.cog.server_manager._get_server_index(guild_id_str)
-                assigned = server_index.get("assigned_keys", {}).get(provider)
-                if assigned and assigned.get("user_id") == self.user_id and assigned.get("slot") == self.selected_slot:
-                    del server_index["assigned_keys"][provider]
-                    self.cog.server_manager._save_server_index(guild_id_str, server_index)
-                    self.cog.server_key_pointers.pop((guild.id, provider), None)
 
-        self.setup_items()
-        await self.update_display()
+        await interaction.response.defer(ephemeral=True)
+        self._apply_assignments(self.selected_slot, self.selected_scopes)
+        await self._repaint()
         await interaction.followup.send("✅ Assignments saved successfully.", ephemeral=True)
 
 class SettingsChildBotView(SettingsBaseView):

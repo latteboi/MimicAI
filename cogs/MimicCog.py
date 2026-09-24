@@ -337,8 +337,8 @@ class MimicCog(EventListeners, commands.Cog):
                 "**Cannot Create Profile**\n"
                 "To create profiles, you must have a way to use them. Please do one of the following:\n\n"
                 "1. **Join a Server:** Be in a server where an administrator has already configured an API key for MimicAI.\n"
-                "2. **Configure Your Server:** If you are a server administrator, use the `/settings` command in a Direct Message with me to add a server-wide API key.\n"
-                "3. **Provide a Personal Key:** Use the `/settings` command in a Direct Message with me to add your own personal Google Gemini API key for private use."
+                "2. **Configure Your Server:** If you are a server administrator, run `/start` or `/settings` to add an API key and assign it to your server.\n"
+                "3. **Provide a Personal Key:** Run `/start` or `/settings` to add your own OpenRouter or Google Gemini API key."
             )
             await interaction.followup.send(error_msg, ephemeral=True)
             return
@@ -2217,9 +2217,10 @@ class MimicCog(EventListeners, commands.Cog):
         view = InviteView(invite_url)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
 
-    @app_commands.command(name="settings", description="Manage API keys and Child Bots (DM-Only).")
+    # Not DM-only: every screen here answers ephemerally, and a key is typed into a
+    # modal, which nobody but its submitter sees wherever it is opened.
+    @app_commands.command(name="settings", description="Your API keys, defaults, About Me and Child Bots.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
-    @app_commands.dm_only()
     async def settings_slash(self, interaction: discord.Interaction):
         if not self.fernet:
             await interaction.response.send_message("Error: The bot's encryption service is not configured.", ephemeral=True)

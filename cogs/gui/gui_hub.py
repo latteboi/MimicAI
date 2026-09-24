@@ -340,7 +340,7 @@ class HubPublicLibraryView(HubBaseView):
         await i.response.send_modal(LibraryIntroModal(self.cog, i.user.id, name, on_saved=repaint))
 
     async def generate_cb(self, i: discord.Interaction):
-        await i.response.send_modal(NewProfileModal(self.cog, generate=True))
+        await i.response.send_modal(NewProfileModal(self.cog))
 
     async def search_cb(self, i: discord.Interaction):
         modal = ui.Modal(title="Search Public Library")

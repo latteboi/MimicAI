@@ -33,7 +33,7 @@ HELP_CATEGORIES = {
         "First Steps": (
             "**The short version: run `/start`.** It works out what you have already done, shows you what is left, "
             "and opens the right screen for each step. Everything below is the same path done by hand.\n\n"
-            "**1. Add an API key.** Open a DM with the bot and run `/settings` -> **API Keys**. Pick an empty slot, click **Submit Key**, "
+            "**1. Add an API key.** Run `/settings` -> **API Keys**, anywhere. Pick an empty slot, click **Submit Key**, "
             "then use the assignment dropdown to point it at **Personal** (your own Global Chat, wherever you run it) and at any server "
             "you administrate. "
             "Click **Save Assignments** -- nothing is stored until you do.\n\n"
@@ -178,7 +178,7 @@ HELP_CATEGORIES = {
             "nothing at all -- local vision models resize to their own fixed resolution -- and ignores it."
         ),
         "Default Settings for New Profiles": (
-            "`/settings` -> **Defaults** (DM only). Standing preferences applied to profiles you create or borrow "
+            "`/settings` -> **Defaults**. Standing preferences applied to profiles you create or borrow "
             "**from then on**. Existing profiles are untouched -- `/profile bulk manage` is what changes those.\n\n"
             "**It is the profile dashboard, set once instead of per profile.** The same tabs -- Params, Tools, "
             "Images, Audio, Memory, Training, Misc -- holding the same settings, and choosing one opens the same form "
@@ -595,63 +595,55 @@ HELP_CATEGORIES = {
 # a button in front of them. Two to four sentences per step, ending in what to press.
 #
 # Depth is not repeated here. Every step declares a `help_ref` in `gui_start` naming a
-# HELP_CATEGORIES page, and its Read More button opens the browser on that page -- so
+# HELP_CATEGORIES page, and its Guide button opens the browser on that page -- so
 # the long-form explanation has exactly one home and this stays a nudge rather than a
 # fourth thing to keep in sync. A step whose blurb starts growing paragraphs is a step
 # whose help_ref is pointing at the wrong page.
 
 WIZARD_COPY = {
-    "key": (
-        "MimicAI is free; the models are billed to **your** key by whoever provides them.\n\n"
-        "**Start with OpenRouter.** One key reaches Claude, GPT, Llama, DeepSeek and a few hundred "
-        "others, and some of them cost nothing to run at all — Ling 3.0 Flash Fin, DeepSeek V4 0731, "
-        "and OpenRouter's own **Free Models Router**, which picks a free one for you. The model list "
-        "here only offers you models some host is known to serve **without training on what it is "
-        "sent**, free ones included, so a free model is not quietly paying for itself with your "
-        "conversations.\n\n"
-        "**Add Google Gemini for what only it does:** speech, native web grounding and URL reading, "
-        "and Gemini's own image models. It has to be a **paid** (billing-enabled) key — Google may "
-        "train on what a free-tier key is sent, so free-tier keys are refused for everyone but the "
-        "bot's owner.\n\n"
-        "You can hold both, and **mix them inside a single character** — thinking on OpenRouter, "
-        "pictures and voice on Google. A picture it draws comes back into its own context, so it "
-        "can see and talk about what it just made.\n\n"
-        "Keys are entered in a DM. Paste the key into a slot, then point it at **Personal** and at "
-        "any server you run — **an unassigned key does nothing.**"
-    ),
     "provider": (
-        "Which provider your characters' models run on first. Both reach the same Gemini models, except for "
-        "the passes that read a transcript: long-term memories, session compaction and the "
-        "anti-repetition critic run on Ling through OpenRouter.\n\n"
-        "Every model a character uses -- replies, images, voice, memory -- runs **Primary → Fallback** on "
-        "the provider you pick. Turn on a profile's **Final Fallback** (`/profile manage` → Params) and it "
-        "tries once more on the other one, so an outage or a key that runs dry there does not silence it.\n\n"
-        "New profiles start on it, and so do drafts from **Generate**. A model you pick yourself stays "
-        "picked. If you only hold a key for the other provider, new profiles use that one until you add "
-        "a key. Change it any time in `/settings` → About Me."
+        "Where your characters' models run. Both run the same default Gemini models; the difference is "
+        "the key you hold.\n\n"
+        "**OpenRouter** is the one to start with. One key also reaches Claude, GPT, DeepSeek and a few "
+        "hundred others, some free to run, and only hosts known **not to train on what they are sent** "
+        "are offered.\n"
+        "**Google** adds native web grounding and URL reading, and Gemini's own speech and image models. "
+        "It needs a **billing-enabled** key.\n\n"
+        "New profiles start on it; a model you pick yourself stays picked. Change it any time here or in "
+        "`/settings` → About Me."
     ),
+    # One per provider: the step says only what the provider chosen before it needs.
+    "key": {
+        "openrouter": (
+            "**1.** Press **Get a key ↗**, sign in to OpenRouter and create a key. It starts `sk-or-`.\n"
+            "**2.** Press **Paste key**. It goes into a private form nobody else sees, and becomes your "
+            "**Personal** key: your Global Chat and your characters' background work.\n"
+            "**3.** Run a server? Tick it in the dropdown that appears, and its channels use the key too.\n\n"
+            "Credit is bought on OpenRouter; free models cost nothing. **Never paste a key into the chat.**"
+        ),
+        "gemini": (
+            "**1.** Press **Get a key ↗**, create a key in Google AI Studio, and turn on **billing** for its "
+            "project. Google may train on what a free-tier key is sent, so free-tier keys are refused.\n"
+            "**2.** Press **Paste key**. It goes into a private form nobody else sees, and becomes your "
+            "**Personal** key: your Global Chat and your characters' background work.\n"
+            "**3.** Run a server? Tick it in the dropdown that appears, and its channels use the key too.\n\n"
+            "**Never paste a key into the chat.**"
+        ),
+    },
     "profile": (
         "A **profile** is one character: a persona, a set of instructions, a model, and its own memory. "
         "Profiles belong to you, not to a server, so they follow you everywhere.\n\n"
-        "Three ways to get one, fastest first:\n"
-        "• **Borrow** a finished character from the Public Library — no writing at all.\n"
-        "• **Generate** one from a concept like *a cynical noir detective* — one small API call.\n"
-        "• **Write** one from blank, if you already know who they are."
-    ),
-    "voice": (
-        "Two halves, and mixing them up is the usual reason a character will not behave.\n\n"
-        "**Persona** answers *who is this* — backstory, traits, likes, dislikes, appearance. It is descriptive.\n"
-        "**Instructions** answer *how should it write* — length, formatting, what never to do. It is imperative, "
-        "and it wins over persona bias during generation.\n\n"
-        "A borrowed character arrives already written, so this step is done the moment you have one."
+        "• **Browse Library** borrows a finished character — no writing at all.\n"
+        "• **Generate one** drafts a whole character from a concept like *a cynical noir detective*.\n\n"
+        "Writing one yourself? `/profile create`, then `/profile manage` → Persona. It counts here once "
+        "it has a persona or instructions."
     ),
     "seat": (
-        "A **session** is bound to one channel and holds a cast of characters sharing a single transcript, "
-        "each seeing it from their own point of view.\n\n"
-        "Pick your character on the **Cast** tab — it is seated the moment you choose it, so you can set its "
-        "reactivity straight away — then press **Start / Update Session**. This is normally an administrator's "
-        "job — profiles are yours, but a channel is the server's — unless an admin has set the channel to "
-        "**Open casting**, which lets any member edit the cast here."
+        "A **session** binds a cast of characters to one channel, sharing a single transcript that each "
+        "sees from its own point of view.\n\n"
+        "Open the cast editor and pick your character on the **Cast** tab — it is seated the moment you "
+        "choose it — then press **Start / Update Session**. This is an administrator's job, since a "
+        "channel is the server's, unless an admin has set the channel to **Open casting**."
     ),
     "speak": (
         "Nothing else to configure. Send a message in the channel and the cast will answer.\n\n"
@@ -726,15 +718,19 @@ DEFAULT_HELP_DOCS = {
     # --- GETTING STARTED ---
     "start/setup_wizard.txt": (
         "Command: `/start` opens a guided setup wizard. It is the first thing a new user should run.\n"
-        "Concept: Six steps -- connect an API key, choose a provider, get a character, give it a voice, seat it in a channel, say something to it. The wizard checks which are already done every time it is opened, so it can be closed and reopened freely and always resumes correctly. No progress is stored anywhere.\n"
-        "Context awareness: The wizard states where you are and what you can do there. API keys can only be entered in a DM. Seating a character in a channel requires server administrator permission. Steps that cannot be done from where you ran it are shown greyed out with the reason rather than hidden.\n"
-        "Non-administrators: You can complete steps 1-4 anywhere and build characters freely, but only an administrator can seat them in a channel. Profiles belong to you rather than to a server, so the fastest way to test your own is to create your own server -- you are its administrator -- and add the bot with `/invite`.\n"
-        "Second track: A 'Using it' section covers talking to characters, `/whisper`, memory commands, images and voice, and what to do when something is wrong. These are not setup steps and have no completion state.\n"
+        "Concept: Five steps -- choose a provider (OpenRouter or Google), add your API key for it, get a character, seat it in a channel, say something to it. The wizard checks which are already done every time it is opened, so it can be closed and reopened freely and always resumes correctly. No progress is stored anywhere.\n"
+        "One screen: the checklist, then the step you are on with its buttons. The dropdown jumps to any step; a finished step you pick keeps its buttons where that makes sense -- switch provider, get another character, reopen the cast.\n"
+        "Adding a key: works anywhere, a server channel included. 'Get a key' opens the provider's key page; 'Paste key' opens a private form, validates the key, saves it and makes it your Personal key. If you administer any servers, a dropdown under the step lists them -- the one you ran it in first, 21 per page with Previous, Next and jump-to-page -- and each tick is saved as you make it, with a confirmation first if another key already serves that server. `/settings` -> API Keys still manages all four slots.\n"
+        "Context awareness: The wizard states where you are and what you can do there. Seating a character in a channel requires server administrator permission, or a channel on Open casting. Steps that cannot be done from where you ran it are shown greyed out with the reason rather than hidden.\n"
+        "Non-administrators: You can complete the first three steps anywhere and build characters freely, but only an administrator can seat them in a channel. Profiles belong to you rather than to a server, so the fastest way to test your own is to create your own server -- you are its administrator -- and add the bot with `/invite`.\n"
+        "Second track: Once setup is done, 'Using it' covers talking to characters, `/whisper`, memory commands, images and voice, and what to do when something is wrong. These are not setup steps and have no completion state.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I do not know where to begin.' Fix: Run `/start`.\n"
         "- Symptom: 'Which API key should I get first?' or 'Do I have to pay to use this?' Fix: OpenRouter. One key reaches a few hundred models and some of them are free to run (Ling 3.0 Flash Fin, DeepSeek V4 0731, and OpenRouter's Free Models Router), and only models some host is known to serve without training on prompts are offered. Add a paid Google Gemini key afterwards for speech, native web grounding and Gemini's image models.\n"
-        "- Symptom: 'The wizard says step 1 cannot be done here.' Fix: API keys are DM-only. Press 'Send me the DM version', then run `/start` in that DM.\n"
-        "- Symptom: 'Step 5 is locked.' Fix: Seating a cast needs server administrator permission. Ask an admin to run `/session config`, or make your own server to test in.\n"
+        "- Symptom: 'The key step is locked.' Fix: Choose a provider first; the key step asks for that provider's key.\n"
+        "- Symptom: 'Google refused my key.' Fix: Only a billing-enabled (paid) Google key is accepted. Turn billing on for the key's project, or choose OpenRouter instead.\n"
+        "- Symptom: 'Seating is locked: needs an API key assigned to this server.' Fix: An administrator ticks the server in the key step's dropdown, or assigns a key in `/settings` -> API Keys.\n"
+        "- Symptom: 'Seating is locked: needs administrator.' Fix: Seating a cast needs server administrator permission. Ask an admin to run `/session config`, or make your own server to test in.\n"
         "- Symptom: 'I finished a step but the wizard still shows it undone.' Fix: Press Refresh. The wizard reads live state and only re-reads it when asked.\n"
         "- Symptom: 'The wizard stopped responding to clicks.' Fix: It times out after fifteen minutes. Run `/start` again; it resumes exactly where you were because nothing was stored.\n"
         "- Symptom: 'The bot says an API key was not found.' Fix: Either no key is set, or a key was saved but never assigned. Run `/start`, which checks assignment rather than just presence.\n"
@@ -762,7 +758,7 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'I cannot edit the persona of a profile I borrowed.' Fix: That is by design. Use Profile Cloning in `/profile hub` instead, which produces an independent Class A copy you own."
     ),
     "profiles/default_settings.txt": (
-        "Command: `/settings` -> Defaults (DM only). Sets standing preferences applied to profiles created or borrowed afterwards. Existing profiles are not changed; `/profile bulk manage` changes those.\n"
+        "Command: `/settings` -> Defaults. Sets standing preferences applied to profiles created or borrowed afterwards. Existing profiles are not changed; `/profile bulk manage` changes those.\n"
         "Scope: Nearly every setting a profile has. The screen is the profile dashboard's own tabs (Params, Tools, Images, Audio, Memory, Training, Misc) and rows, and choosing a row opens the same form `/profile bulk manage` opens for it, so a setting reachable in bulk is reachable as a default. What is not: a persona, an instruction block, the LTM summarisation or critic prompts and the image-generation prompt (a borrow stores no prompts, so a default one would never be read), a content rating, and the neuro engine's live hormone levels. A row that has to leave part of what you entered behind says so on the panel it returns to.\n"
         "Models: Set Models on the Params tab covers all twelve slots across the six categories (Response, Image, TTS, Grounding, Anti-Repetition Critic, LTM Summariser). Each slot has its own 'Platform default' option, which clears it.\n"
         "Clearing: 'Clear...' takes one group of settings, or everything, back to Platform default. Blanking a box inside a form clears that one setting the same way.\n"
@@ -842,7 +838,7 @@ DEFAULT_HELP_DOCS = {
 
     # --- APIS ---
     "apis/key_slots_and_assignment.txt": (
-        "Command: `/settings` -> API Keys (DM only)\n"
+        "Command: `/settings` -> API Keys, or `/start`'s key step\n"
         "Concept: You hold four key slots -- Google Gemini 1 and 2, OpenRouter 1 and 2. Select a slot, click 'Submit Key' to store a key in it, then use the assignment dropdown to choose where that slot applies.\n"
         "Scopes: 'Personal' applies the key to your own Global Chat (`/profile global_chat`) wherever you run it -- a server channel or a DM -- and to your own profiles' background work. A server entry applies it to every session in that server, and only appears for servers where you hold administrator permission.\n"
         "Important: An assignment is not saved until 'Save Assignments' is clicked. Selecting scopes in the dropdown alone changes nothing.\n"
@@ -850,10 +846,11 @@ DEFAULT_HELP_DOCS = {
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I added a key but the bot still will not respond in my server.' Fix: Storing a key and assigning it are two separate steps. Select the slot, tick the server in the assignment dropdown, then click Save Assignments.\n"
         "- Symptom: 'The server I want is not in the assignment dropdown.' Fix: Only servers where you have administrator permission are listed. Ask an administrator of that server to assign their own key.\n"
-        "- Symptom: 'Where do I run this?' Fix: `/settings` is DM-only. Open a direct message with the bot."
+        "- Symptom: 'Where do I run this?' or 'Is it safe to add a key in a channel?' Fix: Anywhere. `/settings` and `/start` answer only you, and the key is typed into a private form -- never paste one into the chat.\n"
+        "- Symptom: 'I added a key in /start; do I still need to assign it?' Fix: No. `/start` makes it your Personal key, and its key step lists the servers you administer to tick; each tick is saved as you make it."
     ),
     "apis/google_gemini.txt": (
-        "Requirements: A Google API key from Google AI Studio, submitted via the `/settings` DM command.\n"
+        "Requirements: A Google API key from Google AI Studio, submitted via `/start` or `/settings` -> API Keys.\n"
         "Capabilities: Powers standard text generation. It is the ONLY provider that natively supports Google Search Grounding and direct URL fetching. Its Gemini image models draw pictures and its Gemini speech models speak, directed by the Director's Desk; OpenRouter offers other image and speech models alongside them.\n"
         "Free versus paid tier: Google may train its models on what a free-tier key is sent, so `/settings` refuses a free-tier key from anyone but the bot's owner, and one saved before that is not used for a server's messages or for Global Chat. Conversations on Gemini need a billing-enabled (paid) key. A server's administrators cannot change that; only the bot's owner can, one server at a time, from `/privacy`. Free keys also rate-limit hard, and image generation is blocked outright on them.\n"
         "Troubleshooting / Symptoms:\n"
@@ -863,7 +860,7 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'This Google key is on Gemini's free tier ... so it was not saved.' Fix: Only the bot's owner can save a free-tier key. Enable billing on the key's Google Cloud project and submit it again; if billing is already on, try again in a few minutes."
     ),
     "apis/openrouter.txt": (
-        "Requirements: An OpenRouter API Key submitted via the `/settings` DM command.\n"
+        "Requirements: An OpenRouter API Key submitted via `/start` or `/settings` -> API Keys.\n"
         "Capabilities: Allows users to access non-Google models like Anthropic's Claude, Meta's Llama, DeepSeek and xAI's Grok. OpenRouter models are also the only ones that honour the advanced sampling parameters (Min P, Top A, and the frequency, presence and repetition penalties).\n"
         "Cost and free models: One key covers every model, billed per token from an OpenRouter credit balance. Some models cost nothing to run -- Ling 3.0 Flash Fin, DeepSeek V4 0731, and OpenRouter's own Free Models Router, which routes to a free model for you -- and they are supported like any other, including as a fallback model. Free or paid, you are only offered models some host is known to serve without training on what it is sent, so a free model here is not paying for itself with your conversations. This is why OpenRouter is the provider to connect first; add Google Gemini for speech, native grounding and Gemini image models.\n"
         "Limitations: OpenRouter models do NOT have native access to Google Search or URL fetching. To use Grounding or URL Context with OpenRouter, you MUST go into `/profile manage` -> Tools -> and set Grounding to RAG (or Legacy RAG) and URL Context to RAG Mode.\n"

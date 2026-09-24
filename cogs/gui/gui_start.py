@@ -1,28 +1,29 @@
 """`/start` -- the guided setup wizard.
 
-Setup crosses two contexts and cannot complete in one message: API keys are entered in
-a DM (`/settings` is dm_only), and a channel's cast is configured by a server
+Setup crosses more than one context: a channel's cast is configured by a server
 administrator (`/session config` is guild_only, and admin unless the channel is on Open
-casting). So this is context-aware
-rather than linear. Steps that cannot run where you are stay **visible and greyed**,
-because a member who cannot see step 5 has no way to learn why the bot is silent.
+casting), and only in a server. So this is context-aware rather than linear. Steps that
+cannot run where you are stay **visible and greyed**, because a member who cannot see
+the seat step has no way to learn why the bot is silent.
 
 **No progress is stored.** Every step's completion is probed from state that already
-exists -- assigned keys, the profile index, the channel's session -- which means the
-wizard cannot desynchronise from reality, "run it again to pick up where you left off"
-is literally true, and there is no new per-user dict to keep bounded. A stale wizard is
-harmless for the same reason: its buttons re-probe, so it needs none of the
-`active_session_config_views` machinery `/session config` carries.
+exists -- the provider preference, assigned keys, the profile index, the channel's
+session -- which means the wizard cannot desynchronise from reality, "run it again to
+pick up where you left off" is literally true, and there is no new per-user dict to keep
+bounded. A stale wizard is harmless for the same reason: its buttons re-probe, so it
+needs none of the `active_session_config_views` machinery `/session config` carries.
 
-It is a router, not a second implementation. Each step launches the real dashboard --
-`SettingsAPIView`, `HubPublicLibraryView`, `ProfileManageView`, `SessionConfigView` --
-as a *separate* ephemeral message, by deferring with `thinking=True`. On a component
-interaction that sends a new message rather than updating this one, so those views'
-`edit_original_response` lands on the new message and the wizard survives underneath to
-be refreshed. Nothing in them needed changing to be reachable from here.
+It is a router, not a second implementation. The key step opens `/settings`'
+`SubmitAPIKeyModal` and its server picker is `/settings`' own (`KeyScopeMixin`),
+applying each pick as it is made instead of staging it for a Save. The other steps
+launch the real dashboard -- `HubPublicLibraryView`, `/profile generate`,
+`SessionConfigView` -- as a *separate* ephemeral message, by deferring with
+`thinking=True`. On a component interaction that sends a new message rather than
+updating this one, so those views' `edit_original_response` lands on the new message
+and the wizard survives underneath to be refreshed.
 
 Prose lives in `content.WIZARD_COPY`, and depth is not repeated: each step names a
-`HELP_CATEGORIES` page, and Read More opens the guide browser on it.
+`HELP_CATEGORIES` page, and the Guide button opens the guide browser on it.
 """
 
 import asyncio
@@ -33,10 +34,18 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 from ..utils.constants import CAST_POLICY_OPEN, DEFAULT_CAST_POLICY, MODEL_PROVIDERS, defaultConfig
 from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
 from ..utils.content import HELP_CATEGORIES, WIZARD_COPY, WIZARD_TOUR
-from .base_components import BlockedGuard, DropdownContentView, TimeoutCleanupMixin, add_button
+from .base_components import (BlockedGuard, DropdownContentView, TimeoutCleanupMixin, add_button,
+                              add_select)
+from .gui_settings import (KEY_SLOTS, SLOT_PROVIDER, KeyScopeMixin, OverrideConfirmView,
+                           SubmitAPIKeyModal, _fit_list)
 
 if TYPE_CHECKING:
     from ..MimicCog import MimicCog
+
+
+#: Where each provider hands out keys, behind the key step's link button.
+KEY_PAGES = {"openrouter": "https://openrouter.ai/settings/keys",
+             "gemini": "https://aistudio.google.com/app/apikey"}
 
 
 class _Step:
@@ -45,23 +54,24 @@ class _Step:
     `probe` reads the state dict assembled once per repaint rather than touching disk
     itself, so adding a step costs no extra reads unless it needs something new.
 
-    `context` is "dm", "guild" or "any". `requires` names boolean keys in the same
-    state dict, so a gate that is not a fixed property of the user -- seating is open
-    to administrators *or* to anyone in an Open casting channel -- is probed at repaint
-    like every other fact here rather than baked into the table. Both describe where the
-    step's *action* can run; a step that cannot run here is still drawn, with the reason
-    of the first gate that is shut.
+    `context` is "guild" or "any". `requires` names keys in the same state dict that
+    must be truthy, so a gate that is not a fixed property of the user -- seating is
+    open to administrators *or* to anyone in an Open casting channel -- is probed at
+    repaint like every other fact here rather than baked into the table. Both describe
+    where the step's *action* can run; a step that cannot run here is still drawn, with
+    the reason of the first gate that is shut.
 
     `actions` names methods on the view. Kept as names so this table stays readable as
     data, and so a step with no action -- the last one, which is just "talk" -- simply
-    declares none.
+    declares none. A `repeatable` step keeps its actions once done, when picked from
+    the dropdown: another character, another cast, the other provider.
     """
 
     __slots__ = ("key", "title", "help_ref", "context", "requires", "probe",
-                 "actions", "done_detail")
+                 "actions", "done_detail", "repeatable")
 
     def __init__(self, key, title, help_ref, probe, *, context="any",
-                 requires=None, actions=(), done_detail=None):
+                 requires=None, actions=(), done_detail=None, repeatable=False):
         self.key = key
         self.title = title
         self.help_ref = help_ref
@@ -70,25 +80,26 @@ class _Step:
         self.requires = (requires,) if isinstance(requires, str) else tuple(requires or ())
         self.actions = actions
         self.done_detail = done_detail
+        self.repeatable = repeatable
 
-    @property
-    def blurb(self) -> str:
-        return WIZARD_COPY.get(self.key, "")
+    def blurb(self, state: Dict[str, Any]) -> str:
+        copy = WIZARD_COPY.get(self.key, "")
+        # The key step speaks for the provider chosen before it, and only that one.
+        if isinstance(copy, dict):
+            return copy.get(state.get("provider") or "openrouter", "")
+        return copy
+
+    def in_context(self, state: Dict[str, Any]) -> bool:
+        return self.context != "guild" or state["in_guild"]
 
     def available(self, state: Dict[str, Any]) -> bool:
         """Whether this step's action can be taken from where the command was run."""
-        if self.context == "dm" and state["in_guild"]:
-            return False
-        if self.context == "guild" and not state["in_guild"]:
-            return False
-        return all(state.get(gate) for gate in self.requires)
+        return self.in_context(state) and all(state.get(gate) for gate in self.requires)
 
     def blocker(self, state: Dict[str, Any]) -> str:
         """Why this step is not actionable here. Only read when `available` is False."""
-        if self.context == "dm" and state["in_guild"]:
-            return "in a DM with me"
-        if self.context == "guild" and not state["in_guild"]:
-            return "in a server channel"
+        if not self.in_context(state):
+            return "only in a server channel"
         for gate in self.requires:
             if not state.get(gate):
                 return _GATE_REASONS.get(gate, "not available here")
@@ -99,39 +110,35 @@ class _Step:
 # step table rather than inside `_Step` so a new gate is one line in each of two
 # places that sit together, and never a message assembled in the renderer.
 _GATE_REASONS = {
+    "provider": "choose a provider first",
     "server_key": "needs an API key assigned to this server",
     "can_cast": "needs administrator, or Open casting",
 }
 
 
 WIZARD_STEPS = (
-    _Step("key", "Connect an API key",
-          ("1. Getting Started", "API Keys and Where They Apply"),
-          lambda s: s["has_key"], context="dm",
-          actions=("_act_open_keys",),
-          done_detail=lambda s: s["key_detail"]),
-    # Before the character: a new profile and a generated draft both start on it.
+    # First: it decides which key the next step asks for, and it can be answered anywhere.
     _Step("provider", "Choose a provider",
           ("1. Getting Started", "API Keys and Where They Apply"),
-          lambda s: bool(s["provider"]),
-          actions=("_act_prefer_gemini", "_act_prefer_openrouter"),
-          done_detail=lambda s: f"{MODEL_PROVIDERS.get(s['provider'], s['provider'])} "
-                                f"· change it in `/settings` → About Me"),
+          lambda s: bool(s["provider"]), repeatable=True,
+          actions=("_act_prefer_openrouter", "_act_prefer_gemini"),
+          done_detail=lambda s: MODEL_PROVIDERS.get(s["provider"], s["provider"])),
+    _Step("key", "Add your API key",
+          ("1. Getting Started", "API Keys and Where They Apply"),
+          lambda s: s["has_key"], requires="provider",
+          actions=("_act_get_key", "_act_paste_key"),
+          done_detail=lambda s: s["key_detail"] or "using this server's key"),
+    # Done once a character has something written: a borrow and a Generate draft arrive
+    # that way, and a blank `/profile create` is not yet a character to talk to.
     _Step("profile", "Get a character",
-          ("1. Getting Started", "Profile Classes (PIDs)"),
-          lambda s: bool(s["personal"] or s["borrowed"]),
-          actions=("_act_library", "_act_generate", "_act_create"),
-          done_detail=lambda s: f"{len(s['personal']) + len(s['borrowed'])} profile(s)"),
-    _Step("voice", "Give it a voice",
           ("2. Writing a Character", "Persona vs Instructions"),
-          lambda s: s["has_written"],
-          actions=("_act_open_dashboard",),
-          done_detail=lambda s: (f"`{s['written_name']}` is written"
-                                 if s["written_name"] else "ready")),
+          lambda s: s["has_written"], repeatable=True,
+          actions=("_act_library", "_act_generate"),
+          done_detail=lambda s: f"`{s['written_name']}` is ready"),
     _Step("seat", "Seat it in this channel",
           ("5. Sessions", "Starting and Shaping a Session"),
           lambda s: s["seated"], context="guild", requires=("server_key", "can_cast"),
-          actions=("_act_cast",),
+          actions=("_act_cast",), repeatable=True,
           done_detail=lambda s: f"{s['seated_count']} in the cast"),
     _Step("speak", "Say something to it",
           ("5. Sessions", "Reactivity and Proactivity"),
@@ -206,17 +213,11 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
 
         server_has_key = False
         server_key_held = False
-        admin_guilds = 0
         if guild is not None:
             idx = cog.server_manager._get_server_index(str(guild.id)) or {}
             server_key_held = cog.storage_manager.gemini_blocked_for_guild(guild.id)
             held = {"gemini"} if server_key_held else set()
             server_has_key = bool(set(idx.get("assigned_keys") or {}) - held)
-        else:
-            for g in cog.bot.guilds:
-                member = g.get_member(user_id)
-                if member and member.guild_permissions.administrator:
-                    admin_guilds += 1
 
         # A dehydrated session has an empty in-memory log but a blueprint on disk. It
         # has been used; reading the log back to prove it would mean decrypting a whole
@@ -245,7 +246,7 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
                 "provider": (index.get("about") or {}).get("provider"),
                 "has_key": usable_key, "key_detail": key_detail,
                 "server_has_key": server_has_key, "server_key_held": server_key_held,
-                "admin_guilds": admin_guilds, "seated_disk": seated_disk,
+                "seated_disk": seated_disk,
                 "cast_policy": cast_policy}
 
     state = await asyncio.to_thread(_sync)
@@ -286,8 +287,10 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
     return state
 
 
-class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
+class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View):
     timeout_message = "Setup closed. Run `/start` again — it picks up where you left off."
+    # Every key added here is Personal; the picker under the key step is for servers.
+    _OFFER_PERSONAL = False
 
     def __init__(self, cog: "MimicCog", interaction: discord.Interaction,
                  state: Dict[str, Any]):
@@ -296,16 +299,24 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         self.original_interaction = interaction
         self.user_id = interaction.user.id
         self.state = state
-        self.screen = "overview"
+        self.screen = "setup"
+        # The step picked from the dropdown; None follows the first one not done.
         self.step_key: Optional[str] = None
         self.tour_page = next(iter(WIZARD_TOUR))
+        self._init_scopes()
+        if interaction.guild is not None:
+            # The server it was run in first: the one its runner came here to fix.
+            self.admin_guilds.sort(key=lambda g: g.id != interaction.guild.id)
+        self._sync_slot()
         self._build_view()
 
     # --- state ------------------------------------------------------------
 
     @property
-    def step(self) -> Optional[_Step]:
-        return next((s for s in WIZARD_STEPS if s.key == self.step_key), None)
+    def focus(self) -> Optional[_Step]:
+        """The step on screen: the one picked, else the first not done."""
+        picked = next((s for s in WIZARD_STEPS if s.key == self.step_key), None)
+        return picked or self._next_incomplete()
 
     def _done(self, step: _Step) -> bool:
         try:
@@ -316,20 +327,50 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     def _next_incomplete(self) -> Optional[_Step]:
         return next((s for s in WIZARD_STEPS if not self._done(s)), None)
 
-    async def _refresh_state(self, interaction: discord.Interaction):
+    def _sync_slot(self):
+        """The key the server picker assigns: your Personal key for the provider you
+        chose, else any Personal key you hold. Reloaded from disk on every repaint,
+        since every pick here is saved as it is made."""
+        keys = self.cog.storage_manager._get_user_keys_data(self.user_id) or {}
+        personal = keys.get("personal_assignments") or {}
+        slot = personal.get(self.state.get("provider")) or next(iter(personal.values()), None)
+        self.selected_slot = slot if slot in SLOT_PROVIDER else None
+        self._load_scopes()
+
+    async def _repaint(self):
+        """Re-probe, rebuild, redraw. What every action that changes state ends on --
+        and what the key form and the override prompt call back into."""
         self.state = await gather_state(self.cog, self.original_interaction)
+        self._sync_slot()
+        self._build_view()
+        await self.update_display()
+
+    async def _scopes_picked(self, interaction: discord.Interaction):
+        """Applied as picked, Personal kept: nothing here waits on a Save."""
+        if not self.selected_slot:
+            return
+        scopes = self.selected_scopes | {"personal"}
+        conflicts = self._assignment_conflicts(self.selected_slot, scopes)
+        if conflicts:
+            # Nothing is taken from another key unasked. The ticks fall back to what is
+            # saved on the repaint, and the prompt applies them if confirmed.
+            await interaction.followup.send(
+                OverrideConfirmView.prompt(conflicts),
+                view=OverrideConfirmView(self, self.selected_slot, scopes), ephemeral=True)
+            return
+        self._apply_assignments(self.selected_slot, scopes)
 
     # --- rendering --------------------------------------------------------
 
     def _banner(self) -> str:
         s = self.state
         if not s["in_guild"]:
-            admin_line = (f"admin of **{s['admin_guilds']}**" if s["admin_guilds"]
-                          else "not an admin anywhere yet")
+            admins = len(self.admin_guilds)
+            admin_line = f"admin of **{admins}**" if admins else "not an admin anywhere yet"
             return (f"📍 **You're in** a direct message with me\n"
                     f"👤 **You** are in {len(self.cog.bot.guilds)} server(s) I'm in, {admin_line}\n\n"
-                    "This is the only place API keys can be entered. Steps 1–4 work here; "
-                    "for 5 and 6, run `/start` again in a channel.")
+                    "Seating a character happens in a server channel: run `/start` there "
+                    "when you reach it.")
 
         guild, channel = s["guild"], s["channel"]
         where = f"📍 **You're in** #{getattr(channel, 'name', 'this channel')} · **{guild.name}**\n"
@@ -344,38 +385,55 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             key_line = "🔑 **This server** has no API key assigned yet — nothing here can generate"
 
         if s["is_admin"]:
-            role = "🛡️ **Your role** Server administrator\n"
-            note = ("You can do everything here. Adding an API key is the one thing "
-                    "Discord makes you do in a DM.")
+            return f"{where}🛡️ **Your role** Server administrator\n{key_line}"
+        role = "👤 **Your role** Member (not an administrator)\n"
+        if s["can_cast"]:
+            note = ("This channel is on **Open casting** — you can seat characters here "
+                    "yourself.")
         else:
-            role = "👤 **Your role** Member (not an administrator)\n"
-            note = (("You can build characters here, and this channel is on **Open "
-                     "casting** — you can seat them yourself."
-                     if s["can_cast"] else
-                     "You can build characters here, but only admins can seat them in a "
-                     "channel.")
-                    + "\n\n💡 **Want somewhere to test freely?** Make your own server — "
-                    "it's free and takes about thirty seconds (**+** in your server list → "
-                    "*Create My Own*). You'll be its admin, and `/invite` adds me to it. "
-                    "Your profiles come with you: they belong to you, not to a server.")
+            note = ("Only admins can seat characters in this channel.\n\n"
+                    "💡 **Want somewhere to test freely?** Make your own server — it's free "
+                    "and takes about thirty seconds (**+** in your server list → *Create My "
+                    "Own*). You'll be its admin, and `/invite` adds me to it. Your profiles "
+                    "come with you: they belong to you, not to a server.")
         return f"{where}{role}{key_line}\n\n{note}"
+
+    def _mark(self, step: _Step) -> str:
+        if self._done(step):
+            return "✅"
+        if not step.available(self.state):
+            return "🔒" if step.in_context(self.state) else "↗️"
+        return "⬜"
 
     def _checklist(self) -> str:
         lines = []
+        focus = self.focus
         for number, step in enumerate(WIZARD_STEPS, start=1):
-            done = self._done(step)
-            available = step.available(self.state)
-            if done:
-                mark, detail = "✅", (step.done_detail(self.state) if step.done_detail else "")
-            elif not available:
-                mark = "🔒" if step.requires and self.state["in_guild"] else "↗️"
+            mark = self._mark(step)
+            if mark == "✅":
+                detail = step.done_detail(self.state) if step.done_detail else ""
+            elif mark != "⬜":
                 detail = step.blocker(self.state)
             else:
-                mark = "⬜"
-                detail = "← you are here" if step is self._next_incomplete() else ""
+                detail = "← you are here" if step is focus else ""
             padded = f"{mark} **{number}. {step.title}**"
             lines.append(f"{padded}  ·  {detail}" if detail else padded)
         return "\n".join(lines)
+
+    def _step_text(self, step: _Step) -> str:
+        """The focused step's field: what to do, then where it stands."""
+        parts = [step.blurb(self.state)]
+        mark = self._mark(step)
+        if mark == "✅":
+            detail = step.done_detail(self.state) if step.done_detail else ""
+            parts.append("✅ **Done**" + (f" · {detail}" if detail else ""))
+        elif mark != "⬜":
+            reason = step.blocker(self.state)
+            parts.append(f"{mark} **Not yet** — {reason[0].upper()}{reason[1:]}.")
+        if step.key == "key" and self.selected_slot:
+            parts.append("**In use:** " + _fit_list(self._scope_labels(self.selected_scopes),
+                                                    ", ", 300))
+        return "\n\n".join(p for p in parts if p)
 
     def embed(self) -> discord.Embed:
         if self.screen == "tour":
@@ -383,32 +441,20 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
                                  color=discord.Color.blurple()
                                  ).set_author(name="MimicAI · Using it")
 
-        if self.screen == "step" and self.step:
-            step = self.step
-            number = WIZARD_STEPS.index(step) + 1
-            e = discord.Embed(title=f"Step {number}. {step.title}", description=step.blurb,
-                              color=(discord.Color.green() if self._done(step)
-                                     else discord.Color.blurple()))
-            e.set_author(name="MimicAI · Getting Started")
-            if self._done(step):
-                detail = step.done_detail(self.state) if step.done_detail else ""
-                e.add_field(name="Done", value=detail or "Already set up.", inline=False)
-            elif not step.available(self.state):
-                e.add_field(name="Not from here",
-                            value=f"This step has to be done {step.blocker(self.state)}.",
-                            inline=False)
-            return e
-
         done = sum(1 for s in WIZARD_STEPS if self._done(s))
         e = discord.Embed(title="Getting Started", description=self._banner(),
                           color=(discord.Color.green() if done == len(WIZARD_STEPS)
                                  else discord.Color.blurple()))
         e.add_field(name=f"Setup — {done} of {len(WIZARD_STEPS)} done",
                     value=self._checklist(), inline=False)
-        if done == len(WIZARD_STEPS):
+        focus = self.focus
+        if focus is None:
             e.add_field(name="You're set up",
                         value="Just talk in the channel. **Using it ▸** covers what else there is.",
                         inline=False)
+        else:
+            e.add_field(name=f"Step {WIZARD_STEPS.index(focus) + 1}. {focus.title}",
+                        value=self._step_text(focus), inline=False)
         return e
 
     def render(self) -> Dict[str, Any]:
@@ -424,53 +470,34 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             self._build_setup()
 
     def _build_setup(self):
+        focus = self.focus
+        if focus is not None:
+            done = self._done(focus)
+            if focus.available(self.state) and (
+                    not done or (focus.repeatable and self.step_key == focus.key)):
+                for name in focus.actions:
+                    self.add_item(self._make_action_button(name))
+            if done and self.step_key and self._next_incomplete() is not None:
+                add_button(self, "Next step ▸", self._act_next,
+                           style=discord.ButtonStyle.primary, row=0)
+            if focus.key == "key" and self.selected_slot and self.admin_guilds:
+                self._add_scope_select(row=1, placeholder="Use this key in servers you run...")
+
         options = []
-        if self.screen == "step":
-            options.append(discord.SelectOption(label="◂ Overview", value="__overview__",
-                                                description="The whole checklist."))
         for number, step in enumerate(WIZARD_STEPS, start=1):
-            mark = "✅" if self._done(step) else ("🔒" if not step.available(self.state) else "⬜")
             options.append(discord.SelectOption(
-                label=f"{mark} {number}. {step.title}"[:100], value=step.key,
-                description=step.blurb.replace("**", "").split("\n")[0][:100],
-                default=(step.key == self.step_key and self.screen == "step")))
-
-        select = ui.Select(placeholder="Open a step...", options=options[:25], row=0)
-
-        async def pick(interaction: discord.Interaction):
-            value = select.values[0]
-            if value == "__overview__":
-                self.screen, self.step_key = "overview", None
-            else:
-                self.screen, self.step_key = "step", value
-            self._build_view()
-            await interaction.response.edit_message(**self.render())
-
-        select.callback = pick
-        self.add_item(select)
-
-        target = self.step if self.screen == "step" else self._next_incomplete()
-        if target is not None and not self._done(target):
-            if target.available(self.state):
-                for name in target.actions:
-                    self.add_item(self._make_action_button(target, name))
-            elif target.context == "dm" and self.state["in_guild"]:
-                # Otherwise a guild user with no key sees the step they are blocked on
-                # and no way forward from it -- the one place this wizard could dead-end.
-                # A step blocked the other way (guild-only, read in a DM) needs no button:
-                # "go to a channel" is not something a button can do for them.
-                self.add_item(self._make_action_button(target, "_act_dm_me"))
-
-        if self.screen == "step" and self.step is not None:
-            add_button(self, "📖 Read more", self._act_read_more,
-                       style=discord.ButtonStyle.secondary, row=2)
+                label=f"{self._mark(step)} {number}. {step.title}"[:100], value=step.key,
+                description=step.blurb(self.state).replace("**", "").split("\n")[0][:100] or None,
+                default=step is focus))
+        add_select(self, options, self._act_pick_step, placeholder="Jump to a step...", row=2)
 
         add_button(self, "🔄 Refresh", self._act_refresh, style=discord.ButtonStyle.secondary,
-                   row=2)
-
-        add_button(self, "Full guide", self._act_guide, style=discord.ButtonStyle.secondary, row=2)
-
-        add_button(self, "Using it ▸", self._act_tour, style=discord.ButtonStyle.primary, row=3)
+                   row=3)
+        add_button(self, "📖 Guide", self._act_guide, style=discord.ButtonStyle.secondary, row=3)
+        # Not before: what there is to do once it talks is noise while it cannot.
+        if focus is None:
+            add_button(self, "Using it ▸", self._act_tour, style=discord.ButtonStyle.primary,
+                       row=3)
 
     def _build_tour(self):
         options = [discord.SelectOption(label=page, value=page,
@@ -487,28 +514,29 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         self.add_item(select)
 
         async def go_back(interaction: discord.Interaction):
-            self.screen, self.step_key = "overview", None
+            self.screen, self.step_key = "setup", None
             self._build_view()
             await interaction.response.edit_message(**self.render())
         add_button(self, "◂ Setup", go_back, style=discord.ButtonStyle.primary, row=1)
 
-        add_button(self, "Full guide", self._act_guide, style=discord.ButtonStyle.secondary, row=1)
+        add_button(self, "📖 Guide", self._act_guide, style=discord.ButtonStyle.secondary, row=1)
 
     _ACTION_LABELS = {
-        "_act_open_keys": ("Open API Keys", discord.ButtonStyle.success),
-        "_act_prefer_gemini": ("Google", discord.ButtonStyle.primary),
-        "_act_prefer_openrouter": ("OpenRouter", discord.ButtonStyle.primary),
+        "_act_prefer_openrouter": ("OpenRouter (recommended)", discord.ButtonStyle.success),
+        "_act_prefer_gemini": ("Google (paid key)", discord.ButtonStyle.secondary),
+        "_act_paste_key": ("🔑 Paste key", discord.ButtonStyle.success),
         "_act_library": ("🏛️ Browse Library", discord.ButtonStyle.success),
         "_act_generate": ("✨ Generate one", discord.ButtonStyle.primary),
-        "_act_create": ("📝 Blank", discord.ButtonStyle.secondary),
-        "_act_open_dashboard": ("Open Dashboard", discord.ButtonStyle.success),
         "_act_cast": ("Open Cast Editor", discord.ButtonStyle.success),
-        "_act_dm_me": ("📩 Send me the DM version", discord.ButtonStyle.success),
     }
 
-    def _make_action_button(self, step: _Step, name: str) -> ui.Button:
+    def _make_action_button(self, name: str) -> ui.Button:
+        if name == "_act_get_key":
+            # A link: Discord opens it, and no interaction reaches us.
+            return ui.Button(label="Get a key ↗", row=0,
+                             url=KEY_PAGES[self.state.get("provider") or "openrouter"])
         label, style = self._ACTION_LABELS.get(name, (name, discord.ButtonStyle.secondary))
-        btn = ui.Button(label=label, style=style, row=1)
+        btn = ui.Button(label=label, style=style, row=0)
         btn.callback = getattr(self, name)
         return btn
 
@@ -518,11 +546,19 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     # deferred_channel_message rather than a message update, so the view it opens edits
     # a NEW ephemeral message and this one is still on screen to refresh afterwards.
 
+    async def _act_pick_step(self, interaction: discord.Interaction):
+        self.step_key = interaction.data["values"][0]
+        self._build_view()
+        await interaction.response.edit_message(**self.render())
+
+    async def _act_next(self, interaction: discord.Interaction):
+        self.step_key = None
+        self._build_view()
+        await interaction.response.edit_message(**self.render())
+
     async def _act_refresh(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        await self._refresh_state(interaction)
-        self._build_view()
-        await interaction.edit_original_response(**self.render())
+        await self._repaint()
 
     async def _act_tour(self, interaction: discord.Interaction):
         self.screen = "tour"
@@ -530,52 +566,23 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         await interaction.response.edit_message(**self.render())
 
     async def _act_guide(self, interaction: discord.Interaction):
-        view = DropdownContentView(HELP_CATEGORIES, "MimicAI Help & Documentation")
-        await interaction.response.send_message(embed=view.get_embed(), view=view, ephemeral=True)
-
-    async def _act_read_more(self, interaction: discord.Interaction):
-        step = self.step
-        category, page = step.help_ref if step else (None, None)
+        focus = self.focus if self.screen == "setup" else None
+        category, page = focus.help_ref if focus else (None, None)
         view = DropdownContentView(HELP_CATEGORIES, "MimicAI Help & Documentation",
                                    start_category=category, start_page=page)
         await interaction.response.send_message(embed=view.get_embed(), view=view, ephemeral=True)
 
-    async def _act_dm_me(self, interaction: discord.Interaction):
-        """Carries the key step into a DM, where it is the only place it can be done.
-
-        Sends the step's own copy rather than another wizard: a view posted to a DM has
-        no interaction behind it, so its Refresh and its timeout cleanup would both be
-        dead controls. Running `/start` there builds a real one, with the DM's context.
-        """
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        step = next(s for s in WIZARD_STEPS if s.key == "key")
-        try:
-            channel = await interaction.user.create_dm()
-            await channel.send(
-                embed=discord.Embed(title="Step 1. Connect an API key",
-                                    description=step.blurb,
-                                    color=discord.Color.blurple()
-                                    ).set_footer(text="Run /start here to continue setup."))
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "I can't DM you — your privacy settings block direct messages from this "
-                "server. Turn them on for this server, or open a DM with me yourself and "
-                "run `/start` there.", ephemeral=True)
-            return
-        except Exception:
-            await interaction.followup.send(
-                "I couldn't send that DM. Open a DM with me and run `/start` there.",
-                ephemeral=True)
-            return
-        await interaction.followup.send(
-            "📨 Sent. Check your DMs and run `/start` there to add a key — then come back "
-            "here and press 🔄 Refresh.", ephemeral=True)
-
-    async def _act_open_keys(self, interaction: discord.Interaction):
-        from .gui_settings import SettingsAPIView
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        view = SettingsAPIView(self.cog, interaction)
-        await view.update_display()
+    async def _act_paste_key(self, interaction: discord.Interaction):
+        provider = self.state.get("provider") or "openrouter"
+        filled = (self.cog.storage_manager._get_user_keys_data(self.user_id) or {}).get("slots") or {}
+        mine = [slot for slot, _label, p in KEY_SLOTS if p == provider]
+        # An empty slot first; with both full, the first is replaced, as Edit Key would.
+        slot = next((s for s in mine if s not in filled), mine[0])
+        if self.admin_guilds:
+            # Stay on this step once it is done: the server picker appears under it.
+            self.step_key = "key"
+        await interaction.response.send_modal(
+            SubmitAPIKeyModal(self.cog, slot, provider, view=self, assign_personal=True))
 
     async def _act_prefer_gemini(self, interaction: discord.Interaction):
         await self._prefer(interaction, "gemini")
@@ -584,12 +591,11 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         await self._prefer(interaction, "openrouter")
 
     async def _prefer(self, interaction: discord.Interaction, provider: str):
-        """Asked here, stored by the setter About Me uses, and changed there afterwards."""
+        """Asked here, stored by the setter About Me uses, and changed in either."""
         await interaction.response.defer()
         self.cog.profile_manager.set_provider_preference(self.user_id, provider)
-        await self._refresh_state(interaction)
-        self._build_view()
-        await interaction.edit_original_response(**self.render())
+        self.step_key = None
+        await self._repaint()
 
     async def _act_library(self, interaction: discord.Interaction):
         from .gui_hub import HubPublicLibraryView
@@ -619,20 +625,8 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         await interaction.response.defer(thinking=True, ephemeral=True)
         await self.cog._open_session_config(interaction)
 
-    async def _act_open_dashboard(self, interaction: discord.Interaction):
-        name = (self.state["personal"] or self.state["borrowed"] or [None])[0]
-        if not name:
-            await interaction.response.send_message(
-                "Make a character first — step 3.", ephemeral=True)
-            return
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        await self.cog._open_profile_manage(interaction, name, repaint=True)
-
-    async def _act_create(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(NewProfileModal(self.cog, generate=False))
-
     async def _act_generate(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(NewProfileModal(self.cog, generate=True))
+        await interaction.response.send_modal(NewProfileModal(self.cog))
 
     async def update_display(self):
         """Paints onto the command interaction's own deferred response.
@@ -658,34 +652,28 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
 
 
 class NewProfileModal(ui.Modal):
-    """Collects a name (and a concept) and hands off to the real slash command.
+    """Collects a name and a concept and hands off to `/profile generate`.
 
-    `/profile create` and `/profile generate` carry name validation, the profile and
-    key-access limits, and in the generate case ninety lines of prompt assembly and
-    parsing. Calling their callbacks directly means the wizard -- and the Public
-    Library's Generate button -- cannot drift from what those commands do, including
-    their error messages, which are the ones the rest of the documentation describes.
+    That command carries name validation, the profile and key-access limits, and ninety
+    lines of prompt assembly and parsing. Calling its callback directly means the wizard
+    -- and the Public Library's Generate button -- cannot drift from what it does,
+    including its error messages, which are the ones the rest of the documentation
+    describes.
     """
 
-    def __init__(self, cog: 'MimicCog', *, generate: bool = False):
-        super().__init__(title="Generate a Character" if generate else "New Character")
+    def __init__(self, cog: 'MimicCog'):
+        super().__init__(title="Generate a Character")
         self.cog = cog
-        self.generate = generate
         self.name_input = ui.TextInput(
             label="Name", placeholder="e.g. detective", max_length=32, required=True)
         self.add_item(self.name_input)
-        if generate:
-            self.concept_input = ui.TextInput(
-                label="Concept", style=discord.TextStyle.paragraph, max_length=500,
-                placeholder="e.g. A cynical noir detective who never removes his coat.",
-                required=True)
-            self.add_item(self.concept_input)
+        self.concept_input = ui.TextInput(
+            label="Concept", style=discord.TextStyle.paragraph, max_length=500,
+            placeholder="e.g. A cynical noir detective who never removes his coat.",
+            required=True)
+        self.add_item(self.concept_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        cog = self.cog
-        name = (self.name_input.value or "").strip()
-        if self.generate:
-            await cog.profile_generate_slash.callback(
-                cog, interaction, (self.concept_input.value or "").strip(), name)
-        else:
-            await cog.create_profile_slash.callback(cog, interaction, name)
+        await self.cog.profile_generate_slash.callback(
+            self.cog, interaction, (self.concept_input.value or "").strip(),
+            (self.name_input.value or "").strip())
