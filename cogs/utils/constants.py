@@ -2459,7 +2459,9 @@ PATTERN_SYSTEM_XML_BLOCKS = re.compile(rf'<({_tags_pattern})>.*?</\1>', flags=re
 PATTERN_SYSTEM_XML_ORPHANS = re.compile(rf'</?({_tags_pattern})>', flags=re.IGNORECASE)
 PATTERN_REASONING_BLOCKS = re.compile(r'<(think|thought|reasoning)>.*?</\1>', flags=re.DOTALL | re.IGNORECASE)
 PATTERN_REASONING_ORPHANS = re.compile(r'</?(think|thought|reasoning)>', flags=re.IGNORECASE)
-PATTERN_SYSTEM_HEADER = re.compile(r'(?i)(?:^|\n)(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[ID:[^\]\r\n]+\](?:\s*\[[^\]\r\n]+\])?:\s*')
+#: The colon is optional only where the header ends its line: a model copying the header
+#: sometimes drops it, and the ID and time then reached the channel.
+PATTERN_SYSTEM_HEADER = re.compile(r'(?i)(?:^|\n)(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[ID:[^\]\r\n]+\](?:\s*\[[^\]\r\n]+\])?(?::\s*|[ \t]*(?:\r?\n|$))')
 PATTERN_TIMESTAMP_HEADER = re.compile(r'(?i)(?:^|\n)(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\]\r\n]+\]:\s*')
 
 #: The turn-telemetry footer, `(Thought Initiated: 12:31 | Duration: 4.21s)`, which

@@ -619,7 +619,7 @@ class MimicCog(EventListeners, commands.Cog):
         )
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
         
-        embed.add_field(name="Version", value="v0.6.0 Beta", inline=True)
+        embed.add_field(name="Version", value="v0.6.1 Beta", inline=True)
         embed.add_field(name="Global Scope", value=f"{len(self.bot.guilds)} Servers", inline=True)
 
         if is_owner:
