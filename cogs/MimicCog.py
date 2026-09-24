@@ -12,7 +12,7 @@ from .utils.constants import (
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
     IMPORT_FILE_TOO_LARGE, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE,
 )
-from .services.profile_generation import ProfileGenerationError, generate_draft
+from .services.profile_generation import ProfileGenerationError, clean_display_name, generate_draft
 from .listeners.event_listeners import EventListeners
 from .gui.base_components import ActionTextInputModal, DropdownContentView, InviteView
 from .gui.gui_data import PrivacyDashboardView, ImportPassphraseModal, BulkExportView
@@ -384,18 +384,40 @@ class MimicCog(EventListeners, commands.Cog):
 
     @profile_group.command(name="generate", description="Uses AI to draft a new profile from a concept, for you to review before saving.")
     @app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
+    @app_commands.rename(profile_name="internal_name")
     @app_commands.describe(
         prompt="The character concept (e.g., 'A cynical noir detective').",
-        profile_name="The unique internal name for the new profile."
+        profile_name="The unique internal name you manage the profile by.",
+        display_name="The name it speaks under. Left blank, the draft picks one.",
+        avatar_url="A link to the image it speaks with, as under Appearance."
     )
-    async def profile_generate_slash(self, interaction: discord.Interaction, prompt: str, profile_name: str):
+    async def profile_generate_slash(self, interaction: discord.Interaction, prompt: str, profile_name: str,
+                                     display_name: Optional[app_commands.Range[str, 1, 20]] = None,
+                                     avatar_url: Optional[str] = None):
         await interaction.response.defer(ephemeral=True, thinking=True)
         profile_name = profile_name.lower().strip()
 
         is_valid, err_msg = self.profile_manager._is_valid_profile_name(profile_name)
         if not is_valid:
-            await interaction.followup.send(f"❌ **Invalid Name:** {err_msg}", ephemeral=True)
+            await interaction.followup.send(f"❌ **Invalid Internal Name:** {err_msg}", ephemeral=True)
             return
+
+        # Held beside the draft rather than written into it: Regenerate replaces the draft.
+        appearance = {}
+        if (display_name or "").strip():
+            appearance["display_name"] = clean_display_name(display_name)
+            if not appearance["display_name"]:
+                await interaction.followup.send(
+                    "❌ **Invalid Display Name:** 20 characters at most, with no Discord, Clyde "
+                    "or @mention in it.", ephemeral=True)
+                return
+        if (avatar_url or "").strip():
+            appearance["avatar_url"] = avatar_url.strip()
+            if not appearance["avatar_url"].startswith(("https://", "http://")):
+                await interaction.followup.send(
+                    "❌ **Invalid Avatar URL:** It must be a link starting with https://.",
+                    ephemeral=True)
+                return
             
         if not prompt.strip():
             await interaction.followup.send("Prompt cannot be empty.", ephemeral=True)
@@ -421,7 +443,8 @@ class MimicCog(EventListeners, commands.Cog):
                 f"❌ **Generation Failed:** {suppress_link_previews(str(e))}", ephemeral=True)
             return
 
-        view = GeneratedProfileView(self, interaction, profile_name, concept, draft, model_used)
+        view = GeneratedProfileView(self, interaction, profile_name, concept, draft, model_used,
+                                    appearance)
         await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
 
     @profile_group.command(name="manage", description="Manage all settings for a specific profile from a unified dashboard.")

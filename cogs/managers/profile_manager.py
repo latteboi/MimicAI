@@ -20,14 +20,14 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from ..utils.user_defaults import (
-    apply_defaults, model_chain, model_provider, model_slot_defaults, other_provider,
-    platform_model_defaults, sanitise_defaults, setting_label, short_model_name)
+    MODEL_SLOT_PAIRS, apply_defaults, model_chain, model_provider, model_slot_defaults,
+    other_provider, platform_model_defaults, sanitise_defaults, setting_label, short_model_name)
 from ..utils.helpers import is_real_model
 from ..utils.constants import (
     USERS_DIR, PUBLIC_PROFILES_DIR, BORROW_INDEX_FILE, PROFILE_NAME_SIDECAR,
     PID_CLASS_PREFIXES, defaultConfig,
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS,
-    DEFAULT_ANTI_REPETITION_PROMPT, UTILITY_FALLBACK_KEYS,
+    DEFAULT_ANTI_REPETITION_PROMPT, UTILITY_FALLBACK_KEYS, NO_FALLBACK,
     TTS_VOICE_GENDER, TTS_VOICE_CHARACTER,
     DEFAULT_SAFETY_SETTINGS,
     CONTENT_RATING_LABELS, CHANNEL_ACCESS_LABELS,
@@ -1541,7 +1541,7 @@ class ProfileManager:
         right answer, and churning it would only hide where the problem came from.
 
         The target is the slot's shipped value on the user's effective provider, so an
-        OpenRouter-only borrower lands on the same Gemini models through OpenRouter.
+        OpenRouter-only borrower lands on the models OpenRouter ships.
         """
         rescued = []
         for slot, platform_value in model_slot_defaults(self.effective_provider(user_id)).items():
@@ -1555,6 +1555,39 @@ class ProfileManager:
             config[slot] = platform_value
             rescued.append(slot)
         return sorted(rescued)
+
+    def _borrower_defaults(self, user_id: int, config: Dict[str, Any]) -> Dict[str, Any]:
+        """What this user's defaults would change on a borrow of `config`, as {key: value}.
+
+        The models their provider ships, then Override Defaults' borrow-scoped keys -- a
+        borrow made theirs the way a new profile is. Empty until they choose a provider.
+        """
+        preferred = self.provider_preference(user_id)
+        if not preferred:
+            return {}
+        mine = {**config, **model_slot_defaults(preferred)}
+        apply_defaults(mine, self._get_user_defaults(user_id), borrowed=True)
+        return {k: v for k, v in mine.items() if config.get(k) != v}
+
+    async def _ask_borrow_defaults(self, interaction: discord.Interaction, profile_name: str,
+                                   changes: Dict[str, Any]) -> bool:
+        """Whether the borrower takes their defaults over the author's. No answer is no."""
+        from ..gui.gui_hub import BorrowDefaultsView
+        labels = sorted({setting_label(k) for k in changes})
+        named = ", ".join(f"**{label}**" for label in labels[:6])
+        if len(labels) > 6:
+            named += f" and {len(labels) - 6} more"
+        view = BorrowDefaultsView(self.cog)
+        message = await interaction.followup.send(
+            f"Borrowing `{profile_name}`: your defaults would change {named}. "
+            f"Use yours, or keep what its author chose?", view=view, ephemeral=True, wait=True)
+        if await view.wait():
+            try:
+                await message.edit(content="No answer, so the original's settings were kept.",
+                                   view=None)
+            except discord.HTTPException:
+                pass
+        return view.use_mine
 
     def _get_profile_config(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> Optional[Dict[str, Any]]:
         p_data = self._get_profile(user_id, profile_name, is_borrowed)
@@ -1939,17 +1972,23 @@ class ProfileManager:
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }
 
-            # Routed onto the user's provider: only the slots it moves are written, so a
-            # Google profile keeps absent slots absent and following the shipped value.
-            platform = platform_model_defaults()
-            config.update({k: v for k, v in model_slot_defaults(self.effective_provider(user_id)).items()
-                           if v != platform.get(k)})
-
-            # The template above is what the bot ships; anything the user has set as
-            # their own default wins over it. New profiles take every defaultable key,
-            # including the ones a borrow may not have -- there is no author here whose
-            # tuning a standing preference could be overwriting.
-            apply_defaults(config, self._get_user_defaults(user_id), borrowed=False)
+            # Defaults are off until the user chooses a provider, in `/start` or Override
+            # Defaults. A key alone is not that choice, so until then every model slot is
+            # NO_FALLBACK -- "None" on the dashboard, refused by `_instantiate_model`.
+            preferred = self.provider_preference(user_id)
+            if preferred:
+                # Routed onto the chosen provider: only the slots it moves are written, so a
+                # Google profile keeps absent slots absent and following the shipped value.
+                platform = platform_model_defaults()
+                config.update({k: v for k, v in model_slot_defaults(preferred).items()
+                               if v != platform.get(k)})
+                # The template above is what the bot ships; anything the user has set as
+                # their own default wins over it. New profiles take every defaultable key,
+                # including the ones a borrow may not have -- there is no author here whose
+                # tuning a standing preference could be overwriting.
+                apply_defaults(config, self._get_user_defaults(user_id), borrowed=False)
+            else:
+                config.update({k: NO_FALLBACK for pair in MODEL_SLOT_PAIRS.items() for k in pair})
 
             # No "ltm_summarization_instructions": a seeded copy of the default freezes
             # this profile on whichever wording shipped today, so /mod's override and
@@ -4261,6 +4300,12 @@ class ProfileManager:
             await interaction.followup.send(f"Limit Reached. You have {current_borrowed}/{limit} borrowed profiles.", ephemeral=True)
             return False
 
+        # Asked only where it would change something: defaults are off until the user
+        # chooses a provider, and a profile already matching them leaves nothing to decide.
+        mine = self._borrower_defaults(interaction.user.id, owner_profile_data)
+        if mine and not await self._ask_borrow_defaults(interaction, current_name, mine):
+            mine = {}
+
         # Collected inside the threaded save, read after it: what the borrow arrived
         # with is not what the library showed, and the user is owed the difference.
         adjustments: List[Tuple[str, str]] = []
@@ -4299,20 +4344,18 @@ class ProfileManager:
 
             # Two passes over the inherited config, in this order.
             #
-            # First the borrower's own defaults, but only the keys whose action row is
-            # scope="all" -- see user_defaults. A borrow is somebody else's writing,
-            # and a standing preference for, say, temperature 1.1 must not silently
-            # retune a persona built at 0.4.
+            # First the borrower's own defaults, if they chose them -- only the keys
+            # whose action row is scope="all", see user_defaults. A borrow is somebody
+            # else's writing, and a standing preference for, say, temperature 1.1 must
+            # not silently retune a persona built at 0.4.
             #
             # Then the rescue, which is not a preference at all: it repoints model
             # slots naming a provider this user holds no key for. Order matters --
             # an explicit default is checked by the rescue like any other value, so
             # choosing an OpenRouter default without an OpenRouter key cannot produce
             # a profile that is dead on arrival.
-            applied = apply_defaults(snapshot_data, self._get_user_defaults(interaction.user.id),
-                                     borrowed=True)
+            snapshot_data.update(mine)
             rescued = self._rescue_unusable_models(interaction.user.id, snapshot_data)
-            adjustments.extend(("default", k) for k in applied)
             adjustments.extend(("rescue", k) for k in rescued)
 
             # The class letter records provenance, not current state: 'C' means the
@@ -4368,18 +4411,17 @@ class ProfileManager:
                                          adjustments: List[Tuple[str, str]]):
         """Tells the borrower which inherited settings did not survive the borrow.
 
-        Silent on the common case, where nothing was changed. It exists for the two
-        that are not silent-able: a standing default overwrote what the author chose,
-        and a model slot was repointed because its provider is one this user cannot
-        reach. Both leave the profile behaving differently from the one in the
-        library, and a difference nobody announced reads as the borrow being broken.
+        Silent on the common case, where nothing was changed. It exists for a model
+        slot repointed because its provider is one this user cannot reach, which
+        leaves the profile behaving differently from the one in the library -- and a
+        difference nobody announced reads as the borrow being broken. Their own
+        defaults are not reported: they were asked (`_ask_borrow_defaults`).
         """
         if not adjustments:
             return
 
         lines = []
         rescued = [k for kind, k in adjustments if kind == "rescue"]
-        applied = [k for kind, k in adjustments if kind == "default"]
 
         if rescued:
             lines.append(
@@ -4388,11 +4430,6 @@ class ProfileManager:
                 + ", ".join(f"**{setting_label(k)}**" for k in rescued)
                 + ".\nAdd the missing key in `/settings`, then set the models back in "
                   f"`/profile manage profile_name:{profile_name}`.")
-        if applied:
-            lines.append(
-                f"⚙️ Your defaults were applied to `{profile_name}`: "
-                + ", ".join(f"`{setting_label(k)}`" for k in applied)
-                + ".\n-# Change what these do in `/settings` → Defaults.")
 
         try:
             await interaction.followup.send("\n\n".join(lines), ephemeral=True)

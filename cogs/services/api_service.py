@@ -18,7 +18,7 @@ from ..utils.constants import (
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
     THINKING_LEVELS_TO_OLLAMA, GEMINI_FREE_TIER_BLOCKED, OLLAMA_OWNER_ONLY,
     OPENROUTER_DATA_POLICY_BLOCKED, IMAGE_MODEL_NO_OLLAMA, SPEECH_MODEL_NO_OLLAMA,
-    API_KEY_COOLING_DOWN,
+    API_KEY_COOLING_DOWN, NO_MODEL_SET,
 )
 from ..utils.data_policy import openrouter_data_collection
 from ..managers.storage_manager import IOManager
@@ -261,6 +261,10 @@ class APIService:
         """
         if speech and image_config is not None:
             raise TypeError("a model is an image model or a speech model, not both")
+        if not is_real_model(raw_model_name):
+            # A profile made before its owner chose a provider has none. MissingKeyError,
+            # so a Final Fallback behind it is still tried and this is not what is reported.
+            raise MissingKeyError(NO_MODEL_SET)
         # System prefixes 'GOOGLE/', 'OPENROUTER/', and 'OLLAMA/' are strictly case-sensitive.
         # OpenRouter hosts models under lowercase creator namespaces like 'google/gemini-2.5-flash'.
         actual_name = raw_model_name

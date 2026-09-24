@@ -9,7 +9,7 @@ import time
 from typing import TYPE_CHECKING, List, Optional
 
 from ..utils.discord_cdn import unsigned_attachment_url
-from .base_components import (PageJumpModal, TabbedView, add_button, add_select,
+from .base_components import (BlockedGuard, PageJumpModal, TabbedView, add_button, add_select,
                               build_pagination_controls, bulk_select_options,
                               paged_nav_options, resolve_bulk_select)
 from .gui_start import NewProfileModal
@@ -1014,6 +1014,31 @@ class RedeemCloneCodeModal(ui.Modal, title="Redeem Clone Code"):
             await self.parent_view.update_display()
         
         await interaction.followup.send(msg, ephemeral=True)
+
+class BorrowDefaultsView(BlockedGuard, ui.View):
+    """Asked by `_accept_share_request` when the borrower's defaults would change what the
+    author chose. Answered or not, the borrow goes ahead: unanswered keeps the original's."""
+
+    def __init__(self, cog: 'MimicCog'):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.use_mine = False
+
+    async def _answer(self, interaction: discord.Interaction, use_mine: bool):
+        self.use_mine = use_mine
+        await interaction.response.edit_message(
+            content="Using your defaults." if use_mine else "Keeping the original's settings.",
+            view=None)
+        self.stop()
+
+    @ui.button(label="Use my defaults", style=discord.ButtonStyle.primary)
+    async def mine(self, interaction: discord.Interaction, _button: ui.Button):
+        await self._answer(interaction, True)
+
+    @ui.button(label="Keep the original's", style=discord.ButtonStyle.secondary)
+    async def original(self, interaction: discord.Interaction, _button: ui.Button):
+        await self._answer(interaction, False)
+
 
 class BorrowNameModal(ui.Modal, title="Name Your Borrowed Profile"):
     profile_name_input = ui.TextInput(label="Enter a unique local name", required=True, min_length=1, max_length=50)

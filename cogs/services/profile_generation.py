@@ -144,16 +144,18 @@ def build_prompt(template: str, concept: str, previous: Optional[Dict[str, Any]]
 def generator_models(cog, user_id: int) -> Tuple[str, Tuple[str, ...]]:
     """(primary, fallbacks) for a draft: the chain the new profile itself would run on.
 
-    Built the way `_get_or_create_user_profile` builds a config -- the shipped models on the
-    user's effective provider, their own defaults over them -- rescued onto a provider
-    they hold, then the Final Fallback behind. Only models on a provider the user holds
-    a key for are kept: a draft is billed to the user alone.
+    The shipped models on the user's effective provider -- a draft needs a model before
+    any provider is chosen, so a key counts here as it does not for a profile -- their
+    own defaults over them once they have chosen one, rescued onto a provider they hold,
+    then the Final Fallback behind. Only models on a provider the user holds a key for
+    are kept: a draft is billed to the user alone.
     """
     pm = cog.profile_manager
     provider = pm.effective_provider(user_id)
     shipped = model_slot_defaults(provider)
     config = {"primary_model": shipped["primary_model"], "fallback_model": shipped["fallback_model"]}
-    apply_defaults(config, pm._get_user_defaults(user_id), borrowed=False)
+    if pm.provider_preference(user_id):
+        apply_defaults(config, pm._get_user_defaults(user_id), borrowed=False)
     pm._rescue_unusable_models(user_id, config)
 
     primary, fallbacks = model_chain(config, "primary_model", provider)
@@ -241,6 +243,7 @@ def save_draft(cog, user_id: int, profile_name: str, draft: Dict[str, Any]) -> O
     pm._save_profile_prompts(user_id, profile_name, prompts)
 
     extras = {"custom_display_name": draft.get("display_name"),
+              "custom_avatar_url": draft.get("avatar_url"),
               "placeholder_emoji": draft.get("placeholder_emoji"),
               "library_intro": draft.get("library_intro")}
     extras = {key: value for key, value in extras.items() if value}

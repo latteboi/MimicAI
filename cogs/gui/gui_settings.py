@@ -160,7 +160,7 @@ class SettingsBaseView(TabbedView):
         ("Home", "home", lambda v: SettingsHomeView(v.cog, v.original_interaction)),
         ("About Me", "about", lambda v: SettingsAboutView(v.cog, v.original_interaction)),
         ("API Keys", "api", lambda v: SettingsAPIView(v.cog, v.original_interaction)),
-        ("Defaults", "defaults", _defaults_view),
+        ("Override Defaults", "defaults", _defaults_view),
         ("Child Bots", "bots", lambda v: SettingsChildBotView(v.cog, v.original_interaction)),
     )
 
@@ -222,23 +222,18 @@ def _standing_text(cog: 'MimicCog', user_id: int) -> str:
     return "\n".join(lines)
 
 
-#: Under the choice, in About Me and in `/start`'s step: what it does, and what it leaves.
+#: Under the choice, in Override Defaults and in `/start`'s step: what it does, and what it leaves.
 PROVIDER_PREFERENCE_NOTE = (
     "Every model runs Primary \u2192 Fallback on this provider. A profile with its **Final "
     "Fallback** turned on (Params, off unless you turn it on) tries the other one last, so "
     "one provider's outage or a spent key cannot silence it. New profiles start on this "
-    "provider; a model you picked yourself stays picked. "
-    "Holding a key for only the other provider overrides it for new profiles.")
-
-
-def provider_wording(provider: Optional[str]) -> str:
-    return MODEL_PROVIDERS.get(provider or "", "Not chosen -- using Google")
+    "provider; a model you picked yourself stays picked.")
 
 
 def provider_options(current: Optional[str]) -> List[discord.SelectOption]:
-    """The two providers, the stored one ticked. One list for About Me and `/start`."""
+    """The two providers, the stored one ticked. One list for Override Defaults and `/start`."""
     blurbs = {"gemini": "Gemini through your Google key.",
-              "openrouter": "The same Gemini models through your OpenRouter key."}
+              "openrouter": "Ling, Ming and Fish Audio through your OpenRouter key."}
     return [discord.SelectOption(label=label, value=value, description=blurbs[value],
                                  default=value == current)
             for value, label in MODEL_PROVIDERS.items()]
@@ -278,11 +273,6 @@ def build_about_embed(cog: 'MimicCog', user_id: int) -> discord.Embed:
                "Timestamps your messages carry into a character's history. A "
                "character's *own* clock is set per profile, under "
                "`/profile manage` -> Timezone."),
-        inline=False)
-
-    embed.add_field(
-        name="\N{TWISTED RIGHTWARDS ARROWS} Your Preferred Provider",
-        value=f"`{provider_wording(about.get('provider'))}`\n{PROVIDER_PREFERENCE_NOTE}",
         inline=False)
 
     birthday = format_birthday(about.get("birthday"))
@@ -333,9 +323,6 @@ class SettingsAboutView(SettingsBaseView):
             add_button(self, "Clear Birthday", self._act_clear_birthday,
                        style=discord.ButtonStyle.secondary, row=1)
 
-        add_select(self, provider_options(about.get("provider")), self._act_provider,
-                   placeholder="Preferred provider...", row=2)
-
         self._add_nav_buttons()
 
     async def update_display(self):
@@ -356,12 +343,6 @@ class SettingsAboutView(SettingsBaseView):
         about = self.cog.profile_manager.get_user_about(self.user_id)
         about.pop("timezone", None)
         self.cog.profile_manager.save_user_about(self.user_id, about)
-        self._build_view()
-        await self.update_display()
-
-    async def _act_provider(self, i: discord.Interaction):
-        await i.response.defer()
-        self.cog.profile_manager.set_provider_preference(self.user_id, i.data["values"][0])
         self._build_view()
         await self.update_display()
 

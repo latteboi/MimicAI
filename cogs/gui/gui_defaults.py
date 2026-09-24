@@ -1,4 +1,7 @@
-"""The `/settings` -> Defaults tab: standing preferences for profiles yet to exist.
+"""The `/settings` -> Override Defaults tab: standing preferences for profiles yet to exist.
+
+Off until the user chooses a provider, here or in `/start`: until then a new profile is
+made with no models and nothing on this screen is applied (`provider_preference`).
 
 Every profile used to start from one hardcoded template, and every borrow from a copy
 of whoever wrote it. Someone who preferred a different model set it again on profile
@@ -32,13 +35,14 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .base_components import add_button, add_select
 from ..utils.helpers import resolve_openrouter_endpoint
-from ..utils.user_defaults import defaultable_keys, model_slot_labels, setting_label
+from ..utils.constants import MODEL_PROVIDERS
+from ..utils.user_defaults import defaultable_keys, model_slot_labels, other_provider, setting_label
 from .gui_profiles import (
     PROFILE_ACTIONS, PROFILE_ACTIONS_BY_VALUE, PROFILE_TABS, _ActionStagingHost,
     _BulkSession, _TAB_BUTTONS_PER_ROW, _select_chunks, ModelPickerMixin,
     OpenRouterHostView,
 )
-from .gui_settings import SettingsBaseView
+from .gui_settings import PROVIDER_PREFERENCE_NOTE, SettingsBaseView, provider_options
 
 if TYPE_CHECKING:
     from ..MimicCog import MimicCog
@@ -116,7 +120,7 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         self._clear_picks: set = set()
         #: What the last stage could not keep, named for the embed. See `_stage_change`.
         self._notice: Optional[str] = None
-        self.view_mode = "google"
+        self.view_mode = self.preferred_api(cog, interaction.user.id)
         self.category = "response"
         self.ollama_working = None
         super().__init__(cog, interaction, "defaults")
@@ -337,14 +341,26 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         e.set_footer(text=self._footer())
         return e
 
+    def _preferred(self) -> Optional[str]:
+        preferred = self.cog.profile_manager.provider_preference(self.user_id)
+        return preferred if preferred in MODEL_PROVIDERS else None
+
     def _embed_actions(self) -> discord.Embed:
+        if not self._preferred():
+            return self._base_embed(
+                "Override Defaults",
+                "**Off.** Profiles you make start with no models, and nothing here is "
+                "applied, until you choose a provider below (or in `/start`). An API key "
+                "alone does not choose one.")
         e = self._base_embed(
-            "My Defaults",
-            "Applied to profiles you **create or borrow from now on**. Existing "
-            "profiles are untouched — use `/profile bulk manage` for those.\n"
-            "-# Anything left on *Platform default* follows the bot's own value, "
-            "including if that value changes later. The tabs and the settings under "
-            "them are the ones on a profile's own dashboard.")
+            "Override Defaults",
+            "Applied to profiles you **create**, and offered on those you **borrow**, from "
+            "now on. Existing profiles are untouched — use `/profile bulk manage` for those.\n"
+            "-# Anything left on *Platform default* follows the bot's own value for your "
+            "provider, including if that value changes later. The tabs and the settings "
+            "under them are the ones on a profile's own dashboard.")
+        e.add_field(name="Provider", value=f"`{MODEL_PROVIDERS[self._preferred()]}` — "
+                                           f"{PROVIDER_PREFERENCE_NOTE}"[:1024], inline=False)
         rows = self._rows(self.tab)
         for action in rows:
             e.add_field(name=action.bulk_label(), value=self._row_value(action), inline=True)
@@ -361,7 +377,7 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         wording = next((lbl for value, lbl, _d in self._CATEGORY_LABELS
                         if value == self.category), self.category.title())
         e = self._base_embed(
-            "My Defaults — Set Models",
+            "Override Defaults — Set Models",
             f"**{wording}** — the model a profile you make from now on starts on. "
             f"Switch categories for the rest.\n"
             f"-# *Platform default* on a slot follows the bot's own choice, including "
@@ -385,13 +401,13 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         action = PROFILE_ACTIONS_BY_VALUE.get(self._choice["action"]) if self._choice else None
         lead = f"{action.bulk_description()}\n\n" if (action and action.bulk_description()) else ""
         return self._base_embed(
-            f"My Defaults — {action.bulk_label() if action else 'Choose a value'}",
+            f"Override Defaults — {action.bulk_label() if action else 'Choose a value'}",
             f"{lead}Pick a value; it is saved and you return to the settings list.")
 
     def _embed_clear(self) -> discord.Embed:
         rows = self._set_rows()
         e = self._base_embed(
-            "My Defaults — Clear",
+            "Override Defaults — Clear",
             "Tick anything that should go back to following the bot's own value.\n"
             "-# Clearing is not the same as choosing the value the bot ships today: a "
             "cleared setting tracks that value if it ever changes.")
@@ -419,6 +435,10 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         self._add_nav_buttons()
 
     def _build_actions_step(self):
+        if not self._preferred():
+            add_select(self, provider_options(None), self._set_provider,
+                       placeholder="Choose a provider to turn defaults on...", row=0)
+            return
         tabs = self._tabs()
         if self.tab not in tabs and tabs:
             self.tab = tabs[0]
@@ -439,6 +459,8 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         nav_row = self._add_tab_row(tabs)
         add_button(self, "Clear…", self._nav("clear"), style=discord.ButtonStyle.secondary,
                    row=nav_row, disabled=not self._set_rows())
+        add_button(self, f"Provider: {MODEL_PROVIDERS[self._preferred()]}", self._set_provider,
+                   style=discord.ButtonStyle.secondary, row=nav_row, emoji="🔀")
 
     def _add_tab_row(self, tabs, row: int = 1) -> int:
         """The PROFILE_TABS strip, wrapping exactly as the dashboard's and the wizard's
@@ -555,6 +577,14 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
             self._notice = None
             await self.refresh(interaction)
         return callback
+
+    async def _set_provider(self, interaction: discord.Interaction):
+        """The dropdown turns defaults on; the button beside Clear swaps provider."""
+        values = (interaction.data or {}).get("values")
+        provider = values[0] if values else other_provider(self._preferred())
+        self.cog.profile_manager.set_provider_preference(self.user_id, provider)
+        self.view_mode = self.preferred_api(self.cog, self.user_id)
+        await self.refresh(interaction)
 
     async def _action_callback(self, interaction: discord.Interaction):
         action = PROFILE_ACTIONS_BY_VALUE.get(interaction.data["values"][0])

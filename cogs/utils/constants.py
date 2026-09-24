@@ -228,14 +228,11 @@ UTILITY_MODEL = 'GOOGLE/gemini-2.5-flash-lite'
 
 #: Every model category runs Primary -> Fallback -> Final Fallback: the first two on
 #: the user's preferred provider, the last on the other one, so an outage or a spent key
-#: on one provider cannot silence the category. The table ships Google; a preference for
-#: OpenRouter routes the same Gemini models through it. `user_defaults.model_chain`.
-#: Stored as `index.json["about"]["provider"]`, absent until chosen, when Google is assumed.
+#: on one provider cannot silence the category. Google ships the table below; OpenRouter
+#: ships OPENROUTER_SHIPPED_MODELS. `user_defaults.model_chain`.
+#: Stored as `index.json["about"]["provider"]`, absent until chosen in `/start` or
+#: Override Defaults -- and until then a new profile is made with no models at all.
 MODEL_PROVIDERS = {"gemini": "Google", "openrouter": "OpenRouter"}
-
-#: Gemini ids OpenRouter does not serve under `google/`, which a chain routed there skips.
-#: Read off /api/v1/models (and ?output_modalities=speech) on 2026-09-23.
-GEMINI_NOT_ON_OPENROUTER = frozenset({'gemini-2.5-flash-preview-tts', 'gemini-2.5-pro-preview-tts'})
 
 #: A value, deliberately not an alias for FALLBACK_MODEL_NAME: it was spelled that way
 #: while the two coincided, so bumping the fallback silently moved the researcher onto a
@@ -408,6 +405,11 @@ OPENROUTER_TRAINING_MODEL_HIDDEN = (
 
 #: A typed OpenRouter id the image catalogue does not list: a text model there reaches
 #: the Image API and 400s, and an omission is deliberate -- api/openrouter_image_catalogue.
+NO_MODEL_SET = (
+    "This profile has no model set. Choose one under `/profile manage` -> Set Models, or pick "
+    "a provider in `/start` so the profiles you make next start with one."
+)
+
 OPENROUTER_NOT_IMAGE_MODEL = (
     "That is not one of the OpenRouter image models this bot can use. Choose one from the "
     "OpenRouter tab."
@@ -894,12 +896,20 @@ MEDIA_DESCRIBER_PAID = 'OPENROUTER/inclusionai/ling-3.0-flash-vl'
 
 MEDIA_DESCRIBER_FALLBACK = 'GOOGLE/gemini-2.5-flash-lite'
 
-#: What the critic, the LTM summariser and session compaction ship on OpenRouter: the
-#: describer's two rather than Gemini routed through it. Each reads a transcript and
-#: reports on it, and runs unattended on every long conversation. Google keeps its Gemini
-#: pair, so each still runs two on the preferred provider and one on the other.
-#: `user_defaults._served`.
-UTILITY_OPENROUTER_MODELS = (MEDIA_DESCRIBER_MODEL, MEDIA_DESCRIBER_PAID)
+#: What each category ships on OpenRouter, Primary then Fallback: its own models, not
+#: Gemini routed through it. The critic, the LTM summariser and session compaction take
+#: the describer's two. Grounding has none: it is Google's search tool. All six ids read
+#: off /api/v1/models on 2026-09-24. `user_defaults._served`.
+OPENROUTER_SHIPPED_MODELS = {
+    'primary_model': ('OPENROUTER/inclusionai/ling-3.0-flash-fin:free',
+                      'OPENROUTER/inclusionai/ling-3.0-flash-vl'),
+    'image_generation_model': ('OPENROUTER/inclusionai/ming-image-0.1-design',
+                               'OPENROUTER/recraft/recraft-v4.1-flash'),
+    'speech_model': ('OPENROUTER/fish-audio/s2.1-pro-free:free',
+                     'OPENROUTER/deepgram/flux-tts:free'),
+    'critic_model': (MEDIA_DESCRIBER_MODEL, MEDIA_DESCRIBER_PAID),
+    'ltm_model': (MEDIA_DESCRIBER_MODEL, MEDIA_DESCRIBER_PAID),
+}
 
 #: Greedy, for every pass that transcribes rather than writes -- the describer, the
 #: classifier, the critic, the LTM summariser and compaction: a second character reading a cached

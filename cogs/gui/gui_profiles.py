@@ -2635,6 +2635,11 @@ class ModelPickerMixin(ReportErrorMixin):
         host = self._ollama_host_url() if provider == 'ollama' else None
         return self.cog.api_service.get_top_models(provider, target_config_key, ollama_host=host)
 
+    @staticmethod
+    def preferred_api(cog, user_id) -> str:
+        """The API tab Set Models opens on: the user's provider, Google until they choose."""
+        return "openrouter" if cog.profile_manager.provider_preference(user_id) == "openrouter" else "google"
+
     def _may_use_ollama(self) -> bool:
         """Ollama is offered only on the bot owner's own configs -- see OLLAMA_OWNER_ONLY.
 
@@ -3179,7 +3184,7 @@ class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
         self.original_interaction = interaction
         self.user_id = user_id or interaction.user.id
         self.profile_name = profile_name
-        self.view_mode = 'google'
+        self.view_mode = self.preferred_api(cog, self.user_id)
         self.category = 'response' # 'response', 'media', 'tools', 'ltm'
 
         if is_borrowed is not None:
@@ -3969,7 +3974,7 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
 
     def __init__(self, wizard):
         super().__init__(wizard)
-        self.view_mode = 'google'
+        self.view_mode = self.preferred_api(self.cog, self.user_id)
         self.category = 'response'
         self.ollama_working = None
         self.models_state = {k: None for k in (

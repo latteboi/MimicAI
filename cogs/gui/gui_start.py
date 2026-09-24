@@ -665,15 +665,24 @@ class NewProfileModal(ui.Modal):
         super().__init__(title="Generate a Character")
         self.cog = cog
         self.name_input = ui.TextInput(
-            label="Name", placeholder="e.g. detective", max_length=32, required=True)
+            label="Internal Name", placeholder="e.g. detective", max_length=32, required=True)
         self.add_item(self.name_input)
         self.concept_input = ui.TextInput(
             label="Concept", style=discord.TextStyle.paragraph, max_length=500,
             placeholder="e.g. A cynical noir detective who never removes his coat.",
             required=True)
         self.add_item(self.concept_input)
+        self.display_name_input = ui.TextInput(
+            label="Display Name (optional)", max_length=20, required=False,
+            placeholder="The name it speaks under. Blank lets the draft pick one.")
+        self.add_item(self.display_name_input)
+        self.avatar_url_input = ui.TextInput(
+            label="Avatar URL (optional)", required=False, placeholder="https://...")
+        self.add_item(self.avatar_url_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         await self.cog.profile_generate_slash.callback(
             self.cog, interaction, (self.concept_input.value or "").strip(),
-            (self.name_input.value or "").strip())
+            (self.name_input.value or "").strip(),
+            (self.display_name_input.value or "").strip() or None,
+            (self.avatar_url_input.value or "").strip() or None)

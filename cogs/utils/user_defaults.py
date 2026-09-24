@@ -38,10 +38,7 @@ a default than it is a thing to propagate in bulk.
 import functools
 from typing import Any, Dict, List, Optional, Tuple
 
-from .constants import (
-    GEMINI_NOT_ON_OPENROUTER, GOOGLE_ONLY_MODEL_KEYS, MODEL_PROVIDERS,
-    UTILITY_FALLBACK_KEYS, UTILITY_OPENROUTER_MODELS,
-)
+from .constants import MODEL_PROVIDERS, OPENROUTER_SHIPPED_MODELS, UTILITY_FALLBACK_KEYS
 from .helpers import is_real_model
 
 #: Config keys that must never be defaulted regardless of what the table says.
@@ -230,28 +227,13 @@ def other_provider(provider: Optional[str]) -> str:
     return "gemini" if provider == "openrouter" else "openrouter"
 
 
-def route_model(model: str, provider: str, primary_key: str) -> Optional[str]:
-    """A shipped Google model as `provider` serves it, or None where it does not."""
-    if provider == "gemini":
-        return model
-    bare = model[len("GOOGLE/"):] if model.startswith("GOOGLE/") else model
-    if primary_key in GOOGLE_ONLY_MODEL_KEYS or bare in GEMINI_NOT_ON_OPENROUTER:
-        return None
-    return f"OPENROUTER/google/{bare}"
-
-
-#: Categories OpenRouter ships models of its own for, instead of the Google pair routed there.
-_OPENROUTER_SHIPPED = {"critic_model": UTILITY_OPENROUTER_MODELS, "ltm_model": UTILITY_OPENROUTER_MODELS}
-
-
 def _served(primary_key: str, provider: str) -> List[str]:
     """The category's shipped models `provider` serves, Primary first."""
-    if provider == "openrouter" and primary_key in _OPENROUTER_SHIPPED:
-        return list(_OPENROUTER_SHIPPED[primary_key])
+    if provider == "openrouter":
+        return list(OPENROUTER_SHIPPED_MODELS.get(primary_key, ()))
     shipped = platform_model_defaults()
-    names = (shipped.get(primary_key), shipped.get(MODEL_SLOT_PAIRS[primary_key]))
-    return [routed for name in names if is_real_model(name)
-            and (routed := route_model(name, provider, primary_key))]
+    return [name for name in (shipped.get(primary_key), shipped.get(MODEL_SLOT_PAIRS[primary_key]))
+            if is_real_model(name)]
 
 
 @functools.lru_cache(maxsize=None)
@@ -259,9 +241,9 @@ def shipped_chain(primary_key: str, preferred: Optional[str]) -> Tuple[str, ...]
     """Primary, Fallback and Final Fallback, as a category ships them for this preference.
 
     The preferred provider's models, then the other's. A provider serving fewer than two
-    -- OpenRouter has one Gemini speech model and no search tool -- gives its places to
-    the next in line, so the chain is as long as there are models to fill it. Cached: the
-    table is fixed at import and this is read on every utility call.
+    -- OpenRouter has no search tool -- gives its places to the next in line, so the
+    chain is as long as there are models to fill it. Cached: the table is fixed at
+    import and this is read on every utility call.
     """
     preferred = preferred if preferred in MODEL_PROVIDERS else "gemini"
     chain: List[str] = []

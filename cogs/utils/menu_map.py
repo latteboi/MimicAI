@@ -72,11 +72,15 @@ _STATIC_DASHBOARDS = [
             ]),
             ("About Me", [
                 "The user's own timezone and birthday, not a character's",
-                "Preferred provider: Google or OpenRouter, where every model runs Primary -> "
-                "Fallback, then the Final Fallback on the other where a profile turns it on",
             ]),
-            ("Defaults", [
-                "Standing preferences applied to profiles created or borrowed LATER",
+            ("Override Defaults", [
+                "Off until a provider is chosen, here or in /start; until then new profiles "
+                "start with no models. An API key alone does not choose one",
+                "Provider: Google or OpenRouter, where every model runs Primary -> Fallback, "
+                "then the Final Fallback on the other where a profile turns it on. A dropdown "
+                "while off; a Provider button beside Clear swaps it once on",
+                "Standing preferences applied to profiles created LATER, and offered on borrows "
+                "(Use my defaults / Keep the original's)",
                 "The same tabs and settings as `/profile manage`: Params, Tools, Images, "
                 "Audio, Memory, Training, Misc. Choosing a row opens the form "
                 "`/profile bulk manage` opens for it",

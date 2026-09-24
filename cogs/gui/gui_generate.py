@@ -49,7 +49,8 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     timeout_message = "This draft expired, and nothing was saved. Run `/profile generate` again."
 
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str,
-                 concept: str, draft: Dict[str, Any], model_used: str):
+                 concept: str, draft: Dict[str, Any], model_used: str,
+                 appearance: Optional[Dict[str, str]] = None):
         # Ten minutes, inside the fifteen an interaction token lasts, so the expiry
         # notice can still be written onto the message.
         super().__init__(timeout=600)
@@ -58,7 +59,9 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         self.user_id = interaction.user.id
         self.profile_name = profile_name
         self.concept = concept
-        self.draft = draft
+        #: The display name and avatar the user gave, laid over every draft.
+        self.appearance = appearance or {}
+        self.draft = {**draft, **self.appearance}
         self.model_used = model_used
         self.busy = False
         self.saved = False
@@ -94,6 +97,8 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         emoji = draft.get("placeholder_emoji")
         embed = discord.Embed(title=_clip(f"{emoji} {title}" if emoji else title, 256),
                               description="\n\n".join(lines), color=discord.Color.blurple())
+        if draft.get("avatar_url"):
+            embed.set_thumbnail(url=draft["avatar_url"])
 
         persona = draft.get("persona") or {}
         for label, key in _PREVIEW_FIELDS:
@@ -126,9 +131,10 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
 
         failure = None
         try:
-            self.draft, self.model_used = await generate_draft(
+            draft, self.model_used = await generate_draft(
                 self.cog, self.user_id, self.concept,
                 previous=self.draft if request else None, request=request)
+            self.draft = {**draft, **self.appearance}
         except ProfileGenerationError as e:
             failure = suppress_link_previews(str(e))
         finally:
