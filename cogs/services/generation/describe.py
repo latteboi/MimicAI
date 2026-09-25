@@ -15,11 +15,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote
 
 from ...utils.constants import (
-    DEFAULT_MEDIA_DESCRIPTION, MEDIA_DESCRIBER_FALLBACK, MEDIA_DESCRIBER_MODEL,
-    MEDIA_DESCRIBER_PAID, MEDIA_DESCRIBER_RESOLUTION, GREEDY_SAMPLING,
+    DEFAULT_MEDIA_DESCRIPTION, DESCRIBER_KEYS, MEDIA_DESCRIBER_RESOLUTION, GREEDY_SAMPLING,
     MEDIA_DESCRIPTION_MAX_CHARS, MEDIA_DESCRIPTION_NONE,
 )
-from ...utils.helpers import _resolve_safety_settings, resolve_thinking_params
+from ...utils.helpers import _resolve_safety_settings, resolve_thinking_params, system_model
 
 
 def _media_key(part: Any) -> Optional[str]:
@@ -139,13 +138,15 @@ class MediaDescriptionMixin:
                 raise ValueError("The describer returned no description")
             return response, answer
 
+        # The chain the profile owner's provider ships, as their profile's own models are.
+        side = self.cog.profile_manager.effective_provider(owner_id)
+        primary, *fallbacks = (system_model(self.cog, k, side) for k in DESCRIBER_KEYS)
         try:
             (response, text), used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                MEDIA_DESCRIBER_MODEL, (MEDIA_DESCRIBER_PAID, MEDIA_DESCRIBER_FALLBACK), run,
-                label="Attachment describer")
+                primary, tuple(fallbacks), run, label="Attachment describer")
         except Exception as e:
             print(f"Attachment describer: {type(e).__name__}: {e}")
-            self._log_description_call(channel, user_id, MEDIA_DESCRIBER_MODEL, "api_error")
+            self._log_description_call(channel, user_id, primary, "api_error")
             return None, None
 
         text = text[:MEDIA_DESCRIPTION_MAX_CHARS * len(media_parts)]

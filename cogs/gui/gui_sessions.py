@@ -333,6 +333,14 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
             
             value = prefix + value
 
+        # A picker whose slots are not a profile's -- /mod's System Models -- says what
+        # they cannot hold before the profile rules below are asked.
+        refuse = getattr(self.parent_view, "refuse_custom_model", None)
+        refusal = refuse(self.target_config_key, value) if refuse else None
+        if refusal:
+            await interaction.response.send_message(refusal, ephemeral=True)
+            return
+
         # Owner first: anyone else who types the prefix is told Ollama is the owner's, not
         # which slots it would or would not fill.
         if value.startswith("OLLAMA/") and not self.parent_view.cog.profile_manager.may_use_ollama(

@@ -29,9 +29,10 @@ Prose lives in `content.WIZARD_COPY`, and depth is not repeated: each step names
 import asyncio
 import discord
 from discord import ui
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from ..utils.constants import CAST_POLICY_OPEN, DEFAULT_CAST_POLICY, MODEL_PROVIDERS, defaultConfig
+from ..utils.constants import (CAST_POLICY_OPEN, DEFAULT_CAST_POLICY, MODEL_PROVIDERS,
+                               PROVIDER_CHOICES, PROVIDER_NONE, defaultConfig)
 from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
 from ..utils.content import HELP_CATEGORIES, WIZARD_COPY, WIZARD_TOUR
 from .base_components import (BlockedGuard, DropdownContentView, TimeoutCleanupMixin, add_button,
@@ -110,7 +111,7 @@ class _Step:
 # step table rather than inside `_Step` so a new gate is one line in each of two
 # places that sit together, and never a message assembled in the renderer.
 _GATE_REASONS = {
-    "provider": "choose a provider first",
+    "provider": "choose a provider first -- None counts",
     "server_key": "needs an API key assigned to this server",
     "can_cast": "needs administrator, or Open casting",
 }
@@ -118,11 +119,13 @@ _GATE_REASONS = {
 
 WIZARD_STEPS = (
     # First: it decides which key the next step asks for, and it can be answered anywhere.
+    # Answering it is registering -- the one way in (`ProfileManager.is_registered`) -- so
+    # every step that would store something waits on it.
     _Step("provider", "Choose a provider",
           ("1. Getting Started", "API Keys and Where They Apply"),
           lambda s: bool(s["provider"]), repeatable=True,
-          actions=("_act_prefer_openrouter", "_act_prefer_gemini"),
-          done_detail=lambda s: MODEL_PROVIDERS.get(s["provider"], s["provider"])),
+          actions=("_act_prefer_openrouter", "_act_prefer_gemini", "_act_prefer_none"),
+          done_detail=lambda s: PROVIDER_CHOICES.get(s["provider"], s["provider"])),
     _Step("key", "Add your API key",
           ("1. Getting Started", "API Keys and Where They Apply"),
           lambda s: s["has_key"], requires="provider",
@@ -132,7 +135,7 @@ WIZARD_STEPS = (
     # that way, and a blank `/profile create` is not yet a character to talk to.
     _Step("profile", "Get a character",
           ("2. Writing a Character", "Persona vs Instructions"),
-          lambda s: s["has_written"], repeatable=True,
+          lambda s: s["has_written"], requires="provider", repeatable=True,
           actions=("_act_library", "_act_generate"),
           done_detail=lambda s: f"`{s['written_name']}` is ready"),
     _Step("seat", "Seat it in this channel",
@@ -475,8 +478,8 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
             done = self._done(focus)
             if focus.available(self.state) and (
                     not done or (focus.repeatable and self.step_key == focus.key)):
-                for name in focus.actions:
-                    self.add_item(self._make_action_button(name))
+                for button in self._action_buttons(focus):
+                    self.add_item(button)
             if done and self.step_key and self._next_incomplete() is not None:
                 add_button(self, "Next step ▸", self._act_next,
                            style=discord.ButtonStyle.primary, row=0)
@@ -524,17 +527,35 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
     _ACTION_LABELS = {
         "_act_prefer_openrouter": ("OpenRouter (recommended)", discord.ButtonStyle.success),
         "_act_prefer_gemini": ("Google", discord.ButtonStyle.secondary),
-        "_act_paste_key": ("🔑 Paste key", discord.ButtonStyle.success),
+        "_act_prefer_none": ("None", discord.ButtonStyle.secondary),
         "_act_library": ("🏛️ Browse Library", discord.ButtonStyle.success),
         "_act_generate": ("✨ Generate one", discord.ButtonStyle.primary),
         "_act_cast": ("Open Cast Editor", discord.ButtonStyle.success),
     }
 
-    def _make_action_button(self, name: str) -> ui.Button:
-        if name == "_act_get_key":
+    def _key_providers(self) -> List[str]:
+        """The provider chosen, or with None chosen, either: the key is theirs to pick."""
+        chosen = self.state.get("provider")
+        return [chosen] if chosen in KEY_PAGES else list(KEY_PAGES)
+
+    def _action_buttons(self, step: _Step) -> List[ui.Button]:
+        if step.key != "key":
+            return [self._make_action_button(name) for name in step.actions]
+        providers = self._key_providers()
+        named = len(providers) > 1
+        buttons = []
+        for provider in providers:
+            name = MODEL_PROVIDERS[provider]
             # A link: Discord opens it, and no interaction reaches us.
-            return ui.Button(label="Get a key ↗", row=0,
-                             url=KEY_PAGES[self.state.get("provider") or "openrouter"])
+            buttons.append(ui.Button(label=f"Get {name} key ↗" if named else "Get a key ↗",
+                                     row=0, url=KEY_PAGES[provider]))
+            paste = ui.Button(label=f"🔑 Paste {name} key" if named else "🔑 Paste key",
+                              style=discord.ButtonStyle.success, row=0)
+            paste.callback = lambda i, p=provider: self._act_paste_key(i, p)
+            buttons.append(paste)
+        return buttons
+
+    def _make_action_button(self, name: str) -> ui.Button:
         label, style = self._ACTION_LABELS.get(name, (name, discord.ButtonStyle.secondary))
         btn = ui.Button(label=label, style=style, row=0)
         btn.callback = getattr(self, name)
@@ -572,8 +593,7 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
                                    start_category=category, start_page=page)
         await interaction.response.send_message(embed=view.get_embed(), view=view, ephemeral=True)
 
-    async def _act_paste_key(self, interaction: discord.Interaction):
-        provider = self.state.get("provider") or "openrouter"
+    async def _act_paste_key(self, interaction: discord.Interaction, provider: str):
         filled = (self.cog.storage_manager._get_user_keys_data(self.user_id) or {}).get("slots") or {}
         mine = [slot for slot, _label, p in KEY_SLOTS if p == provider]
         # An empty slot first; with both full, the first is replaced, as Edit Key would.
@@ -590,12 +610,18 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
     async def _act_prefer_openrouter(self, interaction: discord.Interaction):
         await self._prefer(interaction, "openrouter")
 
+    async def _act_prefer_none(self, interaction: discord.Interaction):
+        await self._prefer(interaction, PROVIDER_NONE)
+
     async def _prefer(self, interaction: discord.Interaction, provider: str):
-        """Asked here, stored by the setter About Me uses, and changed in either."""
+        """Asked here, stored by the setter Override Defaults uses, and changed in either.
+        The first answer registers the user: see `ProfileManager.is_registered`."""
         await interaction.response.defer()
         self.cog.profile_manager.set_provider_preference(self.user_id, provider)
         self.step_key = None
         await self._repaint()
+        if provider == PROVIDER_NONE:
+            await interaction.followup.send(WIZARD_COPY["provider_none"], ephemeral=True)
 
     async def _act_library(self, interaction: discord.Interaction):
         from .gui_hub import HubPublicLibraryView

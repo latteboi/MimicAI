@@ -3,16 +3,17 @@
 One vector per (text, task type, dimensionality). The cache exists because the same
 query is embedded more than once per turn -- LTM recall and help retrieval both ask.
 
-Every vector comes from Google's gemini-embedding-001, asked for directly on a Gemini key
-or through OpenRouter on an OpenRouter key. Both give the same vector for the same text,
-so one archive holds either; a different model would not, which is why OpenRouter is not
-offered any other.
+Every vector comes from one model, EMBEDDING_MODEL_NAME unless `/mod` moves it. A Google
+model is asked for directly on a Gemini key or through OpenRouter's `google/` copy on an
+OpenRouter key. Both give the same vector for the same text, so one archive holds either;
+a different model would not, which is why the routes never mix models. Any other model is
+OpenRouter's alone. `embedding_model_ids`.
 """
 
 import asyncio
 import orjson as json
 from collections import OrderedDict
-from typing import Any, List, NamedTuple, Optional, Sequence
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence
 
 from ...utils.http_client import get_openrouter_client
 from .google_rest import get_google_rest_client
@@ -25,10 +26,30 @@ class EmbeddingRoute(NamedTuple):
     api_key: str
     #: OpenRouter's `provider.data_collection`; None sends nothing.
     data_collection: Optional[str] = None
+    #: The model as this provider names it; None is the shipped one.
+    model: Optional[str] = None
 
 
 _OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
-_OPENROUTER_EMBEDDING_MODEL = "google/gemini-embedding-001"
+_SHIPPED_MODEL = {"gemini": "gemini-embedding-001", "openrouter": "google/gemini-embedding-001"}
+
+
+def embedding_model_ids(value: str) -> Dict[str, str]:
+    """provider -> model id, for every provider that gives this stored model's vectors.
+
+    `GOOGLE/x` and `OPENROUTER/google/x` are one model on two roads; anything else on
+    OpenRouter has only the one.
+    """
+    name = value.split("/", 1)[1] if value.startswith(("GOOGLE/", "OPENROUTER/")) else value
+    if value.startswith("GOOGLE/"):
+        return {"gemini": name, "openrouter": f"google/{name}"}
+    if name.startswith("google/"):
+        return {"gemini": name[len("google/"):], "openrouter": name}
+    return {"openrouter": name}
+
+
+def _route_model(route: EmbeddingRoute) -> str:
+    return route.model or _SHIPPED_MODEL[route.provider]
 
 #: `input_type` and the hosts allowed, per task type. Measured against Google's API
 #: directly (September 2026): both of OpenRouter's Google hosts return Google's own
@@ -64,13 +85,14 @@ _embed_cache: "OrderedDict[Any, Any]" = OrderedDict()
 _embed_inflight: dict = {}
 
 
-def _embed_cache_key(text: str, task_type: str, output_dimensionality: int):
+def _embed_cache_key(text: str, task_type: str, output_dimensionality: int, model: str):
     """Hash the text rather than keying on it: a round context runs to several KB, and
-    holding those strings alive as dict keys is the bulk of what the cache would cost."""
+    holding those strings alive as dict keys is the bulk of what the cache would cost.
+    The model is in the key so a `/mod` change is never answered from the old one."""
     import hashlib
 
     digest = hashlib.blake2b(text.encode("utf-8"), digest_size=16).digest()
-    return (digest, task_type, output_dimensionality)
+    return (digest, task_type, output_dimensionality, model)
 
 
 def _embed_cache_get(key) -> Optional[List[float]]:
@@ -106,7 +128,9 @@ async def get_embedding_vector(
 
     cache_key = None
     if task_type == "RETRIEVAL_QUERY":
-        cache_key = _embed_cache_key(text, task_type, output_dimensionality)
+        # By the model, not the road: OpenRouter's `google/` copy answers from the same entry.
+        model = _route_model(routes[0]).removeprefix("google/")
+        cache_key = _embed_cache_key(text, task_type, output_dimensionality, model)
 
         cached = _embed_cache_get(cache_key)
         if cached is not None:
@@ -172,14 +196,15 @@ async def _fetch_embedding_vector(
 
 
 async def _fetch_google(route: EmbeddingRoute, text: str, task_type: str, dims: int):
+    model = _route_model(route)
     payload = {
-        "model": "models/gemini-embedding-001",
+        "model": f"models/{model}",
         "content": {"parts": [{"text": text}]},
         "taskType": task_type,
         "outputDimensionality": dims,
     }
     response = await get_google_rest_client().post(
-        "/v1beta/models/gemini-embedding-001:embedContent",
+        f"/v1beta/models/{model}:embedContent",
         content=json.dumps(payload),
         headers={"x-goog-api-key": route.api_key, "Content-Type": "application/json"},
     )
@@ -195,17 +220,19 @@ async def _fetch_openrouter(route: EmbeddingRoute, text: str, task_type: str, di
     task = _OPENROUTER_TASKS.get(task_type)
     if task is None:
         return None
-    input_type, hosts = task
-    provider: dict = {"only": hosts}
+    model = _route_model(route)
+    payload = {"model": model, "input": text, "dimensions": dims}
+    provider: dict = {}
+    # The task type and the host list were measured on Google's model, and name Google's
+    # hosts: another model's are its own, and it is sent the text alone.
+    if model.startswith("google/"):
+        input_type, hosts = task
+        payload["input_type"] = input_type
+        provider["only"] = hosts
     if route.data_collection:
         provider["data_collection"] = route.data_collection
-    payload = {
-        "model": _OPENROUTER_EMBEDDING_MODEL,
-        "input": text,
-        "dimensions": dims,
-        "input_type": input_type,
-        "provider": provider,
-    }
+    if provider:
+        payload["provider"] = provider
     response = await get_openrouter_client().post(
         _OPENROUTER_EMBEDDINGS_URL,
         content=json.dumps(payload),

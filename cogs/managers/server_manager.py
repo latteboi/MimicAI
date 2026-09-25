@@ -11,7 +11,7 @@ from ..utils.constants import (BLACKLIST_FILE_PATH, BLACKLIST_FORMAT_VERSION,
                                BLACKLIST_SCOPE_FULL, BLACKLIST_SCOPE_GENERATION,
                                BLACKLIST_SCOPES, GLOBAL_PROMPTS_FILE_PATH,
                                GUILD_BLOCK_ACTIONS, GUILD_BLOCK_LEAVE,
-                               GUILD_BLOCK_QUARANTINE)
+                               GUILD_BLOCK_QUARANTINE, SYSTEM_MODELS_FILE_PATH)
 
 #: Discord's "Unknown Webhook". A webhook URL is cached *and persisted*, and
 #: `Webhook.from_url` contacts nobody, so a webhook deleted in the server leaves a URL
@@ -46,6 +46,15 @@ class ServerManager:
 
     def _save_global_prompts(self):
         IOManager.write_json(self.cog.global_prompts, GLOBAL_PROMPTS_FILE_PATH)
+
+    def _load_system_models(self):
+        """The operator's overrides of SYSTEM_MODEL_DEFAULTS, and of
+        SYSTEM_MODEL_DEFAULTS_BY_PROVIDER under each provider's name. Sparse -- see `system_model`."""
+        data = IOManager.read_json(SYSTEM_MODELS_FILE_PATH)
+        self.cog.system_models = data if isinstance(data, dict) else {}
+
+    def _save_system_models(self):
+        IOManager.write_json(self.cog.system_models, SYSTEM_MODELS_FILE_PATH)
 
     def _get_server_index(self, server_id_str: str) -> Dict[str, Any]:
         if server_id_str == "dm":

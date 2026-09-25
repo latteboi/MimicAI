@@ -46,10 +46,12 @@ _STATIC_DASHBOARDS = [
                 "A five-step checklist, probed live: provider, key, character, seat, speak",
                 "Under it, the current step's text and buttons; a dropdown jumps to any step",
                 "Steps that cannot be done from here are greyed with the reason, not hidden",
-                "Step 1 Choose a provider: OpenRouter (recommended) or Google (paid key)",
-                "Step 2 Add your API key: Get a key (link), Paste key (made your Personal key); "
+                "Step 1 Choose a provider: OpenRouter (recommended), Google (paid key) or None "
+                "(no model defaults); choosing registers you, and nothing is stored before it",
+                "Step 2 Add your API key: Get a key (link), Paste key (made your Personal key), "
+                "both providers' with None; "
                 "servers you administer, ticked in a paged dropdown and saved as ticked",
-                "Step 3 Get a character: Browse Library or Generate one",
+                "Step 3 Get a character: Browse Library or Generate one (after step 1)",
                 "Step 4 Seat it in this channel: opens the cast editor (administrators, or Open casting)",
                 "Step 5 Say something to it: no button; just talk in the channel",
                 "Refresh re-probes; Guide opens /guide at the current step's page",
@@ -74,11 +76,11 @@ _STATIC_DASHBOARDS = [
                 "The user's own timezone and birthday, not a character's",
             ]),
             ("Override Defaults", [
-                "Off until a provider is chosen, here or in /start; until then new profiles "
-                "start with no models. An API key alone does not choose one",
-                "Provider: Google or OpenRouter, where every model runs Primary -> Fallback, "
-                "then the Final Fallback on the other where a profile turns it on. A dropdown "
-                "while off; a Provider button beside Clear swaps it once on",
+                "Open once /start has registered you, as all of /settings is",
+                "Provider: Google, OpenRouter or None, stepped through by a button beside Clear. "
+                "Google and OpenRouter run every model Primary -> Fallback, then the Final "
+                "Fallback on the other where a profile turns it on; None ships no models, so "
+                "new profiles start on what Set Models here names",
                 "Standing preferences applied to profiles created LATER, and offered on borrows "
                 "(Use my defaults / Keep the original's)",
                 "The same tabs and settings as `/profile manage`: Params, Tools, Images, "
@@ -130,8 +132,10 @@ _STATIC_DASHBOARDS = [
         [
             ("Home", ["Library statistics and your own publication status"]),
             ("Public Library", ["Browse, search and borrow published profiles"]),
-            ("Incoming Shares", ["Accept or reject profiles shared directly with you"]),
-            ("Manage My Shares", ["Publish or unpublish, and revoke existing shares"]),
+            ("Incoming Shares", ["Accept, reject or block the sender of profiles offered to you",
+                                 "Open/Closed toggle for new offers; a user dropdown of who is blocked"]),
+            ("Manage My Shares", ["Offer profiles to registered users (no message is sent), "
+                                  "or publish and unpublish"]),
             ("Profile Cloning", ["Generate a clone code, producing an independent copy rather than a link"]),
         ],
     ),
@@ -158,7 +162,9 @@ _STATIC_DASHBOARDS = [
             ("Stats", ["Instance-wide usage and model statistics"]),
             ("Profiles", ["Inspect any user's profiles; clear classifier verdicts",
                           "Reset All Content Ratings (instance-wide, one-off baseline reset)"]),
-            ("Prompts", ["Override the global system prompts, including CONTENT_POLICY and HELP_MODE_INJECTION"]),
+            ("Prompts", ["Override the global system prompts, including CONTENT_POLICY and HELP_MODE_INJECTION",
+                         "System Models: the attachment describer and content classifier (per "
+                         "provider preference), embeddings, System profiles and Gemini key checks"]),
             ("Docs", ["Edit the documentation shards backing Help Mode; re-embeds on save"]),
             ("Blacklist", ["Block users and servers (leave, or quarantine), silently; "
                            "blocks may be temporary",

@@ -4,6 +4,7 @@ import discord
 from discord import ui
 from typing import Awaitable, Callable, Optional
 
+from ..utils.constants import NOT_REGISTERED
 from ..utils.helpers import suppress_link_previews
 
 def build_tab_nav_bar(target_view: ui.View, current_tab: str, tabs, row: int = 4):
@@ -55,6 +56,21 @@ def build_confirm_view(button_label: str, on_confirm) -> ui.View:
     view = ui.View(timeout=60)
     add_button(view, button_label, on_confirm, style=discord.ButtonStyle.danger)
     return view
+
+async def refuse_unregistered(cog, interaction: discord.Interaction) -> bool:
+    """True, having said so, when this user has not set up through `/start`.
+
+    The gate in front of every command and button that would create a user's own data --
+    see `ProfileManager.is_registered`. Answers however far the interaction has got.
+    """
+    if cog.profile_manager.is_registered(interaction.user.id):
+        return False
+    if interaction.response.is_done():
+        await interaction.followup.send(NOT_REGISTERED, ephemeral=True)
+    else:
+        await interaction.response.send_message(NOT_REGISTERED, ephemeral=True)
+    return True
+
 
 def invalidate_model_cache(cog, user_id: int, profile_name: Optional[str] = None):
     """Drop cached model instances so the next turn rebuilds them from the edited config.

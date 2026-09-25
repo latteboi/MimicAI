@@ -14,7 +14,7 @@ from .utils.constants import (
 )
 from .services.profile_generation import ProfileGenerationError, clean_display_name, generate_draft
 from .listeners.event_listeners import EventListeners
-from .gui.base_components import ActionTextInputModal, DropdownContentView, InviteView
+from .gui.base_components import ActionTextInputModal, DropdownContentView, InviteView, refuse_unregistered
 from .gui.gui_data import PrivacyDashboardView, ImportPassphraseModal, BulkExportView
 from .gui.gui_generate import GeneratedProfileView
 from .gui.gui_hub import HubHomeView
@@ -137,6 +137,7 @@ class MimicCog(EventListeners, commands.Cog):
             os.makedirs(d, exist_ok=True)
 
         self.global_prompts: Dict[str, str] = {}
+        self.system_models: Dict[str, str] = {}
 
         try:
             # A MasterCipher, not a Fernet: same ENCRYPTION_KEY, but it also carries the
@@ -161,6 +162,7 @@ class MimicCog(EventListeners, commands.Cog):
         self.game_service = GameService(self)
 
         self.server_manager._load_global_prompts()
+        self.server_manager._load_system_models()
 
         self.persona_modal_sections_order = ['backstory', 'personality_traits', 'likes', 'dislikes', 'appearance'] 
         
@@ -178,8 +180,6 @@ class MimicCog(EventListeners, commands.Cog):
         self.child_bot_edit_cooldowns: LRUCache = LRUCache(max_size=50)
         
         self.server_manager._load_channel_webhooks()
-
-        self.share_codes: Dict[str, Dict[str, Any]] = {}
 
         self.multi_profile_channels: Dict[int, Dict[str, Any]] = {}
         self.sessions_loaded = False
@@ -329,6 +329,10 @@ class MimicCog(EventListeners, commands.Cog):
         if system_profile and interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
             await interaction.followup.send("❌ **Access Denied:** Creating System Profiles is restricted to the Bot Owner.", ephemeral=True)
             return
+        # A System profile is the bot's, filed under its owner; a personal one is the
+        # first thing some users keep, and keeping starts at /start.
+        if not system_profile and await refuse_unregistered(self, interaction):
+            return
 
         has_access = await self.storage_manager._has_api_key_access(interaction.user.id, interaction.guild_id)
         if not has_access:
@@ -394,6 +398,8 @@ class MimicCog(EventListeners, commands.Cog):
                                      display_name: Optional[app_commands.Range[str, 1, 20]] = None,
                                      avatar_url: Optional[str] = None):
         await interaction.response.defer(ephemeral=True, thinking=True)
+        if await refuse_unregistered(self, interaction):
+            return
         profile_name = profile_name.lower().strip()
 
         is_valid, err_msg = self.profile_manager._is_valid_profile_name(profile_name)
@@ -590,6 +596,8 @@ class MimicCog(EventListeners, commands.Cog):
     @app_commands.dm_only()
     @app_commands.describe(file="The .mimic file exported from a MimicAI instance.")
     async def import_command(self, interaction: discord.Interaction, file: discord.Attachment):
+        if await refuse_unregistered(self, interaction):
+            return
         if not file.filename.endswith('.mimic'):
             await interaction.response.send_message("❌ Invalid file type. Please upload a `.mimic` file.", ephemeral=True)
             return
@@ -2192,6 +2200,9 @@ class MimicCog(EventListeners, commands.Cog):
         if interaction.user.id in self.generation_blocked:
             await interaction.edit_original_response(
                 embed=build_about_embed(self, interaction.user.id))
+            return
+        # Every tab here writes: keys, defaults, About Me, child bots.
+        if await refuse_unregistered(self, interaction):
             return
         view = SettingsHomeView(self, interaction)
         await view.update_display()

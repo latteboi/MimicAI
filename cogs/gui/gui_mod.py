@@ -6,16 +6,17 @@ import discord
 from discord import ui
 import datetime
 from string import Formatter
-from typing import TYPE_CHECKING, Dict, List, Set, Tuple, Optional
-from ..utils.helpers import _sanitise_filename
-from .base_components import (BlockedGuard, TabbedView, add_button, add_select,
-                              build_confirm_view)
+from typing import TYPE_CHECKING, Dict, List, Set, Tuple, Optional, get_args
+from ..utils.helpers import _sanitise_filename, system_model
+from ..utils.user_defaults import model_slot_defaults, other_provider
+from .base_components import (BlockedGuard, TabbedView, TimeoutCleanupMixin, add_button,
+                              add_select, build_confirm_view, invalidate_model_cache)
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
     from ..MimicCog import MimicCog
 
-from .gui_profiles import ProfileManageView
+from .gui_profiles import ModelPickerMixin, ProfileManageView
 
 class ModBaseView(TabbedView):
     """Base for every /mod tab.
@@ -1072,6 +1073,11 @@ class ModPromptsView(ModBaseView):
 
             await i.response.send_modal(ModPromptModal(self, key, default_text))
         add_select(self, options, sel_cb, placeholder="Select a prompt to edit...", row=1)
+
+        async def models_cb(i: discord.Interaction):
+            view = ModSystemModelsView(self.cog, self.original_interaction, target_user_id=self.target_user_id)
+            await i.response.edit_message(**view._picker_render())
+        add_button(self, "System Models\u2026", models_cb, style=discord.ButtonStyle.primary, row=2)
         self._add_nav_buttons()
 
     def _get_embed(self):
@@ -1079,7 +1085,8 @@ class ModPromptsView(ModBaseView):
         embed = discord.Embed(
             title="Global System Prompts",
             description=("Modify the internal hardcoded instructions. Leave a prompt completely "
-                         "blank to revert to its default value."),
+                         "blank to revert to its default value.\n"
+                         "-# The models no profile chooses are under **System Models…**."),
             color=discord.Color.purple(),
         )
 
@@ -1101,3 +1108,329 @@ class ModPromptsView(ModBaseView):
 
     async def update_display(self):
         await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
+
+
+# --- System Models ------------------------------------------------------------
+
+def _slots(*pairs) -> tuple:
+    """(key, wording) pairs as the picker's triples. The shipped value depends on whose
+    chain is shown, so it is `ModSystemModelsView._shipped`'s to answer, not the table's."""
+    return tuple((key, wording, None) for key, wording in pairs)
+
+
+#: A System profile's slots are that profile's own config; every other key is the file's.
+_PROFILE_KEYS = ("primary_model", "fallback_model", "ollama_host_url")
+
+#: The categories shipping a chain per provider preference, which the audience button switches.
+_BY_PROVIDER_CATEGORIES = ("describer", "classifier")
+
+#: What each category tells the operator before they choose.
+_SYSTEM_MODEL_NOTES = {
+    "describer": "Pick models that read images -- and audio, for voice messages to be described.",
+    "classifier": ("Sees the persona and the avatar, so pick models that read images. Runs on the "
+                   "profile owner's key, else yours; on yours, OpenRouter is sent "
+                   "`data_collection: deny`."),
+    "embedding": ("⚠️ Changing this degrades recall of **every existing memory and "
+                  "training example**. A Google model also runs through OpenRouter's `google/` "
+                  "copy; any other OpenRouter model runs on OpenRouter keys only."),
+    "system": ("Saved to the System profile itself, so its Final Fallback follows that profile. "
+               "Its other settings are in `/profile`."),
+    "key_check": ("Called on Google's API with the pasted key, so Google models only. The billing "
+                  "check must be one an unbilled key is refused: an image model."),
+}
+
+
+class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, ui.View):
+    """The models no profile chooses, as Set Models presents a profile's.
+
+    Opened from the Prompts tab onto the same message, with a Back, as Thinking opens from
+    Set Models: /mod's nav bar is a full row of five, and a picker needs every row it has.
+    """
+
+    _CATEGORY_LABELS = (
+        ("describer", "Attachment Describer", "Reads an attachment for a profile whose models cannot."),
+        ("classifier", "Content Classifier", "Rates every profile General or 18+."),
+        ("embedding", "Embeddings", "The vectors behind memory, training-example and /help recall."),
+        ("system", "System Profiles", "The models behind each System profile's replies."),
+        ("key_check", "Key Checks", "Tests a pasted Gemini key, then whether it has billing."),
+    )
+    _CATEGORY_KEYS = {
+        "describer": _slots(("describer_model", "Primary"), ("describer_fallback_model", "Fallback"),
+                            ("describer_final_model", "Final Fallback")),
+        "classifier": _slots(("classifier_model", "Primary"), ("classifier_fallback_model", "Fallback"),
+                             ("classifier_final_model", "Final Fallback")),
+        "embedding": _slots(("embedding_model", "Embedding Model")),
+        "system": _slots(("primary_model", "Primary"), ("fallback_model", "Fallback")),
+        "key_check": _slots(("key_check_model", "Validity Check"),
+                            ("key_tier_probe_model", "Billing Check")),
+    }
+    #: Everything but the System profiles runs for every user, and Ollama answers the bot
+    #: owner's own profiles only -- which the System profiles are.
+    _NO_OLLAMA_CATEGORIES = ("describer", "classifier", "embedding", "key_check")
+    _NO_RETRY_KEYS = ("describer_fallback_model", "describer_final_model",
+                      "classifier_fallback_model", "classifier_final_model")
+    #: No tab has a row to spare for a browse list: three slots and a button row fill
+    #: Discord's five, the System Profiles tab spends one on choosing its profile, and no
+    #: list holds embedding models. The model list pages on its own.
+    _BROWSE_ROW_AVAILABLE = False
+
+    is_borrowed = False
+
+    def __init__(self, cog, interaction: discord.Interaction, target_user_id: Optional[int] = None):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.original_interaction = interaction
+        self.user_id = interaction.user.id
+        self.target_user_id = target_user_id
+        self.view_mode = self.preferred_api(cog, self.user_id)
+        #: Whose chain the describer and classifier tabs show: the users preferring Google,
+        #: or OpenRouter. Opens on the operator's own side.
+        self.audience = "openrouter" if self.view_mode == "openrouter" else "gemini"
+        self.category = "describer"
+        self.ollama_working = None
+        #: An embedding model waiting on the warning, or None.
+        self.pending_embedding: Optional[str] = None
+        #: The System profile the System Profiles tab edits; OllamaHostModal reads it too.
+        self.profile_name = "mimicguide"
+        self.cog.profile_manager._get_or_create_system_profile(self.profile_name)
+        self._build_view()
+
+    # --- Where a slot's value lives ------------------------------------------
+
+    def _system_profiles(self) -> List[str]:
+        # ponytail: the first 25 by name, one dropdown's worth; page them if an instance
+        # ever holds more.
+        return sorted(self.cog.profile_manager._system_index())[:25]
+
+    def _system_config(self) -> Dict:
+        return self.cog.profile_manager._get_profile_config(self.user_id, self.profile_name, False) or {}
+
+    def _value(self, key: str) -> str:
+        if key in _PROFILE_KEYS:
+            # An unset slot runs what the owner's provider ships, as `model_chain` reads it.
+            return self._system_config().get(key) or model_slot_defaults(
+                self.cog.profile_manager.provider_preference(self.user_id)).get(key)
+        return system_model(self.cog, key, self.audience)
+
+    def _shipped(self, key: str) -> str:
+        """What Reset puts back: a new System profile's model, else the build's for this audience."""
+        if key in _PROFILE_KEYS:
+            return SYSTEM_PROFILE_MODEL
+        return SYSTEM_MODEL_DEFAULTS.get(key) or SYSTEM_MODEL_DEFAULTS_BY_PROVIDER[self.audience][key]
+
+    def _save_changes(self, key: str, value):
+        if key in _PROFILE_KEYS:
+            config = self._system_config()
+            config[key] = value
+            self.cog.profile_manager._save_profile_config(self.user_id, self.profile_name, config, False)
+            invalidate_model_cache(self.cog, self.user_id, self.profile_name)
+        elif value == self._value(key):
+            return
+        elif key == "embedding_model":
+            # Not written until the warning is confirmed -- see `_build_view`.
+            self.pending_embedding = value
+        else:
+            self._store(key, value)
+
+    def _store(self, key: str, value: str):
+        """Sparse: the shipped value is no override, so the file holds only what differs --
+        a per-preference key under its audience's name, dropped with the last of them."""
+        shared = key in SYSTEM_MODEL_DEFAULTS
+        section = self.cog.system_models if shared else self.cog.system_models.setdefault(self.audience, {})
+        if value == self._shipped(key):
+            section.pop(key, None)
+        else:
+            section[key] = value
+        if not shared and not section:
+            self.cog.system_models.pop(self.audience, None)
+        self.cog.server_manager._save_system_models()
+
+    def _is_changed(self, key: str) -> bool:
+        return self._value(key) != self._shipped(key)
+
+    # --- Mixin contract ------------------------------------------------------
+
+    def _ollama_host_url(self) -> Optional[str]:
+        return self._system_config().get("ollama_host_url")
+
+    def _get_selection_feedback_message(self) -> str:
+        """Unused -- this view renders an embed -- but named by the mixin."""
+        return ""
+
+    def _api_modes(self) -> List[str]:
+        # The key checks are raw calls to Google's API with the key being checked.
+        return ["google"] if self.category == "key_check" else super()._api_modes()
+
+    def _allows_no_fallback(self, target_config_key: str) -> bool:
+        return target_config_key in self._NO_RETRY_KEYS
+
+    def _tier_applies(self) -> bool:
+        """No Hosts & Tier: a tier and a pin are a profile's settings, and only one of these is."""
+        return False
+
+    def _get_top_models(self, provider: str, target_config_key: str) -> List[str]:
+        if target_config_key == "key_tier_probe_model":
+            return list(get_args(IMAGE_MODELS))
+        return super()._get_top_models(provider, target_config_key)
+
+    def _create_model_options(self, current_val: str, target_config_key: str) -> List[discord.SelectOption]:
+        if target_config_key != "embedding_model":
+            return super()._create_model_options(current_val, target_config_key)
+        # Neither tab's list is embedding models: typed, or the shipped one.
+        opts = [discord.SelectOption(label="Custom Model...", value="custom_option",
+                                     description="Enter manually via modal"),
+                discord.SelectOption(label=f"Current: {self.strip_prefix(current_val)}"[:100],
+                                     value=current_val, default=True)]
+        if current_val != EMBEDDING_MODEL_NAME:
+            opts.append(discord.SelectOption(
+                label=f"Shipped: {self.strip_prefix(EMBEDDING_MODEL_NAME)}"[:100],
+                value=EMBEDDING_MODEL_NAME))
+        return opts
+
+    def refuse_custom_model(self, key: str, value: str) -> Optional[str]:
+        """What CustomModelModal asks before the profile rules. See `_NO_OLLAMA_CATEGORIES`."""
+        if key in _PROFILE_KEYS:
+            return None
+        if value.startswith("OLLAMA/"):
+            return ("Ollama can't hold a system model: these run for every user, and Ollama "
+                    "answers the bot owner's own profiles only.")
+        if key in ("key_check_model", "key_tier_probe_model") and not value.startswith("GOOGLE/"):
+            return "The key checks call Google's API with the pasted key, so they take a Google model."
+        return None
+
+    # --- Rendering -----------------------------------------------------------
+
+    def _blind_models(self) -> List[str]:
+        """This tab's OpenRouter models the catalogue says cannot read an image."""
+        if self.category not in ("describer", "classifier"):
+            return []
+        blind = []
+        for key, _wording, _default in self._CATEGORY_KEYS[self.category]:
+            value = self._value(key)
+            if not str(value).startswith("OPENROUTER/"):
+                continue
+            info = self.cog.api_service.catalogue.models.get(self.strip_prefix(value))
+            if info is not None and not info.image_input:
+                blind.append(self.strip_prefix(value))
+        return blind
+
+    def embed(self) -> discord.Embed:
+        if self.pending_embedding is not None:
+            return discord.Embed(
+                title="Change the Embedding Model?", colour=discord.Colour.red(),
+                description=(
+                    f"`{self.strip_prefix(self._value('embedding_model'))}` → "
+                    f"`{self.strip_prefix(self.pending_embedding)}`\n\n"
+                    "Every memory and training example on this bot was embedded by the current "
+                    "model, and a stored vector does not record which model made it. After the "
+                    "change, recall compares new queries against old vectors and returns poor "
+                    "matches **with no error**, until each one is saved again. Nothing "
+                    "re-embeds them.\n\n"
+                    "The `/help` documentation re-embeds itself straight away, on your key."))
+
+        wording, description = next((l, d) for v, l, d in self._CATEGORY_LABELS if v == self.category)
+        whose = ""
+        if self.category in _BY_PROVIDER_CATEGORIES:
+            whose = (f"Showing the chain for profiles whose owner prefers "
+                     f"**{MODEL_PROVIDERS[self.audience]}**.\n")
+        elif self.category == "system":
+            whose = f"Editing **{self.profile_name}**.\n"
+        e = discord.Embed(title="System Models", colour=discord.Colour.purple(),
+                          description=f"**{wording}** — {description}\n{whose}"
+                                      f"-# {_SYSTEM_MODEL_NOTES[self.category]}")
+        for key, slot, _default in self._CATEGORY_KEYS[self.category]:
+            mark = " ✏️" if self._is_changed(key) else ""
+            e.add_field(name=f"{slot}{mark}", value=f"`{self.display_model(self._value(key))}`", inline=True)
+        blind = self._blind_models()
+        if blind:
+            e.add_field(name="⚠️ Cannot read images", inline=False,
+                        value=", ".join(f"`{m}`" for m in blind) + " -- the chain passes over "
+                              f"{'them' if len(blind) > 1 else 'it'} whenever there is a file to read.")
+        self._add_openrouter_details(e, [(slot, self._value(key))
+                                         for key, slot, _d in self._CATEGORY_KEYS[self.category]])
+        e.set_footer(text="Bot-wide · ✏️ differs from the shipped model · saves as you choose")
+        return e
+
+    def _add_system_profile_select(self, row: int):
+        names = self._system_profiles()
+        if self.profile_name not in names:
+            # Converted back to a personal profile, or deleted, since this screen opened.
+            self.profile_name = "mimicguide" if "mimicguide" in names else names[0]
+        select = ui.Select(placeholder="Choose a System profile...", row=row, options=[
+            discord.SelectOption(label=f"Profile: {name}"[:100], value=name,
+                                 default=(name == self.profile_name)) for name in names])
+
+        async def callback(i: discord.Interaction):
+            self.profile_name = select.values[0]
+            # Each profile names its own Ollama host.
+            self.ollama_working = None
+            self._build_view()
+            await i.response.edit_message(**self._picker_render())
+
+        select.callback = callback
+        self.add_item(select)
+
+    def _build_view(self):
+        self.clear_items()
+
+        if self.pending_embedding is not None:
+            async def confirm_cb(i: discord.Interaction):
+                self._store("embedding_model", self.pending_embedding)
+                self.pending_embedding = None
+                # As a Docs edit does: the documentation is the one archive that can be
+                # rebuilt from its source.
+                self.cog.bot.loop.create_task(self.cog.help_service._load_and_embed_docs())
+                self._build_view()
+                await i.response.edit_message(**self._picker_render())
+
+            async def cancel_cb(i: discord.Interaction):
+                self.pending_embedding = None
+                self._build_view()
+                await i.response.edit_message(**self._picker_render())
+
+            add_button(self, "Change Embedding Model", confirm_cb, style=discord.ButtonStyle.danger, row=0)
+            add_button(self, "Cancel", cancel_cb, row=0)
+            return
+
+        if self.view_mode not in self._api_modes():
+            self.view_mode = "google"
+
+        self._add_category_select(0)
+        row = 1
+        if self.category == "system":
+            self._add_system_profile_select(row)
+            row += 1
+        slots = self._CATEGORY_KEYS[self.category]
+        for key, wording, _default in slots:
+            self.add_item(self.GenericModelSelect(
+                f"Select {wording} Model...", self._create_model_options(self._value(key), key), row, key))
+            row += 1
+
+        if self.category in _BY_PROVIDER_CATEGORIES:
+            async def audience_cb(i: discord.Interaction):
+                self.audience = other_provider(self.audience)
+                # The models a side ships are that side's, so the list follows it.
+                self.view_mode = "openrouter" if self.audience == "openrouter" else "google"
+                self._build_view()
+                await i.response.edit_message(**self._picker_render())
+
+            add_button(self, f"For: {MODEL_PROVIDERS[self.audience]} users", audience_cb,
+                       style=discord.ButtonStyle.success, row=row)
+
+        self._add_api_buttons(row=row)
+
+        async def reset_cb(i: discord.Interaction):
+            # Through `_save_changes`, so resetting the embedding model is warned about too.
+            for key, _wording, _default in slots:
+                self._save_changes(key, self._shipped(key))
+            self._build_view()
+            await i.response.edit_message(**self._picker_render())
+
+        add_button(self, "Reset to Shipped", reset_cb, row=row,
+                   disabled=not any(self._is_changed(key) for key, _w, _d in slots))
+
+        async def back_cb(i: discord.Interaction):
+            view = ModPromptsView(self.cog, self.original_interaction, target_user_id=self.target_user_id)
+            await i.response.edit_message(embed=view._get_embed(), view=view)
+
+        add_button(self, "Back", back_cb, row=row)

@@ -230,15 +230,6 @@ PROVIDER_PREFERENCE_NOTE = (
     "provider; a model you picked yourself stays picked.")
 
 
-def provider_options(current: Optional[str]) -> List[discord.SelectOption]:
-    """The two providers, the stored one ticked. One list for Override Defaults and `/start`."""
-    blurbs = {"gemini": "Gemini through your Google key.",
-              "openrouter": "Ling, Ming and Fish Audio through your OpenRouter key."}
-    return [discord.SelectOption(label=label, value=value, description=blurbs[value],
-                                 default=value == current)
-            for value, label in MODEL_PROVIDERS.items()]
-
-
 def build_about_embed(cog: 'MimicCog', user_id: int) -> discord.Embed:
     """About Me, with the user's standing.
 

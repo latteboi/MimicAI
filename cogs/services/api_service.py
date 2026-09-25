@@ -19,7 +19,7 @@ from ..utils.constants import (
     THINKING_LEVELS_TO_OLLAMA, GEMINI_FREE_TIER_BLOCKED, OLLAMA_OWNER_ONLY,
     OPENROUTER_DATA_POLICY_BLOCKED, IMAGE_MODEL_NO_OLLAMA, SPEECH_MODEL_NO_OLLAMA,
     OPENROUTER_SERVER_TOOLS,
-    API_KEY_COOLING_DOWN, NO_MODEL_SET,
+    API_KEY_COOLING_DOWN, NO_MODEL_SET, KEY_CHECK_MODEL_MISSING,
 )
 from ..utils.data_policy import openrouter_data_collection
 from ..managers.storage_manager import IOManager
@@ -30,7 +30,7 @@ from ..utils.helpers import (_format_api_error, _resolve_safety_settings,
                             resolve_image_tools, resolve_media_resolution,
                             resolve_native_tools, resolve_openrouter_image_detail,
                             resolve_openrouter_endpoint, resolve_openrouter_service_tier,
-                            resolve_thinking_params)
+                            resolve_thinking_params, system_model)
 from ..utils.http_client import get_shared_client
 from ..utils.user_defaults import model_chain
 from ..utils.net_guard import safe_stream
@@ -674,14 +674,23 @@ class APIService:
                     headers={"x-goog-api-key": gemini_key, "Content-Type": "application/json"},
                 )
 
+            # Both are `/mod`'s to move, Google-only, and stored with the routing prefix.
+            auth_model, tier_model = (system_model(self.cog, k).removeprefix("GOOGLE/")
+                                      for k in ("key_check_model", "key_tier_probe_model"))
             try:
                 # Step 1: Authentication Check (Is the key valid?)
-                auth_resp = await _ping('gemini-flash-lite-latest')
+                auth_resp = await _ping(auth_model)
+                if auth_resp.status_code == 404:
+                    return False, KEY_CHECK_MODEL_MISSING.format(model=auth_model), "none"
                 if auth_resp.status_code != 200:
                     return False, f"Google Gemini API validation failed: {auth_resp.status_code}: {auth_resp.text}", "none"
 
-                # Step 2: Billing Detection (Does it have access to image models?)
-                billing_resp = await _ping('gemini-3.1-flash-image')
+                # Step 2: Billing Detection (Does it have access to image models?) An
+                # unbilled key is refused with a 400 or a 429; a 404 is the probe model
+                # gone, which used to read as "free" and so turned every key away.
+                billing_resp = await _ping(tier_model)
+                if billing_resp.status_code == 404:
+                    return False, KEY_CHECK_MODEL_MISSING.format(model=tier_model), "none"
                 detected_tier = "paid" if billing_resp.status_code == 200 else "free"
 
             except Exception as e:

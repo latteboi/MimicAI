@@ -120,7 +120,7 @@ cogs/
     profile_manager.py     profile CRUD, personal/borrowed/system resolution, sharing
     session_manager.py     hydration/dehydration, eviction, history derivation
     memory_manager.py      LTM, embeddings, cosine/MMR retrieval, training examples
-    server_manager.py      per-guild index, webhooks, global prompts
+    server_manager.py      per-guild index, webhooks, global prompts, system models
     child_bot_manager.py   child-bot client lifecycle and command dispatch
   services/
     api_service.py         provider adapters + model instantiation/routing
@@ -226,7 +226,7 @@ servers/<guild_id>/
   sessions/<channel_id>/multi/session_log.json.gz
 public_profiles/                      the shared library index
 borrows.json                          plaintext reverse index: source PID -> borrow PIDs
-mod/                                  blacklist, global prompt overrides, docs
+mod/                                  blacklist, global prompt and system model overrides, docs
 ```
 
 `index.json` also carries two stat stamps, so the boot-and-hourly consistency check can
@@ -235,6 +235,16 @@ verify with a `stat` what would otherwise cost a decrypt: `key_file_stamp`, the
 `profiles_stamp`, the `mtime_ns` of `profiles/` — a directory's mtime moves when an entry is
 created or removed in it and not when a file inside a child is rewritten, which is exactly
 when the name maps can go stale.
+
+`users/<id>/` exists only once a user registers, by choosing a provider in `/start` --
+Google, OpenRouter or None, stored as `about.provider` (`ProfileManager.is_registered`).
+Reading someone with no directory -- autocomplete, a message in a session channel -- answers
+an empty index held in memory and writes nothing (`_get_user_index`), and every path that
+would create their data refuses until then (`refuse_unregistered`). A private share is
+offered only to the registered, who may close Incoming Shares or block a sharer (`about`'s
+`shares_closed` and `blocked_sharers`); it waits there, and nobody is messaged. The daily
+cleanup clears a directory holding nothing chosen: no profiles, keys or shares, and no
+About Me or Override Defaults, which live in `index.json` alone.
 
 ### index.json is a cache, and rebuilding it is cheap
 
@@ -586,9 +596,12 @@ Vectors are **256-dimensional**, truncated from the embedding model's native out
 Matryoshka Representation Learning. The quality loss is small; the disk and RAM saving is
 not.
 
-Every vector is Google's `gemini-embedding-001`, asked for on a Gemini key or, failing that,
-through OpenRouter on an OpenRouter key (`StorageManager._embedding_routes`, then
-`services/api/embeddings.py`). One archive can hold both only because they are the same
+Every vector is one model's -- Google's `gemini-embedding-001` unless `/mod` -> System Models
+moves it -- asked for on a Gemini key or, failing that, through OpenRouter's `google/` copy on
+an OpenRouter key (`StorageManager._embedding_routes`, then `services/api/embeddings.py`).
+A model Google does not serve has the OpenRouter route alone. A stored vector does not record
+its model, so a change silently degrades recall of everything already stored; only the
+documentation re-embeds. One archive can hold both routes only because they are the same
 vectors, so OpenRouter is sent `dimensions` and `input_type`, and a stored document goes to
 Vertex alone -- AI Studio drops the task type. A server's OpenRouter route carries its
 `data_collection`. A longer vector is cut to 256 and a shorter one refused, before either is stored.

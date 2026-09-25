@@ -20,7 +20,8 @@ from .constants import (
     PATTERN_REASONING_BLOCKS, PATTERN_REASONING_ORPHANS, PATTERN_SYSTEM_HEADER,
     PATTERN_TIMESTAMP_HEADER, PATTERN_METADATA, PATTERN_MESSAGE_LINK,
     PATTERN_SPEAKER_CLOSE,
-    PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK,
+    PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK, SYSTEM_MODEL_DEFAULTS,
+    SYSTEM_MODEL_DEFAULTS_BY_PROVIDER,
     IMAGE_COMMAND_PREFIXES, IMAGE_MODEL_CAPS, IMAGE_MODEL_CAPS_DEFAULT, IMAGE_THINKING_LEVELS,
     OPENROUTER_IMAGE_CAPS_UNKNOWN, IMAGE_MIME_SUFFIXES, IMAGE_SUFFIX_MIMES,
     IMAGE_GROUNDING_TOOL_MODES, DEFAULT_TYPING_CURSOR,
@@ -1457,6 +1458,22 @@ def is_real_model(name: Optional[str]) -> bool:
             text = text[len(prefix):]
             break
     return text.upper() != NO_FALLBACK
+
+
+def system_model(cog, key: str, provider: Optional[str] = None) -> str:
+    """A model no profile chooses: the operator's `/mod` override, else the shipped model.
+
+    `provider` is the preference whose chain a SYSTEM_MODEL_DEFAULTS_BY_PROVIDER key is
+    read from -- the profile owner's `effective_provider` -- and unset is Google, as an
+    unchosen preference is everywhere. SYSTEM_MODEL_DEFAULTS' keys ignore it.
+
+    Asked at the moment of use, never held: an override takes effect on the next call.
+    """
+    stored = getattr(cog, "system_models", None) or {}
+    if key in SYSTEM_MODEL_DEFAULTS:
+        return stored.get(key) or SYSTEM_MODEL_DEFAULTS[key]
+    side = provider if provider in SYSTEM_MODEL_DEFAULTS_BY_PROVIDER else "gemini"
+    return (stored.get(side) or {}).get(key) or SYSTEM_MODEL_DEFAULTS_BY_PROVIDER[side][key]
 
 
 def is_gateway_shutdown(exc: BaseException) -> bool:

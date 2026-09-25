@@ -24,7 +24,7 @@ from ..utils.user_defaults import (
     other_provider, platform_model_defaults, sanitise_defaults, setting_label, short_model_name)
 from ..utils.helpers import is_real_model
 from ..utils.constants import (
-    USERS_DIR, PUBLIC_PROFILES_DIR, BORROW_INDEX_FILE, PROFILE_NAME_SIDECAR,
+    USERS_DIR, PUBLIC_PROFILES_DIR, BORROW_INDEX_FILE, PROFILE_NAME_SIDECAR, CLASSIFIER_KEYS,
     PID_CLASS_PREFIXES, defaultConfig,
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS,
     DEFAULT_ANTI_REPETITION_PROMPT, UTILITY_FALLBACK_KEYS, NO_FALLBACK,
@@ -40,13 +40,14 @@ from ..utils.constants import (
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
     NEW_PROFILE_SPEECH_TEMPERATURE, SPEECH_LANGUAGE_NAMES,
     IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_SLOT_FILES, VOICE_SAMPLE_SLOT_KEY, VOICE_SAMPLE_SLOTS,
-    UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_MODES, GREEDY_SAMPLING, )
+    UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_MODES, GREEDY_SAMPLING, SYSTEM_PROFILE_MODEL,
+    MODEL_PROVIDERS, PROVIDER_CHOICES, NOT_REGISTERED, )
 from ..utils.helpers import (image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
                             ltm_auto_recall_enabled, resolve_critic_settings,
                             grounding_mode_display, resolve_image_output_params,
                             resolve_image_tools, resolve_thinking_params,
                             resolve_unreadable_media_mode,
-                            resolve_url_mode, suppress_link_previews)
+                            resolve_url_mode, suppress_link_previews, system_model)
 from ..utils.discord_cdn import signed_attachment_url, unsigned_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager
@@ -65,12 +66,6 @@ except ImportError:
 #: never deleted. Recognised here only so the migration and _borrow_key_for_config
 #: can refuse it; nothing writes it any more.
 _UNKNOWN_SOURCE_PID = "00000000"
-
-#: Hard ceiling on live share codes across the whole instance. Not a user-facing
-#: limit -- codes expire in five minutes and pruning on insert holds the dict to
-#: roughly that window, so this only ever bites on a burst inside one window.
-SHARE_CODE_LIMIT = 500
-
 
 def feature_fields(config: Dict[str, Any], speech_providers: Set[str]) -> Tuple[str, str, str]:
     """The dashboard's Tools, Behaviour and Media fields: one setting to a line.
@@ -141,7 +136,7 @@ def feature_fields(config: Dict[str, Any], speech_providers: Set[str]) -> Tuple[
 
 
 class ProfileManager:
-    """Owns profile CRUD, personal/borrowed inheritance resolution, share codes, and cloning logic.
+    """Owns profile CRUD, personal/borrowed inheritance resolution, private shares, and cloning.
 
     Holds a back-reference to the parent cog for state/logic not yet migrated
     (fernet, the generic shard system, and shared instance caches),
@@ -670,30 +665,6 @@ class ProfileManager:
                 found.append((int(borrower_str), borrow_pid))
         return found
 
-    def register_share_code(self, code: str, data: Dict[str, Any]):
-        """Store a share code, dropping the ones that have already expired.
-
-        share_codes was the last plain dict growing on a user gesture, swept only by
-        the daily cleanup -- so a day of unredeemed codes accumulated between sweeps.
-
-        Every code carries a five-minute TTL and redemption already refuses an
-        expired one, so pruning here throws nothing away that was still usable and
-        holds the dict to the codes issued in the last five minutes. The cap is the
-        backstop for a burst inside a single window; it evicts the code nearest to
-        expiring, which is the one with the least left to lose.
-        """
-        now = time.time()
-        for existing in [c for c, d in self.cog.share_codes.items()
-                         if now > d.get("expires_at", 0)]:
-            self.cog.share_codes.pop(existing, None)
-
-        self.cog.share_codes[code] = data
-
-        while len(self.cog.share_codes) > SHARE_CODE_LIMIT:
-            soonest = min(self.cog.share_codes,
-                          key=lambda c: self.cog.share_codes[c].get("expires_at", 0))
-            self.cog.share_codes.pop(soonest, None)
-
     def _load_profile_shares(self):
         self.cog.profile_shares = {}
         if not os.path.isdir(USERS_DIR):
@@ -711,6 +682,60 @@ class ProfileManager:
             self.cog.storage_manager._delete_shard("profile_shares", recipient_id_str)
         else:
             self.cog.storage_manager._save_shard("profile_shares", recipient_id_str, data)
+
+    # --- Who may share with whom ---------------------------------------------------
+    #
+    # A recipient's answer lives beside the rest of their own settings, in About Me's
+    # sparse block: `shares_closed` only while closed, `blocked_sharers` only while it
+    # names someone. A share is only ever offered, never delivered: it waits in Incoming
+    # Shares, and nothing is sent to anyone to say so.
+
+    def accepts_share(self, recipient_id: int, sharer_id: int) -> bool:
+        """Whether `sharer_id` may offer `recipient_id` a profile: someone registered, open
+        to shares, who has not blocked them. The sender is told only that it could not be
+        sent -- never which of the three it was."""
+        about = self.get_user_about(recipient_id)
+        return (about.get("provider") in PROVIDER_CHOICES and not about.get("shares_closed")
+                and int(sharer_id) not in (about.get("blocked_sharers") or []))
+
+    def set_shares_closed(self, user_id: int, closed: bool):
+        about = self.get_user_about(user_id)
+        about["shares_closed"] = True if closed else None
+        self.save_user_about(user_id, about)
+
+    def set_blocked_sharers(self, user_id: int, sharer_ids) -> List[int]:
+        """Replaces the block list, and takes back whatever the blocked had waiting."""
+        blocked = sorted({int(i) for i in sharer_ids} - {int(user_id)})
+        about = self.get_user_about(user_id)
+        about["blocked_sharers"] = blocked or None
+        self.save_user_about(user_id, about)
+        self._drop_pending_shares(user_id, lambda s: s.get("sharer_id") in blocked)
+        return blocked
+
+    def _pending_shares(self, recipient_id: int) -> List[Dict[str, Any]]:
+        return list(self.cog.profile_shares.get(str(recipient_id)) or [])
+
+    def _drop_pending_shares(self, recipient_id: int, drop) -> None:
+        """Removes the shares `drop(share)` names from one recipient's queue, and saves."""
+        key = str(recipient_id)
+        shares = self._pending_shares(recipient_id)
+        kept = [s for s in shares if not drop(s)]
+        if len(kept) == len(shares):
+            return
+        if kept:
+            self.cog.profile_shares[key] = kept
+        else:
+            self.cog.profile_shares.pop(key, None)
+        self._save_profile_share_shard(key, kept)
+
+    @staticmethod
+    def _is_share_of(share: Dict[str, Any], sharer_id: int, target_pid: Optional[str],
+                     fallback_name: str) -> bool:
+        if share.get("sharer_id") != sharer_id:
+            return False
+        if target_pid:
+            return share.get("original_pid") == target_pid
+        return share.get("profile_name") == fallback_name
 
     def _describe_public_entry(self, entry_id: str, p_info: Any) -> Optional[Dict[str, Any]]:
         """Normalises one public-index entry into a single shape.
@@ -1416,7 +1441,13 @@ class ProfileManager:
         path = os.path.join(USERS_DIR, user_id_str, "index.json")
         index = IOManager.read_json(path)
 
-        if not index or not isinstance(index.get("personal"), dict) or not isinstance(index.get("borrowed"), dict):
+        if index is None and not os.path.isdir(os.path.join(USERS_DIR, user_id_str)):
+            # Someone the bot holds nothing for: a keystroke of autocomplete, a message in
+            # a session channel, a look at /start. There is nothing to repair, and the
+            # repair's save would mint a directory for every passer-by. The first thing
+            # they actually keep -- a profile, a key, a setting -- saves the index.
+            index = {key: {} for key in self._DERIVED_INDEX_KEYS}
+        elif not index or not isinstance(index.get("personal"), dict) or not isinstance(index.get("borrowed"), dict):
             index = self._repair_user_index(user_id)
 
         self.cog.user_indices[user_id_str] = index
@@ -1503,7 +1534,12 @@ class ProfileManager:
 
         Returned as a copy: `_get_user_index` hands back the cached index by
         reference, and the settings screen edits what it is given.
+
+        No id is nobody. A session with no `owner_id` once asked for its owner's clock
+        here, and the index read then wrote one -- `users/None/`.
         """
+        if user_id is None:
+            return {}
         about = self._get_user_index(user_id).get("about")
         return dict(about) if isinstance(about, dict) else {}
 
@@ -1540,9 +1576,21 @@ class ProfileManager:
         return self.get_user_about(user_id).get("provider") if user_id else None
 
     def set_provider_preference(self, user_id: int, provider: str) -> None:
+        """The first call, from `/start`, is registering. See `is_registered`."""
+        if provider not in PROVIDER_CHOICES:
+            raise ValueError(f"Not a provider choice: {provider!r}")
         about = self.get_user_about(user_id)
         about["provider"] = provider
         self.save_user_about(user_id, about)
+
+    def is_registered(self, user_id: Optional[int]) -> bool:
+        """Whether this user has set up through `/start` -- the one way in.
+
+        Every path that creates a user's own data asks this first and answers
+        NOT_REGISTERED: a profile, a borrow, a key, a setting, an accepted share. Until
+        then nothing is stored under their id, whatever they read or say in a session.
+        """
+        return self.get_user_about(user_id).get("provider") in PROVIDER_CHOICES
 
     def effective_provider(self, user_id: int) -> str:
         """The provider this user's new models ship on: the preferred one, unless they
@@ -1551,7 +1599,9 @@ class ProfileManager:
 
         Read on creation, borrow and generation only: it decrypts the key file.
         """
-        preferred = self.provider_preference(user_id) or "gemini"
+        preferred = self.provider_preference(user_id)
+        if preferred not in MODEL_PROVIDERS:
+            preferred = "gemini"
         other = other_provider(preferred)
         if (not self._user_holds_provider_key(user_id, preferred)
                 and self._user_holds_provider_key(user_id, other)):
@@ -1632,7 +1682,8 @@ class ProfileManager:
         preferred = self.provider_preference(user_id)
         if not preferred:
             return {}
-        mine = {**config, **model_slot_defaults(preferred)}
+        # No provider ships no models: only their own defaults move a slot.
+        mine = {**config, **(model_slot_defaults(preferred) if preferred in MODEL_PROVIDERS else {})}
         apply_defaults(mine, self._get_user_defaults(user_id), borrowed=True)
         return {k: v for k, v in mine.items() if config.get(k) != v}
 
@@ -2038,23 +2089,23 @@ class ProfileManager:
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }
 
-            # Defaults are off until the user chooses a provider, in `/start` or Override
-            # Defaults. A key alone is not that choice, so until then every model slot is
-            # NO_FALLBACK -- "None" on the dashboard, refused by `_instantiate_model`.
+            # The provider chosen in `/start` ships its models. `none` ships none: every
+            # model slot is NO_FALLBACK -- "None" on the dashboard, refused by
+            # `_instantiate_model` -- until the user's own defaults name one.
             preferred = self.provider_preference(user_id)
-            if preferred:
+            if preferred in MODEL_PROVIDERS:
                 # Routed onto the chosen provider: only the slots it moves are written, so a
                 # Google profile keeps absent slots absent and following the shipped value.
                 platform = platform_model_defaults()
                 config.update({k: v for k, v in model_slot_defaults(preferred).items()
                                if v != platform.get(k)})
-                # The template above is what the bot ships; anything the user has set as
-                # their own default wins over it. New profiles take every defaultable key,
-                # including the ones a borrow may not have -- there is no author here whose
-                # tuning a standing preference could be overwriting.
-                apply_defaults(config, self._get_user_defaults(user_id), borrowed=False)
             else:
                 config.update({k: NO_FALLBACK for pair in MODEL_SLOT_PAIRS.items() for k in pair})
+            # The template above is what the bot ships; anything the user has set as
+            # their own default wins over it. New profiles take every defaultable key,
+            # including the ones a borrow may not have -- there is no author here whose
+            # tuning a standing preference could be overwriting.
+            apply_defaults(config, self._get_user_defaults(user_id), borrowed=False)
 
             # No "ltm_summarization_instructions": a seeded copy of the default freezes
             # this profile on whichever wording shipped today, so /mod's override and
@@ -2098,7 +2149,7 @@ class ProfileManager:
                 "top_k": 40, "training_context_size": 0,
                 "training_relevance_threshold": 0.0,
                 "ltm_context_size": 0, "ltm_relevance_threshold": 1.0, "ltm_creation_interval": 100,
-                "primary_model": "GOOGLE/gemini-2.5-flash-lite", "fallback_model": "GOOGLE/gemini-2.5-flash-lite",
+                "primary_model": SYSTEM_PROFILE_MODEL, "fallback_model": SYSTEM_PROFILE_MODEL,
                 "timezone": "UTC", "generation_metadata_enabled": False,
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
                 # Written explicitly, and False, where absence means on: recall has been
@@ -2667,14 +2718,19 @@ class ProfileManager:
         payload = [{"role": "user", "parts": parts}]
         gen_cfg = dict(GREEDY_SAMPLING)
 
-        # The attachment describer's chain, for the same reasons: the free model while
-        # the key owner's free quota lasts, the same model paid once it is spent, and
-        # Google when there is no OpenRouter key at all.
-        attempts = [
-            ("openrouter", "inclusionai/ling-3.0-flash-vl:free", OpenRouterModel),
-            ("openrouter", "inclusionai/ling-3.0-flash-vl", OpenRouterModel),
-            ("gemini", "gemini-2.5-flash-lite", GoogleGenAIModel),
-        ]
+        # Ships the attachment describer's chain, for the same reasons, on the profile
+        # owner's provider: its two models, then the other provider's when there is no
+        # key for them or they refuse. Built here rather than by the model
+        # factory because the key is not the factory's -- see `_classifier_api_key` -- so
+        # only the two providers that function knows are routed; `/mod` offers no other.
+        # A repeat is tried once, as `run_with_fallback` does.
+        attempts = []
+        side = self.effective_provider(owner_id)
+        for value in dict.fromkeys(system_model(self.cog, k, side) for k in CLASSIFIER_KEYS):
+            if value.startswith("GOOGLE/"):
+                attempts.append(("gemini", value[len("GOOGLE/"):], GoogleGenAIModel))
+            elif value.startswith("OPENROUTER/"):
+                attempts.append(("openrouter", value[len("OPENROUTER/"):], OpenRouterModel))
 
         raw = None
         used_model = None
@@ -4181,7 +4237,20 @@ class ProfileManager:
     
 
     async def _accept_share_request(self, interaction: discord.Interaction, sharer_id: int, target_pid: Optional[str], fallback_name: str, desired_name: str, is_public_borrow: bool = False) -> bool:
-        """Creates the borrow. True if it was made; otherwise the reason has been sent."""
+        """Creates the borrow. True if it was made; otherwise the reason has been sent.
+
+        A private borrow needs a share still waiting for this user from this sharer: there
+        is no other way to be handed one, and blocking the sharer took theirs back.
+        """
+        recipient_id = interaction.user.id
+        if not self.is_registered(recipient_id):
+            await interaction.followup.send(NOT_REGISTERED, ephemeral=True)
+            return False
+        if not is_public_borrow and not any(
+                self._is_share_of(s, sharer_id, target_pid, fallback_name)
+                for s in self._pending_shares(recipient_id)):
+            await interaction.followup.send("That share is no longer waiting for you.", ephemeral=True)
+            return False
         def _sync_prepare():
             current_name = self._get_name_from_pid(sharer_id, target_pid) if target_pid else fallback_name
             if not current_name: current_name = fallback_name
@@ -4325,7 +4394,7 @@ class ProfileManager:
             return False
 
         if not is_public_borrow:
-            await self._reject_share_request(interaction, sharer_id, target_pid, fallback_name, notify_sharer=True, accepted=True)
+            await self._reject_share_request(interaction, sharer_id, target_pid, fallback_name)
 
         await self._report_borrow_adjustments(interaction, desired_name, adjustments)
         return True
@@ -4362,28 +4431,10 @@ class ProfileManager:
             # explanatory note could not be delivered.
             pass
 
-    async def _reject_share_request(self, interaction: discord.Interaction, sharer_id: int, target_pid: Optional[str], fallback_name: str, notify_sharer: bool = True, accepted: bool = False):
-        recipient_id_str = str(interaction.user.id)
-        if recipient_id_str in self.cog.profile_shares:
-            if target_pid:
-                updated_shares = [s for s in self.cog.profile_shares[recipient_id_str] if not (s['sharer_id'] == sharer_id and s.get('original_pid') == target_pid)]
-            else:
-                updated_shares =[s for s in self.cog.profile_shares[recipient_id_str] if not (s['sharer_id'] == sharer_id and s['profile_name'] == fallback_name)]
-                
-            if not updated_shares:
-                del self.cog.profile_shares[recipient_id_str]
-            else:
-                self.cog.profile_shares[recipient_id_str] = updated_shares
-            self._save_profile_share_shard(recipient_id_str, updated_shares)
-
-        if notify_sharer:
-            sharer = self.cog.bot.get_user(sharer_id)
-            if sharer:
-                status = "accepted" if accepted else "rejected"
-                try:
-                    await sharer.send(f"Your share request for '{fallback_name}' to **{interaction.user.name}** was **{status}**.")
-                except discord.Forbidden:
-                    pass
+    async def _reject_share_request(self, interaction: discord.Interaction, sharer_id: int, target_pid: Optional[str], fallback_name: str):
+        """Takes one share off the recipient's queue -- accepted or declined, nobody is told."""
+        self._drop_pending_shares(
+            interaction.user.id, lambda s: self._is_share_of(s, sharer_id, target_pid, fallback_name))
 
     async def _validate_active_profile(self, user_id: int, channel: discord.abc.Messageable) -> bool:
         index = self._get_user_index(user_id)
@@ -4431,6 +4482,9 @@ class ProfileManager:
         return True
 
     async def _execute_clone_handshake(self, owner_id: int, source_pid: str, recipient_id: int, desired_name: str) -> Tuple[bool, str]:
+        if not self.is_registered(recipient_id):
+            return False, NOT_REGISTERED
+
         def _sync_clone():
             owner_id_str = str(owner_id)
             recip_id_str = str(recipient_id)

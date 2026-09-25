@@ -16,7 +16,7 @@ from ..utils.helpers import (
     google_thinking_caps, grounding_mode_display, ltm_auto_recall_enabled,
     resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
-    resolve_unreadable_media_mode,
+    resolve_unreadable_media_mode, system_model,
 )
 from ..utils.user_defaults import final_fallback_enabled, model_provider, setting_label
 from ..utils.birthdays import MONTH_NAMES, parse_birthday, valid_birthday
@@ -30,6 +30,7 @@ from .base_components import (
     BaseBulkProfileView, ConfigModal, ActionTextInputModal, TimeoutCleanupMixin,
     ReportErrorMixin, add_button, add_select, build_pagination_controls,
     build_confirm_view, invalidate_model_cache, PageJumpModal, paged_nav_options,
+    refuse_unregistered,
 )
 from ..services.api.openrouter_catalogue import (
     AUTHOR_PREFIX, BROWSE_CHEAPEST, BROWSE_POPULAR, BROWSE_TRENDING,
@@ -274,6 +275,8 @@ class _Screen:
         self.controls = tuple(controls)
         self.modal = modal
         self.modal_label = modal_label
+        #: Text, or `(cog, owner_id) -> text` for a note naming something the operator
+        #: can change.
         self.note = note
         #: Config predicate for a screen behind an on switch. While it is false the
         #: screen offers only its first control -- that switch -- and Back: a speed or a
@@ -614,6 +617,12 @@ def _render_media_resolution(ctx):
     stored = str(ctx["config"].get("media_input_resolution") or "")
     label = next((l for v, l, _d in MEDIA_RESOLUTIONS if v == stored), "Model default")
     return "Media Input Resolution", f"Resolution: `{label}`", True
+
+
+def _describer_chain(cog, owner_id) -> List[str]:
+    """The models `simulated` hands this owner's attachments to, in order."""
+    side = cog.profile_manager.effective_provider(owner_id)
+    return [m for m in (system_model(cog, k, side) for k in DESCRIBER_KEYS) if is_real_model(m)]
 
 
 def _render_unreadable_media(ctx):
@@ -978,18 +987,17 @@ PROFILE_ACTIONS = (
                         tuple((label, value, desc) for value, label, desc in UNREADABLE_MEDIA_MODES),
                         read=lambda c: resolve_unreadable_media_mode(c),
                         placeholder="What to do with an unreadable attachment..."),
-                note="Reached only when **both** this profile's models refuse the file, so "
-                     "a profile whose fallback can see images never gets here. Either way "
-                     "the character is told the filename and that it cannot read the file, "
-                     "instead of falling silent for the round.\n\n"
-                     "`Simulated` has "
-                     f"`{clean_model_name(MEDIA_DESCRIBER_PAID)}` read it first -- free "
-                     "while the key's free-model quota lasts, paid after -- or "
-                     f"`{clean_model_name(MEDIA_DESCRIBER_FALLBACK)}` if that one cannot, "
-                     "and writes the description into this profile's prompt only -- nobody "
-                     "else at the table sees it. One call per round however many "
-                     "characters need it. With a key for neither, the profile behaves as "
-                     "`Off`."),
+                note=lambda cog, owner_id: (
+                    "Reached only when **both** this profile's models refuse the file, so "
+                    "a profile whose fallback can see images never gets here. Either way "
+                    "the character is told the filename and that it cannot read the file, "
+                    "instead of falling silent for the round.\n\n"
+                    "`Simulated` has " + " \u2192 ".join(
+                        f"`{clean_model_name(model)}`" for model in _describer_chain(cog, owner_id))
+                    + " read it, each only if the one before cannot, and writes the "
+                    "description into this profile's prompt only -- nobody else at the "
+                    "table sees it. One call per round however many characters need it. "
+                    "With no key for any of them, the profile behaves as `Off`.")),
             bulk=_Bulk(_bulk_choice(
                            "Select unreadable-attachment handling...",
                            [(label, value, desc) for value, label, desc in UNREADABLE_MEDIA_MODES],
@@ -1623,6 +1631,9 @@ class ProfileManageView(BlockedGuard, ui.View):
         await interaction.response.send_modal(modal)
 
     async def _handle_duplicate(self, interaction):
+        # A new profile, as /profile create makes one.
+        if await refuse_unregistered(self.cog, interaction):
+            return
         modal = ui.Modal(title=f"Duplicate '{self.profile_name}'")
         new_name_input = ui.TextInput(label="Enter name for copy", required=True)
         modal.add_item(new_name_input)
@@ -1781,8 +1792,11 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
                 self.parent.user_id, self.parent.profile_name)})
         if field:
             e.add_field(name=field[0], value=str(field[1])[:1024], inline=False)
-        if self.screen.note:
-            e.description = f"{e.description}\n\n{self.screen.note}" if e.description else self.screen.note
+        note = self.screen.note
+        if callable(note):
+            note = note(self.cog, self.parent.user_id)
+        if note:
+            e.description = f"{e.description}\n\n{note}" if e.description else note
         return e
 
     async def _apply(self, interaction: discord.Interaction, updates: Dict[str, Any]):
@@ -2690,7 +2704,7 @@ class ModelPickerMixin(ReportErrorMixin):
     def display_model(cls, value) -> str:
         """How a stored model value reads in a summary."""
         if not is_real_model(value):
-            return "None (no retry)"
+            return NO_FALLBACK
         return cls.strip_prefix(value)
 
     @staticmethod
@@ -2812,6 +2826,10 @@ class ModelPickerMixin(ReportErrorMixin):
         """Whether this screen gives the Browse dropdown a row of its own."""
         return self.view_mode == 'openrouter' and getattr(self, "_BROWSE_ROW_AVAILABLE", True)
 
+    def _allows_no_fallback(self, target_config_key: str) -> bool:
+        """Whether this slot offers NONE: every Fallback, the response one included."""
+        return target_config_key == "fallback_model" or target_config_key in UTILITY_FALLBACK_KEYS.values()
+
     def _openrouter_model_options(self, current_val, target_config_key: str) -> List[discord.SelectOption]:
         catalogue = self._openrouter_catalogue()
         browse = self._openrouter_browse()
@@ -2824,9 +2842,9 @@ class ModelPickerMixin(ReportErrorMixin):
         opts = paged_nav_options(page, num_pages, values=self._MODEL_NAV_VALUES, nav_suffix=" of models")
         opts.append(discord.SelectOption(label="Custom Model...", value="custom_option",
                                          description="Enter manually via modal"))
-        if target_config_key in UTILITY_FALLBACK_KEYS.values():
+        if self._allows_no_fallback(target_config_key):
             opts.append(discord.SelectOption(
-                label="None (no retry)", value=NO_FALLBACK,
+                label=NO_FALLBACK, value=NO_FALLBACK,
                 description="Do not try a second model when this one fails.",
                 default=not is_real_model(current_val)))
             if not is_real_model(current_val):
@@ -2945,12 +2963,9 @@ class ModelPickerMixin(ReportErrorMixin):
         top_models = self._get_top_models(self.view_mode, target_config_key)
         opts = [discord.SelectOption(label="Custom Model...", value="custom_option", description="Enter manually via modal")]
 
-        # Only the five utility fallbacks can be switched off. The response fallback is
-        # what _instantiate_model retries onto when the primary will not construct, so
-        # it has to name a real model.
-        if target_config_key in UTILITY_FALLBACK_KEYS.values():
+        if self._allows_no_fallback(target_config_key):
             opts.append(discord.SelectOption(
-                label="None (no retry)", value=NO_FALLBACK,
+                label=NO_FALLBACK, value=NO_FALLBACK,
                 description="Do not try a second model when this one fails.",
                 default=not is_real_model(current_val)))
             if not is_real_model(current_val):
@@ -2996,6 +3011,12 @@ class ModelPickerMixin(ReportErrorMixin):
         if self._ollama_host_url() == host:
             self.ollama_working = answered
 
+    def _api_modes(self) -> List[str]:
+        """The API tabs this category's button cycles through."""
+        return ['google', 'openrouter'] + (
+            ['ollama'] if self._may_use_ollama() and self.category not in self._NO_OLLAMA_CATEGORIES
+            else [])
+
     def _add_api_buttons(self, *, row: int = 3):
         """The API-mode and Ollama-host buttons, identical in both pickers.
 
@@ -3003,9 +3024,7 @@ class ModelPickerMixin(ReportErrorMixin):
         leaves room on this row for the fallback-indicator toggle that had a row of its
         own.
         """
-        api_modes = ['google', 'openrouter'] + (
-            ['ollama'] if self._may_use_ollama() and self.category not in self._NO_OLLAMA_CATEGORIES
-            else [])
+        api_modes = self._api_modes()
         api_labels = {'google': 'API: Google', 'openrouter': 'API: OpenRouter', 'ollama': 'API: Ollama (Local)'}
         if self.view_mode not in api_modes:
             self.view_mode = 'google'

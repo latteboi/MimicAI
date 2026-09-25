@@ -6,6 +6,7 @@ from typing import Optional
 from ..utils.constants import defaultConfig, DOCS_DIR, DEFAULT_HELP_MODE_INJECTION
 from ..utils.content import DEFAULT_HELP_DOCS
 from ..utils.menu_map import build_menu_map
+from ..utils.helpers import system_model
 from ..managers.memory_manager import encode_embedding_b64, decode_embedding_b64
 from .api_service import get_embedding_vector
 
@@ -197,8 +198,11 @@ class HelpService:
             # Fingerprint of the corpus as it now stands on disk. The cache was
             # previously reused whenever the file existed, so an edited shard -- or a
             # shard a new build revised -- kept answering from the vectors of the text
-            # it replaced, with nothing to indicate the documentation had moved on.
-            fingerprint = _digest(_CACHE_FORMAT + "\n" + "\n\x00\n".join(chunks))
+            # it replaced, with nothing to indicate the documentation had moved on. The
+            # embedding model is in it for the same reason: vectors from a model `/mod`
+            # has since replaced would be scored against queries from the new one.
+            fingerprint = _digest(_CACHE_FORMAT + "\n" + system_model(self.cog, "embedding_model")
+                                  + "\n" + "\n\x00\n".join(chunks))
 
             if os.path.exists(cache_path):
                 try:

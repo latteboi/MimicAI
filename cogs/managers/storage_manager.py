@@ -18,9 +18,10 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import base64
 import orjson as json
 
-from ..utils.constants import SERVERS_DIR, CLEANUP_STATE_FILE
+from ..utils.constants import SERVERS_DIR, CLEANUP_STATE_FILE, defaultConfig
 from ..utils.data_policy import is_paid_gemini_slot, openrouter_data_collection, training_opt_in
-from ..services.api.embeddings import EmbeddingRoute
+from ..services.api.embeddings import EmbeddingRoute, embedding_model_ids
+from ..utils.helpers import system_model
 
 # The member cache may legitimately shrink between runs -- people do leave servers --
 # so the guard has to allow a real decline while refusing a collapse. A run that sees
@@ -500,18 +501,6 @@ class StorageManager:
                     if changed:
                         IOManager.write_json(index, str(index_path))
 
-            # --- Cleanup Empty Folders ---
-            has_profiles = False
-            if profiles_dir.exists():
-                has_profiles = any(p.is_dir() for p in profiles_dir.iterdir())
-
-            if not has_profiles:
-                # If they have no valid profiles, keys, or shares, nuke the entire user ID folder
-                has_keys = (user_dir / "keys.json.gz").exists()
-                has_shares = (user_dir / "shares.json.gz").exists()
-                if not has_keys and not has_shares:
-                    shutil.rmtree(str(user_dir), ignore_errors=True)
-
     def _get_user_keys_data(self, user_id: int) -> Dict[str, Any]:
         path = os.path.join(self.cog.USERS_DIR, str(user_id), "keys.json.gz")
         if not os.path.exists(path):
@@ -697,22 +686,27 @@ class StorageManager:
         a guild's OpenRouter key carries that server's `data_collection`. An owner's own
         key carries only their own input -- what they typed into a management screen, or
         the bot owner's documentation -- which nothing gates.
+
+        Only the providers that serve the embedding model are offered: a model OpenRouter
+        alone carries has no Gemini route. See `embedding_model_ids`.
         """
+        models = embedding_model_ids(system_model(self.cog, "embedding_model"))
         if guild_id:
             routes = []
-            gemini = self._get_api_key_for_guild(guild_id)
+            gemini = "gemini" in models and self._get_api_key_for_guild(guild_id)
             if gemini:
-                routes.append(EmbeddingRoute("gemini", gemini))
-            openrouter = self._get_api_key_for_guild(guild_id, "openrouter")
+                routes.append(EmbeddingRoute("gemini", gemini, model=models["gemini"]))
+            openrouter = "openrouter" in models and self._get_api_key_for_guild(guild_id, "openrouter")
             if openrouter:
                 policy = openrouter_data_collection(
                     self.cog.server_manager._get_server_index(str(guild_id)))
-                routes.append(EmbeddingRoute("openrouter", openrouter, policy))
+                routes.append(EmbeddingRoute("openrouter", openrouter, policy, models["openrouter"]))
             if routes:
                 return routes
         if owner_id:
-            return [EmbeddingRoute(provider, key) for provider in ("gemini", "openrouter")
-                    if (key := self._get_api_key_for_user(owner_id, provider))]
+            return [EmbeddingRoute(provider, key, model=models[provider])
+                    for provider in ("gemini", "openrouter")
+                    if provider in models and (key := self._get_api_key_for_user(owner_id, provider))]
         return []
 
     async def _perform_data_cleanup(self):
@@ -771,36 +765,38 @@ class StorageManager:
             except Exception as e:
                 print(f"[Cleanup] Could not record member high-water mark: {e}")
 
-        # --- 1. Expired Share Codes ---
-        cleaned_codes = 0
-        now = time.time()
-        for code, data in list(self.cog.share_codes.items()):
-            if now > data.get("expires_at", 0):
-                del self.cog.share_codes[code]
-                cleaned_codes += 1
-
         # --- 2. Stale/Broken Profile Shares ---
+        # A share waits only for someone registered and still here, from a sharer still
+        # here whose profile still exists -- found by PID, so renaming it withdraws
+        # nothing. A queue for anyone unregistered predates the rule that shares go only
+        # to those who ran /start, and was the one way to get a directory without it.
         cleaned_shares = 0
+        pm = self.cog.profile_manager
         for recipient_id_str, shares in list(self.cog.profile_shares.items()):
-            if recipient_id_str not in all_bot_member_ids:
+            if (recipient_id_str not in all_bot_member_ids
+                    or not pm.is_registered(int(recipient_id_str))):
                 cleaned_shares += len(self.cog.profile_shares.pop(recipient_id_str, []))
-                self.cog.profile_manager._save_profile_share_shard(recipient_id_str, None)
+                pm._save_profile_share_shard(recipient_id_str, None)
                 continue
-            
-            original_len = len(shares)
+
             valid_shares = []
             for share in shares:
                 sharer_id_str = str(share.get("sharer_id"))
-                profile_name = share.get("profile_name")
-                if sharer_id_str in all_bot_member_ids:
-                    sharer_index = self.cog.profile_manager._get_user_index(int(sharer_id_str))
-                    if profile_name in sharer_index.get("personal", []):
-                        valid_shares.append(share)
-            
-            if len(valid_shares) < original_len:
-                self.cog.profile_shares[recipient_id_str] = valid_shares
-                cleaned_shares += original_len - len(valid_shares)
-                self.cog.profile_manager._save_profile_share_shard(recipient_id_str, valid_shares)
+                if sharer_id_str not in all_bot_member_ids:
+                    continue
+                personal = pm._get_user_index(int(sharer_id_str)).get("personal") or {}
+                pid = share.get("original_pid")
+                if (pid in personal.values() if pid and isinstance(personal, dict)
+                        else share.get("profile_name") in personal):
+                    valid_shares.append(share)
+
+            if len(valid_shares) < len(shares):
+                cleaned_shares += len(shares) - len(valid_shares)
+                if valid_shares:
+                    self.cog.profile_shares[recipient_id_str] = valid_shares
+                else:
+                    self.cog.profile_shares.pop(recipient_id_str, None)
+                pm._save_profile_share_shard(recipient_id_str, valid_shares)
 
         # --- 3. Orphaned Server Pointers ---
         cleaned_pointers = 0
@@ -845,9 +841,16 @@ class StorageManager:
                 if not user_id_str.isdigit(): continue
                 
                 user_dir = os.path.join(self.cog.USERS_DIR, user_id_str)
-                is_missing = user_id_str not in all_bot_member_ids
-                
-                # Check for ghost directory (no profiles, no keys, no shares)
+                # The bot owner's tree holds every System profile, whether or not they
+                # share a server with the bot.
+                is_missing = (user_id_str not in all_bot_member_ids
+                              and user_id_str != str(defaultConfig.DISCORD_OWNER_ID))
+
+                # A ghost holds nothing the user chose: no profiles, keys or shares, and
+                # no About Me or Override Defaults -- which live in index.json alone, so a
+                # user who set a provider or timezone in /start before adding a key is not
+                # one. This is also what clears a directory minted before reads stopped
+                # minting them (`_get_user_index`).
                 is_ghost = False
                 try:
                     uid = int(user_id_str)
@@ -857,8 +860,10 @@ class StorageManager:
                     has_system = bool(index.get("system"))
                     has_keys = os.path.exists(os.path.join(user_dir, "keys.json.gz"))
                     has_shares = os.path.exists(os.path.join(user_dir, "shares.json.gz"))
-                    
-                    if not (has_personal or has_borrowed or has_system or has_keys or has_shares):
+                    has_settings = bool(index.get("about") or index.get("defaults"))
+
+                    if not (has_personal or has_borrowed or has_system or has_keys or has_shares
+                            or has_settings):
                         is_ghost = True
                 except Exception:
                     pass

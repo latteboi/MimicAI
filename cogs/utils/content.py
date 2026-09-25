@@ -71,7 +71,7 @@ HELP_CATEGORIES = {
         "Profile Classes (PIDs)": (
             "Every profile has an immutable 16-character **Profile ID**. Its first letter records the class:\n\n"
             "• **A** -- Personal. Yours, fully editable.\n"
-            "• **B** -- borrowed through a private share code.\n"
+            "• **B** -- borrowed through a private share.\n"
             "• **C** -- borrowed from the Public Library.\n"
             "• **X** -- a System Profile provided by the bot operator.\n\n"
             "Borrowed profiles (B and C) are read-only links back to the creator's master profile. You can override local behaviour "
@@ -134,7 +134,7 @@ HELP_CATEGORIES = {
             "**Final Fallback** comes after both, on the provider your primary is not on, and is off unless you turn it on at "
             "`/profile manage` -> Params -> Final Fallback. Its model is not chosen: it is the category's shipped model there. Every "
             "category has one -- replies, image, TTS, grounding, critic, LTM. The profile dashboard's Models line shows it "
-            "when it is on. Setting a utility slot's fallback to *None* turns off the Final for that category as well.\n\n"
+            "when it is on. Setting any fallback to *NONE* turns off the Final for that category as well.\n\n"
             "**Thinking** opens from the same screen, on whichever slot the category dropdown is showing -- choosing a model and choosing "
             "how hard it thinks are one decision. See *Thinking and Reasoning* below."
         ),
@@ -175,8 +175,8 @@ HELP_CATEGORIES = {
             "onto the nearest of its two `detail` steps (Low and Medium both send `low`; High and Ultra High both send `high`)."
         ),
         "Default Settings for New Profiles": (
-            "`/settings` -> **Override Defaults**. Off until you choose a provider, there or in `/start`: until then a new "
-            "profile starts with no models. Standing preferences applied to profiles you create, and offered on those you borrow, "
+            "`/settings` -> **Override Defaults**, once `/start` has set you up. With **None** chosen there a new profile starts "
+            "with no models but those you set here. Standing preferences applied to profiles you create, and offered on those you borrow, "
             "**from then on**. Existing profiles are untouched -- `/profile bulk manage` is what changes those.\n\n"
             "**It is the profile dashboard, set once instead of per profile.** The same tabs -- Params, Tools, "
             "Images, Audio, Memory, Training, Misc -- holding the same settings, and choosing one opens the same form "
@@ -469,7 +469,7 @@ HELP_CATEGORIES = {
         ),
         "The Public Library": (
             "`/profile hub` -> **Public Library** lists every profile published on this instance. Browse or search it, and borrow anything you "
-            "like -- a library borrow is the same read-only link a share code produces.\n\n"
+            "like -- a library borrow is the same read-only link a private share produces.\n\n"
             "**Publishing** puts your profile in that index. It is instant: it reads the Content Rating you already hold rather than running "
             "a fresh check, so there is nothing to wait for.\n\n"
             "Only profiles rated **General** can be published. Adult and Unrated profiles are refused. Rate the profile first from "
@@ -608,9 +608,18 @@ WIZARD_COPY = {
         "hundred others, some free to run, and only hosts known **not to train on what they are sent** "
         "are offered.\n"
         "**Google** adds Gemini's own speech and image models. "
-        "It needs a **billing-enabled** key.\n\n"
-        "New profiles start on it -- until you choose, they start with no models. A model you pick "
-        "yourself stays picked. Change it any time here or in `/settings` → Override Defaults."
+        "It needs a **billing-enabled** key.\n"
+        "**None** ships no models: new profiles start with none, and you choose your own in "
+        "`/settings` → Override Defaults.\n\n"
+        "Choosing is how you set MimicAI up -- nothing is stored for you before it. New profiles "
+        "start on your choice; a model you pick yourself stays picked. Change it any time here or in "
+        "`/settings` → Override Defaults."
+    ),
+    # Sent once None is chosen: the one choice that leaves something still to do.
+    "provider_none": (
+        "**No provider, so no model defaults.** New profiles start with no models. Choose the ones "
+        "they should start on in `/settings` → Override Defaults → Set Models, or per profile in "
+        "`/profile manage` → Set Models."
     ),
     # One per provider: the step says only what the provider chosen before it needs.
     "key": {
@@ -626,6 +635,16 @@ WIZARD_COPY = {
             "project. Google may train on what a free-tier key is sent, so free-tier keys are refused.\n"
             "**2.** Press **Paste key**. It goes into a private form nobody else sees, and becomes your "
             "**Personal** key: your Global Chat and your characters' background work.\n"
+            "**3.** Run a server? Tick it in the dropdown that appears, and its channels use the key too.\n\n"
+            "**Never paste a key into the chat.**"
+        ),
+        # No provider chosen: either key will do, and both are offered.
+        "none": (
+            "With no provider chosen, add whichever key you have -- or both.\n"
+            "**1.** Press **Get OpenRouter key ↗** (its keys start `sk-or-`) or **Get Google key ↗** (turn "
+            "on **billing** for the key's project: free-tier Google keys are refused).\n"
+            "**2.** Press the matching **Paste** button. It goes into a private form nobody else sees, and becomes "
+            "your **Personal** key: your Global Chat and your characters' background work.\n"
             "**3.** Run a server? Tick it in the dropdown that appears, and its channels use the key too.\n\n"
             "**Never paste a key into the chat.**"
         ),
@@ -718,7 +737,7 @@ DEFAULT_HELP_DOCS = {
     # --- GETTING STARTED ---
     "start/setup_wizard.txt": (
         "Command: `/start` opens a guided setup wizard. It is the first thing a new user should run.\n"
-        "Concept: Five steps -- choose a provider (OpenRouter or Google), add your API key for it, get a character, seat it in a channel, say something to it. The wizard checks which are already done every time it is opened, so it can be closed and reopened freely and always resumes correctly. No progress is stored anywhere.\n"
+        "Concept: Five steps -- choose a provider (OpenRouter, Google or None), add your API key for it, get a character, seat it in a channel, say something to it. The wizard checks which are already done every time it is opened, so it can be closed and reopened freely and always resumes correctly. No progress is stored anywhere.\n"
         "One screen: the checklist, then the step you are on with its buttons. The dropdown jumps to any step; a finished step you pick keeps its buttons where that makes sense -- switch provider, get another character, reopen the cast.\n"
         "Adding a key: works anywhere, a server channel included. 'Get a key' opens the provider's key page; 'Paste key' opens a private form, validates the key, saves it and makes it your Personal key. If you administer any servers, a dropdown under the step lists them -- the one you ran it in first, 21 per page with Previous, Next and jump-to-page -- and each tick is saved as you make it, with a confirmation first if another key already serves that server. `/settings` -> API Keys still manages all four slots.\n"
         "Context awareness: The wizard states where you are and what you can do there. Seating a character in a channel requires server administrator permission, or a channel on Open casting. Steps that cannot be done from where you ran it are shown greyed out with the reason rather than hidden.\n"
@@ -726,8 +745,8 @@ DEFAULT_HELP_DOCS = {
         "Second track: Once setup is done, 'Using it' covers talking to characters, `/whisper`, memory commands, images and voice, and what to do when something is wrong. These are not setup steps and have no completion state.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I do not know where to begin.' Fix: Run `/start`.\n"
-        "- Symptom: 'Which API key should I get first?' or 'Do I have to pay to use this?' Fix: OpenRouter. One key reaches a few hundred models and some of them are free to run (Ling 3.0 Flash Fin, DeepSeek V4 0731, and OpenRouter's Free Models Router), and only models some host is known to serve without training on prompts are offered. Add a paid Google Gemini key afterwards for Gemini's speech and image models.\n"
-        "- Symptom: 'The key step is locked.' Fix: Choose a provider first; the key step asks for that provider's key.\n"
+        "- Symptom: 'Which API key should I get first?' or 'Do I have to pay to use this?' Fix: OpenRouter. One key reaches a few hundred models and some of them are free to run (Space Bunny Alpha, DeepSeek V4 0731, and OpenRouter's Free Models Router), and only models some host is known to serve without training on prompts are offered. Add a paid Google Gemini key afterwards for Gemini's speech and image models.\n"
+        "- Symptom: 'The key step is locked.' or 'It says to run /start first.' Fix: Choose a provider first -- None counts. Choosing is how you set MimicAI up: nothing can be created, borrowed or saved for you before it. The key step then asks for that provider's key, or either with None.\n"
         "- Symptom: 'Google refused my key.' Fix: Only a billing-enabled (paid) Google key is accepted. Turn billing on for the key's project, or choose OpenRouter instead.\n"
         "- Symptom: 'Seating is locked: needs an API key assigned to this server.' Fix: An administrator ticks the server in the key step's dropdown, or assigns a key in `/settings` -> API Keys.\n"
         "- Symptom: 'Seating is locked: needs administrator.' Fix: Seating a cast needs server administrator permission. Ask an admin to run `/session config`, or make your own server to test in.\n"
@@ -741,13 +760,13 @@ DEFAULT_HELP_DOCS = {
     # --- PROFILES ---
     "profiles/identifiers_and_pids.txt": (
         "Concept: While users see aesthetic names (e.g., 'Detective'), the system identifies profiles exclusively via 16-character Profile IDs (PIDs).\n"
-        "Prefixes: 'A' is a Personal Profile, 'B' a profile borrowed via a private share code, 'C' a profile borrowed from the Public Library, and 'X' a System Profile provided by the bot operator.\n"
+        "Prefixes: 'A' is a Personal Profile, 'B' a profile borrowed via a private share, 'C' a profile borrowed from the Public Library, and 'X' a System Profile provided by the bot operator.\n"
         "Limits: A maximum of 100 Personal Profiles and 100 borrowed profiles per account.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Name already exists' when renaming or creating. Fix: Every name is tied to an immutable PID. Choose a unique local name to map to your profile."
     ),
     "profiles/personal_vs_borrowed.txt": (
-        "Concept: Every profile has a Profile ID (PID) whose first letter is its class. A = Personal Profile, fully editable and owned by you. B = a profile you borrowed through a private share code. C = a profile you borrowed from the Public Library. X = a System Profile provided by the bot operator. Borrowed profiles (B and C) are read-only links pointing back to the creator's master profile.\n"
+        "Concept: Every profile has a Profile ID (PID) whose first letter is its class. A = Personal Profile, fully editable and owned by you. B = a profile you borrowed through a private share. C = a profile you borrowed from the Public Library. X = a System Profile provided by the bot operator. Borrowed profiles (B and C) are read-only links pointing back to the creator's master profile.\n"
         "B versus C: the letter records where the borrow came from, not what it is now. A PID never changes, so if the owner later unpublishes a profile your borrow keeps its C. Borrows created before the C class existed are all B regardless of origin, so the letter is a hint for reading IDs rather than something the bot decides behaviour from.\n"
         "What a borrower may change: everything in the profile's config, which a borrow owns outright -- models, sampling, memory settings, timezone, response mode, the custom error message and the generation visual. Persona, instructions, the image prompt, the critic prompt and the LTM summarisation prompt stay with the owner: they are read live from the original and are not stored on your borrow, so there is nothing local to edit. The Persona tab is hidden entirely on a borrowed profile, and the webhook name and avatar stay the author's.\n"
         "What arrives changed: a borrow is a copy of the author's config, so their model choices come with it. If those name a provider you hold no key for, the slots are repointed to the bot defaults and you are told which. Once you have chosen a provider, you are asked whether to use your own defaults -- your provider's models and anything set in `/settings` -> Override Defaults, except the settings that belong to the character's own performance -- or keep the author's. See profiles/default_settings.\n"
@@ -758,30 +777,31 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'I cannot edit the persona of a profile I borrowed.' Fix: That is by design. Use Profile Cloning in `/profile hub` instead, which produces an independent Class A copy you own."
     ),
     "profiles/default_settings.txt": (
-        "Command: `/settings` -> Override Defaults. Off until a provider is chosen there or in `/start`: until then new profiles start with no models and nothing here applies. Once on, sets standing preferences applied to profiles created afterwards and offered on borrows. Existing profiles are not changed; `/profile bulk manage` changes those.\n"
-        "Provider: The dropdown on the Off screen turns it on; the Provider button beside Clear swaps between Google and OpenRouter. Set Models opens on the chosen provider's models.\n"
+        "Command: `/settings` -> Override Defaults, open once `/start` has set you up. Sets standing preferences applied to profiles created afterwards and offered on borrows. Existing profiles are not changed; `/profile bulk manage` changes those.\n"
+        "Provider: The Provider button beside Clear steps through Google, OpenRouter and None. Google and OpenRouter ship their models to new profiles; None ships none, so a new profile starts on the models set here under Set Models, and any slot left on 'Platform default' starts with no model. Set Models opens on the chosen provider's models.\n"
         "Scope: Nearly every setting a profile has. The screen is the profile dashboard's own tabs (Params, Tools, Images, Audio, Memory, Training, Misc) and rows, and choosing a row opens the same form `/profile bulk manage` opens for it, so a setting reachable in bulk is reachable as a default. What is not: a persona, an instruction block, the LTM summarisation or critic prompts and the image-generation prompt (a borrow stores no prompts, so a default one would never be read), a content rating, and the neuro engine's live hormone levels. A row that has to leave part of what you entered behind says so on the panel it returns to.\n"
         "Models: Set Models on the Params tab covers all twelve slots across the six categories (Response, Image, TTS, Grounding, Anti-Repetition Critic, LTM Summariser). Each slot has its own 'Platform default' option, which clears it.\n"
         "Clearing: 'Clear...' takes one group of settings, or everything, back to Platform default. Blanking a box inside a form clears that one setting the same way.\n"
         "Platform default: Any setting left on 'Platform default' follows the value the bot ships and keeps following it if that value changes in a later version. Selecting the same model by hand pins it instead.\n"
         "Saving: Values are written the moment they are chosen. This tab has no Save button, unlike the API Keys tab which requires Save Assignments.\n"
-        "Borrowed profiles: Borrowing asks whether to use your defaults or keep the author's; nothing is asked before a provider is chosen, or when yours would change nothing. Your provider's models and your defaults for models, memory, timezone and toggles apply to borrows. Defaults for temperature, Top P, Top K, advanced OpenRouter sampling, TTS voice, placeholder emoji, custom error message and the Director's Desk apply only to profiles you create, because on a borrow those belong to the author. Persona and instructions can never be defaulted or edited locally at all.\n"
+        "Borrowed profiles: Borrowing asks whether to use your defaults or keep the author's; nothing is asked when yours would change nothing. Your provider's models and your defaults for models, memory, timezone and toggles apply to borrows. Defaults for temperature, Top P, Top K, advanced OpenRouter sampling, TTS voice, placeholder emoji, custom error message and the Director's Desk apply only to profiles you create, because on a borrow those belong to the author. Persona and instructions can never be defaulted or edited locally at all.\n"
         "Provider rescue: If a borrowed profile names a provider you hold no key for, its model slots are repointed to the bot defaults at borrow time and you are told which ones. This only happens when you do hold a key for the replacement; if you hold neither, the author's choice is left alone.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I set a default but my existing profiles did not change.' Fix: Defaults only apply to profiles made or borrowed afterwards. Use `/profile bulk manage` -> Set Models to change profiles you already have.\n"
-        "- Symptom: 'This profile has no model set.' Fix: It was made before you chose a provider. Choose one in `/start` or here, then set that profile's models in `/profile manage` -> Params -> Set Models.\n"
+        "- Symptom: 'This profile has no model set.' Fix: Your provider is None, or it was made before you chose one. Set its models in `/profile manage` -> Params -> Set Models, and set the ones new profiles start on here under Set Models.\n"
         "- Symptom: 'A profile I borrowed is using a different model than the library showed.' Fix: Either your default replaced it, or it named a provider you have no key for and was repointed. The bot sends a message saying which at borrow time. Change it in `/profile manage`.\n"
         "- Symptom: 'My default temperature was ignored on a borrowed profile.' Fix: That is deliberate. Sampling is part of how a character was tuned, so a borrow keeps the author's values. Set it on that profile directly.\n"
         "- Symptom: 'I want to stop using a default.' Fix: Choose 'Platform default' on that row. That is different from selecting the shipped value by hand, which pins it."
     ),
     "profiles/sharing_and_cloning.txt": (
-        "Concept: 'Sharing' generates a temporary 5-minute Share Code allowing others to borrow a read-only link. 'Cloning' generates a 5-minute Clone Code to copy the configuration into a brand-new, independent Class A profile.\n"
+        "Concept: 'Sharing' offers a read-only link to someone who has set MimicAI up: pick them in `/profile hub` -> Manage My Shares and press Send. The offer waits in their Incoming Shares until they accept or reject it, and nobody is messaged either way. 'Cloning' generates a 5-minute Clone Code to copy the configuration into a brand-new, independent Class A profile.\n"
         "Choosing between them: share when you want the recipient to keep receiving your edits; clone when you want them to have their own copy to change freely.\n"
         "Limitations: Cloning severs the link to the original, allowing full editing. However, Long-Term Memories (LTM) and Child Bot configurations are deliberately scrubbed during clones -- memories are conversation history that is not the cloner's to receive, and child bot config contains a bot token.\n"
         "Location: Both are generated from `/profile hub`, or from `/profile manage` -> Misc -> Share Profile.\n"
-        "Requirement: Both need the profile rated General, or Exempt by the bot operator. Adult 18+, Unrated and Pending profiles cannot be shared or cloned, and Manage My Shares lists only the profiles that qualify. The rating is checked again when a code or request is redeemed.\n"
+        "Requirement: Both need the profile rated General, or Exempt by the bot operator. Adult 18+, Unrated and Pending profiles cannot be shared or cloned, and Manage My Shares lists only the profiles that qualify. The rating is checked again when a share is accepted or a code redeemed.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'My share code says expired or invalid.' Fix: Codes live for 5 minutes only. Generate a fresh one.\n"
+        "Receiving: Incoming Shares can be closed to everyone with its Open/Closed toggle, and anyone can be blocked from its user list or with Block Sender while reviewing their shares. Blocking also takes back what they have waiting; closing leaves waiting shares to be answered.\n"
+        "- Symptom: 'It says my share was not sent.' Fix: The recipient has not run `/start`, has closed Incoming Shares, has blocked you, or already has 25 of your profiles waiting. The bot does not say which.\n"
         "- Symptom: 'My profile is missing from Manage My Shares.' Fix: It is not rated General. Rate it from `/profile manage` -> Home -> Content Safety. Adult 18+ profiles cannot be shared at all.\n"
         "- Symptom: 'I cloned a profile but it has no memories.' Fix: Intended. LTM is never transferred by a clone."
     ),
@@ -865,7 +885,7 @@ DEFAULT_HELP_DOCS = {
     "apis/openrouter.txt": (
         "Requirements: An OpenRouter API Key submitted via `/start` or `/settings` -> API Keys.\n"
         "Capabilities: Allows users to access non-Google models like Anthropic's Claude, Meta's Llama, DeepSeek and xAI's Grok. OpenRouter models are also the only ones that honour the advanced sampling parameters (Min P, Top A, and the frequency, presence and repetition penalties).\n"
-        "Cost and free models: One key covers every model, billed per token from an OpenRouter credit balance. Some models cost nothing to run -- Ling 3.0 Flash Fin, DeepSeek V4 0731, and OpenRouter's own Free Models Router, which routes to a free model for you -- and they are supported like any other, including as a fallback model. Free or paid, you are only offered models some host is known to serve without training on what it is sent, so a free model here is not paying for itself with your conversations. This is why OpenRouter is the provider to connect first; add Google Gemini for Gemini's speech and image models.\n"
+        "Cost and free models: One key covers every model, billed per token from an OpenRouter credit balance. Some models cost nothing to run -- Space Bunny Alpha, DeepSeek V4 0731, and OpenRouter's own Free Models Router, which routes to a free model for you -- and they are supported like any other, including as a fallback model. Free or paid, you are only offered models some host is known to serve without training on what it is sent, so a free model here is not paying for itself with your conversations. This is why OpenRouter is the provider to connect first; add Google Gemini for Gemini's speech and image models.\n"
         "Web search and links: Native Grounding and URL Context on OpenRouter use OpenRouter's own web search and fetch tools. The model searches or opens a link when it decides to, through its provider's own search where it has one and Exa otherwise, and each search is billed to the OpenRouter balance. RAG and Legacy RAG search on the Grounding Summariser's model, which ships as DeepSeek for anyone who prefers OpenRouter.\n"
         "Image models: OpenRouter's image models (FLUX, GPT Image, Seedream and others) generate pictures through a separate image endpoint. Choose one in Set Models -> Image Generation with the API button on OpenRouter; Set Image Output then offers only the ratios, resolutions and quality levels that model takes. Only models with a single host are listed, so the bot can check that host against a server's data policy.\n"
         "Speech models: OpenRouter's speech models (Voxtral, Aura, MiniMax Speech and others) speak through a separate speech endpoint. Choose one in Set Models -> TTS Generation with the API button on OpenRouter; Choose TTS Voice then offers that model's own voices. They are sent the reply alone, so the Director's Desk and speech temperature do not reach them, and their audio arrives as MP3. Only models with a single host are listed, as for images.\n"

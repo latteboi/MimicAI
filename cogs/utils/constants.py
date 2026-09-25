@@ -172,6 +172,7 @@ SERVERS_DIR = os.path.join(DATA_DIR, "servers")
 DOCS_DIR = os.path.join(MOD_DATA_DIR, "docs")
 BLACKLIST_FILE_PATH = os.path.join(MOD_DATA_DIR, "blacklist.json")
 GLOBAL_PROMPTS_FILE_PATH = os.path.join(MOD_DATA_DIR, "system_prompts.json")
+SYSTEM_MODELS_FILE_PATH = os.path.join(MOD_DATA_DIR, "system_models.json")
 
 #: Plaintext sidecar beside each profile.json.gz, holding the one fact a rebuild of
 #: index.json cannot get from the path: the display name. Everything else is in the
@@ -230,9 +231,18 @@ UTILITY_MODEL = 'GOOGLE/gemini-2.5-flash-lite'
 #: the user's preferred provider, the last on the other one, so an outage or a spent key
 #: on one provider cannot silence the category. Google ships the table below; OpenRouter
 #: ships OPENROUTER_SHIPPED_MODELS. `user_defaults.model_chain`.
-#: Stored as `index.json["about"]["provider"]`, absent until chosen in `/start` or
-#: Override Defaults -- and until then a new profile is made with no models at all.
 MODEL_PROVIDERS = {"gemini": "Google", "openrouter": "OpenRouter"}
+
+#: What `/start` offers, stored as `index.json["about"]["provider"]`: a provider, or
+#: `none` -- no shipped models, only the user's own Override Defaults, and Google's chain
+#: wherever a model must still be read for them. Choosing any of them is registering:
+#: absent, the user may not create anything (`ProfileManager.is_registered`).
+PROVIDER_NONE = "none"
+PROVIDER_CHOICES = {**MODEL_PROVIDERS, PROVIDER_NONE: "None"}
+
+#: What every path that would create a user's data says to someone who has not set up.
+NOT_REGISTERED = ("Run `/start` first and choose a provider -- it is how you set MimicAI "
+                  "up, and nothing is stored for you until you do.")
 
 #: A value, deliberately not an alias for FALLBACK_MODEL_NAME: it was spelled that way
 #: while the two coincided, so bumping the fallback silently moved the researcher onto a
@@ -257,7 +267,10 @@ MODELS_WITHOUT_SEARCH_GROUNDING = frozenset({'gemini-3.1-flash-lite'})
 
 DEFAULT_SYSTEM_INSTRUCTION = "."
 OLLAMA_LOCAL_URL = "http://127.0.0.1:11434"
-EMBEDDING_MODEL_NAME = 'models/gemini-embedding-001'
+#: Every stored memory, training example and documentation shard was embedded by this.
+#: Vectors carry no record of their model, so one made by another cannot be told apart
+#: from a relevant one -- it just scores wrong. `/mod` can move it, behind a warning.
+EMBEDDING_MODEL_NAME = 'GOOGLE/gemini-embedding-001'
 
 # The Google ids offered by name; everything else is typed or browsed.
 ALLOWED_MODELS = Literal[
@@ -290,9 +303,9 @@ SEARCH_MODEL_KEYS = frozenset({
     'grounding_rag_model', 'grounding_rag_fallback_model',
 })
 
-#: "Do not retry on anything" -- the Final Fallback included. Offered by the utility
-#: fallback slots alone: the response fallback is what _instantiate_model retries onto, so
-#: it must name a real model. An *absent* fallback slot is the shipped one, not this.
+#: "Do not retry on anything" -- the Final Fallback included. Offered by every Fallback
+#: slot; a Primary holds it only when `/start`'s None shipped no model. An *absent*
+#: fallback slot is the shipped one, not this.
 NO_FALLBACK = 'NONE'
 
 #: utility primary key -> its fallback key. One table so the pickers, the bulk action
@@ -371,6 +384,13 @@ NO_KEY_NOTICE_FLAG = "no_key_notice_sent"
 #: nothing could generate on.
 NO_SERVER_KEY_GATE = (
     "Sessions need an API key, and none is assigned to this server. " + _SERVER_KEY_HOW
+)
+
+#: A key check whose model Google no longer serves. Refused rather than read as a free
+#: key: a 404 says nothing about billing, and "free" turns every key away.
+KEY_CHECK_MODEL_MISSING = (
+    "This key could not be checked: Google no longer serves `{model}`, the model the bot "
+    "checks keys with. The bot owner can change it in `/mod` \u2192 Prompts \u2192 System Models."
 )
 
 GEMINI_FREE_TIER_KEY_REFUSED = (
@@ -867,7 +887,7 @@ MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL = {
 #:
 #:   off       -- dropped, and the model told it exists and cannot be read. The filename
 #:                is in the turn either way, written when the message is taken in.
-#:   simulated -- MEDIA_DESCRIBER_MODEL describes it first and the description goes into
+#:   simulated -- the describer chain reads it first and the description goes into
 #:                the prompt, as the grounding summariser's results do. One call per
 #:                round however many blind profiles are seated.
 UNREADABLE_MEDIA_MODES = (
@@ -880,26 +900,64 @@ UNREADABLE_MEDIA_VALUES = frozenset(v for v, _l, _d in UNREADABLE_MEDIA_MODES)
 #: The floor, and what a profile that has never been configured does.
 UNREADABLE_MEDIA_DEFAULT = 'off'
 
-#: Who describes an attachment in `simulated`. Hardcoded, on the `utility` thinking slot:
-#: a one-shot internal pass with no character in it to configure. Not FALLBACK_MODEL_NAME
-#: -- this is transcription, not judgement, and both of these cost a fraction of it.
+#: Who describes an attachment in `simulated`, on the `utility` thinking slot: a one-shot
+#: internal pass with no character in it to configure. Transcription, not judgement, so
+#: models costing a fraction of the reply's. The three below are the OpenRouter
+#: preference's chain; SYSTEM_MODEL_DEFAULTS_BY_PROVIDER holds both, and `/mod` overrides.
 #:
-#: Different providers on purpose. The fallback answers when there is no OpenRouter key
-#: at all, and when the first will not describe a file the second may: it is the Google
-#: model, whose safety settings `_resolve_safety_settings` stands down in an
-#: age-restricted channel. It is also the only one of the three that hears audio. With
-#: neither key the profile falls to `off`, which is a complete behaviour rather than an
-#: error.
+#: Each chain ends on the other provider on purpose. The last answers when there is no key
+#: for the first two, and when they will not describe a file it may: Google's safety
+#: settings are the ones `_resolve_safety_settings` stands down in an age-restricted
+#: channel. With neither key the profile falls to `off`, which is a complete behaviour
+#: rather than an error.
 #:
-#: The free model's limits are the key owner's whole account, shared with every other
-#: `:free` model they use: 20 a minute, and 50 a day until $10 of credit has ever been
-#: bought, 1,000 after. A 429 rests it on that key (`_rest_model_on_rate_limit`), so the
-#: paid model answers at once until the rest ends rather than after a refused call.
-MEDIA_DESCRIBER_MODEL = 'OPENROUTER/inclusionai/ling-3.0-flash-vl:free'
+#: The free model's limits are the key owner's account, not the bot's. A 429 rests it on
+#: that key (`_rest_model_on_rate_limit`), so the paid model answers at once until the
+#: rest ends rather than after a refused call.
+MEDIA_DESCRIBER_MODEL = 'OPENROUTER/stealth/space-bunny-alpha'
 
 MEDIA_DESCRIBER_PAID = 'OPENROUTER/inclusionai/ling-3.0-flash-vl'
 
 MEDIA_DESCRIBER_FALLBACK = 'GOOGLE/gemini-2.5-flash-lite'
+
+#: What a pasted Gemini key is checked against, over raw REST: the first answers whether
+#: the key works at all, the second whether it has billing -- an unbilled key is refused
+#: image models. Google only. `APIService._validate_api_keys`.
+KEY_CHECK_MODEL = 'GOOGLE/gemini-flash-lite-latest'
+KEY_TIER_PROBE_MODEL = 'GOOGLE/gemini-3.1-flash-image'
+
+#: What a system profile -- MimicGuide -- is created with, for Primary and Fallback. Its
+#: models then live on that profile, which `/mod` -> System Models edits, as it does every
+#: System profile's.
+SYSTEM_PROFILE_MODEL = 'GOOGLE/gemini-2.5-flash-lite'
+
+#: The models no profile chooses, as `/mod` -> Prompts -> System Models may override them:
+#: key -> shipped value. Stored sparse in SYSTEM_MODELS_FILE_PATH, so an override is the
+#: operator's and everything left alone follows the build. Read through
+#: `helpers.system_model`. These ship one model for everyone -- the embedding model because
+#: stored vectors are one model's, the key checks because they call Google with a Google key.
+SYSTEM_MODEL_DEFAULTS = {
+    'embedding_model': EMBEDDING_MODEL_NAME,
+    'key_check_model': KEY_CHECK_MODEL,
+    'key_tier_probe_model': KEY_TIER_PROBE_MODEL,
+}
+
+#: The describer's and the classifier's chains, which ship -- and are overridden, under the
+#: provider's name in the file -- per provider preference: the preferred side's two, then
+#: the other's as the Final Fallback, as a profile's categories run. The classifier ships
+#: the describer's chain: both read one file -- an avatar, an attachment -- and answer in a
+#: line. Google's second is FALLBACK_MODEL_NAME, which hears audio as the first does.
+_MEDIA_READER_CHAINS = {
+    'gemini': (MEDIA_DESCRIBER_FALLBACK, FALLBACK_MODEL_NAME, MEDIA_DESCRIBER_MODEL),
+    'openrouter': (MEDIA_DESCRIBER_MODEL, MEDIA_DESCRIBER_PAID, MEDIA_DESCRIBER_FALLBACK),
+}
+#: Each reader's slots, Primary then Fallback then Final Fallback.
+DESCRIBER_KEYS = ('describer_model', 'describer_fallback_model', 'describer_final_model')
+CLASSIFIER_KEYS = ('classifier_model', 'classifier_fallback_model', 'classifier_final_model')
+SYSTEM_MODEL_DEFAULTS_BY_PROVIDER = {
+    provider: {**dict(zip(DESCRIBER_KEYS, chain)), **dict(zip(CLASSIFIER_KEYS, chain))}
+    for provider, chain in _MEDIA_READER_CHAINS.items()
+}
 
 #: What each category ships on OpenRouter, Primary then Fallback: its own models, not
 #: Gemini routed through it. The critic, the LTM summariser and session compaction take
@@ -911,7 +969,7 @@ MEDIA_DESCRIBER_FALLBACK = 'GOOGLE/gemini-2.5-flash-lite'
 #: through Exa, having no search of its own (prod_tests/native_tools_live.py). A second
 #: joins it once measured the same way.
 OPENROUTER_SHIPPED_MODELS = {
-    'primary_model': ('OPENROUTER/inclusionai/ling-3.0-flash-fin:free',
+    'primary_model': ('OPENROUTER/stealth/space-bunny-alpha',
                       'OPENROUTER/inclusionai/ling-3.0-flash-vl'),
     'image_generation_model': ('OPENROUTER/inclusionai/ming-image-0.1-design',
                                'OPENROUTER/recraft/recraft-v4.1-flash'),
@@ -2187,7 +2245,10 @@ DROPDOWN_MAX_OPTIONS = 25
 # two sentinels have to come out of the page, not be added on top of it.
 SHARE_PAGE_SIZE = DROPDOWN_MAX_OPTIONS - 2
 
-SHARE_CODE_EXPIRATION_SECONDS = 300
+#: Most profiles one sharer may have waiting on one recipient. Past it a share is refused
+#: like any other the recipient cannot take: a queue nobody bounds is a way to bury
+#: someone's Incoming Shares.
+LIMIT_PENDING_SHARES = 25
 
 #: The Public Library listing's creator-written introduction (`config["library_intro"]`).
 LIBRARY_INTRO_MAX_CHARS = 300

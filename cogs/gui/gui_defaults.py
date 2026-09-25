@@ -1,7 +1,7 @@
 """The `/settings` -> Override Defaults tab: standing preferences for profiles yet to exist.
 
-Off until the user chooses a provider, here or in `/start`: until then a new profile is
-made with no models and nothing on this screen is applied (`provider_preference`).
+Reached only by a user registered through `/start`, whose provider choice -- Google,
+OpenRouter or None -- decides what a new profile ships with before anything here applies.
 
 Every profile used to start from one hardcoded template, and every borrow from a copy
 of whoever wrote it. Someone who preferred a different model set it again on profile
@@ -35,14 +35,14 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .base_components import add_button, add_select
 from ..utils.helpers import resolve_openrouter_endpoint
-from ..utils.constants import MODEL_PROVIDERS
-from ..utils.user_defaults import defaultable_keys, model_slot_labels, other_provider, setting_label
+from ..utils.constants import PROVIDER_CHOICES, PROVIDER_NONE
+from ..utils.user_defaults import defaultable_keys, model_slot_labels, setting_label
 from .gui_profiles import (
     PROFILE_ACTIONS, PROFILE_ACTIONS_BY_VALUE, PROFILE_TABS, _ActionStagingHost,
     _BulkSession, _TAB_BUTTONS_PER_ROW, _select_chunks, ModelPickerMixin,
     OpenRouterHostView,
 )
-from .gui_settings import PROVIDER_PREFERENCE_NOTE, SettingsBaseView, provider_options
+from .gui_settings import PROVIDER_PREFERENCE_NOTE, SettingsBaseView
 
 if TYPE_CHECKING:
     from ..MimicCog import MimicCog
@@ -57,6 +57,12 @@ UNSET = "__unset__"
 #: Lines of stored values one row's embed field shows before it summarises the rest.
 #: Thinking alone declares twenty-odd keys, and an embed field caps at 1024 characters.
 _ROW_VALUE_LINES = 4
+
+
+#: The Provider field with None chosen, where PROVIDER_PREFERENCE_NOTE would promise models.
+NO_PROVIDER_NOTE = ("No provider ships models to your new profiles: they start on what you set "
+                    "under **Set Models** here, and a slot you leave on *Platform default* "
+                    "starts with none.")
 
 
 class _SparseSeed(dict):
@@ -341,17 +347,12 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         e.set_footer(text=self._footer())
         return e
 
-    def _preferred(self) -> Optional[str]:
+    def _preferred(self) -> str:
+        """The choice made in `/start`: `/settings` is closed to anyone without one."""
         preferred = self.cog.profile_manager.provider_preference(self.user_id)
-        return preferred if preferred in MODEL_PROVIDERS else None
+        return preferred if preferred in PROVIDER_CHOICES else PROVIDER_NONE
 
     def _embed_actions(self) -> discord.Embed:
-        if not self._preferred():
-            return self._base_embed(
-                "Override Defaults",
-                "**Off.** Profiles you make start with no models, and nothing here is "
-                "applied, until you choose a provider below (or in `/start`). An API key "
-                "alone does not choose one.")
         e = self._base_embed(
             "Override Defaults",
             "Applied to profiles you **create**, and offered on those you **borrow**, from "
@@ -359,8 +360,10 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
             "-# Anything left on *Platform default* follows the bot's own value for your "
             "provider, including if that value changes later. The tabs and the settings "
             "under them are the ones on a profile's own dashboard.")
-        e.add_field(name="Provider", value=f"`{MODEL_PROVIDERS[self._preferred()]}` — "
-                                           f"{PROVIDER_PREFERENCE_NOTE}"[:1024], inline=False)
+        note = (NO_PROVIDER_NOTE if self._preferred() == PROVIDER_NONE
+                else PROVIDER_PREFERENCE_NOTE)
+        e.add_field(name="Provider", value=f"`{PROVIDER_CHOICES[self._preferred()]}` — "
+                                           f"{note}"[:1024], inline=False)
         rows = self._rows(self.tab)
         for action in rows:
             e.add_field(name=action.bulk_label(), value=self._row_value(action), inline=True)
@@ -435,10 +438,6 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         self._add_nav_buttons()
 
     def _build_actions_step(self):
-        if not self._preferred():
-            add_select(self, provider_options(None), self._set_provider,
-                       placeholder="Choose a provider to turn defaults on...", row=0)
-            return
         tabs = self._tabs()
         if self.tab not in tabs and tabs:
             self.tab = tabs[0]
@@ -459,7 +458,7 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         nav_row = self._add_tab_row(tabs)
         add_button(self, "Clear…", self._nav("clear"), style=discord.ButtonStyle.secondary,
                    row=nav_row, disabled=not self._set_rows())
-        add_button(self, f"Provider: {MODEL_PROVIDERS[self._preferred()]}", self._set_provider,
+        add_button(self, f"Provider: {PROVIDER_CHOICES[self._preferred()]}", self._set_provider,
                    style=discord.ButtonStyle.secondary, row=nav_row, emoji="🔀")
 
     def _add_tab_row(self, tabs, row: int = 1) -> int:
@@ -579,9 +578,9 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         return callback
 
     async def _set_provider(self, interaction: discord.Interaction):
-        """The dropdown turns defaults on; the button beside Clear swaps provider."""
-        values = (interaction.data or {}).get("values")
-        provider = values[0] if values else other_provider(self._preferred())
+        """The button beside Clear steps through Google, OpenRouter and None."""
+        choices = list(PROVIDER_CHOICES)
+        provider = choices[(choices.index(self._preferred()) + 1) % len(choices)]
         self.cog.profile_manager.set_provider_preference(self.user_id, provider)
         self.view_mode = self.preferred_api(self.cog, self.user_id)
         await self.refresh(interaction)
