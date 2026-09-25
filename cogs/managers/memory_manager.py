@@ -11,7 +11,7 @@ import asyncio
 import datetime
 import traceback
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Dict, List, Any, Optional, Union, Tuple
+from typing import TYPE_CHECKING, Dict, List, Any, Optional, Tuple
 import discord
 
 
@@ -48,11 +48,11 @@ else:
 
 from ..utils.constants import (
     defaultConfig, DEFAULT_SAFETY_SETTINGS,
-    MAX_LTM_SUMMARY_CHARACTERS, MIN_HISTORY_FOR_LTM_CREATION,
+    MAX_LTM_SUMMARY_CHARACTERS, MIN_HISTORY_FOR_LTM_CREATION, LTM_MAX_PER_CAPTURE,
     DEFAULT_TRAINING_ANALYST_PROMPT, GREEDY_SAMPLING,
     RECALL_TOOL_MAX, RECALL_TOOL_THRESHOLD,
 )
-from ..utils.helpers import (Timeout, _format_api_error, _get_sanitized_history_and_author,
+from ..utils.helpers import (Timeout, _format_api_error, _resolve_zoneinfo,
                             clip_to_sentence, ltm_auto_recall_enabled,
                             resolve_thinking_params, suppress_link_previews)
 from .storage_manager import IOManager
@@ -79,6 +79,41 @@ def _is_abstention(text: str) -> bool:
     later turn. No real memory can open this way, so a prefix test costs nothing.
     """
     return bool(PATTERN_LTM_ABSTAIN.match((text or "").strip()))
+
+
+def entry_date(entry: Dict[str, Any], tz, fmt: str = "%d %b %Y") -> str:
+    """When a memory or training example was made, on `tz`'s clock, or "" when it carries no date.
+
+    The day by default: recall injects that into every prompt, where a time costs tokens
+    and invites a character to quote it.
+    """
+    stamp = entry.get("created_ts") or entry.get("ts")
+    try:
+        moment = datetime.datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return ""
+    if not moment.tzinfo:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    return moment.astimezone(tz).strftime(fmt)
+
+
+#: A list marker a model puts on a line despite being asked not to.
+_LIST_MARKER = re.compile(r'^\s*(?:[-*\u2022]|\d+[.)])\s+')
+
+
+def split_memories(text: str) -> List[str]:
+    """The memories in a summariser reply: one per line, list markers and declines
+    dropped, each clipped, at most LTM_MAX_PER_CAPTURE.
+
+    Clipped one by one because the prompt's "two sentences" is a request, and a memory
+    that runs on embeds as the average of everything in it.
+    """
+    memories = []
+    for line in (text or "").splitlines():
+        line = _LIST_MARKER.sub("", line).strip()
+        if line and not _is_abstention(line):
+            memories.append(clip_to_sentence(line, MAX_LTM_SUMMARY_CHARACTERS))
+    return memories[:LTM_MAX_PER_CAPTURE]
 
 def decode_embedding_b64(b64_str: str) -> np.ndarray:
     if not b64_str: return np.array([], dtype=np.float32)
@@ -207,6 +242,19 @@ def _build_ltm_vectors(all_profile_ltms) -> Optional["_LTMVectors"]:
     )
 
 
+def _closest_rows(unit, rows, query, top: int) -> List[Tuple[float, int]]:
+    """(similarity, row) for the `top` rows of `unit` -- all of them, or only `rows` --
+    nearest `query`, best first. One product; [] for a zero or mismatched query."""
+    q = np.asarray(query, dtype=np.float32)
+    norm = float(np.linalg.norm(q))
+    if not norm or unit.shape[1] != q.shape[0]:
+        return []
+    idx = np.arange(unit.shape[0]) if rows is None else rows
+    sims = unit[idx] @ (q / norm)
+    best = np.argsort(-sims, kind="stable")[:top]
+    return [(float(sims[b]), int(idx[b])) for b in best]
+
+
 def _cached_vectors(cache, key, max_rows, build, *build_args):
     """Fetch or build one shard's numeric view, keeping `cache` LRU and row-bounded.
 
@@ -313,7 +361,32 @@ class MemoryManager:
         if not data or not data.get("guild"):
             self._delete_ltm_shard(user_id, profile_name)
         else:
+            for entry in data["guild"]:
+                self._compact_ltm_entry(entry)
             self.cog.storage_manager._save_shard("ltm", user_id, data, profile_name)
+
+    def _compact_ltm_entry(self, entry: Dict[str, Any]) -> None:
+        """Brings an entry written by an older version to today's shape, in place.
+
+        The one that matters is `sum`: it used to be Fernet-encrypted inside a shard
+        that is itself sealed, so every search and every list paid a decrypt per entry.
+        Stored plain, the next read costs nothing. The rest is dead weight -- an
+        unedited entry's `modified_ts` repeats `created_ts`, and `kw`, `ts` and a list
+        `s_emb` beside its base64 twin are from formats nothing reads -- multiplied by
+        up to LIMIT_LTM entries in a file parsed on every recall.
+        """
+        text = entry.get("sum")
+        if isinstance(text, str) and text.startswith("gAAAAA"):
+            entry["sum"] = self.cog.storage_manager._decrypt_data(text)
+        if "ts" in entry:
+            entry.setdefault("created_ts", entry.pop("ts"))
+        if "s_emb_b64" in entry:
+            entry.pop("s_emb", None)
+        entry.pop("kw", None)
+        if entry.get("modified_ts") == entry.get("created_ts"):
+            entry.pop("modified_ts", None)
+        if entry.get("usr") is None:
+            entry.pop("usr", None)
 
     def _delete_ltm_shard(self, user_id: str, profile_name: str):
         self.cog.storage_manager._delete_shard("ltm", user_id, profile_name)
@@ -342,8 +415,42 @@ class MemoryManager:
                     return session_owner_id, b_name
         return profile_owner_id, profile_name
 
-    async def _add_ltm(self, profile_owner_id: int, profile_name: str, summary: str, summary_embedding_b64: str, guild_id: Optional[int], triggering_user_id: int, user_dn: Optional[str] = None):
-        """Appends one memory to a profile's LTM shard.
+    def _ltm_cache_key(self, owner_id_str: str, profile_name: str):
+        return self._shard_cache_key("ltm", owner_id_str, profile_name)
+
+    def _shard_cache_key(self, kind: str, owner_id_str: str, profile_name: str):
+        """The vector cache's key for a shard: its stat stamp, or None with no file."""
+        path = self.cog.storage_manager._get_shard_path(kind, owner_id_str, profile_name)
+        try:
+            st = os.stat(path) if path else None
+        except OSError:
+            # No file to stamp (an in-memory or just-deleted shard). Skip the cache
+            # rather than risk serving vectors for content that is no longer on disk.
+            return None
+        return (owner_id_str, profile_name, st.st_mtime_ns, st.st_size) if st else None
+
+    async def _add_ltm(self, profile_owner_id: int, profile_name: str, summary: str, summary_embedding_b64: str, guild_id: Optional[int], triggering_user_id: int, user_dn: Optional[str] = None, duplicate_similarity: Optional[float] = None, source: Optional[str] = None) -> bool:
+        """Appends one memory to a profile's LTM shard. False if it was not stored."""
+        return await self._add_ltms(profile_owner_id, profile_name,
+                                    [(summary, summary_embedding_b64)], guild_id, user_dn,
+                                    duplicate_similarity=duplicate_similarity, source=source) == 1
+
+    async def _add_ltms(self, profile_owner_id: int, profile_name: str,
+                        memories: List[Tuple[str, str]], guild_id: Optional[int],
+                        user_dn: Optional[str] = None, *,
+                        duplicate_similarity: Optional[float] = None,
+                        source: Optional[str] = None) -> int:
+        """Appends (summary, embedding_b64) memories to a profile's LTM shard, in one
+        read and one write. Returns how many were stored.
+
+        With `duplicate_similarity`, a memory that close to one already formed in this
+        guild -- or to one stored earlier in the same call -- is dropped: a scene that
+        keeps returning to a joke would otherwise store it every interval. One product
+        against the cached unit rows, on the shard this loads anyway. A memory someone
+        typed by hand passes None and is always kept.
+
+        `source` is how it came to be -- "auto", "memorise" or "manual" -- for the
+        memory screen. `user_dn` is who that was.
 
         Async because the two shard calls below are a decrypt plus zstd
         decompress plus orjson parse of up to LIMIT_LTM entries, and the same again in
@@ -352,7 +459,7 @@ class MemoryManager:
         loop: they read cog-owned dicts the loop itself mutates, so iterating them from
         a worker thread risks a "dictionary changed size during iteration".
         """
-        if not guild_id: return
+        if not guild_id or not memories: return 0
 
         # Redirect LTM saves to the borrower's folder if running in a borrowed session
         session_owner_id = None
@@ -374,6 +481,34 @@ class MemoryManager:
         context_type = "guild"
         ltm_list = ltm_data.get(context_type, [])
 
+        if duplicate_similarity is not None:
+            cache_key = self._ltm_cache_key(owner_id_str, ltm_profile_name)
+            new = [decode_embedding_b64(b64) for _, b64 in memories]
+
+            def _novel() -> List[bool]:
+                vectors = (_cached_vectors(_ltm_vec_cache, cache_key, _LTM_VEC_CACHE_MAX_ROWS,
+                                           _build_ltm_vectors, ltm_list) if ltm_list else None)
+                rows = vectors.guild_rows.get(str(guild_id)) if vectors else None
+                known = [vectors.unit[rows]] if rows is not None else []
+                keep = []
+                for vec in new:
+                    norm = float(np.linalg.norm(vec))
+                    if not norm:
+                        keep.append(True)
+                        continue
+                    unit = vec / norm
+                    rivals = [k for k in known if k.shape[1] == unit.shape[0]]
+                    closest = max((float((k @ unit).max()) for k in rivals), default=0.0)
+                    keep.append(closest < duplicate_similarity)
+                    if keep[-1]:
+                        known.append(unit[None, :])
+                return keep
+
+            keep = await asyncio.to_thread(_novel)
+            memories = [m for m, k in zip(memories, keep) if k]
+            if not memories:
+                return 0
+
         limit = defaultConfig.LIMIT_LTM
 
         # Entries are appended newest-last and only ever trimmed from the front, so the
@@ -387,27 +522,31 @@ class MemoryManager:
         # single `pop(0)` as the whole cap, so a shard already over it -- profile import
         # writes the bundle's entries without checking -- shed one entry per write
         # forever. One slice deletion trims to fit in a single step.
-        overflow = len(ltm_list) - limit + 1
+        overflow = len(ltm_list) - limit + len(memories)
         if overflow > 0:
             del ltm_list[:overflow]
 
         now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        entry = {
-            "id": str(uuid.uuid4())[:8],
-            "created_ts": now_ts,
-            "modified_ts": now_ts,
-            "sum": summary.strip(),
-            "s_emb_b64": summary_embedding_b64,
-            "usr": user_dn,
-            # The guild the memory formed in, and the only place it is ever
-            # recalled: _build_ltm_vectors groups rows by this, and retrieval only
-            # ever looks at the current guild's group.
-            "context_id": str(guild_id)
-        }
-        ltm_list.append(entry)
+        for summary, summary_embedding_b64 in memories:
+            entry = {
+                "id": str(uuid.uuid4())[:8],
+                "created_ts": now_ts,
+                "sum": summary.strip(),
+                "s_emb_b64": summary_embedding_b64,
+                # The guild the memory formed in, and the only place it is ever
+                # recalled: _build_ltm_vectors groups rows by this, and retrieval only
+                # ever looks at the current guild's group.
+                "context_id": str(guild_id)
+            }
+            if user_dn:
+                entry["usr"] = user_dn
+            if source:
+                entry["src"] = source
+            ltm_list.append(entry)
 
         ltm_data[context_type] = ltm_list
         await asyncio.to_thread(self._save_ltm_shard, owner_id_str, ltm_profile_name, ltm_data)
+        return len(memories)
 
     async def update_ltm(self, profile_owner_id: int, profile_name: str, ltm_id: str, new_summary: str, new_embedding_b64: str) -> bool:
         """Rewrites one memory in place. Async for the same shard-I/O reason as _add_ltm."""
@@ -428,6 +567,109 @@ class MemoryManager:
                 await asyncio.to_thread(self._save_ltm_shard, owner_id_str, profile_name, ltm_data)
                 return True
         return False
+
+    async def load_ltms(self, owner_id: int, profile_name: str) -> List[Dict]:
+        """Every memory in a profile's shard, newest first, `sum` in plain text -- read
+        and decrypted off the event loop. The entries are this call's own copies."""
+        decrypt = self.cog.storage_manager._decrypt_data
+
+        def _load():
+            entries = list(reversed((self._load_ltm_shard(str(owner_id), profile_name) or {}).get("guild", [])))
+            for e in entries:
+                e["sum"] = decrypt(e.get("sum") or "")
+            return entries
+        return await asyncio.to_thread(_load)
+
+    async def delete_ltms(self, owner_id: int, profile_name: str, ids) -> int:
+        """Removes the memories with these ids. Returns how many went."""
+        ids = set(ids)
+
+        def _delete() -> int:
+            data = self._load_ltm_shard(str(owner_id), profile_name)
+            if not data:
+                return 0
+            kept = [e for e in data.get("guild", []) if e.get("id") not in ids]
+            gone = len(data.get("guild", [])) - len(kept)
+            if gone:
+                data["guild"] = kept
+                self._save_ltm_shard(str(owner_id), profile_name, data)
+            return gone
+        return await asyncio.to_thread(_delete)
+
+    async def rank_ltms(self, owner_id: int, profile_name: str, guild_id: str, query: str,
+                        billing_guild_id: Optional[int], top: int = 5) -> Optional[List[Tuple[float, Dict]]]:
+        """One guild's memories nearest `query`, best first, as (similarity, entry).
+
+        What the memory screen's Test recall shows: raw similarity, before the
+        threshold, the repeat cooldown and the diversity pass pick what a turn injects.
+        None when the query could not be embedded.
+        """
+        owner_str = str(owner_id)
+        data = await asyncio.to_thread(self._load_ltm_shard, owner_str, profile_name)
+        entries = (data or {}).get("guild", [])
+        if not entries:
+            return []
+        emb = await self._get_embedding(query, billing_guild_id, task_type="RETRIEVAL_QUERY",
+                                        owner_id=owner_id)
+        if not emb:
+            return None
+        key = self._ltm_cache_key(owner_str, profile_name)
+
+        def _rank():
+            vectors = _cached_vectors(_ltm_vec_cache, key, _LTM_VEC_CACHE_MAX_ROWS,
+                                      _build_ltm_vectors, entries)
+            rows = vectors.guild_rows.get(str(guild_id)) if vectors else None
+            if rows is None:
+                return []
+            return [(sim, entries[vectors.rows[r]]) for sim, r in _closest_rows(vectors.unit, rows, emb, top)]
+        return await asyncio.to_thread(_rank)
+
+    async def rank_training_examples(self, owner_id: int, profile_name: str, query: str,
+                                     billing_guild_id: Optional[int],
+                                     top: int = 5) -> Optional[List[Tuple[float, Dict]]]:
+        """The examples nearest `query`, best first, as (similarity, example): the
+        training screen's Test match. None when the query could not be embedded."""
+        owner_str = str(owner_id)
+        examples = await asyncio.to_thread(self._load_training_shard, owner_str, profile_name) or []
+        if not examples:
+            return []
+        emb = await self._get_embedding(query, billing_guild_id, task_type="RETRIEVAL_QUERY",
+                                        owner_id=owner_id)
+        if not emb:
+            return None
+        key = self._shard_cache_key("training", owner_str, profile_name)
+
+        def _rank():
+            vectors = _cached_vectors(_train_vec_cache, key, _TRAINING_VEC_CACHE_MAX_ROWS,
+                                      _build_training_vectors, examples)
+            if vectors is None:
+                return []
+            return [(sim, examples[vectors.rows[r]]) for sim, r in _closest_rows(vectors.unit, None, emb, top)]
+        return await asyncio.to_thread(_rank)
+
+    async def load_training_examples(self, owner_id: int, profile_name: str) -> List[Dict]:
+        """Every training example of a profile, newest first, in plain text -- read and
+        decrypted off the event loop. The entries are this call's own copies."""
+        decrypt = self.cog.storage_manager._decrypt_data
+
+        def _load():
+            examples = list(reversed(self._load_training_shard(str(owner_id), profile_name) or []))
+            for e in examples:
+                e["u_in"], e["b_out"] = decrypt(e.get("u_in") or ""), decrypt(e.get("b_out") or "")
+            return examples
+        return await asyncio.to_thread(_load)
+
+    async def delete_training_examples(self, owner_id: int, profile_name: str, ids) -> int:
+        """Removes the examples with these ids. Returns how many went."""
+        ids = set(ids)
+
+        def _delete() -> int:
+            examples = self._load_training_shard(str(owner_id), profile_name) or []
+            kept = [e for e in examples if e.get("id") not in ids]
+            if len(kept) < len(examples):
+                self._save_training_shard(str(owner_id), profile_name, kept)
+            return len(examples) - len(kept)
+        return await asyncio.to_thread(_delete)
 
     def _load_training_shard(self, user_id: str, profile_name: str) -> Optional[List[Dict]]:
         return self.cog.storage_manager._load_shard("training", user_id, profile_name)
@@ -458,7 +700,7 @@ class MemoryManager:
                           guild_id: Optional[int], triggering_user_id: int, *,
                           threshold: Optional[float] = None, size: Optional[int] = None,
                           use_cooldown: bool = True) -> List[str]:
-        """The memories `msg_content` retrieves, as decrypted summaries.
+        """The memories `msg_content` retrieves, each prefixed with the date it was made.
 
         Shared by the automatic pass and the `recall` function, which want the same
         search on different terms. The keyword arguments are what differs: an explicit
@@ -538,15 +780,7 @@ class MemoryManager:
         current_turn = len(history)
         session_cooldown_history = self.cog.ltm_recall_history.get(session_key, {}) if use_cooldown else {}
 
-        ltm_shard_path = self.cog.storage_manager._get_shard_path("ltm", owner_id_str, ltm_profile_name)
-        try:
-            st = os.stat(ltm_shard_path) if ltm_shard_path else None
-            ltm_cache_key = ((owner_id_str, ltm_profile_name, st.st_mtime_ns, st.st_size)
-                             if st else None)
-        except OSError:
-            # No file to stamp (an in-memory or just-deleted shard). Skip the cache
-            # rather than risk serving vectors for content that is no longer on disk.
-            ltm_cache_key = None
+        ltm_cache_key = self._ltm_cache_key(owner_id_str, ltm_profile_name)
 
         guild_id_str = str(guild_id)
 
@@ -633,6 +867,9 @@ class MemoryManager:
         if use_cooldown and session_key not in self.cog.ltm_recall_history:
             self.cog.ltm_recall_history[session_key] = {}
 
+        # Dated on the character's clock. Undated, "promised him cake" reads the same a
+        # week on as three years on, and a character has no other way to tell.
+        clock, _ = _resolve_zoneinfo(params_to_use.get("timezone"))
         recalled_summaries = []
         for mem_data in final_memories:
             ltm = mem_data["ltm"]
@@ -640,7 +877,8 @@ class MemoryManager:
                 self.cog.ltm_recall_history[session_key][ltm['id']] = (current_turn, mem_data["original_sim"])
 
             decrypted_sum = self.cog.storage_manager._decrypt_data(ltm.get('sum', ''))
-            recalled_summaries.append(decrypted_sum)
+            date = entry_date(ltm, clock)
+            recalled_summaries.append(f"[{date}] {decrypted_sum}" if date else decrypted_sum)
 
         if not recalled_summaries:
             return []
@@ -732,16 +970,8 @@ class MemoryManager:
         msg_emb = await self._get_embedding(msg_content, guild_id, task_type="RETRIEVAL_QUERY")
         if not msg_emb: return []
 
-        training_shard_path = self.cog.storage_manager._get_shard_path(
-            "training", str(effective_owner_id_for_training), effective_profile_name_for_training
-        )
-        try:
-            st = os.stat(training_shard_path) if training_shard_path else None
-            train_cache_key = ((str(effective_owner_id_for_training),
-                                effective_profile_name_for_training,
-                                st.st_mtime_ns, st.st_size) if st else None)
-        except OSError:
-            train_cache_key = None
+        train_cache_key = self._shard_cache_key(
+            "training", str(effective_owner_id_for_training), effective_profile_name_for_training)
 
         def _thread_search_training():
             vectors = _cached_vectors(
@@ -793,8 +1023,15 @@ class MemoryManager:
 
         return await get_embedding_vector(routes, text, task_type=task_type, output_dimensionality=256, timeout=5.0)
 
-    async def _generate_ltm_data_from_history(self, hist:list, user_dn:str, gen_config_params: Dict[str, Any], guild_id: Optional[int], bot_dn: str = "Bot", profile_owner_id: int = None, profile_name: str = None, warning_channel: Optional[discord.abc.Messageable] = None) -> Optional[str]:
-        """Summarises a slice of history into a long-term memory.
+    async def _generate_ltm_data_from_history(self, hist: List[str], user_dn: str, guild_id: Optional[int], character_name: Optional[str] = None, profile_owner_id: int = None, profile_name: str = None, warning_channel: Optional[discord.abc.Messageable] = None, background: Optional[str] = None) -> Optional[List[str]]:
+        """Summarises a slice of history into up to LTM_MAX_PER_CAPTURE long-term memories.
+
+        Returns the memories; [] when the excerpt was judged and holds nothing worth
+        keeping (declined, blocked or empty); None when no verdict was reached -- an
+        API error, which the caller retries later on the same turns.
+
+        `background` is the scene's synopsis: who is who, from turns this excerpt no
+        longer shows. Marked as known, so it informs the memory without becoming one.
 
         The summariser model comes from the profile's own `ltm_model`, retried on
         `ltm_fallback_model`. It used to take a `model_name_to_use` argument that both
@@ -803,21 +1040,12 @@ class MemoryManager:
         wired: honouring it would have silently moved every LTM summary onto the
         response model.
         """
-        if not hist or len(hist) < MIN_HISTORY_FOR_LTM_CREATION: return None
+        if not hist or len(hist) < MIN_HISTORY_FOR_LTM_CREATION: return []
 
         # [UPDATED] Standardize history for the LTM Summarizer
         # Provides Name [Timestamp] and Content only, stripping metadata and summaries.
         convo_parts = []
-        for turn in hist:
-            if isinstance(turn, dict) and 'role' in turn:
-                display_name = user_dn if turn['role'] == 'user' else bot_dn
-                parts = turn.get('parts', [])
-                if not parts: continue
-                raw_text = "".join(p if isinstance(p, str) else p.get('text', '') for p in parts)
-            else:
-                raw_text = str(turn)
-                display_name = "Unknown" # String-only fallback
-
+        for raw_text in hist:
             if not raw_text: continue
 
             try:
@@ -850,16 +1078,27 @@ class MemoryManager:
                     if final_content:
                         if not re.match(r'^<.+> \[[^\]]+\]:', final_content) and not re.match(r'^.+ \[[^\]]+\]:', final_content):
                             ts_str = datetime.datetime.now(datetime.timezone.utc).strftime("[%a, %d %b %Y, %I:%M %p UTC]")
-                            convo_parts.append(f"<{display_name}> {ts_str}:\n{final_content}\n</{display_name}>")
+                            convo_parts.append(f"<Unknown> {ts_str}:\n{final_content}\n</Unknown>")
                         else:
                             convo_parts.append(final_content)
             except TimeoutError:
                 continue
 
+        if not convo_parts:
+            return []
+        # Whole turns. A 3,000-character tail used to cut here: it opened the excerpt
+        # mid-message with no speaker, and left about one round of a busy scene --
+        # rarely the line that said who anyone was.
         convo = "\n\n".join(convo_parts)
-
-        if len(convo) > 3000: # Slightly higher limit for formatted text
-            convo = convo[-3000:]
+        prompt = f"<target_transcript>\n{convo}\n</target_transcript>"
+        if background:
+            prompt = ("Already known from earlier in the scene. Background only: write no "
+                      f"memory from it.\n<session_synopsis>\n{background}\n</session_synopsis>\n\n"
+                      + prompt)
+        if character_name:
+            # Told only "a character", the summariser guessed which speaker it wrote for.
+            prompt += (f"\n\nThe character whose memory this is: {character_name}. "
+                       f"Times are on {character_name}'s clock.")
 
         # One resolver, shared with the screen that edits this prompt: a profile that
         # never wrote one of its own follows the live default rather than a copy frozen
@@ -882,7 +1121,6 @@ class MemoryManager:
 
         effective_guild_id = guild_id or 0
 
-        status = "api_error"
         try:
             async def _attempt(model_name, is_fallback):
                 # `{}` used to sit in the thinking slot, which is not "no thinking":
@@ -897,11 +1135,10 @@ class MemoryManager:
                         params_source, "ltm", "fallback" if is_fallback else "primary"),
                     None, params_source, config_owner_id=profile_owner_id)
                 return await m.generate_content_async(
-                    [f"<target_transcript>\n{convo}\n</target_transcript>"], generation_config=cfg)
+                    [prompt], generation_config=cfg)
 
             r, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
                 ltm_model_raw, ltm_fallbacks, _attempt, label="LTM summariser")
-            status = "blocked_by_safety" if not r.candidates else "success"
 
             response_text = ""
             if r.candidates:
@@ -912,10 +1149,8 @@ class MemoryManager:
             # Normalised, not compared raw. "NO_SUMMARY." and "No summary needed." both
             # used to pass this test and be stored, embedded and injected as a memory --
             # a permanent entry whose whole content is the model declining to write one.
-            if response_text and not _is_abstention(response_text):
-                # The prompt asks for two sentences; nothing made that true. A model
-                # that writes six stores six, forever, and embeds as their average.
-                return clip_to_sentence(response_text, MAX_LTM_SUMMARY_CHARACTERS)
+            # Declined, blocked or empty is [], a verdict on these turns, not a failure.
+            return [] if _is_abstention(response_text) else split_memories(response_text)
         except Exception as e:
             err_str = str(e)
             # A missing/misconfigured key is a configuration state, not a transient
@@ -930,72 +1165,6 @@ class MemoryManager:
                 if warning_channel:
                     await self.cog.generation_service._send_session_warning(warning_channel, f"Long-Term Memory creation failed ({_format_api_error(e)})")
         return None
-
-    async def _maybe_create_ltm(self, context_obj: Union[discord.Message, discord.abc.Messageable], author_dn: str, hist: list, profile_owner_id: int, profile_name: str, gen_config_params: Dict[str, Any], triggering_user_id_override: Optional[int] = None):
-        guild = getattr(context_obj, 'guild', None)
-        if not guild: return
-
-        index = self.cog.profile_manager._get_user_index(profile_owner_id)
-        is_borrowed = profile_name in index.get("borrowed",[])
-        profile_settings = self.cog.profile_manager._get_profile_config(profile_owner_id, profile_name, is_borrowed) or {}
-
-        if not profile_settings.get("ltm_creation_enabled", False):
-            return
-
-        ltm_counter_key = (profile_owner_id, profile_name, "guild")
-        # 1 exchange = 1 increment
-        self.cog.message_counters_for_ltm[ltm_counter_key] = self.cog.message_counters_for_ltm.get(ltm_counter_key, 0) + 1
-
-        interval = profile_settings.get("ltm_creation_interval", 10)
-        context_size = profile_settings.get("ltm_summarization_context", 10)
-
-        if self.cog.message_counters_for_ltm[ltm_counter_key] >= interval:
-            self.cog.message_counters_for_ltm[ltm_counter_key] = 0
-            # Turn history is now consolidated, so context size represents exact chunks
-            h_sum = hist[-context_size:]
-            if len(h_sum) < 2: # Minimal safety check
-                return
-
-            print(f"[DEBUG: LTM] Triggering summary for {profile_name} using {len(h_sum)} context turns.")
-
-            guild_id = None
-            channel_id = None
-            author = None
-            triggering_user_id = None
-
-            if isinstance(context_obj, discord.Message):
-                guild_id = context_obj.guild.id if context_obj.guild else None
-                channel_id = context_obj.channel.id
-                author = context_obj.author
-                triggering_user_id = author.id if author else self.cog.bot.user.id
-            else: # Is a TextChannel from a child bot
-                guild_id = context_obj.guild.id if context_obj.guild else None
-                channel_id = context_obj.id
-                triggering_user_id = triggering_user_id_override or self.cog.bot.user.id
-
-            _, _, _, temp, top_p, top_k, _, _, _, fallback_model = await asyncio.to_thread(
-                self.cog.session_manager._get_user_profile_for_model, profile_owner_id, channel_id, profile_name
-            )
-            effective_gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
-
-            user_id_map = {triggering_user_id: author_dn}
-            sanitized_history, sanitized_author = _get_sanitized_history_and_author(h_sum, user_id_map, triggering_user_id)
-
-            effective_owner_id, effective_profile_name = self.cog.profile_manager._resolve_effective_profile(profile_owner_id, profile_name)
-
-            bot_display_name = effective_profile_name
-            appearance = self.cog.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
-            if appearance.get("custom_display_name"):
-                bot_display_name = appearance["custom_display_name"]
-
-            warning_target = context_obj.channel if isinstance(context_obj, discord.Message) else context_obj
-
-            summary = await self._generate_ltm_data_from_history(sanitized_history, sanitized_author, effective_gen_config, guild_id, bot_dn=bot_display_name, profile_owner_id=profile_owner_id, profile_name=profile_name, warning_channel=warning_target)
-            if summary:
-                summary_embedding = await self._get_embedding(summary, guild_id, task_type="RETRIEVAL_DOCUMENT")
-                if summary_embedding:
-                    b64_emb = encode_embedding_b64(summary_embedding)
-                    await self._add_ltm(profile_owner_id, profile_name, summary, b64_emb, guild.id if guild else None, triggering_user_id, sanitized_author)
 
     async def add_new_training_example(self, profile_owner_id: int, profile_name: str, usr_in:str, bot_out:str, guild_id: Optional[int])->Tuple[bool,str]:
         if not usr_in.strip() or not bot_out.strip(): return False,"Inputs empty."
@@ -1064,14 +1233,18 @@ class MemoryManager:
         else:
             return False, f"Could not find a training example with ID `{example_id}` for profile '{profile_name}'."
 
-    async def _execute_training_analysis(self, interaction: discord.Interaction, profile_name: str, count: int, verbosity: int, model_name: str):
-        user_id = interaction.user.id
-        user_id_str = str(user_id)
-        
-        examples = self._load_training_shard(user_id_str, profile_name) or []
+    async def _execute_training_analysis(self, interaction: discord.Interaction, owner_id: int,
+                                         profile_name: str, count: int, verbosity: int,
+                                         model_name: Optional[str] = None):
+        """Writes a style guide from the newest `count` examples into AI Instructions slot 4.
+
+        On the profile's LTM summariser chain, with `model_name` first when one was
+        typed. `owner_id` is the profile's owner, who is not the invoker under /mod.
+        """
+        examples = await asyncio.to_thread(self._load_training_shard, str(owner_id), profile_name) or []
         if not examples:
-            await interaction.followup.send("❌ No training examples found to analyse.", ephemeral=True); return
-        
+            await interaction.followup.send("\u274c No training examples found to analyse.", ephemeral=True); return
+
         # Take the N most recent examples
         subset = examples[-count:]
         formatted_examples = []
@@ -1079,43 +1252,51 @@ class MemoryManager:
             u = self.cog.storage_manager._decrypt_data(ex['u_in'])
             b = self.cog.storage_manager._decrypt_data(ex['b_out'])
             formatted_examples.append(f"User: {u}\nAssistant: {b}")
-        
+
         examples_block = "\n---\n".join(formatted_examples)
-        
+
         # [UPDATED] Standardized XML tagging for the Analysis Prompt
         prompt = self.cog.global_prompts.get("TRAINING_ANALYST", DEFAULT_TRAINING_ANALYST_PROMPT).format(verbosity=verbosity, examples_block=examples_block)
 
         try:
-            index = self.cog.profile_manager._get_user_index(user_id)
+            index = self.cog.profile_manager._get_user_index(owner_id)
             p_is_b = profile_name in index.get("borrowed", [])
-            p_cfg = self.cog.profile_manager._get_profile_config(user_id, profile_name, p_is_b) or {}
-            
-            model = self.cog.api_service._instantiate_model(model_name, interaction.guild_id, user_id, None, None, {}, None, p_cfg, config_owner_id=user_id)
-            resp = await model.generate_content_async([prompt])
-            response_text = resp.text
+            p_cfg = self.cog.profile_manager._get_profile_config(owner_id, profile_name, p_is_b) or {}
+
+            async def _attempt(name, _is_fallback):
+                # `{}` reads as "high" in every adapter; a style guide is a utility job.
+                model = self.cog.api_service._instantiate_model(
+                    name, interaction.guild_id, owner_id, profile_settings=p_cfg,
+                    config_owner_id=owner_id, thinking_params=resolve_thinking_params(None, "utility"))
+                return await model.generate_content_async([prompt])
+
+            resp, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
+                *self.cog.api_service.model_chain(
+                    {**p_cfg, "ltm_model": model_name} if model_name else p_cfg, "ltm_model", owner_id),
+                _attempt, label="Training analysis")
+            response_text = getattr(resp, "text", None)
 
             if not response_text: raise ValueError("Model returned an empty response.")
-            
+
             # Save to Slot 4 (Index 3)
-            index = self.cog.profile_manager._get_user_index(user_id)
             if profile_name in index.get("personal", []):
-                prompts = self.cog.profile_manager._get_profile_prompts(user_id, profile_name) or {}
-                
+                prompts = self.cog.profile_manager._get_profile_prompts(owner_id, profile_name) or {}
+
                 # Ensure ai_instructions is a list of 4
                 if not isinstance(prompts.get("ai_instructions"), list):
                     prompts["ai_instructions"] = [prompts.get("ai_instructions", ""), "", "", ""]
                 while len(prompts["ai_instructions"]) < 4:
                     prompts["ai_instructions"].append("")
-                
+
                 prompts["ai_instructions"][3] = self.cog.storage_manager._encrypt_data(response_text[:4000])
-                self.cog.profile_manager._save_profile_prompts(user_id, profile_name, prompts)
-                
-                await interaction.followup.send(f"✅ **Analysis Complete.** Style guide saved to AI Instructions for '{profile_name}'.", ephemeral=True)
+                self.cog.profile_manager._save_profile_prompts(owner_id, profile_name, prompts)
+
+                await interaction.followup.send(f"\u2705 **Analysis Complete.** Style guide saved to AI Instructions for '{profile_name}'.", ephemeral=True)
             else:
-                await interaction.followup.send("❌ Profile not found.", ephemeral=True)
+                await interaction.followup.send("\u274c Profile not found.", ephemeral=True)
 
         except Exception as e:
-            await interaction.followup.send(f"❌ **Analysis Failed:** {suppress_link_previews(str(e))}", ephemeral=True)
+            await interaction.followup.send(f"\u274c **Analysis Failed:** {suppress_link_previews(str(e))}", ephemeral=True)
 
     async def bulk_reset_examples(self, user_id: int, profile_names: List[str]) -> str:
         user_id_str = str(user_id)

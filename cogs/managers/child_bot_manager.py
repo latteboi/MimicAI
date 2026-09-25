@@ -998,7 +998,7 @@ class ChildBotManager:
                 session = {
                     "type": "multi", "unified_log": [], "is_hydrated": False,
                     "last_bot_message_id": None, "owner_id": message_payload.get("author_id"), "is_running": False,
-                    "task_queue": asyncio.Queue(), "worker_task": None, "turns_since_last_ltm": 0,
+                    "task_queue": asyncio.Queue(), "worker_task": None,
                     "session_prompt": None, "session_mode": "sequential", "profiles": []
                 }
                 self.cog.multi_profile_channels[channel_id] = session
@@ -1209,7 +1209,7 @@ class ChildBotManager:
                 "unified_log": [], "is_hydrated": False, "last_bot_message_id": None,
                 "owner_id": event_data.get("user_id"), "is_running": False,
                 "task_queue": asyncio.Queue(),
-                "worker_task": None, "turns_since_last_ltm": 0, "session_prompt": None,
+                "worker_task": None, "session_prompt": None,
                 "session_mode": "sequential", "audio_mode": "off",
                 "compaction": dict(NEW_SESSION_COMPACTION),
             }
@@ -1263,9 +1263,6 @@ class ChildBotManager:
         self.cog.channel_model_last_profile_key.pop(session_key, None)
         self.cog.session_last_accessed.pop(session_key, None)
         self.cog.ltm_recall_history.pop(session_key, None)
-
-        ltm_counter_key = (owner_id, profile_name, "guild")
-        self.cog.message_counters_for_ltm.pop(ltm_counter_key, None)
 
     async def handle_child_bot_confirmation(self, event_data: Dict):
         correlation_id = event_data.get("correlation_id")

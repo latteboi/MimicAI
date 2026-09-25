@@ -41,9 +41,9 @@ def calls_forbidden(generation_config: Any) -> bool:
 class FunctionCall(NamedTuple):
     """One call the model asked for.
 
-    `call_id` is OpenRouter's correlation id, which a function *result* must quote
-    when it goes back. Google correlates by name instead and leaves this empty, so
-    nothing may treat it as present.
+    `call_id` is the correlation id a function *result* must quote when it goes back.
+    OpenRouter always sends one and Gemini 3 does; older Gemini correlates by name and
+    leaves this empty, so nothing may treat it as present.
     """
     name: str
     args: Dict[str, Any]
@@ -127,7 +127,8 @@ def from_google_parts(parts) -> List[FunctionCall]:
         if not name:
             continue
         args = getattr(fc, "args", None)
-        calls.append(FunctionCall(name=name, args=args if isinstance(args, dict) else {}))
+        calls.append(FunctionCall(name=name, args=args if isinstance(args, dict) else {},
+                                  call_id=getattr(fc, "id", None) or ""))
     return calls
 
 
@@ -193,16 +194,34 @@ def result_part(call: FunctionCall, result: Any) -> Dict[str, Any]:
                                   "id": call.call_id}}
 
 
+def verbatim_part(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """A part exactly as a provider sent it, to go back to that provider untouched --
+    see `GoogleRESTResponse.model_parts`. Only ever sent to the model that wrote it:
+    `tool_loop.run` talks to one model, and a fallback starts from its own copy."""
+    return {"verbatim": raw}
+
+
 def google_part(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """One neutral function part in Google's spelling, or None if it is not one."""
+    """One neutral function part in Google's spelling, or None if it is not one.
+
+    The id goes only where one came: Gemini 3 matches a result to its call by it, and
+    older models never sent one to match.
+    """
+    raw = part.get("verbatim")
+    if isinstance(raw, dict):
+        return raw
     call = part.get("function_call")
     if isinstance(call, dict):
-        return {"functionCall": {"name": call.get("name") or "",
-                                 "args": call.get("args") or {}}}
+        out = {"name": call.get("name") or "", "args": call.get("args") or {}}
+        if call.get("id"):
+            out["id"] = call["id"]
+        return {"functionCall": out}
     result = part.get("function_response")
     if isinstance(result, dict):
-        return {"functionResponse": {"name": result.get("name") or "",
-                                     "response": result.get("response") or {}}}
+        out = {"name": result.get("name") or "", "response": result.get("response") or {}}
+        if result.get("id"):
+            out["id"] = result["id"]
+        return {"functionResponse": out}
     return None
 
 

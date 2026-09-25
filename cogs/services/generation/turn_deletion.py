@@ -113,7 +113,7 @@ def remove_turns_from_log(session: Dict, doomed: Iterable[Dict]) -> int:
 
 
 class TurnDeletionMixin:
-    """/delete, /purge's whole-turn expansion, and the message-delete listeners' cascade."""
+    """/purge, its whole_channel expansion, and the message-delete listeners' cascade."""
 
     async def delete_turns(self, channel, session: Dict, turns: List[Dict], *,
                            already_gone: Iterable[int] = ()) -> Dict[str, int]:
@@ -129,23 +129,10 @@ class TurnDeletionMixin:
         gone = set(already_gone)
         remaining = [mid for turn in turns for mid in turn.get("message_ids", []) if mid not in gone]
 
-        self._decrement_ltm_counters(session, turns)
         synopses = remove_turns_from_log(session, turns)
         messages = await self._delete_channel_messages(channel, remaining)
         await self._persist_after_turn_removal(channel.id, session)
         return {"turns": len(turns), "messages": messages, "synopses": synopses}
-
-    def _decrement_ltm_counters(self, session: Dict, turns: List[Dict]) -> None:
-        # speaker_pid -> participant, resolved once rather than per turn.
-        pid_to_profile = {}
-        for p in session.get('profiles', []):
-            pid = self.cog.profile_manager._get_pid_from_name_any(p['owner_id'], p['profile_name'])
-            pid_to_profile.setdefault(pid, p)
-        for turn in turns:
-            if turn.get("is_user") is False:
-                p = pid_to_profile.get(turn.get("speaker_pid"))
-                if p:
-                    p['ltm_counter'] = max(0, p.get('ltm_counter', 0) - 1)
 
     async def _persist_after_turn_removal(self, channel_id: int, session: Dict) -> None:
         session_type = session.get("type", "multi")

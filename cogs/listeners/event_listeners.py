@@ -898,7 +898,7 @@ class EventListeners:
             return
 
         deleted_message_id = payload.message_id
-        # Before the purged-id check: the bot's own deletions (/purge, /delete, the
+        # Before the purged-id check: the bot's own deletions (/purge, the
         # whole-turn cascade, regeneration) take a ❌ with them as surely as anyone's.
         if self.session_manager.release_skips(
                 self.multi_profile_channels.get(payload.channel_id), {deleted_message_id}):

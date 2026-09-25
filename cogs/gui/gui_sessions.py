@@ -324,23 +324,6 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
         
         has_explicit_prefix = any(value.startswith(p) for p in system_prefixes)
 
-        # The dropdown pins these slots to Google, but rule 1 above would still honour a
-        # typed 'OPENROUTER/' here -- and grounding constructs a Google client directly,
-        # so the id would reach the Google API verbatim and 404. Refused rather than
-        # rewritten: 'OPENROUTER/x-ai/grok-4' has no Google meaning, and silently saving
-        # 'GOOGLE/x-ai/grok-4' would only move the 404 later.
-        if self.target_config_key in GOOGLE_ONLY_MODEL_KEYS:
-            if has_explicit_prefix and not value.startswith("GOOGLE/"):
-                await interaction.response.send_message(
-                    f"`{self.target_config_key}` only accepts Google models — grounding has "
-                    "no OpenRouter or Ollama path in the adapters. Enter the model id without "
-                    "a provider prefix.",
-                    ephemeral=True)
-                return
-            if not has_explicit_prefix:
-                value = "GOOGLE/" + value
-            has_explicit_prefix = True
-
         if not has_explicit_prefix:
             prefix = "GOOGLE/"
             if getattr(self.parent_view, 'view_mode', None) == "openrouter":
@@ -350,17 +333,22 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
             
             value = prefix + value
 
+        # Owner first: anyone else who types the prefix is told Ollama is the owner's, not
+        # which slots it would or would not fill.
+        if value.startswith("OLLAMA/") and not self.parent_view.cog.profile_manager.may_use_ollama(
+                getattr(self.parent_view, "user_id", interaction.user.id)):
+            await interaction.response.send_message(OLLAMA_OWNER_ONLY, ephemeral=True)
+            return
+
         is_image_slot = self.target_config_key in IMAGE_MODEL_KEYS
         is_speech_slot = self.target_config_key in AUDIO_MODEL_KEYS
         if value.startswith("OLLAMA/") and (is_image_slot or is_speech_slot):
             await interaction.response.send_message(
                 IMAGE_MODEL_NO_OLLAMA if is_image_slot else SPEECH_MODEL_NO_OLLAMA, ephemeral=True)
             return
-
-        # A typed prefix reaches Ollama as surely as the API switch does.
-        if value.startswith("OLLAMA/") and not self.parent_view.cog.profile_manager.may_use_ollama(
-                getattr(self.parent_view, "user_id", interaction.user.id)):
-            await interaction.response.send_message(OLLAMA_OWNER_ONLY, ephemeral=True)
+        # The API switch skips Ollama here, but a typed prefix does not.
+        if value.startswith("OLLAMA/") and self.target_config_key in SEARCH_MODEL_KEYS:
+            await interaction.response.send_message(SEARCH_MODEL_NO_OLLAMA, ephemeral=True)
             return
 
         if value.startswith("OPENROUTER/"):
@@ -1026,7 +1014,6 @@ class ReactivitySettingsModal(ui.Modal, title="Edit Reactivity"):
         await interaction.response.defer()
         await self.view.update_display()
 
-DEFAULT_DIRECTOR_PROMPT = "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."
 
 class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
     chance_input = ui.TextInput(label="Trigger Chance (0-100%)", placeholder="Default: 10", required=True, max_length=3)
@@ -1040,7 +1027,7 @@ class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
         self.chance_input.default = str(pro.get("chance", 10))
         self.cooldown_input.default = str(pro.get("cooldown", 300))
         self.model_input.default = pro.get("director_model", "off")
-        self.instructions_input.default = pro.get("director_instructions", DEFAULT_DIRECTOR_PROMPT)
+        self.instructions_input.default = pro.get("director_instructions") or DEFAULT_DIRECTOR_INSTRUCTIONS
     async def on_submit(self, interaction: discord.Interaction):
         try:
             pro = self.view.session.setdefault("proactivity", {})
@@ -1051,15 +1038,21 @@ class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
             if model_val in ["", "off"]:
                 pro["director_model"] = "off"
             elif model_val == "on":
-                pro["director_model"] = "GOOGLE/gemini-2.5-flash-lite"
+                # The LTM summariser's chain, resolved when it runs -- see _director_note.
+                pro["director_model"] = "on"
             else:
                 model_val_orig = self.model_input.value.strip()
                 if not (model_val_orig.upper().startswith("GOOGLE/") or model_val_orig.upper().startswith("OPENROUTER/")):
                     model_val_orig = "GOOGLE/" + model_val_orig
                 pro["director_model"] = model_val_orig
             
+            # Blank, or the shipped wording left as it was, is "the default": resolved
+            # when it runs, so a better wording reaches this session too.
             ins_val = self.instructions_input.value.strip()
-            pro["director_instructions"] = ins_val if ins_val else DEFAULT_DIRECTOR_PROMPT
+            if ins_val and ins_val != DEFAULT_DIRECTOR_INSTRUCTIONS:
+                pro["director_instructions"] = ins_val
+            else:
+                pro.pop("director_instructions", None)
             
             self.view.cog.session_manager._save_multi_profile_sessions()
             await interaction.response.defer()
@@ -2093,7 +2086,8 @@ class SessionConfigView(BlockedGuard, ui.View):
         embed.add_field(name="Status", value="**`ON`**" if enabled else "`OFF`", inline=True)
         embed.add_field(name="Chance & Cooldown", value=f"`{pro.get('chance', 10)}%` every `{pro.get('cooldown', 300)}s`", inline=True)
         
-        dir_mod = pro.get("director_model", "GOOGLE/gemini-2.5-flash-lite")
+        # Absent is off: what the worker reads, not a model it would never call.
+        dir_mod = pro.get("director_model") or "off"
         dir_ins = pro.get("director_instructions", "(Default)") or "(Default)"
         embed.add_field(name="AI Director", value=f"Model: `{dir_mod}`\nInstructions: ```{dir_ins[:200]}```", inline=False)
 
@@ -2169,6 +2163,7 @@ class SessionConfigView(BlockedGuard, ui.View):
         What it does that nothing else does:
 
         * Marks the session started, which is the whole point.
+        * Settles any seated profile's stale content rating.
         * Persists the blueprint. A session woken as a shell by `_ensure_session_shell`
           is in memory only until something saves it, and an unstarted empty shell is
           deliberately never written at all.
@@ -2189,6 +2184,14 @@ class SessionConfigView(BlockedGuard, ui.View):
             was_started = self.cog.session_manager.is_started(self.session)
             self.session["started"] = True
             self.cog.session_manager._save_multi_profile_sessions()
+
+            # A profile edited since it was judged -- an import, a restore, a bulk apply --
+            # is settled before it runs here. Here rather than in the per-turn gate: it
+            # hashes the whole persona. Fire-and-forget, since a stale verdict only errs
+            # towards the previous, stricter answer while the recheck lands.
+            for owner_id, name in {(p["owner_id"], p["profile_name"])
+                                   for p in self.session.get("profiles", [])}:
+                asyncio.create_task(self.cog.profile_manager.resolve_stale_rating(owner_id, name))
 
             if not self.session.get("is_hydrated"):
                 hydrated = await self.cog.session_manager._ensure_session_hydrated(
@@ -2373,7 +2376,9 @@ def add_generation_fields(embed: discord.Embed, cog, turn: dict) -> None:
     embed.add_field(name="Turn Telemetry", value=f"├── Profile: `{turn.get('profile_name')}`\n├── Mimic ID: `{turn.get('speaker_pid')}`\n├── Timestamp: {turn_timestamp(turn)}\n├── Model Used: {model}\n{tier_line}├── Duration: `{meta.get('duration', 0.0)}s`\n├── Input Tokens: `{i_tok:,}`\n├── Output Tokens: `{o_tok:,}` ({r_split})\n└── {cost_line}", inline=False)
 
     recalled = len(meta.get("ltms_recalled") or [])
-    created = " · `new memory saved`" if meta.get("ltm_created") else ""
+    # A count since one capture can store several; True on turns from before that.
+    made = int(meta.get("ltm_created") or 0)
+    created = f" · `{made} new memor{'y' if made == 1 else 'ies'} saved`" if made else ""
     trained = meta.get("training_recalled", 0)
     grounded = len(grounding_urls(meta))
     embed.add_field(name="Context Injections", value=f"├── LTM Archive: `{recalled} memories`{created}\n├── Training Examples: `{trained} injected`\n└── Web Grounding: `{grounded} sources`", inline=False)

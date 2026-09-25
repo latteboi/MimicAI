@@ -30,10 +30,25 @@ from .streaming import (
 )
 
 
+def _grounding_metadata(annotations):
+    """A server tool's `url_citation` annotations in the shape of Google's
+    groundingMetadata, so the Sources footer, `response_sources` and `grounding_sources`
+    read them without learning which provider answered. None when nothing was cited.
+
+    Chunks only, no supports: a supported segment becomes an inline **[n]** marker, and
+    some hosts already write their citations into the text as links.
+    """
+    cited = [a.get("url_citation") for a in annotations or ()
+             if isinstance(a, dict) and a.get("type") == "url_citation"]
+    chunks = [{"web": {"uri": c["url"], "title": c.get("title")}}
+              for c in cited if isinstance(c, dict) and c.get("url")]
+    return {"grounding_chunks": chunks} if chunks else None
+
+
 class OpenRouterModel:
     def __init__(self, model_name, api_key, system_instruction=None, thinking_params=None,
                  image_detail=None, service_tier=None, data_collection=None, endpoint=None,
-                 tools=None, **kwargs):
+                 tools=None, server_tools=None, **kwargs):
         self.model_name = model_name.replace("OPENROUTER/", "").replace("GOOGLE/", "")
         self.api_key = api_key
         self.system_instruction = system_instruction
@@ -53,11 +68,14 @@ class OpenRouterModel:
         #: preference. Decided by the model factory from the data policy the request
         #: answers to -- a server's, or a Global Chat's -- see cogs/utils/data_policy.
         self.data_collection = data_collection
-        #: Function declarations in the neutral spelling, or None. Google-only tools
-        #: (`google_search`, `url_context`) never reach here: the resolver keeps them
-        #: apart, because this adapter would send them as a function named
-        #: "google_search" that no host implements and every host would try to call.
+        #: Function declarations in the neutral spelling, or None. Google's native tools
+        #: never reach here as functions -- no host implements one named "google_search",
+        #: and every host would try to call it.
         self.tools = tools
+        #: OpenRouter's own tools (`openrouter:web_search`, `openrouter:web_fetch`), sent
+        #: as they are and run on OpenRouter's side: the model gets the result, and we
+        #: get the reply and its citations. See OPENROUTER_SERVER_TOOLS.
+        self.server_tools = server_tools or []
 
     async def generate_content_async(self, contents, generation_config=None, safety_settings=None, stream_state=None):
         messages = []
@@ -242,10 +260,12 @@ class OpenRouterModel:
             payload["max_tokens"] = cap
 
         declared = as_openai_tools(self.tools)
-        if declared:
-            payload["tools"] = declared
-            if calls_forbidden(generation_config):
-                payload["tool_choice"] = "none"
+        if declared or self.server_tools:
+            payload["tools"] = (declared or []) + self.server_tools
+        # Only where functions are declared, as on Google: a server tool is not a call
+        # the loop has to answer.
+        if declared and calls_forbidden(generation_config):
+            payload["tool_choice"] = "none"
 
         budget = int(self.thinking_params.get("thinking_budget", -1))
         level = self.thinking_params.get("thinking_level", "high").lower()
@@ -348,7 +368,11 @@ class OpenRouterModel:
                     self.candidates = [_RestView({
                         'content': {'parts': [{'text': content}]},
                         'finish_reason': finish_reason,
+                        'grounding_metadata': _grounding_metadata(msg_obj.get('annotations')),
                     })]
+                    #: GoogleRESTResponse keeps its candidates under `.raw` as well, and
+                    #: that is where every reader of citations looks.
+                    self.raw = self
 
                 def __bool__(self): return True
 

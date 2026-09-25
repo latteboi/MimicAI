@@ -46,8 +46,7 @@ from ..utils.helpers import (image_rag_enabled, is_real_model, is_shipped_ltm_pr
                             grounding_mode_display, resolve_image_output_params,
                             resolve_image_tools, resolve_thinking_params,
                             resolve_unreadable_media_mode,
-                            resolve_url_mode, suppress_link_previews,
-                            describe_voice_samples)
+                            resolve_url_mode, suppress_link_previews)
 from ..utils.discord_cdn import signed_attachment_url, unsigned_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager
@@ -71,6 +70,74 @@ _UNKNOWN_SOURCE_PID = "00000000"
 #: limit -- codes expire in five minutes and pruning on insert holds the dict to
 #: roughly that window, so this only ever bites on a burst inside one window.
 SHARE_CODE_LIMIT = 500
+
+
+def feature_fields(config: Dict[str, Any], speech_providers: Set[str]) -> Tuple[str, str, str]:
+    """The dashboard's Tools, Behaviour and Media fields: one setting to a line.
+
+    They were three inline columns under names that did not fit them -- Timezone and
+    Placeholder under Tools -- so they are regrouped: what the character can reach for,
+    how it conducts itself, and what it draws and says aloud. A feature that is on gets
+    subtext lines of its detail.
+    """
+    on, off = "**`ON`**", "`OFF`"
+    flag = lambda value: on if value else off
+    url = {"native": "**`NATIVE`**", "rag": "**`RAG`**"}.get(resolve_url_mode(config), off)
+    # Resolved, not read: the stored value can be anything an import wrote, and this has
+    # to say what the profile will actually do with an attachment.
+    unreadable = "**`SIMULATED`**" if resolve_unreadable_media_mode(config) == "simulated" else off
+    # Three modes: "ON" for the lexical scan would report a model call it never makes.
+    critic = resolve_critic_settings(config)["mode"]
+    critic = off if critic == "off" else f"**`{critic.upper()}`**"
+    response = str(config.get("response_mode", "regular")).replace("_", " ").title()
+
+    image = speech = neuro = ()
+    if config.get("image_generation_enabled"):
+        # Resolved rather than read, so this reports what the request will carry: a ratio
+        # the current image model does not accept is stored but not sent.
+        model = config.get("image_generation_model") or DEFAULT_IMAGE_MODEL
+        output = resolve_image_output_params(config, model)
+        grounded = resolve_image_tools(config, model) or image_rag_enabled(config)
+        image = ((output.get("aspect_ratio"), output.get("image_size"), output.get("quality"),
+                  output.get("thinking_level"),
+                  grounded and IMAGE_GROUNDING_LABELS.get(config.get("image_grounding_mode"))),)
+    if config.get("speech_tts_enabled"):
+        # Gender and character tell thirty star names apart; an unknown voice stays bare.
+        # Temperature and language reach Gemini voices only, speed OpenRouter's only, so
+        # each shows only when the speech chain can reach a model that takes it.
+        voice = config.get("speech_voice", DEFAULT_SPEECH_VOICE)
+        described = " \u00b7 ".join(d for d in (TTS_VOICE_GENDER.get(voice),
+                                                TTS_VOICE_CHARACTER.get(voice)) if d)
+        gemini, openrouter = "gemini" in speech_providers, "openrouter" in speech_providers
+        language, speed = config.get("speech_language") or "", config.get("speech_speed")
+        speech = ((f"{voice} ({described})" if described else voice,
+                   gemini and f"Temperature {config.get('speech_temperature', 1.0)}",
+                   gemini and SPEECH_LANGUAGE_NAMES.get(language, language),
+                   openrouter and speed is not None and f"Speed {speed}\u00d7"),)
+    if config.get("neuro_engine_enabled"):
+        # Two to a line: a half-width column wraps all four.
+        state = config.get("neuro_state") or {}
+        neuro = tuple(tuple(f"{axis.title()} {state.get(axis, default)}" for axis, default in pair)
+                      for pair in ((("dopamine", 50), ("cortisol", 20)),
+                                   (("oxytocin", 50), ("adrenaline", 20))))
+
+    def feature(name, key, rows):
+        details = (" \u00b7 ".join(str(p) for p in row if p) for row in rows)
+        return "\n".join([f"{name}: {flag(config.get(key))}", *(f"-# {d}" for d in details if d)])
+
+    tools = [f"Grounding: {grounding_mode_display(config)}",
+             f"URL Context: {url}",
+             f"Unreadable Media: {unreadable}",
+             f"Help Mode: {flag(config.get('help_mode_enabled'))}",
+             f"Critic: {critic}"]
+    behaviour = [f"Response Mode: `{response}`",
+                 f"Realistic Typing: {flag(config.get('realistic_typing_enabled'))}",
+                 f"Placeholder: {config.get('placeholder_emoji') or 'Default'}",
+                 f"Timezone: `{config.get('timezone', 'UTC')}`",
+                 feature("Neuro Engine", "neuro_engine_enabled", neuro)]
+    media = [feature("Image Gen", "image_generation_enabled", image),
+             feature("Speech TTS", "speech_tts_enabled", speech)]
+    return "\n".join(tools), "\n".join(behaviour), "\n".join(media)
 
 
 class ProfileManager:
@@ -1941,7 +2008,6 @@ class ProfileManager:
                 "top_k": defaultConfig.GEMINI_TOP_K, "training_context_size": defaultConfig.TRAINING_CONTEXT_SIZE,
                 "training_relevance_threshold": defaultConfig.TRAINING_RELEVANCE_THRESHOLD,
                 "ltm_context_size": 3, "ltm_relevance_threshold": 0.75, "ltm_creation_interval": 10,
-                "ltm_summarization_context": 10,
                 "primary_model": PRIMARY_MODEL_NAME, "fallback_model": FALLBACK_MODEL_NAME,
                 "timezone": "UTC",
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
@@ -2032,7 +2098,6 @@ class ProfileManager:
                 "top_k": 40, "training_context_size": 0,
                 "training_relevance_threshold": 0.0,
                 "ltm_context_size": 0, "ltm_relevance_threshold": 1.0, "ltm_creation_interval": 100,
-                "ltm_summarization_context": 10,
                 "primary_model": "GOOGLE/gemini-2.5-flash-lite", "fallback_model": "GOOGLE/gemini-2.5-flash-lite",
                 "timezone": "UTC", "generation_metadata_enabled": False,
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
@@ -3547,6 +3612,17 @@ class ProfileManager:
                 return new_name
             counter += 1
 
+    async def _memory_counts(self, user_id: int, profile_name: str, source_owner_id: int,
+                             source_profile_name: str) -> Tuple[int, int]:
+        """(LTM entries, training examples), read off the event loop: a cache miss is a
+        decrypt, and both dashboards repaint on every edit."""
+        mm = self.cog.memory_manager
+        def _read():
+            ltm = mm._load_ltm_shard(str(user_id), profile_name)
+            training = mm._load_training_shard(str(source_owner_id), source_profile_name)
+            return (len(ltm.get("guild", [])) if ltm else 0), (len(training) if training else 0)
+        return await asyncio.to_thread(_read)
+
     async def _build_participant_embed(self, participant: Dict, channel_id: int) -> discord.Embed:
         owner_id = participant['owner_id']
         profile_name = participant['profile_name']
@@ -3566,10 +3642,8 @@ class ProfileManager:
         display_name = appearance.get("custom_display_name") or effective_profile_name
         appearance_text = f"`{effective_profile_name}`" if appearance else "None"
         
-        ltm_shard = self.cog.memory_manager._load_ltm_shard(str(owner_id), profile_name)
-        ltm_count = len(ltm_shard.get("guild", [])) if ltm_shard else 0
-        training_shard = self.cog.memory_manager._load_training_shard(str(effective_owner_id), effective_profile_name)
-        training_count = len(training_shard) if training_shard else 0
+        ltm_count, training_count = await self._memory_counts(
+            owner_id, profile_name, effective_owner_id, effective_profile_name)
 
         realistic_typing = profile_data.get("realistic_typing_enabled", False)
         timezone_str = profile_data.get("timezone", "UTC")
@@ -3656,67 +3730,6 @@ class ProfileManager:
         return embed
     
 
-    async def _build_render_context(self, user_id: int, profile_name: str, channel_id: int,
-                                    *, with_prompts: bool = False,
-                                    with_counts: bool = False) -> Dict[str, Any]:
-        """Everything a setting's own screen renders, gathered once.
-
-        Read by ProfileFunctionView through build_function_embed. The two expensive
-        reads are opt-in: the memory counts cost a decrypt each, and the prompts are a
-        second full profile read.
-        """
-        index = self._get_user_index(user_id)
-        is_borrowed = profile_name in index.get("borrowed", [])
-        effective_owner_id, effective_profile_name = self._resolve_effective_profile(user_id, profile_name)
-
-        config = self._get_profile_config(user_id, profile_name, is_borrowed) or {}
-        appearance_data = self._get_user_appearance(effective_owner_id, effective_profile_name)
-
-        ltm_count = train_count = 0
-        if with_counts:
-            ltm_shard = self.cog.memory_manager._load_ltm_shard(str(user_id), profile_name)
-            ltm_count = len(ltm_shard.get("guild", [])) if ltm_shard else 0
-            training_shard = self.cog.memory_manager._load_training_shard(str(effective_owner_id), effective_profile_name)
-            train_count = len(training_shard) if training_shard else 0
-
-        prompts = {}
-        if with_prompts:
-            prompts = self._get_profile_prompts(effective_owner_id, effective_profile_name) or {}
-
-        return {
-            "config": config,
-            "prompts": prompts,
-            "appearance": appearance_data,
-            "display_name": appearance_data.get("custom_display_name") or effective_profile_name,
-            "ltm_count": ltm_count,
-            "training_count": train_count,
-            "is_borrowed": is_borrowed,
-            # Stats, not reads: the dashboard says which samples exist, never what they hold.
-            "voice_sample": await self.voice_sample_summary(user_id, profile_name),
-        }
-
-    async def build_function_embed(self, user_id: int, profile_name: str, channel_id: int,
-                                   action_value: str) -> discord.Embed:
-        """The embed behind one setting's own screen: what it is, and where it stands."""
-        from ..gui.gui_profiles import PROFILE_ACTIONS_BY_VALUE
-
-        action = PROFILE_ACTIONS_BY_VALUE.get(action_value)
-        label = action.menu_label if action else action_value.replace("_", " ").title()
-
-        embed = discord.Embed(title=label, colour=discord.Colour.blurple())
-        if action is not None:
-            embed.description = action.description
-
-        if action is not None and action.render is not None:
-            ctx = await self._build_render_context(
-                user_id, profile_name, channel_id, with_prompts=True, with_counts=True)
-            field = action.render(ctx)
-            if field:
-                name, value, _inline = field
-                embed.add_field(name=name, value=str(value)[:1024], inline=False)
-
-        return embed
-
     async def _build_profile_embed(self, user_id: int, profile_name: str, channel_id: int) -> discord.Embed:
         index = self._get_user_index(user_id)
         is_borrowed = profile_name in index.get("borrowed", [])
@@ -3736,10 +3749,8 @@ class ProfileManager:
 
         config = self._get_profile_config(user_id, profile_name, is_borrowed) or {}
 
-        ltm_shard = self.cog.memory_manager._load_ltm_shard(str(user_id), profile_name)
-        ltm_count = len(ltm_shard.get("guild", [])) if ltm_shard else 0
-        training_shard = self.cog.memory_manager._load_training_shard(str(effective_owner_id), effective_profile_name)
-        train_count = len(training_shard) if training_shard else 0
+        ltm_count, train_count = await self._memory_counts(
+            user_id, profile_name, effective_owner_id, effective_profile_name)
 
         created_str = config.get('created_at')
         created_display = "Unknown"
@@ -3837,11 +3848,13 @@ class ProfileManager:
         preferred = self.provider_preference(user_id)
         response_config = {**config, "primary_model": prim_model, "fallback_model": fall_model}
         model_lines = []
+        providers = {}
         for label, key in (("Response", "primary_model"), ("Image", "image_generation_model"),
                            ("Audio", "speech_model"), ("Grounding", "grounding_rag_model"),
                            ("Critic", "critic_model"), ("LTM", "ltm_model")):
             primary, fallbacks = model_chain(
                 response_config if key == "primary_model" else config, key, preferred)
+            providers[key] = {model_provider(m) for m in (primary, *fallbacks)}
             rest = [m for m in dict.fromkeys(fallbacks) if m != primary]
             model_lines.append(f"**{label}** \u2192 **`{short_model_name(primary)}`**")
             model_lines.extend(f"-# \u21b3 `{short_model_name(m)}`" for m in rest)
@@ -3857,26 +3870,20 @@ class ProfileManager:
         )
         embed.add_field(name="\u200bGeneration Parameters", value=gen_val, inline=True)
 
-        freq_p = config.get("frequency_penalty", 0.0)
-        pres_p = config.get("presence_penalty", 0.0)
-        rep_p = config.get("repetition_penalty", 0.0)
-        min_p = config.get("min_p", 0.0)
-        top_a = config.get("top_a", 0.0)
-
-        adv_val = (
-            f"Freq P: `{freq_p}`\n"
-            f"Pres P: `{pres_p}`\n"
-            f"Rep P: `{rep_p}`\n"
-            f"Min P: `{min_p}`\n"
-            f"Top A: `{top_a}`"
-        )
-        embed.add_field(name="Advanced (OpenRouter Only)", value=adv_val, inline=True)
+        # OpenRouter and Ollama are sent these; Google ignores them, so a chain that never
+        # leaves Google has nothing to show here -- the same test as the Params row's gate.
+        # An unset key is not sent, which is the parameter off: the provider's 0.
+        if providers["primary_model"] - {"gemini"}:
+            adv_val = "\n".join(f"{label}: `{config.get(key) or 0}`" for label, key in (
+                ("Freq P", "frequency_penalty"), ("Pres P", "presence_penalty"),
+                ("Rep P", "repetition_penalty"), ("Min P", "min_p"), ("Top A", "top_a")))
+            embed.add_field(name="Advanced Sampling", value=adv_val, inline=True)
 
         t_summary_raw = config.get("thinking_summary_visible", "off").lower()
         t_summary = "**`ON`**" if t_summary_raw == "on" else "`OFF`"
         t_level = config.get("thinking_level", "high").title()
         t_budget = config.get("thinking_budget", -1)
-        budget_display = "Dynamic (-1)" if t_budget == -1 else f"{t_budget}"
+        budget_display = "Dynamic" if t_budget == -1 else f"{t_budget}"
 
         thinking_val = (
             f"Summary: {t_summary}\n"
@@ -3884,94 +3891,16 @@ class ProfileManager:
             f"Budget: `{budget_display}`"
         )
         embed.add_field(name="Thinking/Reasoning", value=thinking_val, inline=True)
+        if not providers["primary_model"] - {"gemini"}:
+            # A blank third, where Advanced Sampling would be: Discord fills a row with up to
+            # three inline fields, so without it Tools would be pulled up beside Thinking.
+            embed.add_field(name="\u200b", value="\u200b", inline=True)
 
-        img_gen = "**`ON`**" if config.get("image_generation_enabled", False) else "`OFF`"
-        # Resolved rather than read straight off the config, so this reports what the
-        # request will actually carry: a ratio the profile's current image model does
-        # not accept is stored but not sent, and claiming it here would be a lie the
-        # user could only catch by inspecting the generated image.
-        img_out = resolve_image_output_params(
-            config, config.get("image_generation_model") or DEFAULT_IMAGE_MODEL)
-        img_ground = resolve_image_tools(
-            config, config.get("image_generation_model") or DEFAULT_IMAGE_MODEL)
-        img_detail = " \u00b7 ".join(v for v in (
-            img_out.get("aspect_ratio"), img_out.get("image_size"),
-            img_out.get("quality"), img_out.get("thinking_level"),
-            IMAGE_GROUNDING_LABELS.get(config.get("image_grounding_mode"))
-            if img_ground or image_rag_enabled(config) else None,
-        ) if v)
-        if img_detail:
-            img_gen += f" `{img_detail}`"
-
-
-        # URL context still has one vocabulary; grounding's stored and shown names
-        # differ for two modes, so it goes through its own resolver.
-        grounding_display = grounding_mode_display(config)
-        url_ctx = {"off": "`OFF`", "native": "**`NATIVE`**",
-                   "rag": "**`RAG`**"}.get(resolve_url_mode(config), "`OFF`")
-        # Resolved, not read: the stored value can be anything an import wrote, and this
-        # line has to say what the profile will actually do with an attachment.
-        unreadable_media = ("**`SIMULATED`**"
-                            if resolve_unreadable_media_mode(config) == "simulated" else "`OFF`")
-
-        timezone = config.get("timezone", "UTC")
-        typing = "**`ON`**" if config.get("realistic_typing_enabled", False) else "`OFF`"
-        # The one line that is not a straight restoration: the critic has three modes
-        # now, and rendering "ON" for the lexical scan would report a per-turn model
-        # call this profile does not make. Same single line, resolved value.
-        critic_mode = resolve_critic_settings(config)["mode"]
-        critic = "`OFF`" if critic_mode == "off" else f"**`{critic_mode.upper()}`**"
-        help_mode = "**`ON`**" if config.get("help_mode_enabled", False) else "`OFF`"
-        resp_mode = config.get("response_mode", "regular").replace('_', ' ').title()
-
-        ph_text = f"{config.get('placeholder_emoji') or 'Default'}"
-
-        tools_val = (
-            f"Image Gen: {img_gen}\n"
-            f"Grounding: {grounding_display}\n"
-            f"URL Context: {url_ctx}\n"
-            f"Unreadable Media: {unreadable_media}\n"
-            f"Response Mode: `{resp_mode}`\n"
-            f"Timezone: `{timezone}`\n"
-            f"Realistic Typing: {typing}\n"
-            f"Critic: {critic}\n"
-            f"Help Mode: {help_mode}\n"
-            f"Placeholder: {ph_text}"
-        )
-        embed.add_field(name="Tools", value=tools_val, inline=True)
-
-        neuro_status = "**`ON`**" if config.get("neuro_engine_enabled", False) else "`OFF`"
-        neuro_state = config.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
-        neuro_val = (
-            f"Status: {neuro_status}\n"
-            f"Dopamine: `{neuro_state.get('dopamine', 50)}`\n"
-            f"Cortisol: `{neuro_state.get('cortisol', 20)}`\n"
-            f"Oxytocin: `{neuro_state.get('oxytocin', 50)}`\n"
-            f"Adrenaline: `{neuro_state.get('adrenaline', 20)}`"
-        )
-        embed.add_field(name="Neuro Engine", value=neuro_val, inline=True)
-
-        s_voice = config.get("speech_voice", DEFAULT_SPEECH_VOICE)
-        s_temp = config.get("speech_temperature", 1.0)
-        s_enabled = "**`ON`**" if config.get("speech_tts_enabled", False) else "`OFF`"
-        # Gender and character are what tell thirty star names apart at a glance; an
-        # unknown name is left bare rather than guessed at, which is also how a voice
-        # stored before the picker existed shows up.
-        s_described = " \u00b7 ".join(d for d in (TTS_VOICE_GENDER.get(s_voice),
-                                             TTS_VOICE_CHARACTER.get(s_voice)) if d)
-
-        s_speed = config.get("speech_speed")
-        s_language = config.get("speech_language") or ""
-        s_sample = describe_voice_samples(await self.voice_sample_summary(user_id, profile_name))
-        speech_val = (
-            f"Enabled: {s_enabled}\n"
-            f"Voice: `{s_voice}`" + (f" ({s_described})\n" if s_described else "\n") +
-            f"Temperature (Gemini): `{s_temp}`\n"
-            f"Speed (OpenRouter): `{s_speed if s_speed is not None else 'Model default'}`\n"
-            f"Language (Gemini): `{SPEECH_LANGUAGE_NAMES.get(s_language, s_language) or 'Auto-detect'}`\n"
-            f"Voice sample: `{s_sample or 'None'}`"
-        )
-        embed.add_field(name="Speech TTS", value=speech_val, inline=True)
+        # Tools and Behaviour share a row, half each; Media, full width, closes it.
+        tools, behaviour, media = feature_fields(config, providers["speech_model"])
+        embed.add_field(name="Tools", value=tools[:1024], inline=True)
+        embed.add_field(name="Behaviour", value=behaviour[:1024], inline=True)
+        embed.add_field(name="Media", value=media[:1024], inline=False)
 
         train_val = (
             f"Count: `{train_count}`\n"
@@ -3990,15 +3919,11 @@ class ProfileManager:
         # Memory Search on, the automatic pass runs at LTM_AUTO_THRESHOLD_WITH_TOOL
         # instead, and the stored value applies again the moment this goes off.
         recall_status = "**`ON`**" if config.get("ltm_recall_tool_enabled", False) else "`OFF`"
-        ltm_inv = config.get("ltm_creation_interval", 10)
-        ltm_s_ctx = config.get("ltm_summarization_context", 10)
 
         ltm_val = (
             f"Auto-Creation: {ltm_status}\n"
             f"Auto-Recall: {auto_recall_status}\n"
             f"Count: `{ltm_count}`\n"
-            f"Creation Interval: `{ltm_inv}`\n"
-            f"Summ Context: `{ltm_s_ctx}`\n"
             f"Context Size: `{ltm_ctx}`\n"
             f"Relevance Threshold: `{ltm_rel}`\n"
             f"Memory Search: {recall_status}"
@@ -4216,7 +4141,6 @@ class ProfileManager:
             if "ltm_context_size" in params: profile["ltm_context_size"] = params["ltm_context_size"]
             if "ltm_relevance_threshold" in params: profile["ltm_relevance_threshold"] = params["ltm_relevance_threshold"]
             if "ltm_creation_interval" in params: profile["ltm_creation_interval"] = params["ltm_creation_interval"]
-            if "ltm_summarization_context" in params: profile["ltm_summarization_context"] = params["ltm_summarization_context"]
 
             self._save_profile_config(user_id, profile_name, profile, is_borrowed)
             return True

@@ -9,10 +9,10 @@ from ...utils.constants import (
     DEFAULT_SYSTEM_INSTRUCTION, DEFAULT_SESSION_RULES, DEFAULT_NEURO_INSTRUCTION,
     NEURO_AXES,
     DEFAULT_TRAINING_DATA_INJECTION, DEFAULT_CURRENT_TIME, DEFAULT_NEGATIVE_CONSTRAINTS,
-    DEFAULT_CONTENT_POLICY, DEFAULT_BIRTHDAY_CONTEXT,
+    DEFAULT_CONTENT_POLICY, DEFAULT_BIRTHDAY_CONTEXT, DEFAULT_LOCAL_TIMES,
 )
 from ...utils.birthdays import birthday_offset, describe_birthday
-from ...utils.helpers import (TURN_TIME_FORMAT, Timeout, _get_user_hash,
+from ...utils.helpers import (TURN_TIME_FORMAT, Timeout, _get_user_hash, _resolve_zoneinfo,
                               default_profile_avatar_url)
 from ._shared import NEURO_BARE_PATTERN, NEURO_TAG_PATTERN
 
@@ -158,6 +158,28 @@ class PromptBuilderMixin:
                 lines.append(line)
         return lines
 
+    def _local_time_lines(self, now: datetime.datetime,
+                          users: Sequence[Tuple[int, str]]) -> List[str]:
+        """Each user's local time, for those whose clock differs from the character's.
+
+        Their own turns used to carry it, stamped in their zone; every turn is now on
+        the character's clock, so it is said here once. A user with no timezone in
+        About Me is left out: unset is unknown, not UTC.
+        """
+        lines, seen = [], set()
+        for user_id, display_name in users:
+            if user_id in seen:
+                continue
+            seen.add(user_id)
+            zone = self.cog.profile_manager.get_user_about(user_id).get("timezone")
+            if not zone:
+                continue
+            local = now.astimezone(_resolve_zoneinfo(zone)[0])
+            if local.utcoffset() != now.utcoffset():
+                lines.append(f"{display_name} [ID: {_get_user_hash(user_id)}]: "
+                             f"{local.strftime(TURN_TIME_FORMAT)}")
+        return lines
+
     def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None, present_users: Optional[Sequence[Tuple[int, str]]] = None, functions: Sequence[Any] = ()) -> Tuple[str, bool, bool, float, float, int, str, str]:
         """The system instruction for one profile's generation, plus its sampling values.
 
@@ -291,7 +313,6 @@ class PromptBuilderMixin:
         # its clock like every other.
         time_template = self.cog.global_prompts.get("TIME_CONTEXT", DEFAULT_CURRENT_TIME)
         try:
-            from ...utils.helpers import _resolve_zoneinfo
             tz, _ = _resolve_zoneinfo(timezone_str)
             now = datetime.datetime.now(tz)
         except Exception as e:
@@ -303,6 +324,10 @@ class PromptBuilderMixin:
         # prompt caching the clock was not already costing.
         if present_users is None:
             present_users = self._users_in_history_window(session, profile_data) if session else []
+        local_times = self._local_time_lines(now, present_users)
+        if local_times:
+            volatile_parts.append(self.cog.global_prompts.get("LOCAL_TIMES", DEFAULT_LOCAL_TIMES)
+                                  .format(times="\n".join(local_times)))
         cast = [(seat.get("owner_id"), seat.get("profile_name"))
                 for seat in (session or {}).get("profiles") or []]
         birthday_lines = self._birthday_lines(profile_owner_id, profile_name_to_use, now.date(),

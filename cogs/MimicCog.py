@@ -175,7 +175,6 @@ class MimicCog(EventListeners, commands.Cog):
         
         # Memory-bounded caches to prevent RAM growth on long uptime
         self.user_appearances: LRUCache = LRUCache(max_size=50)
-        self.message_counters_for_ltm: LRUCache = LRUCache(max_size=200)
         self.child_bot_edit_cooldowns: LRUCache = LRUCache(max_size=50)
         
         self.server_manager._load_channel_webhooks()
@@ -781,9 +780,6 @@ class MimicCog(EventListeners, commands.Cog):
         server_index = self.server_manager._get_server_index(str(interaction.guild.id))
         session_config = server_index.get("active_sessions", {}).get("regular", {}).get(str(ch_id))
 
-        DEFAULT_DIRECTOR_PROMPT = "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."
-        proactivity_defaults = {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": DEFAULT_DIRECTOR_PROMPT}
-
         if session_config:
             # Wake it up as a dehydrated shell
             session = {
@@ -794,7 +790,7 @@ class MimicCog(EventListeners, commands.Cog):
                 "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
                 "session_prompt": session_config.get("session_prompt"),
                 "session_mode": session_config.get("session_mode", "sequential"),
-                "proactivity": session_config.get("proactivity", proactivity_defaults),
+                "proactivity": session_config.get("proactivity", {}),
                 "cast_policy": session_config.get("cast_policy", DEFAULT_CAST_POLICY),
                 # Carried like every other setting. Without it the editor showed the
                 # synopsis off, and the next save wrote that over the blueprint.
@@ -811,7 +807,6 @@ class MimicCog(EventListeners, commands.Cog):
                 "owner_id": interaction.user.id,
                 "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
                 "session_prompt": None, "session_mode": "sequential",
-                "proactivity": proactivity_defaults,
                 "cast_policy": DEFAULT_CAST_POLICY,
                 "compaction": dict(NEW_SESSION_COMPACTION),
                 # Opening the editor seats nobody and starts nothing.
@@ -1042,15 +1037,13 @@ class MimicCog(EventListeners, commands.Cog):
             # Every field the full start path sets is set here, because this session
             # now goes live without ever passing through the config view.
             if not session:
-                new_participant["ltm_counter"] = 0
                 session = {
                     "type": "multi", "profiles": [new_participant],
-                    "unified_log": [], "is_hydrated": False, "last_bot_message_id": None,
+                    "unified_log": [], "is_hydrated": False,
                     "owner_id": interaction.user.id, "is_running": False,
                     "task_queue": asyncio.Queue(),
-                    "worker_task": None, "turns_since_last_ltm": 0, "session_prompt": None,
-                    "session_mode": "sequential", "pending_image_gen_data": None, "pending_whispers": {},
-                    "audio_mode": "off",
+                    "worker_task": None, "session_prompt": None,
+                    "session_mode": "sequential",
                     "compaction": dict(NEW_SESSION_COMPACTION),
                     "cast_policy": DEFAULT_CAST_POLICY,
                     "started": True,
@@ -1341,13 +1334,6 @@ class MimicCog(EventListeners, commands.Cog):
         dummy_session_key = (ch_id, None, None)
         await self.session_manager._delete_session_from_disk(dummy_session_key, session_type)
 
-        # [NEW] Reset counters for all participants
-        for p in session.get('profiles', []):
-            p['ltm_counter'] = 0
-            # Also reset the global counter for this profile in this guild
-            ltm_counter_key = (p['owner_id'], p['profile_name'], "guild")
-            self.message_counters_for_ltm.pop(ltm_counter_key, None)
-        
         # [NEW] Reset LTM recall history (penalty system) for this channel
         for p in session.get("profiles", []):
             full_session_key = (ch_id, p['owner_id'], p['profile_name'])
@@ -1502,106 +1488,27 @@ class MimicCog(EventListeners, commands.Cog):
 
         await interaction.followup.send(f"Session suspended for {interaction.channel.mention}. The bot will be silent until configured again.", ephemeral=True)
 
-    @app_commands.command(name="purge", description="Purges messages and the associated session memory (Admin Only).")
+    @app_commands.command(name="purge", description="Deletes this session's latest turns, every message of each, from channel and memory (Admin Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     @app_commands.guild_only()
     @is_admin_or_owner_check()
-    @app_commands.describe(amount="Messages to delete (1-100).")
-    async def purge_slash(self, interaction: discord.Interaction, amount: app_commands.Range[int,1,100]):
-        if not self.has_lock : return
-        await interaction.response.defer(ephemeral=True)
-
-        if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
-            await interaction.followup.send("Purge command not supported in this channel type.", ephemeral=True)
-            return
-
-        app_perms = interaction.app_permissions
-        if not app_perms or not app_perms.manage_messages:
-            await interaction.followup.send("I lack 'Manage Messages' permission.", ephemeral=True); return
-
-        def check_and_track(m):
-            self.purged_message_ids[m.id] = True
-            return True
-
-        session_lock = self.multi_profile_channels.get(interaction.channel_id)
-
-        # A purge deletes the table message out from under a running game, and the
-        # game cache is independent of the session, so it has to be torn down here.
-        self.game_service.teardown_channel(interaction.channel_id)
-
-        try:
-            if session_lock:
-                # Re-hydrate immediately before executing the Discord API purge
-                session_type = session_lock.get("type", "multi")
-                if not session_lock.get("is_hydrated"):
-                    session_lock = await self.session_manager._ensure_session_hydrated(interaction.channel_id, session_type)
-
-                session_lock['is_purging'] = True
-                # This wait is bounded, and it sits inside the try so the finally below
-                # always clears is_purging. generation_service and both reaction
-                # listeners spin on is_purging, so leaking it True wedges every future
-                # turn in the channel for the life of the process -- and a worker that
-                # died with is_running still set is exactly what produces that.
-                wait_deadline = time.monotonic() + PURGE_BUSY_WAIT_TIMEOUT_SECONDS
-                while (session_lock.get('is_running') or session_lock.get('is_regenerating')
-                       or session_lock.get('is_whispering') or session_lock.get('is_memorising')):
-                    if time.monotonic() > wait_deadline:
-                        await interaction.followup.send(
-                            f"The session is still generating after {int(PURGE_BUSY_WAIT_TIMEOUT_SECONDS)}s. "
-                            "Nothing was deleted \u2014 try again in a moment.", ephemeral=True)
-                        return
-                    await asyncio.sleep(0.5)
-
-            messages_to_delete = await interaction.channel.purge(limit=amount, check=check_and_track, before=interaction.created_at, reason=f"Purge by {interaction.user}")
-            
-            progress_message = await interaction.followup.send(f"Deleted {len(messages_to_delete)} message(s). Now cleaning them from my memory...", ephemeral=True)
-
-            session = self.multi_profile_channels.get(interaction.channel_id)
-            report = {"turns": 0, "messages": 0, "synopses": 0}
-
-            if session:
-                # A purge window rarely ends on a turn boundary. A turn it clipped goes
-                # whole -- its other messages with it -- so nothing is left in the channel
-                # that no turn points at. See TurnDeletionMixin.
-                deleted_msg_ids = {m.id for m in messages_to_delete}
-                turns_to_delete = [
-                    turn for turn in session.get("unified_log", [])
-                    if any(mid in deleted_msg_ids for mid in turn.get("message_ids", []))
-                ]
-                report = await self.generation_service.delete_turns(
-                    interaction.channel, session, turns_to_delete, already_gone=deleted_msg_ids)
-
-            summary = f"Deleted {len(messages_to_delete)} message(s) and cleaned {report['turns']} turn(s) from memory."
-            if report["messages"]:
-                summary += f" {report['messages']} more message(s) belonging to those turns went with them."
-            if report["synopses"]:
-                summary += f" Dropped {report['synopses']} session synopsis(es) that still summarised them."
-            await progress_message.edit(content=summary)
-
-        except Exception as e:
-            await interaction.followup.send(f"An error occurred during purge: {suppress_link_previews(str(e))}", ephemeral=True)
-            traceback.print_exc()
-        finally:
-            if session_lock:
-                session_lock['is_purging'] = False
-
-    @app_commands.command(name="delete", description="Deletes this session's latest turns, every message of each, from channel and memory (Admin Only).")
-    @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
-    @app_commands.guild_only()
-    @is_admin_or_owner_check()
-    @app_commands.describe(amount="Turns to delete, newest first (1-100).")
-    async def delete_slash(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]):
-        """/purge counts messages; this counts turns, as the channel shows them.
+    @app_commands.describe(amount="Turns to delete, newest first (1-100). Messages, with whole_channel.",
+                           whole_channel="Count every message in the channel, not only the session's turns.")
+    async def purge_slash(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100],
+                          whole_channel: bool = False):
+        """Counts turns, as the channel shows them; `whole_channel` counts raw messages.
 
         A turn is one line of the conversation however many messages carried it -- the
         reply, its overflow, citations, warnings, files. Only turns the channel can see
         count: whispers, private responses and synopses are skipped and left in place.
+        `whole_channel` reaches what no turn owns -- other bots, chat from before the
+        session -- and a turn its window clips goes whole.
         """
         if not self.has_lock: return
         await interaction.response.defer(ephemeral=True)
 
         if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
-            await interaction.followup.send("Delete is not supported in this channel type.", ephemeral=True)
+            await interaction.followup.send("Purge is not supported in this channel type.", ephemeral=True)
             return
         app_perms = interaction.app_permissions
         if not app_perms or not app_perms.manage_messages:
@@ -1612,21 +1519,23 @@ class MimicCog(EventListeners, commands.Cog):
         if session and not session.get("is_hydrated"):
             session = await self.session_manager._ensure_session_hydrated(
                 interaction.channel_id, session.get("type", "multi"))
-        if not session:
-            await interaction.followup.send("There is no session in this channel.", ephemeral=True)
+        if not session and not whole_channel:
+            await interaction.followup.send(
+                "There is no session in this channel. Set `whole_channel` to delete its messages anyway.",
+                ephemeral=True)
             return
         # Two rewrites of one log must not overlap, and whichever finished first would
         # release the flag out from under the other.
-        if session.get('is_purging'):
+        if session and session.get('is_purging'):
             await interaction.followup.send(
-                "A purge or delete is already running in this channel. Try again in a moment.",
-                ephemeral=True)
+                "A purge is already running in this channel. Try again in a moment.", ephemeral=True)
             return
 
-        session['is_purging'] = True
+        if session:
+            session['is_purging'] = True
         try:
             # Everything but is_purging, which this has just claimed for itself.
-            if not await self.session_manager._wait_for_session_flags(
+            if session and not await self.session_manager._wait_for_session_flags(
                     session, tuple(f for f in SESSION_BUSY_FLAGS if f != 'is_purging'),
                     PURGE_BUSY_WAIT_TIMEOUT_SECONDS):
                 await interaction.followup.send(
@@ -1634,22 +1543,46 @@ class MimicCog(EventListeners, commands.Cog):
                     "Nothing was deleted \u2014 try again in a moment.", ephemeral=True)
                 return
 
-            visible = [turn for turn in session.get("unified_log", []) if is_visible_turn(turn)]
-            doomed = visible[-amount:]
-            if not doomed:
-                await interaction.followup.send("There are no turns to delete in this channel.", ephemeral=True)
-                return
+            if not whole_channel:
+                doomed = [turn for turn in session.get("unified_log", []) if is_visible_turn(turn)][-amount:]
+                if not doomed:
+                    await interaction.followup.send("There are no turns to delete in this channel.", ephemeral=True)
+                    return
+                report = await self.generation_service.delete_turns(interaction.channel, session, doomed)
+                summary = f"Deleted {report['turns']} turn(s) and {report['messages']} message(s)."
+            else:
+                # The window may take a game's table message, and the game cache is
+                # independent of the session, so the game is torn down here.
+                self.game_service.teardown_channel(interaction.channel_id)
 
-            report = await self.generation_service.delete_turns(interaction.channel, session, doomed)
-            summary = f"Deleted {report['turns']} turn(s) and {report['messages']} message(s)."
+                def track(m):
+                    self.purged_message_ids[m.id] = True
+                    return True
+
+                purged = await interaction.channel.purge(
+                    limit=amount, check=track, before=interaction.created_at,
+                    reason=f"Purge by {interaction.user}")
+                report = {"turns": 0, "messages": 0, "synopses": 0}
+                if session:
+                    # A window rarely ends on a turn boundary. A turn it clipped goes
+                    # whole, so nothing is left that no turn points at. See TurnDeletionMixin.
+                    gone = {m.id for m in purged}
+                    clipped = [turn for turn in session.get("unified_log", [])
+                               if any(mid in gone for mid in turn.get("message_ids", []))]
+                    report = await self.generation_service.delete_turns(
+                        interaction.channel, session, clipped, already_gone=gone)
+                summary = f"Deleted {len(purged)} message(s) and cleaned {report['turns']} turn(s) from memory."
+                if report["messages"]:
+                    summary += f" {report['messages']} more message(s) belonging to those turns went with them."
             if report["synopses"]:
                 summary += f" Dropped {report['synopses']} session synopsis(es) that still summarised them."
             await interaction.followup.send(summary, ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"An error occurred while deleting: {suppress_link_previews(str(e))}", ephemeral=True)
+            await interaction.followup.send(f"An error occurred during purge: {suppress_link_previews(str(e))}", ephemeral=True)
             traceback.print_exc()
         finally:
-            session['is_purging'] = False
+            if session:
+                session['is_purging'] = False
 
     @app_commands.command(name="memorise", description="Forces long-term memory summarisation for this session's cast, right now (Admin Only).")
     @app_commands.checks.cooldown(2, 60.0, key=lambda i: i.user.id)
@@ -1717,16 +1650,22 @@ class MimicCog(EventListeners, commands.Cog):
                     skipped.append(f"{p_name} (LTM disabled)")
                     continue
 
+                if p.get("_ltm_running"):
+                    skipped.append(f"{p_name} (a memory is already being written)")
+                    continue
+
+                p["_ltm_running"] = True
                 try:
                     created, detail = await self.generation_service._summarize_and_store_ltm(
-                        interaction.channel_id, session, owner_id, p_name, p_settings,
+                        session, p, p_settings,
                         guild_id, interaction.user.display_name, interaction.user.id,
-                        warning_channel=interaction.channel,
+                        warning_channel=interaction.channel, source="memorise",
                     )
                 except Exception as e:
                     created, detail = False, str(e)
+                finally:
+                    p.pop("_ltm_running", None)
 
-                p['ltm_counter'] = 0
                 (summarised if created else failed).append(p_name if created else f"{p_name} ({detail})")
 
             lines = []

@@ -37,6 +37,10 @@ if os.getenv("MANUAL_AUTH_MODE", "False").lower() == "true":
     if not os.getenv("ENCRYPTION_KEY"): os.environ["ENCRYPTION_KEY"] = "MANUAL_MODE_PENDING"
 
 from cogs.utils.constants import defaultConfig
+from cogs.utils.discord_retry import install_503_retry
+
+# Before any client exists: child bots are built on the same HTTPClient class.
+install_503_retry()
 
 # --- Global Queue for Cog Dispatch ---
 manager_queue = asyncio.Queue()

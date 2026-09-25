@@ -373,7 +373,7 @@ channel. Its shape:
 
 A turn is often several messages on one log entry: reply, overflow past 2000 characters,
 citations, warnings, files. `TurnDeletionMixin` makes the turn the unit of deletion —
-`/delete` counts visible turns, `/purge` finishes any turn it clips, and a message deleted
+`/purge` counts visible turns, `/purge whole_channel` finishes any turn it clips, and a message deleted
 by anyone takes the rest of its turn with it. While the channel is busy the deletion waits:
 a turn gains messages during delivery, and deleting it early would strand the later ones.
 
@@ -394,7 +394,10 @@ its own and everyone else's as input. The same pass filters private turns to the
 (a `whisper` reaches only its `target_pid`, a `private_response` only its speaker), merges
 consecutive same-role turns into one entry, and attaches per-profile context — URL
 documents and grounding summaries — only if that profile has the corresponding tool
-enabled.
+enabled. It also puts every turn on the reader's clock: a turn is stamped once, in its
+speaker's zone, when it is stored, and `restamp_turn` rewrites the header's time from
+`turn_posted_at` into the reader's `timezone`. A user's own local time, which their stamps
+used to carry, is said once instead, in `<local_times>`.
 
 **Do not add per-participant history objects.** With a cast of up to 200, storing a
 per-participant history is a multiplicative memory cost for data that is a pure function of
@@ -599,6 +602,29 @@ matrix = np.frombuffer(raw_bytes, dtype=np.float16).reshape(len(b64_embs), -1).a
 
 **Never loop cosine per item.** Retrieval also runs a vectorised MMR pass for diversity,
 operating on the already-decoded matrix rather than re-decoding base64 per candidate.
+
+### Writing a memory
+
+Each seat keeps one bookmark, `ltm_read_through_id`: the newest turn its last memory read,
+with that turn's moment `ltm_read_through` standing in once the turn is deleted, both saved
+in the session blueprint. It is a turn rather than a time because a message sent mid-reply
+is logged after the reply but stamped before it. Everything else is derived from the log
+against it (`generation/ltm_capture.py`): a memory is due once the character has replied
+`ltm_creation_interval` times since, and it reads the public turns since — never whispers,
+since a memory is recalled in every channel — up to the newest `LTM_EXCERPT_TURNS`, on the
+character's clock, with the session synopsis as background. The summariser writes up to
+`LTM_MAX_PER_CAPTURE` memories, one a line, each embedded and stored as its own entry, all
+or none. A verdict (memories, nothing worth keeping, or near-duplicates of ones it already
+has) moves the bookmark on; a failure leaves it and waits another interval. The duplicate
+test is one product against the cached unit rows of the guild the memory formed in, plus
+those stored earlier in the same batch. Recall prefixes each memory with the date it was
+made, on the character's calendar.
+
+An entry is `id`, `created_ts`, `sum` (plain text: the shard is sealed whole),
+`s_emb_b64`, `context_id`, and sparsely `modified_ts`, `usr` and `src`
+(`auto`/`memorise`/`manual`). `_save_ltm_shard` rewrites older shapes to this one, so a
+shard written before value-level encryption was retired stops paying a decrypt per entry
+the first time it is saved.
 
 ---
 

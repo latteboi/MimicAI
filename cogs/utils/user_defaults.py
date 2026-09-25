@@ -241,7 +241,7 @@ def shipped_chain(primary_key: str, preferred: Optional[str]) -> Tuple[str, ...]
     """Primary, Fallback and Final Fallback, as a category ships them for this preference.
 
     The preferred provider's models, then the other's. A provider serving fewer than two
-    -- OpenRouter has no search tool -- gives its places to the next in line, so the
+    -- OpenRouter ships one researcher -- gives its places to the next in line, so the
     chain is as long as there are models to fill it. Cached: the table is fixed at
     import and this is read on every utility call.
     """
@@ -340,7 +340,6 @@ SETTING_LABELS = {
     "ltm_creation_interval": "LTM Creation Interval",
     "ltm_context_size": "LTM Recall Depth",
     "ltm_relevance_threshold": "LTM Relevance Threshold",
-    "ltm_summarization_context": "LTM Summarisation Context",
     "thinking_level": "Reasoning Effort",
     "thinking_budget": "Thinking Budget",
     "thinking_summary_visible": "Thinking Summary",

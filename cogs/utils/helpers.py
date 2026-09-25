@@ -487,6 +487,29 @@ def _format_history_entry(display_name: str, timestamp: Union[datetime.datetime,
     return f"<{display_name}> [ID: {entity_id}] {time_str}:\n{content}\n</{display_name}>\n\n"
 
 
+#: A stored turn's opening header, capturing its time: `<Name> [ID: x] [time]:`.
+_TURN_HEADER_TIME = re.compile(r'<[^>\r\n]+> \[ID: [^\]\r\n]+\] \[([^\]\r\n]+)\]:')
+
+
+def restamp_turn(content: str, moment: Optional[datetime.datetime], tz) -> str:
+    """`content` with its header's time shown on `tz`'s clock.
+
+    A turn is stamped once, in its speaker's zone, when it is stored -- so a transcript
+    mixes clocks, and a character in AEST read a UTC speaker as ten hours out. Every
+    reader restamps to its own clock. `moment` is `turn_posted_at`; with none, or a
+    header that is not the stored shape, the content is returned as it was.
+    """
+    if moment is None:
+        return content
+    match = _TURN_HEADER_TIME.match(content)
+    if not match:
+        return content
+    stamp = moment.astimezone(tz).strftime(TURN_TIME_FORMAT)
+    if match.group(1) == stamp:
+        return content
+    return f"{content[:match.start(1)]}{stamp}{content[match.end(1):]}"
+
+
 def turn_posted_at(turn: Dict[str, Any]) -> Optional[datetime.datetime]:
     """When a turn happened, in UTC, or None when nothing in it says.
 
@@ -501,7 +524,9 @@ def turn_posted_at(turn: Dict[str, Any]) -> Optional[datetime.datetime]:
     stamp = turn.get("timestamp")
     if stamp:
         try:
-            return datetime.datetime.fromisoformat(str(stamp))
+            moment = datetime.datetime.fromisoformat(str(stamp))
+            # A naive stamp is UTC: compared with an aware one it would raise.
+            return moment if moment.tzinfo else moment.replace(tzinfo=datetime.timezone.utc)
         except (TypeError, ValueError):
             pass
     ids = turn.get("message_ids")
@@ -589,10 +614,6 @@ def is_citation_subtext(content: str) -> bool:
     first line of them each time it was regenerated.
     """
     return bool(content) and bool(_CITATION_SUBTEXT_RE.match(content))
-
-def _get_sanitized_history_and_author(history: List[str], user_id_map: Dict[int, str], primary_author_id: int) -> Tuple[List[str], str]:
-    primary_author_name = user_id_map.get(primary_author_id, "A user")
-    return history, primary_author_name
 
 def _format_and_chunk_thought_summary(thought_text: str) -> List[str]:
     if not thought_text:
@@ -1388,6 +1409,14 @@ def is_shipped_ltm_prompt(text: str, live_default: str) -> bool:
     return hashlib.sha256(stripped.encode("utf-8")).hexdigest() in SUPERSEDED_LTM_SUMMARIZATION_HASHES
 
 
+#: A sentence end: its mark, any closing quote or bracket, then a space or the end of the
+#: text -- so "18.5" and "v0.6.1" are not ends.
+_SENTENCE_END = re.compile(r'[.!?]+["\'”’)\]]*(?=\s|$)')
+#: A full stop after one of these belongs to a name: "Mr. C" is not a sentence end, and
+#: taking it for one stored a memory ending "to which Mr.".
+_TITLES = frozenset({"mr", "mrs", "ms", "mx", "dr", "prof", "st", "jr", "sr", "vs"})
+
+
 def clip_to_sentence(text: str, limit: int) -> str:
     """`text` cut to `limit` characters, at a sentence end where there is one.
 
@@ -1398,13 +1427,17 @@ def clip_to_sentence(text: str, limit: int) -> str:
     stripped = (text or "").strip()
     if len(stripped) <= limit:
         return stripped
-    window = stripped[:limit]
-    end = max(window.rfind(". "), window.rfind("! "), window.rfind("? "),
-              window.rfind("."), window.rfind("!"), window.rfind("?"))
+    end = 0
+    for match in _SENTENCE_END.finditer(stripped):
+        if match.end() > limit:
+            break
+        word = stripped[:match.start()].rsplit(None, 1)
+        if word and word[-1].lower() not in _TITLES:
+            end = match.end()
     # Half the limit, so a single runaway sentence is not cut down to its first clause.
     if end >= limit // 2:
-        return window[:end + 1].strip()
-    return window.rstrip()
+        return stripped[:end]
+    return stripped[:limit].rstrip()
 
 
 def is_real_model(name: Optional[str]) -> bool:

@@ -30,7 +30,8 @@ from ...utils.constants import (
     SEARCH_TOOL_DECLARATION, SEARCH_TOOL_NAME,
 )
 from ...utils.helpers import provider_takes_functions, resolve_grounding_mode
-from ..api.function_calls import FunctionCall, call_part, forbid_calls, result_part
+from ..api.function_calls import (FunctionCall, call_part, forbid_calls, result_part,
+                                  verbatim_part)
 
 
 class FunctionContext(NamedTuple):
@@ -45,9 +46,10 @@ class FunctionContext(NamedTuple):
     has the channel: `search_web` asks a second model, which has to answer under the
     rules the reply does, and those key off the channel, never the profile.
 
-    `search_key` is the Google key a search is billed to when it is not the server's --
-    Global Chat's host's, which that path has already cleared against the data policy.
-    None means the server's key, as everywhere else.
+    `policy` is Global Chat's `{"policy_guild_id", "conversation"}`, handed to the
+    researcher's model exactly as the reply's own models get it: the host's keys, judged
+    against the policy of the server the card is open in. None means the server's keys,
+    as everywhere else.
     """
     owner_id: int
     profile_name: str
@@ -55,7 +57,7 @@ class FunctionContext(NamedTuple):
     guild_id: Optional[int]
     triggering_user_id: int
     safety_settings: Optional[Dict[str, Any]] = None
-    search_key: Optional[str] = None
+    policy: Optional[Dict[str, Any]] = None
 
 
 async def _recall(cog, query: str, ctx: FunctionContext) -> Dict[str, Any]:
@@ -68,7 +70,7 @@ async def _search_web(cog, query: str, ctx: FunctionContext) -> Dict[str, Any]:
     return await cog.tools_service.search_for_tool(
         query, guild_id=ctx.guild_id, owner_id=ctx.owner_id,
         profile_name=ctx.profile_name, safety_settings=ctx.safety_settings,
-        api_key=ctx.search_key)
+        policy=ctx.policy)
 
 
 @dataclass(frozen=True)
@@ -125,8 +127,8 @@ def functions_for(config: Optional[Dict[str, Any]], *, has_server: bool = True,
     because the prompt is written once for a turn the fallback may answer.
 
     `has_server` False drops what needs one (`recall`). `can_search` False drops
-    `search_web`: Global Chat has no server key, and without its host's own a search
-    could only come back "unavailable", a request spent to learn nothing.
+    `search_web`: Global Chat has no server key, and without one of its host's own a
+    search could only come back "unavailable", a request spent to learn nothing.
     """
     config = config or {}
     if not provider_takes_functions(config.get("primary_model"), config.get("fallback_model")):
@@ -188,19 +190,26 @@ async def execute(cog, calls: List[FunctionCall], ctx: FunctionContext,
     return out
 
 
-def exchange_turns(results: List[Tuple[FunctionCall, Any]],
-                   spoken: str) -> List[Dict[str, Any]]:
+def exchange_turns(results: List[Tuple[FunctionCall, Any]], spoken: str,
+                   echo: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """The two conversation turns that record one round of calls and their answers.
 
     A `model` turn holding the calls, then a `user` turn holding the results -- the
     neutral spelling both adapters translate. `spoken` is whatever the model said
     alongside its calls, kept because dropping it would leave the next request looking
     as though the character had gone silent mid-sentence.
+
+    `echo` is the response's own `model_parts` where it has them (Google), and then the
+    model turn is those, untouched: they carry `spoken` already, and the signatures and
+    built-in tool parts a rebuilt turn would lose.
     """
     if not results:
         return []
-    model_parts: List[Any] = [spoken] if spoken else []
-    model_parts.extend(call_part(call) for call, _ in results)
+    if echo:
+        model_parts: List[Any] = [verbatim_part(p) for p in echo]
+    else:
+        model_parts = [spoken] if spoken else []
+        model_parts.extend(call_part(call) for call, _ in results)
     return [
         {"role": "model", "parts": model_parts},
         {"role": "user", "parts": [result_part(call, value) for call, value in results]},
@@ -297,5 +306,6 @@ async def run(cog, model, contents: List[Any], gen_config: Optional[Dict[str, An
                                        if isinstance(m, str))
                 result.sources.extend(src for src in (value.get(SEARCH_WEB.found_key) or ())
                                       if isinstance(src, dict) and src.get("uri"))
-        turn.extend(exchange_turns(answered, getattr(result.response, "text", "") or ""))
+        turn.extend(exchange_turns(answered, getattr(result.response, "text", "") or "",
+                                   getattr(result.response, "model_parts", None)))
     return result

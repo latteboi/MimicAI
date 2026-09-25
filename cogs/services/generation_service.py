@@ -8,6 +8,7 @@ import asyncio
 import discord
 import traceback
 import collections
+import itertools
 import datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -17,7 +18,7 @@ from ..utils.constants import (
     WARN_VOICE_SYNTHESIS_FAILED,
     ERR_REASON_AUDIO_TOO_LARGE, ERR_REASON_AUDIO_NOT_UPLOADED,
     DEFAULT_KICKSTART_START,
-    DEFAULT_WHISPER_RECAP, DEFAULT_DIRECTOR_USER_PROMPT,
+    DEFAULT_WHISPER_RECAP, DEFAULT_DIRECTOR_USER_PROMPT, DEFAULT_DIRECTOR_INSTRUCTIONS,
     DEFAULT_IMAGE_GROUNDING, DEFAULT_IMAGE_PRESENT,
     DEFAULT_IMAGE_PRESENT_OTHER, DEFAULT_IMAGE_FAILED,
     DEFAULT_SPEECH_VOICE, TTS_SYNTHESIS_PREAMBLE, CRITIC_AUDIT_TEXT_MAX,
@@ -26,7 +27,8 @@ from ..utils.constants import (
     GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB, NO_KEY_NOTICE_FLAG, NO_SERVER_KEY_NOTICE,
 )
 from ..utils.helpers import (
-    _format_api_error, _format_citation_subtext,
+    _format_api_error, _format_citation_subtext, _resolve_zoneinfo, _scrub_response_text,
+    restamp_turn, turn_posted_at,
     _format_history_entry, _get_user_hash, _resolve_safety_settings,
     _split_into_sentences_with_abbreviations, generated_image_attachment,
     resolve_critic_settings,
@@ -403,6 +405,69 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         await self.cog.session_manager.flush_session(
             (channel.id, None, None), session.get("type", "multi"))
 
+    def _director_history(self, session: dict) -> str:
+        """What the AI Director reads: the scene, its synopsis, and the last ten public turns.
+
+        Public only. Its note is narrated to the whole cast, so a whisper it read could
+        surface in it; the last ten log entries used to go whatever their type, private
+        replies and retracted turns included. The scene and the synopsis are there so an
+        event fits the setting: ten lines alone rarely say where anyone is. On the
+        session owner's clock, like any text the cast shares.
+        """
+        log = session.get("unified_log") or []
+        recent = list(itertools.islice(
+            (t for t in reversed(log) if not t.get("type") and not t.get("is_hidden")), 10))
+        clock, _ = _resolve_zoneinfo(self.cog.profile_manager.user_timezone(session.get("owner_id")))
+        parts = []
+        if session.get("session_prompt"):
+            parts.append(f"<scene_prompt>\n{session['session_prompt']}\n</scene_prompt>")
+        synopsis = self.cog.session_manager.get_latest_synopsis(session)
+        if synopsis:
+            parts.append(f"<session_synopsis>\n{synopsis}\n</session_synopsis>")
+        parts.extend(restamp_turn(t.get("content") or "", turn_posted_at(t), clock).strip()
+                     for t in reversed(recent))
+        return "\n\n".join(p for p in parts if p)
+
+    async def _director_note(self, channel_id: int, session: dict) -> Optional[str]:
+        """The AI Director's note for a proactive round, or None when it is off or fails.
+
+        Its model runs the LTM summariser's chain, like the session synopsis: a model the
+        session chose goes first, "on" means the shipped one, and either falls back rather
+        than leaving the round with no event because one provider was busy.
+        """
+        pro = session.get("proactivity") or {}
+        chosen = str(pro.get("director_model") or "off").strip()
+        if chosen.lower() == "off":
+            return None
+        channel = self.cog.bot.get_channel(channel_id)
+        guild_id = channel.guild.id if channel and getattr(channel, 'guild', None) else 0
+        owner_id = session.get("owner_id")
+        instructions = pro.get("director_instructions") or DEFAULT_DIRECTOR_INSTRUCTIONS
+        request = self.cog.global_prompts.get("DIRECTOR_USER_PROMPT", DEFAULT_DIRECTOR_USER_PROMPT).format(
+            history=self._director_history(session))
+
+        async def _attempt(model_name, _is_fallback):
+            # `{}` reads as "high" in every adapter. A Director's note is one short
+            # instruction off ten lines of history; it takes the shared `utility` default.
+            model = self.cog.api_service._instantiate_model(
+                model_name, guild_id, owner_id, system_instruction=instructions,
+                config_owner_id=owner_id, thinking_params=resolve_thinking_params(None, "utility"))
+            return await model.generate_content_async([request])
+
+        try:
+            resp, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
+                *self.cog.api_service.model_chain(
+                    {"ltm_model": None if chosen.lower() == "on" else chosen,
+                     "final_fallback_enabled": True},
+                    "ltm_model", owner_id),
+                _attempt, label="AI Director")
+        except Exception as e:
+            print(f"AI Director failed: {e}")
+            return None
+        text = _scrub_response_text(getattr(resp, "text", None) or "").strip() if resp else ""
+        # Scrubbed: it goes back to the cast inside a tag, and a stray one would compound.
+        return f"<internal_note>Director's Note: {text}</internal_note>" if text else None
+
     async def _multi_profile_worker(self, channel_id: int):
         session = self.cog.multi_profile_channels.get(channel_id)
         if not session: return
@@ -477,37 +542,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 for i, t in enumerate(all_triggers_for_round):
                     if isinstance(t, tuple) and t[0] == 'proactive_trigger':
                         is_proactive_auto_round = True
-                        pro = session.get("proactivity", {})
-                        director_prompt = None
-                        model_raw = pro.get("director_model", "off")
-                        
-                        if model_raw.lower() != "off":
-                            sys_instr = pro.get("director_instructions")
-                            if sys_instr:
-                                try:
-                                    channel = self.cog.bot.get_channel(channel_id)
-                                    guild_id = channel.guild.id if channel and getattr(channel, 'guild', None) else 0
-                                    # Via the factory rather than a local copy of the prefix parsing.
-                                    # The copy matched prefixes case-insensitively, which the factory
-                                    # deliberately does not: OpenRouter namespaces its models as
-                                    # 'google/gemini-2.5-flash', so an upper()-ed match read that as a
-                                    # GOOGLE/ prefix and sent an OpenRouter model id to Google.
-                                    # `{}` reads as "high" in every adapter. A Director's
-                                    # Note is one short instruction off ten lines of
-                                    # history; it takes the shared `utility` default.
-                                    m = self.cog.api_service._instantiate_model(
-                                        model_raw, guild_id, session.get("owner_id"),
-                                        system_instruction=sys_instr,
-                                        config_owner_id=session.get("owner_id"),
-                                        thinking_params=resolve_thinking_params(None, "utility"))
-                                    hist_text = ""
-                                    for ht in session.get("unified_log", [])[-10:]:
-                                        hist_text += f"{ht.get('content', '')}\n"
-                                    director_template = self.cog.global_prompts.get("DIRECTOR_USER_PROMPT", DEFAULT_DIRECTOR_USER_PROMPT)
-                                    resp = await m.generate_content_async([director_template.format(history=hist_text)])
-                                    if resp and resp.text: director_prompt = f"<internal_note>Director's Note: {resp.text.strip()}</internal_note>"
-                                except Exception as e: print(f"AI Director failed: {e}")
-                        all_triggers_for_round[i] = director_prompt
+                        all_triggers_for_round[i] = await self._director_note(channel_id, session)
 
                 if not all_triggers_for_round and not is_proactive_auto_round:
                     session['is_running'] = False
@@ -1908,38 +1943,31 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 guild_id = self.cog.bot.get_channel(channel_id).guild.id
                 
                 if not was_blocked:
-                    # Check each participant that ACTUALLY SPOKE this round
+                    # Each seat that spoke this round, due once it has replied its
+                    # `ltm_creation_interval` since its last memory (LtmCaptureMixin).
                     for participant in profile_order:
                         owner_id = participant['owner_id']
                         profile_name = participant['profile_name']
                         p_index = self.cog.profile_manager._get_user_index(owner_id)
                         p_is_borrowed = profile_name in p_index.get("borrowed", [])
                         p_settings = self.cog.profile_manager._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
-                        
+
                         if not p_settings.get("ltm_creation_enabled", False): continue
-                        
-                        # Increment individual counter
-                        participant['ltm_counter'] = participant.get('ltm_counter', 0) + 1
-                        
-                        interval = p_settings.get("ltm_creation_interval", 10)
+                        if not self._ltm_due(session, participant, p_settings): continue
 
-                        if participant['ltm_counter'] >= interval:
-                            # Offloaded to a background task so a slow summary doesn't block the
-                            # queue. The actual summarise -> embed -> store chain lives in
-                            # LtmCaptureMixin._summarize_and_store_ltm, shared with /memorise, which
-                            # awaits it directly instead since it has to report success back to the
-                            # admin who ran it.
-                            async def background_ltm_gen(o_id, p_name, p_stgs, r_author, g_id, t_user_id):
-                                try:
-                                    await self._summarize_and_store_ltm(
-                                        channel_id, session, o_id, p_name, p_stgs, g_id, r_author, t_user_id
-                                    )
-                                except Exception as e:
-                                    print(f"Background LTM generation failed for {p_name}: {e}")
+                        # Offloaded to a background task so a slow summary doesn't block the
+                        # queue. The flag keeps a slow one from being started twice.
+                        async def background_ltm_gen(seat, p_stgs, r_author, g_id, t_user_id):
+                            try:
+                                await self._summarize_and_store_ltm(
+                                    session, seat, p_stgs, g_id, r_author, t_user_id)
+                            except Exception as e:
+                                print(f"Background LTM generation failed for {seat['profile_name']}: {e}")
+                            finally:
+                                seat.pop("_ltm_running", None)
 
-                            asyncio.create_task(background_ltm_gen(owner_id, profile_name, p_settings, round_author_name, guild_id, triggering_user_id))
-
-                            participant['ltm_counter'] = 0
+                        participant["_ltm_running"] = True
+                        asyncio.create_task(background_ltm_gen(participant, p_settings, round_author_name, guild_id, triggering_user_id))
 
                 # AGGRESSIVE GC: Clear references
                 if 'new_round_content_objects' in locals(): del new_round_content_objects

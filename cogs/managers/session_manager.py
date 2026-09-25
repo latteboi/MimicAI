@@ -25,7 +25,7 @@ from ..utils.constants import (
     ROUND_EXEMPT_USER_TURNS, ROUND_EXEMPT_USER_CHARS, SESSION_BUSY_FLAGS,
 )
 from ..utils.discord_cdn import unsigned_attachment_url
-from ..utils.helpers import turn_posted_at
+from ..utils.helpers import _resolve_zoneinfo, restamp_turn, turn_posted_at
 from .storage_manager import (IOManager, _delete_file_shard, _get_compressor,
                               _get_decompressor, seal_blob, unseal_blob)
 
@@ -465,9 +465,7 @@ class SessionManager:
             p_oid = participant.get("owner_id")
             p_name = participant.get("profile_name")
             if p_oid and p_name:
-                # Clear the round counter and the LTM recall penalty history for this
-                # profile, or a fresh session inherits a half-elapsed cadence.
-                self.cog.message_counters_for_ltm.pop((p_oid, p_name, "guild"), None)
+                # Clear the LTM recall penalty history for this profile.
                 self.cog.ltm_recall_history.pop((channel_id, p_oid, p_name), None)
 
             if participant.get("method") == "child_bot":
@@ -820,11 +818,10 @@ class SessionManager:
                         "is_running": False,
                         "task_queue": asyncio.Queue(),
                         "worker_task": None,
-                        "turns_since_last_ltm": 0,
                         "session_prompt": session_data.get("session_prompt"),
                         "session_mode": session_data.get("session_mode", "sequential"),
                         "type": "multi",
-                        "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 20, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
+                        "proactivity": session_data.get("proactivity", {}),
                         "compaction": session_data.get("compaction", {}),
                         # Absent means CLOSED: a blueprint written before this field
                         # existed keeps the admin-only access it was configured under.
@@ -944,6 +941,12 @@ class SessionManager:
                         "chance": p.get("chance", 100),
                         "wakewords": p.get("wakewords",[])
                     }
+                    # The turn its last memory read up to, and that turn's moment
+                    # (LtmCaptureMixin). Lost, the next memory reads the newest turns
+                    # instead, and can repeat itself.
+                    for key in ("ltm_read_through", "ltm_read_through_id"):
+                        if p.get(key):
+                            entry[key] = p[key]
                     # Sparse, so an unskipped cast writes exactly what it always has. Kept
                     # across a restart because the ❌ that did it stays on its message.
                     if p.get("is_skipped"):
@@ -958,7 +961,7 @@ class SessionManager:
                     "session_prompt": session_data.get("session_prompt"),
                     "session_mode": session_data.get("session_mode", "sequential"),
                     "type": "multi",
-                    "proactivity": session_data.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
+                    "proactivity": session_data.get("proactivity", {}),
                     "compaction": session_data.get("compaction", {}),
                     "cast_policy": session_data.get("cast_policy", DEFAULT_CAST_POLICY),
                     "started": bool(session_data.get("started", True)),
@@ -1243,7 +1246,6 @@ class SessionManager:
 
                 if session_config:
                     profiles = session_config.get("profiles", [])
-                    for p in profiles: p.setdefault('ltm_counter', 0)
                     # Same repair as the boot path: this branch restores a blueprint
                     # that has been on disk, so its names are exactly as stale.
                     self._repair_participant_identity(profiles)
@@ -1255,7 +1257,7 @@ class SessionManager:
                             "session_prompt": session_config.get("session_prompt"),
                             "session_mode": session_config.get("session_mode", "sequential"),
                             "type": "multi",
-                            "proactivity": session_config.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."}),
+                            "proactivity": session_config.get("proactivity", {}),
                             "compaction": session_config.get("compaction", {}),
                             "cast_policy": session_config.get("cast_policy", DEFAULT_CAST_POLICY),
                             "task_queue": asyncio.Queue(),
@@ -1272,7 +1274,7 @@ class SessionManager:
                         session["session_prompt"] = session_config.get("session_prompt")
                         session["session_mode"] = session_config.get("session_mode", "sequential")
                         session["type"] = "multi"
-                        session["proactivity"] = session_config.get("proactivity", {"enabled": False, "chance": 10, "cooldown": 300, "director_model": "off", "director_instructions": "You are an AI Director for a roleplay session. Introduce a sudden event, an environmental change, or a question to spark conversation among the cast. Keep it brief (1-2 sentences)."})
+                        session["proactivity"] = session_config.get("proactivity", {})
                         session["compaction"] = session_config.get("compaction", {})
                         session["cast_policy"] = session_config.get("cast_policy", DEFAULT_CAST_POLICY)
                         session["audio_mode"] = session_config.get("audio_mode", "off")
@@ -1658,10 +1660,13 @@ class SessionManager:
         # stm_length 0 means "no memory", but the current round is still in front of it.
         window = effective_stm + self._bound_reserved_tail(full_log, reserved_tail)
         log_slice = self._select_history_window(full_log, window, hide_folded)
+        # Every turn on this character's own clock, the one its <current_time> reads.
+        clock, _ = _resolve_zoneinfo(p_settings.get("timezone"))
 
         participant_history = []
         for turn in log_slice:
             if turn.get("is_hidden") or (hide_folded and turn.get("compacted")): continue
+            content = restamp_turn(turn.get("content") or "", turn_posted_at(turn), clock)
 
             turn_type = turn.get("type")
             # Not conversation. A synopsis is standing context injected into the system
@@ -1672,7 +1677,7 @@ class SessionManager:
             if turn_type == "synopsis": continue
             if not turn_type:
                 role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
-                parts = [turn.get("content")]
+                parts = [content]
                 
                 if role == 'user':
                     if turn.get("url_context") and p_settings.get("url_fetching_enabled", False):
@@ -1688,7 +1693,7 @@ class SessionManager:
                     
             elif turn_type == "whisper":
                 if turn.get("target_pid") == bot_pid:
-                    clean_content = turn.get("content")
+                    clean_content = content
                     header, body = clean_content.split('\n', 1) if '\n' in clean_content else ("", clean_content)
                     wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
                     if participant_history and participant_history[-1]['role'] == 'user':
@@ -1698,7 +1703,7 @@ class SessionManager:
                         
             elif turn_type == "private_response":
                 if turn.get("speaker_pid") == bot_pid:
-                    clean_content = turn.get("content")
+                    clean_content = content
                     header, body = clean_content.split('\n', 1) if '\n' in clean_content else ("", clean_content)
                     wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
                     if participant_history and participant_history[-1]['role'] == 'model':
@@ -1708,80 +1713,6 @@ class SessionManager:
                         participant_history.append(obj)
                         
         return participant_history
-
-    async def setup_multi_profile_session(self, interaction: discord.Interaction, participants: List[Dict], session_prompt: Optional[str], session_mode: str, as_admin_scope: bool = False, audio_mode: str = "off"):
-        user_id = interaction.user.id
-        is_update = interaction.channel_id in self.cog.multi_profile_channels
-
-        # Verify each participant's content rating is still current before the
-        # session runs. Session setup is user-initiated and infrequent, which is why
-        # the staleness check lives here and not in the per-turn gate -- it decrypts
-        # the whole persona to hash it. Fire-and-forget: a stale verdict only ever
-        # errs toward the previous, stricter answer while the recheck lands.
-        for _p in {(p["owner_id"], p["profile_name"]) for p in participants}:
-            asyncio.create_task(
-                self.cog.profile_manager.resolve_stale_rating(_p[0], _p[1]))
-
-        if is_update:
-            session = self.cog.multi_profile_channels[interaction.channel_id]
-            if not session.get("is_hydrated"):
-                session = await self._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi"))
-
-        else:
-            for p in participants:
-                p['ltm_counter'] = 0
-
-            session = {
-                "type": "multi",
-                "unified_log": [],
-                "is_hydrated": False,
-                "last_bot_message_id": None,
-                "owner_id": interaction.user.id,
-                "is_running": False,
-                "task_queue": asyncio.Queue(),
-                "worker_task": None,
-                "turns_since_last_ltm": 0,
-                "session_prompt": None,
-                "session_mode": "sequential",
-                "pending_image_gen_data": None,
-                "pending_whispers": {},
-                "audio_mode": "off",
-                "compaction": dict(NEW_SESSION_COMPACTION),
-                "cast_policy": DEFAULT_CAST_POLICY,
-                "started": True,
-            }
-            self.cog.multi_profile_channels[interaction.channel_id] = session
-
-        session["type"] = "multi"
-        session["session_prompt"] = session_prompt
-        session["profiles"] = participants
-        session["session_mode"] = session_mode
-        session["audio_mode"] = audio_mode
-        session["started"] = True
-        
-        for p_data in participants:
-            if p_data.get('method') == 'child_bot':
-                await self.cog.manager_queue.put({
-                    "action": "send_to_child", "bot_id": p_data['bot_id'],
-                    "payload": {"action": "session_update_add", "channel_id": interaction.channel_id}
-                })
-        
-        self._save_multi_profile_sessions()
-
-        profile_list_str = []
-        for p_data in participants:
-            if p_data.get('method') == 'child_bot':
-                bot_user = self.cog.bot.get_user(int(p_data['bot_id']))
-                profile_list_str.append(f"`{bot_user.name if bot_user else 'Unknown Bot'}`")
-            else:
-                profile_list_str.append(f"`{p_data['profile_name']}`")
-
-        action_str = "updated" if is_update else "activated"
-        msg = f"Regular session {action_str} with participants: {', '.join(profile_list_str)}."
-        if as_admin_scope:
-            msg = f"Regular session is now active for all users with profiles: {', '.join(profile_list_str)}."
-        
-        await interaction.edit_original_response(content=msg, view=None)
 
     @staticmethod
     def is_started(session: Optional[Dict]) -> bool:

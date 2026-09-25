@@ -196,7 +196,7 @@ class GlobalChatMixin:
             # No server, so no `recall`: memories are filed per server. One tuple for the
             # prompt and every model -- see tool_loop.
             functions = tool_loop.functions_for(profile_data, has_server=False,
-                                                can_search=bool(user_api_key))
+                                                can_search=bool(user_api_key or or_key))
             # Channel 0 resolves to no channel, so the builder takes the not-age-restricted
             # branch and always injects <content_policy>: the card can be opened in any
             # channel, which is why content_capability refuses an Adult profile here.
@@ -321,13 +321,14 @@ class GlobalChatMixin:
                 contents_for_api_call.append(user_content_obj_for_turn)
 
             app_name, app_avatar = self._resolve_appearance_data(host_user_id, profile_name)
-            # No server: `recall` is not offered here, and a search bills the host's key.
+            # No server: `recall` is not offered here, and a search bills the host's keys,
+            # policed as the reply is -- see `_attempt_reply`'s `conversation`.
             fn_ctx = tool_loop.FunctionContext(
                 owner_id=host_user_id, profile_name=profile_name, author_dn=app_name,
                 guild_id=None,
                 triggering_user_id=queued_turns[-1]["user_id"] if queued_turns else host_user_id,
                 safety_settings=_resolve_safety_settings(None, profile_data),
-                search_key=user_api_key)
+                policy={"policy_guild_id": interaction.guild_id, "conversation": True})
             chat_participant_names = [app_name] + [t['display_name'] for t in queued_turns]
             state_container = {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg,
                                "message_type": "embed"}

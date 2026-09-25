@@ -9,7 +9,7 @@ from ...utils.constants import (
     COMPACTION_THRESHOLD_MIN, DEFAULT_SESSION_SYNOPSIS_PROMPT,
     DEFAULT_SESSION_SYNOPSIS_USER_PROMPT, GREEDY_SAMPLING, SESSION_BUSY_FLAGS,
 )
-from ...utils.helpers import resolve_thinking_params
+from ...utils.helpers import _resolve_zoneinfo, restamp_turn, resolve_thinking_params, turn_posted_at
 from ...managers.session_manager import SessionManager, intern_turn
 
 #: What the settings modal wrote into every session it saved, typed or not: the shipped
@@ -165,7 +165,11 @@ class SessionCompactionMixin:
 
         unified_log = session["unified_log"]
         turns = [unified_log[i] for i in indices]
-        transcript = "\n".join((t.get("content") or "").strip() for t in turns if t.get("content"))
+        # One clock for a synopsis the whole cast shares: the session owner's. Stored
+        # turns carry each speaker's own, and a date read across two zones is wrong.
+        clock, _ = _resolve_zoneinfo(self.cog.profile_manager.user_timezone(session.get("owner_id")))
+        transcript = "\n".join(restamp_turn(t["content"], turn_posted_at(t), clock).strip()
+                               for t in turns if t.get("content"))
         if not transcript.strip():
             return False
 

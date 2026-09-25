@@ -5,18 +5,17 @@ from discord import ui
 import datetime
 import traceback
 from typing import TYPE_CHECKING, List, Dict, Tuple, Optional
-from ..utils.helpers import suppress_link_previews
+from ..utils.helpers import _resolve_zoneinfo, suppress_link_previews
 from ..managers.memory_manager import (EMBEDDING_FAILED_MSG, NO_EMBEDDING_KEY_MSG,
-                                       encode_embedding_b64)
+                                       encode_embedding_b64, entry_date)
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
     from ..MimicCog import MimicCog
     from .gui_profiles import ProfileManageView
 
-from .base_components import (BaseBulkProfileView, BlockedGuard, PageJumpModal, add_button, add_select,
-                              build_confirm_view, build_pagination_controls,
-                              compute_window_slice)
+from .base_components import (PAGE_NAV_VALUES, BaseBulkProfileView, BlockedGuard, PageJumpModal, add_button,
+                              add_select, build_confirm_view, paged_nav_options)
 from .gui_data_policy import DataPolicyView, add_data_policy_fields
 from ..utils.data_policy import may_set_data_policy
 
@@ -85,18 +84,15 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
                 "and add it there.", ephemeral=True)
             return
 
-        # [NEW] Manual Hard Block Check
-        user_id_str = str(self.profile_owner_id)
-        ltm_shard = self.cog.memory_manager._load_ltm_shard(user_id_str, self.profile_name)
-        current_count = len(ltm_shard.get("guild", [])) if ltm_shard else 0
-        
+        # Refused at the limit rather than rolled over: automatic creation drops the
+        # oldest to make room, but a memory typed by hand should not silently cost one.
         limit = defaultConfig.LIMIT_LTM
-
+        current_count = len(await self.cog.memory_manager.load_ltms(self.profile_owner_id, self.profile_name))
         if current_count >= limit:
-            msg = "**Limit Reached.**\n"
-            msg += f"You have **{current_count}** memories (Limit: {limit}).\n"
-            msg += "You cannot manually add more memories while at or above the limit. Please delete old memories first."
-            await i.followup.send(msg, ephemeral=True)
+            await i.followup.send(
+                f"**Limit Reached.**\nYou have **{current_count}** memories (Limit: {limit}).\n"
+                "You cannot manually add more memories while at or above the limit. "
+                "Please delete old memories first.", ephemeral=True)
             return
 
         summary = self.summary_field.value
@@ -111,21 +107,11 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
             await i.followup.send(EMBEDDING_FAILED_MSG, ephemeral=True)
             return
 
-        b64_emb = encode_embedding_b64(embedding)
-        
-        # The _add_ltm method now handles the rolling window logic automatically.
-        await self.cog.memory_manager._add_ltm(self.profile_owner_id, self.profile_name, summary, b64_emb, self.guild_id, i.user.id, i.user.display_name)
-        
-        # Fetch new count for feedback
-        ltm_shard = self.cog.memory_manager._load_ltm_shard(str(self.profile_owner_id), self.profile_name)
-        count = len(ltm_shard.get("guild", [])) if ltm_shard else 0
-        limit = defaultConfig.LIMIT_LTM
-        
-        msg = f"LTM entry added for '{self.profile_name}'."
-        if count >= limit:
-            msg += f"\nNote: You have reached the {limit} memory limit. The oldest memory was automatically replaced."
-            
-        await i.followup.send(msg, ephemeral=True)
+        await self.cog.memory_manager._add_ltm(
+            self.profile_owner_id, self.profile_name, summary, encode_embedding_b64(embedding),
+            self.guild_id, i.user.id, i.user.display_name, source="manual")
+        await i.followup.send(f"Memory added for '{self.profile_name}' "
+                              f"({current_count + 1}/{limit}).", ephemeral=True)
 
     async def on_error(self, i: discord.Interaction, e: Exception):
         print(f"AddLtmModal error: {e}"); traceback.print_exc()
@@ -142,23 +128,7 @@ class AddTrainingExampleModal(ui.Modal, title="Add Profile Training Example"):
         self.guild_id = guild_id
     async def on_submit(self,i:discord.Interaction):
         await i.response.defer(ephemeral=True,thinking=True)
-        
-        # [NEW] Manual Hard Block Check
-        # Although add_new_training_example has a check, we do it here to provide a better UI response
-        # and prevent the embedding API call if blocked.
-        user_id_str = str(self.profile_owner_id)
-        training_shard = self.cog.memory_manager._load_training_shard(user_id_str, self.profile_name) or []
-        current_count = len(training_shard)
-        
-        limit = defaultConfig.LIMIT_TRAINING
-
-        if current_count >= limit:
-            msg = "**Limit Reached.**\n"
-            msg += f"You have **{current_count}** training examples (Limit: {limit}).\n"
-            msg += "You cannot add more examples. Please delete existing ones first."
-            await i.followup.send(msg, ephemeral=True)
-            return
-
+        # add_new_training_example checks the limit itself, before the embedding call.
         s,m=await self.cog.memory_manager.add_new_training_example(self.profile_owner_id, self.profile_name, self.user_input_field.value, self.chatbot_response_field.value, self.guild_id)
         await i.followup.send(m,ephemeral=True)
     async def on_error(self,i:discord.Interaction,e:Exception):print(f"AddTrainExModal err:{e}");traceback.print_exc();await i.followup.send('Oops!',ephemeral=True)
@@ -187,8 +157,8 @@ class EditTrainingExampleModal(ui.Modal, title="Edit Profile Training Example"):
         traceback.print_exc()
         await i.followup.send("An error occurred with the edit form.", ephemeral=True)
 
-class SearchDataModal(ui.Modal, title="Search Data"):
-    search_input = ui.TextInput(label="Enter search term (leave blank to clear)", required=False, max_length=100)
+class SearchDataModal(ui.Modal, title="Search"):
+    search_input = ui.TextInput(label="Search term (leave blank to clear)", required=False, max_length=100)
 
     def __init__(self, parent_view: 'DataManageView'):
         super().__init__()
@@ -197,12 +167,50 @@ class SearchDataModal(ui.Modal, title="Search Data"):
             self.search_input.default = self.parent_view.search_term
 
     async def on_submit(self, interaction: discord.Interaction):
-        search_term = self.search_input.value.strip()
-        self.parent_view.search_term = search_term if search_term else None
-        self.parent_view.current_page = 1
-        await self.parent_view._update_view(interaction)
+        self.parent_view.search_term = self.search_input.value.strip() or None
+        self.parent_view.page = 0
+        self.parent_view.open_id = None
+        await self.parent_view._show(interaction)
+
+class TestMatchModal(ui.Modal, title="Test"):
+    phrase = ui.TextInput(label="Something someone might say", style=discord.TextStyle.paragraph,
+                          required=True, max_length=500)
+
+    def __init__(self, parent_view: 'DataManageView'):
+        super().__init__(title="Test Recall" if parent_view.mode == 'ltm' else "Test Match")
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.parent_view.run_test(interaction, self.phrase.value)
+
+#: Entries per page. Five code blocks of up to MAX_LTM_SUMMARY_CHARACTERS each stay
+#: under an embed description's 4096.
+DATA_PAGE_SIZE = 5
+#: Servers per page of the server dropdown: 3 page controls + 22 = Discord's 25.
+SERVER_PAGE_SIZE = 22
+SERVER_NAV_VALUES = ("server_prev", "server_jump", "server_next")
+#: The Delete dropdown's two bulk picks: every entry on this page, or every one shown.
+SELECT_PAGE, SELECT_ALL = "select_page", "select_all"
+
+def _clip(text: str, limit: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+def _code(text: str) -> str:
+    """A code block, with any backtick swapped for its look-alike so none can close it early."""
+    return "```\n" + text.replace("`", "ˋ") + "\n```"
 
 class DataManageView(BlockedGuard, ui.View):
+    """A profile's long-term memories or training examples: a page of five, or one opened.
+
+    Memories are listed one server at a time, since a memory is only ever recalled in
+    the server it formed in -- so a server is chosen before anything is shown, starting
+    on the one this was opened in when it has any. The shard is read, decrypted and
+    grouped off the event loop once per change, never per page: it holds up to
+    LIMIT_LTM entries.
+    """
+
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str, is_borrowed: bool, mode: Optional[Literal['training', 'ltm']] = None, parent_manage_view: Optional['ProfileManageView'] = None, target_user_id: Optional[int] = None):
         super().__init__(timeout=600)
         self.cog = cog
@@ -214,383 +222,366 @@ class DataManageView(BlockedGuard, ui.View):
         self.profile_name = profile_name
         self.is_borrowed = is_borrowed
         self.parent_manage_view = parent_manage_view
-        
-        if mode:
-            self.mode: Literal['training', 'ltm'] = mode
-        else:
-            self.mode: Literal['training', 'ltm'] = 'ltm' if self.is_borrowed else 'training'
-        self.current_page = 1
-        self.items_per_page = 1
-        self.max_pages = 1
-        self.current_item_id: Optional[str] = None
-        self.full_data_list: List[Dict] = []
+        self.mode: Literal['training', 'ltm'] = mode or ('ltm' if is_borrowed else 'training')
+        self.entries: List[Dict] = []                  # newest first, plain text
+        self.servers: List[Tuple[str, str, int]] = []  # (guild id, name, memories), LTM only
+        self.server_id: Optional[str] = None
         self.search_term: Optional[str] = None
-        self.displayed_data_list: List[Dict] = []
-        self.ltm_filter: Optional[str] = "all"
+        self.page = 0
+        self.server_page = 0
+        self.open_id: Optional[str] = None
+        self._clock = None
 
-    async def start(self):
-        await self._update_view(self.original_interaction)
+    # --- data -------------------------------------------------------------------
 
-    async def _update_view(self, interaction: discord.Interaction):
-        embed, page_items, ltm_filter_options = await self._build_embed()
-        self._build_components(page_items, ltm_filter_options)
+    async def _reload(self):
+        mm = self.cog.memory_manager
+        if self.mode == 'training':
+            self.entries = await mm.load_training_examples(self.user_id, self.profile_name)
+            return
+        self.entries = await mm.load_ltms(self.user_id, self.profile_name)
+        counts: Dict[str, int] = {}
+        for e in self.entries:
+            if e.get("context_id"):
+                counts[str(e["context_id"])] = counts.get(str(e["context_id"]), 0) + 1
+        here = str(self.guild_id) if self.guild_id else None
+        servers = []
+        for sid, n in counts.items():
+            guild = self.cog.bot.get_guild(int(sid)) if sid.isdigit() else None
+            servers.append((sid, guild.name if guild else f"Server {sid}", n))
+        servers.sort(key=lambda s: (s[0] != here, -s[2], s[1].lower()))
+        self.servers = servers
+        ids = {sid for sid, _, _ in self.servers}
+        if self.server_id not in ids:
+            self.server_id = here if here in ids else None
+
+    def _text(self, e: Dict) -> str:
+        return e.get("sum", "") if self.mode == 'ltm' else f"{e.get('u_in', '')} {e.get('b_out', '')}"
+
+    def _visible(self) -> List[Dict]:
+        items = self.entries
+        if self.mode == 'ltm':
+            items = [e for e in items if str(e.get("context_id")) == self.server_id] if self.server_id else []
+        if self.search_term:
+            needle = self.search_term.lower()
+            items = [e for e in items if needle in self._text(e).lower()]
+        return items
+
+    def _opened(self) -> Optional[Dict]:
+        return next((e for e in self.entries if e.get("id") == self.open_id), None) if self.open_id else None
+
+    def _server_name(self, sid: Optional[str]) -> str:
+        return next((name for s, name, _ in self.servers if s == sid), f"Server {sid}")
+
+    def _date(self, e: Dict, key: str = "created_ts") -> str:
+        """On the viewer's clock, from About Me -- not UTC, and not the character's."""
+        if self._clock is None:
+            self._clock, _ = _resolve_zoneinfo(
+                self.cog.profile_manager.user_timezone(self.original_interaction.user.id))
+        return entry_date({"created_ts": e.get(key) or e.get("ts")}, self._clock,
+                          "%d %b %Y, %I:%M %p %Z") or "undated"
+
+    @staticmethod
+    def _source(e: Dict) -> str:
+        by = f" by {e['usr']}" if e.get("usr") else ""
+        return {"auto": "auto", "memorise": f"/memorise{by}", "manual": f"added{by}"}.get(e.get("src"), "")
+
+    # --- rendering ----------------------------------------------------------------
+
+    def _embed(self, items: List[Dict]) -> discord.Embed:
+        opened = self._opened()
+        if opened:
+            return self._detail_embed(opened)
+        noun = "Long-Term Memories" if self.mode == 'ltm' else "Training Examples"
+        embed = discord.Embed(title=f"{noun} · {self.profile_name}", color=discord.Color.dark_teal())
+        limit = defaultConfig.LIMIT_LTM if self.mode == 'ltm' else defaultConfig.LIMIT_TRAINING
+        embed.set_footer(text=f"{len(self.entries)} / {limit} {'memories across every server' if self.mode == 'ltm' else 'examples'}")
+
+        if self.mode == 'ltm' and not self.server_id:
+            embed.description = ("Choose a server. A memory is only ever recalled in the server it formed in."
+                                 if self.servers else "No memories yet.")
+            return embed
+
+        start = self.page * DATA_PAGE_SIZE
+        header = []
+        if self.mode == 'ltm':
+            header.append(f"**{self._server_name(self.server_id)}** · {len(items)} memories")
+        if self.search_term:
+            header.append(f"Search: `{self.search_term}` · {len(items)} found")
+        lines = []
+        for n, e in enumerate(items[start:start + DATA_PAGE_SIZE], start + 1):
+            if self.mode == 'ltm':
+                meta = " · ".join(x for x in (self._date(e), self._source(e)) if x)
+                lines.append(f"**{n}.** {meta}\n{_code(_clip(e.get('sum', ''), MAX_LTM_SUMMARY_CHARACTERS))}")
+            else:
+                lines.append(f"**{n}.** {self._date(e)}\n" + _code(
+                    f"User: {_clip(e.get('u_in', ''), 200)}\n"
+                    f"{_clip(self.profile_name, 40)}: {_clip(e.get('b_out', ''), 400)}"))
+        body = "\n\n".join(lines) or ("Nothing matches." if self.search_term else "Nothing here yet.")
+        embed.description = "\n".join(header + ([""] if header else []) + [body])
+        return embed
+
+    def _detail_embed(self, e: Dict) -> discord.Embed:
+        edited = e.get("modified_ts") and e.get("modified_ts") != e.get("created_ts")
+        made = self._date(e) + (f" · edited {self._date(e, 'modified_ts')}" if edited else "")
+        if self.mode == 'ltm':
+            embed = discord.Embed(title=f"Memory `{e.get('id')}`", description=e.get("sum", "")[:4000],
+                                  color=discord.Color.dark_teal())
+            embed.add_field(name="Made", value=made, inline=True)
+            embed.add_field(name="Server", value=self._server_name(str(e.get("context_id"))), inline=True)
+            if self._source(e):
+                embed.add_field(name="Source", value=self._source(e), inline=True)
+        else:
+            embed = discord.Embed(title=f"Example `{e.get('id')}`",
+                                  description=f"**User**\n{e.get('u_in', '')}\n\n**{self.profile_name}**\n{e.get('b_out', '')}"[:4000],
+                                  color=discord.Color.dark_teal())
+            embed.add_field(name="Made", value=made, inline=True)
+        return embed
+
+    def _build_components(self, items: List[Dict]):
+        self.clear_items()
+        opened = self._opened()
+        if opened:
+            add_button(self, "Edit", self.edit_callback, style=discord.ButtonStyle.primary, row=0)
+            add_button(self, "Delete", self.delete_callback, style=discord.ButtonStyle.danger, row=0)
+            add_button(self, "Back to list", self.close_callback, row=0, emoji="⬅️")
+            return
+
+        # Paged the way Set Models pages its models: the page controls are the dropdown's
+        # first options, so no row of buttons is spent on them.
+        if self.mode == 'ltm' and self.servers:
+            start = self.server_page * SERVER_PAGE_SIZE
+            add_select(self, paged_nav_options(self.server_page, self._pages(self.servers, SERVER_PAGE_SIZE),
+                                               values=SERVER_NAV_VALUES, nav_suffix=" of servers")
+                       + [discord.SelectOption(label=_clip(name, 80), description=f"{n} memories",
+                                               value=sid, default=sid == self.server_id)
+                          for sid, name, n in self.servers[start:start + SERVER_PAGE_SIZE]],
+                       self.server_callback, placeholder="Choose a server…", row=0)
+
+        page_items = items[self.page * DATA_PAGE_SIZE:(self.page + 1) * DATA_PAGE_SIZE]
+        if page_items:
+            first = self.page * DATA_PAGE_SIZE + 1
+
+            def options():   # once per dropdown, so the two share no option objects
+                return paged_nav_options(self.page, self._pages(items)) + [
+                    discord.SelectOption(label=_clip(f"{n}. {self._text(e)}", 100),
+                                         value=str(e.get("id")), description=self._date(e))
+                    for n, e in enumerate(page_items, first)]
+            add_select(self, options(), self.open_callback, placeholder="Open…", row=1)
+            delete = options()
+            bulk = [discord.SelectOption(label="☑ Select Page", value=SELECT_PAGE,
+                                         description=f"All {len(page_items)} on this page")]
+            if len(items) > len(page_items):   # on one page, Select All would say the same thing
+                shown = (f"matching `{_clip(self.search_term, 40)}`" if self.search_term
+                         else f"in {_clip(self._server_name(self.server_id), 60)}" if self.mode == 'ltm'
+                         else "for this profile")
+                bulk.append(discord.SelectOption(label="☑ Select All", value=SELECT_ALL,
+                                                 description=f"All {len(items)} {shown}"[:100]))
+            nav = len(delete) - len(page_items)
+            delete[nav:nav] = bulk
+            add_select(self, delete, self.delete_selected_callback, placeholder="Delete…",
+                       max_values=len(delete), row=2)
+
+        showing = self.mode == 'training' or self.server_id
+        if showing:
+            add_button(self, "Search", self.search_callback, row=3, emoji="\U0001f50d")
+            add_button(self, "Test recall" if self.mode == 'ltm' else "Test match", self.test_callback,
+                       row=3, emoji="\U0001f9e0" if self.mode == 'ltm' else "\U0001f9ea",
+                       disabled=not self.entries)
+
+        add_button(self, "Add", self.add_callback, style=discord.ButtonStyle.success, row=4, emoji="➕")
+        if self.mode == 'training' and not self.is_borrowed and self.entries:
+            async def analyse_cb(i): await i.response.send_modal(AnalyseExamplesModal(self))
+            add_button(self, "Analyse", analyse_cb, style=discord.ButtonStyle.blurple, row=4)
+        if self.parent_manage_view:
+            add_button(self, "Back to Dashboard", self.back_callback, row=4, emoji="⬅️")
+
+    @staticmethod
+    def _pages(items: list, size: int = DATA_PAGE_SIZE) -> int:
+        return max(1, -(-len(items) // size))
+
+    async def _show(self, interaction: discord.Interaction):
+        # Filtered once per repaint, and the pages clamped before either half reads them.
+        items = self._visible()
+        self.page = max(0, min(self.page, self._pages(items) - 1))
+        self.server_page = max(0, min(self.server_page, self._pages(self.servers, SERVER_PAGE_SIZE) - 1))
+        embed = self._embed(items)
+        self._build_components(items)
         if interaction.response.is_done():
             await interaction.edit_original_response(embed=embed, view=self)
         else:
             await interaction.response.edit_message(embed=embed, view=self)
 
-    async def _build_embed(self) -> Tuple[discord.Embed, List[Dict], List[discord.SelectOption]]:
-        user_id_str = str(self.user_id)
-        title_prefix = ""
-        ltm_filter_options = []
+    async def start(self):
+        if not self.original_interaction.response.is_done():
+            await self.original_interaction.response.defer()
+        await self._reload()
+        await self._show(self.original_interaction)
 
-        if self.mode == 'training':
-            # Shards are append-only (edits mutate an entry in place rather than moving
-            # it), so insertion order is chronological. Reversed here, once, so every
-            # downstream consumer -- filtering, search, pagination, the item count --
-            # sees latest-first without having to know that.
-            self.full_data_list = list(reversed(self.cog.memory_manager._load_training_shard(user_id_str, self.profile_name) or []))
-            title_prefix = "Training Examples"
-            self.displayed_data_list = self.full_data_list
-        else: # ltm
-            ltm_shard = self.cog.memory_manager._load_ltm_shard(user_id_str, self.profile_name)
-            self.full_data_list = list(reversed(ltm_shard.get("guild", []))) if ltm_shard else []
-            title_prefix = "Long-Term Memories"
+    async def _refresh(self):
+        """After a change made through a modal or a confirmation: re-read, then repaint
+        the screen itself, which belongs to the interaction that opened it."""
+        await self._reload()
+        if self.open_id and not self._opened():
+            self.open_id = None
+        await self._show(self.original_interaction)
 
-            server_filters = {}
-            for item in self.full_data_list:
-                server_id = item.get('context_id')
-                if server_id and server_id not in server_filters:
-                    try:
-                        guild = self.cog.bot.get_guild(int(server_id))
-                        server_filters[server_id] = guild.name if guild else f"Server ID: {server_id}"
-                    except (ValueError, TypeError):
-                        continue
-            
-            ltm_filter_options.append(discord.SelectOption(label="All Memories", value="all"))
-            for server_id, server_name in sorted(server_filters.items(), key=lambda item: item[1]):
-                ltm_filter_options.append(discord.SelectOption(label=f"Server: {server_name}", value=f"server_{server_id}"))
+    # --- callbacks ------------------------------------------------------------------
 
-            for option in ltm_filter_options:
-                if option.value == self.ltm_filter:
-                    option.default = True
+    async def _turn_page(self, interaction: discord.Interaction, value: str) -> bool:
+        """Previous, next or jump, when `value` is one of a dropdown's page controls."""
+        for attr, values, pages in (("page", PAGE_NAV_VALUES, lambda: self._pages(self._visible())),
+                                    ("server_page", SERVER_NAV_VALUES,
+                                     lambda: self._pages(self.servers, SERVER_PAGE_SIZE))):
+            if value not in values:
+                continue
+            step = (-1, 0, 1)[values.index(value)]
+            if step:
+                setattr(self, attr, getattr(self, attr) + step)
+                await self._show(interaction)
+                return True
 
-            if self.ltm_filter == "all":
-                self.displayed_data_list = self.full_data_list
-            elif self.ltm_filter and self.ltm_filter.startswith("server_"):
-                filter_server_id = self.ltm_filter.split("_", 1)[1]
-                self.displayed_data_list =[item for item in self.full_data_list if str(item.get('context_id')) == filter_server_id]
-            else:
-                self.displayed_data_list = self.full_data_list
+            async def jump(i: discord.Interaction, page: int):
+                setattr(self, attr, page)
+                await self._show(i)
+            await interaction.response.send_modal(PageJumpModal(pages(), jump, zero_indexed=True))
+            return True
+        return False
 
-
-        # After server filtering, apply search term filtering on the result
-        if self.search_term:
-            search_term_lower = self.search_term.lower()
-            
-            # Note: We filter the already-server-filtered 'displayed_data_list'
-            search_filtered_list = []
-            for item in self.displayed_data_list:
-                content_to_search = ""
-                if self.mode == 'training':
-                    content_to_search = self.cog.storage_manager._decrypt_data(item.get('u_in', '')) + " " + self.cog.storage_manager._decrypt_data(item.get('b_out', ''))
-                else: # ltm
-                    content_to_search = self.cog.storage_manager._decrypt_data(item.get('sum', ''))
-                
-                if search_term_lower in content_to_search.lower():
-                    search_filtered_list.append(item)
-            self.displayed_data_list = search_filtered_list
-        
-        self.max_pages = len(self.displayed_data_list) or 1
-        self.current_page = max(1, min(self.current_page, self.max_pages))
-        start_index = self.current_page - 1
-        
-        page_items = self.displayed_data_list[start_index : start_index + 1]
-        self.current_item_id = page_items[0].get('id') if page_items else None
-
-        embed = discord.Embed(title=f"{title_prefix} for '{self.profile_name}'", color=discord.Color.dark_teal())
-        embed.set_footer(text=f"Item {self.current_page}/{self.max_pages} | Total: {len(self.full_data_list)}")
-
-        if not page_items:
-            embed.description = f"No {title_prefix.lower()} found."
-        else:
-            item = page_items[0]
-            item_id = item.get('id', 'N/A')
-
-            created_ts_str = item.get('created_ts') or item.get('ts')
-            modified_ts_str = item.get('modified_ts')
-            ts_display = ""
-            
-            created_dt = None
-            if created_ts_str:
-                try:
-                    created_dt = datetime.datetime.fromisoformat(created_ts_str)
-                    ts_display += f" | Created: {created_dt.strftime('%d/%m/%y')} UTC"
-                except ValueError:
-                    pass
-
-            if modified_ts_str:
-                try:
-                    modified_dt = datetime.datetime.fromisoformat(modified_ts_str)
-                    if created_dt and (modified_dt - created_dt).total_seconds() > 5:
-                        ts_display += f" | Modified: {modified_dt.strftime('%d/%m/%y')} UTC"
-                except ValueError:
-                    pass
-
-            if self.mode == 'training':
-                user_input = self.cog.storage_manager._decrypt_data(item.get('u_in', ''))
-                bot_response = self.cog.storage_manager._decrypt_data(item.get('b_out', ''))
-                embed.add_field(name=f"ID: `{item_id}`{ts_display}", value=f"**User Input:**\n{user_input}", inline=False)
-                embed.add_field(name="Bot Response:", value=bot_response, inline=False)
-            else: # ltm
-                content = self.cog.storage_manager._decrypt_data(item.get('sum', ''))
-                
-                display_content = content
-                if len(content) > 950:
-                    display_content = content[:950] + "... (truncated)"
-
-                embed.add_field(name=f"ID: `{item_id}`{ts_display}", value=f"**Summary:**\n{display_content}", inline=False)
-        
-        return embed, page_items, ltm_filter_options
-
-    def _build_components(self, page_items: List[Dict], ltm_filter_options: List[discord.SelectOption]):
-        self.clear_items()
-
-        # Row 0: Navigation and Mode
-        if not self.is_borrowed:
-            add_button(self, "Training", self.mode_button_callback,
-                       style=discord.ButtonStyle.green if self.mode == 'training' else discord.ButtonStyle.grey,
-                       row=0, custom_id="mode_training")
-
-            add_button(self, "LTMs", self.mode_button_callback,
-                       style=discord.ButtonStyle.green if self.mode == 'ltm' else discord.ButtonStyle.grey,
-                       row=0, custom_id="mode_ltm")
-
-        # `current_page` counts from 1 here and the builder's cursor is 0-based. A
-        # single page now renders no controls at all rather than three dead ones.
-        build_pagination_controls(self, self.current_page - 1, self.max_pages, 0,
-                                  self.prev_page_callback, self.next_page_callback,
-                                  self.page_button_callback)
-
-        # [NEW] Move Analyse button to Row 1 (Only visible in training mode)
-        if self.mode == 'training' and not self.is_borrowed:
-            async def analyse_cb(i): await i.response.send_modal(AnalyseExamplesModal(self))
-            add_button(self, "Analyse", analyse_cb, style=discord.ButtonStyle.blurple, row=1)
-
-        # Row 1: LTM Filter
-        if self.mode == 'ltm' and ltm_filter_options:
-            add_select(self, ltm_filter_options, self.ltm_filter_callback,
-                       placeholder="Filter memories by server...", row=1)
-
-            # New sliding window logic
-            start_slice_index, end_slice_index = compute_window_slice(self.current_page - 1, len(self.displayed_data_list))
-
-            items_for_dropdown = self.displayed_data_list[start_slice_index:end_slice_index]
-
-            options = []
-            for i, item in enumerate(items_for_dropdown):
-                item_id = item.get('id', 'N/A')
-                absolute_page_number = start_slice_index + i + 1
-                
-                if self.mode == 'training':
-                    content = self.cog.storage_manager._decrypt_data(item.get('u_in', ''))[:80]
-                    label = f"Ex ({item_id}): {content}..."
-                else:
-                    content = self.cog.storage_manager._decrypt_data(item.get('sum', ''))[:80]
-                    label = f"LTM ({item_id}): {content}..."
-                
-                option = discord.SelectOption(label=label, value=str(absolute_page_number))
-                if absolute_page_number == self.current_page:
-                    option.default = True
-                options.append(option)
-
-            if options:
-                add_select(self, options, self.select_callback, placeholder="Quick Navigation...",
-                           row=2)
-
-        # Row 3: Action Buttons
-        add_button(self, "🔍 Search", self.search_callback, style=discord.ButtonStyle.secondary,
-                   row=3)
-
-        add_button(self, "Add New", self.add_callback, style=discord.ButtonStyle.success, row=3)
-
-        add_button(self, "Edit", self.edit_callback, style=discord.ButtonStyle.primary, row=3,
-                   disabled=not page_items)
-
-        add_button(self, "Delete", self.delete_callback, style=discord.ButtonStyle.danger, row=3,
-                   disabled=not page_items)
-
-        delete_all_button = ui.Button(label="Delete All (Filtered)", style=discord.ButtonStyle.danger, row=3, disabled=True)
-        if self.mode == 'ltm' and self.ltm_filter and self.ltm_filter.startswith("server_") and self.displayed_data_list:
-            delete_all_button.disabled = False
-        delete_all_button.callback = self.delete_all_callback
-        self.add_item(delete_all_button)
-
-        if self.parent_manage_view:
-            async def back_callback(i: discord.Interaction):
-                await i.response.defer()
-                embed = await self.cog.profile_manager._build_profile_manage_embed(self.original_interaction, self.profile_name, target_user_id=self.parent_manage_view.user_id)
-                self.parent_manage_view._build_view()
-                await self.original_interaction.edit_original_response(embed=embed, view=self.parent_manage_view)
-            add_button(self, "Back to Dashboard", back_callback,
-                       style=discord.ButtonStyle.secondary, row=4, emoji="⬅️")
-
-    async def delete_all_callback(self, interaction: discord.Interaction):
-        if not (self.mode == 'ltm' and self.ltm_filter and self.ltm_filter.startswith("server_")):
-            await interaction.response.send_message("This action is only available when filtering LTMs by a specific server.", ephemeral=True)
+    async def server_callback(self, interaction: discord.Interaction):
+        if await self._turn_page(interaction, interaction.data['values'][0]):
             return
+        self.server_id = interaction.data['values'][0]
+        self.page, self.open_id, self.search_term = 0, None, None
+        await self._show(interaction)
 
-        items_to_delete = self.displayed_data_list
-        if not items_to_delete:
-            await interaction.response.send_message("There are no items matching the current filter to delete.", ephemeral=True)
+    async def open_callback(self, interaction: discord.Interaction):
+        if await self._turn_page(interaction, interaction.data['values'][0]):
             return
+        self.open_id = interaction.data['values'][0]
+        await self._show(interaction)
 
-        async def confirm_action(i: discord.Interaction):
-            owner_id_str = str(self.user_id)
-            ltm_data = self.cog.memory_manager._load_ltm_shard(owner_id_str, self.profile_name)
-            if not ltm_data:
-                await i.response.edit_message(content="Could not load LTM data.", view=None)
-                return
+    async def close_callback(self, interaction: discord.Interaction):
+        self.open_id = None
+        await self._show(interaction)
 
-            ids_to_delete = {item['id'] for item in items_to_delete}
-            context_type = "guild"
-            original_list = ltm_data.get(context_type, [])
+    async def search_callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(SearchDataModal(self))
 
-            new_list = [item for item in original_list if item.get("id") not in ids_to_delete]
+    async def test_callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(TestMatchModal(self))
 
-            ltm_data[context_type] = new_list
-            self.cog.memory_manager._save_ltm_shard(owner_id_str, self.profile_name, ltm_data)
-
-            await i.response.edit_message(content=f"Successfully deleted {len(ids_to_delete)} LTM entries.", view=None)
-
-            self.current_page = 1
-            await self._update_view(self.original_interaction)
-
-        confirm_view = build_confirm_view(f"Confirm Delete All ({len(items_to_delete)})", confirm_action)
-
-        try:
-            filter_server_id = self.ltm_filter.split("_", 1)[1]
-            guild = self.cog.bot.get_guild(int(filter_server_id))
-            server_name = guild.name if guild else f"ID: {filter_server_id}"
-        except (IndexError, ValueError):
-            server_name = "the selected server"
-
-        await interaction.response.send_message(
-            f"**Are you sure you want to delete all {len(items_to_delete)} LTMs for profile '{self.profile_name}' from '{server_name}'?**\nThis action is permanent.",
-            view=confirm_view,
-            ephemeral=True
-        )
-
-
-    async def ltm_filter_callback(self, interaction: discord.Interaction):
-        self.ltm_filter = interaction.data['values'][0]
-        self.current_page = 1
-        await self._update_view(interaction)
-
-    async def mode_button_callback(self, interaction: discord.Interaction):
-        self.mode = 'ltm' if interaction.data['custom_id'] == 'mode_ltm' else 'training'
-        self.current_page = 1
-        await self._update_view(interaction)
-
-    async def page_button_callback(self, interaction: discord.Interaction):
-        async def _jump(i: discord.Interaction, page: int):
-            self.current_page = page
-            await self._update_view(i)
-
-        await interaction.response.send_modal(PageJumpModal(self.max_pages, _jump))
-
-    async def prev_page_callback(self, interaction: discord.Interaction):
-        if self.current_page > 1:
-            self.current_page -= 1
-            await self._update_view(interaction)
-
-    async def next_page_callback(self, interaction: discord.Interaction):
-        if self.current_page < self.max_pages:
-            self.current_page += 1
-            await self._update_view(interaction)
-
-    async def select_callback(self, interaction: discord.Interaction):
-        self.current_page = int(interaction.data['values'][0])
-        await self._update_view(interaction)
+    async def back_callback(self, i: discord.Interaction):
+        await i.response.defer()
+        embed = await self.cog.profile_manager._build_profile_manage_embed(self.original_interaction, self.profile_name, target_user_id=self.parent_manage_view.user_id)
+        self.parent_manage_view._build_view()
+        await self.original_interaction.edit_original_response(embed=embed, view=self.parent_manage_view)
 
     async def add_callback(self, interaction: discord.Interaction):
         if self.mode == 'training':
             modal = AddTrainingExampleModal(self.cog, self.user_id, self.profile_name, self.guild_id)
-        else: # ltm
+        else:
             modal = AddLtmModal(self.cog, self.user_id, self.profile_name, self.guild_id)
-        
+
         original_on_submit = modal.on_submit
         async def on_submit_refresh(i: discord.Interaction):
             await original_on_submit(i)
-            if not i.response.is_done(): await i.response.defer()
-            self.current_page = self.max_pages + 1 # Go to the new item
-            await self._update_view(self.original_interaction)
-        
+            # Newest first, so the new entry heads page one -- of the server it was
+            # filed under, which is the one this screen was opened in.
+            self.page, self.open_id, self.search_term = 0, None, None
+            if self.mode == 'ltm' and self.guild_id:
+                self.server_id = str(self.guild_id)
+            await self._refresh()
         modal.on_submit = on_submit_refresh
         await interaction.response.send_modal(modal)
 
     async def edit_callback(self, interaction: discord.Interaction):
-        if not self.current_item_id: return
-        
-        item_to_edit = next((item for item in self.full_data_list if item.get("id") == self.current_item_id), None)
-        modal = None
-        if item_to_edit:
-            if self.mode == 'training':
-                modal = EditTrainingExampleModal(self.cog, self.user_id, self.profile_name, self.current_item_id, self.cog.storage_manager._decrypt_data(item_to_edit.get("u_in", "")), self.cog.storage_manager._decrypt_data(item_to_edit.get("b_out", "")), self.guild_id)
-            else: # ltm
-                modal = EditLtmModal(self.cog, self.user_id, self.profile_name, self.current_item_id, self.cog.storage_manager._decrypt_data(item_to_edit.get("sum", "")))
-        
-        if modal:
-            original_on_submit = modal.on_submit
-            async def on_submit_refresh(i: discord.Interaction):
-                await original_on_submit(i)
-                if not i.response.is_done(): await i.response.defer()
-                await self._update_view(self.original_interaction)
-            modal.on_submit = on_submit_refresh
-            await interaction.response.send_modal(modal)
-        else:
+        item = self._opened()
+        if not item:
             await interaction.response.send_message("Could not find the selected item to edit.", ephemeral=True)
+            return
+        if self.mode == 'training':
+            modal = EditTrainingExampleModal(self.cog, self.user_id, self.profile_name, item["id"],
+                                             item.get("u_in", ""), item.get("b_out", ""), self.guild_id)
+        else:
+            modal = EditLtmModal(self.cog, self.user_id, self.profile_name, item["id"], item.get("sum", ""))
+        original_on_submit = modal.on_submit
+        async def on_submit_refresh(i: discord.Interaction):
+            await original_on_submit(i)
+            await self._refresh()
+        modal.on_submit = on_submit_refresh
+        await interaction.response.send_modal(modal)
+
+    async def _confirm_delete(self, interaction: discord.Interaction, ids: List[str], prompt: str):
+        async def confirm(i: discord.Interaction):
+            mm = self.cog.memory_manager
+            delete = mm.delete_ltms if self.mode == 'ltm' else mm.delete_training_examples
+            gone = await delete(self.user_id, self.profile_name, ids)
+            await i.response.edit_message(content=f"Deleted {gone} item(s)." if gone else "Nothing was found to delete.",
+                                          view=None, embed=None)
+            await self._refresh()
+        await interaction.response.send_message(prompt, view=build_confirm_view(f"Delete {len(ids)}", confirm),
+                                                ephemeral=True)
 
     async def delete_callback(self, interaction: discord.Interaction):
-        if not self.current_item_id: return
-        
-        async def confirm_delete(i: discord.Interaction):
-            user_id_str = str(self.user_id)
-            deleted = False
-            item_id_to_delete = self.current_item_id
-            if self.mode == 'training':
-                training_shard = self.cog.memory_manager._load_training_shard(user_id_str, self.profile_name) or []
-                new_list = [item for item in training_shard if item.get("id") != item_id_to_delete]
-                if len(new_list) < len(training_shard):
-                    self.cog.memory_manager._save_training_shard(user_id_str, self.profile_name, new_list)
-                    deleted = True
-            else: # ltm
-                # Always the guild bucket: it is the only one there is. Keying this
-                # off self.guild_id sent every deletion opened from a DM at a "dm"
-                # bucket that no longer exists, so it silently found nothing.
-                context_type = "guild"
-                ltm_shard = self.cog.memory_manager._load_ltm_shard(user_id_str, self.profile_name)
-                if ltm_shard:
-                    data_list = ltm_shard.get(context_type, [])
-                    new_list = [item for item in data_list if item.get("id") != item_id_to_delete]
-                    if len(new_list) < len(data_list):
-                        ltm_shard[context_type] = new_list
-                        self.cog.memory_manager._save_ltm_shard(user_id_str, self.profile_name, ltm_shard)
-                        deleted = True
+        if self.open_id:
+            await self._confirm_delete(interaction, [self.open_id],
+                                       f"**Delete `{self.open_id}`?** This is permanent.")
 
-            if deleted:
-                await i.response.edit_message(content=f"Item `{item_id_to_delete}` deleted.", view=None, embed=None)
-                self.current_page = max(1, self.current_page - 1)
-                await self._update_view(self.original_interaction)
-            else:
-                await i.response.edit_message(content="Could not find item to delete.", view=None, embed=None)
+    async def delete_selected_callback(self, interaction: discord.Interaction):
+        # A page control picked beside entries is ignored: the deletion is what was meant,
+        # and it still waits on a confirmation. Select All outranks Select Page, which
+        # outranks single picks -- each already includes the next.
+        values = list(interaction.data['values'])
+        items = self._visible()
+        if SELECT_ALL in values:
+            what = f"matching `{self.search_term}` " if self.search_term else ""
+            where = f"from '{self._server_name(self.server_id)}' " if self.mode == 'ltm' else ""
+            await self._confirm_delete(
+                interaction, [e["id"] for e in items if e.get("id")],
+                f"**Delete all {len(items)} {what}{where}for '{self.profile_name}'?** This is permanent.")
+            return
+        if SELECT_PAGE in values:
+            ids = [e["id"] for e in items[self.page * DATA_PAGE_SIZE:(self.page + 1) * DATA_PAGE_SIZE]
+                   if e.get("id")]
+        else:
+            ids = [v for v in values if v not in PAGE_NAV_VALUES]
+        if not ids:
+            await self._turn_page(interaction, values[0])
+            return
+        await self._confirm_delete(interaction, ids, f"**Delete {len(ids)} selected item(s)?** This is permanent.")
 
-        confirm_view = build_confirm_view("Confirm Deletion", confirm_delete)
-        await interaction.response.send_message(f"**Are you sure you want to delete item `{self.current_item_id}`?**", view=confirm_view, ephemeral=True)
-
-    async def search_callback(self, interaction: discord.Interaction):
-        modal = SearchDataModal(self)
-        await interaction.response.send_modal(modal)
+    async def run_test(self, interaction: discord.Interaction, query: str):
+        """Test recall / Test match: the stored entries nearest `query`, scored, against
+        the profile's own threshold -- which is what decides what a turn is sent."""
+        if not self.cog.storage_manager._embedding_routes(interaction.guild_id, self.user_id):
+            await interaction.followup.send(NO_EMBEDDING_KEY_MSG, ephemeral=True)
+            return
+        mm = self.cog.memory_manager
+        cfg = self.cog.profile_manager._get_profile_config(self.user_id, self.profile_name, self.is_borrowed) or {}
+        if self.mode == 'ltm':
+            ranked = await mm.rank_ltms(self.user_id, self.profile_name, self.server_id, query, interaction.guild_id)
+            threshold = float(cfg.get("ltm_relevance_threshold", 0.75))
+            size = int(cfg.get("ltm_context_size", 3))
+            note = (f"Threshold {threshold} · up to {size} per turn. A turn also skips memories it "
+                    "recalled recently, and prefers ones that differ from each other.")
+            text = lambda e: self.cog.storage_manager._decrypt_data(e.get("sum", ""))
+        else:
+            ranked = await mm.rank_training_examples(self.user_id, self.profile_name, query, interaction.guild_id)
+            threshold = float(cfg.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD))
+            size = int(cfg.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE))
+            note = f"Threshold {threshold} · up to {size} per turn."
+            text = lambda e: self.cog.storage_manager._decrypt_data(e.get("u_in", ""))
+        if ranked is None:
+            await interaction.followup.send(EMBEDDING_FAILED_MSG, ephemeral=True)
+            return
+        lines = [f"{'✅' if sim >= threshold else '▫️'} `{sim:.2f}` {_clip(text(e), 150)}"
+                 for sim, e in ranked]
+        embed = discord.Embed(title="Test Recall" if self.mode == 'ltm' else "Test Match",
+                              description=f"> {_clip(query, 200)}\n\n" + ("\n".join(lines) or "Nothing stored here to match."),
+                              color=discord.Color.dark_teal())
+        embed.set_footer(text=note)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 class AnalyseExamplesModal(ui.Modal, title="Analyse Training Examples"):
     def __init__(self, parent_view: 'DataManageView'):
@@ -598,7 +589,7 @@ class AnalyseExamplesModal(ui.Modal, title="Analyse Training Examples"):
         self.parent_view = parent_view
         self.count_input = ui.TextInput(label="Number of Examples to Process", placeholder="Default: 10", default="10", required=True, min_length=1, max_length=3)
         self.verbosity_input = ui.TextInput(label="Target Verbosity (50 - 3000 chars)", placeholder="Default: 800", default="800", required=True, min_length=2, max_length=4)
-        self.model_input = ui.TextInput(label="Analysis Model", placeholder="Default: GOOGLE/gemini-2.5-flash-lite", default="GOOGLE/gemini-2.5-flash-lite", required=True)
+        self.model_input = ui.TextInput(label="Analysis Model (optional)", placeholder="Blank: this profile's LTM model, with fallback", required=False)
         self.add_item(self.count_input)
         self.add_item(self.verbosity_input)
         self.add_item(self.model_input)
@@ -611,13 +602,15 @@ class AnalyseExamplesModal(ui.Modal, title="Analyse Training Examples"):
             
             if not (50 <= verbosity <= 3000): raise ValueError("Verbosity out of range.")
             if count < 1: raise ValueError("Count too low.")
-            if not (model_name.upper().startswith("GOOGLE/") or model_name.upper().startswith("OPENROUTER/")):
+            if model_name and not model_name.upper().startswith(("GOOGLE/", "OPENROUTER/")):
                 raise ValueError("Model must start with GOOGLE/ or OPENROUTER/.")
         except ValueError as e:
             await interaction.response.send_message(f"❌ **Invalid Input:** {suppress_link_previews(str(e))}", ephemeral=True); return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.parent_view.cog.memory_manager._execute_training_analysis(interaction, self.parent_view.profile_name, count, verbosity, model_name)
+        await self.parent_view.cog.memory_manager._execute_training_analysis(
+            interaction, self.parent_view.user_id, self.parent_view.profile_name, count, verbosity,
+            model_name or None)
 
 class PrivacyDashboardView(BlockedGuard, ui.View):
     # Open to a blocked user. Export and deletion are theirs whatever their standing --

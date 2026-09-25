@@ -476,7 +476,7 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         return row + (len(tabs) + _TAB_BUTTONS_PER_ROW - 1) // _TAB_BUTTONS_PER_ROW
 
     def _build_models_step(self):
-        if self.category in self._GOOGLE_ONLY_CATEGORIES:
+        if self.view_mode == "ollama" and self.category in self._NO_OLLAMA_CATEGORIES:
             self.view_mode = "google"
         self._add_category_select(0)
         for offset, (key, wording, _default) in enumerate(self._CATEGORY_KEYS[self.category]):

@@ -523,7 +523,7 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
 
     _ACTION_LABELS = {
         "_act_prefer_openrouter": ("OpenRouter (recommended)", discord.ButtonStyle.success),
-        "_act_prefer_gemini": ("Google (paid key)", discord.ButtonStyle.secondary),
+        "_act_prefer_gemini": ("Google", discord.ButtonStyle.secondary),
         "_act_paste_key": ("🔑 Paste key", discord.ButtonStyle.success),
         "_act_library": ("🏛️ Browse Library", discord.ButtonStyle.success),
         "_act_generate": ("✨ Generate one", discord.ButtonStyle.primary),

@@ -133,6 +133,18 @@ def _file_uri_cache_put(key, uri: str):
         _file_uri_cache.popitem(last=False)
 
 
+#: Models that refused a built-in tool beside declared functions -- Gemini 2.5 answers
+#: "Tool call context circulation is not enabled", and the combination is Gemini 3's
+#: alone. The refusal is the probe, as for `output_cap`: learnt once, then those models
+#: are sent the functions without the built-in tools. Bounded for the same reason.
+_NO_CIRCULATION: set = set()
+_NO_CIRCULATION_MAX = 64
+
+
+class _RetryWithoutBuiltins(Exception):
+    """Internal signal, as RetryUncapped: redo this call now `_NO_CIRCULATION` knows."""
+
+
 class GoogleRESTModel:
     """Google Gemini over raw REST, satisfying the same adapter interface as
     OpenRouterModel and OllamaModel: generate_content_async(contents,
@@ -260,7 +272,8 @@ class GoogleRESTModel:
         for p in raw_parts:
             if isinstance(p, str):
                 parts.append({"text": p})
-            elif isinstance(p, dict) and ('function_call' in p or 'function_response' in p):
+            elif isinstance(p, dict) and ('function_call' in p or 'function_response' in p
+                                          or 'verbatim' in p):
                 # A tool loop's own bookkeeping, echoed back so the model sees the call
                 # it made and the answer it got. Translated rather than passed through:
                 # the neutral spelling is shared with OpenRouter, which needs whole
@@ -552,13 +565,27 @@ class GoogleRESTModel:
                 payload["safetySettings"] = safety
 
             tools = self._build_tools()
+            circulating = False
             if tools:
+                declares = any(isinstance(t, dict) and "functionDeclarations" in t for t in tools)
+                if declares and self.model_name in _NO_CIRCULATION:
+                    # The functions win: the prompt describes them, and a character told
+                    # of a function it was not sent narrates a lookup it cannot run.
+                    tools = [t for t in tools if isinstance(t, dict) and "functionDeclarations" in t]
                 payload["tools"] = tools
+                tool_config = {}
+                # A built-in tool (google_search, url_context) beside declared functions
+                # is refused outright on Gemini 3 -- a 400 on every turn of a Native
+                # profile with `recall` on -- unless the request opts in. The parts it
+                # then answers in must go back verbatim: see `model_parts`.
+                if declares and len(tools) > 1:
+                    tool_config["includeServerSideToolInvocations"] = circulating = True
                 # Only where functions are declared: the mode governs them alone, and
                 # a request carrying nothing but google_search has none to forbid.
-                if calls_forbidden(generation_config) and any(
-                        isinstance(t, dict) and "functionDeclarations" in t for t in tools):
-                    payload["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
+                if declares and calls_forbidden(generation_config):
+                    tool_config["functionCallingConfig"] = {"mode": "NONE"}
+                if tool_config:
+                    payload["toolConfig"] = tool_config
 
             gen_cfg = self._build_generation_config(generation_config)
             if gen_cfg:
@@ -594,6 +621,14 @@ class GoogleRESTModel:
                         detail = (await response.aread()).decode('utf-8', 'replace')
                         if capped and refused_output_cap(self.model_name, response.status_code, detail):
                             raise RetryUncapped()
+                        if (circulating and response.status_code == 400
+                                and "context circulation" in detail.lower()
+                                and len(_NO_CIRCULATION) < _NO_CIRCULATION_MAX):
+                            _NO_CIRCULATION.add(self.model_name)
+                            print(f"{self.model_name} cannot take a built-in tool beside declared "
+                                  f"functions; retrying without Native search/URL context and "
+                                  f"remembering.")
+                            raise _RetryWithoutBuiltins()
                         raise Exception(f"Google API Error {response.status_code}: {detail}")
 
                     async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK_BYTES):
@@ -603,7 +638,7 @@ class GoogleRESTModel:
         except httpx.RequestError as e:
             extractor.cleanup()
             raise Exception(f"Google API Network Error: {str(e)}")
-        except RetryUncapped:
+        except (RetryUncapped, _RetryWithoutBuiltins):
             extractor.cleanup()
             return await self.generate_content_async(contents, generation_config, stream_state)
         except BaseException:
@@ -666,6 +701,14 @@ class GoogleRESTResponse:
         self.function_calls = from_google_parts(
             self.candidates[0].content.parts
             if self.candidates and self.candidates[0].content else None)
+        #: The candidate's parts exactly as they came, for a tool loop to send back.
+        #: Gemini 3 signs its parts (`thoughtSignature`), and with a built-in tool
+        #: beside declared functions it also answers in `toolCall`/`toolResponse` parts
+        #: of its own. A turn rebuilt from each call's name and args drops all of that,
+        #: and the next request is refused.
+        first = (body.get("candidates") or [{}])[0]
+        self.model_parts = ((first.get("content") or {}).get("parts") or []) \
+            if self.function_calls else []
 
         self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
 

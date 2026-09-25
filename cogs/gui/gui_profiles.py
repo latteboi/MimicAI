@@ -18,8 +18,8 @@ from ..utils.helpers import (
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
     resolve_unreadable_media_mode,
 )
-from ..utils.user_defaults import final_fallback_enabled, setting_label
-from ..utils.birthdays import MONTH_NAMES, format_birthday, parse_birthday, valid_birthday
+from ..utils.user_defaults import final_fallback_enabled, model_provider, setting_label
+from ..utils.birthdays import MONTH_NAMES, parse_birthday, valid_birthday
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -267,19 +267,18 @@ class _Screen:
     operations (rename, duplicate, delete, the data managers) are not settings at all.
     """
 
-    __slots__ = ("controls", "modal", "modal_label", "sub_view", "note")
+    __slots__ = ("controls", "modal", "modal_label", "note", "when")
 
     def __init__(self, *controls, modal=None, modal_label="Edit values…",
-                 sub_view=None, note=None):
+                 note=None, when=None):
         self.controls = tuple(controls)
         self.modal = modal
         self.modal_label = modal_label
-        #: (button label, row handler) for a screen that also opens a purpose-built
-        #: picker. The handler has the same shape as `_Action.run` and is called with
-        #: the parent dashboard, so the timezone picker is reached the same way it
-        #: always was rather than being reimplemented as controls.
-        self.sub_view = sub_view
         self.note = note
+        #: Config predicate for a screen behind an on switch. While it is false the
+        #: screen offers only its first control -- that switch -- and Back: a speed or a
+        #: scope for a feature that is off is a setting nothing reads.
+        self.when = when
 
     @property
     def choices(self):
@@ -296,8 +295,6 @@ def _write_profile_config(cog, user_id: str, profile_name: str, is_borrowed: boo
 
     The invalidation is what makes a setting take effect mid-session: a cached model
     instance carries the system instruction and sampling parameters it was built with.
-    Copied out of _save_and_refresh, which is now one caller of this rather than the
-    only place that knew to do it.
     """
     target = cog.profile_manager._get_profile_config(user_id, profile_name, is_borrowed)
     if target is None:
@@ -545,6 +542,30 @@ def _to_personal(view):
             and view.is_system)
 
 
+# Config gates. A row whose feature is off, or whose provider ignores it, is a setting
+# nothing reads, so it waits for the feature. `view.config` is read once per
+# `_build_view`; the two plain predicates also serve as screens' `when`.
+def _images_on(config): return bool(config.get("image_generation_enabled"))
+def _tts_on(config):    return bool(config.get("speech_tts_enabled"))
+def _providers(view, key):
+    """Every provider `key`'s chain can reach, Final Fallback included."""
+    primary, rest = view.cog.api_service.model_chain(view.config, key, view.user_id)
+    return {model_provider(m) for m in (primary, *rest)}
+def _images(view): return _images_on(view.config)
+def _voice(view):  return _tts_on(view.config)
+# OpenRouter image models take no sampling; language and the Director's Desk reach
+# Gemini voices only; Google ignores the advanced sampling keys.
+def _gemini_images(view):
+    return _images(view) and "gemini" in _providers(view, "image_generation_model")
+def _gemini_tts(view): return _voice(view) and "gemini" in _providers(view, "speech_model")
+def _own_gemini_tts(view): return _own(view) and _gemini_tts(view)
+def _not_google(view): return bool(_providers(view, "primary_model") - {"gemini"})
+# Lexical is a local scan: only Full sends the prompt.
+def _own_full_critic(view):
+    return _own(view) and resolve_critic_settings(view.config)["mode"] == "full"
+def _own_ltm_creating(view): return _own(view) and bool(view.config.get("ltm_creation_enabled"))
+
+
 # --- Dashboard field renderers ------------------------------------------------
 #
 # One per setting, declared beside the action that changes it and pulled into the
@@ -582,23 +603,6 @@ _url_mode = resolve_url_mode
 
 
 
-
-
-def _render_thinking(ctx):
-    config = ctx["config"]
-    # Resolved per slot and per role rather than read raw, so this reports what a round
-    # will actually run at: an unset utility slot is low/512 rather than the response
-    # slot's high, and an unset fallback is whatever its primary came out as.
-    lines = [f"Summary: {_flag(str(config.get('thinking_summary_visible', 'off')).lower() == 'on')}"]
-    for value, label, _desc in THINKING_SLOT_LABELS:
-        parts = []
-        for role in ("primary", "fallback"):
-            resolved = resolve_thinking_params(config, value, role)
-            budget = resolved["thinking_budget"]
-            parts.append(f"`{resolved['thinking_level'].title()}`"
-                         f"/`{'Dyn' if budget == -1 else budget}`")
-        lines.append(f"{label}: " + " \u2192 ".join(parts))
-    return "Thinking / Reasoning", "\n".join(lines), True
 
 
 #: Stands in for "send no mediaResolution at all" wherever a Discord select needs a
@@ -702,14 +706,6 @@ def _render_response_mode(ctx):
     return "Response Mode", f"`{raw.replace('_', ' ').title()}`", True
 
 
-def _render_time(ctx):
-    return "Timezone", f"Zone: `{ctx['config'].get('timezone', 'UTC')}`", True
-
-
-def _render_birthday(ctx):
-    return "Birthday", f"`{format_birthday(ctx['prompts'].get('birthday')) or 'Not set'}`", True
-
-
 def _render_typing(ctx):
     config = ctx["config"]
     if not config.get("realistic_typing_enabled", False):
@@ -778,7 +774,7 @@ def _render_memory(ctx):
     # existed reads as what it actually does.
     return "Memory", (
         f"Auto-Creation: {_flag(config.get('ltm_creation_enabled', False))} "
-        f"· every `{config.get('ltm_creation_interval', 10)}` msgs\n"
+        f"· every `{config.get('ltm_creation_interval', 10)}` replies\n"
         f"Auto-Recall: {_flag(ltm_auto_recall_enabled(config))} "
         f"· `{config.get('ltm_context_size', 3)}` @ `{config.get('ltm_relevance_threshold', 0.75)}`\n"
         f"Memory Search: {_flag(config.get('ltm_recall_tool_enabled', False))}"
@@ -894,7 +890,7 @@ PROFILE_ACTIONS = (
     # Identity, so it is stored with the persona and a borrow reads the original's. No
     # bulk form: one birthday stamped onto forty characters means nothing.
     _Action("birthday", "persona", "Set Birthday", "Set the character's birthday, and the year if it has one.",
-            _method("_act_birthday"), _own, render=_render_birthday),
+            _method("_act_birthday"), _own),
 
     # --- Params ---
     _Action("models", "params", "Set Models", "Choose Primary and Fallback AI models.",
@@ -931,7 +927,7 @@ PROFILE_ACTIONS = (
             bulk=_Bulk(_bulk_modal("ProfileParamsModal"), scope="all",
                        keys=("temperature", "top_p", "top_k", "stm_length"))),
     _Action("adv_params", "params", "Set Advanced Parameters (OPENROUTER)", "Set penalties, Min P, and Top A.",
-            _modal("ProfileAdvancedParamsModal"),
+            _modal("ProfileAdvancedParamsModal"), _not_google,
             bulk=_Bulk(_bulk_modal("ProfileAdvancedParamsModal"), scope="all",
                        keys=("frequency_penalty", "presence_penalty", "repetition_penalty",
                              "min_p", "top_a"))),
@@ -941,7 +937,7 @@ PROFILE_ACTIONS = (
     # the response slot, which was the whole problem.
     _Action("thinking_params", "params", "Set Thinking Parameters",
             "Set reasoning effort and budget, per model slot.",
-            _method("_act_thinking", wants_profile=True), render=_render_thinking,
+            _method("_act_thinking", wants_profile=True),
             bulk=_Bulk(_bulk_sub("ThinkingApplyView"), scope="all",
                        description="Stage reasoning effort and budget per slot.",
                        keys=THINKING_ALL_KEYS)),
@@ -964,8 +960,7 @@ PROFILE_ACTIONS = (
                 note="This is what the model spends reading media **you send it** -- the "
                      "opposite direction from the image size on the Images tab, which is "
                      "about what an image model draws. Google honours it exactly; "
-                     "OpenRouter gets the nearest of its two `detail` steps; Ollama has no "
-                     "equivalent and ignores it."),
+                     "OpenRouter gets the nearest of its two `detail` steps."),
             bulk=_Bulk(_bulk_choice(
                            "Select input media resolution...",
                            [(label, value or _MEDIA_RES_DEFAULT, desc)
@@ -1017,15 +1012,15 @@ PROFILE_ACTIONS = (
                 "grounding_mode", "Grounding",
                 (("Off", "off", "No web search."),
                  ("RAG", "tool", "The character searches when a reply needs a fact it lacks."),
-                 ("Native", "native", "Provider-side Google Search. Google models only."),
+                 ("Native", "native", "The model's own provider searches. Google or OpenRouter."),
                  ("Legacy RAG", "rag", "A second model decides and searches before every round.")),
                 read=_grounding_mode, placeholder="Grounding mode..."),
                 note="-# **RAG** costs nothing on the turns nobody searches, and the researcher "
                      "is sent one query rather than the conversation. **Legacy RAG** pays a call "
                      "every round to ask whether a search is needed, and the answer is almost "
                      "always no.\n"
-                     "-# **Native** is a Google-side tool; Ollama can carry neither it nor RAG, "
-                     "so an Ollama profile has **Legacy RAG** alone. This grounds replies; "
+                     "-# **Native** searches through the model's own provider, Google or OpenRouter. "
+                     "This grounds replies; "
                      "images have their own setting in **Set Image Output**."),
             bulk=_Bulk(_bulk_choice("Select Grounding Mode...",
                                     [("Off", "off"), ("RAG", "tool"), ("Native", "native"),
@@ -1041,12 +1036,11 @@ PROFILE_ACTIONS = (
             screen=_Screen(_Choice(
                 "url_mode", "URL Context",
                 (("Off", "off", "Links posted in chat are ignored."),
-                 ("Native", "native", "Provider-side URL fetching. Google models only."),
+                 ("Native", "native", "The model's own provider opens links. Google or OpenRouter."),
                  ("RAG", "rag", "Fetch and scrape the page. Works on any provider.")),
                 read=_url_mode,
                 to_payload=lambda v: {"url_mode": v, "url_fetching_enabled": v == "rag"},
-                placeholder="URL context mode..."),
-                note="-# OpenRouter and Ollama models must use **RAG**; Native is a Google-side tool."),
+                placeholder="URL context mode...")),
             bulk=_Bulk(_bulk_choice("Select URL Mode...",
                                     [("Off", "off"), ("Native", "native"), ("RAG", "rag")],
                                     to_payload=lambda v: {"url_mode": v,
@@ -1074,11 +1068,12 @@ PROFILE_ACTIONS = (
     # picker directly. The on/off toggle that used to sit on a screen here is retired with
     # `time_tracking_enabled`, which nothing reads any more.
     _Action("time", "tools", "Set Timezone", "Set the timezone the character's clock runs on.",
-            _method("_handle_timezone", wants_profile=True, wants_borrowed=True), render=_render_time,
+            _method("_handle_timezone", wants_profile=True, wants_borrowed=True),
             bulk=_Bulk(_bulk_sub("BulkTimezoneView"), scope="all", keys=("timezone",))),
     _Action("typing", "tools", "Realistic Typing", "Enable a human-like delay when the bot sends messages.",
             _open_screen("typing"), render=_render_typing,
             screen=_Screen(
+                _Toggle("realistic_typing_enabled", "Realistic Typing"),
                 _Choice("typing_mode", "Chunking",
                         (("Sentence", "sentence", "Split the reply on sentence boundaries."),
                          ("Line", "line", "Split the reply on line breaks.")),
@@ -1092,8 +1087,8 @@ PROFILE_ACTIONS = (
                                         if str(c.get("typing_cursor") or DEFAULT_TYPING_CURSOR).lower()
                                         in TYPING_CURSOR_MODES else DEFAULT_TYPING_CURSOR),
                         placeholder="Typing cursor..."),
-                _Toggle("realistic_typing_enabled", "Realistic Typing"),
                 modal="ProfileTypingSettingsModal", modal_label="Edit speed…",
+                when=lambda c: bool(c.get("realistic_typing_enabled")),
                 note="-# The cursor is this profile's placeholder emoji, parked on the "
                      "message between edits and removed by the last one."),
             bulk=_Bulk(_bulk_modal("ProfileTypingSettingsModal"), scope="all",
@@ -1121,7 +1116,8 @@ PROFILE_ACTIONS = (
                          ("Strict", "strict", "Short repeated phrases count.")),
                         read=lambda c: resolve_critic_settings(c)["strictness"],
                         placeholder="Critic strictness..."),
-                modal="ProfileCriticSettingsModal", modal_label="Edit lookback & persistence…"),
+                modal="ProfileCriticSettingsModal", modal_label="Edit lookback & persistence…",
+                when=lambda c: resolve_critic_settings(c)["mode"] != "off"),
             bulk=_Bulk(_bulk_modal("ProfileCriticSettingsModal"), scope="all",
                        label="Configure Anti-Repetition Critic",
                        description="Set mode, scope, strictness, lookback and persistence.",
@@ -1129,7 +1125,7 @@ PROFILE_ACTIONS = (
                              "critic_strictness", "critic_lookback", "critic_persistence"))),
     _Action("critic_instructions", "tools", "Set Critic Instructions",
             "Customise the prompt the critic screens replies with.",
-            _method("_act_critic_instructions", wants_profile=True), _own,
+            _method("_act_critic_instructions", wants_profile=True), _own_full_critic,
             bulk=_Bulk(_bulk_modal("ProfileCriticInstructionsModal",
                                    action_key="update_prompts", pass_borrowed=False,
                                    seed=lambda c: c.profile_manager._default_critic_instructions()),
@@ -1140,7 +1136,8 @@ PROFILE_ACTIONS = (
     _Action("neuro", "tools", "Neuro-Endocrine Engine", "Simulate hormonal states for dynamic emotions.",
             _open_screen("neuro"), render=_render_neuro,
             screen=_Screen(_Toggle("neuro_engine_enabled", "Neuro Engine"),
-                           modal="ProfileNeuroModal", modal_label="Edit hormones…"),
+                           modal="ProfileNeuroModal", modal_label="Edit hormones…",
+                           when=lambda c: bool(c.get("neuro_engine_enabled"))),
             bulk=_Bulk(_bulk_modal("ProfileNeuroModal"), scope="all",
                        keys=("neuro_engine_enabled", "neuro_state"))),
     _Action("help_mode", "tools", "Help Mode (Guide RAG)", "Allow profile to answer technical bot questions.",
@@ -1156,7 +1153,8 @@ PROFILE_ACTIONS = (
     _Action("image_toggle", "images", "Image Generation", "Allow this profile to generate images via !image/!imagine.",
             _open_screen("image_toggle"), render=_render_image_toggle,
             screen=_Screen(_Toggle("image_generation_enabled", "Image Generation"),
-                           modal="ProfileImageGenSettingsModal", modal_label="Edit prompt…"),
+                           modal="ProfileImageGenSettingsModal", modal_label="Edit prompt…",
+                           when=_images_on),
             bulk=_Bulk(_bulk_modal("ProfileImageGenSettingsModal", action_key="update_both"),
                        scope="all", label="Configure Image Generation",
                        description="Set up models, prompts, and toggles for multiple profiles.",
@@ -1164,13 +1162,13 @@ PROFILE_ACTIONS = (
                        prompt_keys=("image_generation_prompt",))),
     _Action("image_output", "images", "Set Image Output",
             "Set aspect ratio, resolution, quality, thinking level and search grounding.",
-            _method("_act_image_output", wants_profile=True),
+            _method("_act_image_output", wants_profile=True), _images,
             bulk=_Bulk(_bulk_sub("ImageOutputApplyView"), scope="all", label="Set Image Output",
                        description="Stage aspect ratio, resolution, quality, thinking level and grounding.",
                        keys=IMAGE_OUTPUT_KEYS)),
     _Action("image_sampling", "images", "Set Image Sampling",
             "Temperature, Top P and Top K for the image model.",
-            _modal("ProfileImageSamplingModal"),
+            _modal("ProfileImageSamplingModal"), _gemini_images,
             bulk=_Bulk(_bulk_modal("ProfileImageSamplingModal"), scope="all",
                        label="Set Image Sampling",
                        description="Stage temperature, Top P and Top K for the image slot.",
@@ -1181,17 +1179,18 @@ PROFILE_ACTIONS = (
             "Turn TTS on or off, and set its temperature and speed.",
             _open_screen("speech_settings"), render=_render_speech,
             screen=_Screen(_Toggle("speech_tts_enabled", "TTS"),
-                           modal="ProfileSpeechSettingsModal", modal_label="Edit temperature & speed…"),
+                           modal="ProfileSpeechSettingsModal", modal_label="Edit temperature & speed…",
+                           when=_tts_on),
             bulk=_Bulk(_bulk_modal("ProfileSpeechSettingsModal"), scope="all",
                        keys=("speech_tts_enabled", "speech_temperature", "speech_speed"))),
     _Action("voice", "audio", "Choose TTS Voice", "Pick a voice from the ones its speech model offers.",
-            _method("_act_voice", wants_profile=True),
+            _method("_act_voice", wants_profile=True), _voice,
             bulk=_Bulk(_bulk_sub("VoiceApplyView"), scope="all", label="Choose TTS Voice",
                        description="Stage a voice for the TTS model staged in Set Models.",
                        keys=("speech_voice",), needs=("speech_model",))),
     _Action("speech_language", "audio", "Set TTS Language",
             "Pin the language a Gemini voice speaks, or let it detect one.",
-            _open_screen("speech_language"), render=_render_speech_language,
+            _open_screen("speech_language"), _gemini_tts, render=_render_speech_language,
             screen=_Screen(
                 _Choice("speech_language", "Language", _SPEECH_LANGUAGE_CHOICES,
                         read=lambda c: c.get("speech_language") or _SPEECH_LANGUAGE_AUTO,
@@ -1204,7 +1203,7 @@ PROFILE_ACTIONS = (
     # Owner-only, as it was: the Persona tab it moved from is hidden on a borrow, and that
     # was the only thing keeping a borrower out of it.
     _Action("tts_instructions", "audio", "TTS Instructions", "Configure the 'Director's Desk' for vocal performance.",
-            _modal("ProfileDirectorDeskModal", pass_borrowed=False), _own,
+            _modal("ProfileDirectorDeskModal", pass_borrowed=False), _own_gemini_tts,
             bulk=_Bulk(_bulk_modal("ProfileDirectorDeskModal", pass_borrowed=False),
                        scope="personal",
                        keys=("speech_archetype", "speech_accent", "speech_pacing",
@@ -1254,13 +1253,13 @@ PROFILE_ACTIONS = (
                              "ltm_recall_tool_enabled"),
                        description="Turn auto-creation, automatic recall or memory search "
                                    "on or off.")),
-    _Action("ltm_params", "memory", "Set LTM Parameters", "Set frequency, context, and recall settings.",
+    _Action("ltm_params", "memory", "Set LTM Parameters", "Set creation frequency and recall settings.",
             _modal("ProfileLTMParamsModal", pass_borrowed=False),
             bulk=_Bulk(_bulk_modal("ProfileLTMParamsModal", pass_borrowed=False), scope="all",
-                       keys=("ltm_creation_interval", "ltm_summarization_context",
-                             "ltm_context_size", "ltm_relevance_threshold"))),
+                       keys=("ltm_creation_interval", "ltm_context_size",
+                             "ltm_relevance_threshold"))),
     _Action("ltm_summarization", "memory", "Set LTM Summarization Prompt", "Customize how the AI creates memories.",
-            _method("_act_ltm_summarization", wants_profile=True), _own,
+            _method("_act_ltm_summarization", wants_profile=True), _own_ltm_creating,
             bulk=_Bulk(_bulk_modal("ProfileLTMSummarizationModal",
                                    action_key="update_prompts", pass_borrowed=False,
                                    seed=lambda c: c.profile_manager._default_ltm_summarization_instructions()),
@@ -1365,18 +1364,23 @@ class ProfileManageView(BlockedGuard, ui.View):
 
         is_mod = getattr(self, 'is_mod_view', False)
 
+        # Re-read on every build: the config gates hide rows for features that are off,
+        # and every path that can turn one on comes back through here.
+        self.config = self.cog.profile_manager._get_profile_config(
+            self.user_id, self.profile_name, self.is_borrowed) or {}
+        visible = [a for a in PROFILE_ACTIONS if a.visible(self)]
+
         # A tab with nothing on it is not offered: every row can be gated, so a tab can
         # empty out entirely on a borrowed profile, and the button used to open a screen
         # with no dropdown under it at all.
         valid_tabs = [t for t in PROFILE_TABS
                       if (t != "persona" or not self.is_borrowed)
-                      and any(a.tab == t and a.visible(self) for a in PROFILE_ACTIONS)]
+                      and any(a.tab == t for a in visible)]
         if self.current_tab not in valid_tabs and valid_tabs:
             self.current_tab = valid_tabs[0]
 
         # --- 1. Category Dropdown (Row 0) ---
-        options = [a.option(self) for a in PROFILE_ACTIONS
-                   if a.tab == self.current_tab and a.visible(self)]
+        options = [a.option(self) for a in visible if a.tab == self.current_tab]
 
         if options:
             add_select(self, options, self.dropdown_callback,
@@ -1548,11 +1552,6 @@ class ProfileManageView(BlockedGuard, ui.View):
         view = DataManageView(self.cog, interaction, self.profile_name, self.is_borrowed,
                               mode='training', parent_manage_view=self, target_user_id=self.user_id)
         await view.start()
-        # NOTE: this defer runs *after* start() has already responded, so it raises
-        # InteractionResponded and is swallowed by discord.py's handler. Preserved
-        # verbatim from the pre-refactor branch rather than silently fixed -- see the
-        # note accompanying this refactor.
-        await interaction.response.defer()
 
     async def _act_critic_instructions(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         # Resolved, not read raw: the box has to show what this profile actually screens
@@ -1572,17 +1571,6 @@ class ProfileManageView(BlockedGuard, ui.View):
         await interaction.response.send_modal(modal)
 
     # --- Internal Helpers for UI Flow ---
-
-    async def _save_and_refresh(self, interaction, profile, profile_name, is_borrowed):
-        self.cog.profile_manager._save_profile_config(self.user_id, profile_name, profile, is_borrowed)
-        
-        # [NEW] Hot-Swap: Invalidate model and session caches for this profile immediately
-        # This ensures settings take effect even if a multi-profile session is active.
-        invalidate_model_cache(self.cog, self.user_id, self.profile_name)
-
-        new_embed = await self.cog.profile_manager._build_profile_manage_embed(
-            interaction, profile_name, target_user_id=self.user_id)
-        await interaction.response.edit_message(embed=new_embed, view=self)
 
     async def _handle_content_safety(self, interaction):
         view = ContentSafetyView(self.cog, self.original_interaction, self.profile_name,
@@ -1784,9 +1772,15 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             self.parent.user_id, self.parent.profile_name, self.parent.is_borrowed) or {}
 
     async def embed(self) -> discord.Embed:
-        e = await self.cog.profile_manager.build_function_embed(
-            self.parent.user_id, self.parent.profile_name,
-            self.original_interaction.channel_id, self.action.value)
+        """What the setting is, and where it stands."""
+        e = discord.Embed(title=self.action.menu_label, description=self.action.description,
+                          colour=discord.Colour.blurple())
+        field = self.action.render and self.action.render({
+            "config": self._config, "is_borrowed": self.parent.is_borrowed,
+            "voice_sample": await self.cog.profile_manager.voice_sample_summary(
+                self.parent.user_id, self.parent.profile_name)})
+        if field:
+            e.add_field(name=field[0], value=str(field[1])[:1024], inline=False)
         if self.screen.note:
             e.description = f"{e.description}\n\n{self.screen.note}" if e.description else self.screen.note
         return e
@@ -1800,9 +1794,11 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     def _build_view(self):
         self.clear_items()
         config = self._config
+        live = self.screen.when is None or self.screen.when(config)
+        controls = self.screen.controls if live else self.screen.controls[:1]
 
         row = 0
-        for choice in self.screen.choices:
+        for choice in (c for c in controls if isinstance(c, _Choice)):
             current = choice.read(config)
             options = []
             for option in choice.options:
@@ -1822,22 +1818,16 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
                            placeholder=placeholder, row=row)
                 row += 1
 
-        for toggle in self.screen.toggles:
+        for toggle in (c for c in controls if isinstance(c, _Toggle)):
             on = toggle.read(config)
             add_button(self, f"{toggle.label}: {'On' if on else 'Off'}",
                        self._toggle_callback(toggle, on),
                        style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary,
                        row=row)
 
-        if self.screen.modal:
+        if self.screen.modal and live:
             add_button(self, self.screen.modal_label, self._modal_callback,
                        style=discord.ButtonStyle.primary, row=row)
-
-        if self.screen.sub_view:
-            label, handler = self.screen.sub_view
-            async def sub_callback(interaction: discord.Interaction, _handler=handler):
-                await _handler(self.parent, interaction, self._config)
-            add_button(self, label, sub_callback, style=discord.ButtonStyle.primary, row=row)
 
         add_button(self, "◀ Back", self._back_callback, style=discord.ButtonStyle.secondary,
                    row=row)
@@ -2030,15 +2020,13 @@ def ProfileTrainingParamsModal(cog, profile_name: str, current_params: Dict[str,
 
 def ProfileLTMParamsModal(cog, profile_name: str, current_params: Dict[str, Any], values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     fields = [
-        {"label": "Creation Interval (5-100 msgs)", "custom_id": "ltm_creation_interval", "default": str(current_params.get("ltm_creation_interval", 10)), "required": False, "placeholder": "Default: 10"},
-        {"label": "Summarization Context (5-50 msgs)", "custom_id": "ltm_summarization_context", "default": str(current_params.get("ltm_summarization_context", 10)), "required": False, "placeholder": "Default: 10"},
+        {"label": "Creation Interval (5-100 replies)", "custom_id": "ltm_creation_interval", "default": str(current_params.get("ltm_creation_interval", 10)), "required": False, "placeholder": "Default: 10"},
         {"label": "Recall Context Size (0-10)", "custom_id": "ltm_context_size", "default": str(current_params.get("ltm_context_size", 3)), "required": False, "placeholder": "Default: 3"},
         {"label": "Relevance Threshold (0.0-1.0)", "custom_id": "ltm_relevance_threshold", "default": str(current_params.get("ltm_relevance_threshold", 0.75)), "required": False, "placeholder": "Default: 0.75"}
     ]
     def parser(v):
         c = {}
         c.update(_ranged(v, "ltm_creation_interval", 5, 100, "Interval", _pi))
-        c.update(_ranged(v, "ltm_summarization_context", 5, 50, "Context", _pi))
         c.update(_ranged(v, "ltm_context_size", 0, 10, "Context Size", _pi))
         c.update(_ranged(v, "ltm_relevance_threshold", 0.0, 1.0, "Relevance Threshold"))
         return {"config": c}
@@ -2051,9 +2039,9 @@ def ProfileLTMSummarizationModal(cog, profile_name: str, current_instructions: s
         "custom_id": "ltm_summarization_instructions",
         "style": discord.TextStyle.paragraph,
         "default": decrypted,
-        "required": True,
+        "required": False,
         "max_length": 2000,
-        "placeholder": "The system will automatically append the conversation excerpt to these instructions."
+        "placeholder": "Leave blank for the default. The conversation excerpt is appended automatically."
     }]
     def parser(v):
         default = cog.profile_manager._default_ltm_summarization_instructions()
@@ -2061,7 +2049,8 @@ def ProfileLTMSummarizationModal(cog, profile_name: str, current_instructions: s
         # Stored as absence when it is the default, rather than as a copy of it. Saving
         # the text would pin this profile to today's wording, which is the thing
         # resolve_ltm_summarization_instructions exists to undo -- and a box submitted
-        # unedited is by far the commonest way this screen is used.
+        # unedited is by far the commonest way this screen is used. A blank box is the
+        # same absence, and resolves to the default.
         if is_shipped_ltm_prompt(ins, default):
             ins = ""
         return {"prompts": {"ltm_summarization_instructions": cog.storage_manager._encrypt_data(ins)}}
@@ -2693,13 +2682,9 @@ class ModelPickerMixin(ReportErrorMixin):
         ("ltm", "LTM Summariser", "Turns conversations into long-term memories."),
     )
 
-    #: Categories whose every slot is in GOOGLE_ONLY_MODEL_KEYS. They pin the API
-    #: switch to Google rather than letting a stale mode sit behind a disabled button.
-    #: Grounding attaches the native `google_search` tool, so an OpenRouter id in that slot
-    #: was never honoured -- it resolved to the Google default at call time, which read as
-    #: the picker having accepted the choice. Image and TTS left when OpenRouter's image and
-    #: speech endpoints got adapters; their OpenRouter tabs browse catalogues of their own.
-    _GOOGLE_ONLY_CATEGORIES = ("grounding",)
+    #: Categories whose every slot is in SEARCH_MODEL_KEYS: the model must run a web
+    #: search, which Ollama cannot carry, so the API switch skips Ollama on them.
+    _NO_OLLAMA_CATEGORIES = ("grounding",)
 
     @classmethod
     def display_model(cls, value) -> str:
@@ -2825,8 +2810,7 @@ class ModelPickerMixin(ReportErrorMixin):
 
     def _shows_openrouter_browse(self) -> bool:
         """Whether this screen gives the Browse dropdown a row of its own."""
-        return (self.view_mode == 'openrouter' and self.category not in self._GOOGLE_ONLY_CATEGORIES
-                and getattr(self, "_BROWSE_ROW_AVAILABLE", True))
+        return self.view_mode == 'openrouter' and getattr(self, "_BROWSE_ROW_AVAILABLE", True)
 
     def _openrouter_model_options(self, current_val, target_config_key: str) -> List[discord.SelectOption]:
         catalogue = self._openrouter_catalogue()
@@ -2927,7 +2911,7 @@ class ModelPickerMixin(ReportErrorMixin):
 
         `slots` is (wording, stored value) per model slot on screen.
         """
-        if self.view_mode != 'openrouter' or self.category in self._GOOGLE_ONLY_CATEGORIES:
+        if self.view_mode != 'openrouter':
             return
         catalogue = self._openrouter_catalogue()
         browse = self._openrouter_browse()
@@ -2956,7 +2940,7 @@ class ModelPickerMixin(ReportErrorMixin):
     def _create_model_options(self, current_val: str, target_config_key: str) -> List[discord.SelectOption]:
         if self.view_mode == 'ollama' and not self._may_use_ollama():
             self.view_mode = 'google'
-        if self.view_mode == 'openrouter' and target_config_key not in GOOGLE_ONLY_MODEL_KEYS:
+        if self.view_mode == 'openrouter':
             return self._openrouter_model_options(current_val, target_config_key)
         top_models = self._get_top_models(self.view_mode, target_config_key)
         opts = [discord.SelectOption(label="Custom Model...", value="custom_option", description="Enter manually via modal")]
@@ -2981,10 +2965,7 @@ class ModelPickerMixin(ReportErrorMixin):
         prefix = "GOOGLE/"
         if self.view_mode == 'openrouter': prefix = "OPENROUTER/"
         elif self.view_mode == 'ollama': prefix = "OLLAMA/"
-        
-        if target_config_key in GOOGLE_ONLY_MODEL_KEYS:
-            prefix = "GOOGLE/"
-            
+
         added = len(opts)
         for m in top_models:
             if added >= 25: break
@@ -3022,7 +3003,9 @@ class ModelPickerMixin(ReportErrorMixin):
         leaves room on this row for the fallback-indicator toggle that had a row of its
         own.
         """
-        api_modes = ['google', 'openrouter'] + (['ollama'] if self._may_use_ollama() else [])
+        api_modes = ['google', 'openrouter'] + (
+            ['ollama'] if self._may_use_ollama() and self.category not in self._NO_OLLAMA_CATEGORIES
+            else [])
         api_labels = {'google': 'API: Google', 'openrouter': 'API: OpenRouter', 'ollama': 'API: Ollama (Local)'}
         if self.view_mode not in api_modes:
             self.view_mode = 'google'
@@ -3047,7 +3030,7 @@ class ModelPickerMixin(ReportErrorMixin):
                 self._build_view()
                 await i.edit_original_response(**self._picker_render())
         add_button(self, api_labels[self.view_mode], api_cb, style=discord.ButtonStyle.primary,
-                   row=row, disabled=self.category in self._GOOGLE_ONLY_CATEGORIES)
+                   row=row)
         
         if self.view_mode == 'ollama':
             host_style = discord.ButtonStyle.secondary
@@ -3070,9 +3053,9 @@ class ModelPickerMixin(ReportErrorMixin):
             self._add_openrouter_buttons(row=row)
 
     #: Slots whose models go through an adapter other than chat: OpenRouter's image and
-    #: speech endpoints are adapters of their own and take neither a tier nor a pin, and
-    #: grounding is Google's. Only the chat adapter sends either.
-    _NON_CHAT_MODEL_KEYS = IMAGE_MODEL_KEYS | AUDIO_MODEL_KEYS | GOOGLE_ONLY_MODEL_KEYS
+    #: speech endpoints are adapters of their own and take neither a tier nor a pin. Only
+    #: the chat adapter sends either -- grounding's included, which is built through it.
+    _NON_CHAT_MODEL_KEYS = IMAGE_MODEL_KEYS | AUDIO_MODEL_KEYS
 
     def _tier_applies(self) -> bool:
         """Whether this tab holds a model the tier or a pin can reach.
@@ -3279,7 +3262,7 @@ class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
         self.clear_items()
         data = self._get_current_profile_data()
 
-        if self.category in self._GOOGLE_ONLY_CATEGORIES:
+        if self.view_mode == 'ollama' and self.category in self._NO_OLLAMA_CATEGORIES:
             self.view_mode = 'google'
 
         self._add_category_select(0)
@@ -4130,7 +4113,7 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
 
     def _build_view(self):
         self.clear_items()
-        if self.category in self._GOOGLE_ONLY_CATEGORIES:
+        if self.view_mode == 'ollama' and self.category in self._NO_OLLAMA_CATEGORIES:
             self.view_mode = 'google'
 
         self._add_category_select(0)

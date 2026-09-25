@@ -18,6 +18,7 @@ from ..utils.constants import (
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
     THINKING_LEVELS_TO_OLLAMA, GEMINI_FREE_TIER_BLOCKED, OLLAMA_OWNER_ONLY,
     OPENROUTER_DATA_POLICY_BLOCKED, IMAGE_MODEL_NO_OLLAMA, SPEECH_MODEL_NO_OLLAMA,
+    OPENROUTER_SERVER_TOOLS,
     API_KEY_COOLING_DOWN, NO_MODEL_SET,
 )
 from ..utils.data_policy import openrouter_data_collection
@@ -233,8 +234,9 @@ class APIService:
         `config_owner_id` is the owner of the config that chose this model. Ollama is
         refused unless that is the bot owner, and refused when it is not given.
 
-        `tools` are the Google-only native tools (`google_search`, `url_context`) and go
-        nowhere else. `functions` are the character's own -- the `tool_loop.functions_for`
+        `tools` are the native tools in Google's spelling (`google_search`, `url_context`);
+        OpenRouter is sent its own server tools for the same jobs (OPENROUTER_SERVER_TOOLS)
+        and Ollama nothing. `functions` are the character's own -- the `tool_loop.functions_for`
         tuple the caller also handed the prompt builder -- declared on every provider that
         can carry one, which is why they are a separate argument rather than one list to
         be sorted out downstream. Ollama takes neither. The model keeps the tuple as
@@ -324,7 +326,9 @@ class APIService:
                 return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
             model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params, image_detail=image_detail, service_tier=service_tier, data_collection=data_collection,
                                     endpoint=resolve_openrouter_endpoint(p_settings, actual_name),
-                                    tools=declarations(functions))
+                                    tools=declarations(functions),
+                                    server_tools=[OPENROUTER_SERVER_TOOLS[k] for t in tools or ()
+                                                  for k in t if k in OPENROUTER_SERVER_TOOLS])
             model.functions = tuple(functions)
             return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
         elif is_ollama:
