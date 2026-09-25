@@ -244,7 +244,8 @@ class ToolsService:
 
                 # Strictly handle images and text
                 if content_type.startswith('image/'):
-                    media_parts.append({"url": url, "mime_type": content_type})
+                    # Tagged so a profile with URL Context off is not sent it: `_round_media`.
+                    media_parts.append({"url": url, "mime_type": content_type, "from_link": True})
 
                 elif 'text/html' in content_type:
                     # Streamed with a hard byte cap. Reading .text on an unbounded body
@@ -317,7 +318,7 @@ class ToolsService:
             resolve_thinking_params(p_cfg, "grounding", "fallback" if is_fallback else "primary"),
             [_GOOGLE_SEARCH_TOOL], p_cfg, config_owner_id=owner_id, **(policy or {}))
 
-    async def _get_hybrid_grounding_context(self, user_query: str, guild_id: int, conversation_history: List, mapping_key: Any, safety_settings: Optional[Dict] = None, is_for_image: bool = False, warning_channel: Optional[discord.abc.Messageable] = None) -> Optional[Tuple[str, List[Dict], bool, Optional[str]]]:
+    async def _get_hybrid_grounding_context(self, user_query: str, guild_id: int, conversation_history: List, p_cfg: Optional[Dict[str, Any]], owner_id: Optional[int], safety_settings: Optional[Dict] = None, is_for_image: bool = False, warning_channel: Optional[discord.abc.Messageable] = None) -> Optional[Tuple[str, List[Dict], bool, Optional[str]]]:
         status = "api_error"
         warning_str = None
         # Provisional, for the finally-block log if we fail before resolving the slot.
@@ -379,23 +380,10 @@ class ToolsService:
             payload_template = self.cog.global_prompts.get("GROUNDING_RAG_PAYLOAD", DEFAULT_GROUNDING_RAG_PAYLOAD)
             user_prompt = payload_template.format(transcript=history_transcript, query=user_query)
 
-            # [NEW] Utility Routing Logic for Grounding RAG
-            # Bound up front rather than only inside the session branch: the grounding
-            # phase runs without a resolvable session often enough, and an empty config
-            # is exactly the "use the slot default" case the resolver is built for.
-            p_cfg: Dict[str, Any] = {}
-            owner_id = None
-            session_id = mapping_key[1] if isinstance(mapping_key, tuple) else None
-            if session_id:
-                session = self.cog.multi_profile_channels.get(session_id)
-                if session:
-                    # Just grab the first profile's settings for the RAG model to keep it simple
-                    first_p = session.get("profiles", [])[0] if session.get("profiles") else None
-                    if first_p:
-                        owner_id = first_p["owner_id"]
-                        p_idx = self.cog.profile_manager._get_user_index(first_p["owner_id"])
-                        is_b = first_p["profile_name"] in p_idx.get("borrowed", [])
-                        p_cfg = self.cog.profile_manager._get_profile_config(first_p["owner_id"], first_p["profile_name"], is_b) or {}
+            # The profile whose setting asked for this search: a session's first speaker,
+            # an image's generator. It used to be read off the cast's first seat, which
+            # need not be the one that asked. Empty is the slot default.
+            p_cfg = p_cfg or {}
 
             rag_primary, rag_fallbacks = self.cog.api_service.model_chain(
                 p_cfg, "grounding_rag_model", owner_id)

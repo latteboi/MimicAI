@@ -98,15 +98,19 @@ class TriggerIntakeMixin:
         return joined[:defaultConfig.LIMIT_IMAGE_PROMPT_CHARS]
 
     @staticmethod
-    def _round_media(new_round_turn_data) -> Tuple[List[Dict[str, str]], Optional[str]]:
+    def _round_media(new_round_turn_data, links: bool = True) -> Tuple[List[Dict[str, str]], Optional[str]]:
         """The round's attachments to send with a character's turn, and a note for any left out.
 
         Every attachment in the round used to go to every character: up to ten a message,
         across however many messages the round took in. The newest ROUND_MEDIA_MAX go.
         The rest are counted in the note, because their messages still say something was
         attached.
+
+        `links` False leaves out images fetched off a posted link -- a profile with URL
+        Context off sees nothing a link brought in, as grounding off sees no search.
         """
-        media = [part for _text, _url, turn_media in new_round_turn_data for part in turn_media]
+        media = [part for _text, _url, turn_media in new_round_turn_data for part in turn_media
+                 if links or not part.get("from_link")]
         if len(media) <= ROUND_MEDIA_MAX:
             return media, None
         note = ROUND_MEDIA_SKIPPED_NOTE.format(limit=ROUND_MEDIA_MAX, count=len(media) - ROUND_MEDIA_MAX)
@@ -319,13 +323,6 @@ class TriggerIntakeMixin:
                     "message_ids": [trigger_id],
                     "content": user_line
                 }
-                if url_text_content:
-                    # Clear any previous URL context from the log to make the new one exclusive
-                    for turn in session.get("unified_log", []):
-                        if "url_context" in turn:
-                            del turn["url_context"]
-                    turn_object["url_context"] = url_text_content
-
                 # Where the channel shows it, which for a message sent while the previous
                 # round's last character was still generating is above that reply, not
                 # below it. The reserve has to follow it back, or the round's own user

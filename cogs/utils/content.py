@@ -344,7 +344,7 @@ HELP_CATEGORIES = {
     },
     "6. Tools and Media": {
         "Web Grounding": (
-            "`/profile manage` -> **Tools** -> Grounding (Web Search). Pick **OFF**, **RAG**, **NATIVE** or **LEGACY RAG**.\n\n"
+            "`/profile manage` -> **Tools** -> Grounding (Web Search). Pick **OFF**, **NATIVE**, **RAG** or **LEGACY RAG**.\n\n"
             "• **RAG** -- the character decides. It calls a search when a reply turns on a fact it cannot be sure of, and a background "
             "model runs that one query and reports back. Nothing happens on the turns nobody searches, so most turns cost nothing. "
             "Works on Google and OpenRouter.\n"

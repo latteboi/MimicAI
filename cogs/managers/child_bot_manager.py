@@ -1143,7 +1143,6 @@ class ChildBotManager:
 
             # The image's own search setting, never the profile's chat grounding_mode.
             if image_rag_enabled(profile_data):
-                session_key = (channel_id, owner_id, profile_name)
                 img_session = self.cog.multi_profile_channels.get(channel_id) or {}
                 g_bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
                 history_for_grounding = self.cog.session_manager._build_history_for_participant(
@@ -1151,9 +1150,8 @@ class ChildBotManager:
                     hide_folded=self.cog.session_manager.compaction_enabled(img_session),
                 )
 
-                mapping_key = self.cog.session_manager._get_mapping_key_for_session(session_key, 'multi')
                 ch_obj = self.cog.bot.get_channel(channel_id)
-                grounding_call = self.cog.tools_service._get_hybrid_grounding_context(prompt_text, guild_id, history_for_grounding, mapping_key, is_for_image=True, warning_channel=ch_obj)
+                grounding_call = self.cog.tools_service._get_hybrid_grounding_context(prompt_text, guild_id, history_for_grounding, profile_data, owner_id, is_for_image=True, warning_channel=ch_obj)
                 if ch_obj:
                     grounding_result = await self.cog.generation_service._await_with_status(
                         grounding_call, STATUS_SEARCHING_WEB, ch_obj,

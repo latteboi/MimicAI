@@ -1,5 +1,6 @@
 from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE, STATUS_IMAGINING_IMAGE
-from ...utils.helpers import _format_api_error, _resolve_safety_settings, image_suffix_for_mime
+from ...utils.helpers import (_format_api_error, _resolve_safety_settings, image_suffix_for_mime,
+                             resolve_url_mode)
 from ...utils.memory_tuning import maybe_trim_malloc
 from ...utils import mem_probe
 
@@ -69,9 +70,12 @@ class ImageRoundMixin:
                     final_prompt_text = appearance_template.format(appearance=appearance_text.strip(), prompt=image_gen_prompt)
 
             ref_images = []
+            # A linked image is the generator's to draw from only with its URL Context on.
+            links = resolve_url_mode(gen_cfg) != "off"
             for _, _, turn_media in new_round_turn_data:
                 for media in turn_media:
-                    if media.get("mime_type", "").startswith("image/"):
+                    if (media.get("mime_type", "").startswith("image/")
+                            and (links or not media.get("from_link"))):
                         ref_images.append(media)
 
             parts = [final_prompt_text]

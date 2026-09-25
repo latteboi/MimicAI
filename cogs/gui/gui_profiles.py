@@ -999,7 +999,7 @@ PROFILE_ACTIONS = (
                        keys=("unreadable_media_mode",))),
     # --- Tools ---
     _Action("grounding", "tools", "Grounding (Web Search)",
-            "Choose Off, RAG, Native or Legacy RAG web search.",
+            "Choose Off, Native, RAG or Legacy RAG web search.",
             _open_screen("grounding"), render=_render_grounding,
             # A select, not the old three-way cycle: going Off -> Native -> RAG -> Off
             # meant two clicks to reach RAG and no indication that Native is
@@ -1011,8 +1011,8 @@ PROFILE_ACTIONS = (
             screen=_Screen(_Choice(
                 "grounding_mode", "Grounding",
                 (("Off", "off", "No web search."),
-                 ("RAG", "tool", "The character searches when a reply needs a fact it lacks."),
                  ("Native", "native", "The model's own provider searches. Google or OpenRouter."),
+                 ("RAG", "tool", "The character searches when a reply needs a fact it lacks."),
                  ("Legacy RAG", "rag", "A second model decides and searches before every round.")),
                 read=_grounding_mode, placeholder="Grounding mode..."),
                 note="-# **RAG** costs nothing on the turns nobody searches, and the researcher "
@@ -1023,16 +1023,16 @@ PROFILE_ACTIONS = (
                      "This grounds replies; "
                      "images have their own setting in **Set Image Output**."),
             bulk=_Bulk(_bulk_choice("Select Grounding Mode...",
-                                    [("Off", "off"), ("RAG", "tool"), ("Native", "native"),
+                                    [("Off", "off"), ("Native", "native"), ("RAG", "tool"),
                                      ("Legacy RAG", "rag")],
                                     to_payload=lambda v: {"grounding_mode": v}),
                        scope="all", label="Set Grounding Mode", keys=("grounding_mode",),
-                       description="Choose Off, RAG, Native or Legacy RAG for every selected profile.")),
+                       description="Choose Off, Native, RAG or Legacy RAG for every selected profile.")),
     _Action("url_toggle", "tools", "URL Context Fetching", "Choose Off, Native or RAG link reading.",
             _open_screen("url_toggle"), render=_render_url,
-            # url_fetching_enabled is the legacy flag the turn path still reads, so it
-            # has to move with url_mode -- on the screen as well as in bulk, or setting
-            # it one way leaves the two disagreeing.
+            # url_fetching_enabled is the legacy flag `resolve_url_mode` falls back to
+            # where url_mode is absent. It moves with url_mode -- on the screen as well as
+            # in bulk -- so the two never disagree on disk.
             screen=_Screen(_Choice(
                 "url_mode", "URL Context",
                 (("Off", "off", "Links posted in chat are ignored."),

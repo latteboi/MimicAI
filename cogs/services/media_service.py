@@ -878,7 +878,6 @@ class MediaService:
 
             # The image's own search setting, never the profile's chat grounding_mode.
             if image_rag_enabled(profile_data):
-                session_key = (channel_id, owner_id, profile_name)
                 img_session = self.cog.multi_profile_channels.get(channel_id) or {}
 
                 stm_len = int(profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
@@ -891,8 +890,7 @@ class MediaService:
                         hide_folded=self.cog.session_manager.compaction_enabled(img_session),
                     )[-grounding_stm:]
 
-                mapping_key = self.cog.session_manager._get_mapping_key_for_session(session_key, 'multi')
-                grounding_result = await self.cog.tools_service._get_hybrid_grounding_context(prompt_text, guild_id, history_for_grounding, mapping_key, safety_settings=dynamic_safety_settings, is_for_image=True, warning_channel=message.channel)
+                grounding_result = await self.cog.tools_service._get_hybrid_grounding_context(prompt_text, guild_id, history_for_grounding, profile_data, owner_id, safety_settings=dynamic_safety_settings, is_for_image=True, warning_channel=message.channel)
                 if grounding_result:
                     grounding_context, sources, *_ = grounding_result
                     if grounding_context:

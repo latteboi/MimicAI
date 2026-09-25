@@ -12,7 +12,8 @@ from ...utils.constants import (
 )
 from ...utils.helpers import (
     _format_citation_subtext, _format_history_entry, _get_user_hash, _resolve_safety_settings,
-    default_profile_avatar_url, resolve_grounding_mode, suppress_link_previews,
+    default_profile_avatar_url, resolve_grounding_mode, resolve_url_mode,
+    suppress_link_previews,
 )
 from . import tool_loop
 from .reply import _merge_sources, reply_gen_config
@@ -225,9 +226,9 @@ class GlobalChatMixin:
                 parts = [t.get('content')]
 
                 if t_role == 'user':
-                    if t.get('url_context') and profile_data.get('url_fetching_enabled', False):
+                    if t.get('url_context') and resolve_url_mode(profile_data) != 'off':
                         parts.append(f"\n<document_context>\n{t.get('url_context')}\n</document_context>")
-                    if t.get('grounding_context') and profile_data.get('grounding_mode', 'off') != 'off':
+                    if t.get('grounding_context') and resolve_grounding_mode(profile_data) != 'off':
                         parts.append(f"\n{t.get('grounding_context')}")
 
                 content_obj = {'role': t_role, 'parts': parts}
@@ -292,8 +293,10 @@ class GlobalChatMixin:
                 # any global-chat profile with RAG grounding enabled.)
                 d_safe = _resolve_safety_settings(None, profile_data)
 
+                # No owner: guild 0 is falsy, so one here would bill the host's own key
+                # with no data policy -- this call does not take Global Chat's yet.
                 g_res = await self._await_with_status(
-                    self.cog.tools_service._get_hybrid_grounding_context(combined_prompt_text, 0, g_hist, ('global_chat', host_user_id), safety_settings=d_safe),
+                    self.cog.tools_service._get_hybrid_grounding_context(combined_prompt_text, 0, g_hist, profile_data, None, safety_settings=d_safe),
                     STATUS_SEARCHING_WEB, interaction.channel, None,
                     {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg, "message_type": "embed"})
                 if g_res:

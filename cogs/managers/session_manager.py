@@ -25,7 +25,8 @@ from ..utils.constants import (
     ROUND_EXEMPT_USER_TURNS, ROUND_EXEMPT_USER_CHARS, SESSION_BUSY_FLAGS,
 )
 from ..utils.discord_cdn import unsigned_attachment_url
-from ..utils.helpers import _resolve_zoneinfo, restamp_turn, turn_posted_at
+from ..utils.helpers import (_resolve_zoneinfo, resolve_grounding_mode, resolve_url_mode,
+                             restamp_turn, turn_posted_at)
 from .storage_manager import (IOManager, _delete_file_shard, _get_compressor,
                               _get_decompressor, seal_blob, unseal_blob)
 
@@ -62,6 +63,37 @@ def intern_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
         if type(value) is str:
             turn[field] = sys.intern(value)
     return turn
+
+
+def pin_grounding(unified_log: List[Dict[str, Any]], context: str) -> None:
+    """Make `context` the one search summary the log carries, on its newest user message.
+
+    The history builder is its only reader, this round and every later one. Sent on the
+    round's last user turn as well, a grounded participant read it twice. On a user
+    message because a model turn renders as its author's own words and carries no
+    context: pinned to the newest turn, often a reply, it never reached that reply's author.
+    """
+    for turn in unified_log:
+        turn.pop("grounding_context", None)
+    anchor = next((t for t in reversed(unified_log)
+                   if t.get("is_user") and not t.get("type")), None)
+    if anchor is not None:
+        anchor["grounding_context"] = context
+
+
+def keep_url_context(unified_log: List[Dict[str, Any]], keep: List[Dict[str, Any]]) -> bool:
+    """Clear fetched page text from every turn but `keep`, the round's own. True if any
+    went, which the caller saves as structural: the cleared turns may be sealed.
+
+    The history builder is the text's only reader, so every page a round fetched has to
+    stay on its message -- a second link clearing the first lost it for the whole round.
+    """
+    purged = False
+    for turn in unified_log:
+        if "url_context" in turn and not any(turn is k for k in keep):
+            del turn["url_context"]
+            purged = True
+    return purged
 
 
 def log_user_turn(session: Dict[str, Any], turn: Dict[str, Any],
@@ -1680,9 +1712,9 @@ class SessionManager:
                 parts = [content]
                 
                 if role == 'user':
-                    if turn.get("url_context") and p_settings.get("url_fetching_enabled", False):
+                    if turn.get("url_context") and resolve_url_mode(p_settings) != "off":
                         parts.append(f"\n<document_context>\n{turn.get('url_context')}\n</document_context>")
-                    if turn.get("grounding_context") and p_settings.get("grounding_mode", "off") != "off":
+                    if turn.get("grounding_context") and resolve_grounding_mode(p_settings) != "off":
                         parts.append(f"\n{turn.get('grounding_context')}")
                 
                 if participant_history and participant_history[-1]['role'] == role:

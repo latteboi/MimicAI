@@ -34,11 +34,11 @@ from ..utils.helpers import (
     resolve_critic_settings,
     image_command_prompt, image_rag_enabled, is_gateway_shutdown, kickstart_note,
     resolve_grounding_mode,
-    resolve_thinking_params,
+    resolve_thinking_params, resolve_url_mode,
     resolve_typing_cursor,
 )
 from ..utils import mem_probe
-from ..managers.session_manager import intern_turn, log_user_turn
+from ..managers.session_manager import intern_turn, keep_url_context, log_user_turn, pin_grounding
 
 from .generation.heartbeat import HeartbeatMixin
 from .generation.prompt_builder import PromptBuilderMixin
@@ -757,7 +757,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         if last_mid: anchor_message = await channel.fetch_message(last_mid)
                     except: pass
 
-                grounding_context, grounding_sources = None, []
+                grounding_sources = []
                 grounding_profile_key = None
                 grounding_mode_for_citator = "off"
 
@@ -799,11 +799,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         is_for_image_flag = is_image_gen_round
                         grounding_query = image_gen_prompt if is_image_gen_round else initial_round_context
 
-                        mapping_key = (session.get("type", "multi"), channel.id)
-                        grounding_task = self.cog.tools_service._get_hybrid_grounding_context(grounding_query, channel.guild.id, history_for_grounding, mapping_key, safety_settings=g_dynamic_safety_settings, is_for_image=is_for_image_flag, warning_channel=channel)
+                        # The first speaker's grounding slot searches, as its setting decided to.
+                        grounding_task = self.cog.tools_service._get_hybrid_grounding_context(grounding_query, channel.guild.id, history_for_grounding, g_profile_settings, g_owner_id, safety_settings=g_dynamic_safety_settings, is_for_image=is_for_image_flag, warning_channel=channel)
 
                 ## [NEW] Phase: Research Once (URL Context)
-                round_url_text_contexts = []
+                # This round's messages carrying fetched page text; see keep_url_context.
+                round_url_turns = []
                 
                 url_tasks = []
                 if pending_url_fetches:
@@ -841,15 +842,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             grounding_template = self.cog.global_prompts.get("IMAGE_GROUNDING", DEFAULT_IMAGE_GROUNDING)
                             image_gen_prompt = grounding_template.format(prompt=image_gen_prompt, grounding=g_context)
                         else:
-                            grounding_context = g_context
-                            # [NEW] Sticky Grounding: Purge previous search results from history
-                            for turn in session.get("unified_log", []):
-                                if "grounding_context" in turn:
-                                    del turn["grounding_context"]
-                            
-                            # Attach new summary to the latest turn (the trigger)
-                            if session.get("unified_log"):
-                                session["unified_log"][-1]["grounding_context"] = g_context
+                            pin_grounding(session.setdefault("unified_log", []), g_context)
 
                             # The purge above rewrites turns anywhere in the log, including
                             # ones already sealed into the cold segment, so this cannot ride
@@ -862,26 +855,16 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     grounding_profile_key = (g_owner_id, g_profile_name)
 
                 # Unpack and apply URL results
-                url_updates_made = False
-                url_purged_cold_turns = False
                 for i, (u_t, u_m, u_w) in enumerate(url_results):
                     fetch_info = pending_url_fetches[i]
                     pre_generation_warnings.extend(u_w)
-                    
+
                     if u_t:
                         url_text_content = "\n".join(u_t)
-                        round_url_text_contexts.append(url_text_content)
-                        
-                        # Update turn_object
                         if "turn_object" in fetch_info:
                             fetch_info["turn_object"]["url_context"] = url_text_content
-                            url_updates_made = True
-                            # Clear previous URL contexts from log
-                            for turn in session.get("unified_log", []):
-                                if turn is not fetch_info["turn_object"] and "url_context" in turn:
-                                    del turn["url_context"]
-                                    url_purged_cold_turns = True
-                                    
+                            round_url_turns.append(fetch_info["turn_object"])
+
                     if u_m:
                         url_media_parts.extend(u_m)
                         # Update new_round_turn_data
@@ -890,12 +873,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         old_media.extend(u_m)
                         new_round_turn_data[idx] = (user_line, url_text_content if u_t else old_url_text, old_media)
                         
-                if url_updates_made:
-                    # Structural for the same reason as the grounding purge above: the
-                    # loop clears url_context from older turns as well as setting it on
-                    # the current one.
+                if round_url_turns:
+                    # Structural for the same reason as the grounding purge above: older
+                    # turns lose their url_context as well as these gaining theirs.
+                    purged = keep_url_context(session.get("unified_log", []), round_url_turns)
                     self.cog.session_manager.mark_session_dirty(
-                        (channel_id, None, None), session_type, structural=url_purged_cold_turns)
+                        (channel_id, None, None), session_type, structural=purged)
 
                 # --- NEW IMAGE GENERATION LOGIC ---
                 if is_image_gen_round and generator_profile_key:
@@ -1070,10 +1053,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         p_is_b = p_name in p_index.get("borrowed", [])
                         p_settings = self.cog.profile_manager._get_profile_config(p_owner_id, p_name, p_is_b) or {}
 
-                        if p_settings.get("url_fetching_enabled", False) and round_url_text_contexts:
-                            url_instr = "<url_research>\n[Context from links in current messages]:\n" + "\n".join(round_url_text_contexts) + "\n</url_research>"
-                            contents_for_api_call.append({'role': 'user', 'parts': [url_instr]})
-
                         if not contents_for_api_call:
                             contents_for_api_call.append({'role': 'user', 'parts':[self.cog.global_prompts.get("KICKSTART_START", DEFAULT_KICKSTART_START)]})
 
@@ -1232,23 +1211,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             whisper_context = recap_template.format(whispers="\n---\n".join(pending_whispers))
                             supplementary_parts.append(whisper_context)
 
-                        if grounding_context and p_settings.get("grounding_mode", "off") != "off":
-                            # Already wrapped by _get_hybrid_grounding_context, which returns
-                            # the summary inside <external_context> along with the footnote
-                            # instruction. Re-wrapping here nested the tag inside itself for
-                            # every grounded participant.
-                            supplementary_parts.append(grounding_context)
-
-                        if p_settings.get("url_fetching_enabled", False) and round_url_text_contexts:
-                            url_instr = "<document_context>\n" + "\n".join(round_url_text_contexts) + "\n</document_context>"
-                            supplementary_parts.append(url_instr)
-                            
                         if help_context_text:
                             supplementary_parts.append(help_context_text)
 
                         # [FIXED] Ephemeral Media Injection: Manually add all current round media to the API call
                         # This allows participants to see images this round without them persisting in RAM history.
-                        all_current_media, media_skipped_note = self._round_media(new_round_turn_data)
+                        all_current_media, media_skipped_note = self._round_media(
+                            new_round_turn_data, links=resolve_url_mode(p_settings) != "off")
                         if media_skipped_note:
                             supplementary_parts.append(media_skipped_note)
                         if all_current_media:
@@ -1890,6 +1859,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     }
                                     if url_text_batch:
                                         new_turn_object["url_context"] = url_text_batch
+                                        round_url_turns.append(new_turn_object)
+                                        if keep_url_context(session.get("unified_log", []), round_url_turns):
+                                            self.cog.session_manager.mark_session_dirty(
+                                                (channel_id, None, None), session_type, structural=True)
                                     # Before the reply that was still being delivered when
                                     # this was sent, which is the order the channel shows.
                                     insert_index = log_user_turn(
