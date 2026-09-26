@@ -14,6 +14,7 @@ from ...utils.helpers import (_format_history_entry, image_command_prefix,
                              turn_posted_at)
 from ...utils.attachment_limits import over_attachment_limit
 from .reply import reply_gen_config, reply_meta
+from .triggers import referenced_message, reply_record
 from .tool_loop import functions_for, ltm_auto_threshold
 
 
@@ -144,16 +145,9 @@ class RegenerationMixin:
             target_msg = await channel.fetch_message(user_msg_ids[-1])
             recovered_media_parts.extend({"url": a.url, "mime_type": a.content_type}
                                          for a in target_msg.attachments if readable(a))
-            if target_msg.reference and target_msg.reference.message_id:
-                ref_msg = target_msg.reference.resolved
-                if not ref_msg:
-                    r_ch = self.cog.bot.get_channel(target_msg.reference.channel_id)
-                    if r_ch:
-                        ref_msg = await r_ch.fetch_message(target_msg.reference.message_id)
-                ref_media = next((a for a in getattr(ref_msg, 'attachments', None) or []
-                                  if readable(a)), None)
-                if ref_media:
-                    recovered_media_parts.append({"url": ref_media.url, "mime_type": ref_media.content_type})
+            # What the round sent for the reply, so the regeneration is answering the same.
+            _, reply_media = reply_record([], await referenced_message(target_msg))
+            recovered_media_parts.extend(reply_media)
         except Exception as e:
             print(f"Failed to recover media for regeneration: {e}")
         return recovered_media_parts

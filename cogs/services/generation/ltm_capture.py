@@ -8,6 +8,7 @@ from ...utils.constants import (LTM_DUPLICATE_SIMILARITY, LTM_EXCERPT_TURNS,
                                 MIN_HISTORY_FOR_LTM_CREATION)
 from ...utils.helpers import _resolve_zoneinfo, restamp_turn, turn_posted_at
 from ...managers.memory_manager import encode_embedding_b64
+from ...managers.session_manager import reply_tags, turn_lookup, with_reply
 
 
 def ltm_backlog(log: List[Dict[str, Any]], pid: str, read_through: Optional[str] = None,
@@ -93,7 +94,9 @@ class LtmCaptureMixin:
         read_through = turn_posted_at(turns[-1]) or datetime.datetime.now(datetime.timezone.utc)
         read_through_id = turns[-1].get("turn_id")
         clock, _ = _resolve_zoneinfo(p_settings.get("timezone"))
-        excerpt = [restamp_turn(t.get("content") or "", turn_posted_at(t), clock) for t in turns]
+        tags, find = reply_tags(turns), turn_lookup(log)
+        excerpt = [with_reply(restamp_turn(t.get("content") or "", turn_posted_at(t), clock), t, clock, tags, find)
+                   for t in turns]
 
         # The name this seat's turns carry, `<Name> [ID: ...]`, so the summariser is told
         # which speaker in the transcript it is writing for.

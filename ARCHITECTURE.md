@@ -394,6 +394,13 @@ again. New synopses record `covers_turn_ids`; older ones are found by position. 
 stay hidden, and the synopsis is sent, only while the session's rolling synopsis is on
 (`compaction_enabled`), so switching it off puts the whole transcript back in the prompt.
 
+`/compact` and the Compaction tab's buttons run `manual_compaction`: fold every public turn
+but the newest `keep` in passes of at most `COMPACT_PASS_MAX_CHARS`, each chained on the
+last, reading a turn's linked page beside it (`_fold_text`); or unfold everything and drop
+every synopsis. It claims `is_compacting`, which the worker waits on before a round
+captures its positions, and switches the rolling synopsis on, since a fold made with it
+off would be hidden from nobody and read by no one.
+
 ### Histories are derived, never maintained
 
 There is exactly one `unified_log` per session. Each participant's view of the conversation
@@ -408,6 +415,14 @@ enabled. It also puts every turn on the reader's clock: a turn is stamped once, 
 speaker's zone, when it is stored, and `restamp_turn` rewrites the header's time from
 `turn_posted_at` into the reader's `timezone`. A user's own local time, which their stamps
 used to carry, is said once instead, in `<local_times>`.
+
+A reply is the turn's `reply_to`, never text in its `content`: the replied-to turn's
+`turn_id`, or — for a message outside the log — a snapshot of who, when and the start of
+what it said (`reply_record`). `render_reply` draws it per reader, inside the replier's
+block: a turn that reader has in view is tagged `[#n]` in its header for that prompt alone
+(`reply_tags`) and the reply names the tag, not quoting it again; one out of view is
+quoted from the log, so deleting or muting it takes it out of every reply too. The replied-to message comes off the gateway payload
+(`referenced_message`); a child bot's payload carries the same snapshot.
 
 **Do not add per-participant history objects.** With a cast of up to 200, storing a
 per-participant history is a multiplicative memory cost for data that is a pure function of

@@ -52,7 +52,7 @@ from ..utils.constants import (
     DEFAULT_TRAINING_ANALYST_PROMPT, GREEDY_SAMPLING,
     RECALL_TOOL_MAX, RECALL_TOOL_THRESHOLD,
 )
-from ..utils.helpers import (Timeout, _format_api_error, _resolve_zoneinfo,
+from ..utils.helpers import (TURN_TIME_FORMAT, Timeout, _format_api_error, _resolve_zoneinfo,
                             clip_to_sentence, ltm_auto_recall_enabled,
                             resolve_thinking_params, suppress_link_previews)
 from .storage_manager import IOManager
@@ -1077,7 +1077,7 @@ class MemoryManager:
                     final_content = "\n".join(filtered_lines).strip()
                     if final_content:
                         if not re.match(r'^<.+> \[[^\]]+\]:', final_content) and not re.match(r'^.+ \[[^\]]+\]:', final_content):
-                            ts_str = datetime.datetime.now(datetime.timezone.utc).strftime("[%a, %d %b %Y, %I:%M %p UTC]")
+                            ts_str = f"[{datetime.datetime.now(datetime.timezone.utc).strftime(TURN_TIME_FORMAT)}]"
                             convo_parts.append(f"<Unknown> {ts_str}:\n{final_content}\n</Unknown>")
                         else:
                             convo_parts.append(final_content)

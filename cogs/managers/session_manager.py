@@ -9,12 +9,13 @@ import asyncio
 import random
 import time
 import contextlib
+import re
 from discord.ext import tasks
 import pathlib
 import datetime
 import collections
 import discord
-from typing import Dict, List, Any, Optional, Set, Union, Tuple
+from typing import Callable, Dict, List, Any, Optional, Set, Union, Tuple
 from cryptography.fernet import InvalidToken
 import orjson as json
 
@@ -23,10 +24,11 @@ from ..utils.constants import (
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME,
     DEFAULT_CAST_POLICY, DELIVERY_GUARD_SECONDS,
     ROUND_EXEMPT_USER_TURNS, ROUND_EXEMPT_USER_CHARS, SESSION_BUSY_FLAGS,
+    PATTERN_SPEAKER_CLOSE, REPLY_IN_VIEW, REPLY_QUOTE_CHARS, REPLY_UNAVAILABLE,
 )
 from ..utils.discord_cdn import unsigned_attachment_url
-from ..utils.helpers import (_resolve_zoneinfo, resolve_grounding_mode, resolve_url_mode,
-                             restamp_turn, turn_posted_at)
+from ..utils.helpers import (TURN_TIME_FORMAT, _resolve_zoneinfo, resolve_grounding_mode,
+                             resolve_url_mode, restamp_turn, turn_posted_at)
 from .storage_manager import (IOManager, _delete_file_shard, _get_compressor,
                               _get_decompressor, seal_blob, unseal_blob)
 
@@ -140,6 +142,106 @@ def log_user_turn(session: Dict[str, Any], turn: Dict[str, Any],
     if isinstance(cold_len, int) and index < cold_len:
         session["_log_cold_len"] = index
     return index
+
+
+#: A stored turn's identity, `<Name> [ID: x]`, as its header shows it to the model.
+_TURN_IDENTITY = re.compile(r'<([^>\r\n]+)> \[ID: ([^\]\r\n]+)\]')
+
+
+def turn_lookup(unified_log: List[Dict[str, Any]]) -> Callable[[str], Optional[Dict[str, Any]]]:
+    """`turn_id` -> turn, indexed on first use: most prompts hold no reply to an older turn."""
+    index = None
+
+    def find(turn_id: str) -> Optional[Dict[str, Any]]:
+        nonlocal index
+        if index is None:
+            index = {t["turn_id"]: t for t in unified_log if t.get("turn_id")}
+        return index.get(turn_id)
+    return find
+
+
+def reply_quote(text: str) -> str:
+    """The start of what a reply points at, on one line and cut at a word."""
+    text = " ".join(text.split())
+    if len(text) <= REPLY_QUOTE_CHARS:
+        return text
+    cut = text.rfind(" ", 0, REPLY_QUOTE_CHARS)
+    return text[:cut if cut > 0 else REPLY_QUOTE_CHARS] + "…"
+
+
+def reply_tags(turns: List[Dict[str, Any]]) -> Dict[str, int]:
+    """`turn_id` -> `n` for the turns a later turn in `turns` replies to, numbered in the
+    order they appear. `turns` is what one prompt shows, oldest first.
+
+    For that prompt only, never stored: the tag is `[#n]` on the replied-to turn's header
+    and `#n` in the reply, which names the turn exactly where a name and a time to the
+    second can still match two -- and costs a few tokens where repeating the header, id
+    and date cost thirty. A turn nothing in view replies to carries no tag.
+    """
+    seen: Set[str] = set()
+    targets: Set[str] = set()
+    for turn in turns:
+        target = (turn.get("reply_to") or {}).get("turn_id")
+        if target in seen:
+            targets.add(target)
+        if turn.get("turn_id"):
+            seen.add(turn["turn_id"])
+    ordered = [turn["turn_id"] for turn in turns if turn.get("turn_id") in targets]
+    return {turn_id: n for n, turn_id in enumerate(ordered, 1)}
+
+
+def render_reply(reply: Dict[str, Any], clock, tags: Dict[str, int], find) -> str:
+    """A turn's `reply_to` as its reader sees it.
+
+    A replied-to turn in view is named by the tag `reply_tags` gave it, and not quoted:
+    the model is already reading it. Out of view -- folded, or older than the window --
+    it is quoted, with who said it and when on the reader's clock. A turn since deleted
+    or muted is not quoted from a snapshot, because it is read from the log each time:
+    the reply stops carrying what was withdrawn.
+    """
+    if reply.get("missing"):
+        return REPLY_UNAVAILABLE
+    files = list(reply.get("files") or ())
+    turn_id = reply.get("turn_id")
+    quote = None
+    if turn_id:
+        target = find(turn_id)
+        if target is None or target.get("is_hidden"):
+            return REPLY_UNAVAILABLE
+        content = target.get("content") or ""
+        match = _TURN_IDENTITY.match(content)
+        if turn_id in tags:
+            name = match.group(1) if match else "Unknown"
+            return (f"<reply_context to='{name} #{tags[turn_id]}'>\n"
+                    f"{chr(10).join(files) or REPLY_IN_VIEW}\n</reply_context>")
+        speaker = f"{match.group(1)} [ID: {match.group(2)}]" if match else "Unknown"
+        moment = turn_posted_at(target)
+        quote = reply_quote(PATTERN_SPEAKER_CLOSE.sub("", content.partition("\n")[2]))
+    else:
+        speaker = reply.get("speaker") or "Unknown"
+        try:
+            moment = datetime.datetime.fromisoformat(reply["at"])
+        except (KeyError, TypeError, ValueError):
+            moment = None
+        quote = reply.get("quote")
+    to = f"{speaker} [{moment.astimezone(clock).strftime(TURN_TIME_FORMAT)}]" if moment else speaker
+    lines = [f for f in files if not quote or f not in quote] + ([quote] if quote else [])
+    return f"<reply_context to='{to}'>\n{chr(10).join(lines)}\n</reply_context>"
+
+
+def with_reply(content: str, turn: Dict[str, Any], clock, tags: Dict[str, int], find) -> str:
+    """`content` as one prompt shows it: its header tagged if a later turn in view replies
+    to it, and the reply it makes, if any, inside its own block under the header."""
+    header, sep, rest = content.partition("\n")
+    if not sep:
+        return content
+    tag = tags.get(turn.get("turn_id"))
+    if tag and header.endswith(":"):
+        header = f"{header[:-1]} [#{tag}]:"
+    reply = turn.get("reply_to")
+    if reply:
+        header = f"{header}\n{render_reply(reply, clock, tags, find)}"
+    return f"{header}\n{rest}"
 
 
 class SessionManager:
@@ -1459,9 +1561,8 @@ class SessionManager:
                     # reference to this session dict and reads its unified_log the moment it
                     # claims the channel, and dehydrating underneath it would have the
                     # profile answer with no history at all.
-                    if session and (session.get('is_running') or session.get('is_regenerating')
-                                    or session.get('is_purging') or session.get('is_whispering')
-                                    or session.get('is_memorising') or session.get('whisper_waiting')):
+                    if session and (any(session.get(flag) for flag in SESSION_BUSY_FLAGS)
+                                    or session.get('whisper_waiting')):
                         continue
                 keys_to_evict.add(key)
 
@@ -1696,6 +1797,11 @@ class SessionManager:
         clock, _ = _resolve_zoneinfo(p_settings.get("timezone"))
 
         participant_history = []
+        # A reply to a turn this participant is shown names it by a tag rather than
+        # quoting it again. See reply_tags.
+        tags = reply_tags([t for t in log_slice if not t.get("type") and not t.get("is_hidden")
+                           and not (hide_folded and t.get("compacted"))])
+        find = turn_lookup(full_log)
         for turn in log_slice:
             if turn.get("is_hidden") or (hide_folded and turn.get("compacted")): continue
             content = restamp_turn(turn.get("content") or "", turn_posted_at(turn), clock)
@@ -1709,7 +1815,7 @@ class SessionManager:
             if turn_type == "synopsis": continue
             if not turn_type:
                 role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
-                parts = [content]
+                parts = [with_reply(content, turn, clock, tags, find)]
                 
                 if role == 'user':
                     if turn.get("url_context") and resolve_url_mode(p_settings) != "off":
@@ -1943,6 +2049,8 @@ class SessionManager:
             session['is_purging'] = False
             session['is_whispering'] = False
             session['is_memorising'] = False
+            # Not is_compacting: /compact runs in its own interaction, which this cannot
+            # stop, and a round let in under it would read shifted positions.
 
             # Drain task queue completely
             q = session.get('task_queue')

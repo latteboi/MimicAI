@@ -18,6 +18,7 @@ from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PA
                               add_select, build_pagination_controls,
                               bulk_select_options, resolve_bulk_select)
 from ..services.generation.compaction import compaction_model_config, resolve_compaction_settings
+from ..managers.session_manager import turn_lookup, with_reply
 from ..services.generation.global_chat import build_global_chat_embed
 from ..services.generation.tool_loop import functions_for
 
@@ -1136,6 +1137,23 @@ class CompactionSettingsModal(ui.Modal, title="Rolling Synopsis"):
         await self.view.update_display()
 
 
+class CompactNowModal(ui.Modal, title="Compact Now"):
+    keep_input = ui.TextInput(label=f"Newest turns to leave unfolded (0-{COMPACT_KEEP_MAX})",
+                              default=str(COMPACT_KEEP_DEFAULT), required=True, max_length=3)
+
+    def __init__(self, view: 'SessionConfigView'):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            keep = int(self.keep_input.value)
+        except ValueError:
+            await interaction.response.send_message("❌ The number of turns to keep must be a whole number.", ephemeral=True)
+            return
+        await self.view._run_manual_compaction(interaction, keep=max(0, min(COMPACT_KEEP_MAX, keep)))
+
+
 class ResponseLimitModal(ui.Modal, title="Set Response Limit"):
     limit_input = ui.TextInput(label="Max Responses per Round (1-10)", placeholder="Enter a number between 1 and 10 (Default: 10)", required=False, max_length=2)
     def __init__(self, view):
@@ -2157,6 +2175,25 @@ class SessionConfigView(BlockedGuard, ui.View):
             on_off_style=True)
         self._add_modal_button("Edit Settings", CompactionSettingsModal)
 
+        # One-off actions, a row below the standing switch: the same as /compact.
+        self._add_modal_button("Compact Now", CompactNowModal, row=1, style=discord.ButtonStyle.secondary)
+
+        async def uncompact(i: discord.Interaction):
+            await self._run_manual_compaction(i, undo=True)
+        add_button(self, "Uncompact", uncompact, row=1, disabled=not (folded or synopses))
+
+    async def _run_manual_compaction(self, i: discord.Interaction, **kwargs):
+        # Re-tested where it is acted on, as the tab bar is: this spends summariser calls,
+        # and the view outlives a role.
+        if not self._viewer_is_admin():
+            await i.response.send_message("Only server administrators can compact a session.", ephemeral=True)
+            return
+        await i.response.defer(ephemeral=True, thinking=True)
+        message = await self.cog.generation_service.manual_compaction(
+            self.original_interaction.channel_id, **kwargs)
+        await i.followup.send(message, ephemeral=True)
+        await self.update_display()
+
 
     def _add_commit_button(self):
         """The Start / Update Session button, on every tab.
@@ -2828,7 +2865,9 @@ class SessionAuditView(BlockedGuard, ui.View):
                     self._add_system_turn_fields(embed, target, log)
                 elif target.get("is_user"):
                     speaker_name = self._resolve_turn_speaker_name(target)
-                    content = target.get("content", "")
+                    # The reply as a reader without it in view gets it: the costlier form.
+                    content = with_reply(target.get("content", ""), target, datetime.timezone.utc,
+                                         {}, turn_lookup(log))
                     if target.get("url_context"):
                         content += f"\n<document_context>\n{target.get('url_context')}\n</document_context>"
                     input_tokens = _estimate_text_tokens(content)

@@ -1,5 +1,6 @@
 import re
-import html
+import collections
+from html.parser import HTMLParser
 import asyncio
 import httpx
 import discord
@@ -11,8 +12,7 @@ from ..utils.constants import (
     MAX_URL_FETCH_BYTES, WARN_URL_FETCHING_FAILED,
     WARN_GROUNDING_FAILED, DEFAULT_WEB_GROUNDING_VISUAL,
     DEFAULT_WEB_GROUNDING_TEXT, DEFAULT_WEB_SEARCH_RESEARCH,
-    PATTERN_HTML_CONTAINERS, PATTERN_HTML_TAGS,
-    PATTERN_HTML_BLANKLINES, DEFAULT_GROUNDING_RAG_PAYLOAD,
+    DEFAULT_GROUNDING_RAG_PAYLOAD,
 )
 from ..utils.helpers import (_format_api_error, _truncate_text_by_char,
                             resolve_thinking_params)
@@ -90,6 +90,134 @@ async def close_url_fetch_client():
     if _url_fetch_client is not None and not _url_fetch_client.is_closed:
         await _url_fetch_client.aclose()
     _url_fetch_client = None
+
+
+# Linked-page text extraction. A regex scrub that dropped chrome by tag name alone
+# (`<nav>`, `<header>`, ...) let everything through on a div-built theme: the sidebar
+# widgets, the archive dropdown and the site header came back as page text, half the
+# extract, and on a page whose chrome comes first it used up the character cap before
+# the article. A parser can close the <div> it opened, so chrome is skipped by what it
+# is marked as, not only by its tag. Stdlib on purpose: trafilatura holds ~31 MB resident
+# once imported and readability-lxml ~15 MB, for no better an extract of that page.
+
+#: Never text: their contents are code, controls or another document.
+_NEVER_TEXT_TAGS = frozenset(("head", "script", "style", "noscript", "template", "svg",
+                              "iframe", "select", "button"))
+#: Chrome by tag. header/footer only at page level: inside an <article> they hold its
+#: title and byline.
+_CHROME_TAGS = frozenset(("nav", "aside", "form", "header", "footer"))
+_PAGE_ONLY_TAGS = frozenset(("header", "footer"))
+_CHROME_ROLES = frozenset(("navigation", "banner", "contentinfo", "complementary", "search"))
+#: Chrome by class/id word. Kept conservative on purpose: "comment" and "menu" are left
+#: out because on a forum thread or a restaurant's page they are the content.
+_CHROME_WORDS = frozenset((
+    "widget", "sidebar", "header", "footer", "masthead", "nav", "navigation", "breadcrumb",
+    "breadcrumbs", "share", "sharing", "social", "related", "cookie", "newsletter",
+    "subscribe", "subscription", "noscript", "ad", "ads", "advert"))
+#: A chrome word next to one of these is a layout wrapper (`content-sidebar-wrap`,
+#: `entry-header`), not chrome: skipping it would take the article with it.
+_CONTENT_WORDS = frozenset(("content", "main", "article", "body", "entry"))
+#: Where the article is. When a page marks one, only its text is kept.
+_MAIN_TAGS = frozenset(("article", "main"))
+_VOID_TAGS = frozenset(("area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+                        "meta", "param", "source", "track", "wbr"))
+#: A new one of these closes an unclosed sibling, as a browser would; otherwise an
+#: unclosed <p class="share"> would take every paragraph after it.
+_SIBLING_CLOSED_TAGS = frozenset(("p", "li", "dt", "dd", "tr", "td", "th", "option"))
+_BLOCK_TAGS = frozenset((
+    "address", "article", "blockquote", "br", "dd", "div", "dl", "dt", "figcaption", "figure",
+    "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "ol", "p",
+    "pre", "section", "table", "tr", "ul"))
+_CELL_TAGS = frozenset(("td", "th"))
+_WORD_SPLIT = re.compile(r"[^a-z0-9]+")
+_WHITESPACE = re.compile(r"\s+")
+
+
+class _PageText(HTMLParser):
+    """Collects a page's visible text three ways at once -- inside the article, outside
+    anything marked as chrome, and everything -- so `page_text` can take the best that
+    is not empty. Each open element is a frame of flags its children inherit."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        # (tag, never, skip, main, pre). The root frame stands in for the document.
+        self._stack = [("", False, False, False, False)]
+        # How many of each tag are open, so a stray end tag is refused without walking
+        # the stack: a page of unclosed <div>s and stray </x>s is otherwise quadratic.
+        self._open = collections.Counter()
+        self.main, self.kept, self.raw = [], [], []
+
+    def _break(self, sep: str):
+        self.main.append(sep)
+        self.kept.append(sep)
+        self.raw.append(sep)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _BLOCK_TAGS:
+            self._break("\n")
+        elif tag in _CELL_TAGS:
+            self._break(" ")
+        if tag in _VOID_TAGS:
+            return
+        if tag in _SIBLING_CLOSED_TAGS and self._stack[-1][0] == tag:
+            self._open[self._stack.pop()[0]] -= 1
+        _, never, skip, main, pre = self._stack[-1]
+        never = never or tag in _NEVER_TEXT_TAGS
+        if not skip:
+            # Inside chrome nothing is kept whatever it is marked as, so only an element
+            # still being read has its attributes looked at.
+            a = dict(attrs)
+            role = (a.get("role") or "").lower()
+            # <body> classes describe the layout (`has-sidebar`), never the content.
+            words = (set() if tag in ("html", "body") else
+                     set(_WORD_SPLIT.split(f"{a.get('class') or ''} {a.get('id') or ''}".lower())))
+            chrome = ((tag in _CHROME_TAGS and not (main and tag in _PAGE_ONLY_TAGS))
+                      or role in _CHROME_ROLES or bool(words & _CHROME_WORDS))
+            hidden = ("hidden" in a or a.get("aria-hidden") == "true"
+                      or "display:none" in (a.get("style") or "").replace(" ", "").lower())
+            skip = never or hidden or (chrome and not words & _CONTENT_WORDS)
+            main = main or tag in _MAIN_TAGS or role == "main" or "hentry" in words
+        self._stack.append((tag, never, skip, main, pre or tag == "pre"))
+        self._open[tag] += 1
+
+    def handle_endtag(self, tag):
+        # Close back to the matching open tag; a stray end tag closes nothing.
+        if self._open[tag]:
+            while True:
+                closed = self._stack.pop()[0]
+                self._open[closed] -= 1
+                if closed == tag:
+                    break
+        if tag in _BLOCK_TAGS:
+            self._break("\n")
+
+    def handle_data(self, data):
+        _, never, skip, main, pre = self._stack[-1]
+        if never:
+            return
+        text = data if pre else _WHITESPACE.sub(" ", data)
+        self.raw.append(text)
+        if not skip:
+            self.kept.append(text)
+            if main:
+                self.main.append(text)
+
+
+def page_text(markup: str) -> str:
+    """A linked page's readable text, one line per block.
+
+    The article when the page marks one (<article>, <main>, role="main", WordPress's
+    `hentry`); otherwise everything not marked as chrome; and only if that leaves
+    nothing -- a wrapper mistaken for chrome -- the whole page, as the regex scrub gave.
+    """
+    parser = _PageText()
+    parser.feed(markup)
+    parser.close()
+    for pieces in (parser.main, parser.kept, parser.raw):
+        text = "\n".join(line.strip() for line in "".join(pieces).splitlines() if line.strip())
+        if text:
+            return text
+    return ""
 
 
 class ToolsService:
@@ -238,47 +366,37 @@ class ToolsService:
                 if not url.startswith(('http://', 'https://')):
                     url = 'http://' + url
 
-                async with safe_stream(client, "HEAD", url, timeout=5.0) as head_response:
-                    head_response.raise_for_status()
-                    content_type = head_response.headers.get('content-type', '').lower()
+                # One GET, typed by its own headers; only an HTML body is read. A HEAD
+                # first lost the page wherever a server refuses HEAD but serves GET
+                # (403/405/501, common behind bot managers).
+                async with safe_stream(client, "GET", url, timeout=10.0) as response:
+                    response.raise_for_status()
+                    content_type = response.headers.get('content-type', '').lower()
+                    is_html = 'text/html' in content_type
+                    if is_html:
+                        # Streamed with a hard byte cap. Reading .text on an unbounded body
+                        # made peak RSS a function of whatever page the user linked.
+                        chunks, total = [], 0
+                        async for chunk in response.aiter_bytes(65536):
+                            chunks.append(chunk)
+                            total += len(chunk)
+                            if total >= MAX_URL_FETCH_BYTES:
+                                break
+                        encoding = response.encoding or 'utf-8'
+                        page_content = b"".join(chunks)[:MAX_URL_FETCH_BYTES].decode(encoding, errors='replace')
+                        del chunks
 
                 # Strictly handle images and text
                 if content_type.startswith('image/'):
                     # Tagged so a profile with URL Context off is not sent it: `_round_media`.
                     media_parts.append({"url": url, "mime_type": content_type, "from_link": True})
 
-                elif 'text/html' in content_type:
-                    # Streamed with a hard byte cap. Reading .text on an unbounded body
-                    # made peak RSS a function of whatever page the user linked.
-                    chunks, total = [], 0
-                    async with safe_stream(client, "GET", url, timeout=10.0) as get_response:
-                        get_response.raise_for_status()
-                        async for chunk in get_response.aiter_bytes(65536):
-                            chunks.append(chunk)
-                            total += len(chunk)
-                            if total >= MAX_URL_FETCH_BYTES:
-                                break
-                        encoding = get_response.encoding or 'utf-8'
-                    page_content = b"".join(chunks)[:MAX_URL_FETCH_BYTES].decode(encoding, errors='replace')
-                    del chunks
-
-                    def _sync_scrub_html():
-                        # Two full-string rewrites, not four: the container tags share one
-                        # alternation with a backreference, so style/script/head/nav/... are
-                        # stripped in a single pass before the generic tag strip.
-                        clean_content = PATTERN_HTML_CONTAINERS.sub('', page_content)
-                        clean_content = PATTERN_HTML_TAGS.sub('', clean_content)
-
-                        clean_content = html.unescape(clean_content)
-                        clean_content = "\n".join([line.strip() for line in clean_content.splitlines() if line.strip()])
-                        clean_content = PATTERN_HTML_BLANKLINES.sub('\n\n', clean_content)
-                        return clean_content
-
+                elif is_html:
                     try:
-                        # Offloaded to a worker thread (regex/unescape work on full page bodies is CPU-bound);
+                        # Offloaded to a worker thread (parsing a full page body is CPU-bound);
                         # signal.alarm-based Timeout can't be used off the main thread, so the timeout is
                         # enforced here via wait_for instead.
-                        clean_content = await asyncio.wait_for(asyncio.to_thread(_sync_scrub_html), timeout=3.0)
+                        clean_content = await asyncio.wait_for(asyncio.to_thread(page_text, page_content), timeout=3.0)
                         truncated_content = _truncate_text_by_char(clean_content, MAX_URL_CONTEXT_CHARACTERS)
                         url_context = f"Source URL: {url}\nExtracted Content:\n{truncated_content}"
                         text_contexts.append(url_context)

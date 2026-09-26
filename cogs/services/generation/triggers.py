@@ -9,10 +9,92 @@ from ...utils.helpers import (
 )
 from ...utils.attachment_limits import over_attachment_limit, skipped_attachment_note
 from ...utils.http_client import get_shared_client
-from ...managers.session_manager import intern_turn, log_user_turn
+from ...managers.session_manager import intern_turn, log_user_turn, reply_quote
 from ...utils.constants import (
     defaultConfig, ROUND_MEDIA_MAX, ROUND_MEDIA_SKIPPED_NOTE,
 )
+from ...utils.discord_cdn import unsigned_attachment_url
+
+
+def reply_snapshot(message: Any) -> Dict[str, Any]:
+    """The message a reply points at, as plain data: what a child bot's payload carries,
+    and what `reply_record` reads, whichever way the reply arrived."""
+    return {
+        "id": message.id,
+        "author_id": message.author.id,
+        "author_name": message.author.display_name,
+        "author_is_bot": bool(getattr(message.author, "bot", False)),
+        "content": message.clean_content,
+        "created_at": message.created_at.isoformat(),
+        "attachments": [{"url": a.url, "filename": a.filename, "content_type": a.content_type,
+                         "size": a.size} for a in message.attachments],
+    }
+
+
+async def referenced_message(message: Any) -> Optional[Dict[str, Any]]:
+    """What `message` replies to, None when it is not a reply, and `{"missing": True}`
+    when what it replied to cannot be loaded.
+
+    The gateway delivers the replied-to message with the reply, and the client caches
+    recent ones: a REST fetch is the last resort, not the first. It used to be the only
+    one -- a round trip on the round's critical path for every reply, one after another.
+    """
+    reference = getattr(message, "reference", None)
+    # A forward carries a reference too, to a message usually in another channel: it is
+    # not a reply, and fetching it here would report it missing.
+    if (not reference or not reference.message_id
+            or getattr(reference, "type", None) == discord.MessageReferenceType.forward):
+        return None
+    target = reference.resolved or reference.cached_message
+    if target is None:
+        try:
+            target = await message.channel.fetch_message(reference.message_id)
+        except Exception:
+            target = None
+    if target is None or isinstance(target, discord.DeletedReferencedMessage):
+        return {"id": reference.message_id, "missing": True}
+    return reply_snapshot(target)
+
+
+def reply_record(unified_log: List[Dict[str, Any]], ref: Optional[Dict[str, Any]]
+                 ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, str]]]:
+    """What a turn stores about the message it replies to, and that message's media to
+    send with this round.
+
+    A reply to a turn in the log stores its `turn_id` and nothing of its text: the
+    history builder names it for a reader who has it in view and quotes it, from the
+    log, for one who has not (`render_reply`). Anything else -- chat from before the
+    session, another bot -- is a snapshot: who, when, and the start of what it said.
+
+    The media goes out with this round because the log keeps none: a reply to a picture
+    asks about the picture. Every file, not the first, and tagged in the reply so the
+    character knows which message it came from.
+    """
+    if not ref:
+        return None, []
+    if ref.get("missing"):
+        return {"missing": True}, []
+    reply_media = []
+    files = []
+    for attachment in ref.get("attachments") or ():
+        if not is_media_attachment(attachment):
+            continue
+        if over_attachment_limit(attachment):
+            files.append(skipped_attachment_note(attachment))
+            continue
+        reply_media.append({"url": attachment["url"], "mime_type": attachment_mime(attachment)})
+        files.append(attachment_tag(attachment))
+    record: Dict[str, Any] = {"files": files} if files else {}
+    target = next((t for t in reversed(unified_log) if ref["id"] in (t.get("message_ids") or ())), None)
+    if target is not None and not target.get("type") and target.get("turn_id"):
+        record["turn_id"] = target["turn_id"]
+    else:
+        # A person as their turns name them; a bot has no id a header would carry.
+        record["speaker"] = (ref["author_name"] if ref.get("author_is_bot")
+                             else f"{ref['author_name']} [ID: {_get_user_hash(ref['author_id'])}]")
+        record["at"] = ref["created_at"]
+        record["quote"] = reply_quote(ref.get("content") or "")
+    return record, reply_media
 
 
 class UserTurn(NamedTuple):
@@ -33,8 +115,7 @@ class TriggerIntakeMixin:
     reactions, replies, proactive kicks -- into the round's user-side history.
     """
 
-    async def _compose_user_turn(self, typed: str, attachments: Sequence[Any],
-                                 reply_context: Optional[str] = None, *,
+    async def _compose_user_turn(self, typed: str, attachments: Sequence[Any], *,
                                  edited: bool = False) -> UserTurn:
         """A user message's turn content, and the media parts to send with it.
 
@@ -46,7 +127,8 @@ class TriggerIntakeMixin:
 
         `attachments` are discord.Attachment objects, or the dicts a child bot's payload
         carries. `typed` is only what the person wrote: URL Context reads links from that
-        and nothing folded in here.
+        and nothing folded in here. What it replies to is not folded in either: it is the
+        turn's `reply_to`, rendered per reader (`reply_record`).
         """
         content = f"{typed}\n(edited)" if edited else typed
 
@@ -56,9 +138,6 @@ class TriggerIntakeMixin:
             attachments, get_shared_client())
         if text_att_content:
             content = f"{content}\n\n{text_att_content}"
-
-        if reply_context:
-            content = f"{reply_context}\n{content}"
 
         media_parts = []
         att_tags = []
@@ -109,8 +188,17 @@ class TriggerIntakeMixin:
         `links` False leaves out images fetched off a posted link -- a profile with URL
         Context off sees nothing a link brought in, as grounding off sees no search.
         """
-        media = [part for _text, _url, turn_media in new_round_turn_data for part in turn_media
-                 if links or not part.get("from_link")]
+        # Once each: a reply to a picture posted in the same round carries it again.
+        media, seen = [], set()
+        for _text, _url, turn_media in new_round_turn_data:
+            for part in turn_media:
+                if not links and part.get("from_link"):
+                    continue
+                key = unsigned_attachment_url(part.get("url"))
+                if key and key in seen:
+                    continue
+                seen.add(key)
+                media.append(part)
         if len(media) <= ROUND_MEDIA_MAX:
             return media, None
         note = ROUND_MEDIA_SKIPPED_NOTE.format(limit=ROUND_MEDIA_MAX, count=len(media) - ROUND_MEDIA_MAX)
@@ -246,11 +334,10 @@ class TriggerIntakeMixin:
                 author_name = trigger_obj['author_name'] if is_child_mention else trigger_obj.author.display_name
                 if round_author_name == "A user": round_author_name = author_name
 
-                reply_context = ""
-                if is_child_mention and trigger_obj.get('replied_to'):
-                    reply_context = "[Replying to a previous message]"
-                elif message_trigger:
-                    reply_context = await self._resolve_reply_context(message_trigger)
+                # A child bot's payload carries the snapshot its listener took.
+                reply_ref = (trigger_obj.get('replied_to') if is_child_mention
+                             else await referenced_message(message_trigger) if message_trigger else None)
+                reply_to, reply_media = reply_record(session.get("unified_log", []), reply_ref)
 
                 # What the person typed, before text files and the quoted reply are folded
                 # in. URL Context reads links from this alone: a link inside an attached file
@@ -259,7 +346,7 @@ class TriggerIntakeMixin:
                 typed_text = trigger_obj['content'] if is_child_mention else trigger_obj.clean_content
 
                 raw_att_list = trigger_obj['attachments'] if is_child_mention else trigger_obj.attachments
-                user_turn = await self._compose_user_turn(typed_text, raw_att_list, reply_context)
+                user_turn = await self._compose_user_turn(typed_text, raw_att_list)
                 content, own_media_parts = user_turn.content, user_turn.media_parts
 
                 if image_prompt_from_this_trigger:
@@ -323,6 +410,8 @@ class TriggerIntakeMixin:
                     "message_ids": [trigger_id],
                     "content": user_line
                 }
+                if reply_to:
+                    turn_object["reply_to"] = reply_to
                 # Where the channel shows it, which for a message sent while the previous
                 # round's last character was still generating is above that reply, not
                 # below it. The reserve has to follow it back, or the round's own user
@@ -338,42 +427,9 @@ class TriggerIntakeMixin:
                 # SessionManager.mark_session_dirty.
                 self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
 
-                # Initialize list for standard message attachments/reply images
-                new_message_parts = []
-
-                # --- Logic to fetch image from replied-to message ---
-                msg_for_ref = message_trigger
-                if not msg_for_ref and message_payload:
-                    try:
-                        # For child bots, we only have payload, so fetch the discord.Message
-                        r_ch = self.cog.bot.get_channel(message_payload['channel_id'])
-                        if r_ch:
-                            msg_for_ref = await r_ch.fetch_message(message_payload['id'])
-                    except Exception: pass
-
-                if msg_for_ref and msg_for_ref.reference:
-                    ref_img = None 
-                    try:
-                        ref_msg = msg_for_ref.reference.resolved
-                        if not ref_msg:
-                            r_ch = self.cog.bot.get_channel(msg_for_ref.reference.channel_id)
-                            if r_ch:
-                                ref_msg = await r_ch.fetch_message(msg_for_ref.reference.message_id)
-
-                        if ref_msg and ref_msg.attachments:
-                            # Find the first image/audio/video attachment in the referenced message
-                            ref_media = next((a for a in ref_msg.attachments if a.content_type and (a.content_type.startswith("image/") or a.content_type.startswith("audio/") or a.content_type.startswith("video/")) and not over_attachment_limit(a)), None)
-                            if ref_media:
-                                new_message_parts.append({"url": ref_media.url, "mime_type": ref_media.content_type})
-                    except Exception as e:
-                        print(f"Error fetching replied media: {e}")
-
-                # The message's own media after the replied-to picture, the order they had
-                # when both were gathered here.
-                new_message_parts.extend(own_media_parts)
-
-                # Combine standard attachments with URL-extracted media
-                trigger_media_parts.extend(new_message_parts)
+                # The replied-to message's media first, then the message's own: the order
+                # they had when the reply scanner fetched the first of them here.
+                trigger_media_parts.extend(reply_media + own_media_parts)
 
                 # Store raw components for gating logic
                 new_round_turn_data.append((user_line, url_text_content, trigger_media_parts))

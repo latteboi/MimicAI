@@ -459,7 +459,9 @@ def _resolve_zoneinfo(tz_str: Optional[str]) -> Tuple[ZoneInfo, str]:
         return ZoneInfo("UTC"), "UTC"
 
 #: How a time is written in a turn's header and in `<current_time>` alike.
-TURN_TIME_FORMAT = "%a, %d %b %Y, %I:%M %p %Z"
+#: Seconds, not finer: enough to tell two messages in one minute apart, and every extra
+#: digit is paid for again in every header of every prompt.
+TURN_TIME_FORMAT = "%a, %d %b %Y, %I:%M:%S %p %Z"
 
 
 def _format_history_entry(display_name: str, timestamp: Union[datetime.datetime, str], content: str, timezone_str: str = "UTC", *, entity_id: str) -> str:
@@ -483,7 +485,7 @@ def _format_history_entry(display_name: str, timestamp: Union[datetime.datetime,
         local_time = timestamp.astimezone(target_tz)
         time_str = f"[{local_time.strftime(TURN_TIME_FORMAT)}]"
     except Exception:
-        time_str = timestamp.strftime("[%a, %d %b %Y, %I:%M %p UTC]")
+        time_str = timestamp.strftime(f"[{TURN_TIME_FORMAT.replace('%Z', 'UTC')}]")
 
     return f"<{display_name}> [ID: {entity_id}] {time_str}:\n{content}\n</{display_name}>\n\n"
 

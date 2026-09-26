@@ -5,7 +5,7 @@ from .utils.constants import (
     FALLBACK_MODEL_NAME, LOCK_REFRESH_INTERVAL_SECONDS, LOCK_STALE_THRESHOLD_SECONDS,
     MAX_MULTI_PROFILES, MOD_DATA_DIR, PRIMARY_MODEL_NAME, PUBLIC_PROFILES_DIR,
     GAME_CACHE_MAX_SIZE, MEDIA_DESCRIPTION_CACHE_MAX, PURGED_MESSAGE_ID_CACHE_MAX_SIZE,
-    PURGE_BUSY_WAIT_TIMEOUT_SECONDS, SERVERS_DIR,
+    PURGE_BUSY_WAIT_TIMEOUT_SECONDS, SERVERS_DIR, COMPACT_KEEP_DEFAULT, COMPACT_KEEP_MAX,
     SESSIONS_GLOBAL_DIR, SESSION_BUSY_FLAGS, TRAIN_ARMED_CACHE_MAX_SIZE, TRAIN_INPUT_EMOJI,
     TRAIN_COMMAND_ENABLED, TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check,
     is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
@@ -1690,6 +1690,23 @@ class MimicCog(EventListeners, commands.Cog):
         finally:
             if session:
                 session['is_memorising'] = False
+
+    @app_commands.command(name="compact", description="Folds this session's conversation into its synopsis, or unfolds it again (Admin Only).")
+    @app_commands.checks.cooldown(2, 60.0, key=lambda i: i.user.id)
+    @app_commands.guild_only()
+    @is_admin_or_owner_check()
+    @app_commands.describe(keep=f"Newest turns left as they are (0-{COMPACT_KEEP_MAX}). Default {COMPACT_KEEP_DEFAULT}.",
+                           undo="Unfold every folded turn and remove the synopsis instead.")
+    async def compact_slash(self, interaction: discord.Interaction,
+                            keep: app_commands.Range[int, 0, COMPACT_KEEP_MAX] = COMPACT_KEEP_DEFAULT,
+                            undo: bool = False):
+        """The same operation as the Compaction tab's Compact Now and Uncompact buttons."""
+        if not self.has_lock: return
+        await interaction.response.defer(ephemeral=True)
+        self.session_last_accessed[interaction.channel_id] = time.time()
+        message = await self.generation_service.manual_compaction(
+            interaction.channel_id, undo=undo, keep=keep)
+        await interaction.followup.send(message, ephemeral=True)
 
     @app_commands.command(name="train", description="Arms this channel to capture a training example from reactions (1️⃣ input, 2️⃣ output).")
     @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)

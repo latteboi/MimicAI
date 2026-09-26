@@ -49,7 +49,7 @@ from .generation.speak import SpeakAsMixin
 from .generation.global_chat import GlobalChatMixin
 from .generation.whisper import WhisperMixin
 from .generation.image_round import ImageRoundMixin
-from .generation.triggers import TriggerIntakeMixin
+from .generation.triggers import TriggerIntakeMixin, referenced_message, reply_record
 from .generation.compaction import SessionCompactionMixin
 from .generation.ltm_capture import LtmCaptureMixin
 from .generation.turn_deletion import TurnDeletionMixin
@@ -496,7 +496,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 try:
                     initial_trigger = await session['task_queue'].get()
                     
-                    while session.get('is_purging') or session.get('is_regenerating') or session.get('is_memorising'):
+                    while (session.get('is_purging') or session.get('is_regenerating') or session.get('is_memorising')
+                           or session.get('is_compacting')):
                         await asyncio.sleep(0.5)
 
                     # Yield to a whisper that is already queued for this channel. Without
@@ -1813,9 +1814,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                         }
 
                                     author_name = trigger.author.display_name
-                                    reply_context = await self._resolve_reply_context(trigger)
+                                    reply_to, reply_media = reply_record(
+                                        session.get("unified_log", []), await referenced_message(trigger))
                                     batch_turn = await self._compose_user_turn(
-                                        trigger.clean_content, trigger.attachments, reply_context)
+                                        trigger.clean_content, trigger.attachments)
                                     content, batch_msg_media = batch_turn.content, batch_turn.media_parts
                                     
                                     # [NEW] Batch URL Context Logic
@@ -1857,6 +1859,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                         "message_ids": [trigger.id],
                                         "content": user_line
                                     }
+                                    if reply_to:
+                                        new_turn_object["reply_to"] = reply_to
                                     if url_text_batch:
                                         new_turn_object["url_context"] = url_text_batch
                                         round_url_turns.append(new_turn_object)
@@ -1872,7 +1876,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     # no one: the log keeps text only, and the characters still
                                     # to speak take their media from here.
                                     new_round_turn_data.append(
-                                        (user_line, url_text_batch, batch_msg_media + url_media_batch))
+                                        (user_line, url_text_batch, reply_media + batch_msg_media + url_media_batch))
 
                             all_triggers_for_round.extend(batched_triggers)
                     

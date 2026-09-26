@@ -19,7 +19,7 @@ from ..utils.helpers import (
     _format_history_entry, _get_user_hash, image_command_prompt, is_media_attachment,
     is_text_attachment,
 )
-from ..utils.attachment_limits import over_attachment_limit
+from ..services.generation.triggers import referenced_message, reply_record
 from ..utils.fuzzy import MAX_CHOICES, rank_keyed
 
 
@@ -290,16 +290,11 @@ class EventListeners:
         # --- 2. Standalone Child Bot Detection ---
         mentioned_child_ids = []
         
-        ref_msg = None
-        if message.reference:
-            if message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
-                ref_msg = message.reference.resolved
-            else:
-                try: ref_msg = await message.channel.fetch_message(message.reference.message_id)
-                except: pass
-
-        if ref_msg:
-            ref_author_id = str(ref_msg.author.id)
+        # Taken whole, for the payload: the round reads the reply from this snapshot,
+        # rather than fetching this message back to find out what it replied to.
+        reply_data = await referenced_message(message)
+        if reply_data and not reply_data.get("missing"):
+            ref_author_id = str(reply_data["author_id"])
             if ref_author_id in self.child_bots and ref_author_id not in mentioned_child_ids:
                 mentioned_child_ids.append(ref_author_id)
 
@@ -331,14 +326,6 @@ class EventListeners:
             attachments_data = [{"url": a.url, "filename": a.filename, "content_type": a.content_type, "size": a.size}
                                 for a in message.attachments if is_media_attachment(a) or is_text_attachment(a)]
             
-            reply_data = None
-            if ref_msg:
-                ref_attach_url = ref_msg.attachments[0].url if ref_msg.attachments and ref_msg.attachments[0].content_type.startswith("image/") and not over_attachment_limit(ref_msg.attachments[0]) else None
-                reply_data = {
-                    "id": ref_msg.id, "channel_id": ref_msg.channel.id,
-                    "attachment_url": ref_attach_url, "author_name": ref_msg.author.display_name
-                }
-
             payload = {
                 "id": message.id,
                 "content": message.content.replace(f"<@{self.bot.user.id}>", "").strip(),
@@ -1044,12 +1031,19 @@ class EventListeners:
             # or an edit re-renders the line in a different timezone from the original.
             user_tz = self.profile_manager.user_timezone(author_id)
 
-            # Rebuilt by the same builder that wrote the turn, so the text files, image tags
-            # and quoted reply survive the edit. Read from the message as it is now: an
-            # attachment removed in the edit goes from the turn too.
-            reply_context = await self.generation_service._resolve_reply_context(msg)
+            # Rebuilt by the same builder that wrote the turn, so the text files and image
+            # tags survive the edit. Read from the message as it is now: an attachment
+            # removed in the edit goes from the turn too. An edit cannot change what a
+            # message replies to, so a stored `reply_to` stands; a turn written before
+            # replies were stored, its quote baked into the text, is given one here.
             new_content = (await self.generation_service._compose_user_turn(
-                msg.clean_content, msg.attachments, reply_context, edited=True)).content
+                msg.clean_content, msg.attachments, edited=True)).content
+            reply_added = False
+            if "reply_to" not in turn_object:
+                reply_to, _ = reply_record(session.get("unified_log", []), await referenced_message(msg))
+                if reply_to:
+                    turn_object["reply_to"] = reply_to
+                    reply_added = True
 
             # Format and inject, keeping the original timestamp
             original_ts = msg.created_at
@@ -1062,7 +1056,7 @@ class EventListeners:
 
             # An update to a message that was edited once already, with no cached copy to
             # compare its edit time against, rebuilds to the same line: nothing to save.
-            if new_history_line == turn_object.get("content"):
+            if new_history_line == turn_object.get("content") and not reply_added:
                 return
             turn_object["content"] = new_history_line
             

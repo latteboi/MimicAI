@@ -276,7 +276,8 @@ HELP_CATEGORIES = {
             "sets the scene every participant sees, **Set Response Limit** caps replies per round, and **Toggle TTS** turns on audio.\n\n"
             "**Compaction** holds the Rolling Synopsis: once a conversation reaches 50 public turns, the oldest 25 are folded into a running "
             "synopsis the whole cast is given, so a long scene keeps its thread. New sessions start with it on. **Edit Settings** sets when "
-            "it folds and how long the synopsis is (100-800 words), and turning it off puts the folded turns back.\n\n"
+            "it folds and how long the synopsis is (100-800 words), and turning it off puts the folded turns back. **Compact Now** folds "
+            "everything but the newest turns at once, links and files included, and **Uncompact** unfolds it all again -- the same as `/compact`.\n\n"
             "`/session swap` changes the cast live without interrupting the conversation, including into a specific slot. In an empty channel it also starts the session outright -- naming the first profile is the fastest way in. Naming a profile "
             "that is already in the session removes it, which is the same thing giving a slot with no profile name does. "
             "`/session view` dumps the current configuration and participant status. `/trigger` forces a round. "
@@ -404,7 +405,7 @@ HELP_CATEGORIES = {
         ),
         "Attachments the Bot Can Read": (
             "Profiles can read images, audio and video attached to your messages, provided the model behind them supports it. Replying to a "
-            "message with an image pulls that image into context too.\n\n"
+            "message pulls every picture, voice note or video on it into context too, labelled as coming from that message.\n\n"
             "Many OpenRouter models are text-only. If the profile's fallback model can read the file, it answers that turn. If "
             "neither can, the attachment is left out and the character is told the filename and that it cannot read it -- it replies to "
             "what you wrote rather than falling silent for the round, and a note under the reply says the attachment was not read.\n\n"
@@ -575,11 +576,11 @@ HELP_CATEGORIES = {
             "**Profiles:** `/profile create`, `/profile generate`, `/profile manage`, `/profile list`, `/profile bulk manage`, `/profile hub`, "
             "`/profile global_chat`\n\n"
             "**Sessions:** `/session config`, `/session swap`, `/session view`, `/session audit`, `/trigger`\n\n"
-            "**In-channel:** `/whisper`, `/speak`, `/refresh`, `/cancel`, `/suspend`, `/purge`, `/clear`\n\n"
+            "**In-channel:** `/whisper`, `/speak`, `/refresh`, `/cancel`, `/suspend`, `/purge`, `/compact`, `/clear`\n\n"
             "**Setup and data:** `/settings`, `/export`, `/import`, `/privacy`, `/terms`, `/invite`, `/whoami`, `/viewavatar`\n\n"
             "**Documentation:** `/start` (guided setup), `/guide` (this browser), `/help`\n\n"
             "**Operator:** `/mod`, `/shutdown`\n\n"
-            "`/refresh`, `/cancel`, `/suspend`, `/purge`, `/memorise`, `/play stop`, `/session config` and `/session swap` require "
+            "`/refresh`, `/cancel`, `/suspend`, `/purge`, `/memorise`, `/compact`, `/play stop`, `/session config` and `/session swap` require "
             "administrator permission — though an admin can set a channel to **Open casting**, which opens `/session config` "
             "(Cast tab only) to everyone. `/mod` and `/shutdown` are bot-owner only, as is changing a server's data policy in `/privacy`."
         ),
@@ -952,7 +953,7 @@ DEFAULT_HELP_DOCS = {
         "Response Limit: Caps how many profiles reply in a single round, so a large cast does not answer every message all at once.\n"
         "Seating versus starting: choosing a profile on the Cast tab seats it immediately -- it appears on the Reactivity tab and can have its chance and wakewords set straight away, with no button press in between. It does not make the channel live. Until 'Start / Update Session' is pressed the session is a draft: the footer reads 'Draft', ordinary messages pass through untouched and the AI Director stays quiet. The button, on every tab, starts it -- saving the configuration, loading the transcript, and telling every child bot in the cast which channel it is in. Pressing it again on a live session re-saves and re-announces.\n"
         "An empty cast is allowed. A started session with nobody in it keeps its transcript, Master Prompt and settings and simply has no one to answer, which is what 'Clear Cast' leaves behind. `/suspend` is what ends a session outright.\n"
-        "Rolling Synopsis (Compaction tab): once a conversation reaches 50 public turns, the oldest 25 are folded into one running synopsis that every participant is given with each reply, so a long scene keeps its thread after it scrolls out of Short-Term Memory. Sessions created now start with it on; a session made before keeps what it had. 'Edit Settings' sets when it folds, how many turns go each time, the synopsis length (100-800 words, 220 by default) and the summariser -- left blank, it runs the same models as the LTM Summariser. Turning it off puts the folded turns back into the prompt and stops sending the synopsis. Whispers are never summarised, and a folded turn is only left out of the prompt -- the transcript, regeneration and `/session audit` still have it.\n"
+        "Rolling Synopsis (Compaction tab): once a conversation reaches 50 public turns, the oldest 25 are folded into one running synopsis that every participant is given with each reply, so a long scene keeps its thread after it scrolls out of Short-Term Memory. Sessions created now start with it on; a session made before keeps what it had. 'Edit Settings' sets when it folds, how many turns go each time, the synopsis length (100-800 words, 220 by default) and the summariser -- left blank, it runs the same models as the LTM Summariser. Turning it off puts the folded turns back into the prompt and stops sending the synopsis. Whispers are never summarised, and a folded turn is only left out of the prompt -- the transcript, regeneration and `/session audit` still have it. To fold now rather than wait, run `/compact` (or press Compact Now): everything but the newest 10 turns (`keep` sets how many) goes into the synopsis, including the pages people linked and the files they pasted, and the Rolling Synopsis is switched on if it was off. `/compact undo:True` (or Uncompact) unfolds every turn and removes the synopsis; while the Rolling Synopsis stays on, it starts folding again once the session is past its trigger.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I configured a session but nothing happens.' Fix: Press 'Start / Update Session'. Seating a cast does not start it -- check the footer, which reads 'Draft' until you do.\n"
         "- Symptom: 'A child bot is in the cast but ignores the channel.' Fix: Press 'Start / Update Session'. It re-announces the channel to every child bot in the cast, which a restored session does not do on its own.\n"
@@ -1043,13 +1044,14 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'Other people in the channel can see my global chat.' Fix: They can, and that is by design -- the card is a normal message. The lock only stops them pressing the buttons. Run the command in a DM with the bot for a conversation nobody else can read; the history is the same one either way."
     ),
     "sessions/maintenance_commands.txt": (
-        "Commands: `/refresh`, `/cancel`, `/suspend`, `/purge`, `/memorise`, `/clear`, `/trigger`, `/session view`, `/session audit`\n"
+        "Commands: `/refresh`, `/cancel`, `/suspend`, `/purge`, `/memorise`, `/compact`, `/clear`, `/trigger`, `/session view`, `/session audit`\n"
         "- `/refresh`: Clears the short-term conversation buffer for this channel. Long-term memories and training examples are untouched. Use when a profile has become confused about recent events.\n"
         "- `/cancel`: Administrators. Stops whatever generation or typing indicator is currently running in this channel. It aborts the round the whole channel is waiting on, which is why it is not open to everyone.\n"
         "- `/suspend`: Administrators. Ends the session in this channel and stops the bot responding until it is configured again.\n"
         ""
         "- `/purge`: Administrators. Deletes the latest turns of the session, counted as the channel shows them -- one reply however many messages it took -- including every message of each (reply, citations, warnings, files), and removes those turns from memory. Whispers and private responses are not counted. Set `whole_channel` to count messages instead, whoever posted them, session or not; a turn it only partly covers is deleted whole.\n"
         "- `/memorise`: Administrators (or a participant's owner, for a single named profile). Forces long-term memory summarisation for the session's cast right now, instead of waiting for the automatic creation interval.\n"
+        "- `/compact`: Administrators. Folds everything but the newest turns (10 unless `keep` says otherwise) into the session synopsis now, including linked pages and pasted files, and turns the Rolling Synopsis on if it was off. `undo:True` unfolds every turn and removes the synopsis. The session waits while it runs.\n"
         "- `/clear`: Clears the bot's own messages from a DM channel.\n"
         "- `/session view`: Shows the current session configuration and participant status.\n"
         "- `/trigger`: Forces a new round immediately without waiting for a user message. Renamed from `/session trigger`.\n"
@@ -1190,7 +1192,7 @@ DEFAULT_HELP_DOCS = {
     ),
     "features/multimodal_media_handling.txt": (
         "Concept: Multimodal processing allows profiles to analyse media files (images, audio, video) attached to your Discord messages.\n"
-        "Vision Processing: Models with native vision support can analyse image attachments. Replying to a message containing an image pulls that image into the profile's context.\n"
+        "Vision Processing: Models with native vision support can analyse image attachments. Replying to a message pulls every image, audio clip or video on it into the profile's context for that round, tagged in the reply so the character knows which message it came from. A reply to a message the character can already see names it rather than quoting it; one it cannot see (older than its Short-Term Memory, folded, or from before the session) is quoted, up to about 200 characters.\n"
         "Audio & Video: Capable models can process direct audio and video files.\n"
         "File size: Nothing over 25 MB is downloaded -- not an image, audio, video or text attachment, a reference picture for !image, or a `.mimic` import. The character is told a larger attachment was sent and not read, and a larger import is refused. Media is billed by its length, so the limit bounds what one file can cost as well as the memory it takes.\n"
         "Text-only models: Many OpenRouter models cannot read attachments at all. The profile's fallback model is tried first, and answers if it can read the file. If neither model can, the attachment is dropped and the character is told the filename and that it cannot read it, so it answers the message instead of failing the turn; a note under the reply says so.\n"

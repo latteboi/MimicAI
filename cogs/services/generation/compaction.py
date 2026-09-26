@@ -8,9 +8,10 @@ from ...utils.constants import (
     COMPACTION_SYNOPSIS_WORDS_MIN, COMPACTION_THRESHOLD_DEFAULT, COMPACTION_THRESHOLD_MAX,
     COMPACTION_THRESHOLD_MIN, DEFAULT_SESSION_SYNOPSIS_PROMPT,
     DEFAULT_SESSION_SYNOPSIS_USER_PROMPT, GREEDY_SAMPLING, SESSION_BUSY_FLAGS,
+    COMPACT_KEEP_DEFAULT, COMPACT_PASS_MAX_CHARS, PURGE_BUSY_WAIT_TIMEOUT_SECONDS,
 )
 from ...utils.helpers import _resolve_zoneinfo, restamp_turn, resolve_thinking_params, turn_posted_at
-from ...managers.session_manager import SessionManager, intern_turn
+from ...managers.session_manager import SessionManager, intern_turn, reply_tags, turn_lookup, with_reply
 
 #: What the settings modal wrote into every session it saved, typed or not: the shipped
 #: pair of the day, seeded rather than resolved. Read as unset, so those sessions follow
@@ -163,31 +164,62 @@ class SessionCompactionMixin:
             return False
         indices, settings = plan
 
-        unified_log = session["unified_log"]
-        turns = [unified_log[i] for i in indices]
-        # One clock for a synopsis the whole cast shares: the session owner's. Stored
-        # turns carry each speaker's own, and a date read across two zones is wrong.
-        clock, _ = _resolve_zoneinfo(self.cog.profile_manager.user_timezone(session.get("owner_id")))
-        transcript = "\n".join(restamp_turn(t["content"], turn_posted_at(t), clock).strip()
-                               for t in turns if t.get("content"))
-        if not transcript.strip():
-            return False
-
-        previous = self._latest_synopsis(unified_log, before_index=indices[0])
-
-        synopsis = await self._generate_synopsis(channel_id, session, transcript, previous, settings)
-        if not synopsis:
+        folded = await self._fold(channel_id, session, indices, settings)
+        if folded is None:
             # Tried again once another fold's worth of public turns has built up. Held in
             # memory only: a restart is a fair moment to try again.
             session["_compaction_retry_at"] = (
                 len(self._compactable_indices(session.get("unified_log") or [])) + settings["chunk"])
             return False
+        if not folded:
+            return False
         session.pop("_compaction_retry_at", None)
+        await self._flush_folds(channel_id, session)
+        return True
+
+    @staticmethod
+    def _fold_text(turn: Dict[str, Any], clock, tags, find) -> str:
+        """A turn as the summariser reads it: what was said, what it replied to, and the
+        page it linked.
+
+        The page travels beside the turn rather than in it (see `keep_url_context`), and
+        a folded turn is never shown again -- so a synopsis written from `content` alone
+        remembered that a link was posted and nothing of what it said.
+        """
+        text = with_reply(restamp_turn(turn.get("content") or "", turn_posted_at(turn), clock),
+                          turn, clock, tags, find).strip()
+        if turn.get("url_context"):
+            text += f"\n<document_context>\n{turn['url_context']}\n</document_context>"
+        return text
+
+    async def _fold(self, channel_id: int, session: Dict[str, Any], indices: List[int],
+                    settings: Dict[str, Any]) -> Optional[int]:
+        """Fold the turns at `indices` into one synopsis placed after them.
+
+        Returns how many were folded; 0 when there was nothing to summarise or the log
+        was replaced while the summariser ran; None when the summariser failed. Saving
+        is the caller's: a manual compact folds several times and writes the log once.
+        """
+        unified_log = session["unified_log"]
+        turns = [unified_log[i] for i in indices]
+        # One clock for a synopsis the whole cast shares: the session owner's. Stored
+        # turns carry each speaker's own, and a date read across two zones is wrong.
+        clock, _ = _resolve_zoneinfo(self.cog.profile_manager.user_timezone(session.get("owner_id")))
+        tags, find = reply_tags(turns), turn_lookup(unified_log)
+        transcript = "\n".join(text for text in (self._fold_text(t, clock, tags, find) for t in turns) if text)
+        if not transcript.strip():
+            return 0
+
+        previous = self._latest_synopsis(unified_log, before_index=indices[0])
+
+        synopsis = await self._generate_synopsis(channel_id, session, transcript, previous, settings)
+        if not synopsis:
+            return None
 
         # Re-read the log: generating awaited, and a whisper or a delete could have
         # landed on it. Positions are only meaningful against the list we planned from.
         if session.get("unified_log") is not unified_log:
-            return False
+            return 0
 
         marked_ids = []
         for turn in turns:
@@ -196,7 +228,7 @@ class SessionCompactionMixin:
                 marked_ids.append(turn.get("turn_id"))
         marked = len(marked_ids)
         if not marked:
-            return False
+            return 0
 
         synopsis_turn = intern_turn({
             "turn_id": str(uuid.uuid4()),
@@ -215,13 +247,112 @@ class SessionCompactionMixin:
         # After the last folded turn, so the synopsis sits where the range it replaces
         # used to be rather than after conversation that came later.
         unified_log.insert(indices[-1] + 1, synopsis_turn)
+        return marked
 
+    async def _flush_folds(self, channel_id: int, session: Dict[str, Any]):
         # Structural: the flags land on turns anywhere in the log, including ones already
-        # sealed into the cold segment, and the insert shifts the tail boundary.
+        # sealed into the cold segment, and an insert or removal shifts the tail boundary.
         session["_log_cold_len"] = 0
         await self.cog.session_manager.flush_session(
             (channel_id, None, None), session.get("type", "multi"), structural=True)
-        return True
+
+    async def manual_compaction(self, channel_id: int, *, undo: bool = False,
+                                keep: int = COMPACT_KEEP_DEFAULT) -> str:
+        """`/compact` and the Compaction tab's buttons: fold now, or unfold everything.
+
+        Returns what to tell whoever asked. Claims the channel for the whole run, as
+        /memorise does: a round captures `batch_start_index` when it starts, and a
+        synopsis inserted under it would shift every turn that round is about to read.
+        """
+        session = self.cog.multi_profile_channels.get(channel_id)
+        if not session:
+            return "There is no session in this channel."
+        if not session.get("is_hydrated"):
+            session = await self.cog.session_manager._ensure_session_hydrated(
+                channel_id, session.get("type", "multi"))
+            if not session:
+                return "Could not load this session's transcript."
+        if not await self.cog.session_manager._wait_for_session_flags(
+                session, SESSION_BUSY_FLAGS, PURGE_BUSY_WAIT_TIMEOUT_SECONDS):
+            return (f"The session is still busy after {int(PURGE_BUSY_WAIT_TIMEOUT_SECONDS)}s. "
+                    "Nothing was changed \u2014 try again in a moment.")
+        session["is_compacting"] = True
+        try:
+            if undo:
+                return await self._unfold_all(channel_id, session)
+            return await self._fold_all(channel_id, session, keep)
+        finally:
+            session["is_compacting"] = False
+
+    async def _fold_all(self, channel_id: int, session: Dict[str, Any], keep: int) -> str:
+        """Fold every public turn but the newest `keep`, in passes of bounded size."""
+        settings = self._compaction_settings(session)
+        folded, failed = 0, False
+        while True:
+            log = session.get("unified_log") or []
+            candidates = self._compactable_indices(log)
+            foldable = candidates[:max(0, len(candidates) - keep)]
+            if not foldable:
+                break
+            # Oldest first, up to the size cap, and always at least one turn: a single
+            # turn over the cap -- a long pasted file -- is still a turn to fold.
+            indices, size = [], 0
+            for i in foldable:
+                turn = log[i]
+                size += len(turn.get("content") or "") + len(turn.get("url_context") or "")
+                if indices and size > COMPACT_PASS_MAX_CHARS:
+                    break
+                indices.append(i)
+            count = await self._fold(channel_id, session, indices, settings)
+            if count is None:
+                failed = True
+            if not count:
+                break
+            folded += count
+
+        if not folded:
+            if failed:
+                return "The summariser could not run, so nothing was folded."
+            live = len(self._compactable_indices(session.get("unified_log") or []))
+            return f"Nothing to fold: the session has {live} live turn(s), and the newest {keep} are kept."
+
+        session.pop("_compaction_retry_at", None)
+        notes = []
+        if not settings["enabled"]:
+            # Folded turns are hidden, and the synopsis sent, only while it is on. Left
+            # off, this would have paid for a synopsis nobody reads and hidden nothing.
+            session.setdefault("compaction", {})["enabled"] = True
+            self.cog.session_manager._save_multi_profile_sessions()
+            notes.append("The rolling synopsis was off and is now on, or the synopsis would never be sent.")
+        await self._flush_folds(channel_id, session)
+
+        remaining = len(self._compactable_indices(session["unified_log"]))
+        message = f"Folded {folded} turn(s) into the session synopsis; {remaining} live turn(s) remain."
+        if failed:
+            message += " The summariser failed partway, so some of those were meant to be folded too."
+        return " ".join([message, *notes])
+
+    async def _unfold_all(self, channel_id: int, session: Dict[str, Any]) -> str:
+        """Unfold every folded turn and drop every synopsis block, back to the transcript."""
+        log = session.get("unified_log") or []
+        folded = [turn for turn in log if turn.get("compacted")]
+        synopses = sum(1 for turn in log if turn.get("type") == "synopsis")
+        if not folded and not synopses:
+            return "Nothing in this session is folded."
+        for turn in folded:
+            del turn["compacted"]
+        # In place: whatever holds this list keeps seeing the session's log.
+        log[:] = [turn for turn in log if turn.get("type") != "synopsis"]
+        session.pop("_compaction_retry_at", None)
+        await self._flush_folds(channel_id, session)
+
+        message = f"Unfolded {len(folded)} turn(s) and removed {synopses} synopsis block(s)."
+        settings = self._compaction_settings(session)
+        if settings["enabled"]:
+            message += (f" The rolling synopsis is still on, so it folds {settings['chunk']} again at a "
+                        f"round's end whenever {settings['threshold']} or more turns are live. Turn it off "
+                        "on the Compaction tab of `/session config` to keep them.")
+        return message
 
     async def _generate_synopsis(self, channel_id: int, session: Dict[str, Any], transcript: str,
                                  previous: Optional[str], settings: Dict[str, Any]) -> Optional[str]:

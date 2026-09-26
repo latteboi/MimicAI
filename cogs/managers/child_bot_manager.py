@@ -18,7 +18,7 @@ from ..utils.constants import (
     IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS,
 )
 from ..utils.helpers import (_resolve_safety_settings, _split_into_sentences_with_abbreviations,
-                             apply_typing_cursor, image_command_prompt, image_rag_enabled,
+                             apply_typing_cursor, attachment_mime, image_command_prompt, image_rag_enabled,
                              typing_cursor_cost, upload_too_large)
 from ..utils.attachment_limits import over_attachment_limit
 from ..utils.discord_cdn import signed_attachment_url
@@ -1127,9 +1127,12 @@ class ChildBotManager:
             system_instruction = self.cog.media_service._get_image_gen_system_instruction(owner_id, profile_name)
 
             reference_image_urls = []
-            replied_to_data = message_data.get("replied_to")
-            if replied_to_data and replied_to_data.get("attachment_url"):
-                reference_image_urls.append({"url": replied_to_data["attachment_url"], "mime_type": "image/png"})
+            # The first picture the replied-to message carries, as the reference to draw from.
+            replied_to_data = message_data.get("replied_to") or {}
+            ref_image = next((a for a in replied_to_data.get("attachments") or ()
+                              if attachment_mime(a).startswith("image/") and not over_attachment_limit(a)), None)
+            if ref_image:
+                reference_image_urls.append({"url": ref_image["url"], "mime_type": attachment_mime(ref_image)})
 
             attachments_data = message_data.get("attachments", [])
             if len(reference_image_urls) < 10 and attachments_data:

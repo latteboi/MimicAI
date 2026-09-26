@@ -407,20 +407,3 @@ class WhisperMixin:
         await interaction.edit_original_response(
             embed=self._whisper_embed(interaction, self._whisper_display(reply), display_name, avatar_url, whisper_message),
             view=view)
-
-    async def _resolve_reply_context(self, message: discord.Message) -> Optional[str]:
-        if not message.reference or not message.reference.message_id:
-            return None
-
-        try:
-            referenced_message = await message.channel.fetch_message(message.reference.message_id)
-            author_name = referenced_message.author.display_name
-            content = referenced_message.clean_content
-            if len(content) > 150:
-                content = content[:150] + "..."
-            return f"<reply_context author='{author_name}'>\n{content}\n</reply_context>"
-        except (discord.NotFound, discord.Forbidden):
-            return "<reply_context author='Unknown'>\n[Message could not be loaded]\n</reply_context>"
-        except Exception as e:
-            print(f"Error resolving reply context: {e}")
-            return None
