@@ -8,7 +8,8 @@ from ...utils.constants import (
     PLACEHOLDER_EMOJI, DEFAULT_WHISPER_INJECTION,
     SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS, WHISPER_WAITING_NOTICE,
 )
-from ...utils.helpers import _format_citation_subtext, _format_history_entry, _get_user_hash
+from ...utils.helpers import (_format_citation_subtext, _format_history_entry, _get_user_hash,
+                             _resolve_zoneinfo, restamp_turn, turn_posted_at)
 from . import tool_loop
 from .reply import ReplyText, reply_gen_config
 from ...gui.gui_sessions import WhisperActionView
@@ -154,6 +155,33 @@ class WhisperMixin:
             text += "\n\n" + "\n".join(f"-# {i+1}. {w}" for i, w in enumerate(reply.warnings))
         return text[:4096]
 
+    def _whisper_history(self, session: Dict, log, bot_pid: str, p_settings: Dict, whisper_turn: Dict):
+        """What a whisper is answered from: `log` as this participant sees it, then the
+        whisper itself in its <whisper_context>. The one prompt for a whisper and its
+        regeneration, which used to read the whisper back out of the log as a bare
+        <private_whisper> -- without the note that it is private -- and exempted every
+        turn since the last user message from STM.
+
+        Derived from unified_log, the single source of truth, rather than a shadow copy
+        maintained by incremental appends. _build_history_for_participant already rewrites
+        this participant's own whispers and private responses into their XML tags, and
+        hides other participants' — so the privacy boundary is enforced in one place.
+        """
+        contents = self.cog.session_manager._build_history_for_participant(
+            log, bot_pid, p_settings, hide_folded=self.cog.session_manager.compaction_enabled(session))
+        # On the character's clock, like every turn the builder shows it. It went as stored,
+        # in UTC, so a character in AEST was whispered to ten hours from its own present.
+        clock, _ = _resolve_zoneinfo(p_settings.get("timezone"))
+        whisper_content = restamp_turn(whisper_turn.get("content") or "", turn_posted_at(whisper_turn), clock)
+        prompt = self.cog.global_prompts.get("WHISPER_INJECTION", DEFAULT_WHISPER_INJECTION).format(
+            whisper_content=whisper_content.strip())
+        # Ensure alternating roles by appending to the last user turn if present
+        if contents and contents[-1].get('role', 'user') == 'user':
+            contents[-1]['parts'].append(prompt)
+        else:
+            contents.append({'role': 'user', 'parts': [prompt]})
+        return contents
+
     def _whisper_appearance(self, owner_id: int, profile_name: str, p_settings: Dict):
         """(effective owner, effective name, display name, avatar url, placeholder emoji)."""
         effective_owner_id, effective_profile_name = self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)
@@ -186,25 +214,21 @@ class WhisperMixin:
         effective_owner_id, effective_profile_name, display_name, avatar_url, custom_emoji = \
             self._whisper_appearance(owner_id, profile_name, p_settings)
 
-        user_hash = _get_user_hash(interaction.user.id)
-        whisper_content = _format_history_entry(interaction.user.name, interaction.created_at, whisper_message, entity_id=user_hash)
-        api_whisper_prompt = self.cog.global_prompts.get("WHISPER_INJECTION", DEFAULT_WHISPER_INJECTION).format(whisper_content=whisper_content.strip())
-
-        # Derived from unified_log, the single source of truth, rather than a shadow copy
-        # maintained by incremental appends. _build_history_for_participant already rewrites
-        # this participant's own whispers and private responses into their XML tags, and
-        # hides other participants' — so the privacy boundary is enforced in one place.
         bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
-        contents_for_api_call = self.cog.session_manager._build_history_for_participant(
-            session.get("unified_log", []), bot_pid, p_settings,
-            hide_folded=self.cog.session_manager.compaction_enabled(session),
-        )
-
-        # Ensure alternating roles by appending to the last user turn if present
-        if contents_for_api_call and contents_for_api_call[-1].get('role', 'user') == 'user':
-            contents_for_api_call[-1]['parts'].append(api_whisper_prompt)
-        else:
-            contents_for_api_call.append({'role': 'user', 'parts': [api_whisper_prompt]})
+        # Built now, logged only once the character has answered. On the whisperer's
+        # clock, as every user turn is stored.
+        whisper_turn = {
+            "turn_id": str(uuid.uuid4()), "type": "whisper",
+            "is_user": True, "speaker_pid": str(interaction.user.id), "target_pid": bot_pid,
+            "message_ids": [],
+            "content": _format_history_entry(
+                interaction.user.name, interaction.created_at, whisper_message,
+                self.cog.profile_manager.user_timezone(interaction.user.id),
+                entity_id=_get_user_hash(interaction.user.id)),
+            "timestamp": interaction.created_at.isoformat(),
+        }
+        contents_for_api_call = self._whisper_history(
+            session, session.get("unified_log", []), bot_pid, p_settings, whisper_turn)
 
         placeholder_embed = self._whisper_embed(interaction, custom_emoji, display_name, avatar_url, whisper_message)
         if waiting_msg is not None:
@@ -232,27 +256,22 @@ class WhisperMixin:
         if sources:
             response_text += "\n\n" + "\n".join(sources)
 
-        whisper_turn_id = str(uuid.uuid4())
-        target_pid = bot_pid
-
-        session.setdefault("unified_log", []).append(intern_turn({
-            "turn_id": whisper_turn_id, "type": "whisper",
-            "is_user": True, "speaker_pid": str(interaction.user.id), "target_pid": target_pid,
-            "message_ids":[],
-            "content": whisper_content,
-            "timestamp": interaction.created_at.isoformat()
-        }))
+        whisper_turn_id = whisper_turn["turn_id"]
+        session.setdefault("unified_log", []).append(intern_turn(whisper_turn))
 
         response_turn_id = str(uuid.uuid4())
         profile_id = self.cog.profile_manager._get_profile_id(effective_owner_id, effective_profile_name)
-        response_content = _format_history_entry(profile_name, datetime.datetime.now(datetime.timezone.utc), response_text, entity_id=profile_id)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        # On the character's clock, as its session turns are.
+        response_content = _format_history_entry(
+            profile_name, now, response_text, p_settings.get("timezone", "UTC"), entity_id=profile_id)
 
         resp_log = {
             "turn_id": response_turn_id, "type": "private_response",
-            "is_user": False, "speaker_pid": target_pid, "target_id": interaction.user.id,
+            "is_user": False, "speaker_pid": bot_pid, "target_id": interaction.user.id,
             "message_ids":[],
             "content": response_content,
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            "timestamp": now.isoformat()
         }
 
         session.setdefault("unified_log", []).append(intern_turn(resp_log))
@@ -262,7 +281,7 @@ class WhisperMixin:
         # participant's history, so there is no second copy to maintain here.
 
         # Add to pending whispers to be injected into the next public turn
-        session.setdefault("pending_whispers", {}).setdefault(participant_key, []).append(whisper_content)
+        session.setdefault("pending_whispers", {}).setdefault(participant_key, []).append(whisper_turn)
 
         # [NEW] Immediate persistence for private whisper turns
         session_type = session.get("type", "multi")
@@ -347,26 +366,17 @@ class WhisperMixin:
 
         # Reconstruct context for AI
         log = session.get("unified_log", [])
-        try:
-            old_resp_index = next(i for i, t in enumerate(log) if t.get("turn_id") == response_turn_id)
-            sliced_log = log[:old_resp_index]
-        except StopIteration:
+        indices = {t.get("turn_id"): i for i, t in enumerate(log)
+                   if t.get("turn_id") in (whisper_turn_id, response_turn_id)}
+        if response_turn_id not in indices:
             await interaction.followup.send("Original response not found in log.", ephemeral=True)
             return
-
-        # [NEW] Hybrid STM for Whisper Regeneration
-        batch_start_index = 0
-        for i in range(len(sliced_log) - 1, -1, -1):
-            if sliced_log[i].get("is_user") is True:
-                batch_start_index = i
-                break
+        # The log as it stood when the whisper was sent, and the whisper as it was logged.
+        cut = indices.get(whisper_turn_id, indices[response_turn_id])
+        whisper_turn = log[cut] if whisper_turn_id in indices else {"content": whisper_message}
 
         bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
-        participant_history = self.cog.session_manager._build_history_for_participant(
-            sliced_log, bot_pid, p_settings,
-            reserved_tail=len(sliced_log) - batch_start_index,
-            hide_folded=self.cog.session_manager.compaction_enabled(session),
-        )
+        participant_history = self._whisper_history(session, log[:cut], bot_pid, p_settings, whisper_turn)
 
         try:
             reply = await self._whisper_reply(
@@ -389,11 +399,15 @@ class WhisperMixin:
 
         # Update log
         profile_id = self.cog.profile_manager._get_profile_id(effective_owner_id, effective_profile_name)
-        new_content = _format_history_entry(profile_name, datetime.datetime.now(datetime.timezone.utc), response_text, entity_id=profile_id)
-
+        now = datetime.datetime.now(datetime.timezone.utc)
         for turn in log:
             if turn.get("turn_id") == response_turn_id:
-                turn["content"] = new_content
+                # Rewrites what the reply says, not when: the same as a session turn's
+                # regeneration (see _execute_regeneration).
+                turn["content"] = _format_history_entry(
+                    profile_name, turn_posted_at(turn) or now, response_text,
+                    p_settings.get("timezone", "UTC"), entity_id=profile_id)
+                turn["edited_at"] = now.isoformat()
                 turn.pop('thought_signature', None) # Clean up legacy signature
                 break
 

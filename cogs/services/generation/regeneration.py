@@ -7,11 +7,12 @@ from typing import Dict, List, Optional
 
 from ...utils.constants import (
     PLACEHOLDER_EMOJI,
-    DEFAULT_KICKSTART_START, DEFAULT_IMAGE_PRESENT, DEFAULT_WHISPER_RECAP,
+    DEFAULT_KICKSTART_START, DEFAULT_IMAGE_PRESENT,
 )
 from ...utils.helpers import (_format_history_entry, image_command_prefix,
                              is_citation_subtext, kickstart_note,
-                             turn_posted_at)
+                             resolve_critic_settings, turn_posted_at, whisper_recap)
+from ...managers.session_manager import round_reserve
 from ...utils.attachment_limits import over_attachment_limit
 from .reply import reply_gen_config, reply_meta
 from .triggers import referenced_message, reply_record
@@ -234,15 +235,16 @@ class RegenerationMixin:
 
             # The history as it stood when the turn was first written.
             earlier = log[:turn_index]
-            last_user_index = next(
-                (i for i in range(len(earlier) - 1, -1, -1) if earlier[i].get("is_user") is True), None)
-            last_user_turn = earlier[last_user_index] if last_user_index is not None else None
+            # The turn's own round is what it answered, and all the live round exempted
+            # from STM. Its user message, not merely the last one above: a whisper is
+            # is_user too, and a message several 🍿 rounds back was answered long ago.
+            reserve = round_reserve(earlier, bot_pid)
+            round_turns = [t for t in earlier[len(earlier) - reserve:] if not t.get("type")]
+            last_user_turn = next((t for t in reversed(round_turns) if t.get("is_user") is True), None)
 
-            # The turns since the last user message are what this regeneration is
-            # answering; STM governs how far back it remembers, not those. See
-            # SessionManager._build_history_for_participant.
             history = self.cog.session_manager._build_history_for_participant(
-                earlier, bot_pid, p_settings, reserved_tail=len(earlier) - (last_user_index or 0),
+                earlier, bot_pid, p_settings, len(session.get("profiles") or []) or 1,
+                reserved_tail=reserve,
                 hide_folded=self.cog.session_manager.compaction_enabled(session),
             )
             pending_whispers = self.cog.session_manager._get_pending_whispers_for_participant(earlier, bot_pid)
@@ -259,19 +261,32 @@ class RegenerationMixin:
             media = await self._recover_regeneration_media(channel, original_attachments, last_user_turn)
             if media:
                 _add_to_last_user_turn(history, media)
-            if pending_whispers:
-                recap_template = self.cog.global_prompts.get("WHISPER_RECAP", DEFAULT_WHISPER_RECAP)
-                _add_to_last_user_turn(history, [recap_template.format(whispers="\n---\n".join(pending_whispers))])
+            recap = whisper_recap(pending_whispers, p_settings.get("timezone"), self.cog.global_prompts)
+            if recap:
+                _add_to_last_user_turn(history, [recap])
 
-            trigger_content = last_user_turn.get("content", "") if last_user_turn else ""
-            ltm_recall_text, training_examples = await asyncio.gather(
+            # What the live round searched on: its own turns, or the last turn when it
+            # had none of its own. The last user message alone was empty on a scene with
+            # no user in it, and stale on one carried on by 🍿.
+            trigger_content = "\n".join(t.get("content", "") for t in round_turns) or (
+                earlier[-1].get("content", "") if earlier else "")
+            help_search = (self.cog.help_service._get_relevant_help_context(trigger_content, channel.guild.id)
+                           if p_settings.get("help_mode_enabled", False) else asyncio.sleep(0))
+            ltm_recall_text, training_examples, help_context_text = await asyncio.gather(
                 self.cog.memory_manager._get_relevant_ltm_for_prompt(
                     (channel.id, owner_id, profile_name), history, owner_id, profile_name,
                     trigger_content, "User", channel.guild.id, payload.user_id,
                     threshold=ltm_auto_threshold(p_settings)),
                 self.cog.memory_manager._get_relevant_training_examples(
                     owner_id, profile_name, trigger_content, channel.guild.id),
+                help_search,
             )
+            if help_context_text:
+                _add_to_last_user_turn(history, [help_context_text])
+            # The constraints the turn was first written under, as its trace kept them. A
+            # regeneration skipped the critic, so it wrote the very patterns it screens out.
+            critic = ((target_turn.get("meta") or {}).get("critic")
+                      if resolve_critic_settings(p_settings)["enabled"] else None)
             # One tuple for the prompt and both models -- see tool_loop.
             functions = functions_for(p_settings)
             (system_instruction, _, _, temp, top_p, top_k,
@@ -279,7 +294,7 @@ class RegenerationMixin:
                 self._construct_system_instructions,
                 owner_id, profile_name, channel.id, is_multi_profile=True,
                 training_examples_list=training_examples, recalled_ltm=ltm_recall_text,
-                functions=functions,
+                critic_constraints=(critic or {}).get("text"), functions=functions,
             )
 
             app_name, app_avatar = self._resolve_appearance_data(owner_id, profile_name)
@@ -361,7 +376,8 @@ class RegenerationMixin:
             final_target_turn["message_ids"] = list(surviving_message_ids)
             final_target_turn["meta"] = reply_meta(
                 attempt, duration=time.monotonic() - t_start, training_examples=training_examples,
-                ltm_recall_text=ltm_recall_text, sources=reply.sources, neuro_state=reply.neuro_state)
+                ltm_recall_text=ltm_recall_text, sources=reply.sources, neuro_state=reply.neuro_state,
+                critic=critic)
             # Clean up legacy signatures from the turn if they exist
             final_target_turn.pop('thought_signature', None)
 

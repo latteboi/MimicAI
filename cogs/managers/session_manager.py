@@ -144,6 +144,34 @@ def log_user_turn(session: Dict[str, Any], turn: Dict[str, Any],
     return index
 
 
+def round_reserve(earlier: List[Dict[str, Any]], speaker_pid: str) -> int:
+    """How many of `earlier`'s trailing turns the round that wrote the next turn had in it:
+    a regeneration's `reserved_tail`, so it sees what the live round exempted from STM.
+
+    The log does not record rounds, so this reads one off it. A round's replies are
+    consecutive and one per seat, after whatever triggered it -- user messages, a
+    director's note. Walking back, a repeat speaker (the regenerating profile included),
+    or a reply above a trigger, belongs to an earlier round. It reserved everything since
+    the last user message, so a scene run on 🍿 -- or a log with no user turn at all --
+    was regenerated with its whole history and no STM.
+    """
+    speakers = {speaker_pid}
+    start = len(earlier)
+    triggered = False
+    for index in range(len(earlier) - 1, -1, -1):
+        turn = earlier[index]
+        if turn.get("type"):
+            continue  # whispers and synopses: not the round's; the builder decides who sees them
+        if turn.get("is_user") is True or turn.get("speaker_pid") == "SYSTEM":
+            triggered = True
+        elif triggered or turn.get("speaker_pid") in speakers:
+            break
+        else:
+            speakers.add(turn.get("speaker_pid"))
+        start = index
+    return len(earlier) - start
+
+
 #: A stored turn's identity, `<Name> [ID: x]`, as its header shows it to the model.
 _TURN_IDENTITY = re.compile(r'<([^>\r\n]+)> \[ID: ([^\]\r\n]+)\]')
 
@@ -1666,8 +1694,9 @@ class SessionManager:
     async def evict_inactive_sessions_task(self):
         await self._evict_inactive_sessions()
 
-    def _get_pending_whispers_for_participant(self, log_list: List[Dict], bot_pid: str) -> List[str]:
-        """Whispers aimed at bot_pid that it has not spoken since.
+    def _get_pending_whispers_for_participant(self, log_list: List[Dict], bot_pid: str) -> List[Dict]:
+        """Whisper turns aimed at bot_pid that it has not spoken since -- the turns, not
+        their text, so `whisper_recap` can restamp them to the reader's clock.
 
         Scanned backwards and stopped at the participant's own last ordinary turn: that
         turn is what clears the list, so nothing before it can contribute. The forward
@@ -1684,7 +1713,7 @@ class SessionManager:
                     break
             elif turn_type == "whisper":
                 if turn.get("target_pid") == bot_pid:
-                    pending.append(turn.get("content"))
+                    pending.append(turn)
         pending.reverse()
         return pending
 

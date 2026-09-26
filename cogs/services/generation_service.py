@@ -18,7 +18,7 @@ from ..utils.constants import (
     WARN_VOICE_SYNTHESIS_FAILED,
     ERR_REASON_AUDIO_TOO_LARGE, ERR_REASON_AUDIO_NOT_UPLOADED,
     DEFAULT_KICKSTART_START,
-    DEFAULT_WHISPER_RECAP, DEFAULT_DIRECTOR_USER_PROMPT, DEFAULT_DIRECTOR_INSTRUCTIONS,
+    DEFAULT_DIRECTOR_USER_PROMPT, DEFAULT_DIRECTOR_INSTRUCTIONS,
     DEFAULT_IMAGE_GROUNDING, DEFAULT_IMAGE_PRESENT,
     DEFAULT_IMAGE_PRESENT_OTHER, DEFAULT_IMAGE_FAILED,
     DEFAULT_SPEECH_VOICE, TTS_SYNTHESIS_PREAMBLE, CRITIC_AUDIT_TEXT_MAX,
@@ -32,7 +32,7 @@ from ..utils.helpers import (
     _format_history_entry, _get_user_hash, _resolve_safety_settings,
     _split_into_sentences_with_abbreviations, generated_image_attachment,
     resolve_critic_settings,
-    image_command_prompt, image_rag_enabled, is_gateway_shutdown, kickstart_note,
+    image_command_prompt, image_rag_enabled, is_gateway_shutdown, kickstart_note, whisper_recap,
     resolve_grounding_mode,
     resolve_thinking_params, resolve_url_mode,
     resolve_typing_cursor,
@@ -1206,10 +1206,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         supplementary_parts = []
 
                         # [UPDATED] Standardised XML injection for pending whispers
-                        pending_whispers = session.get("pending_whispers", {}).pop(participant_key, None)
-                        if pending_whispers:
-                            recap_template = self.cog.global_prompts.get("WHISPER_RECAP", DEFAULT_WHISPER_RECAP)
-                            whisper_context = recap_template.format(whispers="\n---\n".join(pending_whispers))
+                        whisper_context = whisper_recap(
+                            session.get("pending_whispers", {}).pop(participant_key, None),
+                            p_settings.get("timezone"), self.cog.global_prompts)
+                        if whisper_context:
                             supplementary_parts.append(whisper_context)
 
                         if help_context_text:

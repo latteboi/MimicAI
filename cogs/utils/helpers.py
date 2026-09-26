@@ -34,7 +34,7 @@ from .constants import (
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
     MEDIA_RESOLUTION_VALUES, MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL,
     GROUNDING_MODE_LABELS,
-    DEFAULT_KICKSTART_CONTINUE, DEFAULT_KICKSTART_IDLE,
+    DEFAULT_KICKSTART_CONTINUE, DEFAULT_KICKSTART_IDLE, DEFAULT_WHISPER_RECAP,
     SUPERSEDED_LTM_SUMMARIZATION_HASHES,
     OPENROUTER_SERVICE_TIER_VALUES,
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_KEYS, UNREADABLE_MEDIA_LABELS,
@@ -293,6 +293,23 @@ def kickstart_note(history: List[Dict[str, Any]],
     if "<private_response>" in text or len(parts) % KICKSTART_FOLLOW_UP_CYCLE == 1:
         return prompts.get("KICKSTART_CONTINUE", DEFAULT_KICKSTART_CONTINUE)
     return prompts.get("KICKSTART_IDLE", DEFAULT_KICKSTART_IDLE)
+
+
+def whisper_recap(pending: List[Dict[str, Any]], timezone: Optional[str],
+                  global_prompts: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """The recap of whispers a character has not yet spoken since, on its own clock.
+
+    `pending` is whisper turns, as `_get_pending_whispers_for_participant` returns them.
+    They used to be the stored text, on whatever clock it was stamped in, so a character
+    in AEST read a whisper stamped in UTC a minute ago as ten hours old. None when there
+    are none.
+    """
+    if not pending:
+        return None
+    clock, _ = _resolve_zoneinfo(timezone)
+    template = (global_prompts or {}).get("WHISPER_RECAP", DEFAULT_WHISPER_RECAP)
+    return template.format(whispers="\n---\n".join(
+        restamp_turn(t.get("content") or "", turn_posted_at(t), clock) for t in pending))
 
 
 def _sanitise_filename(name: str) -> str:
