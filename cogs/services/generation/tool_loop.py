@@ -273,6 +273,23 @@ class LoopResult:
             meta["function_calls_capped"] = True
 
 
+def spaced(content: Any) -> Any:
+    """`content` with a blank line closing every text part that has another after it.
+
+    A history turn ends in one (`_format_history_entry`); a kickstart note, the turn
+    context, a whisper recap or an image note did not, and Gemini joins parts with
+    nothing, so the next block ran straight on from its closing tag. A history part
+    already ends so and is untouched, so no cached prefix moves.
+    """
+    if not isinstance(content, dict) or len(content.get('parts') or ()) < 2:
+        return content
+    parts = content['parts']
+    return {**content, 'parts': [
+        p.rstrip("\n") + "\n\n" if isinstance(p, str) and p.strip() and i < len(parts) - 1
+        and not p.endswith("\n\n") else p
+        for i, p in enumerate(parts)]}
+
+
 async def run(cog, model, contents: List[Any], gen_config: Optional[Dict[str, Any]],
               ctx: FunctionContext,
               send: Callable[[List[Any], Dict[str, Any]], Awaitable[Any]]) -> LoopResult:
@@ -288,7 +305,7 @@ async def run(cog, model, contents: List[Any], gen_config: Optional[Dict[str, An
     A model that declared nothing makes one request, as it always did.
     """
     offered = declared_on(model)
-    turn = list(contents)
+    turn = [spaced(c) for c in contents]
     gen_config = dict(gen_config or {})
     result = LoopResult()
     for round_no in range(LIMIT_FUNCTION_CALL_ROUNDS + 1):

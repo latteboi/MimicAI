@@ -15,10 +15,12 @@ from ..utils.constants import (
     DEFAULT_IMAGE_PRESENT, DEFAULT_IMAGE_FAILED, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING,
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
     IMAGE_COMMAND_PREFIXES, IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS, STATUS_IMAGINING_IMAGE,
-    TEXT_ATTACHMENT_EXTENSIONS,
+    TEXT_ATTACHMENT_EXTENSIONS, GOOGLE_VOICE_PREFIX, VOICE_KEY_REUSE_SECONDS,
+    VOICE_SAMPLE_GEMINI_ACCEPTED, VOICE_SAMPLE_GEMINI_REFUSED, VOICE_SAMPLE_GEMINI_UNCHECKED,
 )
-from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, generated_image_attachment, image_command_prefix, image_command_prompt, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor
+from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, generated_image_attachment, image_command_prefix, image_command_prompt, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor, speaks_verbatim
 from ..utils.attachment_limits import over_attachment_limit, skipped_attachment_note
+from .api.google_rest import GoogleSpeechModel
 from .generation import tool_loop
 from .generation.reply import _merge_sources
 from ..utils.http_client import get_capped
@@ -65,7 +67,7 @@ class MediaService:
             openrouter_key_error="Server OpenRouter key not configured.")
 
     async def synthesise_speech(self, transcript: str, guild_id: int, *, user_id: int, config_owner_id: int,
-                                directed_prompt: Optional[str] = None,
+                                directed_prompt: Optional[str] = None, style: Optional[str] = None,
                                 voice_sample_of: Optional[tuple] = None,
                                 model_id: str = DEFAULT_SPEECH_MODEL, voice_name: str = DEFAULT_SPEECH_VOICE,
                                 temperature: float = 1.0, fallback_model_id: Optional[str] = None,
@@ -74,12 +76,13 @@ class MediaService:
                                 language_code: Optional[str] = None) -> str:
         """Returns the path of an audio file of `transcript` spoken, and hands the file to the caller.
 
-        `directed_prompt` is the Director's Desk wrapped around the transcript. Each adapter
-        takes what its model can use -- Gemini the directed prompt, an OpenRouter model the
-        transcript alone -- and resolves the voice to one its model carries, so a fallback
-        on the other provider still gets both right. `voice_sample_of` is the (owner id,
-        profile name) whose voice sample a model that clones voices speaks with; it is
-        decrypted only for such a model. `max_bytes` is the largest file the channel can
+        `directed_prompt` is the Director's Desk wrapped around the transcript, and `style` the
+        same direction as one line, for a model that would read the Desk aloud. Each adapter
+        takes what its model can use -- a Gemini model before 3.8 the directed prompt, 3.8 the
+        transcript and style, an OpenRouter model the transcript alone -- and resolves the
+        voice to one its model carries, so a fallback on the other provider still gets both
+        right. `voice_sample_of` is the (owner id, profile name) whose voice sample a model
+        that clones voices speaks with; it is decrypted only for such a model. `max_bytes` is the largest file the channel can
         upload, which a Gemini model's audio is capped to. `speed` reaches an OpenRouter
         model and `language_code` a Gemini one; each adapter ignores the other's.
 
@@ -108,10 +111,19 @@ class MediaService:
                 name, guild_id, user_id, config_owner_id=config_owner_id, speech=True,
                 google_key_error="No Google key is assigned to this server.",
                 openrouter_key_error="No OpenRouter key is assigned to this server.")
+            voice = voice_name
+            if voice_sample_of and isinstance(model, GoogleSpeechModel) and model.verbatim:
+                try:
+                    voice = await self.replicated_voice(model, *voice_sample_of) or voice_name
+                except Exception as e:
+                    # The preset voice speaks rather than nothing. Reported the once: the
+                    # refusal is remembered, and the lines after it do not ask again.
+                    print(f"Text-to-speech: Google would not clone the voice sample of "
+                          f"'{voice_sample_of[1]}' ({_format_api_error(e)}); using the preset voice.")
             while True:
                 try:
                     return await model.synthesise(
-                        transcript, directed_prompt=directed_prompt, voice_name=voice_name,
+                        transcript, directed_prompt=directed_prompt, style=style, voice_name=voice,
                         temperature=temperature,
                         voice_sample=load_voice_sample if voice_sample_of else None,
                         max_bytes=max_bytes, speed=speed, language_code=language_code)
@@ -134,6 +146,64 @@ class MediaService:
         path, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
             model_id, fallbacks, _attempt, label="Text-to-speech")
         return path
+
+    async def replicated_voice(self, model: GoogleSpeechModel, owner_id: int,
+                               profile_name: str) -> Optional[str]:
+        """The voice (GOOGLE_VOICE_PREFIX + `voicekey_...`) a profile's selected voice sample
+        speaks as on `model`, or None when the sample has no consent recording.
+
+        Minted once per sample, key and model, and reused for VOICE_KEY_REUSE_SECONDS: a
+        mint sends both recordings, and Google keeps the key a week. A refusal -- a consent
+        that does not match, audio it cannot read -- is kept for as long, so the lines after
+        it speak with the preset voice without asking again, and raised this once.
+        """
+        manager = self.cog.profile_manager
+        record = await manager.voice_sample_record(owner_id, profile_name)
+        if not (record and record.get("consent_mime_type")):
+            return None
+        cache_key = (owner_id, profile_name, manager.voice_sample_slot(owner_id, profile_name),
+                     record.get("consented_at"), model.key_id, model.model_name)
+        cached = self.cog.voice_keys.get(cache_key)
+        if cached and time.monotonic() - cached[1] < VOICE_KEY_REUSE_SECONDS:
+            return cached[0]
+        sample = await manager.materialise_voice_sample(owner_id, profile_name, with_consent=True)
+        if not sample:
+            return None
+        try:
+            voice = GOOGLE_VOICE_PREFIX + await model.replicate(sample)
+        except Exception as e:
+            if getattr(e, "status", 0) // 100 == 4:
+                self.cog.voice_keys[cache_key] = (None, time.monotonic())
+            raise
+        finally:
+            for path in (sample["path"], sample["consent_path"]):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        self.cog.voice_keys[cache_key] = (voice, time.monotonic())
+        return voice
+
+    async def check_cloned_voice(self, guild_id: Optional[int], user_id: int, profile_name: str) -> str:
+        """Has Google take a profile's newly saved sample and consent recording now, rather than
+        on its first line, and says how that went. On the key and speech model the profile's
+        lines here would use: its own model when that is Gemini 3.8, else the shipped one.
+        What Google accepts is kept for those lines."""
+        config = self.cog.profile_manager._get_profile_config(user_id, profile_name) or {}
+        model_id = config.get("speech_model") or DEFAULT_SPEECH_MODEL
+        if model_id.startswith(("OPENROUTER/", "OLLAMA/")) or not speaks_verbatim(model_id):
+            model_id = DEFAULT_SPEECH_MODEL
+        try:
+            model = self.cog.api_service._instantiate_model(
+                model_id, guild_id, user_id, config_owner_id=user_id, speech=True,
+                google_key_error="no Google key here")
+            await self.replicated_voice(model, user_id, profile_name)
+        except Exception as e:
+            reason = _format_api_error(e)
+            if getattr(e, "status", 0) // 100 == 4:
+                return VOICE_SAMPLE_GEMINI_REFUSED.format(reason=reason)
+            return VOICE_SAMPLE_GEMINI_UNCHECKED.format(reason=reason)
+        return VOICE_SAMPLE_GEMINI_ACCEPTED
 
     def _stitch_wav_segments(self, segments):
         """Concatenates multiple WAV Byte streams into a single Master stream without re-encoding."""
@@ -321,7 +391,7 @@ class MediaService:
                         if package.get('failure_reason'):
                             turn_warnings.append(WARN_IMAGE_GEN_FAILED.format(reason=package['failure_reason']))
 
-                        text_model, _, temp, top_p, top_k, _, _ = await self.cog.api_service._get_or_create_model_for_channel(package['channel_id'], package['author_id'], package['guild_id'], profile_owner_override=package['effective_profile_owner_id'], profile_name_override=package['effective_profile_name'])
+                        text_model, _, temp, top_p, top_k, _, _, turn_context = await self.cog.api_service._get_or_create_model_for_channel(package['channel_id'], package['author_id'], package['guild_id'], profile_owner_override=package['effective_profile_owner_id'], profile_name_override=package['effective_profile_name'])
 
                         # Derived from the channel's unified_log. This previously read
                         # cog.chat_sessions, a cache that only this worker ever wrote to, so
@@ -356,6 +426,8 @@ class MediaService:
                                 user_turn = {'role': 'user', 'parts': [system_note]}
                             else:
                                 user_turn = {'role': 'user', 'parts': [package['prompt_text']]}
+                        if turn_context:
+                            user_turn['parts'].insert(0, turn_context)
 
                         contents_for_api_call.append(user_turn)
                         gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}

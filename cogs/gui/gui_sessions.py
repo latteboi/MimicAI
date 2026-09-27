@@ -2399,6 +2399,8 @@ def add_generation_fields(embed: discord.Embed, cog, turn: dict) -> None:
     if meta.get("fallback"):
         model += " *(fallback)*"
     i_tok = meta.get("input_tokens", 0)
+    cached = meta.get("cached_tokens") or 0
+    i_split = f" (Cached: `{cached:,}`)" if cached else ""
     o_tok = billable_output_tokens(meta)
     # Thinking as the provider counted it where it did (Google), else the
     # estimate from the visible summary. Either way, part of the output.
@@ -2418,7 +2420,7 @@ def add_generation_fields(embed: discord.Embed, cog, turn: dict) -> None:
     cost_line = (f"Turn Cost: `~${cost:.6f} USD` (estimated)" if not billed
                  else f"Turn Cost: `${cost:.6f} USD` (billed)")
 
-    embed.add_field(name="Turn Telemetry", value=f"├── Profile: `{turn.get('profile_name')}`\n├── Mimic ID: `{turn.get('speaker_pid')}`\n├── Timestamp: {turn_timestamp(turn)}\n├── Model Used: {model}\n{tier_line}├── Duration: `{meta.get('duration', 0.0)}s`\n├── Input Tokens: `{i_tok:,}`\n├── Output Tokens: `{o_tok:,}` ({r_split})\n└── {cost_line}", inline=False)
+    embed.add_field(name="Turn Telemetry", value=f"├── Profile: `{turn.get('profile_name')}`\n├── Mimic ID: `{turn.get('speaker_pid')}`\n├── Timestamp: {turn_timestamp(turn)}\n├── Model Used: {model}\n{tier_line}├── Duration: `{meta.get('duration', 0.0)}s`\n├── Input Tokens: `{i_tok:,}`{i_split}\n├── Output Tokens: `{o_tok:,}` ({r_split})\n└── {cost_line}", inline=False)
 
     recalled = len(meta.get("ltms_recalled") or [])
     # A count since one capture can store several; True on turns from before that.
@@ -2828,6 +2830,7 @@ class SessionAuditView(BlockedGuard, ui.View):
 
             if self.mode == "overview":
                 total_in = 0
+                total_cached = 0
                 total_out = 0
                 total_cost = 0.0
                 estimated = False
@@ -2839,6 +2842,7 @@ class SessionAuditView(BlockedGuard, ui.View):
                         i_toks = meta.get("input_tokens", 0)
                         o_toks = billable_output_tokens(meta)
                         total_in += i_toks
+                        total_cached += meta.get("cached_tokens") or 0
                         total_out += o_toks
                         cost, billed = self.cog.api_service.turn_cost(meta)
                         total_cost += cost
@@ -2849,7 +2853,7 @@ class SessionAuditView(BlockedGuard, ui.View):
                 embed.description = "Session Overview"
                 cost_line = (f"Estimated Session API Cost: `~${total_cost:.4f} USD`" if estimated
                              else f"Session API Cost (billed): `${total_cost:.4f} USD`")
-                embed.add_field(name="1. Overall Session Telemetry", value=f"├── Active Participants: `{len(self.session.get('profiles', []))}` Profiles\n├── Total Session Turns: `{len(log)}`\n├── Total Input Tokens Processed: `{total_in:,}`\n├── Total Output Tokens Generated: `{total_out:,}`\n└── {cost_line}", inline=False)
+                embed.add_field(name="1. Overall Session Telemetry", value=f"├── Active Participants: `{len(self.session.get('profiles', []))}` Profiles\n├── Total Session Turns: `{len(log)}`\n├── Total Input Tokens Processed: `{total_in:,}`{f" (Cached: `{total_cached:,}`)" if total_cached else ""}\n├── Total Output Tokens Generated: `{total_out:,}`\n└── {cost_line}", inline=False)
                 
                 avg_lat = sum(durations) / len(durations) if durations else 0.0
                 embed.add_field(name="2. System Health Checks", value=f"└── Model Latency Average: `{avg_lat:.2f}s`", inline=False)
@@ -2898,10 +2902,10 @@ class SessionAuditView(BlockedGuard, ui.View):
                         p_cfg = self.cog.profile_manager._get_profile_config(o_id, p_name, is_b) or {}
                         # With the function blocks the reply would carry, or the estimate
                         # is short by them on every profile that has one.
-                        sys_instr, _, _, _, _, _, prim_mod, _ = self.cog.generation_service._construct_system_instructions(
+                        sys_instr, turn_context, _, _, _, _, prim_mod, _ = self.cog.generation_service._construct_system_instructions(
                             o_id, p_name, self.channel_id, is_multi_profile=True,
                             functions=functions_for(p_cfg))
-                        sys_toks = _estimate_text_tokens(sys_instr)
+                        sys_toks = _estimate_text_tokens(sys_instr + "\n\n" + (turn_context or ""))
 
                         # The window the next reply would actually get. The last N raw
                         # entries counted folded, muted and synopsis turns and other

@@ -1119,7 +1119,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             dynamic_context_for_turn = session["unified_log"][-1].get("content", "")
 
                         # Parallelise Training Examples, LTM retrieval, and Help Context
-                        ltm_task = self.cog.memory_manager._get_relevant_ltm_for_prompt(session_key, contents_for_api_call, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id,
+                        ltm_task = self.cog.memory_manager._get_relevant_ltm_for_prompt(session_key, unified_log, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id,
                                                                        threshold=ltm_auto_threshold(p_settings))
                         training_task = self.cog.memory_manager._get_relevant_training_examples(owner_id, profile_name, dynamic_context_for_turn, channel.guild.id)
                         
@@ -1187,7 +1187,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # above, so moving it ahead of this call costs nothing.
                         # One tuple for the prompt and both models -- see tool_loop.
                         functions = functions_for(p_settings)
-                        full_system_instruction, _, grounding_enabled, temp, top_p, top_k, primary_model, fallback_model_name = await asyncio.to_thread(
+                        full_system_instruction, turn_context, grounding_enabled, temp, top_p, top_k, primary_model, fallback_model_name = await asyncio.to_thread(
                             self._construct_system_instructions,
                             owner_id, profile_name, channel.id, is_multi_profile=True,
                             training_examples_list=training_examples_list, recalled_ltm=ltm_recall_text,
@@ -1202,8 +1202,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         if follow_up:
                             contents_for_api_call.append({'role': 'user', 'parts': [follow_up]})
 
-                        # Collect all supplementary context to inject into the final user turn
-                        supplementary_parts = []
+                        # Collect all supplementary context to inject into the final user turn.
+                        # The turn context first: straight after the conversation, ahead of
+                        # the round's own material, so the transcript before it stays a
+                        # cacheable prefix.
+                        supplementary_parts = [turn_context] if turn_context else []
 
                         # [UPDATED] Standardised XML injection for pending whispers
                         whisper_context = whisper_recap(
@@ -1473,7 +1476,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 prompt_parts.insert(0, TTS_SYNTHESIS_PREAMBLE)
 
                             tts_priming_prompt = "\n\n".join(prompt_parts)
-                            
+                            # The same direction for a model that would read the prompt above
+                            # aloud (Gemini 3.8): one style line sent beside the bare reply.
+                            tts_style = "; ".join(f"{label}: {value}" for label, value in (
+                                ("Archetype", s_arch), ("Accent", s_acc), ("Scene", s_dyn),
+                                ("Style", s_styl), ("Pacing", s_pace)) if value)
+
                             # 3. Synthesise Audio
                             #
                             # The heartbeat started before this is still the one running, so
@@ -1487,6 +1495,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     response_text,
                                     channel.guild.id,
                                     directed_prompt=tts_priming_prompt,
+                                    style=tts_style or None,
                                     voice_sample_of=(owner_id, profile_name),
                                     user_id=triggering_user_id,
                                     config_owner_id=owner_id,

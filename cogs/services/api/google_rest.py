@@ -7,6 +7,7 @@ and TTS calls generateContent with a speechConfig no other provider takes.
 
 import asyncio
 import base64
+import hashlib
 import os
 import random
 import re
@@ -15,18 +16,22 @@ import time
 import wave
 import orjson as json
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import quote
 
 import httpx
 
-from ...utils.blob_stream import InlineBlobExtractor, TruncatedJSONError
+from ...utils.blob_stream import BLOB_SENTINEL, InlineBlobExtractor, TruncatedJSONError
 from ...utils.constants import (
-    DEFAULT_SPEECH_VOICE, ERR_REASON_NO_AUDIO, ERR_REASON_SPEECH_PROHIBITED,
-    ERR_REASON_SPEECH_REFUSED, ERR_REASON_SPEECH_TIMED_OUT, THINKING_BUDGET_MAX,
+    DEFAULT_SPEECH_VOICE, ERR_REASON_NO_AUDIO, ERR_REASON_NOTHING_TO_SPEAK,
+    ERR_REASON_SPEECH_PROHIBITED, ERR_REASON_SPEECH_REFUSED, GOOGLE_VOICE_PREFIX,
+    TTS_VOICE_CHARACTER, ERR_REASON_SPEECH_TIMED_OUT, THINKING_BUDGET_MAX,
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY, TTS_VOICE_LOOKUP,
     defaultConfig,
 )
-from ...utils.helpers import google_thinking_caps, resolve_media_resolution
+from ...utils.helpers import (
+    google_thinking_caps, resolve_media_resolution, speakable_text, speaks_verbatim,
+)
 from ...utils.http_client import get_shared_client
 from ...utils.memory_tuning import maybe_trim_malloc
 from ...utils.net_guard import safe_stream
@@ -35,7 +40,8 @@ from .function_calls import calls_forbidden, from_google_parts, google_part
 from .output_cap import RetryUncapped, output_cap, refused_output_cap
 from .rest_view import _BlobRef, _RestView, _to_camel, _wrap_rest
 from .streaming import (
-    _DOWNLOAD_CHUNK_BYTES, _aiter_file_bytes, _stream_to_tempfile,
+    _DOWNLOAD_CHUNK_BYTES, _FILE_BLOB_TOKEN, _aiter_file_bytes, _aiter_streamed_body,
+    _close_body_segments, _plan_streamed_body, _stream_to_tempfile,
 )
 
 
@@ -687,6 +693,8 @@ class GoogleRESTResponse:
         #: count above leaves it out, so without this a thinking model's turns were
         #: estimated at the price of their visible text alone.
         self.thinking_tokens = (self.usage_metadata.thoughts_token_count or 0) if self.usage_metadata else 0
+        #: The part of `input_tokens` served from Gemini's implicit prefix cache.
+        self.cached_tokens = (self.usage_metadata.cached_content_token_count or 0) if self.usage_metadata else 0
 
         if self.candidates and self.candidates[0].content and self.candidates[0].content.parts:
             for part in self.candidates[0].content.parts:
@@ -834,6 +842,19 @@ _OUTPUT_CAP_FIELD = re.compile(r"max_?output_?tokens", re.IGNORECASE)
 _TTS_NO_LANGUAGE: set = set()
 _LANGUAGE_FIELD = re.compile(r"language_?code", re.IGNORECASE)
 
+#: (key, voice) pairs Google answered "no such voice" for. A designed or replicated voice
+#: lives in one Google project and speaks only with that project's keys, and a server's key
+#: need not be the one its voice was made with. Remembered so the next line goes straight
+#: to the default voice; bounded, oldest out first.
+_TTS_MISSING_VOICES: "OrderedDict[Tuple[str, str], None]" = OrderedDict()
+_TTS_MISSING_VOICES_MAX = 256
+_VOICE_FIELD = re.compile(r"voice", re.IGNORECASE)
+
+
+def _key_id(api_key: str) -> str:
+    """A key's stand-in in the records kept per key, so no record holds the key itself."""
+    return hashlib.sha256(api_key.encode()).hexdigest()[:16]
+
 
 def _refused_speech_field(detail: str, capped: bool, languaged: bool):
     """(the record of models refusing it, how to say it) for the field a 400 names, or None.
@@ -867,11 +888,10 @@ def _speech_token_cap(transcript: str, max_bytes: Optional[int] = None) -> int:
 
 
 def _log_speech_usage(model_id: str, tokens: int, finish: str, cap: Optional[int]) -> None:
-    """One terminal line per line spoken: the audio billed, and whether the cap ended it.
+    """A terminal line for a line spoken that the cap ended, or that ran past it.
 
-    Nothing else in the bot records a speech call, so this is what traces a day's bill back
-    to the lines that ran it up. A count past the cap the request carried means the model
-    does not honour `maxOutputTokens`, and the line says so.
+    A count past the cap the request carried means the model does not honour
+    `maxOutputTokens`, and the line says so. A line that ended on its own prints nothing.
     """
     if not tokens:
         return
@@ -880,7 +900,7 @@ def _log_speech_usage(model_id: str, tokens: int, finish: str, cap: Optional[int
     elif cap and tokens > cap:
         note = f", past its {cap}-token cap: this model does not honour the cap"
     else:
-        note = ""
+        return
     print(f"Google TTS: {model_id} generated {tokens / _TTS_TOKENS_PER_SECOND:.0f} s of audio "
           f"({tokens} output tokens{note}).")
 
@@ -942,34 +962,44 @@ async def generate_google_tts_audio(
     temperature: float = 1.0,
     max_output_tokens: Optional[int] = None,
     language_code: Optional[str] = None,
+    style: Optional[str] = None,
 ) -> str:
     """Returns the path of a WAV file of `text` spoken, and hands the file to the caller.
 
     Raises on every failure, with an error `_format_api_error` can word. This used to
     return bytes or None, and None reached the channel as "API Error or Unknown" whatever
-    had gone wrong. The audio streams to disk as it comes off the socket and is wrapped
-    into a WAV there, so a long line is never held in the heap.
+    had gone wrong. The audio streams to disk as it comes off the socket -- wrapped into a
+    WAV there when it is bare PCM -- so a long line is never held in the heap.
 
     `max_output_tokens` caps the audio billed -- see `_speech_token_cap`. `language_code` is
     a profile's chosen `speechConfig.languageCode`. A model that refuses either field is
-    asked once more without it, and is not sent it again.
+    asked once more without it, and is not sent it again. `style` is the direction a
+    verbatim model takes beside `text` (`helpers.speaks_verbatim`). A voice outside the
+    thirty that Google says this key has no such voice for is remembered, and the line
+    spoken in the default voice instead.
     """
     if model_id.upper().startswith("GOOGLE/"):
         model_id = model_id[7:]
 
+    custom = voice_name not in TTS_VOICE_CHARACTER
+    if custom and (_key_id(api_key), voice_name) in _TTS_MISSING_VOICES:
+        voice_name, custom = DEFAULT_SPEECH_VOICE, False
+
     capped = bool(max_output_tokens) and model_id not in _TTS_NO_OUTPUT_CAP
     languaged = bool(language_code) and model_id not in _TTS_NO_LANGUAGE
     refused_field = False
+    part = {"text": text}
+    if style:
+        part["speechMetadata"] = {"style": style}
+    # 3.8 documents `voice`; the models before it keep the field they were built on.
+    voice = ({"voice": voice_name} if speaks_verbatim(model_id)
+             else {"prebuiltVoiceConfig": {"voiceName": voice_name}})
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": text}]}],
+        "contents": [{"role": "user", "parts": [part]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "temperature": temperature,
-            "speechConfig": {
-                "voiceConfig": {
-                    "prebuiltVoiceConfig": {"voiceName": voice_name}
-                }
-            },
+            "speechConfig": {"voiceConfig": voice},
         },
     }
     if capped:
@@ -1019,6 +1049,17 @@ async def generate_google_tts_audio(
                     if refused and len(refused[0]) < _TTS_NO_OUTPUT_CAP_MAX:
                         refused[0].add(model_id)
                         print(f"Google TTS: {model_id} refused {refused[1]}; asking again without it, and remembering.")
+                        extractor.cleanup()
+                        refused_field = True
+                        break
+                    # A voice this key's project does not hold. The refusal is the probe
+                    # here too: remembered, and the line spoken in the default voice.
+                    if custom and response.status_code in (400, 404) and _VOICE_FIELD.search(detail):
+                        _TTS_MISSING_VOICES[(_key_id(api_key), voice_name)] = None
+                        while len(_TTS_MISSING_VOICES) > _TTS_MISSING_VOICES_MAX:
+                            _TTS_MISSING_VOICES.popitem(last=False)
+                        print(f"Google TTS: {model_id} has no voice {voice_name} for this key; "
+                              f"speaking as {DEFAULT_SPEECH_VOICE}, and remembering.")
                         extractor.cleanup()
                         refused_field = True
                         break
@@ -1077,12 +1118,16 @@ async def generate_google_tts_audio(
                 if not (inline and inline.data):
                     continue
                 # A path either way: a long line was diverted to disk as it streamed, and a
-                # short one is still bytes and is written out here.
-                pcm_path = await materialise_inline_data(parsed, inline.data, ".pcm")
-                if pcm_path:
+                # short one is still bytes and is written out here. 3.8 sends a whole WAV
+                # file, the models before it bare PCM, which a second header would corrupt.
+                wav = "wav" in (inline.mime_type or "").lower()
+                path = await materialise_inline_data(parsed, inline.data, ".wav" if wav else ".pcm")
+                if path:
                     _log_speech_usage(model_id, parsed.output_tokens, finish,
                                       max_output_tokens if capped else None)
-                    return await asyncio.to_thread(_pcm_file_to_wav, pcm_path, _pcm_rate(inline.mime_type))
+                    if wav:
+                        return path
+                    return await asyncio.to_thread(_pcm_file_to_wav, path, _pcm_rate(inline.mime_type))
         finally:
             parsed.close()
 
@@ -1096,13 +1141,91 @@ async def generate_google_tts_audio(
             print(f"Google TTS: {model_id} returned no audio; retrying once.")
 
     if refused_field:
-        # The refused field is remembered now and not sent again, so the same refusal
-        # cannot bring the line back here.
+        # The refused field or voice is remembered now and not sent again, so the same
+        # refusal cannot bring the line back here.
         return await generate_google_tts_audio(api_key, model_id, text, voice_name=voice_name,
                                                temperature=temperature,
                                                max_output_tokens=max_output_tokens,
-                                               language_code=language_code)
+                                               language_code=language_code, style=style)
     raise last_error
+
+
+#: The Voices API: the Extended Voice Library, and the voices designed or replicated for a
+#: project. Its JSON is snake_case, as the Interactions API's is.
+_VOICES_URL = "/v1beta/voices"
+
+
+async def _voices_call(api_key: str, method: str, url: str, *, params: Optional[dict] = None,
+                       payload: Optional[dict] = None, files: Sequence[str] = ()) -> Tuple[dict, List[str]]:
+    """One Voices API call: (the response, the paths of any audio it carried, the caller's).
+
+    The response streams through the blob extractor as a speech line's does, since a
+    designed voice comes back with its preview inside it; `files` are spliced into
+    `payload` where `_FILE_BLOB_TOKEN` marks them, so a recording is never held whole
+    either. Raises on anything but a 200, with its status on the error as `status`.
+    """
+    headers = {"x-goog-api-key": api_key}
+    content = segments = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        if files:
+            segments, length = _plan_streamed_body(payload, list(files))
+            content = _aiter_streamed_body(segments)
+            headers["Content-Length"] = str(length)
+        else:
+            content = json.dumps(payload)
+    extractor = InlineBlobExtractor(suffix=".wav")
+    try:
+        async with get_google_rest_client().stream(method, url, params=params, content=content,
+                                                   headers=headers) as response:
+            if response.status_code != 200:
+                detail = (await response.aread()).decode("utf-8", "replace")
+                error = Exception(f"Google API Error {response.status_code}: {detail}")
+                error.status = response.status_code
+                try:
+                    # Google's own words, which name what it refused -- a consent that
+                    # does not match, a voice it does not hold.
+                    error.formatted_reason = str(json.loads(detail)["error"]["message"])[:300]
+                except Exception:
+                    pass
+                raise error
+            async for chunk in response.aiter_bytes(_DOWNLOAD_CHUNK_BYTES):
+                extractor.feed(chunk)
+            skeleton, blob_paths = extractor.finish()
+    except BaseException:
+        extractor.cleanup()
+        raise
+    finally:
+        if segments:
+            _close_body_segments(segments)
+    try:
+        return (json.loads(skeleton) if skeleton else {}), blob_paths
+    except json.JSONDecodeError:
+        for path in blob_paths:
+            _remove_quietly(path)
+        raise Exception("Google API Error: a Voices API response that could not be read.")
+
+
+def voice_id_of(voice: dict) -> str:
+    """A Voices API voice's id: `achird` for one of the thirty, `ar-001-tutor-3` from the
+    library, `voice_...` for a designed one (prod_tests/google_voices_live.py)."""
+    return str(voice.get("id") or "").strip()
+
+
+async def _audio_path(value: str) -> Optional[str]:
+    """A path for an audio `data` value: the file it was diverted to, or its base64 written out."""
+    if value.startswith(BLOB_SENTINEL):
+        return value[len(BLOB_SENTINEL):]
+    if not value:
+        return None
+
+    def _write():
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        with os.fdopen(fd, "wb") as f:
+            f.write(base64.b64decode(value))
+        return path
+
+    return await asyncio.to_thread(_write)
 
 
 class GoogleSpeechModel:
@@ -1110,29 +1233,127 @@ class GoogleSpeechModel:
 
     It holds the key the factory resolved -- after the data policy's gate -- so speech never
     looks one up for itself, and `synthesise` is what the factory's cooldown tracking wraps,
-    so a 429 rests the key as it does for every other slot.
+    so a 429 rests the key as it does for every other slot. The Voices API calls take the
+    same key: a designed voice is made in, and a library search answered for, the project
+    this server's lines will be spoken with.
     """
 
     def __init__(self, model_name: str, api_key: str):
         self.model_name = model_name
         self.api_key = api_key
+        #: 3.8 on: reads its text verbatim, speaks any Google voice id, and clones.
+        self.verbatim = speaks_verbatim(model_name)
+        #: The key's stand-in for anything cached per key.
+        self.key_id = _key_id(api_key)
 
     async def synthesise(self, transcript: str, directed_prompt: Optional[str] = None,
                          voice_name: Optional[str] = None, temperature: float = 1.0,
                          voice_sample=None, max_bytes: Optional[int] = None,
-                         speed: Optional[float] = None, language_code: Optional[str] = None) -> str:
+                         speed: Optional[float] = None, language_code: Optional[str] = None,
+                         style: Optional[str] = None) -> str:
         """The path of an audio file of the reply spoken; the caller owns it.
 
-        Gemini is sent the Director's Desk prompt when there is one. A voice it does not
-        carry -- one a profile kept from an OpenRouter model -- is swapped for the default
-        rather than sent to a 400. Gemini clones no voice, so `voice_sample` is never loaded,
-        and takes no speed. The audio billed is capped by the transcript and `max_bytes`,
-        never by the prompt.
+        A model before 3.8 is sent the Director's Desk prompt when there is one. From 3.8 a
+        model speaks its text verbatim, so it is sent the reply as `speakable_text` leaves
+        it, a sound its actions name as the inline tag for it, and the direction as `style`.
+        A 3.8 model speaks a Google voice id (GOOGLE_VOICE_PREFIX) as well as the thirty;
+        any other voice -- one a profile kept from an OpenRouter model -- is swapped for the
+        default rather than sent to a 400. A cloned voice arrives as a replicated voice id,
+        minted by `MediaService`, so `voice_sample` is never loaded here, and no speed is
+        taken. The audio billed is capped by the transcript and `max_bytes`, never by the
+        prompt.
         """
-        voice = TTS_VOICE_LOOKUP.get((voice_name or "").lower(), DEFAULT_SPEECH_VOICE)
+        if self.verbatim and (voice_name or "").startswith(GOOGLE_VOICE_PREFIX):
+            voice = voice_name[len(GOOGLE_VOICE_PREFIX):]
+        else:
+            voice = TTS_VOICE_LOOKUP.get((voice_name or "").lower(), DEFAULT_SPEECH_VOICE)
+        if self.verbatim:
+            text = speakable_text(transcript, vocal_tags=True)
+            if not text:
+                # Raised before a request exists, and not retried: a fallback would be
+                # handed the same empty reply.
+                error = Exception("Google TTS: the reply has nothing to say aloud")
+                error.formatted_reason = ERR_REASON_NOTHING_TO_SPEAK
+                error.retryable = False
+                raise error
+        else:
+            text, style = directed_prompt or transcript, None
         return await generate_google_tts_audio(
-            self.api_key, self.model_name, directed_prompt or transcript,
+            self.api_key, self.model_name, text,
             voice_name=voice, temperature=temperature,
             max_output_tokens=min(_speech_token_cap(transcript, max_bytes),
                                   defaultConfig.LIMIT_OUTPUT_TOKENS),
-            language_code=language_code)
+            language_code=language_code, style=style)
+
+    async def list_voices(self, search: str = "", language: str = "", gender: str = "") -> List[dict]:
+        """A select's worth of the voices Google offers this key, filtered: the project's
+        own designed and replicated voices first, then the Extended Voice Library."""
+        params = {"page_size": "25"}
+        for name, value in (("search", search), ("language_code", language), ("gender", gender)):
+            if value:
+                params[name] = value
+        body, blobs = await _voices_call(self.api_key, "GET", _VOICES_URL, params=params)
+        for path in blobs:
+            _remove_quietly(path)
+        return [v for v in body.get("voices") or () if isinstance(v, dict) and voice_id_of(v)]
+
+    async def get_voice(self, voice_id: str) -> Optional[dict]:
+        """The voice Google holds under `voice_id` for this key, or None if it holds none."""
+        try:
+            body, blobs = await _voices_call(self.api_key, "GET", f"{_VOICES_URL}/{quote(voice_id, safe='')}")
+        except Exception as e:
+            if getattr(e, "status", None) in (400, 404):
+                return None
+            raise
+        for path in blobs:
+            _remove_quietly(path)
+        return body
+
+    async def design_voice(self, description: str, display_name: str, gender: str = "",
+                           language: str = "") -> Tuple[str, Optional[str]]:
+        """(the new voice's id, the path of the preview Google sent, the caller's).
+
+        Stored in this key's project -- 200 voices a project, kept a year -- so it speaks
+        only with a key from that project.
+        """
+        voice = {"model": self.model_name, "type": "prompted", "display_name": display_name,
+                 "prompted": {"input": description}}
+        if gender:
+            voice["gender"] = gender
+        if language:
+            voice["language_code"] = language
+        body, blobs = await _voices_call(self.api_key, "POST", _VOICES_URL,
+                                         payload={"store": True, "voice": voice})
+        preview = await _audio_path(str((body.get("sample_audio") or {}).get("data") or ""))
+        for path in blobs:
+            if path != preview:
+                _remove_quietly(path)
+        voice_id = voice_id_of(body)
+        if not voice_id:
+            if preview:
+                _remove_quietly(preview)
+            raise Exception("Google API Error: the designed voice came back with no id.")
+        return voice_id, preview
+
+    async def replicate(self, sample: Dict[str, Any]) -> str:
+        """A stateless replicated voice key (`voicekey_...`) for a voice sample and its consent
+        recording, `ProfileManager.materialise_voice_sample(with_consent=True)`'s shape.
+
+        Stateless, so nothing is kept in this key's project -- no quota spent, nothing left
+        behind -- and Google holds the key good for seven days (VOICE_KEY_REUSE_SECONDS).
+        """
+        def audio(idx: int, mime_type: str) -> dict:
+            return {"mime_type": mime_type, "data": _FILE_BLOB_TOKEN.format(idx)}
+
+        payload = {"store": False, "voice": {
+            "model": self.model_name, "type": "replicated",
+            "replicated": {"source_audio": audio(0, sample["mime_type"]),
+                           "consent_audio": audio(1, sample["consent_mime_type"])}}}
+        body, blobs = await _voices_call(self.api_key, "POST", _VOICES_URL, payload=payload,
+                                         files=(sample["path"], sample["consent_path"]))
+        for path in blobs:
+            _remove_quietly(path)
+        key = str(body.get("key") or "")
+        if not key:
+            raise Exception("Google API Error: the replicated voice came back with no key.")
+        return key

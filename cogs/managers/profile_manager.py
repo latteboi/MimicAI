@@ -39,7 +39,7 @@ from ..utils.constants import (
     CONTENT_RATING_EMOJI,
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
     NEW_PROFILE_SPEECH_TEMPERATURE, SPEECH_LANGUAGE_NAMES,
-    IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_SLOT_FILES, VOICE_SAMPLE_SLOT_KEY, VOICE_SAMPLE_SLOTS,
+    IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_CONSENT_FILES, VOICE_SAMPLE_SLOT_FILES, VOICE_SAMPLE_SLOT_KEY, VOICE_SAMPLE_SLOTS,
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_MODES, GREEDY_SAMPLING, SYSTEM_PROFILE_MODEL,
     MODEL_PROVIDERS, PROVIDER_CHOICES, NOT_REGISTERED, )
 from ..utils.helpers import (image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
@@ -1883,9 +1883,25 @@ class ProfileManager:
 
         return await asyncio.to_thread(_read)
 
+    async def voice_sample_record(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
+        """The selected slot's record, None for an empty one: one small read, for a caller that
+        needs to know what the sample is -- and whether it has a consent recording -- before
+        paying to decrypt it."""
+        p_dir = self._voice_sample_dir(user_id, profile_name)
+        if not p_dir:
+            return None
+        _audio, record_file = VOICE_SAMPLE_SLOT_FILES[self.voice_sample_slot(user_id, profile_name) - 1]
+        return await asyncio.to_thread(IOManager.read_json_gzip, os.path.join(p_dir, record_file), self.cog.fernet)
+
     async def save_voice_sample(self, user_id: int, profile_name: str, audio: bytes, *, slot: int,
-                                mime_type: str, filename: str, transcript: Optional[str]) -> bool:
-        """Stores a voice sample in `slot` with the consent given for it; False if it is not the user's to give."""
+                                mime_type: str, filename: str, transcript: Optional[str],
+                                consent: Optional[bytes] = None, consent_mime_type: Optional[str] = None,
+                                consent_filename: Optional[str] = None) -> bool:
+        """Stores a voice sample in `slot` with the consent given for it; False if it is not the user's to give.
+
+        `consent` is the speaker's recorded consent, which Gemini needs to clone the voice.
+        A sample saved without one drops the slot's old one: it spoke for another recording.
+        """
         if not self.may_set_voice_sample(user_id, profile_name) or not self._valid_voice_slot(slot):
             return False
         p_dir = self._voice_sample_dir(user_id, profile_name)
@@ -1895,13 +1911,24 @@ class ProfileManager:
                   "transcript": (transcript or "").strip(),
                   # Who said the voice is theirs, or theirs to use, and when.
                   "consented_by": user_id, "consented_at": int(time.time())}
+        if consent:
+            record.update(consent_mime_type=consent_mime_type or "audio/wav",
+                          consent_filename=consent_filename or "consent")
         fernet = self.cog.fernet
         audio_file, record_file = VOICE_SAMPLE_SLOT_FILES[slot - 1]
+        consent_path = os.path.join(p_dir, VOICE_SAMPLE_CONSENT_FILES[slot - 1])
 
         def _write():
             # The audio first: a crash between the two orphans a file, never a record that
             # names nothing.
             IOManager.write_blob(audio, os.path.join(p_dir, audio_file), fernet)
+            if consent:
+                IOManager.write_blob(consent, consent_path, fernet)
+            else:
+                try:
+                    os.remove(consent_path)
+                except FileNotFoundError:
+                    pass
             IOManager.write_json_gzip(record, os.path.join(p_dir, record_file), fernet)
 
         await asyncio.to_thread(_write)
@@ -1917,7 +1944,7 @@ class ProfileManager:
 
         def _delete():
             # The record first, for the reason the audio is written first.
-            for name in (record_file, audio_file):
+            for name in (record_file, audio_file, VOICE_SAMPLE_CONSENT_FILES[slot - 1]):
                 try:
                     os.remove(os.path.join(p_dir, name))
                 except FileNotFoundError:
@@ -1926,19 +1953,23 @@ class ProfileManager:
         await asyncio.to_thread(_delete)
         return True
 
-    async def materialise_voice_sample(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
+    async def materialise_voice_sample(self, user_id: int, profile_name: str,
+                                       with_consent: bool = False) -> Optional[Dict[str, Any]]:
         """The selected slot's voice sample decrypted to a temp file the caller removes, or None.
 
         `{"path", "mime_type", "transcript"}`, the shape the OpenRouter speech adapter sends.
         Only the selected slot, never the others beside it. Decrypted per request rather
         than kept: the plaintext of someone's voice sits in the temp directory only while
-        one request takes.
+        one request takes. `with_consent` adds the consent recording as `consent_path` and
+        `consent_mime_type` -- a second file the caller removes -- and is None for a slot
+        that has none.
         """
         p_dir = self._voice_sample_dir(user_id, profile_name)
         if not p_dir:
             return None
         fernet = self.cog.fernet
-        audio_file, record_file = VOICE_SAMPLE_SLOT_FILES[self.voice_sample_slot(user_id, profile_name) - 1]
+        slot = self.voice_sample_slot(user_id, profile_name)
+        audio_file, record_file = VOICE_SAMPLE_SLOT_FILES[slot - 1]
 
         def _load():
             import tempfile
@@ -1948,11 +1979,22 @@ class ProfileManager:
             audio = IOManager.read_blob(os.path.join(p_dir, audio_file), fernet)
             if not audio:
                 return None
-            fd, path = tempfile.mkstemp(suffix=".voice")
-            with os.fdopen(fd, "wb") as f:
-                f.write(audio)
-            return {"path": path, "mime_type": record.get("mime_type") or "audio/wav",
-                    "transcript": record.get("transcript") or ""}
+            consent = None
+            if with_consent:
+                consent = record.get("consent_mime_type") and IOManager.read_blob(
+                    os.path.join(p_dir, VOICE_SAMPLE_CONSENT_FILES[slot - 1]), fernet)
+                if not consent:
+                    return None
+            sample = {"mime_type": record.get("mime_type") or "audio/wav",
+                      "transcript": record.get("transcript") or ""}
+            for key, data in (("path", audio), ("consent_path", consent)):
+                if data:
+                    fd, sample[key] = tempfile.mkstemp(suffix=".voice")
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(data)
+            if consent:
+                sample["consent_mime_type"] = record["consent_mime_type"]
+            return sample
 
         return await asyncio.to_thread(_load)
 

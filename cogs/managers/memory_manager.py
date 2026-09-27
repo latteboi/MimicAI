@@ -777,6 +777,10 @@ class MemoryManager:
         if not prompt_embedding:
             return []
 
+        # `history` must be the session's log, not a prompt's windowed history: this length
+        # is the turn count the cooldown runs on, and a window's stops growing once it is
+        # full (and steps back, see _build_history_for_participant), so a memory recalled
+        # in a long session never came off cooldown.
         current_turn = len(history)
         session_cooldown_history = self.cog.ltm_recall_history.get(session_key, {}) if use_cooldown else {}
 

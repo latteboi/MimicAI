@@ -342,7 +342,7 @@ class OpenRouterModel:
             class OpenRouterThoughtResponse:
                 def __init__(self, content, reasoning, finish_reason, input_toks, output_toks,
                              billed_cost=None, served_tier=None, served_by=None,
-                             function_calls=None):
+                             function_calls=None, cached_toks=0):
                     self.text = content
                     #: Normalised the same way GoogleRESTResponse normalises its own,
                     #: so a dispatcher never branches on which provider answered.
@@ -350,6 +350,8 @@ class OpenRouterModel:
                     self.thought = reasoning or ""
                     self.input_tokens = input_toks
                     self.output_tokens = output_toks
+                    #: The part of `input_tokens` the host served from its prefix cache.
+                    self.cached_tokens = cached_toks
                     self.reasoning_tokens = int(len(self.thought) / 3.8) if self.thought else 0
                     #: What OpenRouter says it charged, and which tier served it. The
                     #: gateway returns both unasked. Kept as None when absent rather
@@ -388,6 +390,7 @@ class OpenRouterModel:
                 data.get('service_tier'),
                 data.get('provider') if isinstance(data.get('provider'), str) else None,
                 function_calls=from_openrouter_message(msg_obj),
+                cached_toks=(usage_obj.get('prompt_tokens_details') or {}).get('cached_tokens') or 0,
             )
         except httpx.RequestError as e:
             raise Exception(f"OpenRouter Network Error: {str(e)}")

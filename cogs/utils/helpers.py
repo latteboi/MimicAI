@@ -19,7 +19,7 @@ from .constants import (
     PATTERN_SYSTEM_XML_BLOCKS, PATTERN_SYSTEM_XML_ORPHANS,
     PATTERN_REASONING_BLOCKS, PATTERN_REASONING_ORPHANS, PATTERN_SYSTEM_HEADER,
     PATTERN_TIMESTAMP_HEADER, PATTERN_METADATA, PATTERN_MESSAGE_LINK,
-    PATTERN_SPEAKER_CLOSE,
+    PATTERN_SPEAKER_CLOSE, PATTERN_STRAY_WRAPPERS,
     PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK, SYSTEM_MODEL_DEFAULTS,
     SYSTEM_MODEL_DEFAULTS_BY_PROVIDER,
     IMAGE_COMMAND_PREFIXES, IMAGE_MODEL_CAPS, IMAGE_MODEL_CAPS_DEFAULT, IMAGE_THINKING_LEVELS,
@@ -39,6 +39,7 @@ from .constants import (
     OPENROUTER_SERVICE_TIER_VALUES,
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_KEYS, UNREADABLE_MEDIA_LABELS,
     UNREADABLE_MEDIA_VALUES,
+    GOOGLE_VOICE_PREFIX, PROSE_DIRECTED_TTS_MODELS, TTS_VOICE_LOOKUP,
 )
 
 
@@ -397,6 +398,7 @@ def _scrub_response_text(text: str, participant_names: Optional[List[str]] = Non
             scrubbed_text = PATTERN_SYSTEM_HEADER.sub('', scrubbed_text)
             scrubbed_text = PATTERN_TIMESTAMP_HEADER.sub('', scrubbed_text)
             scrubbed_text = PATTERN_METADATA.sub('', scrubbed_text)
+            scrubbed_text = PATTERN_STRAY_WRAPPERS.sub('', scrubbed_text)
 
             if participant_names:
                 escaped_names = tuple(re.escape(name.strip()) for name in participant_names if name and name.strip())
@@ -847,6 +849,91 @@ def describe_voice_samples(summary: Optional[Tuple[int, int, bool]]) -> Optional
             + f" \u00b7 {filled} of {VOICE_SAMPLE_SLOTS} saved")
 
 
+#: Discord markup a speech model would read out: custom emoji (the name is kept), links (a
+#: masked link keeps its text), subtext markers, and the emphasis, strike and spoiler characters.
+_CUSTOM_EMOJI = re.compile(r"<a?:(\w+):\d+>")
+#: A mention, channel or timestamp: angle brackets Gemini 3.8 would take for a vocal tag.
+_DISCORD_TOKEN = re.compile(r"<(?:@[!&]?|#|t:)\d+(?::\w)?>")
+_MASKED_LINK = re.compile(r"\[([^\[\]\n]+)\]\(<?https?://[^\s)>]+>?\)")
+_LINK = re.compile(r"<?https?://\S+>?")
+_SUBTEXT = re.compile(r"^-#\s*", re.MULTILINE)
+_MARKERS = re.compile(r"[*_~`|]+")
+_SPACES = re.compile(r"[ \t]{2,}")
+
+#: What a reply says about its own delivery, which a model that does not understand it reads
+#: out as words: `[whispers]` as "whispers", `*sighs*` as "sighs".
+_AUDIO_TAG = re.compile(r"\[[^\[\]\n]*\]")
+_ITALIC = re.compile(r"(?<!\*)\*(?!\*)([^*\n]+)\*(?!\*)")
+
+#: Word stem -> the Gemini 3.8 inline tag voicing it, from the tags Google recommends. A
+#: stem stops short of any final "e" so one suffix list covers "chuckle", "chuckles" and
+#: "chuckling". Sounds a stem could also mean something else ("pants") are left out: a
+#: wrong sound is worse than the silence an unmatched action gets.
+_VOCAL_TAGS = {
+    "sigh": "sigh", "laugh": "laugh", "chuckl": "chuckle", "giggl": "giggle", "cackl": "cackle",
+    "snicker": "snicker", "snort": "snort", "cough": "cough", "sneez": "sneeze", "yawn": "yawn",
+    "gasp": "gasp", "groan": "groan", "growl": "growl", "grunt": "grunt", "moan": "moan",
+    "whimper": "whimper", "sob": "sob", "cry": "cry", "cries": "cry", "cried": "cry",
+    "scream": "scream", "shriek": "shriek", "shout": "shout", "hiss": "hiss", "tsk": "tsk",
+    "whisper": "whispers", "breath": "breath", "exhal": "exhales", "paus": "short pause",
+}
+_VOCALISATION = re.compile(
+    r"\b(" + "|".join(sorted(_VOCAL_TAGS, key=len, reverse=True))
+    + r")(?:e|es|ed|ing|s|d|ter|bing|bed)?\b", re.IGNORECASE)
+_THROAT = re.compile(r"\bclear\w*\s+(?:\w+\s+)?throat\b", re.IGNORECASE)
+
+
+def _vocal_tag(action: str) -> str:
+    """The inline tag for the first sound an action or audio tag names, "" if it names none."""
+    if _THROAT.search(action):
+        return "<throat-clearing>"
+    match = _VOCALISATION.search(action)
+    return f"<{_VOCAL_TAGS[match.group(1).lower()]}>" if match else ""
+
+
+def _is_action(text: str, match: "re.Match") -> bool:
+    """Whether an italic span is a roleplay action standing as a sentence of its own, rather
+    than a stressed word: it starts a line or follows the end of a sentence (or another
+    action), and it ends the line or a new sentence follows it. "*sighs* Fine." is an action;
+    "I *never* said that" and "*Never* again" are not."""
+    before = text[text.rfind("\n", 0, match.start()) + 1:match.start()].rstrip().rstrip("\"'”’)")
+    if before and before[-1] not in ".!?…*":
+        return False
+    end = text.find("\n", match.end())
+    after = text[match.end():end if end != -1 else len(text)]
+    following = after.lstrip()
+    return not following or (after[0].isspace() and not following[0].islower())
+
+
+def speaks_verbatim(model_id: str) -> bool:
+    """Whether a Google speech model reads its text word for word -- Gemini 3.8 on -- and so
+    takes direction as a style line, and any Google voice id. See PROSE_DIRECTED_TTS_MODELS."""
+    return model_id.removeprefix("GOOGLE/").removeprefix("models/") not in PROSE_DIRECTED_TTS_MODELS
+
+
+def stored_google_voice(voice_id: str) -> str:
+    """`speech_voice` for a voice Google names by id: one of the thirty in its own spelling,
+    which every Gemini speech model speaks, and any other as GOOGLE_VOICE_PREFIX + id."""
+    return TTS_VOICE_LOOKUP.get(voice_id.lower()) or GOOGLE_VOICE_PREFIX + voice_id
+
+
+def speakable_text(text: str, keep_tags: bool = False, vocal_tags: bool = False) -> str:
+    """The reply as a speech model should hear it: the words, without Discord's markup, a
+    roleplay action, or -- unless `keep_tags` -- an audio tag. With `vocal_tags`, an action or
+    audio tag that is a sound becomes Gemini 3.8's inline tag for it: "*sighs*" is `<sigh>`."""
+    replace = _vocal_tag if vocal_tags else (lambda _action: "")
+    text = _CUSTOM_EMOJI.sub(r"\1", text or "")
+    text = _DISCORD_TOKEN.sub("", text)
+    text = _MASKED_LINK.sub(r"\1", text)
+    text = _LINK.sub("", text)
+    source = _SUBTEXT.sub("", text)
+    text = _ITALIC.sub(lambda m: replace(m.group(1)) if _is_action(source, m) else m.group(0), source)
+    if not keep_tags:
+        text = _AUDIO_TAG.sub(lambda m: replace(m.group(0)[1:-1]), text)
+    text = _MARKERS.sub("", text)
+    return _SPACES.sub(" ", text).strip()
+
+
 #: model id -> `image_model_caps` for OpenRouter's image models, installed whole by the image
 #: catalogue each time it loads or syncs. A registry rather than a catalogue lookup because
 #: the pickers, the request path and /profile manage all ask `image_model_caps`, and a utils
@@ -1293,7 +1380,8 @@ def prune_openrouter_endpoints(config: Dict[str, Any]) -> None:
 
 def record_billed_usage(meta: Dict[str, Any], response) -> None:
     """Copy what the provider reports about billing onto a turn's `meta`: its cost,
-    served tier and host, and any thinking tokens it counted apart from the reply.
+    served tier and host, any thinking tokens it counted apart from the reply, and how
+    much of the input it served from its prompt cache.
 
     Written by every path that records a turn, read by `/session audit`. Only
     OpenRouter reports a cost, tier or host: it returns what it actually charged, the one
@@ -1318,6 +1406,10 @@ def record_billed_usage(meta: Dict[str, Any], response) -> None:
     thinking = getattr(response, "thinking_tokens", None)
     if isinstance(thinking, int) and not isinstance(thinking, bool) and thinking > 0:
         meta["thinking_tokens"] = thinking
+    # Part of `input_tokens`, not beside it: what the prefix cache served, billed cheaper.
+    cached = getattr(response, "cached_tokens", None)
+    if isinstance(cached, int) and not isinstance(cached, bool) and cached > 0:
+        meta["cached_tokens"] = cached
 
 
 def billable_output_tokens(meta: Dict[str, Any]) -> int:

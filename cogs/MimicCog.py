@@ -190,6 +190,9 @@ class MimicCog(EventListeners, commands.Cog):
         self.command_ids: Dict[str, int] = {}
         self.decrypted_key_cache: LRUCache = LRUCache(max_size=100)
         self.server_key_pointers: LRUCache = LRUCache(max_size=200)
+        #: Replicated Gemini voices minted from voice samples, per sample, key and model --
+        #: `MediaService.replicated_voice`. Lost on restart, which costs one mint each.
+        self.voice_keys: LRUCache = LRUCache(max_size=64)
         self.profile_shares: Dict[str, List[Dict[str, Any]]] = {}
         self.profile_manager._load_profile_shares()
         self.public_profiles: Dict[str, Dict[str, Any]] = {}
@@ -663,22 +666,25 @@ class MimicCog(EventListeners, commands.Cog):
     @app_commands.describe(profile_name="The profile to give the voice.",
                            sample="A clean 10-30 second recording of one speaker.",
                            transcript="Optional: exactly what is said in the recording. It improves the match.",
-                           slot=f"Optional: which of the {VOICE_SAMPLE_SLOTS} slots to save it in. Defaults to an empty one.")
+                           slot=f"Optional: which of the {VOICE_SAMPLE_SLOTS} slots to save it in. Defaults to an empty one.",
+                           consent="For Gemini: the same speaker reading Google's consent sentence, shown on the next screen.")
     @app_commands.autocomplete(profile_name=EventListeners.master_autocomplete)
     async def voice_sample_slash(self, interaction: discord.Interaction, profile_name: str,
                                  sample: discord.Attachment,
                                  transcript: Optional[app_commands.Range[str, 1, 2000]] = None,
-                                 slot: Optional[app_commands.Range[int, 1, VOICE_SAMPLE_SLOTS]] = None):
+                                 slot: Optional[app_commands.Range[int, 1, VOICE_SAMPLE_SLOTS]] = None,
+                                 consent: Optional[discord.Attachment] = None):
         # Checked before the consent screen, so nobody vouches for a file that would be refused.
         if not self.profile_manager.may_set_voice_sample(interaction.user.id, profile_name):
             await interaction.response.send_message(VOICE_SAMPLE_NOT_OWN, ephemeral=True)
             return
         mime_type = voice_sample_mime_type(sample.content_type, sample.filename)
-        if mime_type is None:
+        consent_mime_type = consent and voice_sample_mime_type(consent.content_type, consent.filename)
+        if mime_type is None or (consent and consent_mime_type is None):
             await interaction.response.send_message(VOICE_SAMPLE_NOT_AUDIO, ephemeral=True)
             return
         limit = defaultConfig.LIMIT_VOICE_SAMPLE_BYTES
-        if sample.size > limit:
+        if sample.size > limit or (consent and consent.size > limit):
             await interaction.response.send_message(
                 VOICE_SAMPLE_TOO_LARGE.format(limit=limit // (1024 * 1024)), ephemeral=True)
             return
@@ -695,7 +701,8 @@ class MimicCog(EventListeners, commands.Cog):
             return
         replaces = (records[slot - 1].get("filename") or "recording") if records[slot - 1] else None
         view = VoiceSampleConsentView(self, interaction.user.id, profile_name, sample, mime_type, transcript,
-                                      slot=slot, replaces=replaces)
+                                      slot=slot, replaces=replaces, consent=consent,
+                                      consent_mime_type=consent_mime_type, guild_id=interaction.guild_id)
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
     @profile_group.command(name="hub", description="The unified dashboard for managing profiles, sharing, and the public library.")

@@ -413,14 +413,15 @@ consecutive same-role turns into one entry, and attaches per-profile context —
 documents and grounding summaries — only if that profile has the corresponding tool
 enabled. It also puts every turn on the reader's clock: a turn is stamped once, in its
 speaker's zone, when it is stored, and `restamp_turn` rewrites the header's time from
-`turn_posted_at` into the reader's `timezone`. A user's own local time, which their stamps
-used to carry, is said once instead, in `<local_times>`.
+`turn_posted_at` into the reader's `timezone`. A user's own local time is not sent.
 
 A reply is the turn's `reply_to`, never text in its `content`: the replied-to turn's
 `turn_id`, or — for a message outside the log — a snapshot of who, when and the start of
 what it said (`reply_record`). `render_reply` draws it per reader, inside the replier's
-block: a turn that reader has in view is tagged `[#n]` in its header for that prompt alone
-(`reply_tags`) and the reply names the tag, not quoting it again; one out of view is
+block: every public turn that reader has in view is numbered `[#n]` in its header, counted
+from the window's start, and the reply names the number, not quoting it again. The start
+holds still between steps, so a reply rewrites no earlier turn and the cached prefix
+survives it (compaction and memory capture tag only replied-to turns, `reply_tags`); one out of view is
 quoted from the log, so deleting or muting it takes it out of every reply too. The replied-to message comes off the gateway payload
 (`referenced_message`); a child bot's payload carries the same snapshot.
 
@@ -538,6 +539,8 @@ proof rules. The TTS category browses it, and the voice screen offers the chosen
 voices. Each speech adapter swaps a voice its model lacks for one it has — the Gemini
 default, or an OpenRouter model's first — so a fallback on the other provider still speaks.
 An OpenRouter model is sent the reply alone, as MP3: the Director's Desk reaches Google only.
+Gemini 3.8 reads its text verbatim, so it gets the reply with its actions as vocal tags
+(`<sigh>`) and the Desk as one `speechMetadata.style` line; earlier models get the Desk itself.
 
 A text model can be **pinned to one endpoint** — a host at a tier, e.g.
 `google-vertex/global/priority` — from Set Models → Hosts & Tier (`OpenRouterHostView`),
@@ -566,6 +569,16 @@ selection its config was copied with, and follows the source's while it has none
 rebuild a profile from its config and prompts — and removing the profile's directory removes
 them. The selected one is decrypted to a temp file per request, only for a model whose host
 clones voices, and sent in place of a preset voice. A turn's speech retries one timeout and no more, across both of its models.
+
+Gemini 3.8 clones only with a **consent recording** (the same speaker reading
+`VOICE_REPLICATION_CONSENT`), sealed per slot beside the sample and dropped when the sample is
+replaced without one. It is never sent per line: `MediaService.replicated_voice` mints a
+stateless `voicekey_…` once per sample, key and model (`cog.voice_keys`, six days of a
+seven-day key), and every line on that key speaks it. It is checked with Google on upload.
+3.8 also speaks **Google voice ids** — Extended Voice Library, AI Studio or Design a Voice —
+stored as `GOOGLE/<id>` so no OpenRouter voice is mistaken for one. A designed voice lives in
+one Google project, so a key from another gets "no such voice": that key and voice are
+remembered (`_TTS_MISSING_VOICES`) and speak the default from then on, without a second 400.
 
 ### No vendor SDKs
 
@@ -673,23 +686,33 @@ messages.** This is the most common way to ship a visible bug here.
 
 Two destinations, and the choice is not stylistic.
 
-**The system instruction** (`_construct_system_instructions`) carries standing context —
-what is true for the whole scene. It is assembled in three bands:
+`_construct_system_instructions` returns two of them: the system instruction and the
+**turn context**.
 
-| Band | Blocks | Why there |
+| Where | Blocks | Why there |
 |---|---|---|
-| stable | `scene_prompt`, `persona_profile`, `character_instructions`, `memory_search`, `web_search` | changes rarely, so it is the cacheable prefix |
-| volatile | `session_synopsis`, `game_context`, `neuro_endocrine_engine`, `current_time`, `birthday_context`, `training_data`, `archive_context`, `negative_constraints` | changes per turn or per minute |
-| trailing | `session_rules`, `content_policy` | output-format and hard-content rules, last for recency |
+| system instruction | `scene_prompt`, `persona_profile`, `character_instructions`, `memory_search`, `web_search`, `neuro_endocrine_engine` (what the levels mean), `session_rules`, then `session_synopsis`, `content_policy` | changes only when someone edits it; the synopsis (once per compaction pass) comes after the rules so it re-bills only what follows; the policy is last |
+| turn context | `current_time` (first), `game_context`, `neuro_state`, `birthday_context`, `training_data`, `archive_context`, `negative_constraints` | changes per turn |
 
-Providers cache on a shared prefix, so **the first block that changes invalidates every
-token after it**. `<current_time>` is formatted to the minute; with the persona behind it
-the largest stable part of every prompt was re-billed uncached every time the clock ticked.
-A new block goes in `volatile_parts` unless it is genuinely per-profile-stable.
+Providers cache on a shared prefix — system instruction, then transcript — so **the first
+block that changes invalidates every token after it**, the whole transcript included. With
+`<current_time>` (formatted to the minute) or a per-turn memory in the system instruction,
+every call re-billed the transcript uncached. A new block goes in `turn_parts` unless it
+changes only when someone edits it. The clock is on trial there: a probe run had models
+asked the time at 11 AM answer "midnight" more often from the turn context than from the
+system instruction (`prod_tests/prompt_cache_live.py`). The transcript holds still
+too: `_build_history_for_participant` moves the window's start in steps of half the STM
+rather than a turn at a time, which would change the first message on every call.
+`cached_tokens` on a turn's meta is what the provider says its cache served. An edit still lands on the next call: nothing holds a
+built instruction, so a change just starts a new cached prefix.
 
-**The final user turn** carries per-turn context — what is true for *this* round:
-`whisper_context` recaps, `external_context`, `document_context`, help context, media, and
-image notes. Retrieval that serves the turn sits next to the turn.
+**The final user turn** carries what is true for *this* round. The turn context goes
+first, straight after the conversation; then the round's own material — `whisper_context`
+recaps, `external_context`, `document_context`, help context, media, image notes. Every
+caller places the turn context itself; one that drops it sends a character with no clock,
+memories or examples, and nothing fails (`tests/test_prompt_blocks.py` checks each binds it).
+`prod_tests/prompt_cache_live.py` measures the cache hit, and whether the moved blocks
+still work, against real models.
 
 Recency is real. `<content_policy>` is last deliberately, and `<rewrite_request>` — the
 in-character `/speak` directive — goes in the **final user turn, after the whole

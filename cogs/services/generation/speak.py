@@ -217,27 +217,29 @@ class SpeakAsMixin:
             contents = self.cog.session_manager._build_history_for_participant(
                 session.get("unified_log", []), bot_pid,
                 {**p_settings, "stm_length": SPEAK_REWRITE_HISTORY_TURNS},
-                hide_folded=self.cog.session_manager.compaction_enabled(session),
+                hide_folded=self.cog.session_manager.compaction_enabled(session), stepped=False,
             )
-
-        # Its own final user turn where the history allows one. Merged into a trailing
-        # user turn only when there is one, which is what the adapters' role handling
-        # everywhere else in the codebase expects.
-        if contents and contents[-1].get('role') == 'user':
-            contents[-1]['parts'].append(directive)
-        else:
-            contents.append({'role': 'user', 'parts': [directive]})
 
         # One tuple for the prompt and both models -- see tool_loop.
         functions = tool_loop.functions_for(p_settings, has_server=bool(guild_id))
         try:
-            system_instruction, _, _, temp, top_p, top_k, primary_model, fallback_model = await asyncio.to_thread(
+            system_instruction, turn_context, _, temp, top_p, top_k, primary_model, fallback_model = await asyncio.to_thread(
                 self._construct_system_instructions,
                 owner_id, profile_name, channel.id, is_multi_profile=bool(session),
                 functions=functions,
             )
         except Exception as e:
             return None, f"Could not build the character's prompt: {e}"
+
+        # Its own final user turn where the history allows one. Merged into a trailing
+        # user turn only when there is one, which is what the adapters' role handling
+        # everywhere else in the codebase expects. The turn context goes ahead of the
+        # directive, which must stay last.
+        final_parts = [p for p in (turn_context, directive) if p]
+        if contents and contents[-1].get('role') == 'user':
+            contents[-1]['parts'].extend(final_parts)
+        else:
+            contents.append({'role': 'user', 'parts': final_parts})
 
         safety_settings = _resolve_safety_settings(channel, p_settings)
         tools = resolve_native_tools(p_settings)

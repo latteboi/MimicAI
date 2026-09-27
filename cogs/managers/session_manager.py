@@ -205,6 +205,9 @@ def reply_tags(turns: List[Dict[str, Any]]) -> Dict[str, int]:
     and `#n` in the reply, which names the turn exactly where a name and a time to the
     second can still match two -- and costs a few tokens where repeating the header, id
     and date cost thirty. A turn nothing in view replies to carries no tag.
+
+    For the one-off prompts, compaction and memory capture. A session prompt numbers every
+    turn instead (`_build_history_for_participant`), so a reply rewrites nothing cached.
     """
     seen: Set[str] = set()
     targets: Set[str] = set()
@@ -221,7 +224,7 @@ def reply_tags(turns: List[Dict[str, Any]]) -> Dict[str, int]:
 def render_reply(reply: Dict[str, Any], clock, tags: Dict[str, int], find) -> str:
     """A turn's `reply_to` as its reader sees it.
 
-    A replied-to turn in view is named by the tag `reply_tags` gave it, and not quoted:
+    A replied-to turn in view is named by its tag, and not quoted:
     the model is already reading it. Out of view -- folded, or older than the window --
     it is quoted, with who said it and when on the reader's clock. A turn since deleted
     or muted is not quoted from a snapshot, because it is read from the log each time:
@@ -258,8 +261,8 @@ def render_reply(reply: Dict[str, Any], clock, tags: Dict[str, int], find) -> st
 
 
 def with_reply(content: str, turn: Dict[str, Any], clock, tags: Dict[str, int], find) -> str:
-    """`content` as one prompt shows it: its header tagged if a later turn in view replies
-    to it, and the reply it makes, if any, inside its own block under the header."""
+    """`content` as one prompt shows it: its header tagged if `tags` numbers it, and the
+    reply it makes, if any, inside its own block under the header."""
     header, sep, rest = content.partition("\n")
     if not sep:
         return content
@@ -1747,7 +1750,8 @@ class SessionManager:
         return None
 
     @staticmethod
-    def _select_history_window(full_log: List[Dict], window: int, hide_folded: bool) -> List[Dict]:
+    def _select_history_window(full_log: List[Dict], window: int, hide_folded: bool,
+                               step: int = 1) -> List[Dict]:
         """The trailing slice of `full_log` holding `window` turns that will actually
         be shown -- which counts folded turns only while `hide_folded` is off.
 
@@ -1758,6 +1762,10 @@ class SessionManager:
 
         Walks backwards and stops as soon as the quota is met, so it costs O(window)
         plus whatever hidden turns it steps over, not O(log).
+
+        `step` rounds the start down to a multiple of itself, in the log's own index, so
+        it holds still while the log grows that many turns -- see
+        `_build_history_for_participant`.
         """
         if window <= 0:
             return []
@@ -1769,7 +1777,7 @@ class SessionManager:
                 continue
             kept += 1
             if kept >= window:
-                return full_log[index:]
+                return full_log[index - index % step:]
         return list(full_log)
 
     @staticmethod
@@ -1796,7 +1804,7 @@ class SessionManager:
                 return kept
         return reserved_tail
 
-    def _build_history_for_participant(self, full_log: List[Dict], bot_pid: str, p_settings: Dict[str, Any], num_participants: int = 1, reserved_tail: int = 0, *, hide_folded: bool) -> List[Dict]:
+    def _build_history_for_participant(self, full_log: List[Dict], bot_pid: str, p_settings: Dict[str, Any], num_participants: int = 1, reserved_tail: int = 0, *, hide_folded: bool, stepped: bool = True) -> List[Dict]:
         """This participant's view of the log: the last `stm_length` turns, with other
         participants' private exchanges hidden and its own rewritten into their XML tags.
 
@@ -1816,20 +1824,33 @@ class SessionManager:
         caller can leave it out. A folded turn is hidden only because a synopsis stands in
         for it; with the rolling synopsis off that synopsis is not sent, so the turns come
         back rather than being missing from both.
+
+        `stepped=False` is for a one-off prompt whose tail length is tuned (`/speak`): it
+        gains nothing from the cache and would lose what the tuning bought.
         """
         stm_length = int(p_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
         effective_stm = max(stm_length, num_participants) if stm_length > 0 else 0
         # stm_length 0 means "no memory", but the current round is still in front of it.
         window = effective_stm + self._bound_reserved_tail(full_log, reserved_tail)
-        log_slice = self._select_history_window(full_log, window, hide_folded)
+        # The start moves in steps of half the STM, not a turn at a time. Providers cache on
+        # a shared prefix, and a window that drops its oldest turn for every new one changes
+        # the transcript's first message on every call, so none of it ever cached. Held
+        # still, one prefix serves the next STM/2 turns; the price is up to STM/2 - 1 older
+        # turns in each prompt, billed at the cached rate when they hit.
+        step = max(1, effective_stm // 2) if stepped else 1
+        log_slice = self._select_history_window(full_log, window, hide_folded, step)
         # Every turn on this character's own clock, the one its <current_time> reads.
         clock, _ = _resolve_zoneinfo(p_settings.get("timezone"))
 
         participant_history = []
-        # A reply to a turn this participant is shown names it by a tag rather than
-        # quoting it again. See reply_tags.
-        tags = reply_tags([t for t in log_slice if not t.get("type") and not t.get("is_hidden")
-                           and not (hide_folded and t.get("compacted"))])
+        # Every public turn numbered from the window's start, and a reply names the number
+        # rather than quoting its turn again. Not `reply_tags`, which tags only a turn
+        # something replies to: that rewrote the target's header the moment someone did,
+        # inside the cached prefix, and everything after it re-billed. The start holds
+        # still between steps, so a number never changes until the prefix does anyway.
+        public = (t for t in log_slice if not t.get("type") and not t.get("is_hidden")
+                  and not (hide_folded and t.get("compacted")) and t.get("turn_id"))
+        tags = {t["turn_id"]: n for n, t in enumerate(public, 1)}
         find = turn_lookup(full_log)
         for turn in log_slice:
             if turn.get("is_hidden") or (hide_folded and turn.get("compacted")): continue

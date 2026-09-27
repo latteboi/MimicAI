@@ -534,7 +534,7 @@ class APIService:
             except RuntimeError:
                 self.catalogue.flush_usage()
 
-    async def _get_or_create_model_for_channel(self, channel_id: int, actual_message_author_id: int, guild_id: int, profile_owner_override: Optional[int] = None, profile_name_override: Optional[str] = None, prompt_content: Optional[str] = None) -> Tuple[Optional[Any], bool, float, float, int, Optional[str], Optional[str]]:
+    async def _get_or_create_model_for_channel(self, channel_id: int, actual_message_author_id: int, guild_id: int, profile_owner_override: Optional[int] = None, profile_name_override: Optional[str] = None, prompt_content: Optional[str] = None) -> Tuple[Optional[Any], bool, float, float, int, Optional[str], Optional[str], str]:
         
         api_key = self.cog.storage_manager._get_api_key_for_guild(guild_id)
         
@@ -547,10 +547,10 @@ class APIService:
         
         channel = self.cog.bot.get_channel(channel_id)
         if not channel:
-            return None, True, 0.0, 0.0, 0, "Could not find the channel for this interaction.", None
+            return None, True, 0.0, 0.0, 0, "Could not find the channel for this interaction.", None, ""
 
         if not self.cog.profile_manager._check_unrestricted_safety_policy(profile_owner_id_for_instructions, profile_name_for_instructions, channel):
-            return None, True, 0.0, 0.0, 0, "This character's content rating is Adult 18+, which only runs in age-restricted channels.", None
+            return None, True, 0.0, 0.0, 0, "This character's content rating is Adult 18+, which only runs in age-restricted channels.", None, ""
 
         model_cache_key = (channel_id, profile_owner_id_for_instructions, profile_name_for_instructions)
 
@@ -575,7 +575,7 @@ class APIService:
         # exactly what it is sent. Every caller of this runs `tool_loop.run`.
         functions = functions_for(p_settings, has_server=bool(guild_id))
 
-        current_instructions, error_in_instr_constr, _, temperature, top_p, top_k, primary_model, fallback_model = self.cog.generation_service._construct_system_instructions(
+        current_instructions, turn_context, _, temperature, top_p, top_k, primary_model, fallback_model = self.cog.generation_service._construct_system_instructions(
             profile_owner_id_for_instructions,
             profile_name_for_instructions,
             channel_id,
@@ -588,8 +588,8 @@ class APIService:
         if (not api_key and not primary_model.upper().startswith("OLLAMA/")
                 and not self.cog.storage_manager._get_api_key_for_guild(guild_id, "openrouter")):
             if self.cog.storage_manager.gemini_blocked_for_guild(guild_id):
-                return None, True, 0.0, 0.0, 0, GEMINI_FREE_TIER_BLOCKED, None
-            return None, True, 0.0, 0.0, 0, "Server API key is not configured.", None
+                return None, True, 0.0, 0.0, 0, GEMINI_FREE_TIER_BLOCKED, None, ""
+            return None, True, 0.0, 0.0, 0, "Server API key is not configured.", None, ""
         
         warning_message = None
 
@@ -609,14 +609,14 @@ class APIService:
         
         if model_cache_key in self.cog.channel_models and not recreate_model:
             model_instance, model_init_error_state, cached_model_name = self.cog.channel_models[model_cache_key]
-            # The instruction built above, not the one the model was cached with. That
-            # one carried the <current_time> and <birthday_context> of whenever the entry
-            # was made, so a whisper answered on a clock frozen at the first whisper and
-            # never learnt of a birthday that came round, or was set, after it. Every
-            # adapter reads this attribute when it builds a request.
+            # The instruction built above, not the one the model was cached with, so an
+            # edit to the persona or the rules -- or the hour on the clock -- takes effect
+            # on the very next call. Birthdays and the other per-turn blocks are in the
+            # turn context, which the caller places.
+            # Every adapter reads this attribute when it builds a request.
             if model_instance is not None:
                 model_instance.system_instruction = current_instructions
-            return model_instance, model_init_error_state, temperature, top_p, top_k, warning_message, fallback_model
+            return model_instance, model_init_error_state, temperature, top_p, top_k, warning_message, fallback_model, turn_context
 
         model_instance, model_init_error = None, True
         
@@ -645,12 +645,12 @@ class APIService:
                 model_instance = self._instantiate_model(model_to_create, guild_id, profile_owner_id_for_instructions, current_instructions, dynamic_safety_settings, t_params_fb, model_tools, p_sett_thinking, config_owner_id=profile_owner_id_for_instructions, functions=functions)
                 model_init_error = False
             except Exception as e2:
-                return None, True, temperature, top_p, top_k, f"Model Initialization Error: Failed to load Primary ('{primary_model}') and Fallback ('{fallback_model}') models. Check your API key.", fallback_model
+                return None, True, temperature, top_p, top_k, f"Model Initialization Error: Failed to load Primary ('{primary_model}') and Fallback ('{fallback_model}') models. Check your API key.", fallback_model, ""
         
-        final_error_state = error_in_instr_constr or model_init_error
+        final_error_state = model_init_error
         self.cog.channel_models[model_cache_key] = (model_instance, final_error_state, model_to_create)
         self.cog.channel_model_last_profile_key[model_cache_key] = current_profile_key_for_model
-        return model_instance, final_error_state, temperature, top_p, top_k, warning_message, fallback_model
+        return model_instance, final_error_state, temperature, top_p, top_k, warning_message, fallback_model, turn_context
 
     async def _validate_api_keys(self, gemini_key: str, openrouter_key: str) -> Tuple[bool, str, str]:
         """Validates API keys against the REST API. Returns (is_valid, error_message, tier).
@@ -736,6 +736,11 @@ class APIService:
         "GOOGLE/gemini-pro-latest": {"input_1m": 2.00, "output_1m": 12.00},
         "GOOGLE/gemini-flash-lite-latest": {"input_1m": 0.30, "output_1m": 2.50},
     }
+    #: What Google bills an input token its implicit prompt cache served, as a share of the
+    #: input rate: a tenth on every Gemini model above. Only estimates read it -- an
+    #: OpenRouter turn carries the invoice, cache discount and all.
+    # ponytail: one share for every model; a `cached_1m` per rate if Google's ever diverge.
+    GOOGLE_CACHED_INPUT_SHARE = 0.10
 
     @tasks.loop(hours=24)
     async def pricing_sync_task(self):
@@ -909,9 +914,14 @@ class APIService:
             pass
         return 0.0, 0.0
 
-    def _calculate_turn_cost(self, model_name: str, input_tokens: int, output_tokens: int) -> float:
+    def _calculate_turn_cost(self, model_name: str, input_tokens: int, output_tokens: int,
+                             cached_tokens: int = 0) -> float:
+        """The standard-rate estimate. `cached_tokens` is the part of `input_tokens` the
+        prompt cache served, priced at `GOOGLE_CACHED_INPUT_SHARE` of the input rate."""
         input_rate, output_rate = self._get_model_pricing(model_name)
-        cost_input = (input_tokens / 1000000) * input_rate
+        cached = min(max(cached_tokens, 0), input_tokens)
+        cost_input = ((input_tokens - cached + cached * self.GOOGLE_CACHED_INPUT_SHARE)
+                      / 1000000) * input_rate
         cost_output = (output_tokens / 1000000) * output_rate
         return cost_input + cost_output
 
@@ -929,4 +939,5 @@ class APIService:
             return float(billed), True
         return self._calculate_turn_cost(meta.get("model", "") or "",
                                          meta.get("input_tokens", 0) or 0,
-                                         billable_output_tokens(meta)), False
+                                         billable_output_tokens(meta),
+                                         meta.get("cached_tokens", 0) or 0), False

@@ -9,7 +9,7 @@ from ...utils.constants import (
     DEFAULT_SYSTEM_INSTRUCTION, DEFAULT_SESSION_RULES, DEFAULT_NEURO_INSTRUCTION,
     NEURO_AXES,
     DEFAULT_TRAINING_DATA_INJECTION, DEFAULT_CURRENT_TIME, DEFAULT_NEGATIVE_CONSTRAINTS,
-    DEFAULT_CONTENT_POLICY, DEFAULT_BIRTHDAY_CONTEXT, DEFAULT_LOCAL_TIMES,
+    DEFAULT_CONTENT_POLICY, DEFAULT_BIRTHDAY_CONTEXT, DEFAULT_NEURO_DEFINITION,
 )
 from ...utils.birthdays import birthday_offset, describe_birthday
 from ...utils.helpers import (TURN_TIME_FORMAT, Timeout, _get_user_hash, _resolve_zoneinfo,
@@ -158,30 +158,14 @@ class PromptBuilderMixin:
                 lines.append(line)
         return lines
 
-    def _local_time_lines(self, now: datetime.datetime,
-                          users: Sequence[Tuple[int, str]]) -> List[str]:
-        """Each user's local time, for those whose clock differs from the character's.
+    def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None, present_users: Optional[Sequence[Tuple[int, str]]] = None, functions: Sequence[Any] = ()) -> Tuple[str, str, bool, float, float, int, str, str]:
+        """The system instruction for one profile's generation, the turn context, and its
+        sampling values.
 
-        Their own turns used to carry it, stamped in their zone; every turn is now on
-        the character's clock, so it is said here once. A user with no timezone in
-        About Me is left out: unset is unknown, not UTC.
-        """
-        lines, seen = [], set()
-        for user_id, display_name in users:
-            if user_id in seen:
-                continue
-            seen.add(user_id)
-            zone = self.cog.profile_manager.get_user_about(user_id).get("timezone")
-            if not zone:
-                continue
-            local = now.astimezone(_resolve_zoneinfo(zone)[0])
-            if local.utcoffset() != now.utcoffset():
-                lines.append(f"{display_name} [ID: {_get_user_hash(user_id)}]: "
-                             f"{local.strftime(TURN_TIME_FORMAT)}")
-        return lines
-
-    def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None, present_users: Optional[Sequence[Tuple[int, str]]] = None, functions: Sequence[Any] = ()) -> Tuple[str, bool, bool, float, float, int, str, str]:
-        """The system instruction for one profile's generation, plus its sampling values.
+        The turn context is every block that changes per turn -- the neuro state, training
+        examples, recalled memories, the critic's constraints.
+        The caller puts it on the end of its final user turn, ahead of anything that turn
+        must end on (`<rewrite_request>`). Dropped, the character silently loses all of it.
 
         `present_users` is (user id, display name) for the people in the conversation, whose
         birthdays the character may know. A session derives them from its own log, so only
@@ -217,19 +201,21 @@ class PromptBuilderMixin:
             neuro_enabled = profile_data.get("neuro_engine_enabled", False)
             neuro_state = profile_data.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
 
-        # Assembled most-stable-first, and that is a cost decision rather than a
-        # stylistic one. Providers cache on a shared prefix, so the first block that
-        # changes invalidates every token after it -- and <current_time> is formatted to
-        # the minute. With the persona and the character instructions sitting *behind*
-        # it, as they used to, the largest and most stable part of every prompt was
-        # re-billed uncached on every turn that crossed a minute boundary.
+        # Split by how often a block changes, and that is a cost decision rather than a
+        # stylistic one. Providers cache on a shared prefix -- the system instruction,
+        # then the transcript -- so the first block that changes invalidates every token
+        # after it. With <current_time> (formatted to the second) or a per-turn memory
+        # anywhere in here, the whole transcript behind it was re-billed uncached on
+        # every call. Those go in `turn_parts`, which rides the final user turn.
         #
-        # <session_rules> and <content_policy> stay at the very end despite being stable
-        # themselves: they are the output-format and hard-content rules and they want
-        # recency, and by that point a volatile block already sits in front of them --
-        # so nothing past `stable_parts` was ever going to cache anyway.
+        # What stays here changes only when someone edits it (or a compaction pass, for
+        # the synopsis), and an edit still lands on the very next call: nothing holds a
+        # built instruction, so a change just starts a new cached prefix.
         stable_parts = []
-        volatile_parts = []
+        turn_parts = []
+        # After the rules: the synopsis changes once per compaction pass, and everything
+        # behind it re-bills when it does.
+        slow_parts = []
 
         session = self.cog.multi_profile_channels.get(channel_id) if is_multi_profile else None
         if is_multi_profile:
@@ -286,31 +272,42 @@ class PromptBuilderMixin:
             # window would hide it from exactly the long sessions it exists for. Shared
             # by the whole cast -- only public turns are ever compacted, so it can carry
             # nothing a participant was not already entitled to see.
+            #
+            # Kept in the instruction although it changes: once per compaction pass, a
+            # chunk of turns apart, which costs one cache miss per pass -- and it tells
+            # what happened *before* the transcript, so it reads ahead of it.
             synopsis = self.cog.session_manager.get_latest_synopsis(session)
             if synopsis:
-                volatile_parts.append(f"<session_synopsis>\n{synopsis}\n</session_synopsis>")
+                slow_parts.append(f"<session_synopsis>\n{synopsis}\n</session_synopsis>")
 
             # Standing context for the same reason, and injected here rather than into
             # the game's own call so that *every* generation in the channel sees it --
             # a seated character answering ordinary chatter mid-hand knows what it just
             # played, which is what removed the need to bench the cast during a game.
             # Returns None on the overwhelmingly common no-game path, for one dict get.
+            # Per move, so it rides the turn.
             game_block = self.cog.game_service.context_block(channel_id)
             if game_block:
-                volatile_parts.append(f"<game_context>\n{game_block}\n</game_context>")
+                turn_parts.append(f"<game_context>\n{game_block}\n</game_context>")
 
         if neuro_enabled:
+            stable_parts.append(self.cog.global_prompts.get("NEURO_DEFINITION", DEFAULT_NEURO_DEFINITION))
             neuro_block = self.cog.global_prompts.get("NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION).format(
                 d=neuro_state.get('dopamine', 50),
                 c=neuro_state.get('cortisol', 20),
                 o=neuro_state.get('oxytocin', 50),
                 a=neuro_state.get('adrenaline', 20)
             )
-            volatile_parts.append(neuro_block)
+            turn_parts.append(neuro_block)
 
         # Always sent. `time_tracking_enabled` used to switch this block off; that mode is
         # retired and the key is no longer read, so a profile still carrying False gets
         # its clock like every other.
+        #
+        # First in the turn context, to the second: there it costs no cache, so it needs
+        # no rounding. Under trial -- measured from here, models asked the time at 11 AM
+        # answered "midnight" (5/12, and 2/12 last in the turn), against 5-9/12 from the
+        # system instruction (prod_tests/prompt_cache_live.py).
         time_template = self.cog.global_prompts.get("TIME_CONTEXT", DEFAULT_CURRENT_TIME)
         try:
             tz, _ = _resolve_zoneinfo(timezone_str)
@@ -318,32 +315,26 @@ class PromptBuilderMixin:
         except Exception as e:
             print(f"Error processing timezone '{timezone_str}': {e}. Defaulting to UTC.")
             now = datetime.datetime.now(datetime.timezone.utc)
-        volatile_parts.append(time_template.format(time_str=now.strftime(TURN_TIME_FORMAT)))
+        turn_parts.insert(0, time_template.format(time_str=now.strftime(TURN_TIME_FORMAT)))
 
-        # Beside <current_time>, which already changes every minute, so it costs no
-        # prompt caching the clock was not already costing.
         if present_users is None:
             present_users = self._users_in_history_window(session, profile_data) if session else []
-        local_times = self._local_time_lines(now, present_users)
-        if local_times:
-            volatile_parts.append(self.cog.global_prompts.get("LOCAL_TIMES", DEFAULT_LOCAL_TIMES)
-                                  .format(times="\n".join(local_times)))
         cast = [(seat.get("owner_id"), seat.get("profile_name"))
                 for seat in (session or {}).get("profiles") or []]
         birthday_lines = self._birthday_lines(profile_owner_id, profile_name_to_use, now.date(),
                                               present_users, cast)
         if birthday_lines:
             birthday_template = self.cog.global_prompts.get("BIRTHDAY_CONTEXT", DEFAULT_BIRTHDAY_CONTEXT)
-            volatile_parts.append(birthday_template.format(birthdays="\n".join(birthday_lines)))
+            turn_parts.append(birthday_template.format(birthdays="\n".join(birthday_lines)))
 
         if training_examples_list:
             examples_block = "\n---\n".join(training_examples_list)
-            volatile_parts.append(
+            turn_parts.append(
                 self.cog.global_prompts.get("TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION)
                 .format(examples_block=examples_block))
 
         if recalled_ltm:
-            volatile_parts.append(recalled_ltm)
+            turn_parts.append(recalled_ltm)
 
         # The critic's constraints, placed here rather than appended by the caller after
         # <content_policy>. This parameter existed and no caller passed it: the worker
@@ -352,13 +343,14 @@ class PromptBuilderMixin:
         # fiction. The worker now runs its critic before this call and passes the result.
         if critic_constraints:
             constraints_block = self.cog.global_prompts.get("NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS)
-            volatile_parts.append(constraints_block.format(constraints=critic_constraints))
+            turn_parts.append(constraints_block.format(constraints=critic_constraints))
 
         rule_block = self.cog.global_prompts.get("CONTEXT_RULES", DEFAULT_SESSION_RULES)
 
         # [NEW] Dynamically inject the profile's ID into the context rules
         profile_id_val = self.cog.profile_manager._get_profile_id(profile_owner_id, profile_name_to_use)
-        trailing_parts = [rule_block.format(profile_id_placeholder=profile_id_val).strip()]
+        rules = rule_block.format(profile_id_placeholder=profile_id_val).strip()
+        trailing_parts = []
 
         # Channel-level content shaping, gated on the destination rather than the
         # profile: an Adult-rated profile is already confined to age-restricted
@@ -374,12 +366,12 @@ class PromptBuilderMixin:
                 trailing_parts.append(policy_block)
 
         current_instructions_str = "\n\n".join(
-            p for p in (stable_parts + volatile_parts + trailing_parts) if p and p.strip()
+            p for p in (stable_parts + [rules] + slow_parts + trailing_parts) if p and p.strip()
         ).strip()
-
+        turn_context = "\n\n".join(p for p in turn_parts if p and p.strip())
 
         final_system_instruction = current_instructions_str if current_instructions_str.strip() else DEFAULT_SYSTEM_INSTRUCTION
-        return final_system_instruction, False, grounding_enabled, temperature, top_p, top_k, primary_model, fallback_model
+        return final_system_instruction, turn_context, grounding_enabled, temperature, top_p, top_k, primary_model, fallback_model
 
     def _neuro_state_from_text(self, raw_text: str) -> Tuple[str, Dict[str, int]]:
         """The state the reply's `<neuro_update>` tag reports, and the reply without it.

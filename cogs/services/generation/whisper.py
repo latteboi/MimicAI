@@ -117,10 +117,13 @@ class WhisperMixin:
 
         # One tuple for the prompt and both models -- see tool_loop.
         functions = tool_loop.functions_for(p_settings)
-        (system_instruction, _, _, temp, top_p, top_k,
+        (system_instruction, turn_context, _, temp, top_p, top_k,
          primary_model, fallback_model_name) = await asyncio.to_thread(
             self._construct_system_instructions, owner_id, profile_name, interaction.channel_id,
             is_multi_profile=True, functions=functions)
+        # `_whisper_history` always ends on the user turn carrying the whisper.
+        if turn_context:
+            history[-1]['parts'].append(turn_context)
 
         # Every name the history wraps a turn in: the whisperer, and each seated profile under
         # both the name its private turns are logged as and the one it is shown as.

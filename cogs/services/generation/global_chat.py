@@ -201,7 +201,7 @@ class GlobalChatMixin:
             # Channel 0 resolves to no channel, so the builder takes the not-age-restricted
             # branch and always injects <content_policy>: the card can be opened in any
             # channel, which is why content_capability refuses an Adult profile here.
-            (system_instruction, _, _, temp, top_p, top_k,
+            (system_instruction, turn_context, _, temp, top_p, top_k,
              primary_model, fallback_model_name) = await asyncio.to_thread(
                 self._construct_system_instructions, host_user_id, profile_name, 0,
                 present_users=present_users, functions=functions)
@@ -310,6 +310,8 @@ class GlobalChatMixin:
                 user_hash = _get_user_hash(turn["user_id"])
                 user_line = _format_history_entry(turn["display_name"], turn["timestamp"], turn["content"], user_tz, entity_id=user_hash)
                 final_user_parts.append(user_line)
+            if turn_context:
+                final_user_parts.append(turn_context)
 
             user_content_obj_for_turn = {'role': 'user', 'parts': final_user_parts}
 

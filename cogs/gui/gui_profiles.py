@@ -3,6 +3,8 @@ from ..utils.constants import *
 import discord
 from discord import ui
 import asyncio
+import os
+import re
 import datetime
 import traceback
 import time
@@ -17,6 +19,7 @@ from ..utils.helpers import (
     resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
     resolve_unreadable_media_mode, system_model,
+    _format_api_error, speaks_verbatim, stored_google_voice,
 )
 from ..utils.user_defaults import final_fallback_enabled, model_provider, setting_label
 from ..utils.birthdays import MONTH_NAMES, parse_birthday, valid_birthday
@@ -36,6 +39,7 @@ from ..services.api.openrouter_catalogue import (
     AUTHOR_PREFIX, BROWSE_CHEAPEST, BROWSE_POPULAR, BROWSE_TRENDING,
 )
 from ..services.api.openrouter_endpoints import option_description, option_label
+from ..services.api.google_rest import voice_id_of
 from ..utils.data_policy import may_pick_training_models
 from .gui_data import DataManageView
 from .gui_hub import HubShareManagerView
@@ -2251,6 +2255,27 @@ def ProfileImageGenSettingsModal(cog, profile_name: str, current_params: Dict[st
         return {"config": c, "prompts": p}
     return ConfigModal(cog, profile_name, is_borrowed, "Image Generation Settings", fields, parser, callback, target_user_id)
 
+#: What the Voices API takes: a BCP-47 tag, and the three genders it files voices under.
+_LANGUAGE_TAG = re.compile(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*")
+GOOGLE_VOICE_GENDERS = ("female", "male", "neutral")
+#: A voice id as Google spells them (`voice_...`, a library name); anything else is refused
+#: before it reaches a URL path.
+_VOICE_ID = re.compile(r"[\w.-]{1,100}")
+
+
+class _VoiceFormModal(ui.Modal):
+    """A few text fields, handed to `on_submit` as {custom_id: value, stripped}."""
+
+    def __init__(self, title: str, fields: List[Dict[str, Any]], on_submit):
+        super().__init__(title=title[:45])
+        self._on_submit = on_submit
+        for field in fields:
+            self.add_item(ui.TextInput(**field))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self._on_submit(interaction, {c.custom_id: (c.value or "").strip() for c in self.children})
+
+
 class MediaOptionsMixin:
     """The dropdown machinery shared by the image-output and voice pickers.
 
@@ -2414,6 +2439,8 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
         #: Each slot's voice sample record, None for an empty slot, read by whoever opened
         #: the screen.
         self.voice_samples = list(voice_samples or [None] * VOICE_SAMPLE_SLOTS)
+        #: The last Search Voice Library answer, offered as a select until the next search.
+        self.library_results: List[Dict[str, Any]] = []
         self._build_view()
 
     def _profile(self) -> Dict[str, Any]:
@@ -2504,15 +2531,26 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
             offered = self._offered_voices()
             if offered is None:
                 voice = stored or DEFAULT_SPEECH_VOICE
-                described = " · ".join(d for d in (TTS_VOICE_GENDER.get(voice),
-                                                   TTS_VOICE_CHARACTER.get(voice)) if d)
-                lines.append(f"**Voice:** `{voice}`" + (f" ({described})" if described else ""))
-                if voice.lower() not in TTS_VOICE_LOOKUP:
-                    lines.append(f"-# Not a Gemini voice, so `{DEFAULT_SPEECH_VOICE}` speaks instead.")
+                verbatim = speaks_verbatim(model)
+                if voice.startswith(GOOGLE_VOICE_PREFIX):
+                    lines.append(f"**Voice:** `{voice[len(GOOGLE_VOICE_PREFIX):]}` (Google voice id)")
+                    lines.append(f"-# Gemini 3.8 and later only, so `{DEFAULT_SPEECH_VOICE}` speaks on this "
+                                 "model instead." if not verbatim else
+                                 "-# A designed or replicated voice speaks only with a key from the Google "
+                                 f"project that made it; with any other, `{DEFAULT_SPEECH_VOICE}` speaks.")
+                else:
+                    described = " · ".join(d for d in (TTS_VOICE_GENDER.get(voice),
+                                                       TTS_VOICE_CHARACTER.get(voice)) if d)
+                    lines.append(f"**Voice:** `{voice}`" + (f" ({described})" if described else ""))
+                    if voice.lower() not in TTS_VOICE_LOOKUP:
+                        lines.append(f"-# Not a Gemini voice, so `{DEFAULT_SPEECH_VOICE}` speaks instead.")
                 lines.append(f"**Speech model:** `{model}`")
                 lines.append("\nVoices are grouped by gender, then described by Google's own "
                              "one-word character. Everything beyond that — accent, mood, pacing — is "
                              "the Director's Desk, not the voice.")
+                if verbatim:
+                    lines.append("Search Voice Library reaches Google's hundreds more; Use Voice ID takes "
+                                 "one made in Google AI Studio; Design a Voice makes one from a description.")
             else:
                 lines.append(f"**Voice:** `{stored or 'model default'}`")
                 if offered and (stored or "").lower() not in {v.lower() for v in offered}:
@@ -2525,13 +2563,21 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
             slot = self._voice_slot()
             selected = self.voice_samples[slot - 1]
             if selected:
-                model_id = model[len("OPENROUTER/"):] if model.startswith("OPENROUTER/") else None
-                clones = bool(model_id) and self.cog.api_service.speech_catalogue.clones(model_id)
+                if model.startswith("OPENROUTER/"):
+                    clones = self.cog.api_service.speech_catalogue.clones(model[len("OPENROUTER/"):])
+                else:
+                    clones = speaks_verbatim(model) and bool(selected.get("consent_mime_type"))
                 lines.append(f"**Voice sample:** slot {slot} \u00b7 `{selected.get('filename') or 'recording'}`"
-                             + (" with a transcript" if selected.get("transcript") else ""))
-                lines.append("-# This model clones it, so the profile speaks in that voice." if clones else
-                             "-# This model cannot clone a voice, so the voice above is used. Choose "
-                             "a model marked 'clones voices' to hear the sample.")
+                             + (" with a transcript" if selected.get("transcript") else "")
+                             + (" and a consent recording" if selected.get("consent_mime_type") else ""))
+                if clones:
+                    lines.append("-# This model clones it, so the profile speaks in that voice.")
+                elif not model.startswith("OPENROUTER/") and speaks_verbatim(model):
+                    lines.append("-# Gemini clones a voice only with the speaker's consent recording, so the "
+                                 "voice above is used. Add one with `/profile voice_sample consent:`.")
+                else:
+                    lines.append("-# This model cannot clone a voice, so the voice above is used. Choose "
+                                 "a model marked 'clones voices' to hear the sample.")
             elif any(self.voice_samples):
                 lines.append(f"**Voice sample:** slot {slot} \u00b7 empty, so the voice above is used.")
             elif self.cog.profile_manager.may_set_voice_sample(self.user_id, self.profile_name):
@@ -2574,13 +2620,19 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
                                         labels=IMAGE_GROUNDING_LABELS)
         else:
             self._add_voice_select("speech_voice", 0)
+            if self.library_results:
+                self._add_library_select(1)
             if any(self.voice_samples):
-                self._add_voice_slot_select(1)
+                self._add_voice_slot_select(2)
+            if self._offered_voices() is None and speaks_verbatim(self._voice_model()):
+                add_button(self, "Search Voice Library", self._search_library, emoji="🔎", row=3)
+                add_button(self, "Use Voice ID", self._use_voice_id, emoji="🆔", row=3)
+                add_button(self, "Design a Voice", self._design_voice, emoji="🎨", row=3)
             slot = self._voice_slot()
             if self.voice_samples[slot - 1] and self.cog.profile_manager.may_set_voice_sample(
                     self.user_id, self.profile_name):
                 add_button(self, f"Remove Slot {slot}", self._remove_voice_sample,
-                           style=discord.ButtonStyle.danger, row=2)
+                           style=discord.ButtonStyle.danger, row=4)
 
     def _voice_slot(self) -> int:
         return self.cog.profile_manager.voice_sample_slot(self.user_id, self.profile_name)
@@ -2612,6 +2664,124 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
 
         select.callback = callback
         self.add_item(select)
+
+    def _add_library_select(self, row: int):
+        """The last library search's voices; choosing one stores it as its Google id."""
+        current = self._current_value("speech_voice")
+        options = []
+        for idx, voice in enumerate(self.library_results[:25]):
+            voice_id = voice_id_of(voice)
+            about = " · ".join(", ".join(map(str, v)) if isinstance(v, list) else str(v)
+                               for v in (voice.get(k) for k in ("accent", "gender", "pitch", "persona")) if v)
+            options.append(discord.SelectOption(
+                label=str(voice.get("display_name") or voice_id)[:100], value=str(idx),
+                description=about[:100] or None, default=(stored_google_voice(voice_id) == current)))
+        select = ui.Select(placeholder=f"Library results ({len(options)})...", options=options, row=row)
+
+        async def callback(interaction: discord.Interaction):
+            self._apply("speech_voice", stored_google_voice(voice_id_of(self.library_results[int(select.values[0])])))
+            self._build_view()
+            await interaction.response.edit_message(**self._render())
+
+        select.callback = callback
+        self.add_item(select)
+
+    def _google_speech_model(self, interaction: discord.Interaction):
+        """The profile's speech model on the key this server's lines are spoken with -- through
+        the factory, so the data policy and the cooldown judge a Voices API call as a line."""
+        return self.cog.api_service._instantiate_model(
+            self._voice_model(), interaction.guild_id, interaction.user.id, config_owner_id=self.user_id,
+            speech=True, google_key_error="No Google key is set up here.")
+
+    async def _voice_form(self, interaction: discord.Interaction, title: str, fields: List[Dict[str, Any]],
+                          run, pending: str = "⏳ Asking Google…") -> None:
+        """Opens a form, then runs `run(model, values)` against Google and redraws the screen.
+
+        A language and gender, where the form asks, are checked here: Google answers an
+        unknown one with an empty list or a 400, which reads as nothing matching. While
+        Google works the screen says so, with its buttons off: a second press of Design a
+        Voice would make a second voice in the project.
+        """
+        async def submit(modal_interaction: discord.Interaction, values: Dict[str, str]):
+            values["gender"] = values.get("gender", "").lower()
+            if values["gender"] and values["gender"] not in GOOGLE_VOICE_GENDERS:
+                await modal_interaction.response.send_message(
+                    f"❌ Gender is one of {', '.join(GOOGLE_VOICE_GENDERS)}, or blank.", ephemeral=True)
+                return
+            if values.get("language") and not _LANGUAGE_TAG.fullmatch(values["language"]):
+                await modal_interaction.response.send_message(
+                    "❌ Language is a code like `en-GB` or `ja-JP`, or blank.", ephemeral=True)
+                return
+            await modal_interaction.response.edit_message(content=pending, view=None)
+            try:
+                note = await run(self._google_speech_model(modal_interaction), values)
+            except Exception as e:
+                note = {"content": f"❌ {_format_api_error(e)}"}
+            self._build_view()
+            await modal_interaction.edit_original_response(**self._render())
+            if note:
+                await modal_interaction.followup.send(**note, ephemeral=True)
+
+        await interaction.response.send_modal(_VoiceFormModal(title, fields, submit))
+
+    async def _search_library(self, interaction: discord.Interaction):
+        async def run(model, values):
+            self.library_results = await model.list_voices(values["search"], values["language"], values["gender"])
+            return None if self.library_results else {"content": "No voices matched that search."}
+
+        await self._voice_form(interaction, "Search Voice Library", [
+            {"label": "Search", "custom_id": "search", "required": False, "max_length": 100,
+             "placeholder": "e.g. warm, narrator, gravelly"},
+            {"label": "Language", "custom_id": "language", "required": False, "max_length": 20,
+             "placeholder": "e.g. en-GB"},
+            {"label": "Gender", "custom_id": "gender", "required": False, "max_length": 10,
+             "placeholder": "female, male or neutral"},
+        ], run)
+
+    async def _use_voice_id(self, interaction: discord.Interaction):
+        async def run(model, values):
+            voice_id = values["voice_id"]
+            if not _VOICE_ID.fullmatch(voice_id):
+                return {"content": "❌ That is not a voice id: letters, digits, `_`, `-` and `.` only."}
+            if voice_id.lower() not in TTS_VOICE_LOOKUP and await model.get_voice(voice_id) is None:
+                return {"content": "❌ " + GOOGLE_VOICE_NOT_FOUND.format(voice=voice_id)}
+            self._apply("speech_voice", stored_google_voice(voice_id))
+            return None
+
+        await self._voice_form(interaction, "Use Voice ID", [
+            {"label": "Voice ID", "custom_id": "voice_id", "required": True, "max_length": 100,
+             "placeholder": "e.g. voice_abc123, from Google AI Studio"},
+        ], run)
+
+    async def _design_voice(self, interaction: discord.Interaction):
+        data = self._profile()
+
+        async def run(model, values):
+            voice_id, preview = await model.design_voice(values["description"], self.profile_name[:100],
+                                                         values["gender"], values["language"])
+            self._apply("speech_voice", GOOGLE_VOICE_PREFIX + voice_id)
+            if not preview:
+                return None
+            # discord.File opens the file now, and an open handle still reads once the path
+            # is unlinked: nothing is left in the temp directory whether or not it is sent.
+            try:
+                file = discord.File(preview, filename="voice_preview.wav")
+            finally:
+                os.remove(preview)
+            return {"content": f"A preview of **{self.profile_name}**'s new voice, now selected.",
+                    "file": file}
+
+        await self._voice_form(interaction, "Design a Voice", [
+            {"label": "Describe the voice", "custom_id": "description", "required": True, "max_length": 500,
+             "style": discord.TextStyle.paragraph,
+             "default": "; ".join(v for v in (data.get("speech_archetype"), data.get("speech_accent")) if v) or None,
+             "placeholder": "Age, timbre, accent and manner, in a sentence or two."},
+            {"label": "Language", "custom_id": "language", "required": False, "max_length": 20,
+             "placeholder": "e.g. en-AU"},
+            {"label": "Gender", "custom_id": "gender", "required": False, "max_length": 10,
+             "placeholder": "female, male or neutral"},
+        ], run, f"🎨 Designing **{self.profile_name}**'s voice with Google. This can take a little "
+                "while; the preview arrives here when it is ready.")
 
     async def _remove_voice_sample(self, interaction: discord.Interaction):
         slot = self._voice_slot()
@@ -2696,9 +2866,10 @@ class ModelPickerMixin(ReportErrorMixin):
         ("ltm", "LTM Summariser", "Turns conversations into long-term memories."),
     )
 
-    #: Categories whose every slot is in SEARCH_MODEL_KEYS: the model must run a web
-    #: search, which Ollama cannot carry, so the API switch skips Ollama on them.
-    _NO_OLLAMA_CATEGORIES = ("grounding",)
+    #: Categories Ollama cannot serve, so the API switch skips it: grounding must run a web
+    #: search, and image and speech have no Ollama path. Offered anyway, the tab lists the
+    #: Google models (`get_top_models`) and stores them as `OLLAMA/...`, which always fail.
+    _NO_OLLAMA_CATEGORIES = ("grounding", "image", "tts")
 
     @classmethod
     def display_model(cls, value) -> str:
@@ -3402,6 +3573,23 @@ class OpenRouterHostView(BlockedGuard, ui.View):
         # a cached OpenRouterModel carries the endpoint it was built with.
         self.parent._save_changes("openrouter_endpoints", pins)
 
+    def _tier_choice(self, tier, listing) -> str:
+        """The dropdown value a Default Tier press moves one model to: Flex its cheapest
+        endpoint, Priority its best, Auto no pin. Without this the press changed nothing
+        on screen, and nothing at all for a model already pinned, whose tag wins."""
+        if tier == "flex":
+            return listing[0].tag  # parse_endpoints sorts cheapest first
+        if tier == "priority":
+            # Ties keep listing order, so the cheapest of equals.
+            return max(listing, key=lambda e: (e.tier == "priority", e.takes_temperature,
+                                               e.uptime or 0.0)).tag
+        return self._AUTO
+
+    def _pin_for_tier(self, tier):
+        for model_id in self.parent._pinnable_openrouter_models():
+            if self.listings.get(model_id):
+                self._choose(model_id, self._tier_choice(tier, self.listings[model_id]))
+
     def _head_options(self, chosen: str, tier, tier_wording: str) -> List[discord.SelectOption]:
         """The options above the hosts."""
         if tier is None:
@@ -3426,7 +3614,9 @@ class OpenRouterHostView(BlockedGuard, ui.View):
                 "fails or has no capacity, OpenRouter routes the request as it otherwise would, "
                 "so a pin never costs a reply.\n"
                 "-# A pin names its own tier, so it overrides the Default Tier for that model. "
-                "Pins are per model: a primary and fallback on the same model share one.")
+                "Pins are per model: a primary and fallback on the same model share one.\n"
+                "-# Changing the Default Tier re-pins the models here: Flex to the cheapest "
+                "host, Priority to the best, Auto to none.")
 
     def _footer(self) -> str:
         return f"{self.parent.profile_name} · changes save as you make them"
@@ -3544,7 +3734,9 @@ class OpenRouterHostView(BlockedGuard, ui.View):
         style, wording = self.parent.tier_wording(self.parent._current_service_tier())
 
         async def tier_cb(i: discord.Interaction):
-            self.parent._set_service_tier(self.parent._next_service_tier())
+            tier = self.parent._next_service_tier()
+            self.parent._set_service_tier(tier)
+            self._pin_for_tier(tier)
             self._build_view()
             await i.response.edit_message(**self._render())
         add_button(self, f"Default Tier: {wording}", tier_cb, style=style, row=4)
@@ -4214,6 +4406,10 @@ class BulkOpenRouterHostView(OpenRouterHostView):
         else:
             pins[model_id] = None if chosen == self._AUTO else chosen
 
+    def _tier_choice(self, tier, listing) -> str:
+        # The tier leaving the changeset takes the pins it staged with it.
+        return self._UNCHANGED if tier is None else super()._tier_choice(tier, listing)
+
     def _head_options(self, chosen: str, tier, tier_wording: str) -> List[discord.SelectOption]:
         auto = super()._head_options(chosen, tier, tier_wording)
         auto[0].description = f"Unpins it. {auto[0].description}"[:100]
@@ -4508,7 +4704,9 @@ class VoiceSampleConsentView(BlockedGuard, ui.View):
     """
 
     def __init__(self, cog: 'MimicCog', user_id: int, profile_name: str, sample: discord.Attachment,
-                 mime_type: str, transcript: Optional[str], *, slot: int, replaces: Optional[str] = None):
+                 mime_type: str, transcript: Optional[str], *, slot: int, replaces: Optional[str] = None,
+                 consent: Optional[discord.Attachment] = None, consent_mime_type: Optional[str] = None,
+                 guild_id: Optional[int] = None):
         super().__init__(timeout=300)
         self.cog = cog
         self.user_id = user_id
@@ -4516,6 +4714,11 @@ class VoiceSampleConsentView(BlockedGuard, ui.View):
         self.sample = sample
         self.mime_type = mime_type
         self.transcript = transcript
+        #: The speaker reading VOICE_REPLICATION_CONSENT, which Gemini clones with and
+        #: nothing else needs; and the server whose key checks it with Google.
+        self.consent = consent
+        self.consent_mime_type = consent_mime_type
+        self.guild_id = guild_id
         self.slot = slot
         #: The filename already in that slot, which confirming overwrites; None for an empty slot.
         self.replaces = replaces
@@ -4543,7 +4746,12 @@ class VoiceSampleConsentView(BlockedGuard, ui.View):
         e.add_field(name="Slot", value=f"{self.slot} of {VOICE_SAMPLE_SLOTS}"
                     + (f" · replaces `{self.replaces}`" if self.replaces else " · empty"), inline=True)
         e.add_field(name="Models that clone voices",
-                    value=(", ".join(cloning) or "None listed right now")[:1024], inline=False)
+                    value=", ".join(cloning + ["Gemini 3.8, with a consent recording"])[:1024], inline=False)
+        e.add_field(name="Consent recording for Gemini",
+                    value=(f"`{self.consent.filename}` · checked with Google once saved" if self.consent else
+                           "None, so Gemini will not clone this voice. For Gemini, run the command again "
+                           f"with `consent`: the same speaker saying\n> {VOICE_REPLICATION_CONSENT}")[:1024],
+                    inline=False)
         return e
 
     def _build_view(self):
@@ -4569,6 +4777,7 @@ class VoiceSampleConsentView(BlockedGuard, ui.View):
         await interaction.response.defer()
         try:
             audio = await self.sample.read()
+            consent = await self.consent.read() if self.consent else None
         except discord.HTTPException:
             await self._finish(interaction, "The recording could not be read back from Discord, "
                                             "so nothing was saved. Upload it again.")
@@ -4576,16 +4785,24 @@ class VoiceSampleConsentView(BlockedGuard, ui.View):
         manager = self.cog.profile_manager
         saved = await manager.save_voice_sample(
             self.user_id, self.profile_name, audio, slot=self.slot, mime_type=self.mime_type,
-            filename=self.sample.filename, transcript=self.transcript)
+            filename=self.sample.filename, transcript=self.transcript, consent=consent,
+            consent_mime_type=self.consent_mime_type,
+            consent_filename=self.consent.filename if self.consent else None)
+        selected = saved and manager.voice_sample_slot(self.user_id, self.profile_name) == self.slot
         if not saved:
             outcome = VOICE_SAMPLE_NOT_OWN
-        elif manager.voice_sample_slot(self.user_id, self.profile_name) == self.slot:
+        elif selected:
             outcome = (f"Saved to slot {self.slot}. **{self.profile_name}** now speaks with this voice "
                        "on models that clone voices.")
         else:
             # Not switched to: slots are there to keep a voice for later, and the one in use stays.
             outcome = (f"Saved to slot {self.slot}. Select it in Choose TTS Voice for "
                        f"**{self.profile_name}** to speak with it.")
+        if consent and selected:
+            # Checked now, so a consent Google will not take is heard about here rather
+            # than discovered as the wrong voice on the profile's first line.
+            outcome += "\n" + await self.cog.media_service.check_cloned_voice(
+                self.guild_id, self.user_id, self.profile_name)
         await self._finish(interaction, outcome)
 
     async def _cancel(self, interaction: discord.Interaction):

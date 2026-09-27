@@ -259,11 +259,7 @@ class RegenerationMixin:
                 history.append({'role': 'user', 'parts': [self.cog.global_prompts.get("KICKSTART_START", DEFAULT_KICKSTART_START)]})
 
             media = await self._recover_regeneration_media(channel, original_attachments, last_user_turn)
-            if media:
-                _add_to_last_user_turn(history, media)
             recap = whisper_recap(pending_whispers, p_settings.get("timezone"), self.cog.global_prompts)
-            if recap:
-                _add_to_last_user_turn(history, [recap])
 
             # What the live round searched on: its own turns, or the last turn when it
             # had none of its own. The last user message alone was empty on a scene with
@@ -274,28 +270,29 @@ class RegenerationMixin:
                            if p_settings.get("help_mode_enabled", False) else asyncio.sleep(0))
             ltm_recall_text, training_examples, help_context_text = await asyncio.gather(
                 self.cog.memory_manager._get_relevant_ltm_for_prompt(
-                    (channel.id, owner_id, profile_name), history, owner_id, profile_name,
+                    (channel.id, owner_id, profile_name), earlier, owner_id, profile_name,
                     trigger_content, "User", channel.guild.id, payload.user_id,
                     threshold=ltm_auto_threshold(p_settings)),
                 self.cog.memory_manager._get_relevant_training_examples(
                     owner_id, profile_name, trigger_content, channel.guild.id),
                 help_search,
             )
-            if help_context_text:
-                _add_to_last_user_turn(history, [help_context_text])
             # The constraints the turn was first written under, as its trace kept them. A
             # regeneration skipped the critic, so it wrote the very patterns it screens out.
             critic = ((target_turn.get("meta") or {}).get("critic")
                       if resolve_critic_settings(p_settings)["enabled"] else None)
             # One tuple for the prompt and both models -- see tool_loop.
             functions = functions_for(p_settings)
-            (system_instruction, _, _, temp, top_p, top_k,
+            (system_instruction, turn_context, _, temp, top_p, top_k,
              primary_model, fallback_model_name) = await asyncio.to_thread(
                 self._construct_system_instructions,
                 owner_id, profile_name, channel.id, is_multi_profile=True,
                 training_examples_list=training_examples, recalled_ltm=ltm_recall_text,
                 critic_constraints=(critic or {}).get("text"), functions=functions,
             )
+            # In the live round's order: the turn context, then the round's own material.
+            _add_to_last_user_turn(history, [p for p in (turn_context, recap, help_context_text) if p]
+                                   + list(media or []))
 
             app_name, app_avatar = self._resolve_appearance_data(owner_id, profile_name)
             state_container = {
