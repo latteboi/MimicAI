@@ -2853,7 +2853,7 @@ class SessionAuditView(BlockedGuard, ui.View):
                 embed.description = "Session Overview"
                 cost_line = (f"Estimated Session API Cost: `~${total_cost:.4f} USD`" if estimated
                              else f"Session API Cost (billed): `${total_cost:.4f} USD`")
-                embed.add_field(name="1. Overall Session Telemetry", value=f"├── Active Participants: `{len(self.session.get('profiles', []))}` Profiles\n├── Total Session Turns: `{len(log)}`\n├── Total Input Tokens Processed: `{total_in:,}`{f" (Cached: `{total_cached:,}`)" if total_cached else ""}\n├── Total Output Tokens Generated: `{total_out:,}`\n└── {cost_line}", inline=False)
+                embed.add_field(name="1. Overall Session Telemetry", value=f"├── Active Participants: `{len(self.session.get('profiles', []))}` Profiles\n├── Total Session Turns: `{len(log)}`\n├── Total Input Tokens Processed: `{total_in:,}`{f' (Cached: `{total_cached:,}`)' if total_cached else ''}\n├── Total Output Tokens Generated: `{total_out:,}`\n└── {cost_line}", inline=False)
                 
                 avg_lat = sum(durations) / len(durations) if durations else 0.0
                 embed.add_field(name="2. System Health Checks", value=f"└── Model Latency Average: `{avg_lat:.2f}s`", inline=False)
