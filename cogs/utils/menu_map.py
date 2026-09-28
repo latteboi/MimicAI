@@ -134,9 +134,9 @@ _STATIC_DASHBOARDS = [
             ("Public Library", ["Browse, search and borrow published profiles"]),
             ("Incoming Shares", ["Accept, reject or block the sender of profiles offered to you",
                                  "Open/Closed toggle for new offers; a user dropdown of who is blocked"]),
-            ("Manage My Shares", ["Offer profiles to registered users (no message is sent), "
-                                  "or publish and unpublish"]),
-            ("Profile Cloning", ["Generate a clone code, producing an independent copy rather than a link"]),
+            ("Profile Sharing", ["Offer profiles to registered users as a borrow or, with Send as "
+                                 "Clone, an independent copy (no message is sent)",
+                                 "Publish and unpublish"]),
         ],
     ),
     (

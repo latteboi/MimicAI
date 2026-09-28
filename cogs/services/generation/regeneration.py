@@ -6,7 +6,7 @@ import datetime
 from typing import Dict, List, Optional
 
 from ...utils.constants import (
-    PLACEHOLDER_EMOJI,
+    PLACEHOLDER_EMOJI, PROFILE_MESSAGE_MAX_LENGTH,
     DEFAULT_KICKSTART_START, DEFAULT_IMAGE_PRESENT,
 )
 from ...utils.helpers import (_format_history_entry, image_command_prefix,
@@ -380,8 +380,9 @@ class RegenerationMixin:
 
             await self._stop_sending_heartbeat(state_container)
 
-            # Truncate text strictly for Discord's 2000 character limit on edits
-            safe_text = display_text if len(display_text) <= 2000 else display_text[:1997] + "..."
+            # Truncated to one message, less the room an edit's line needs.
+            safe_text = (display_text if len(display_text) <= PROFILE_MESSAGE_MAX_LENGTH
+                         else display_text[:PROFILE_MESSAGE_MAX_LENGTH - 3] + "...")
             if participant.get('method') == 'child_bot':
                 await self.cog.manager_queue.put({
                     "action": "send_to_child", "bot_id": bot_id,

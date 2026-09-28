@@ -1631,6 +1631,7 @@ class SessionManager:
                     # dropping the cancellation set is what bounds it for a session
                     # that is abandoned before its worker next drains the queue.
                     session_to_evict.pop('cancelled_reaction_triggers', None)
+                    session_to_evict.pop('deleted_unlogged_messages', None)
                     session_to_evict.pop('pending_whispers', None)
                     # Clean up LTM recall history for participants in this channel to prevent RAM leak
                     for p in session_to_evict.get("profiles", []):
@@ -1999,19 +2000,32 @@ class SessionManager:
         return True
 
     @staticmethod
-    def withdraw_cancelled_reactions(session: Dict, triggers: List[Any]) -> List[Any]:
-        """The drained batch minus the reaction triggers withdrawn while they waited.
+    def withdraw_cancelled_triggers(session: Dict, triggers: List[Any]) -> List[Any]:
+        """The drained batch minus the reactions withdrawn and the messages deleted while they waited.
 
         Every reaction trigger in the batch stops counting as queued here, run or not. One
         cancellation withdraws one trigger, so the same emoji pressed again after it still
-        runs. Anything left in the cancellation set afterwards is cleared: the worker
-        drains the whole queue with no await before this call, so no queued trigger is
-        left for it to match.
+        runs. Anything left in either set afterwards is cleared: the worker drains the
+        whole queue with no await before this call, so no queued trigger is left for it
+        to match.
+
+        A message deleted before its turn was written has nothing in the log for the
+        delete listener to remove (`on_turn_messages_deleted` notes it instead), and
+        discord.py marks nothing on the object the queue holds, so without this the round
+        logged it and answered a message nobody could see.
         """
         queued = session.get('queued_reaction_triggers')
         cancelled = session.get('cancelled_reaction_triggers')
+        deleted = session.pop('deleted_unlogged_messages', None)
         surviving = []
         for trigger in triggers:
+            if deleted:
+                # A message, or the message inside a reply / child_mention tuple, whose
+                # payload is a dict. No other trigger shape carries an id.
+                message = trigger[1] if isinstance(trigger, tuple) and trigger[0] in ('reply', 'child_mention') else trigger
+                message_id = message.get('id') if isinstance(message, dict) else getattr(message, 'id', None)
+                if message_id in deleted:
+                    continue
             if isinstance(trigger, tuple) and trigger[0] in ('reaction', 'reaction_single'):
                 key = (trigger[1].message_id, str(trigger[1].emoji))
                 if queued:
@@ -2029,6 +2043,7 @@ class SessionManager:
         """For a queue emptied without a round: nothing it held can be withdrawn any more."""
         session.pop('queued_reaction_triggers', None)
         session.pop('cancelled_reaction_triggers', None)
+        session.pop('deleted_unlogged_messages', None)
 
     @staticmethod
     def register_in_flight(session: Dict, state_container: Dict) -> None:

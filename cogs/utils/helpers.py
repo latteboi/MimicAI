@@ -509,6 +509,20 @@ def _format_history_entry(display_name: str, timestamp: Union[datetime.datetime,
     return f"<{display_name}> [ID: {entity_id}] {time_str}:\n{content}\n</{display_name}>\n\n"
 
 
+#: The three parts `_format_history_entry` writes: header, what was said, closing tag.
+_TURN_PARTS = re.compile(r'(<([^>\r\n]+)> \[ID: [^\]\r\n]+\] \[[^\]\r\n]+\]:\n)(.*)(\n</\2>\n*)', re.DOTALL)
+
+
+def split_turn(content: str) -> Optional[Tuple[str, str, str]]:
+    """(header, body, closer) of a stored turn, or None for one in no shape this wrote.
+
+    Rewriting only the body keeps the name, id and moment exactly as first stamped,
+    which re-running `_format_history_entry` could only do by re-resolving all three.
+    """
+    match = _TURN_PARTS.fullmatch(content or "")
+    return (match.group(1), match.group(3), match.group(4)) if match else None
+
+
 #: A stored turn's opening header, capturing its time: `<Name> [ID: x] [time]:`.
 _TURN_HEADER_TIME = re.compile(r'<[^>\r\n]+> \[ID: [^\]\r\n]+\] \[([^\]\r\n]+)\]:')
 

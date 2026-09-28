@@ -14,7 +14,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 from ..utils.constants import (
     defaultConfig, PLACEHOLDER_EMOJI, GAME_BEAT_STALE_SECONDS,
-    WHISPER_BUSY_WAIT_TIMEOUT_SECONDS,
+    WHISPER_BUSY_WAIT_TIMEOUT_SECONDS, ROUND_SETTLE_SECONDS, ROUND_SETTLE_MAX_SECONDS,
     WARN_VOICE_SYNTHESIS_FAILED,
     ERR_REASON_AUDIO_TOO_LARGE, ERR_REASON_AUDIO_NOT_UPLOADED,
     DEFAULT_KICKSTART_START,
@@ -495,7 +495,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 
                 try:
                     initial_trigger = await session['task_queue'].get()
-                    
+
                     while (session.get('is_purging') or session.get('is_regenerating') or session.get('is_memorising')
                            or session.get('is_compacting')):
                         await asyncio.sleep(0.5)
@@ -525,7 +525,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 
                 # Reactions pulled back off while they waited are withdrawn, and every
                 # reaction in the batch stops counting as queued.
-                valid_triggers = self.cog.session_manager.withdraw_cancelled_reactions(
+                valid_triggers = self.cog.session_manager.withdraw_cancelled_triggers(
                     session, all_triggers_for_round)
                 
                 all_triggers_for_round = valid_triggers
@@ -669,6 +669,32 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 if first_participant:
                     pending_state_container = await self._open_turn_feedback(
                         session, channel, first_participant)
+
+                    # A burst settles into this round behind the placeholder, not ahead of
+                    # it (ROUND_SETTLE_SECONDS). Who speaks was rolled on what had arrived,
+                    # as for a message landing mid-round; the rest is read as this round's
+                    # history. Polled, not pulled, so a /cancel meanwhile drains it. A
+                    # reaction, /trigger or a game beat is the whole of what it asks for.
+                    # The whole batch is filtered again, not just what came late: the
+                    # message that opened the round can be deleted while it settles, and
+                    # a round left with nothing to answer ends here, the finally below
+                    # taking its placeholder down.
+                    if isinstance(initial_trigger, discord.Message) or (
+                            isinstance(initial_trigger, tuple)
+                            and initial_trigger[0] in ('reply', 'child_mention')):
+                        queue = session['task_queue']
+                        settle_until = time.monotonic() + ROUND_SETTLE_MAX_SECONDS
+                        seen = -1
+                        while queue.qsize() != seen and time.monotonic() < settle_until:
+                            seen = queue.qsize()
+                            await asyncio.sleep(min(ROUND_SETTLE_SECONDS,
+                                                    settle_until - time.monotonic()))
+                        while not queue.empty():
+                            all_triggers_for_round.append(queue.get_nowait())
+                        all_triggers_for_round = self.cog.session_manager.withdraw_cancelled_triggers(
+                            session, all_triggers_for_round)
+                        if not all_triggers_for_round:
+                            continue
 
                 # Runs for an empty order too: a message nobody answers is still part of
                 # the conversation the next round reads.
@@ -1804,7 +1830,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         while not session['task_queue'].empty():
                             try: batched_triggers.append(session['task_queue'].get_nowait())
                             except asyncio.QueueEmpty: break
-                        
+                        batched_triggers = self.cog.session_manager.withdraw_cancelled_triggers(
+                            session, batched_triggers)
+
                         if batched_triggers:
                             for trigger in batched_triggers:
                                 # [UPDATED] Unpack structured tuples in mid-round batches to ensure all messages are read

@@ -1,24 +1,38 @@
+import re
 import time
 import uuid
 import asyncio
+import datetime
 import discord
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from ...utils.constants import (
     DEFAULT_SPEAK_REWRITE_STRICT, DEFAULT_SPEAK_REWRITE_LOOSE,
     SPEAK_REWRITE_HISTORY_TURNS, SPEAK_REWRITE_MAX_INPUT_CHARS,
-    PLACEHOLDER_EMOJI,
+    PLACEHOLDER_EMOJI, EDIT_ATTRIBUTION, PROFILE_MESSAGE_MAX_LENGTH, SESSION_BUSY_FLAGS,
 )
 from ...utils.helpers import (
     _format_history_entry, _resolve_safety_settings, _scrub_response_text,
-    resolve_native_tools, resolve_thinking_params,
+    resolve_native_tools, resolve_thinking_params, split_turn, suppress_link_previews,
 )
 from ...managers.session_manager import intern_turn
 from . import tool_loop
 
 
+#: What the channel shows around a message's share of a reply but the log does not keep:
+#: the mention a "mention" response mode puts first, and a /speak or edit credit line.
+_LEADING_MENTION = re.compile(r'<@!?\d+> ')
+_TRAILING_CREDIT = re.compile(r'\n\n\|\|-# (?:Authored|Directed|Edited) by <@\d+> \(\d+\)\.\|\|\Z')
+
+
+def edit_attribution(editor_id: int) -> str:
+    """The spoilered line under an edited message, worded as /speak's "Authored by" line."""
+    return EDIT_ATTRIBUTION.format(id=editor_id)
+
+
 class SpeakAsMixin:
-    """The `/speak` one-off message injection, verbatim or re-voiced in character."""
+    """The `/speak` one-off message injection, verbatim or re-voiced in character,
+    and the Edit Profile Message context menu, which rewrites one already sent."""
 
     async def _execute_speak_as(self, interaction_to_respond: discord.Interaction, channel: discord.abc.Messageable, author: discord.User, profile_name: str, message: str, method: str, style: str = 'verbatim', fidelity: str = 'strict'):
         ctx = await self._resolve_speak_target(interaction_to_respond, channel, author, profile_name, method)
@@ -401,3 +415,99 @@ class SpeakAsMixin:
             await self.cog.session_manager.flush_session((channel.id, None, None), session.get("type", "multi"))
 
         return True
+
+    # --- Editing a sent message -----------------------------------------------
+
+    def _profile_edit_target(self, session: Optional[Dict], message: discord.Message) -> Tuple[Optional[Dict], str]:
+        """What an edit of `message` rewrites, or (None, refusal).
+
+        One message, not the whole reply: every message a profile sends leaves room for
+        the edit's line (PROFILE_MESSAGE_MAX_LENGTH), so any one of them can take it. Its
+        text is found in the turn by its words, not its characters: realistic typing
+        rejoins sentences with single spaces, so the channel's whitespace is not the log's.
+
+        Asked when the form opens and again on submit, against the message as it is then,
+        since a round can run while an admin types. Any profile's reply: the caller has
+        already required a server admin. Refused while the channel is busy -- a round or
+        a regeneration may be writing this turn -- and for a turn folded into the
+        synopsis, which would go on repeating the old words to every prompt.
+        """
+        session = session or {}
+        turn = next((t for t in session.get("unified_log") or ()
+                     if message.id in (t.get("message_ids") or ())), None)
+        if not turn or turn.get("is_user") is not False or turn.get("type"):
+            return None, "Only a profile's reply in this channel's session can be edited."
+        if turn.get("compacted"):
+            return None, "That reply is folded into the session synopsis, so it can no longer be edited."
+        if any(session.get(flag) for flag in SESSION_BUSY_FLAGS):
+            return None, "The channel is busy. Try again once the current turn has finished."
+        parts = split_turn(turn.get("content"))
+        if not parts:
+            return None, "That reply is stored in an older format and cannot be edited."
+        shown = _TRAILING_CREDIT.sub("", message.content or "")
+        mention = _LEADING_MENTION.match(shown)
+        prefix = mention.group(0) if mention else ""
+        shown = shown[len(prefix):].strip()
+        words = shown.split()
+        # The first place the reply says these words, should it say them twice.
+        span = re.search(r"\s+".join(map(re.escape, words)), parts[1]) if words else None
+        if not span:
+            return None, "That message holds none of what the character said (a source line or a file), so there is nothing to edit."
+        if len(shown) > PROFILE_MESSAGE_MAX_LENGTH:
+            return None, (f"That message was sent before edits had room: it is {len(shown):,} characters, "
+                          f"and an edit takes at most {PROFILE_MESSAGE_MAX_LENGTH:,}.")
+        return {"turn": turn, "parts": parts, "span": span.span(), "prefix": prefix, "text": shown}, ""
+
+    async def _execute_profile_edit(self, interaction: discord.Interaction, channel, message_id: int, text: str) -> None:
+        """Replace what one of a profile's messages says, in the channel and the log. Plain text only.
+
+        The rest of the reply is untouched. The header keeps its name, id and moment; the
+        turn records `edited_by` and `edited_at` (a /speak turn keeps its `authored_by`),
+        and the message's credit line becomes the edit's. No memory already formed is
+        revisited.
+        """
+        session = self.cog.multi_profile_channels.get(channel.id)
+        text = text.strip()
+        try:
+            message = await channel.fetch_message(message_id)
+            target, refusal = self._profile_edit_target(session, message)
+        except discord.HTTPException:
+            message, target, refusal = None, None, "That message is no longer there to edit."
+        if target is not None and not text:
+            target, refusal = None, "An edit cannot be empty. Delete the message instead."
+        if message is None or target is None:
+            # With their text: a modal cannot be reopened from its own submit.
+            await interaction.followup.send(
+                refusal, ephemeral=True,
+                embed=discord.Embed(description=text[:4096]) if text else discord.utils.MISSING)
+            return
+
+        display = target["prefix"] + text + edit_attribution(interaction.user.id)
+        try:
+            if message.webhook_id:
+                if await self.cog.server_manager.run_webhook(channel, "edit_message", message.id, content=display) is None:
+                    raise RuntimeError("no webhook in this channel")
+            elif str(message.author.id) in self.cog.child_bots:
+                # Reports nothing back: a failure is printed by the child bot's manager.
+                await self.cog.child_bot_manager.execute_regenerate(
+                    str(message.author.id), {"channel_id": channel.id, "message_id": message.id, "content": display})
+            elif message.author.id == self.cog.bot.user.id:
+                await message.edit(content=display)
+            else:
+                raise RuntimeError("it was not sent by this bot")
+        except (discord.HTTPException, RuntimeError) as e:
+            await interaction.followup.send(f"Could not edit that message: {suppress_link_previews(str(e))}", ephemeral=True)
+            return
+
+        turn = target["turn"]
+        header, body, closer = target["parts"]
+        start, end = target["span"]
+        turn["content"] = header + body[:start] + text + body[end:] + closer
+        turn["edited_by"] = interaction.user.id
+        turn["edited_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        log = session.get("unified_log") or []
+        index = next((i for i, t in enumerate(log) if t is turn), 0)
+        await self.cog.session_manager.flush_session(
+            (channel.id, None, None), session.get("type", "multi"),
+            structural=index < session.get("_log_cold_len", 0))
+        await interaction.followup.send("Message edited.", ephemeral=True)

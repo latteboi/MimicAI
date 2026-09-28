@@ -458,14 +458,17 @@ HELP_CATEGORIES = {
     "7. Sharing and Publishing": {
         "Sharing, Borrowing and Cloning": (
             "There are two ways to give someone a profile, and they are not the same thing.\n\n"
-            "**Share** produces a 5-minute code that creates a *borrow*: a read-only link back to your master profile. The borrower gets your "
+            "Both are offered from **Profile Sharing** in `/profile hub` to someone who has set MimicAI up. The offer waits in their "
+            "Incoming Shares until they accept or reject it, and nobody is messaged either way. Accepted profiles keep their name, "
+            "with a number added only if the recipient already has one called that.\n\n"
+            "**Send** offers a *borrow*: a read-only link back to your master profile. The borrower gets your "
             "character, and any edit you make reaches them. If you delete or rename the original, their copy is severed.\n\n"
-            "**Clone** produces a 5-minute code that creates an *independent copy* -- a new Class A profile the recipient owns and can edit "
+            "**Send as Clone** offers an *independent copy* -- a new Class A profile the recipient owns and can edit "
             "freely, with no link back to you.\n\n"
             "Cloning deliberately scrubs Long-Term Memories and any child-bot configuration. Memories are conversation history and are not "
             "yours to hand on; child-bot config contains a token.\n\n"
-            "Both are generated from `/profile hub`, and both require the profile to be rated **General** (or Exempt). An **Adult 18+** "
-            "profile cannot be shared, cloned or published, and an **Unrated** one cannot either until you rate it. **Manage My Shares** "
+            "Both require the profile to be rated **General** (or Exempt). An **Adult 18+** "
+            "profile cannot be shared, cloned or published, and an **Unrated** one cannot either until you rate it. **Profile Sharing** "
             "lists only the profiles that qualify."
         ),
         "The Public Library": (
@@ -476,9 +479,9 @@ HELP_CATEGORIES = {
             "Only profiles rated **General** can be published. Adult and Unrated profiles are refused. Rate the profile first from "
             "`/profile manage` -> Home -> **Content Safety**. A listed profile whose rating later becomes Adult or Unrated is taken out "
             "of the Library automatically.\n\n"
-            "Unpublish at any time from **Manage My Shares**. Existing borrows survive; the profile just stops being listed.\n\n"
+            "Unpublish at any time from **Profile Sharing**. Existing borrows survive; the profile just stops being listed.\n\n"
             "**Intro.** A listing can carry a short introduction you write, up to 300 characters. Set it from `/profile manage` -> Home -> "
-            "**Library Intro**, from **Edit Intro** on your own listing, or in **Manage My Shares** with one profile selected. The intro is "
+            "**Library Intro**, from **Edit Intro** on your own listing, or in **Profile Sharing** with one profile selected. The intro is "
             "part of what the Content Rating judges, so changing it on a rated profile offers to re-check the rating."
         ),
         "Content Ratings": (
@@ -515,7 +518,8 @@ HELP_CATEGORIES = {
         ),
         "Export, Import and Deletion": (
             "**`/export`** (DM only) writes selected profiles, and optionally their memories and training examples, to an encrypted "
-            "`.mimic` file. **`/import`** reads one back, renaming around any name collisions.\n\n"
+            "`.mimic` file. **`/import`** reads one back, numbering any name you already use (`name-2`). An import must fit your "
+            "profile limit, and a content rating other than Adult 18+ does not carry over: submit the profile again before sharing it.\n\n"
             "**Standard Export** is sealed with this instance's own key, so only this instance can import it. **Export for Self-Hosted** "
             "is sealed with a passphrase you choose instead, and any self-hosted instance can import it given that passphrase -- which "
             "makes the passphrase the only thing protecting it. The official MimicAI bot imports only its own Standard Exports: files "
@@ -775,7 +779,7 @@ DEFAULT_HELP_DOCS = {
         "Naming: Your own profiles always win a name clash. If you create a personal profile with the same name as a System Profile, yours is the one that runs; the System Profile is only reached when you have no profile of your own by that name.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'A borrowed profile vanished from my list.' Fix: The owner deleted or renamed the original. Borrows are links, not copies; ask them to share it again.\n"
-        "- Symptom: 'I cannot edit the persona of a profile I borrowed.' Fix: That is by design. Use Profile Cloning in `/profile hub` instead, which produces an independent Class A copy you own."
+        "- Symptom: 'I cannot edit the persona of a profile I borrowed.' Fix: That is by design. Ask its owner to send it with Send as Clone from `/profile hub` -> Profile Sharing instead, which gives you an independent Class A copy you own."
     ),
     "profiles/default_settings.txt": (
         "Command: `/settings` -> Override Defaults, open once `/start` has set you up. Sets standing preferences applied to profiles created afterwards and offered on borrows. Existing profiles are not changed; `/profile bulk manage` changes those.\n"
@@ -795,23 +799,23 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'I want to stop using a default.' Fix: Choose 'Platform default' on that row. That is different from selecting the shipped value by hand, which pins it."
     ),
     "profiles/sharing_and_cloning.txt": (
-        "Concept: 'Sharing' offers a read-only link to someone who has set MimicAI up: pick them in `/profile hub` -> Manage My Shares and press Send. The offer waits in their Incoming Shares until they accept or reject it, and nobody is messaged either way. 'Cloning' generates a 5-minute Clone Code to copy the configuration into a brand-new, independent Class A profile.\n"
+        "Concept: 'Sharing' offers a read-only link to someone who has set MimicAI up: pick them in `/profile hub` -> Profile Sharing and press Send. The offer waits in their Incoming Shares until they accept or reject it, and nobody is messaged either way. 'Cloning' is offered the same way with Send as Clone, and accepting it copies the configuration into a brand-new, independent Class A profile. Accepted profiles keep the original's name, with a number added only if the recipient already has one called that.\n"
         "Choosing between them: share when you want the recipient to keep receiving your edits; clone when you want them to have their own copy to change freely.\n"
         "Limitations: Cloning severs the link to the original, allowing full editing. However, Long-Term Memories (LTM) and Child Bot configurations are deliberately scrubbed during clones -- memories are conversation history that is not the cloner's to receive, and child bot config contains a bot token.\n"
-        "Location: Both are generated from `/profile hub`, or from `/profile manage` -> Misc -> Share Profile.\n"
-        "Requirement: Both need the profile rated General, or Exempt by the bot operator. Adult 18+, Unrated and Pending profiles cannot be shared or cloned, and Manage My Shares lists only the profiles that qualify. The rating is checked again when a share is accepted or a code redeemed.\n"
+        "Location: Both are sent from `/profile hub` -> Profile Sharing, or from `/profile manage` -> Misc -> Share Profile.\n"
+        "Requirement: Both need the profile rated General, or Exempt by the bot operator. Adult 18+, Unrated and Pending profiles cannot be shared or cloned, and Profile Sharing lists only the profiles that qualify. The rating is checked again when a share or clone is accepted.\n"
         "Troubleshooting / Symptoms:\n"
         "Receiving: Incoming Shares can be closed to everyone with its Open/Closed toggle, and anyone can be blocked from its user list or with Block Sender while reviewing their shares. Blocking also takes back what they have waiting; closing leaves waiting shares to be answered.\n"
         "- Symptom: 'It says my share was not sent.' Fix: The recipient has not run `/start`, has closed Incoming Shares, has blocked you, or already has 25 of your profiles waiting. The bot does not say which.\n"
-        "- Symptom: 'My profile is missing from Manage My Shares.' Fix: It is not rated General. Rate it from `/profile manage` -> Home -> Content Safety. Adult 18+ profiles cannot be shared at all.\n"
+        "- Symptom: 'My profile is missing from Profile Sharing.' Fix: It is not rated General. Rate it from `/profile manage` -> Home -> Content Safety. Adult 18+ profiles cannot be shared at all.\n"
         "- Symptom: 'I cloned a profile but it has no memories.' Fix: Intended. LTM is never transferred by a clone."
     ),
     "profiles/public_hub_publishing.txt": (
         "Concept: Publishing to the global Public Library (`/profile hub`) allows any user to borrow your profile.\n"
         "Mechanism: Publishing reads the Content Rating the profile already holds. It runs no check of its own and makes no API call, so it is instant. Only 'General' profiles (or operator-Exempt ones) can be published; 'Adult 18+' is refused, and so is anything Unrated or Pending. A listed profile whose rating becomes Adult or Unrated is taken out of the Library automatically; existing borrows keep working.\n"
         "Getting rated: `/profile manage` -> Home -> Content Safety -> Submit for Rating.\n"
-        "Unpublishing: Done from `/profile hub` -> Manage My Shares. Existing borrows keep working; the profile simply stops being listed.\n"
-        "Intro: An optional creator-written introduction of up to 300 characters, shown on the listing. Set it from `/profile manage` -> Misc -> Library Intro, Edit Intro on your own listing, or Manage My Shares with one profile selected. The Library never derives one from the persona, which stays private; `/profile generate` drafts one you can keep or change. It is part of the rated content, so editing it on a rated profile makes the rating stale.\n"
+        "Unpublishing: Done from `/profile hub` -> Profile Sharing. Existing borrows keep working; the profile simply stops being listed.\n"
+        "Intro: An optional creator-written introduction of up to 300 characters, shown on the listing. Set it from `/profile manage` -> Misc -> Library Intro, Edit Intro on your own listing, or Profile Sharing with one profile selected. The Library never derives one from the persona, which stays private; `/profile generate` drafts one you can keep or change. It is part of the rated content, so editing it on a rated profile makes the rating stale.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Publishing was refused because the profile is Unrated.' Fix: Submit it for a rating from the Content Safety dashboard, then publish.\n"
         "- Symptom: 'Publishing used to fail with an avatar or URL error.' Fix: That download is gone. Publishing no longer fetches the avatar.\n"
@@ -1230,12 +1234,13 @@ DEFAULT_HELP_DOCS = {
     ),
     "features/data_portability.txt": (
         "Commands: `/export`, `/import`, `/privacy` (DM only)\n"
-        "Export: Writes selected profiles, and optionally their memories and training examples, to an encrypted `.mimic` file. Standard Export is sealed with this instance's own key and imports only on this instance. Export for Self-Hosted is sealed with a passphrase you choose, for moving to a self-hosted instance.\n"
-        "Import: Takes a `.mimic` file of up to 25 MB, decrypts it (asking for the passphrase if it has one), resolves name collisions by renaming, re-encrypts the content and files it into your account. The official MimicAI bot imports only its own Standard Exports, never files from other instances or passphrase files. Plaintext and legacy exports are refused everywhere.\n"
+        "Export: Writes selected profiles, and optionally their memories and training examples, to an encrypted `.mimic` file of up to 10 MB, the most Discord lets the bot send. Standard Export is sealed with this instance's own key and imports only on this instance. Export for Self-Hosted is sealed with a passphrase you choose, for moving to a self-hosted instance.\n"
+        "Import: Takes a `.mimic` file of up to 25 MB, decrypts it (asking for the passphrase if it has one), numbers any name you already use (`name-2`), re-encrypts the content and files it into your account. It is refused whole if it holds more profiles than your limit has room for. A content rating other than Adult 18+ does not carry over, so an imported profile must be submitted again before it can be shared. The official MimicAI bot imports only its own Standard Exports, never files from other instances or passphrase files. Plaintext and legacy exports are refused everywhere.\n"
         "Privacy: `/privacy` covers reviewing and deleting your stored data, including full account data deletion.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Export or import is not available.' Fix: Both are DM-only. Run them in a direct message with the bot.\n"
-        "- Symptom: 'Imported profiles came in with different names.' Fix: A name already existed in your account. Imports rename around collisions rather than overwriting.\n"
+        "- Symptom: 'Imported profiles came in with different names.' Fix: A name already existed in your account. Imports number the new one (`name-2`) rather than overwriting.\n"
+        "- Symptom: 'That export comes to N MB, over the 10 MB Discord lets me send.' Fix: Export fewer profiles at a time, or leave out Long-Term Memories.\n"
         "- Symptom: 'Import rejected: the file belongs to a different MimicAI instance.' Fix: A Standard Export imports only where it was made. To move to a self-hosted instance, export again with Export for Self-Hosted and enter the passphrase on import. The official bot cannot import from other instances at all."
     ),
 }

@@ -360,9 +360,15 @@ channel. Its shape:
    lazily validates every participant (once per distinct owner, not once per participant —
    that scan decrypts profile files).
 2. **Block on the queue.** `session['task_queue'].get()` waits for a trigger.
-3. **Batch.** Everything already queued is drained into one round, so a burst of messages
-   produces one round rather than one per message. Messages arriving mid-round are drained
-   again at each handoff. The round's messages are exempt from STM only up to
+3. **Batch.** Everything already queued is drained into one round, and a round someone's
+   message opens then waits behind its placeholder (step 5) for the channel to go quiet
+   (`ROUND_SETTLE_SECONDS`, capped at `ROUND_SETTLE_MAX_SECONDS`) and drains again — so a
+   burst produces one reply, not one to its first message and another to the rest, and the
+   reply lands below the burst (delivery replaces the placeholder with a fresh message).
+   Who speaks is rolled before the wait. Messages arriving mid-round are drained
+   again at each handoff. Every drain goes through `withdraw_cancelled_triggers`, which drops
+   reactions pulled back and messages deleted while they waited; a round left with nothing
+   ends there. The round's messages are exempt from STM only up to
    `ROUND_EXEMPT_USER_TURNS` / `ROUND_EXEMPT_USER_CHARS` (`_bound_reserved_tail`), and each
    character is sent the newest `ROUND_MEDIA_MAX` attachments (`_round_media`).
 4. **Yield.** A queued whisper or an in-flight purge/regeneration takes precedence, using

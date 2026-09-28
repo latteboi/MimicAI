@@ -3548,6 +3548,7 @@ class OpenRouterHostView(BlockedGuard, ui.View):
         self.user_id = parent.user_id
         #: model id -> its endpoints, or None where OpenRouter could not be asked.
         self.listings = listings
+        self._pin_unpinned()
         self._build_view()
 
     def _render(self) -> Dict[str, Any]:
@@ -3585,10 +3586,20 @@ class OpenRouterHostView(BlockedGuard, ui.View):
                                                e.uptime or 0.0)).tag
         return self._AUTO
 
-    def _pin_for_tier(self, tier):
+    def _pin_for_tier(self, tier, *, unpinned_only: bool = False):
         for model_id in self.parent._pinnable_openrouter_models():
-            if self.listings.get(model_id):
+            if self.listings.get(model_id) and not (unpinned_only and self._tag(self._chosen(model_id))):
                 self._choose(model_id, self._tier_choice(tier, self.listings[model_id]))
+
+    def _pin_unpinned(self):
+        """At Flex or Priority, pins what the Default Tier press has not reached yet: a
+        model chosen since, or one on another tab. Otherwise a new model read Auto (Flex)
+        beside pins the press had made. Run on opening and on Retry, never on a
+        dropdown's own rebuild, so Auto can still be chosen -- it lasts until reopened.
+        """
+        tier = self._tier()[0]
+        if tier:
+            self._pin_for_tier(tier, unpinned_only=True)
 
     def _head_options(self, chosen: str, tier, tier_wording: str) -> List[discord.SelectOption]:
         """The options above the hosts."""
@@ -3748,6 +3759,7 @@ class OpenRouterHostView(BlockedGuard, ui.View):
                 fetched = await asyncio.gather(
                     *(self.cog.api_service.openrouter_endpoints(m) for m in missing))
                 self.listings.update(zip(missing, fetched))
+                self._pin_unpinned()
                 self._build_view()
                 await i.edit_original_response(**self._render())
             add_button(self, "Retry", retry_cb, row=4)

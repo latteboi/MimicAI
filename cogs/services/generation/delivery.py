@@ -5,7 +5,7 @@ import discord
 import traceback
 from typing import Optional, List
 
-from ...utils.constants import PLACEHOLDER_EMOJI
+from ...utils.constants import PLACEHOLDER_EMOJI, PROFILE_MESSAGE_MAX_LENGTH
 from ...utils.helpers import (_split_into_sentences_with_abbreviations, _yield_message_chunks,
                               apply_typing_cursor, default_profile_avatar_url,
                               resolve_typing_cursor, typing_cursor_cost, upload_too_large)
@@ -203,7 +203,7 @@ class DeliveryMixin:
 
                     separator = "\n" if typing_mode == "line" and displayed_text else (" " if displayed_text else "")
 
-                    if len(displayed_text) + len(separator) + len(chunk) > 2000 - cursor_room:
+                    if len(displayed_text) + len(separator) + len(chunk) > PROFILE_MESSAGE_MAX_LENGTH - cursor_room:
                         # This chunk starts a second message, so the one being left
                         # behind is finished -- strip its marker now or it keeps a
                         # "still typing" emoji nothing will ever come back to remove.
@@ -316,7 +316,9 @@ class DeliveryMixin:
 
         is_first_chunk = True
 
-        for chunk in _yield_message_chunks(content):
+        # Short of 2000 on purpose: any message a profile sends can be edited, and the
+        # edit adds a line (PROFILE_MESSAGE_MAX_LENGTH).
+        for chunk in _yield_message_chunks(content, PROFILE_MESSAGE_MAX_LENGTH):
             current_target_to_edit = target_message_to_edit if is_first_chunk else None
             current_reply_to = reply_to if is_first_chunk else None
             current_store_prompt = store_prompt_for_id if is_first_chunk else None

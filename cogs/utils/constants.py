@@ -1841,6 +1841,13 @@ ROUND_EXEMPT_USER_TURNS = 20
 
 ROUND_EXEMPT_USER_CHARS = 100_000
 
+# A round opened by someone talking waits, placeholder already up, until the channel has
+# been quiet this long, so "hey" / "wait" / "actually..." is answered once rather than
+# "hey" alone and then the rest. Every new message restarts the wait, up to the cap, so a
+# channel that never goes quiet still gets rounds.
+ROUND_SETTLE_SECONDS = 2.0
+ROUND_SETTLE_MAX_SECONDS = 8.0
+
 # Archive depth for a session's unified_log, which is NOT its context window --
 # _build_history_for_participant windows to stm_length. These bound what regeneration,
 # purges and an un-compacted synopsis can still reach. Two numbers so the trim has
@@ -2289,6 +2296,11 @@ TRAIN_ARMED_CACHE_MAX_SIZE = 100
 # --- Limits, caches and timeouts ----------------------------------------------
 
 DISCORD_MAX_MESSAGE_LENGTH = 2000
+# The line Edit Profile Message puts under an edited message, worded as /speak's
+# "Authored by". Every message a profile sends stops short of Discord's limit by its
+# length at the longest id, so any one of them can be edited and take it.
+EDIT_ATTRIBUTION = "\n\n||-# Edited by <@{id}> ({id}).||"
+PROFILE_MESSAGE_MAX_LENGTH = DISCORD_MAX_MESSAGE_LENGTH - len(EDIT_ATTRIBUTION.format(id=2**64 - 1))
 PERSONA_TEXT_INPUT_MAX_LENGTH = 4000
 AI_INSTRUCTIONS_PART_MAX_LENGTH = 4000
 

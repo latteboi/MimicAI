@@ -83,6 +83,12 @@ _OPENROUTER_RATE_LIMIT_RESET = re.compile(r'''["']X-RateLimit-Reset["']\s*:\s*["
 _UPSTREAM_RETRY_AFTER = re.compile(
     r'''["'](?:retry_after_seconds|Retry-After)["']\s*:\s*["']?(\d+(?:\.\d+)?)''', re.IGNORECASE)
 
+#: (label, model) pairs `run_with_fallback` has logged a failure for, oldest out first. A
+#: saved model that is gone for good -- a retired `:free` id -- fails on every call, and
+#: the fallback answering is the chain working: once per process says so.
+_FALLBACK_LOGGED: "OrderedDict[Tuple[str, str], None]" = OrderedDict()
+_FALLBACK_LOGGED_MAX = 256
+
 
 def _rate_limit_rest_seconds(error: BaseException, now: Optional[float] = None) -> Optional[float]:
     """How long to rest a model after `error`, or None when it was not a rate limit."""
@@ -420,7 +426,10 @@ class APIService:
                     raise
                 if last_error is None or not isinstance(e, MissingKeyError):
                     last_error = e
-                if i + 1 < len(attempts):
+                if i + 1 < len(attempts) and (label, name) not in _FALLBACK_LOGGED:
+                    _FALLBACK_LOGGED[(label, name)] = None
+                    while len(_FALLBACK_LOGGED) > _FALLBACK_LOGGED_MAX:
+                        _FALLBACK_LOGGED.popitem(last=False)
                     # The phrased reason, not the exception: a provider's error body is a
                     # JSON document, and a journal on a 1 GB box is not where it belongs.
                     print(f"{label}: {'fallback' if is_fallback else 'primary'} '{name}' failed "

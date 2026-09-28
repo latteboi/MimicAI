@@ -92,8 +92,8 @@ shape of it.
 Personas are split into backstory, traits, likes, dislikes and appearance, with four
 separate instruction segments for behaviour and formatting. `/profile generate` will draft
 a whole profile from a one-line concept if you would rather start from something than from
-nothing. Profiles can be shared directly by time-limited share code, or published to the
-**Public Library** for anyone to borrow.
+nothing. Profiles can be offered directly to another user, as a borrow or an independent clone,
+or published to the **Public Library** for anyone to borrow.
 
 ### Sessions
 
@@ -107,7 +107,8 @@ Alongside the main session loop: `/whisper` for a private, ephemeral exchange wi
 participant, `/speak` to post as one of your profiles — either verbatim, or re-voiced
 in character with a private preview before it goes out — `/trigger` to force a round,
 and `/session audit` for token telemetry and diagnostics. The **View Generation Trace**
-context menu opens the same telemetry for a single reply.
+context menu opens the same telemetry for a single reply, and **Edit Profile Message** lets
+a server admin rewrite any profile's reply, marked as edited by them.
 
 `/play eights` seats the cast, and any people who join, at a table of **Mimic Eights**, a
 Crazy Eights variant for two to six players. Moves cost no model call: each character's

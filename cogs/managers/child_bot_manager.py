@@ -15,7 +15,7 @@ from discord.ext import commands
 from ..utils.constants import (
     PLACEHOLDER_EMOJI, IMAGE_QUEUE_PRIORITY, STATUS_SEARCHING_WEB,
     DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING, DEFAULT_IMAGE_MODEL,
-    IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS,
+    IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS, PROFILE_MESSAGE_MAX_LENGTH,
 )
 from ..utils.helpers import (_resolve_safety_settings, _split_into_sentences_with_abbreviations,
                              apply_typing_cursor, attachment_mime, image_command_prompt, image_rag_enabled,
@@ -685,7 +685,7 @@ class ChildBotManager:
                     await asyncio.sleep(delay)
 
                     separator = "\n" if typing_mode == "line" and displayed_text else (" " if displayed_text else "")
-                    if len(displayed_text) + len(separator) + len(chunk) > 2000 - cursor_room:
+                    if len(displayed_text) + len(separator) + len(chunk) > PROFILE_MESSAGE_MAX_LENGTH - cursor_room:
                         # The message being left behind is finished; strip its marker
                         # or nothing ever comes back to remove it.
                         if sent_message is not None and cursor_room and displayed_text:
@@ -731,13 +731,14 @@ class ChildBotManager:
                 remaining_content = content
                 first_chunk = True
                 while remaining_content:
-                    if len(remaining_content) <= 2000:
+                    # Short of 2000 on purpose, as DeliveryMixin: room for an edit's line.
+                    if len(remaining_content) <= PROFILE_MESSAGE_MAX_LENGTH:
                         chunk = remaining_content
                         remaining_content = ""
                     else:
-                        split_pos = remaining_content.rfind('\n', 0, 2000)
+                        split_pos = remaining_content.rfind('\n', 0, PROFILE_MESSAGE_MAX_LENGTH)
                         if split_pos == -1:
-                            split_pos = 2000
+                            split_pos = PROFILE_MESSAGE_MAX_LENGTH
                         chunk = remaining_content[:split_pos]
                         remaining_content = remaining_content[split_pos:]
 

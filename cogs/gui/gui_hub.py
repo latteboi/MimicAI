@@ -4,8 +4,6 @@ import discord
 from discord import ui
 import asyncio
 import datetime
-import uuid
-import time
 from typing import TYPE_CHECKING, List, Optional
 
 from ..utils.discord_cdn import unsigned_attachment_url
@@ -24,8 +22,7 @@ class HubBaseView(TabbedView):
         ("Home", "home", lambda v: HubHomeView(v.cog, v.original_interaction)),
         ("Public Library", "library", lambda v: HubPublicLibraryView(v.cog, v.original_interaction)),
         ("Incoming Shares", "incoming", lambda v: HubIncomingView(v.cog, v.original_interaction)),
-        ("Manage My Shares", "manage", lambda v: HubShareManagerView(v.cog, v.original_interaction)),
-        ("Profile Cloning", "cloning", lambda v: HubCloningView(v.cog, v.original_interaction)),
+        ("Profile Sharing", "manage", lambda v: HubShareManagerView(v.cog, v.original_interaction)),
     )
 
 class HubHomeView(HubBaseView):
@@ -224,8 +221,10 @@ class HubPublicLibraryView(HubBaseView):
             await i.response.send_message("You already have this profile.", ephemeral=True)
             return
 
-        modal = BorrowNameModal(self.cog, self.original_interaction, p_info['owner_id'], p_info.get('original_pid'), p_info['profile_name'], is_public_borrow=True)
-        await i.response.send_modal(modal)
+        await i.response.defer(ephemeral=True)
+        local_name = self.cog.profile_manager._generate_unique_local_name(i.user.id, p_info['profile_name'])
+        if await self.cog.profile_manager._accept_share_request(i, p_info['owner_id'], p_info.get('original_pid'), p_info['profile_name'], local_name, is_public_borrow=True):
+            await i.followup.send(f"✅ Borrowed **{p_info['profile_name']}** as **{local_name}**.", ephemeral=True)
 
     async def edit_intro_cb(self, i: discord.Interaction):
         # Deferred: gui_profiles imports this module at load time.
@@ -354,9 +353,12 @@ class HubIncomingView(HubBaseView):
         if self.selected_sharer_id:
             u = self.cog.bot.get_user(self.selected_sharer_id)
             name = u.name if u else "Unknown"
-            user_shares = [s['profile_name'] for s in shares if s['sharer_id'] == self.selected_sharer_id]
-            desc = (f"**Pending shares from {name}:**\n" + ", ".join([f"`{n}`" for n in user_shares])
-                    + "\n\n-# **Block Sender** rejects these and stops them sharing with you again.")
+            user_shares = [f"`{s['profile_name']}`" + (" (clone)" if s.get("kind") == "clone" else "")
+                           for s in shares if s['sharer_id'] == self.selected_sharer_id]
+            desc = (f"**Pending shares from {name}:**\n" + ", ".join(user_shares)
+                    + "\n\n-# A borrow follows its owner's edits; a (clone) becomes your own "
+                    "independent copy, without memories.\n"
+                    "-# **Block Sender** rejects these and stops them sharing with you again.")
             embed = discord.Embed(title="Reviewing Shares", description=desc, color=discord.Color.blue())
             await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
             return
@@ -434,39 +436,47 @@ class HubIncomingView(HubBaseView):
         await i.response.defer(ephemeral=True)
         if await refuse_unregistered(self.cog, i):
             return
+        pm = self.cog.profile_manager
         sharer_id = self.selected_sharer_id
-        shares = [s for s in self.cog.profile_manager._pending_shares(self.user_id) if s['sharer_id'] == sharer_id]
-        
-        limit = defaultConfig.LIMIT_BORROWED
-        index = self.cog.profile_manager._get_user_index(self.user_id)
-        
-        borrowed_field = index.get("borrowed", {})
-        current_borrowed = len(borrowed_field) if isinstance(borrowed_field, dict) else len(borrowed_field)
+        shares = [s for s in pm._pending_shares(self.user_id) if s['sharer_id'] == sharer_id]
+        clones = sum(1 for s in shares if s.get("kind") == "clone")
 
-        if current_borrowed + len(shares) > limit:
-            await i.followup.send(f"Limit Reached. Accepting these would exceed your limit of {limit} borrowed profiles.", ephemeral=True)
-            return
+        # A borrow counts towards the borrowed limit, a clone towards the personal one.
+        index = pm._get_user_index(self.user_id)
+        for field, count, limit in (("borrowed", len(shares) - clones, defaultConfig.LIMIT_BORROWED),
+                                    ("personal", clones, defaultConfig.LIMIT_PROFILES)):
+            if count and len(index.get(field, {})) + count > limit:
+                await i.followup.send(f"Limit Reached. Accepting these would exceed your limit of {limit} {field} profiles.", ephemeral=True)
+                return
 
-        accepted = []
-        sharer_user = self.cog.bot.get_user(sharer_id)
-        sharer_name = sharer_user.name if sharer_user else "User"
+        accepted, failed = [], []
+        sharer_index = pm._get_user_index(sharer_id)
 
         for s in shares:
+            kind = s.get("kind")
             fallback_name = s['profile_name']
             target_pid = s.get('original_pid')
-            current_name = self.cog.profile_manager._get_name_from_pid(sharer_id, target_pid) if target_pid else fallback_name
-            if not current_name: current_name = fallback_name
+            current_name = (pm._get_name_from_pid(sharer_id, target_pid) if target_pid else None) or fallback_name
 
-            sharer_index = self.cog.profile_manager._get_user_index(sharer_id)
             if current_name not in sharer_index.get("personal", []):
-                await self.cog.profile_manager._reject_share_request(self.original_interaction, sharer_id, target_pid, fallback_name)
+                await pm._reject_share_request(self.original_interaction, sharer_id, target_pid, fallback_name, kind)
                 continue
 
-            local_name = self.cog.profile_manager._generate_unique_local_name(self.user_id, current_name, sharer_name)
-            if await self.cog.profile_manager._accept_share_request(self.original_interaction, sharer_id, target_pid, current_name, local_name, is_public_borrow=False):
-                accepted.append(current_name)
-        
+            # The source's own name, amended only where this user already has it.
+            local_name = pm._generate_unique_local_name(self.user_id, current_name)
+            label = current_name if local_name == current_name else f"{current_name} as {local_name}"
+            if kind == "clone":
+                ok, message = await pm._execute_clone_handshake(sharer_id, target_pid, self.user_id, local_name)
+                if ok:
+                    accepted.append(f"{label} (clone)")
+                else:
+                    failed.append(f"• **{current_name}** -- {message}")
+            elif await self.cog.profile_manager._accept_share_request(self.original_interaction, sharer_id, target_pid, current_name, local_name, is_public_borrow=False):
+                accepted.append(label)
+
         msg = f"Accepted: {', '.join(accepted)}" if accepted else "No valid profiles found."
+        if failed:
+            msg += "\n\n**Not accepted:**\n" + "\n".join(failed)
         await i.followup.send(msg, ephemeral=True)
         self.selected_sharer_id = None
         self.setup_items()
@@ -477,7 +487,7 @@ class HubIncomingView(HubBaseView):
         sharer_id = self.selected_sharer_id
         shares =[s for s in self.cog.profile_manager._pending_shares(self.user_id) if s['sharer_id'] == sharer_id]
         for s in shares:
-            await self.cog.profile_manager._reject_share_request(self.original_interaction, sharer_id, s.get('original_pid'), s['profile_name'])
+            await self.cog.profile_manager._reject_share_request(self.original_interaction, sharer_id, s.get('original_pid'), s['profile_name'], s.get("kind"))
         await i.followup.send("Rejected shares.", ephemeral=True)
         self.selected_sharer_id = None
         self.setup_items()
@@ -531,9 +541,9 @@ class HubShareManagerView(HubBaseView):
         label = "Mode: Private Sharing" if self.mode == "private" else "Mode: Public Publishing"
         add_button(self, label, self.toggle_mode, style=style, row=0)
 
-        # Row 0, not beside the action buttons: row 2 carries the three pagination
-        # controls plus Send or Apply Changes and Edit Intro. Sitting directly above
-        # the select reads as belonging to it anyway.
+        # Row 0 holds Clear and the page controls too, directly above the select they
+        # act on: rows 2 and 3 are recipients then Send, so Send reads as sending to them.
+        # Mode, Clear and three page controls are exactly Discord's five.
         if self.selected_profiles:
             add_button(self, f"Clear ({len(self.selected_profiles)})", self.clear_selection,
                        style=discord.ButtonStyle.secondary, row=0)
@@ -545,6 +555,7 @@ class HubShareManagerView(HubBaseView):
         # full page plus the sentinels would be rejected outright.
         num_pages = max(1, (len(self.personal_profiles) - 1) // SHARE_PAGE_SIZE + 1)
         if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
+        build_pagination_controls(self, self.current_page, num_pages, 0, self.prev_page, self.next_page)
 
         start = self.current_page * SHARE_PAGE_SIZE
         page_profiles = self.personal_profiles[start : start + SHARE_PAGE_SIZE]
@@ -565,24 +576,18 @@ class HubShareManagerView(HubBaseView):
             add_select(self, options, self.select_profiles, placeholder="Select profiles...",
                        min_values=0, max_values=len(options), row=1)
 
-        # Row 2: Pagination Buttons (if needed) AND Action Buttons
-        build_pagination_controls(self, self.current_page, num_pages, 2, self.prev_page, self.next_page)
-
         if self.mode == "private":
-            add_button(self, "Send", self.send_private, style=discord.ButtonStyle.green, row=2)
+            user_sel = ui.UserSelect(placeholder="Select recipients...", min_values=1, max_values=10, row=2)
+            user_sel.callback = self.select_users
+            self.add_item(user_sel)
+            add_button(self, "Send", self.send_private, style=discord.ButtonStyle.green, row=3)
+            add_button(self, "Send as Clone", self.send_clone, style=discord.ButtonStyle.blurple, row=3)
         else:
             add_button(self, "Apply Changes", self.apply_public, style=discord.ButtonStyle.green,
                        row=2)
-            # One intro at a time, so only with one profile selected. Row 2 holds at most
-            # the three page controls and Apply Changes beside it.
+            # One intro at a time, so only with one profile selected.
             add_button(self, "Edit Intro", self.edit_intro, row=2,
                        disabled=len(self.selected_profiles) != 1)
-
-        # Row 3: User Select (Private)
-        if self.mode == "private":
-            user_sel = ui.UserSelect(placeholder="Select recipients...", min_values=1, max_values=10, row=3)
-            user_sel.callback = self.select_users
-            self.add_item(user_sel)
 
     async def update_display(self):
         if self._loaded_mode != self.mode:
@@ -594,6 +599,8 @@ class HubShareManagerView(HubBaseView):
         if self.mode == "private":
             desc += ("**Private Mode:** Offer profiles to people who have set MimicAI up. An offer "
                      "waits in their Incoming Shares until they answer it; nobody is messaged.\n"
+                     "**Send** lends a borrow that follows your edits. **Send as Clone** gives them "
+                     "an independent copy of their own, without memories or child bot.\n"
                      "Only profiles rated **General** or **Exempt** are listed.")
         else:
             desc += ("**Public Mode:** Publish your profiles to the global library for anyone to borrow.\n"
@@ -603,7 +610,7 @@ class HubShareManagerView(HubBaseView):
             desc += (f"\n\nNone of your profiles can be {'shared' if self.mode == 'private' else 'published'} "
                      f"yet. Rate one from `/profile manage` → Home → **Content Safety**.")
             
-        embed = discord.Embed(title="Share Manager", description=desc, color=discord.Color.teal())
+        embed = discord.Embed(title="Profile Sharing", description=desc, color=discord.Color.teal())
         
         full_text = ", ".join(self.selected_profiles)
         # A field value, so 1024. This cut at 4000, the description's limit, and Select All
@@ -664,12 +671,17 @@ class HubShareManagerView(HubBaseView):
         self.selected_users = i.data['values'] 
         await i.response.defer()
 
-    async def send_private(self, i: discord.Interaction):
+    async def send_clone(self, i: discord.Interaction):
+        await self.send_private(i, kind="clone")
+
+    async def send_private(self, i: discord.Interaction, kind: Optional[str] = None):
+        """Offers the selection to each recipient; `kind` is the share's, sparse as
+        `ProfileManager._is_share_of` reads it."""
         if self.processing: return
         self.processing = True
 
         for item in self.children:
-            if isinstance(item, ui.Button) and item.label == "Send": item.disabled = True
+            if isinstance(item, ui.Button) and str(item.label).startswith("Send"): item.disabled = True
         await i.response.edit_message(view=self)
 
         if not self.selected_profiles or not self.selected_users:
@@ -700,7 +712,7 @@ class HubShareManagerView(HubBaseView):
             waiting = pm._pending_shares(recipient_id)
             mine = [s for s in waiting if s.get('sharer_id') == self.user_id]
             new = [n for n in shareable
-                   if not any(pm._is_share_of(s, self.user_id, pids[n], n) for s in mine)]
+                   if not any(pm._is_share_of(s, self.user_id, pids[n], n, kind) for s in mine)]
             # Unregistered, closed, blocked or full: one answer for all four, so a
             # sender cannot tell a block from anything else.
             if (not pm.accepts_share(recipient_id, self.user_id)
@@ -709,7 +721,8 @@ class HubShareManagerView(HubBaseView):
                 continue
             if new:
                 waiting += [{"sharer_id": self.user_id, "original_pid": pids[n],
-                             "profile_name": n, "shared_at": now} for n in new]
+                             "profile_name": n, "shared_at": now, **({"kind": kind} if kind else {})}
+                            for n in new]
                 self.cog.profile_shares[str(recipient_id)] = waiting
                 pm._save_profile_share_shard(str(recipient_id), waiting)
             offered.append(f"<@{recipient_id}>")
@@ -717,7 +730,7 @@ class HubShareManagerView(HubBaseView):
         self.processing = False
         self.setup_items()
         await self.update_display()
-        report = (f"Offered to {', '.join(offered)}. It waits in their Incoming Shares "
+        report = (f"Offered{' as a clone' if kind else ''} to {', '.join(offered)}. It waits in their Incoming Shares "
                   f"(`/profile hub`) until they answer." if offered else "Nothing was sent.")
         if turned_away:
             report += (f"\n\nNot sent to {', '.join(turned_away)}: they are not taking shares "
@@ -838,138 +851,6 @@ class HubShareManagerView(HubBaseView):
 
         await i.followup.send(embed=report_embed, ephemeral=True)
 
-class HubCloningView(HubBaseView):
-    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):
-        super().__init__(cog, interaction, "cloning")
-        self.selected_profile = None
-        self.current_page = 0
-        
-        index = self.cog.profile_manager._get_user_index(self.user_id)
-        self.personal_profiles = sorted(list(index.get("personal", [])))
-        self.setup_items()
-
-    def setup_items(self):
-        for item in self.children[:]:
-            if item.row != 4: self.remove_item(item)
-
-        num_pages = (len(self.personal_profiles) - 1) // DROPDOWN_MAX_OPTIONS + 1
-        if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
-        
-        start = self.current_page * DROPDOWN_MAX_OPTIONS
-        page_profiles = self.personal_profiles[start : start + DROPDOWN_MAX_OPTIONS]
-
-        options = []
-        for p in page_profiles:
-            options.append(discord.SelectOption(label=p, value=p, default=(p == self.selected_profile)))
-        
-        if options:
-            add_select(self, options, self.select_profile_cb,
-                       placeholder="Select a personal profile to clone...", row=0)
-
-        build_pagination_controls(self, self.current_page, num_pages, 1, self.prev_page, self.next_page)
-
-        action_row = 2 if num_pages > 1 else 1
-        
-        add_button(self, "Generate Clone Code", self.generate_clone_code_cb,
-                   style=discord.ButtonStyle.green, row=action_row,
-                   disabled=not self.selected_profile)
-
-        add_button(self, "Redeem Clone Code", self.redeem_clone_code_cb,
-                   style=discord.ButtonStyle.blurple, row=action_row)
-
-    async def update_display(self):
-        embed = discord.Embed(title="Profile Cloning", description="Clone profiles to create independent copies. Cloned profiles will not copy memories or child bot configurations.", color=discord.Color.dark_purple())
-        embed.add_field(name="Selected Profile", value=f"`{self.selected_profile or 'None'}`", inline=False)
-        await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
-
-    async def select_profile_cb(self, i: discord.Interaction):
-        self.selected_profile = i.data['values'][0]
-        self.setup_items()
-        await i.response.defer()
-        await self.update_display()
-
-
-    async def generate_clone_code_cb(self, i: discord.Interaction):
-        if not self.selected_profile: return
-        allowed, reason = self.cog.profile_manager.content_capability(
-            self.user_id, self.selected_profile, "share")
-        if not allowed:
-            await i.response.send_message(
-                f"**'{self.selected_profile}' cannot be cloned.**\n{reason}", ephemeral=True)
-            return
-        code = f"CLN-{uuid.uuid4().hex[:8].upper()}"
-        
-        pid = self.cog.profile_manager._get_pid_from_name_any(self.user_id, self.selected_profile)
-        
-        if not hasattr(self.cog, "clone_codes"):
-            self.cog.clone_codes = {}
-        
-        self.cog.clone_codes[code] = {
-            "owner_id": self.user_id,
-            "pid": pid,
-            "profile_name": self.selected_profile,
-            "expires_at": time.time() + 300
-        }
-        
-        await i.response.send_message(f"Clone Code Generated: `{code}`\nProvide this to another user. Valid for 5 minutes.", ephemeral=True)
-
-    async def redeem_clone_code_cb(self, i: discord.Interaction):
-        # The clone becomes the redeemer's own profile.
-        if await refuse_unregistered(self.cog, i):
-            return
-        modal = RedeemCloneCodeModal(self.cog, self)
-        await i.response.send_modal(modal)
-
-class RedeemCloneCodeModal(ui.Modal, title="Redeem Clone Code"):
-    code_input = ui.TextInput(label="Enter Clone Code", required=True, min_length=12, max_length=16)
-    name_input = ui.TextInput(label="Local Profile Name", required=True, min_length=1, max_length=30)
-
-    def __init__(self, cog: 'MimicCog', parent_view: HubCloningView):
-        super().__init__()
-        self.cog = cog
-        self.parent_view = parent_view
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        code = self.code_input.value.strip()
-        desired_name = self.name_input.value.lower().strip()
-
-        is_valid, err_msg = self.cog.profile_manager._is_valid_profile_name(desired_name)
-        if not is_valid:
-            await interaction.followup.send(f"❌ **Invalid Name:** {err_msg}", ephemeral=True)
-            return
-
-        clone_codes = getattr(self.cog, "clone_codes", {})
-        share_data = clone_codes.get(code)
-        if not share_data or time.time() > share_data["expires_at"]:
-            await interaction.followup.send("This clone code is invalid or has expired.", ephemeral=True)
-            return
-
-        owner_id = share_data["owner_id"]
-        pid = share_data["pid"]
-        
-        if owner_id == interaction.user.id:
-            await interaction.followup.send("You cannot clone your own profile.", ephemeral=True)
-            return
-
-        index = self.cog.profile_manager._get_user_index(interaction.user.id)
-        if desired_name in index.get("personal", []) or desired_name in index.get("borrowed", []):
-            await interaction.followup.send("A profile with that name already exists.", ephemeral=True)
-            return
-
-        limit = defaultConfig.LIMIT_PROFILES
-        if len(index.get("personal", [])) >= limit:
-            await interaction.followup.send(f"You have reached your personal profile limit of {limit}.", ephemeral=True)
-            return
-
-        success, msg = await self.cog.profile_manager._execute_clone_handshake(owner_id, pid, interaction.user.id, desired_name)
-        if success:
-            clone_codes.pop(code, None)
-            self.parent_view.setup_items()
-            await self.parent_view.update_display()
-        
-        await interaction.followup.send(msg, ephemeral=True)
-
 class BorrowDefaultsView(BlockedGuard, ui.View):
     """Asked by `_accept_share_request` when the borrower's defaults would change what the
     author chose. Answered or not, the borrow goes ahead: unanswered keeps the original's."""
@@ -993,33 +874,3 @@ class BorrowDefaultsView(BlockedGuard, ui.View):
     @ui.button(label="Keep the original's", style=discord.ButtonStyle.secondary)
     async def original(self, interaction: discord.Interaction, _button: ui.Button):
         await self._answer(interaction, False)
-
-
-class BorrowNameModal(ui.Modal, title="Name Your Borrowed Profile"):
-    profile_name_input = ui.TextInput(label="Enter a unique local name", required=True, min_length=1, max_length=50)
-    
-    def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction, sharer_id: int, target_pid: Optional[str], fallback_name: str, is_public_borrow: bool = False):
-        super().__init__()
-        self.cog = cog
-        self.original_interaction = original_interaction
-        self.sharer_id = sharer_id
-        self.target_pid = target_pid
-        self.fallback_name = fallback_name
-        self.is_public_borrow = is_public_borrow
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        desired_name = self.profile_name_input.value.lower().strip()
-        
-        is_valid, err_msg = self.cog.profile_manager._is_valid_profile_name(desired_name)
-        if not is_valid:
-            await interaction.followup.send(f"❌ **Invalid Name:** {err_msg}", ephemeral=True)
-            return
-
-        index = self.cog.profile_manager._get_user_index(interaction.user.id)
-        if desired_name in index.get("personal", []) or desired_name in index.get("borrowed",[]):
-            await interaction.followup.send(f"You already have a profile named '{desired_name}'. Please choose a different name.", ephemeral=True)
-            return
-
-        if await self.cog.profile_manager._accept_share_request(interaction, self.sharer_id, self.target_pid, self.fallback_name, desired_name, self.is_public_borrow):
-            await interaction.followup.send(f"✅ Successfully borrowed profile **{self.fallback_name}** and named it **{desired_name}**.", ephemeral=True)

@@ -10,7 +10,7 @@ from .utils.constants import (
     TRAIN_COMMAND_ENABLED, TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check,
     is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
-    IMPORT_FILE_TOO_LARGE, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE,
+    IMPORT_FILE_TOO_LARGE, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
 )
 from .services.profile_generation import ProfileGenerationError, clean_display_name, generate_draft
 from .listeners.event_listeners import EventListeners
@@ -317,6 +317,11 @@ class MimicCog(EventListeners, commands.Cog):
             callback=self.view_generation_trace
         )
         self.bot.tree.add_command(self.trace_ctx_menu)
+        self.edit_ctx_menu = app_commands.ContextMenu(
+            name="Edit Profile Message",
+            callback=self.edit_profile_message
+        )
+        self.bot.tree.add_command(self.edit_ctx_menu)
 
     profile_group = app_commands.Group(name="profile", description="Manage your personal bot profiles (persona, instructions).")
 
@@ -1798,6 +1803,35 @@ class MimicCog(EventListeners, commands.Cog):
         prompt_url = message.channel.get_partial_message(prompt_id).jump_url if prompt_id else None
         view = GenerationTraceView(self, interaction, target_turn, prompt_url)
         await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
+
+    @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
+    async def edit_profile_message(self, interaction: discord.Interaction, message: discord.Message):
+        """Rewrite one message of any profile's reply, in the channel and the session log. Server admins only."""
+        if not self.has_lock or self._refused_by_blacklist(interaction): return
+        # Asked here: a context menu is not bound to the cog, so a check decorator's
+        # refusal would reach the tree's error handler, not this user.
+        if not (isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator):
+            await interaction.response.send_message("Editing profile messages is for server admins.", ephemeral=True)
+            return
+        session = self.multi_profile_channels.get(message.channel.id)
+        if session and not session.get("is_hydrated"):
+            session = await self.session_manager._ensure_session_hydrated(message.channel.id, session.get("type", "multi"))
+        target, refusal = self.generation_service._profile_edit_target(session, message)
+        if target is None:
+            await interaction.response.send_message(refusal, ephemeral=True)
+            return
+
+        async def on_submit(modal_interaction: discord.Interaction, new_text: str):
+            await modal_interaction.response.defer(ephemeral=True)
+            await self.generation_service._execute_profile_edit(
+                modal_interaction, message.channel, message.id, new_text)
+
+        modal = ActionTextInputModal(
+            title=f"Edit {target['turn'].get('profile_name', 'profile')}'s message"[:45],
+            label="Message", placeholder="What the character says instead...",
+            on_submit_callback=on_submit, default=target["text"])
+        modal.input.max_length = PROFILE_MESSAGE_MAX_LENGTH
+        await interaction.response.send_modal(modal)
 
     @profile_group.command(name="global_chat", description="Have a persistent, private conversation with a profile.")
     @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)

@@ -6,7 +6,7 @@ import re
 import uuid
 import shutil
 import base64
-import gzip
+import zlib
 import zstandard as zstd
 import datetime
 import asyncio
@@ -50,7 +50,7 @@ from ..utils.helpers import (image_rag_enabled, is_real_model, is_shipped_ltm_pr
                             resolve_url_mode, suppress_link_previews, system_model)
 from ..utils.discord_cdn import signed_attachment_url, unsigned_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
-from .storage_manager import IOManager
+from .storage_manager import IOManager, _get_compressor, _get_decompressor
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
 
 try:
@@ -66,6 +66,48 @@ except ImportError:
 #: never deleted. Recognised here only so the migration and _borrow_key_for_config
 #: can refuse it; nothing writes it any more.
 _UNKNOWN_SOURCE_PID = "00000000"
+
+#: The most a .mimic payload may inflate to. A real export is at most one Discord
+#: upload -- 10 MiB, a few times that inflated -- and every inflated byte costs several
+#: more once parsed, on a 1 GB box.
+_IMPORT_MAX_INFLATED_BYTES = 64 * 1024 * 1024
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+_GZIP_MAGIC = b"\x1f\x8b"
+
+
+def _passphrase_fernet(passphrase: str, salt: bytes) -> Fernet:
+    """The key an Export for Self-Hosted is sealed with. Seconds of CPU on an e2-micro:
+    call it off the loop (it releases the GIL, so a thread is enough)."""
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=480000)
+    return Fernet(base64.urlsafe_b64encode(kdf.derive(passphrase.encode('utf-8'))))
+
+
+def _inflate_export(blob: bytes) -> bytes:
+    """A decrypted .mimic payload inflated: zstd, gzip, or neither, as each build wrote it.
+
+    Bounded, because a passphrase file is anyone's to write. A zstd frame states its own
+    size and `decompress` allocates that on trust -- 6 KB of zeros declares 200 MB --
+    so the declared size is refused before anything is allocated.
+    """
+    damaged = ValueError("The export is damaged, or inflates past the "
+                         f"{_IMPORT_MAX_INFLATED_BYTES // (1024 * 1024)} MB an import may hold.")
+    if blob[:4] == _ZSTD_MAGIC:
+        try:
+            # -1 when the frame does not say; max_output_size then caps it.
+            if zstd.frame_content_size(blob) <= _IMPORT_MAX_INFLATED_BYTES:
+                return _get_decompressor().decompress(blob, max_output_size=_IMPORT_MAX_INFLATED_BYTES)
+        except zstd.ZstdError:
+            pass
+        raise damaged
+    if blob[:2] == _GZIP_MAGIC:
+        try:
+            out = zlib.decompressobj(zlib.MAX_WBITS | 16).decompress(blob, _IMPORT_MAX_INFLATED_BYTES + 1)
+        except zlib.error:
+            raise damaged
+        if len(out) > _IMPORT_MAX_INFLATED_BYTES:
+            raise damaged
+        return out
+    return blob
 
 def feature_fields(config: Dict[str, Any], speech_providers: Set[str]) -> Tuple[str, str, str]:
     """The dashboard's Tools, Behaviour and Media fields: one setting to a line.
@@ -730,8 +772,10 @@ class ProfileManager:
 
     @staticmethod
     def _is_share_of(share: Dict[str, Any], sharer_id: int, target_pid: Optional[str],
-                     fallback_name: str) -> bool:
-        if share.get("sharer_id") != sharer_id:
+                     fallback_name: str, kind: Optional[str] = None) -> bool:
+        """`kind` is sparse: None is a borrow offer, "clone" a clone offer. A waiting
+        offer of one kind never answers for the other."""
+        if share.get("sharer_id") != sharer_id or share.get("kind") != kind:
             return False
         if target_pid:
             return share.get("original_pid") == target_pid
@@ -3380,190 +3424,214 @@ class ProfileManager:
 
     async def _execute_export(self, interaction: discord.Interaction, profile_names: List[str], filters: Set[str], passphrase: Optional[str] = None):
         user_id = interaction.user.id
-        user_id_str = str(user_id)
-        
-        raw_export_data = {
-            "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "profiles": {}
-        }
+        # Names resolve here, on the loop, against the cog's index; the shard reads, the
+        # seal and the passphrase's key derivation all run off it.
+        pids = {name: self._get_pid_from_name(user_id, name) for name in profile_names}
+        file_data = await asyncio.to_thread(self._build_export, user_id, pids, filters, passphrase)
 
-        for name in profile_names:
-            pid = self._get_pid_from_name_any(user_id, name)
-            p_dir = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", pid)
-            if not os.path.exists(p_dir): continue
+        # Export is DM-only, and a DM takes Discord's default upload.
+        limit = discord.utils.DEFAULT_FILE_SIZE_LIMIT_BYTES
+        if len(file_data) > limit:
+            await interaction.followup.send(
+                f"❌ That export comes to {len(file_data) / (1024 * 1024):.1f} MB, over the "
+                f"{limit // (1024 * 1024)} MB Discord lets me send. Export fewer profiles at a "
+                "time, or leave out Long-Term Memories.", ephemeral=True)
+            return
 
-            p_data = self._get_profile_by_pid(user_id, pid) or {}
-            config = p_data.get("config", {}).copy()
-            prompts = p_data.get("prompts", {}).copy()
-            config.pop("profile_id", None)
-
-            p_entry = {
-                "pid": pid,
-                "config": config,
-                "prompts": prompts,
-                "ltm": [],
-                "training": []
-            }
-
-            if "ltm" in filters:
-                ltm_data = self.cog.storage_manager._load_json_gzip(os.path.join(p_dir, "ltm.json.gz"))
-                if ltm_data:
-                    p_entry["ltm"] = ltm_data.get("guild", [])
-
-            if "training" in filters:
-                training_data = self.cog.storage_manager._load_json_gzip(os.path.join(p_dir, "training.json.gz"))
-                if training_data:
-                    p_entry["training"] = training_data
-
-            raw_export_data["profiles"][name] = p_entry
-
-        raw_json_bytes = json.dumps(raw_export_data)
-        # Fernet, deliberately, where every file on disk is AES-GCM: the payload below
-        # is stored as a *string* inside a plaintext JSON container that travels between
-        # installs, so base64 is the point rather than the overhead it is on disk, and
-        # any build that can import a .mimic must keep being able to import this one.
-        compressed_payload = zstd.ZstdCompressor(level=1).compress(raw_json_bytes)
-        export_container = {
-            "mimic_version": "3.0",
-        }
-
-        if passphrase:
-            salt = os.urandom(16)
-            kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=480000)
-            derived_key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode('utf-8')))
-            temp_fernet = Fernet(derived_key)
-            
-            encrypted_payload = temp_fernet.encrypt(compressed_payload)
-            export_container["auth_mode"] = "passphrase"
-            export_container["salt"] = base64.b64encode(salt).decode('utf-8')
-            export_container["payload"] = encrypted_payload.decode('utf-8')
-        else:
-            encrypted_payload = self.cog.fernet.encrypt(compressed_payload)
-            export_container["auth_mode"] = "master"
-            export_container["payload"] = encrypted_payload.decode('utf-8')
-
-        file_data = json.dumps(export_container, option=json.OPT_INDENT_2)
         filename = f"mimic_export_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.mimic"
-        
-        buffer = io.BytesIO(file_data)
-        discord_file = discord.File(buffer, filename=filename)
-        
+        discord_file = discord.File(io.BytesIO(file_data), filename=filename)
+
         msg = "✅ Export complete."
         if passphrase:
             msg += " Your data has been securely encrypted with your passphrase for self-hosted migration."
         else:
             msg += " Your data is encrypted with this instance's master key, so only this instance can import it."
-            
+
         await interaction.followup.send(msg, file=discord_file, ephemeral=True)
+
+    def _build_export(self, user_id: int, pids: Dict[str, Optional[str]], filters: Set[str],
+                      passphrase: Optional[str]) -> bytes:
+        """The .mimic file for `pids` (name -> PID), as bytes. Blocking: run it in a thread."""
+        user_dir = os.path.join(USERS_DIR, str(user_id), "profiles")
+        decrypt = self.cog.storage_manager._decrypt_data
+
+        def unseal(value):
+            # Values sealed one at a time, before shards were encrypted whole, open only
+            # with this instance's key -- which the file's reader need not hold.
+            if isinstance(value, str):
+                return decrypt(value)
+            if isinstance(value, list):
+                return [unseal(v) for v in value]
+            if isinstance(value, dict):
+                return {k: unseal(v) for k, v in value.items()}
+            return value
+
+        profiles = {}
+        for name, pid in pids.items():
+            p_dir = os.path.join(user_dir, pid) if pid else None
+            if not p_dir or not os.path.isdir(p_dir):
+                continue
+            p_data = self._get_profile_by_pid(user_id, pid) or {}
+            config = dict(p_data.get("config") or {})
+            config.pop("profile_id", None)
+            entry = {"pid": pid, "config": config, "prompts": p_data.get("prompts") or {},
+                     "ltm": [], "training": []}
+            if "ltm" in filters:
+                ltm = IOManager.read_json_gzip(os.path.join(p_dir, "ltm.json.gz"), self.cog.fernet)
+                entry["ltm"] = (ltm or {}).get("guild", [])
+            if "training" in filters:
+                entry["training"] = IOManager.read_json_gzip(
+                    os.path.join(p_dir, "training.json.gz"), self.cog.fernet) or []
+            profiles[name] = unseal(entry)
+
+        raw = json.dumps({"exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                          "profiles": profiles})
+        # Fernet, deliberately, where every file on disk is AES-GCM: the payload below
+        # is stored as a *string* inside a plaintext JSON container that travels between
+        # installs, so base64 is the point rather than the overhead it is on disk, and
+        # any build that can import a .mimic must keep being able to import this one.
+        compressed = _get_compressor().compress(raw)
+        container = {"mimic_version": "3.0"}
+        if passphrase:
+            salt = os.urandom(16)
+            container["auth_mode"] = "passphrase"
+            container["salt"] = base64.b64encode(salt).decode('utf-8')
+            container["payload"] = _passphrase_fernet(passphrase, salt).encrypt(compressed).decode('utf-8')
+        else:
+            container["auth_mode"] = "master"
+            container["payload"] = self.cog.fernet.encrypt(compressed).decode('utf-8')
+        return json.dumps(container, option=json.OPT_INDENT_2)
+
+    def _open_export(self, file_bytes: bytes, passphrase: Optional[str]) -> Dict[str, Any]:
+        """A .mimic file decrypted, inflated and parsed. Blocking: run it in a thread.
+
+        Raises ValueError carrying the message the user is shown.
+        """
+        try:
+            container = json.loads(file_bytes)
+        except json.JSONDecodeError:
+            raise ValueError("The provided file is not a valid MimicAI 3.0 export container (Invalid JSON).")
+        if (not isinstance(container, dict) or container.get("mimic_version") != "3.0"
+                or not isinstance(container.get("payload"), str)):
+            raise ValueError("Plaintext and legacy v2.0 exports cannot be imported. "
+                             "Please use a valid v3.0 encrypted `.mimic` file.")
+
+        payload = container["payload"].encode('utf-8')
+        if container.get("auth_mode") == "passphrase":
+            if not passphrase:
+                raise ValueError("This file is encrypted with a passphrase. Please use the import command properly to enter it.")
+            salt_b64 = container.get("salt")
+            if not salt_b64:
+                raise ValueError("Corrupted passphrase export: missing cryptographic salt.")
+            try:
+                decrypted = _passphrase_fernet(passphrase, base64.b64decode(salt_b64)).decrypt(payload)
+            except InvalidToken:
+                raise ValueError("Decryption failed. The passphrase provided is incorrect.")
+        else:
+            try:
+                decrypted = self.cog.fernet.decrypt(payload)
+            except InvalidToken:
+                raise ValueError("Master key decryption failed. This file belongs to a different MimicAI instance and cannot be imported here without a passphrase migration export.")
+
+        data = json.loads(_inflate_export(decrypted))
+        if not isinstance(data, dict) or not isinstance(data.get("profiles"), dict):
+            raise ValueError("Decrypted payload is missing the profiles object.")
+        return data
 
     async def _execute_import(self, interaction: discord.Interaction, file_bytes: bytes, passphrase: Optional[str] = None):
         try:
-            try:
-                container = json.loads(file_bytes)
-            except json.JSONDecodeError:
-                raise ValueError("The provided file is not a valid MimicAI 3.0 export container (Invalid JSON).")
-
-            if container.get("mimic_version") != "3.0" or "payload" not in container:
-                raise ValueError("Plaintext or legacy v2.0 exports are rejected by the official instance for security and anti-injection compliance. Please use a valid v3.0 encrypted `.mimic` file.")
-
-            auth_mode = container.get("auth_mode")
-            encrypted_payload = container["payload"].encode('utf-8')
-            raw_json_bytes = None
-
-            if auth_mode == "passphrase":
-                if not passphrase:
-                    raise ValueError("This file is encrypted with a passphrase. Please use the import command properly to enter it.")
-                
-                salt_b64 = container.get("salt")
-                if not salt_b64:
-                    raise ValueError("Corrupted passphrase export: missing cryptographic salt.")
-                    
-                salt = base64.b64decode(salt_b64)
-                kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=480000)
-                derived_key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode('utf-8')))
-                temp_fernet = Fernet(derived_key)
-                
-                try:
-                    decrypted_bytes = temp_fernet.decrypt(encrypted_payload)
-                except InvalidToken:
-                    raise ValueError("Decryption failed. The passphrase provided is incorrect.")
-            else:
-                try:
-                    decrypted_bytes = self.cog.fernet.decrypt(encrypted_payload)
-                except InvalidToken:
-                    raise ValueError("Master key decryption failed. This file belongs to a different MimicAI instance and cannot be imported here without a passphrase migration export.")
-
-            try:
-                raw_json_bytes = zstd.ZstdDecompressor().decompress(decrypted_bytes)
-            except zstd.ZstdError:
-                try:
-                    raw_json_bytes = gzip.decompress(decrypted_bytes)
-                except gzip.BadGzipFile:
-                    # Backward compatibility fallback for uncompressed legacy v3 exports
-                    raw_json_bytes = decrypted_bytes
-
-            data = json.loads(raw_json_bytes)
-            
-            if "profiles" not in data:
-                raise ValueError("Decrypted payload is missing the profiles object.")
+            data = await asyncio.to_thread(self._open_export, file_bytes, passphrase)
 
             user_id = interaction.user.id
-            user_id_str = str(user_id)
             index = self._get_user_index(user_id)
-            
-            import_log = []
-            for name, p_data in data["profiles"].items():
-                local_name = name
-                if local_name in index.get("personal", []):
-                    local_name = f"{name}_imported_{uuid.uuid4().hex[:4]}"
-                
+            personal = index.setdefault("personal", {})
+            profiles = data["profiles"]
+            room = defaultConfig.LIMIT_PROFILES - len(personal)
+            if len(profiles) > room:
+                raise ValueError(f"This file holds {len(profiles)} profiles and you have room for "
+                                 f"{max(room, 0)} more (the limit is {defaultConfig.LIMIT_PROFILES}). "
+                                 "Delete some first, or export fewer.")
+
+            # Planned on the loop, with no await between the limit check and the last
+            # name reserved; the shards are written after, off it, and the index saved last.
+            jobs, skipped, unrated = [], [], []
+            for name, p_data in profiles.items():
+                local_name = self._generate_unique_local_name(user_id, name)
+                valid, reason = self._is_valid_profile_name(local_name)
+                if not valid or not isinstance(p_data, dict):
+                    skipped.append(f"- `{name[:40]}`: {reason or 'unreadable entry'}")
+                    continue
+
+                config = p_data.get("config") if isinstance(p_data.get("config"), dict) else {}
+                prompts = p_data.get("prompts") if isinstance(p_data.get("prompts"), dict) else {}
                 new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
-                recip_dir = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", new_pid)
-                os.makedirs(recip_dir, exist_ok=True)
-
-                config = p_data.get("config", {})
-                prompts = p_data.get("prompts", {})
-
                 config["profile_id"] = new_pid
                 config["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                # Adult alone crosses: it is the strictest verdict, and dropping it would let
+                # the profile run anywhere. Any other -- a moderator's Exempt included -- was
+                # made about another copy, perhaps on another instance, and a file can claim
+                # any of them. Unrated runs the same and waits to be submitted before sharing.
+                rating = config.pop("content_rating", None)
+                verdict = rating.get("verdict") if isinstance(rating, dict) else None
+                if verdict == CONTENT_RATING_ADULT:
+                    config["content_rating"] = rating
+                elif verdict in (CONTENT_RATING_GENERAL, CONTENT_RATING_EXEMPT):
+                    unrated.append(local_name)
 
-                unified_profile = {
-                    "name": local_name,
-                    "config": config,
-                    "prompts": prompts,
-                    "child_bot": None
-                }
-                self._save_profile_by_pid(user_id, new_pid, unified_profile)
+                ltm = p_data.get("ltm") if isinstance(p_data.get("ltm"), list) else []
+                training = p_data.get("training") if isinstance(p_data.get("training"), list) else []
+                # Newest last in both, as they are written.
+                jobs.append((new_pid, {"name": local_name, "config": config, "prompts": prompts, "child_bot": None},
+                             ltm[-defaultConfig.LIMIT_LTM:], training[-defaultConfig.LIMIT_TRAINING:]))
+                personal[local_name] = new_pid
 
-                ltm_list = p_data.get("ltm", [])
-                if ltm_list:
-                    self.cog.storage_manager._atomic_json_save_gzip({"guild": ltm_list}, os.path.join(recip_dir, "ltm.json.gz"))
+            try:
+                await asyncio.to_thread(self._write_imported_profiles, user_id, jobs)
+            except BaseException:
+                for _, profile, _, _ in jobs:
+                    personal.pop(profile["name"], None)
+                raise
+            if jobs:
+                self._save_user_index(user_id, index)
 
-                training_list = p_data.get("training", [])
-                if training_list:
-                    self.cog.storage_manager._atomic_json_save_gzip(training_list, os.path.join(recip_dir, "training.json.gz"))
-
-                if config.get("custom_display_name") or config.get("custom_avatar_url"):
-                    self.cog.user_appearances.setdefault(user_id_str, {})[local_name] = {
-                        "custom_display_name": config.get("custom_display_name"),
-                        "custom_avatar_url": config.get("custom_avatar_url")
-                    }
-
-                if isinstance(index.get("personal"), dict):
-                    index["personal"][local_name] = new_pid
-                else:
-                    index.setdefault("personal", []).append(local_name)
-
-                import_log.append(f"- `{local_name}`")
-
-            self._save_user_index(user_id, index)
-            
-            await interaction.followup.send(f"### 📥 Import Successful\nThe following profiles have been securely decrypted and added to your vault:\n" + "\n".join(import_log), ephemeral=True)
+            if jobs:
+                lines = ["### 📥 Import Successful\nThe following profiles have been securely decrypted and added to your vault:"]
+                lines += [f"- `{profile['name']}`" for _, profile, _, _ in jobs]
+            else:
+                lines = ["Nothing was imported."]
+            if unrated:
+                lines.append(f"-# Content ratings other than Adult 18+ do not carry over: submit "
+                             f"{', '.join(f'`{n}`' for n in unrated)} again before sharing.")
+            if skipped:
+                lines.append("**Not imported:**")
+                lines += skipped
+            await interaction.followup.send("\n".join(lines), ephemeral=True)
 
         except ValueError as ve:
             await interaction.followup.send(f"❌ **Import Rejected:** {ve}", ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ **Import Failed:** An unexpected error occurred: {suppress_link_previews(str(e))}", ephemeral=True)
+
+    def _write_imported_profiles(self, user_id: int, jobs: List[Tuple[str, Dict[str, Any], list, list]]):
+        """Writes each (pid, profile, ltm, training). Blocking: run it in a thread.
+
+        All or nothing: a failure removes what this call wrote, which a rebuild would
+        otherwise adopt as profiles nobody asked for.
+        """
+        written = []
+        try:
+            for pid, profile, ltm, training in jobs:
+                p_dir = os.path.join(USERS_DIR, str(user_id), "profiles", pid)
+                written.append(p_dir)
+                self._save_profile_by_pid(user_id, pid, profile)
+                if ltm:
+                    IOManager.write_json_gzip({"guild": ltm}, os.path.join(p_dir, "ltm.json.gz"), self.cog.fernet)
+                if training:
+                    IOManager.write_json_gzip(training, os.path.join(p_dir, "training.json.gz"), self.cog.fernet)
+        except BaseException:
+            for p_dir in written:
+                shutil.rmtree(p_dir, ignore_errors=True)
+            raise
 
     async def _execute_privacy_export(self, user_id: int, interaction: discord.Interaction):
         user_id_str = str(user_id)
@@ -3695,20 +3763,18 @@ class ProfileManager:
 
         await interaction.followup.send("Account Deleted. All your profiles, memories, and settings have been permanently erased from this instance.", ephemeral=True)
 
-    def _generate_unique_local_name(self, user_id: int, original_name: str, sharer_name: str) -> str:
+    def _generate_unique_local_name(self, user_id: int, original_name: str) -> str:
+        """The source's own name, else the first free `name-2`, `name-3`..., cut to
+        `_is_valid_profile_name`'s 20 characters."""
         index = self._get_user_index(user_id)
-        all_profile_names = set(index.get("personal", [])) | set(index.get("borrowed", []))
-        
-        base_name = f"{original_name}-{sharer_name}".lower().strip()
-        if base_name not in all_profile_names:
-            return base_name
-        
-        counter = 2
-        while True:
-            new_name = f"{base_name}-{counter}"
-            if new_name not in all_profile_names:
-                return new_name
+        taken = set(index.get("personal", [])) | set(index.get("borrowed", []))
+        base = original_name.lower().strip()[:20]
+        name, counter = base, 1
+        while name in taken:
             counter += 1
+            suffix = f"-{counter}"
+            name = base[:20 - len(suffix)] + suffix
+        return name
 
     async def _memory_counts(self, user_id: int, profile_name: str, source_owner_id: int,
                              source_profile_name: str) -> Tuple[int, int]:
@@ -3785,7 +3851,7 @@ class ProfileManager:
             borrowed_config = self._get_profile_config(owner_id, profile_name, True) or {}
             # Not "A class" and "B class": the source of a borrow can be a personal
             # profile (A) or a System one (X), and the local PID is B or C depending
-            # on whether the borrow came through a share code or the Public Library.
+            # on whether the borrow came through a private share or the Public Library.
             source_pid = borrowed_config.get("original_profile_id", "Unknown")
             local_pid = self._get_pid_from_name_any(owner_id, profile_name)
             embed.add_field(name="Profile ID (Source)", value=f"`{source_pid}`", inline=True)
@@ -4473,10 +4539,10 @@ class ProfileManager:
             # explanatory note could not be delivered.
             pass
 
-    async def _reject_share_request(self, interaction: discord.Interaction, sharer_id: int, target_pid: Optional[str], fallback_name: str):
+    async def _reject_share_request(self, interaction: discord.Interaction, sharer_id: int, target_pid: Optional[str], fallback_name: str, kind: Optional[str] = None):
         """Takes one share off the recipient's queue -- accepted or declined, nobody is told."""
         self._drop_pending_shares(
-            interaction.user.id, lambda s: self._is_share_of(s, sharer_id, target_pid, fallback_name))
+            interaction.user.id, lambda s: self._is_share_of(s, sharer_id, target_pid, fallback_name, kind))
 
     async def _validate_active_profile(self, user_id: int, channel: discord.abc.Messageable) -> bool:
         index = self._get_user_index(user_id)
@@ -4524,8 +4590,16 @@ class ProfileManager:
         return True
 
     async def _execute_clone_handshake(self, owner_id: int, source_pid: str, recipient_id: int, desired_name: str) -> Tuple[bool, str]:
+        """Makes the clone a waiting clone offer names, and takes the offer off the queue.
+
+        The offer is the only authorisation, as a private borrow's is: it was sent
+        through `accepts_share`, and blocking its sender took it back.
+        """
         if not self.is_registered(recipient_id):
             return False, NOT_REGISTERED
+        if not any(self._is_share_of(s, owner_id, source_pid, "", "clone")
+                   for s in self._pending_shares(recipient_id)):
+            return False, "That clone is no longer waiting for you."
 
         def _sync_clone():
             owner_id_str = str(owner_id)
@@ -4537,7 +4611,7 @@ class ProfileManager:
                 return False, "Source profile data no longer exists."
 
             # A clone hands another user the whole persona, so it is sharing, and is
-            # gated as sharing is -- again here because the code can outlive the rating.
+            # gated as sharing is -- again here because the offer can outlive the rating.
             source_name = self._get_name_from_pid(owner_id, source_pid)
             if not source_name:
                 return False, "Source profile data no longer exists."
@@ -4548,6 +4622,9 @@ class ProfileManager:
             index = self._get_user_index(recipient_id)
             if len(index.get("personal", [])) >= defaultConfig.LIMIT_PROFILES:
                 return False, "You have reached your personal profile limit."
+            # Writing the index entry over an existing one would orphan that profile.
+            if desired_name in index.get("personal", []) or desired_name in index.get("borrowed", []):
+                return False, f"You already have a profile named '{desired_name}'."
 
             new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
             recip_dir = os.path.join(self.cog.USERS_DIR, recip_id_str, "profiles", new_pid)
@@ -4591,7 +4668,11 @@ class ProfileManager:
                 shutil.rmtree(recip_dir, ignore_errors=True)
                 return False, f"An unexpected error occurred during cloning: {e}"
 
-        return await asyncio.to_thread(_sync_clone)
+        ok, message = await asyncio.to_thread(_sync_clone)
+        if ok:
+            self._drop_pending_shares(
+                recipient_id, lambda s: self._is_share_of(s, owner_id, source_pid, "", "clone"))
+        return ok, message
 
 
     async def _convert_copy_profile(self, user_id: int, source_name: str, target_name: str, to_system: bool) -> Tuple[bool, str]:

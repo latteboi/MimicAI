@@ -238,6 +238,9 @@ class TurnDeletionMixin:
         turns = [turn for turn in session.get("unified_log", [])
                  if any(mid in deleted_ids for mid in turn.get("message_ids", []))]
         if not turns:
+            # Not in the log yet, so it may be a trigger still waiting in the queue: the
+            # next drain drops it (withdraw_cancelled_triggers) and clears this.
+            session.setdefault('deleted_unlogged_messages', set()).update(deleted_ids)
             return
 
         if any(session.get(flag) for flag in SESSION_BUSY_FLAGS):
