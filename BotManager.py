@@ -50,6 +50,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.guilds = True
+intents.dm_typing = False  # only session channels read typing, and sessions are guild-only
 
 # --- Bot Initialization ---
 # max_messages=None disables discord.py's cache of the last 1000 Message objects.

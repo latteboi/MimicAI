@@ -818,6 +818,7 @@ class MimicCog(EventListeners, commands.Cog):
                 "started": session_config.get("started", True),
                 "audio_mode": session_config.get("audio_mode", "off"),
                 "max_responses": session_config.get("max_responses", 10),
+                "settle": session_config.get("settle", {}),
             }
         else:
             # Blank session

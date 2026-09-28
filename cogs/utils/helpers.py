@@ -34,7 +34,8 @@ from .constants import (
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
     MEDIA_RESOLUTION_VALUES, MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL,
     GROUNDING_MODE_LABELS,
-    DEFAULT_KICKSTART_CONTINUE, DEFAULT_KICKSTART_IDLE, DEFAULT_WHISPER_RECAP,
+    DEFAULT_KICKSTART_CONTINUE, DEFAULT_KICKSTART_IDLE, DEFAULT_KICKSTART_UNANSWERED,
+    DEFAULT_WHISPER_RECAP,
     SUPERSEDED_LTM_SUMMARIZATION_HASHES,
     OPENROUTER_SERVICE_TIER_VALUES,
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_KEYS, UNREADABLE_MEDIA_LABELS,
@@ -256,7 +257,8 @@ KICKSTART_FOLLOW_UP_CYCLE = 3
 
 
 def kickstart_note(history: List[Dict[str, Any]],
-                   global_prompts: Optional[Dict[str, str]] = None) -> Optional[str]:
+                   global_prompts: Optional[Dict[str, str]] = None,
+                   log: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
     """The pseudo-user turn to append when a history ends on the character's own turn.
 
     An adapter needs the last turn to be the user's, so a character speaking into
@@ -282,10 +284,19 @@ def kickstart_note(history: List[Dict[str, Any]],
 
     Returns None when the history does not end on a model turn, which is the caller's
     "append nothing".
+
+    `log` is the unified_log the history was built from. A message sent while the reply
+    after it was being written sits above that reply (`log_user_turn`), so the round it
+    opens ends on the character's own turn -- and told nobody had spoken, the character
+    talked to an empty room over a question still waiting. That round is **Unanswered**.
     """
     if not history or history[-1].get('role', 'user') != 'model':
         return None
     prompts = global_prompts or {}
+    log = log or []
+    last_user = next((i for i in range(len(log) - 1, -1, -1) if log[i].get("is_user") is True), None)
+    if last_user is not None and 0 < len(log) - 1 - last_user <= log[last_user].get("sent_during", 0):
+        return prompts.get("KICKSTART_UNANSWERED", DEFAULT_KICKSTART_UNANSWERED)
     parts = history[-1].get('parts') or []
     text = "".join(p if isinstance(p, str) else p.get('text', '') if isinstance(p, dict) else ''
                    for p in parts)

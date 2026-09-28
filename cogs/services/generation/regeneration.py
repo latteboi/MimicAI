@@ -252,7 +252,7 @@ class RegenerationMixin:
             # Pseudo-turn injection to ensure history ends with a 'user' role. The same
             # note a live round would get for the same silence -- `kickstart_note` owns
             # which one that is, so a regenerate cannot answer it differently.
-            follow_up = kickstart_note(history, self.cog.global_prompts)
+            follow_up = kickstart_note(history, self.cog.global_prompts, earlier)
             if follow_up:
                 history.append({'role': 'user', 'parts': [follow_up]})
             elif not history:

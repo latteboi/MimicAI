@@ -195,6 +195,25 @@ class EventListeners:
             print(f"Welcome message failed in guild {guild.id}: {type(e).__name__}({e})")
 
     @commands.Cog.listener()
+    async def on_typing(self, channel, user, when):
+        """Note who is typing in a live session's channel, for `_settle_round`.
+
+        `session['typing']` is user id -> [first seen, last seen], monotonic. Entries a
+        while past their indicator are dropped on each write, which keeps it to the people
+        typing lately.
+        """
+        session = self.multi_profile_channels.get(getattr(channel, 'id', None))
+        if (not session or not self.has_lock or getattr(user, 'bot', True)
+                or user.id in self.generation_blocked
+                or not self.session_manager.is_started(session)):
+            return
+        now = time.monotonic()
+        typing = session.setdefault('typing', {})
+        for uid in [u for u, (_, last) in typing.items() if now - last > 2 * TYPING_INDICATOR_SECONDS]:
+            del typing[uid]
+        typing.setdefault(user.id, [now, now])[1] = now
+
+    @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         # The game table is a sticky message, so anything landing in the channel buries
         # it. This sits above every guard below deliberately: during a game most of the
@@ -214,6 +233,12 @@ class EventListeners:
 
         if not message.guild or not self.has_lock or message.author.bot:
             return
+
+        # Sending ends a typing indicator, and Discord says nothing when it does. A round
+        # settling on this person's typing learns they stopped from this alone.
+        typing = (self.multi_profile_channels.get(message.channel.id) or {}).get('typing')
+        if typing:
+            typing.pop(message.author.id, None)
 
         # A quarantined guild keeps the bot present and generates nothing. Tested here
         # rather than at each trigger below: every one of them ends in a model call,

@@ -1844,9 +1844,18 @@ ROUND_EXEMPT_USER_CHARS = 100_000
 # A round opened by someone talking waits, placeholder already up, until the channel has
 # been quiet this long, so "hey" / "wait" / "actually..." is answered once rather than
 # "hey" alone and then the rest. Every new message restarts the wait, up to the cap, so a
-# channel that never goes quiet still gets rounds.
-ROUND_SETTLE_SECONDS = 2.0
+# channel that never goes quiet still gets rounds. The first person typing can hold it
+# longer, to the typing cap. A session's Settle Window overrides each one sparsely
+# (`SessionManager.settle_window`); these are the shipped values it falls back to.
+ROUND_SETTLE_SECONDS = 3.0
 ROUND_SETTLE_MAX_SECONDS = 8.0
+ROUND_SETTLE_TYPING_SECONDS = 15.0
+#: What the Settle Window accepts: the quiet gap up to the first, both caps up to the second.
+ROUND_SETTLE_QUIET_LIMIT = 10
+ROUND_SETTLE_WAIT_LIMIT = 30
+#: How long Discord shows a typing indicator after its last typing event. There is no
+#: "stopped typing" event, so a typer is "still typing" for this long after the last one.
+TYPING_INDICATOR_SECONDS = 10.0
 
 # Archive depth for a session's unified_log, which is NOT its context window --
 # _build_history_for_participant windows to stm_length. These bound what regeneration,
@@ -1967,6 +1976,8 @@ DEFAULT_KICKSTART_START = "<internal_note>Start the conversation.</internal_note
 
 DEFAULT_KICKSTART_CONTINUE = "<internal_note>Continue the public conversation.</internal_note>"
 DEFAULT_KICKSTART_IDLE = "<internal_note>No response from anyone, or no user is present.</internal_note>"
+DEFAULT_KICKSTART_UNANSWERED = ("<internal_note>The newest message above arrived while you were still "
+                                "writing the reply after it, so it has not been answered yet.</internal_note>")
 DEFAULT_DIRECTOR_USER_PROMPT = "Recent History:\n{history}\n\nGenerate your Director's prompt."
 #: The AI Director's instruction where a session has written none. Resolved when it runs,
 #: never copied into the session: six copies of it had drifted, and a session made by

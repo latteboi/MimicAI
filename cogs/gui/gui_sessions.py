@@ -1172,9 +1172,67 @@ class ResponseLimitModal(ui.Modal, title="Set Response Limit"):
                     raise ValueError()
                 self.view.session["max_responses"] = val
             except ValueError:
-                await interaction.response.send_message("❌ Invalid input. Please enter a number between 1 and 10.", ephemeral=True)
+                self.view.notice = f"`{val_str}` is not a number from 1 to 10."
+                await interaction.response.defer()
+                await self.view.update_display()
                 return
         self.view.cog.session_manager._save_multi_profile_sessions()
+        await interaction.response.defer()
+        await self.view.update_display()
+
+
+class SettleWindowModal(ui.Modal, title="Settle Window"):
+    """The three settle times. Blank is the shipped default, and stays blank in storage."""
+    quiet_input = ui.TextInput(label=f"Quiet gap, seconds (0-{ROUND_SETTLE_QUIET_LIMIT})",
+                               placeholder=f"Blank = default ({ROUND_SETTLE_SECONDS:g})",
+                               required=False, max_length=5)
+    max_input = ui.TextInput(label=f"Maximum wait, seconds (up to {ROUND_SETTLE_WAIT_LIMIT})",
+                             placeholder=f"Blank = default ({ROUND_SETTLE_MAX_SECONDS:g})",
+                             required=False, max_length=5)
+    typing_input = ui.TextInput(label=f"Typing wait, seconds (0-{ROUND_SETTLE_WAIT_LIMIT}, 0 = off)",
+                                placeholder=f"Blank = default ({ROUND_SETTLE_TYPING_SECONDS:g})",
+                                required=False, max_length=5)
+
+    FIELDS = (("quiet", "Quiet gap", ROUND_SETTLE_QUIET_LIMIT),
+              ("max", "Maximum wait", ROUND_SETTLE_WAIT_LIMIT),
+              ("typing", "Typing wait", ROUND_SETTLE_WAIT_LIMIT))
+
+    def __init__(self, view: 'SessionConfigView'):
+        super().__init__()
+        self.view = view
+        stored = view.session.get("settle") or {}
+        for field, (key, _, _) in zip(self._inputs(), self.FIELDS):
+            if key in stored:
+                field.default = f"{stored[key]:g}"
+
+    def _inputs(self):
+        return (self.quiet_input, self.max_input, self.typing_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        settle, problems = {}, []
+        for field, (key, name, limit) in zip(self._inputs(), self.FIELDS):
+            text = field.value.strip()
+            if not text:
+                continue
+            try:
+                value = round(float(text), 1)
+            except ValueError:
+                value = None
+            # NaN fails both comparisons, so it lands here too.
+            if value is None or not 0 <= value <= limit:
+                problems.append(f"{name} has to be a number from 0 to {limit}.")
+            else:
+                settle[key] = value
+        if not problems:
+            quiet, burst_cap, _ = self.view.cog.session_manager.settle_window({"settle": settle})
+            if burst_cap < quiet:
+                problems.append(f"Maximum wait ({burst_cap:g} s) can't be shorter than the "
+                                f"quiet gap ({quiet:g} s).")
+        if problems:
+            self.view.notice = " ".join(problems)
+        else:
+            self.view.session["settle"] = settle
+            self.view.cog.session_manager._save_multi_profile_sessions()
         await interaction.response.defer()
         await self.view.update_display()
 
@@ -1310,6 +1368,11 @@ class SessionConfigView(BlockedGuard, ui.View):
         self.current_page = 0
         self.selected_reactivity_profiles = set()
         self._seated_cache = None
+        #: The Config tab setting whose screen is open, or None for the tab itself.
+        self.config_screen = None
+        #: One line for the next render only, e.g. a modal value it could not take. Shown
+        #: on this message rather than sent as another one below it.
+        self.notice = None
         self._load_lists()
 
     #: Cast sources, in the order the Source dropdown lists them. `session` is last
@@ -1656,25 +1719,33 @@ class SessionConfigView(BlockedGuard, ui.View):
             self.current_tab = "cast"
             self.current_page = 0
             self.selected_reactivity_profiles.clear()
+        if self.current_tab != "config":
+            self.config_screen = None
 
         self.clear_items()
-        self._add_nav_buttons()
         embed = discord.Embed(title=f"Chat Session: #{self.original_interaction.channel.name}", color=discord.Color.gold())
 
-        # One method per tab. This was a 573-line `update_display` with the five
-        # bodies inline; the shared prologue and epilogue below are the whole reason
-        # they were ever in one method.
-        renderer = {
-            "cast": self._render_cast,
-            "config": self._render_config,
-            "reactivity": self._render_reactivity,
-            "proactivity": self._render_proactivity,
-            "compaction": self._render_compaction,
-        }.get(self.current_tab)
-        if renderer:
-            renderer(embed)
+        if self.config_screen:
+            self._render_config_screen(embed)
+        else:
+            self._add_nav_buttons()
+            # One method per tab. This was a 573-line `update_display` with the five
+            # bodies inline; the shared prologue and epilogue below are the whole reason
+            # they were ever in one method.
+            renderer = {
+                "cast": self._render_cast,
+                "config": self._render_config,
+                "reactivity": self._render_reactivity,
+                "proactivity": self._render_proactivity,
+                "compaction": self._render_compaction,
+            }.get(self.current_tab)
+            if renderer:
+                renderer(embed)
+            self._add_commit_button()
 
-        self._add_commit_button()
+        if self.notice:
+            embed.add_field(name="⚠️ Not saved", value=self.notice[:1024], inline=False)
+            self.notice = None
 
         # On every tab, because the button is on every tab: the one thing the editor
         # must never leave ambiguous is whether the channel is already live.
@@ -1949,7 +2020,7 @@ class SessionConfigView(BlockedGuard, ui.View):
         embed.add_field(name="Current Cast", value=cast_list, inline=False)
 
     def _render_config(self, embed: discord.Embed):
-        """Session-wide behaviour: execution mode, master prompt, TTS, response limit, cast access."""
+        """Session-wide behaviour: execution mode, master prompt, TTS, response limit, settle window, cast access."""
         embed.description = "Configure session-wide behavior."
         mp = self.session.get("session_prompt")
         audio_val = self.session.get("audio_mode", "off")
@@ -1963,24 +2034,16 @@ class SessionConfigView(BlockedGuard, ui.View):
 
         embed.add_field(name="Text-to-Speech", value=f"{tts_status}", inline=True)
         embed.add_field(name="Response Limit", value=f"`{response_limit}`", inline=True)
-        embed.add_field(name="\u200b", value="\u200b", inline=True)
+        embed.add_field(name="Settle Window", value=f"`{self._config_summary('settle')}`", inline=True)
         
         embed.add_field(name="Master Prompt Content", value=f"```{mp[:500]}```" if mp else "`None`", inline=False)
 
-        self._add_toggle(
-            "Toggle Execution",
-            self.session.get("session_mode", "sequential") == "random",
-            lambda on: self.session.__setitem__("session_mode",
-                                                "random" if on else "sequential"))
-        self._add_modal_button("Edit Master Prompt", SessionPromptModal)
-        self._add_toggle(
-            "Toggle TTS", audio_val == "on",
-            lambda on: self.session.__setitem__("audio_mode", "on" if on else "off"))
-        self._add_modal_button("Set Response Limit", ResponseLimitModal)
+        # Each setting opens its own screen on this message (`_render_config_screen`).
+        add_select(self, [discord.SelectOption(label=label, value=key,
+                                               description=self._config_summary(key)[:100])
+                          for key, (label, _) in self.CONFIG_SCREENS.items()],
+                   self._open_config_screen, placeholder="Change a setting…", row=0)
 
-        # Row 1, vacated by the two buttons above. A select needs a row to itself,
-        # and the four config buttons fit one row with a slot to spare.
-        #
         # Administrators only, and rendered disabled rather than hidden for everyone
         # else so a member under Open Casting can see the terms they are editing
         # under. It is the control that grants the access: a member who could set it
@@ -2007,6 +2070,122 @@ class SessionConfigView(BlockedGuard, ui.View):
             await self._save_and_repaint(i)
         policy_sel.callback = policy_cb
         self.add_item(policy_sel)
+
+    #: The Config tab's settings: key -> (label, what the screen says it does).
+    CONFIG_SCREENS = {
+        "execution": ("Execution Mode",
+                      "The order the cast answers in each round.\n\n"
+                      "**Sequential** — seat order, starting after whoever spoke last.\n"
+                      "**Random** — shuffled every round.\n\n"
+                      "Either way, replying to a character or mentioning it puts it first."),
+        "prompt": ("Master Prompt",
+                   "Standing scene direction every character in the cast reads on every "
+                   "turn: the setting, the tone, what is going on. The AI Director reads "
+                   "it too."),
+        "tts": ("Text-to-Speech",
+                "Voices each reply as an audio clip. Only characters with speech set up on "
+                "their own profile are voiced; while this is off, nobody in this channel is."),
+        "limit": ("Response Limit",
+                  "The most characters that answer in one round, 1 to 10. Anyone past the "
+                  "limit sits that round out."),
+        "settle": ("Settle Window",
+                   "How long a round waits before it reads the channel, so a few quick "
+                   "messages are answered together rather than one at a time. The "
+                   "character's placeholder is already up while it waits.\n\n"
+                   "**Quiet gap** — how long the channel has to be quiet after the last "
+                   "message. `0` starts the round as soon as the placeholder is up.\n"
+                   "**Maximum wait** — the cap while messages keep arriving.\n"
+                   "**Typing wait** — how long the first person typing can hold the "
+                   "round, so a follow-up still being written makes it in. `0` switches "
+                   "this off.\n\n"
+                   "Messages sent while a character is replying always go into the next "
+                   "round together, whatever this is set to."),
+    }
+
+    def _config_summary(self, key: str) -> str:
+        """A setting's current value, in a few words, for the dropdown and the tab."""
+        if key == "execution":
+            return self.session.get("session_mode", "sequential").title()
+        if key == "prompt":
+            return "Set" if self.session.get("session_prompt") else "Not set"
+        if key == "tts":
+            return "On" if self.session.get("audio_mode", "off") == "on" else "Off"
+        if key == "limit":
+            return f"{self.session.get('max_responses', 10)} per round"
+        quiet, burst_cap, typing_cap = self.cog.session_manager.settle_window(self.session)
+        typing = f"typing {typing_cap:g}s" if typing_cap else "typing off"
+        return f"{quiet:g}s quiet · {burst_cap:g}s max · {typing}"
+
+    async def _open_config_screen(self, i: discord.Interaction):
+        self.config_screen = i.data['values'][0]
+        await i.response.defer()
+        await self.update_display()
+
+    def _screen_button(self, label: str, action, **kwargs):
+        """A button on a setting's screen: `action()` changes the session, then it saves and
+        repaints this message. Re-tests the role on the press, as the tab bar does."""
+        async def callback(i: discord.Interaction):
+            if self._viewer_is_admin():
+                action()
+                self.cog.session_manager._save_multi_profile_sessions()
+            await i.response.defer()
+            await self.update_display()
+        add_button(self, label, callback, row=0, **kwargs)
+
+    def _render_config_screen(self, embed: discord.Embed):
+        """One Config setting on its own: what it does, where it stands, and its controls.
+
+        Rendered onto the editor's own message, with Back to the tab, the way a profile's
+        settings open from its dashboard. Every control and modal here repaints this
+        message; nothing sends another one below it.
+        """
+        key = self.config_screen
+        label, about = self.CONFIG_SCREENS[key]
+        embed.title = label
+        embed.description = about
+        session = self.session
+
+        if key == "execution":
+            mode = session.get("session_mode", "sequential")
+            for value in ("sequential", "random"):
+                self._screen_button(
+                    value.title(), lambda v=value: session.__setitem__("session_mode", v),
+                    style=discord.ButtonStyle.primary if value == mode else discord.ButtonStyle.secondary,
+                    disabled=value == mode)
+        elif key == "prompt":
+            mp = session.get("session_prompt")
+            embed.add_field(name="Current", value=f"```{mp[:1000]}```" if mp else "`Not set`",
+                            inline=False)
+            self._add_modal_button("Edit", SessionPromptModal)
+            self._screen_button("Clear", lambda: session.__setitem__("session_prompt", None),
+                                style=discord.ButtonStyle.danger, disabled=not mp)
+        elif key == "tts":
+            on = session.get("audio_mode", "off") == "on"
+            self._screen_button(
+                f"Text-to-Speech: {'On' if on else 'Off'}",
+                lambda: session.__setitem__("audio_mode", "off" if on else "on"),
+                style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary)
+        elif key == "limit":
+            embed.add_field(name="Current", value=f"`{session.get('max_responses', 10)}` per round",
+                            inline=False)
+            self._add_modal_button("Edit", ResponseLimitModal)
+        elif key == "settle":
+            stored = session.get("settle") or {}
+            values = self.cog.session_manager.settle_window(session)
+            for (field, name), value in zip((("quiet", "Quiet gap"), ("max", "Maximum wait"),
+                                             ("typing", "Typing wait")), values):
+                shown = "Off" if field == "typing" and not value else f"{value:g} s"
+                embed.add_field(name=name, value=f"`{shown}`" + ("" if field in stored else " (default)"),
+                                inline=True)
+            self._add_modal_button("Edit Values…", SettleWindowModal)
+            self._screen_button("Reset to Defaults", lambda: session.pop("settle", None),
+                                disabled=not stored)
+
+        async def back(i: discord.Interaction):
+            self.config_screen = None
+            await i.response.defer()
+            await self.update_display()
+        add_button(self, "◀ Back", back, row=0, style=discord.ButtonStyle.secondary)
 
     def _render_reactivity(self, embed: discord.Embed):
         """Per-participant response chance and wakewords."""

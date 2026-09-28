@@ -14,7 +14,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 from ..utils.constants import (
     defaultConfig, PLACEHOLDER_EMOJI, GAME_BEAT_STALE_SECONDS,
-    WHISPER_BUSY_WAIT_TIMEOUT_SECONDS, ROUND_SETTLE_SECONDS, ROUND_SETTLE_MAX_SECONDS,
+    WHISPER_BUSY_WAIT_TIMEOUT_SECONDS, TYPING_INDICATOR_SECONDS,
     WARN_VOICE_SYNTHESIS_FAILED,
     ERR_REASON_AUDIO_TOO_LARGE, ERR_REASON_AUDIO_NOT_UPLOADED,
     DEFAULT_KICKSTART_START,
@@ -468,6 +468,39 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         # Scrubbed: it goes back to the cast inside a tag, and a stray one would compound.
         return f"<internal_note>Director's Note: {text}</internal_note>" if text else None
 
+    #: How often a settling round looks at the queue and the typers.
+    SETTLE_POLL_SECONDS = 0.25
+
+    async def _settle_round(self, session: dict) -> None:
+        """Wait until the channel has settled, per the session's Settle Window.
+
+        Holds while the channel has not been quiet for the quiet gap (each message
+        restarts it, up to the maximum wait), or while the round's typer is still typing
+        (up to the typing wait). Both caps count from here, and whichever is longer bounds
+        the whole wait. The typer is whoever has been typing longest when one is first
+        seen, and stays the only one: a chatty channel cannot pass the hold along. The
+        listener drops a typer's entry when their message lands, which is the only way
+        to learn they stopped.
+        """
+        quiet, burst_cap, typing_cap = self.cog.session_manager.settle_window(session)
+        queue = session['task_queue']
+        start = quiet_since = time.monotonic()
+        seen = queue.qsize()
+        anchor = None
+        while True:
+            now = time.monotonic()
+            if queue.qsize() != seen:
+                seen, quiet_since = queue.qsize(), now
+            typers = {uid: first for uid, (first, last) in (session.get('typing') or {}).items()
+                      if now - last < TYPING_INDICATOR_SECONDS}
+            if anchor is None and typers:
+                anchor = min(typers, key=typers.get)
+            settling = now - quiet_since < quiet and now - start < burst_cap
+            held = anchor in typers and now - start < typing_cap
+            if not (settling or held):
+                return
+            await asyncio.sleep(self.SETTLE_POLL_SECONDS)
+
     async def _multi_profile_worker(self, channel_id: int):
         session = self.cog.multi_profile_channels.get(channel_id)
         if not session: return
@@ -671,7 +704,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         session, channel, first_participant)
 
                     # A burst settles into this round behind the placeholder, not ahead of
-                    # it (ROUND_SETTLE_SECONDS). Who speaks was rolled on what had arrived,
+                    # it (`_settle_round`). Who speaks was rolled on what had arrived,
                     # as for a message landing mid-round; the rest is read as this round's
                     # history. Polled, not pulled, so a /cancel meanwhile drains it. A
                     # reaction, /trigger or a game beat is the whole of what it asks for.
@@ -683,12 +716,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             isinstance(initial_trigger, tuple)
                             and initial_trigger[0] in ('reply', 'child_mention')):
                         queue = session['task_queue']
-                        settle_until = time.monotonic() + ROUND_SETTLE_MAX_SECONDS
-                        seen = -1
-                        while queue.qsize() != seen and time.monotonic() < settle_until:
-                            seen = queue.qsize()
-                            await asyncio.sleep(min(ROUND_SETTLE_SECONDS,
-                                                    settle_until - time.monotonic()))
+                        await self._settle_round(session)
                         while not queue.empty():
                             all_triggers_for_round.append(queue.get_nowait())
                         all_triggers_for_round = self.cog.session_manager.withdraw_cancelled_triggers(
@@ -1224,7 +1252,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                         # The history ends on this character's own turn when nobody has
                         # answered it -- which note that earns is `kickstart_note`.
-                        follow_up = kickstart_note(contents_for_api_call, self.cog.global_prompts)
+                        follow_up = kickstart_note(contents_for_api_call, self.cog.global_prompts, unified_log)
                         if follow_up:
                             contents_for_api_call.append({'role': 'user', 'parts': [follow_up]})
 

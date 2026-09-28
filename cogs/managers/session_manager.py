@@ -25,6 +25,7 @@ from ..utils.constants import (
     DEFAULT_CAST_POLICY, DELIVERY_GUARD_SECONDS,
     ROUND_EXEMPT_USER_TURNS, ROUND_EXEMPT_USER_CHARS, SESSION_BUSY_FLAGS,
     PATTERN_SPEAKER_CLOSE, REPLY_IN_VIEW, REPLY_QUOTE_CHARS, REPLY_UNAVAILABLE,
+    ROUND_SETTLE_SECONDS, ROUND_SETTLE_MAX_SECONDS, ROUND_SETTLE_TYPING_SECONDS,
 )
 from ..utils.discord_cdn import unsigned_attachment_url
 from ..utils.helpers import (TURN_TIME_FORMAT, _resolve_zoneinfo, resolve_grounding_mode,
@@ -130,6 +131,10 @@ def log_user_turn(session: Dict[str, Any], turn: Dict[str, Any],
                 break
             index -= 1
 
+    if index < len(unified_log):
+        # How many replies were already being written when it was sent. None of them read
+        # it, and kickstart_note has to know that of a round ending on the last of them.
+        turn["sent_during"] = len(unified_log) - index
     unified_log.insert(index, intern_turn(turn))
 
     # An insert below the boundary would leave the sealed cold segment no longer a
@@ -996,6 +1001,7 @@ class SessionManager:
                         # them out lost the TTS toggle and the response limit on every restart.
                         "audio_mode": session_data.get("audio_mode", "off"),
                         "max_responses": session_data.get("max_responses", 10),
+                        "settle": session_data.get("settle", {}),
                     }
                     if channel is None and not guild.unavailable:
                         uncached.append(channel_id)
@@ -1132,6 +1138,7 @@ class SessionManager:
                     "started": bool(session_data.get("started", True)),
                     "audio_mode": session_data.get("audio_mode", "off"),
                     "max_responses": session_data.get("max_responses", 10),
+                    "settle": session_data.get("settle", {}),
                 }
 
                 current_server_sessions[server_id_str][category][str(channel_id)] = blueprint
@@ -1430,6 +1437,7 @@ class SessionManager:
                             "started": session_config.get("started", True),
                             "audio_mode": session_config.get("audio_mode", "off"),
                             "max_responses": session_config.get("max_responses", 10),
+                            "settle": session_config.get("settle", {}),
                         }
                         self.cog.multi_profile_channels[channel_id] = session
                     else:
@@ -1444,6 +1452,7 @@ class SessionManager:
                         session["cast_policy"] = session_config.get("cast_policy", DEFAULT_CAST_POLICY)
                         session["audio_mode"] = session_config.get("audio_mode", "off")
                         session["max_responses"] = session_config.get("max_responses", 10)
+                        session["settle"] = session_config.get("settle", {})
 
         if not session: return None
 
@@ -1720,6 +1729,18 @@ class SessionManager:
                     pending.append(turn)
         pending.reverse()
         return pending
+
+    @staticmethod
+    def settle_window(session: Optional[Dict]) -> Tuple[float, float, float]:
+        """(quiet gap, maximum wait, typing wait) in seconds, as the round settle reads them.
+
+        `session['settle']` is sparse: a value the Settle Window never set reads the shipped
+        constant, so changing that constant still reaches every session that left it alone.
+        """
+        settle = (session or {}).get("settle") or {}
+        return (float(settle.get("quiet", ROUND_SETTLE_SECONDS)),
+                float(settle.get("max", ROUND_SETTLE_MAX_SECONDS)),
+                float(settle.get("typing", ROUND_SETTLE_TYPING_SECONDS)))
 
     @staticmethod
     def compaction_enabled(session: Optional[Dict]) -> bool:
