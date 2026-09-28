@@ -38,7 +38,8 @@ a default than it is a thing to propagate in bulk.
 import functools
 from typing import Any, Dict, List, Optional, Tuple
 
-from .constants import MODEL_PROVIDERS, OPENROUTER_SHIPPED_MODELS, UTILITY_FALLBACK_KEYS
+from .constants import (AUTO_DEFAULT, AUTO_MODEL_PREFIX, AUTO_TIERS, MODEL_PROVIDERS,
+                        OPENROUTER_SHIPPED_MODELS, UTILITY_FALLBACK_KEYS)
 from .helpers import is_real_model
 
 #: Config keys that must never be defaulted regardless of what the table says.
@@ -175,7 +176,7 @@ def apply_defaults(config: Dict[str, Any], defaults: Optional[Dict[str, Any]], *
 
 #: Prefix -> the provider name `_get_api_key_for_user` and the key slots use.
 _PROVIDER_PREFIXES = (("OPENROUTER/", "openrouter"), ("OLLAMA/", "ollama"),
-                      ("GOOGLE/", "gemini"))
+                      ("GOOGLE/", "gemini"), (AUTO_MODEL_PREFIX, "openrouter"))
 
 
 def model_provider(value: Optional[str]) -> str:
@@ -194,11 +195,21 @@ def model_provider(value: Optional[str]) -> str:
 _SHORT_PREFIXES = {"gemini": "GO", "openrouter": "OR", "ollama": "OL"}
 
 
+def auto_wording(value: Optional[str]) -> str:
+    """`Auto · Free` for `AUTO/free`, short to fit a dropdown label; the bare value for an
+    unknown tier."""
+    tier = str(value or "")[len(AUTO_MODEL_PREFIX):]
+    wording = next((w for t, w, _d in AUTO_TIERS if t == tier), None)
+    return f"Auto \u00b7 {wording}" if wording else str(value)
+
+
 def short_model_name(value: Optional[str]) -> str:
     """`OR/nova-micro-v1` for `OPENROUTER/amazon/nova-micro-v1`: the profile dashboard's
     spelling. Display only -- the vendor segment is gone, so it cannot be routed back."""
     if not is_real_model(value):
         return "None"
+    if str(value).startswith(AUTO_MODEL_PREFIX):
+        return auto_wording(value)
     return f"{_SHORT_PREFIXES[model_provider(value)]}/{str(value).rsplit('/', 1)[-1]}"
 
 
@@ -264,6 +275,9 @@ def model_slot_defaults(preferred: Optional[str]) -> Dict[str, str]:
         out[primary_key] = chain[0]
         if len(chain) > 1:
             out[fallback_key] = chain[1]
+    if preferred == "openrouter":
+        # Auto rather than the day's ids, which OpenRouter withdraws -- see AUTO_MODEL_PREFIX.
+        out["primary_model"] = out["fallback_model"] = AUTO_DEFAULT
     return out
 
 

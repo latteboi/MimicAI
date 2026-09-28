@@ -19,6 +19,8 @@ The operator may edit the on-disk shards via `/mod` -> Docs. `HelpService` track
 which shards it wrote and leaves edited ones alone on upgrade.
 """
 
+from .news import latest_release_text
+
 HELP_CATEGORIES = {
     "1. Getting Started": {
         "What MimicAI Is": (
@@ -127,7 +129,11 @@ HELP_CATEGORIES = {
             "Set at `/profile manage` -> **Params** -> Set Models. You choose a **Primary Model** and a **Fallback Model**.\n\n"
             "**Providers:**\n"
             "• **Google Gemini** -- Gemini models, plus Gemini's own speech and image models.\n"
-            "• **OpenRouter** -- Anthropic, Meta, xAI, DeepSeek and many others through one key.\n\n"
+            "• **OpenRouter** -- Anthropic, Meta, xAI, DeepSeek and many others through one key.\n"
+            "• **MimicAI Auto** -- the first options in the OpenRouter tab's Browse dropdown, for Response only. **Auto · Free**, "
+            "**Budget** and **Recommended** each run a Primary and a Fallback the bot owner picks and can change, so the profile "
+            "follows that pick instead of holding a model OpenRouter may retire. Each option names the model its tier runs today. "
+            "Needs an OpenRouter key; new profiles on OpenRouter start on Auto · Free.\n\n"
             "**Fallback** is not optional infrastructure you can ignore. If the primary request fails -- rate limit, timeout, safety block -- "
             "the payload is immediately re-sent to the fallback. Choose something cheap and fast; a profile with a good fallback stays alive "
             "through an outage that would otherwise silence it.\n\n"
@@ -272,8 +278,15 @@ HELP_CATEGORIES = {
             "Choosing a profile seats it and saves it at once; **Start / Update Session** is what makes the channel live. "
             "Until then the dashboard footer reads *Draft* and nothing in the channel runs. An empty cast is a valid "
             "session -- it simply has nobody to answer.\n\n"
-            "**Config** sets how the round runs: **Toggle Execution** switches between sequential and random turn order, **Edit Master Prompt** "
-            "sets the scene every participant sees, **Set Response Limit** caps replies per round, and **Toggle TTS** turns on audio.\n\n"
+            "**Config** sets how the round runs. Its dropdown opens each setting on its own screen: **Execution Mode** (sequential or "
+            "random turn order), **Master Prompt** (the scene every participant sees), **Text-to-Speech** (voices the replies of characters "
+            "with speech set up), **Response Limit** (replies per round) and **Settle Window**. Below it, **Cast access** lets an "
+            "administrator open the channel to **Open casting**.\n\n"
+            "**Settle Window** is how long a round waits before it reads the channel, so a few quick messages get one reply rather than one "
+            "each. The placeholder is already up while it waits. **Quiet gap** (default 3 seconds) is how long the channel has to be quiet "
+            "after the last message, **Maximum wait** (default 8) caps it while messages keep arriving, and **Typing wait** (default 15, 0 "
+            "for off) is how long the first person typing can hold the round. Messages sent while a character is replying always go into "
+            "the next round together.\n\n"
             "**Compaction** holds the Rolling Synopsis: once a conversation reaches 50 public turns, the oldest 25 are folded into a running "
             "synopsis the whole cast is given, so a long scene keeps its thread. New sessions start with it on. **Edit Settings** sets when "
             "it folds and how long the synopsis is (100-800 words), and turning it off puts the folded turns back. **Compact Now** folds "
@@ -400,8 +413,8 @@ HELP_CATEGORIES = {
             "near default, since far from it produces audible artefacts. The speech model itself is under Set Models, on Google or OpenRouter. "
             "An OpenRouter speech model is sent the reply alone, with a speed if one is set: the Director's Desk, temperature and language reach Gemini models only.\n\n"
             "**Audio tags** steer delivery mid-line: `[whispers]`, `[shouting]`, `[laughs]`, `[sighs]`. There is no fixed list. On OpenRouter only Fish Audio S2 and Qwen Audio 3.0 are sent them, and no model there is sent an action standing as its own sentence ('*sighs* Fine.'), so neither is read out as words.\n\n"
-            "**Session audio** (`/session config` -> Config -> Toggle TTS) can deliver text plus audio, audio only, or hold every participant's "
-            "audio until the round ends and stitch it into one file."
+            "**Session audio** (`/session config` -> Config -> Text-to-Speech) voices a channel: while it is on, each reply from a character "
+            "with speech set up comes with an audio clip. While it is off, nobody in that channel is voiced."
         ),
         "Attachments the Bot Can Read": (
             "Profiles can read images, audio and video attached to your messages, provided the model behind them supports it. Replying to a "
@@ -582,7 +595,7 @@ HELP_CATEGORIES = {
             "**Sessions:** `/session config`, `/session swap`, `/session view`, `/session audit`, `/trigger`\n\n"
             "**In-channel:** `/whisper`, `/speak`, `/refresh`, `/cancel`, `/suspend`, `/purge`, `/compact`, `/clear`\n\n"
             "**Setup and data:** `/settings`, `/export`, `/import`, `/privacy`, `/terms`, `/invite`, `/whoami`, `/viewavatar`\n\n"
-            "**Documentation:** `/start` (guided setup), `/guide` (this browser), `/help`\n\n"
+            "**Documentation:** `/start` (guided setup), `/guide` (this browser), `/help`, `/news` (what changed in each release)\n\n"
             "**Operator:** `/mod`, `/shutdown`\n\n"
             "`/refresh`, `/cancel`, `/suspend`, `/purge`, `/memorise`, `/compact`, `/play stop`, `/session config` and `/session swap` require "
             "administrator permission — though an admin can set a channel to **Open casting**, which opens `/session config` "
@@ -889,6 +902,7 @@ DEFAULT_HELP_DOCS = {
     ),
     "apis/openrouter.txt": (
         "Requirements: An OpenRouter API Key submitted via `/start` or `/settings` -> API Keys.\n"
+        "MimicAI Auto: In Set Models -> Response, the OpenRouter tab's Browse dropdown lists up to three tiers first -- Auto · Free, Auto · Budget and Auto · Recommended -- each a Primary and a Fallback the bot owner picks in `/mod` and can change at any time. A profile on a tier runs whatever it names from its next reply, sent with the host and service tier the owner set for it rather than the profile's own Hosts & Tier. New profiles on OpenRouter start on Auto · Free, and a tier the owner has left empty is not offered. Choosing a tier sets the Primary and the Fallback; the Fallback can then be changed on its own. `/settings` -> Override Defaults, having no Browse dropdown, lists the tiers in the model dropdowns.\n"
         "Capabilities: Allows users to access non-Google models like Anthropic's Claude, Meta's Llama, DeepSeek and xAI's Grok. OpenRouter models are also the only ones that honour the advanced sampling parameters (Min P, Top A, and the frequency, presence and repetition penalties).\n"
         "Cost and free models: One key covers every model, billed per token from an OpenRouter credit balance. Some models cost nothing to run -- Space Bunny Alpha, DeepSeek V4 0731, and OpenRouter's own Free Models Router, which routes to a free model for you -- and they are supported like any other, including as a fallback model. Free or paid, you are only offered models some host is known to serve without training on what it is sent, so a free model here is not paying for itself with your conversations. This is why OpenRouter is the provider to connect first; add Google Gemini for Gemini's speech and image models.\n"
         "Web search and links: Native Grounding and URL Context on OpenRouter use OpenRouter's own web search and fetch tools. The model searches or opens a link when it decides to, through its provider's own search where it has one and Exa otherwise, and each search is billed to the OpenRouter balance. RAG and Legacy RAG search on the Grounding Summariser's model, which ships as DeepSeek for anyone who prefers OpenRouter.\n"
@@ -949,12 +963,13 @@ DEFAULT_HELP_DOCS = {
     # --- SESSIONS ---
     "sessions/session_config.txt": (
         "Command: `/session config` (server administrators)\n"
-        "Capabilities: Configures the multi-profile chat session in this channel. The Cast tab adds and removes participants (up to 200). The Source button cycles through four sources: personal, borrowed, System and child bot. The Config tab sets execution order, the Master Prompt, TTS and the per-round response limit.\n"
+        "Capabilities: Configures the multi-profile chat session in this channel. The Cast tab adds and removes participants (up to 200). The Source button cycles through four sources: personal, borrowed, System and child bot. The Config tab's dropdown opens each of its settings on its own screen: execution order, the Master Prompt, TTS, the per-round response limit and the Settle Window, with Cast access below it.\n"
         "One profile, one seat: a profile speaks either as a child bot or as a webhook, never both. Seating the same profile the other way is refused, and the dropdown marks it 'Already seated as a webhook' (or as a child bot) so the clash is visible before it is attempted. Remove it and add it back the other way to change how it speaks.\n"
         "System profiles: profiles published by the bot operator, addressable by everyone. They are seated like any other participant. A personal or borrowed profile of the same name takes precedence and the System one is not offered.\n"
         "Execution Modes: 'Sequential' forces participants to speak in a strict order. 'Random' shuffles the speaker order every round.\n"
         "Master Prompt: A scene prompt shared by every participant in the session -- the setting, the situation, what is happening. Distinct from any individual profile's persona.\n"
         "Response Limit: Caps how many profiles reply in a single round, so a large cast does not answer every message all at once.\n"
+        "Settle Window: How long a round waits before it reads the channel, so several quick messages -- from one person or several -- get one reply instead of one each. The replying character's placeholder is already up while it waits. Quiet gap (0-10 seconds, default 3) is how long the channel must be quiet after the last message; 0 starts the round at once. Maximum wait (up to 30, default 8) caps the wait while messages keep arriving. Typing wait (0-30, default 15, 0 for off) is how long the first person typing can hold the round so a follow-up still being written makes it in. Who answers is decided by the message that opened the round. Messages sent while a character is replying always go into the next round together. Reset to Defaults clears all three.\n"
         "Seating versus starting: choosing a profile on the Cast tab seats it immediately -- it appears on the Reactivity tab and can have its chance and wakewords set straight away, with no button press in between. It does not make the channel live. Until 'Start / Update Session' is pressed the session is a draft: the footer reads 'Draft', ordinary messages pass through untouched and the AI Director stays quiet. The button, on every tab, starts it -- saving the configuration, loading the transcript, and telling every child bot in the cast which channel it is in. Pressing it again on a live session re-saves and re-announces.\n"
         "An empty cast is allowed. A started session with nobody in it keeps its transcript, Master Prompt and settings and simply has no one to answer, which is what 'Clear Cast' leaves behind. `/suspend` is what ends a session outright.\n"
         "Rolling Synopsis (Compaction tab): once a conversation reaches 50 public turns, the oldest 25 are folded into one running synopsis that every participant is given with each reply, so a long scene keeps its thread after it scrolls out of Short-Term Memory. Sessions created now start with it on; a session made before keeps what it had. 'Edit Settings' sets when it folds, how many turns go each time, the synopsis length (100-800 words, 220 by default) and the summariser -- left blank, it runs the same models as the LTM Summariser. Turning it off puts the folded turns back into the prompt and stops sending the synopsis. Whispers are never summarised, and a folded turn is only left out of the prompt -- the transcript, regeneration and `/session audit` still have it. To fold now rather than wait, run `/compact` (or press Compact Now): everything but the newest 10 turns (`keep` sets how many) goes into the synopsis, including the pages people linked and the files they pasted, and the Rolling Synopsis is switched on if it was off. `/compact undo:True` (or Uncompact) unfolds every turn and removes the synopsis; while the Rolling Synopsis stays on, it starts folding again once the session is past its trigger.\n"
@@ -1143,7 +1158,7 @@ DEFAULT_HELP_DOCS = {
         "Other speech settings: TTS on/off, temperature and speed are at `/profile manage` -> Audio -> Set Speech Settings, and the language at Audio -> Set TTS Language; the speech model is under Set Models, on Google or OpenRouter. Temperature, language and the Director's Desk reach Gemini models only: an OpenRouter speech model is sent the reply alone, as MP3, with the speed if one is set -- and only some hosts, such as OpenAI's, honour speed. Language is Auto-detect unless pinned, and Gemini then reads it from the text. New profiles start at temperature 0.1; a lower temperature produces stable audio, and values far from default cause audible artefacts.\n"
         "Cloned voice: `/profile voice_sample` gives a profile you own a voice cloned from a short recording -- a clean 10 to 30 seconds of one speaker, up to 1 MB, with an optional transcript of what is said. A profile has 3 slots; choose one with `slot`, or leave it out to fill an empty one. Choose TTS Voice selects which slot the profile speaks with, and only that recording is sent. Only upload your own voice, or one you have the speaker's permission to use. It is stored encrypted with the profile, sent only to speech models that can clone a voice (marked 'clones voices' in the OpenRouter tab), and used by anyone who borrows the profile. Remove a slot's recording from Choose TTS Voice.\n"
         "Audio tags: Inline tags in a response steer delivery for that stretch of text -- `[whispers]`, `[shouting]`, `[laughs]`, `[sighs]`, `[excitedly]`, `[sarcastic]`. There is no fixed list; the model interprets what it is given. OpenRouter speech models other than Fish Audio S2 and Qwen Audio 3.0 are sent the reply without them, and every OpenRouter model without an action standing as its own sentence ('*sighs* Fine.'), so neither is read out as words; a stressed word, as in 'I *never* said that', is still spoken.\n"
-        "Session audio: `/session config` -> Config -> Toggle TTS chooses text-only, audio plus text, audio only, or multi-audio, which holds each participant's audio until the round ends and stitches it into one file.\n"
+        "Session audio: `/session config` -> Config -> Text-to-Speech switches voicing on or off for the channel. While it is on, each reply from a character with speech set up carries an audio clip; while it is off, nobody in that channel is voiced.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Audio sounds garbled or erratic.' Fix: Lower the speech temperature back towards its default.\n"
         "- Symptom: 'No audio is generated.' Fix: The warning under the reply names the reason. Most often the server has no key for the speech model's provider -- Google for a Gemini speech model, OpenRouter for an OpenRouter one; the profile's own text model does not matter.\n"
@@ -1244,6 +1259,13 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'Import rejected: the file belongs to a different MimicAI instance.' Fix: A Standard Export imports only where it was made. To move to a self-hosted instance, export again with Export for Self-Hosted and enter the passphrase on import. The official bot cannot import from other instances at all."
     ),
 }
+
+# The newest release's notes, so `/help` can answer "what changed". The newest alone: an older
+# release describes features since changed, and retrieval would state them as current.
+_LATEST_RELEASE = latest_release_text()
+if _LATEST_RELEASE:
+    DEFAULT_HELP_DOCS["news/latest_release.txt"] = (
+        "Command: `/news` shows these notes, and every release's since Beta v0.7.0.\n" + _LATEST_RELEASE)
 
 
 OLLAMA_GUIDE_TEXT = (

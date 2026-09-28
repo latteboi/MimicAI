@@ -115,10 +115,14 @@ _STATIC_DASHBOARDS = [
                 "An empty cast is allowed.",
             ]),
             ("Config", [
-                "Toggle Execution (sequential or random turn order)",
-                "Edit Master Prompt (the scene prompt every participant sees)",
-                "Toggle TTS (per-round audio, including stitched multi-audio)",
-                "Set Response Limit (maximum replies per round)",
+                "A dropdown; each setting opens its own screen on the same message, with Back",
+                "Execution Mode (sequential or random turn order)",
+                "Master Prompt (the scene prompt every participant sees): Edit, Clear",
+                "Text-to-Speech (on or off for the channel)",
+                "Response Limit (maximum replies per round)",
+                "Settle Window (quiet gap, maximum wait and typing wait before a round "
+                "reads the channel): Edit Values, Reset to Defaults",
+                "Cast access (administrators): whether any member may seat characters here",
             ]),
             ("Reactivity", ["Edit Chance & Wakewords (probability rolls and exact-match interjection)"]),
             ("Proactivity", [
@@ -164,7 +168,9 @@ _STATIC_DASHBOARDS = [
                           "Reset All Content Ratings (instance-wide, one-off baseline reset)"]),
             ("Prompts", ["Override the global system prompts, including CONTENT_POLICY and HELP_MODE_INJECTION",
                          "System Models: the attachment describer and content classifier (per "
-                         "provider preference), embeddings, System profiles and Gemini key checks"]),
+                         "provider preference), embeddings, System profiles and Gemini key checks",
+                         "System Models -> Auto · Free, Budget and Recommended: each tier's "
+                         "OpenRouter Primary and Fallback, with Hosts & Tier for every profile on it"]),
             ("Docs", ["Edit the documentation shards backing Help Mode; re-embeds on save"]),
             ("Blacklist", ["Block users and servers (leave, or quarantine), silently; "
                            "blocks may be temporary",

@@ -29,7 +29,7 @@ from ..utils.helpers import (_format_api_error, _resolve_safety_settings,
                             google_thinking_caps, resolve_image_output_params,
                             resolve_image_tools, resolve_media_resolution,
                             resolve_native_tools, resolve_openrouter_image_detail,
-                            resolve_openrouter_endpoint, resolve_openrouter_service_tier,
+                            openrouter_routing, resolve_auto_models,
                             resolve_thinking_params, system_model)
 from ..utils.http_client import get_shared_client
 from ..utils.user_defaults import model_chain
@@ -299,7 +299,8 @@ class APIService:
         # it needs is already in hand.
         media_res = resolve_media_resolution(p_settings)
         image_detail = resolve_openrouter_image_detail(p_settings)
-        service_tier = resolve_openrouter_service_tier(p_settings)
+        # A MimicAI Auto model goes where the bot owner routed its tier, not the profile.
+        endpoint, service_tier = openrouter_routing(self.cog, p_settings, raw_model_name)
 
         if policy_guild_id is not None and not conversation:
             raise TypeError("policy_guild_id is only read for a conversation")
@@ -331,7 +332,7 @@ class APIService:
                     image_params=resolve_image_output_params(image_config, f"OPENROUTER/{actual_name}"))
                 return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
             model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params, image_detail=image_detail, service_tier=service_tier, data_collection=data_collection,
-                                    endpoint=resolve_openrouter_endpoint(p_settings, actual_name),
+                                    endpoint=endpoint,
                                     tools=declarations(functions),
                                     server_tools=[OPENROUTER_SERVER_TOOLS[k] for t in tools or ()
                                                   for k in t if k in OPENROUTER_SERVER_TOOLS])
@@ -439,7 +440,10 @@ class APIService:
 
     def model_chain(self, config: Optional[Dict[str, Any]], primary_key: str,
                     owner_id: Optional[int]) -> Tuple[str, Tuple[str, ...]]:
-        """`user_defaults.model_chain` under the provider preference of `config`'s owner."""
+        """`user_defaults.model_chain` under the provider preference of `config`'s owner, with
+        a MimicAI Auto response slot turned into the models its tier runs on today."""
+        if primary_key == "primary_model":
+            config = resolve_auto_models(self.cog, config)
         return model_chain(config, primary_key,
                            self.cog.profile_manager.provider_preference(owner_id))
 

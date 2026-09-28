@@ -657,7 +657,8 @@ class MimicCog(EventListeners, commands.Cog):
         )
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
         
-        embed.add_field(name="Version", value="v0.6.1 Beta", inline=True)
+        from .utils.news import current_version
+        embed.add_field(name="Version", value=current_version() or "Beta", inline=True)
         embed.add_field(name="Global Scope", value=f"{len(self.bot.guilds)} Servers", inline=True)
 
         if is_owner:
@@ -2023,6 +2024,17 @@ class MimicCog(EventListeners, commands.Cog):
         from .utils.content import HELP_CATEGORIES
         view = DropdownContentView(HELP_CATEGORIES, "MimicAI Help & Documentation")
         await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
+
+    @app_commands.command(name="news", description="What changed in each release of MimicAI.")
+    @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
+    async def news_slash(self, interaction: discord.Interaction):
+        from .utils.news import releases
+        notes = releases()
+        if not notes:
+            await interaction.response.send_message("No release notes shipped with this instance.", ephemeral=True)
+            return
+        view = DropdownContentView(notes, "MimicAI News")
+        await interaction.response.send_message(embed=view.get_embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="help", description="Toggle MimicGuide into this session, or instantly ask a technical question.")
     @app_commands.checks.cooldown(2, 60.0, key=lambda i: i.user.id)

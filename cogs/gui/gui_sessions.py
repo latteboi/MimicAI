@@ -9,8 +9,7 @@ import asyncio
 import urllib.parse
 from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
 from ..utils.helpers import (_estimate_text_tokens, _get_user_hash, billable_output_tokens,
-                             clean_model_name, resolve_openrouter_endpoint,
-                             resolve_openrouter_service_tier,
+                             clean_model_name, openrouter_routing, resolve_auto_model,
                              strip_history_envelope, turn_posted_at)
 from ..utils.data_policy import may_pick_training_models
 from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PAGE, add_button,
@@ -3084,6 +3083,7 @@ class SessionAuditView(BlockedGuard, ui.View):
                         sys_instr, turn_context, _, _, _, _, prim_mod, _ = self.cog.generation_service._construct_system_instructions(
                             o_id, p_name, self.channel_id, is_multi_profile=True,
                             functions=functions_for(p_cfg))
+                        prim_mod = resolve_auto_model(self.cog, prim_mod)
                         sys_toks = _estimate_text_tokens(sys_instr + "\n\n" + (turn_context or ""))
 
                         # The window the next reply would actually get. The last N raw
@@ -3114,13 +3114,12 @@ class SessionAuditView(BlockedGuard, ui.View):
                         # The projection is the rate table, which only knows standard
                         # rates for a listed model id. Say so when the profile has asked
                         # for a tier, rather than quoting a number the turn will not cost.
-                        tier = resolve_openrouter_service_tier(p_cfg)
-                        pinned = resolve_openrouter_endpoint(p_cfg, str(prim_mod or "").removeprefix("OPENROUTER/"))
+                        pinned, tier = openrouter_routing(self.cog, p_cfg, prim_mod)
                         if pinned:
-                            tier_note = (f"\n*(Priced at standard rates; this profile pins this model to "
+                            tier_note = (f"\n*(Priced at standard rates; this model is pinned to "
                                          f"`{pinned}`, so the billed figure may differ.)*")
                         elif tier:
-                            tier_note = (f"\n*(Priced at standard rates; this profile requests the "
+                            tier_note = (f"\n*(Priced at standard rates; this model is sent at the "
                                          f"`{tier}` tier, so the billed figure will differ.)*")
                         else:
                             tier_note = ""

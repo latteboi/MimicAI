@@ -7,8 +7,8 @@ from discord import ui
 import datetime
 from string import Formatter
 from typing import TYPE_CHECKING, Dict, List, Set, Tuple, Optional, get_args
-from ..utils.helpers import _sanitise_filename, system_model
-from ..utils.user_defaults import model_slot_defaults, other_provider
+from ..utils.helpers import _sanitise_filename, resolve_openrouter_endpoint, system_model
+from ..utils.user_defaults import auto_wording, model_slot_defaults, other_provider
 from .base_components import (BlockedGuard, TabbedView, TimeoutCleanupMixin, add_button,
                               add_select, build_confirm_view, invalidate_model_cache)
 
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
     from ..MimicCog import MimicCog
 
-from .gui_profiles import ModelPickerMixin, ProfileManageView
+from .gui_profiles import ModelPickerMixin, OpenRouterHostView, ProfileManageView
 
 class ModBaseView(TabbedView):
     """Base for every /mod tab.
@@ -1124,6 +1124,15 @@ _PROFILE_KEYS = ("primary_model", "fallback_model", "ollama_host_url")
 #: The categories shipping a chain per provider preference, which the audience button switches.
 _BY_PROVIDER_CATEGORIES = ("describer", "classifier")
 
+#: MimicAI Auto's tiers, one category each: a tier is a Primary and a Fallback, and a tab
+#: holds three slots at most.
+_AUTO_CATEGORIES = {f"auto_{tier}": tier for tier, _wording, _desc in AUTO_TIERS}
+_AUTO_KEYS = frozenset(key for keys in AUTO_TIER_KEYS.values() for key in keys)
+_AUTO_NOTE = ("OpenRouter models only. Every profile on this tier runs your choice from its next "
+              "reply, sent with this tab's Hosts & Tier rather than its own.")
+_AUTO_UNSET_NOTE = (" A Primary of None stops offering the tier, and refuses the profiles already "
+                    "on it until one is set.")
+
 #: What each category tells the operator before they choose.
 _SYSTEM_MODEL_NOTES = {
     "describer": "Pick models that read images -- and audio, for voice messages to be described.",
@@ -1137,6 +1146,9 @@ _SYSTEM_MODEL_NOTES = {
                "Its other settings are in `/profile`."),
     "key_check": ("Called on Google's API with the pasted key, so Google models only. The billing "
                   "check must be one an unbilled key is refused: an image model."),
+    "auto_free": _AUTO_NOTE + " New profiles on OpenRouter start on this tier.",
+    "auto_budget": _AUTO_NOTE + _AUTO_UNSET_NOTE,
+    "auto_recommended": _AUTO_NOTE + _AUTO_UNSET_NOTE,
 }
 
 
@@ -1153,6 +1165,8 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         ("embedding", "Embeddings", "The vectors behind memory, training-example and /help recall."),
         ("system", "System Profiles", "The models behind each System profile's replies."),
         ("key_check", "Key Checks", "Tests a pasted Gemini key, then whether it has billing."),
+        *((f"auto_{tier}", auto_wording(AUTO_MODEL_PREFIX + tier), desc)
+          for tier, _wording, desc in AUTO_TIERS),
     )
     _CATEGORY_KEYS = {
         "describer": _slots(("describer_model", "Primary"), ("describer_fallback_model", "Fallback"),
@@ -1163,12 +1177,15 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         "system": _slots(("primary_model", "Primary"), ("fallback_model", "Fallback")),
         "key_check": _slots(("key_check_model", "Validity Check"),
                             ("key_tier_probe_model", "Billing Check")),
+        **{category: _slots((AUTO_TIER_KEYS[tier][0], "Primary"), (AUTO_TIER_KEYS[tier][1], "Fallback"))
+           for category, tier in _AUTO_CATEGORIES.items()},
     }
     #: Everything but the System profiles runs for every user, and Ollama answers the bot
     #: owner's own profiles only -- which the System profiles are.
     _NO_OLLAMA_CATEGORIES = ("describer", "classifier", "embedding", "key_check")
     _NO_RETRY_KEYS = ("describer_fallback_model", "describer_final_model",
-                      "classifier_fallback_model", "classifier_final_model")
+                      "classifier_fallback_model", "classifier_final_model",
+                      *(key for key in _AUTO_KEYS if key != AUTO_TIER_KEYS["free"][0]))
     #: No tab has a row to spare for a browse list: three slots and a button row fill
     #: Discord's five, the System Profiles tab spends one on choosing its profile, and no
     #: list holds embedding models. The model list pages on its own.
@@ -1244,6 +1261,51 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         if not shared and not section:
             self.cog.system_models.pop(self.audience, None)
         self.cog.server_manager._save_system_models()
+        if key in _AUTO_KEYS:
+            self._store_auto_pins(self.cog.system_models.get(AUTO_ENDPOINTS_KEY) or {})
+
+    # --- MimicAI Auto's Hosts & Tier -------------------------------------------
+
+    def _auto_tier(self) -> Optional[str]:
+        return _AUTO_CATEGORIES.get(self.category)
+
+    def _put(self, key: str, value: Dict):
+        """Sparse, as `_store`: an empty mapping is no entry."""
+        if value:
+            self.cog.system_models[key] = value
+        else:
+            self.cog.system_models.pop(key, None)
+        self.cog.server_manager._save_system_models()
+
+    def _auto_pins(self) -> Dict[str, str]:
+        pins = self.cog.system_models.get(AUTO_ENDPOINTS_KEY)
+        return dict(pins) if isinstance(pins, dict) else {}
+
+    def _store_auto_pins(self, pins: Dict[str, str]):
+        """Kept only for a model some tier still runs, as `prune_openrouter_endpoints` keeps a
+        profile's, so a model swapped out does not leave its pin behind."""
+        held = {str(system_model(self.cog, key)).removeprefix("OPENROUTER/") for key in _AUTO_KEYS}
+        self._put(AUTO_ENDPOINTS_KEY, {m: tag for m, tag in pins.items() if m in held})
+
+    def _pinnable_slots(self) -> List[tuple]:
+        return [(key, wording, self._value(key)) for key, wording, _d in self._CATEGORY_KEYS[self.category]]
+
+    def _current_service_tier(self):
+        return (self.cog.system_models.get(AUTO_SERVICE_TIERS_KEY) or {}).get(self._auto_tier()) or ""
+
+    def _set_service_tier(self, value):
+        tiers = dict(self.cog.system_models.get(AUTO_SERVICE_TIERS_KEY) or {})
+        if value:
+            tiers[self._auto_tier()] = value
+        else:
+            tiers.pop(self._auto_tier(), None)
+        self._put(AUTO_SERVICE_TIERS_KEY, tiers)
+
+    def _add_openrouter_buttons(self, *, row: int):
+        pins = {"openrouter_endpoints": self._auto_pins()}
+        lit = bool(self._current_service_tier()) or any(
+            resolve_openrouter_endpoint(pins, m) for m in self._pinnable_openrouter_models())
+        self._add_hosts_button(row=row, view_cls=ModAutoHostView, lit=lit)
 
     def _is_changed(self, key: str) -> bool:
         return self._value(key) != self._shipped(key)
@@ -1258,15 +1320,19 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         return ""
 
     def _api_modes(self) -> List[str]:
-        # The key checks are raw calls to Google's API with the key being checked.
-        return ["google"] if self.category == "key_check" else super()._api_modes()
+        # The key checks are raw calls to Google's API with the key being checked, and
+        # MimicAI Auto runs on OpenRouter keys.
+        if self.category == "key_check":
+            return ["google"]
+        return ["openrouter"] if self._auto_tier() else super()._api_modes()
 
     def _allows_no_fallback(self, target_config_key: str) -> bool:
         return target_config_key in self._NO_RETRY_KEYS
 
     def _tier_applies(self) -> bool:
-        """No Hosts & Tier: a tier and a pin are a profile's settings, and only one of these is."""
-        return False
+        """Hosts & Tier on the Auto tabs alone. Everywhere else a tier and a pin are a
+        profile's settings, and only the System profiles here are profiles."""
+        return self._auto_tier() is not None
 
     def _get_top_models(self, provider: str, target_config_key: str) -> List[str]:
         if target_config_key == "key_tier_probe_model":
@@ -1294,6 +1360,8 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         if value.startswith("OLLAMA/"):
             return ("Ollama can't hold a system model: these run for every user, and Ollama "
                     "answers the bot owner's own profiles only.")
+        if key in _AUTO_KEYS and not value.startswith("OPENROUTER/"):
+            return "MimicAI Auto runs on OpenRouter keys, so its tiers take OpenRouter models."
         if key in ("key_check_model", "key_tier_probe_model") and not value.startswith("GOOGLE/"):
             return "The key checks call Google's API with the pasted key, so they take a Google model."
         return None
@@ -1393,7 +1461,7 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
             return
 
         if self.view_mode not in self._api_modes():
-            self.view_mode = "google"
+            self.view_mode = self._api_modes()[0]
 
         self._add_category_select(0)
         row = 1
@@ -1434,3 +1502,27 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
             await i.response.edit_message(embed=view._get_embed(), view=view)
 
         add_button(self, "Back", back_cb, row=row)
+
+
+class ModAutoHostView(OpenRouterHostView):
+    """Hosts & Tier for one MimicAI Auto tier, bot-wide: what every profile on it is sent
+    with. Pins are the owner's, keyed by model id across the tiers as a profile's are
+    across its slots, and read at the call by `helpers.openrouter_routing`."""
+
+    _TIER_REACH = "Both of this tier's models, for every profile on it, wherever a model is left on Auto."
+
+    def _chosen(self, model_id: str) -> str:
+        return (resolve_openrouter_endpoint({"openrouter_endpoints": self.parent._auto_pins()}, model_id)
+                or self._AUTO)
+
+    def _choose(self, model_id: str, chosen: str):
+        pins = self.parent._auto_pins()
+        if chosen == self._AUTO:
+            pins.pop(model_id, None)
+        else:
+            pins[model_id] = chosen
+        self.parent._store_auto_pins(pins)
+
+    def _footer(self) -> str:
+        return (f"Bot-wide \u00b7 {auto_wording(AUTO_MODEL_PREFIX + self.parent._auto_tier())} "
+                "\u00b7 changes save as you make them")

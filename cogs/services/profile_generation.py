@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..utils.constants import (DEFAULT_PROFILE_GENERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS,
                                LIBRARY_INTRO_MAX_CHARS, defaultConfig)
-from ..utils.helpers import _format_api_error, resolve_thinking_params
+from ..utils.helpers import _format_api_error, resolve_auto_models, resolve_thinking_params
 from ..utils.user_defaults import (apply_defaults, model_chain, model_provider,
                                    model_slot_defaults)
 
@@ -158,7 +158,7 @@ def generator_models(cog, user_id: int) -> Tuple[str, Tuple[str, ...]]:
         apply_defaults(config, pm._get_user_defaults(user_id), borrowed=False)
     pm._rescue_unusable_models(user_id, config)
 
-    primary, fallbacks = model_chain(config, "primary_model", provider)
+    primary, fallbacks = model_chain(resolve_auto_models(cog, config), "primary_model", provider)
     usable: List[str] = [m for m in dict.fromkeys((primary, *fallbacks))
                          if pm._user_holds_provider_key(user_id, model_provider(m))]
     if not usable:

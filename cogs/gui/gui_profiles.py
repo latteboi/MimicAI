@@ -18,10 +18,10 @@ from ..utils.helpers import (
     google_thinking_caps, grounding_mode_display, ltm_auto_recall_enabled,
     resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
-    resolve_unreadable_media_mode, system_model,
+    resolve_unreadable_media_mode, system_model, auto_tier, resolve_auto_model,
     _format_api_error, speaks_verbatim, stored_google_voice,
 )
-from ..utils.user_defaults import final_fallback_enabled, model_provider, setting_label
+from ..utils.user_defaults import auto_wording, final_fallback_enabled, model_provider, setting_label
 from ..utils.birthdays import MONTH_NAMES, parse_birthday, valid_birthday
 
 if TYPE_CHECKING:
@@ -2876,7 +2876,17 @@ class ModelPickerMixin(ReportErrorMixin):
         """How a stored model value reads in a summary."""
         if not is_real_model(value):
             return NO_FALLBACK
+        if auto_tier(value):
+            return auto_wording(value)
         return cls.strip_prefix(value)
+
+    def _auto_label(self, value, key: str) -> str:
+        """`display_model`, and for MimicAI Auto the model its tier runs this slot on today."""
+        shown = self.display_model(value)
+        if not auto_tier(value):
+            return shown
+        model = resolve_auto_model(self.cog, value, "fallback" if key == "fallback_model" else "primary")
+        return f"{shown} ({self.display_model(model)})"
 
     @staticmethod
     def strip_prefix(value) -> str:
@@ -2947,6 +2957,9 @@ class ModelPickerMixin(ReportErrorMixin):
                 await interaction.response.send_modal(CustomModelModal(view, self.target_config_key))
             else: 
                 view._save_changes(self.target_config_key, self.values[0])
+                if self.target_config_key == "primary_model" and auto_tier(self.values[0]):
+                    # A tier is a Primary and a Fallback: choosing it for one takes both.
+                    view._save_changes("fallback_model", self.values[0])
                 view._build_view()
                 await interaction.response.edit_message(**view._picker_render())
 
@@ -3005,12 +3018,14 @@ class ModelPickerMixin(ReportErrorMixin):
         catalogue = self._openrouter_catalogue()
         browse = self._openrouter_browse()
         ids, _note = catalogue.browse(browse, show_training=self._shows_training_models())
-        per_page = self._OPENROUTER_MODELS_PER_PAGE
+        per_page = self._models_per_page()
         num_pages = max(1, (len(ids) - 1) // per_page + 1)
         page = max(0, min(getattr(self, "or_model_page", 0), num_pages - 1))
         self.or_model_page = page
 
         opts = paged_nav_options(page, num_pages, values=self._MODEL_NAV_VALUES, nav_suffix=" of models")
+        if not self._shows_openrouter_browse():
+            opts += self._auto_tier_options(target_config_key, skip=current_val)
         opts.append(discord.SelectOption(label="Custom Model...", value="custom_option",
                                          description="Enter manually via modal"))
         if self._allows_no_fallback(target_config_key):
@@ -3020,7 +3035,10 @@ class ModelPickerMixin(ReportErrorMixin):
                 default=not is_real_model(current_val)))
             if not is_real_model(current_val):
                 current_val = None
-        if current_val:
+        if current_val and auto_tier(current_val):
+            opts.append(discord.SelectOption(label=f"Current: {self._auto_label(current_val, target_config_key)}"[:100],
+                                             value=current_val, default=True))
+        elif current_val:
             current_id = self.strip_prefix(current_val)
             opts.append(discord.SelectOption(
                 label=f"Current: {catalogue.label(current_id)}"[:100], value=current_val,
@@ -3042,12 +3060,13 @@ class ModelPickerMixin(ReportErrorMixin):
         catalogue = self._openrouter_catalogue()
         authors = catalogue.authors(show_training=self._shows_training_models())
         browse = self._openrouter_browse()
-        per_page = self._OPENROUTER_AUTHORS_PER_PAGE
+        per_page = self._authors_per_page()
         num_pages = max(1, (len(authors) - 1) // per_page + 1)
         page = max(0, min(getattr(self, "or_browse_page", 0), num_pages - 1))
         self.or_browse_page = page
 
         opts = paged_nav_options(page, num_pages, values=self._BROWSE_NAV_VALUES, nav_suffix=" of authors")
+        opts += self._auto_tier_options("primary_model")
         for value, label, description in self._browse_general():
             opts.append(discord.SelectOption(label=label, value=value, description=description,
                                              default=(browse == value)))
@@ -3064,6 +3083,13 @@ class ModelPickerMixin(ReportErrorMixin):
             if value in self._BROWSE_NAV_VALUES:
                 await self._turn_openrouter_page(interaction, "or_browse_page", value)
                 return
+            if auto_tier(value):
+                # A tier is a Primary and a Fallback, so choosing one takes both slots.
+                self._save_changes("primary_model", value)
+                self._save_changes("fallback_model", value)
+                self._build_view()
+                await interaction.response.edit_message(**self._picker_render())
+                return
             self.or_browse = value
             self.or_model_page = 0
             self._build_view()
@@ -3078,10 +3104,10 @@ class ModelPickerMixin(ReportErrorMixin):
             if attr == "or_model_page":
                 ids, _note = self._openrouter_catalogue().browse(
                     self._openrouter_browse(), show_training=self._shows_training_models())
-                total, per_page = len(ids), self._OPENROUTER_MODELS_PER_PAGE
+                total, per_page = len(ids), self._models_per_page()
             else:
                 total = len(self._openrouter_catalogue().authors(show_training=self._shows_training_models()))
-                per_page = self._OPENROUTER_AUTHORS_PER_PAGE
+                per_page = self._authors_per_page()
 
             async def jump(i: discord.Interaction, page: int):
                 setattr(self, attr, page)
@@ -3146,7 +3172,8 @@ class ModelPickerMixin(ReportErrorMixin):
             # The [:100] truncation was present only in the single-profile copy. Discord
             # rejects an option label over 100 characters, so the bulk picker would raise
             # on a long custom model id; sharing this version fixes that.
-            opts.append(discord.SelectOption(label=f"Current: {current_val}"[:100], value=current_val, default=True))
+            opts.append(discord.SelectOption(label=f"Current: {self.display_model(current_val) if auto_tier(current_val) else current_val}"[:100],
+                                             value=current_val, default=True))
         
         prefix = "GOOGLE/"
         if self.view_mode == 'openrouter': prefix = "OPENROUTER/"
@@ -3168,6 +3195,27 @@ class ModelPickerMixin(ReportErrorMixin):
                 opts.append(discord.SelectOption(label="⚠️ Ollama Offline / No Models", value="ollama_offline", description=f"Check {host}"[:100]))
             
         return opts
+
+    def _auto_tier_options(self, key: str, skip=None) -> List[discord.SelectOption]:
+        """MimicAI Auto's tiers the bot owner has given a Primary, each named with the model it
+        runs `key` on today. The Browse dropdown lists them first, or the model rows on a
+        screen with no Browse row. Response only, for now."""
+        if self.category != 'response':
+            return []
+        opts = []
+        for tier, _wording, description in AUTO_TIERS:
+            value = AUTO_MODEL_PREFIX + tier
+            if value != skip and is_real_model(resolve_auto_model(self.cog, value)):
+                opts.append(discord.SelectOption(label=self._auto_label(value, key)[:100],
+                                                 value=value, description=description))
+        return opts
+
+    def _authors_per_page(self) -> int:
+        return self._OPENROUTER_AUTHORS_PER_PAGE - (len(AUTO_TIERS) if self.category == 'response' else 0)
+
+    def _models_per_page(self) -> int:
+        tiers = self.category == 'response' and not self._shows_openrouter_browse()
+        return self._OPENROUTER_MODELS_PER_PAGE - (len(AUTO_TIERS) if tiers else 0)
 
     async def _update_ollama_status(self):
         """Probes this view's Ollama host; the models it lists are read back off the service.
@@ -3198,7 +3246,7 @@ class ModelPickerMixin(ReportErrorMixin):
         api_modes = self._api_modes()
         api_labels = {'google': 'API: Google', 'openrouter': 'API: OpenRouter', 'ollama': 'API: Ollama (Local)'}
         if self.view_mode not in api_modes:
-            self.view_mode = 'google'
+            self.view_mode = api_modes[0]
         
         async def api_cb(i: discord.Interaction):
             next_idx = (api_modes.index(self.view_mode) + 1) % len(api_modes)
@@ -3416,7 +3464,7 @@ class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
 
         for key, wording_slot, default in self._CATEGORY_KEYS[self.category]:
             e.add_field(name=wording_slot,
-                        value=f"`{self.display_model(data.get(key, default))}`", inline=True)
+                        value=f"`{self._auto_label(data.get(key, default), key)}`", inline=True)
         if self.category == 'response':
             state = data.get("show_fallback_indicator", True)
             e.add_field(name="Fallback Indicator",
@@ -3617,6 +3665,9 @@ class OpenRouterHostView(BlockedGuard, ui.View):
         """(embed text, dropdown reason) for a slot holding no OpenRouter model."""
         if not is_real_model(value):
             return "No model set.", "not an OpenRouter model"
+        if auto_tier(value):
+            return (f"`{self.parent.display_model(value)}` is sent where the bot owner routes it.",
+                    "routed by the bot owner")
         return (f"`{self.parent.display_model(value)}` is not an OpenRouter model, "
                 "so there is no host to choose.", "not an OpenRouter model")
 

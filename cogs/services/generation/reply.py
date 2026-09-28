@@ -321,7 +321,8 @@ class ReplyMixin:
         the safety settings of no channel, since the card can be opened in any. It brings
         its own `function_context`, which bills a search to that same key.
         """
-        _, chain = self.cog.api_service.model_chain(
+        # The Primary too, not only the rest: a MimicAI Auto slot is a tier until this resolves it.
+        primary_model, chain = self.cog.api_service.model_chain(
             {**p_settings, "primary_model": primary_model, "fallback_model": fallback_model_name},
             "primary_model", owner_id)
         fallback_names = [name for name in dict.fromkeys(chain) if name != primary_model]

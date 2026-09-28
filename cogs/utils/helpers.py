@@ -21,7 +21,8 @@ from .constants import (
     PATTERN_TIMESTAMP_HEADER, PATTERN_METADATA, PATTERN_MESSAGE_LINK,
     PATTERN_SPEAKER_CLOSE, PATTERN_STRAY_WRAPPERS,
     PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK, SYSTEM_MODEL_DEFAULTS,
-    SYSTEM_MODEL_DEFAULTS_BY_PROVIDER,
+    SYSTEM_MODEL_DEFAULTS_BY_PROVIDER, AUTO_MODEL_PREFIX, AUTO_TIER_KEYS,
+    AUTO_ENDPOINTS_KEY, AUTO_SERVICE_TIERS_KEY,
     IMAGE_COMMAND_PREFIXES, IMAGE_MODEL_CAPS, IMAGE_MODEL_CAPS_DEFAULT, IMAGE_THINKING_LEVELS,
     OPENROUTER_IMAGE_CAPS_UNKNOWN, IMAGE_MIME_SUFFIXES, IMAGE_SUFFIX_MIMES,
     IMAGE_GROUNDING_TOOL_MODES, DEFAULT_TYPING_CURSOR,
@@ -1610,6 +1611,55 @@ def system_model(cog, key: str, provider: Optional[str] = None) -> str:
         return stored.get(key) or SYSTEM_MODEL_DEFAULTS[key]
     side = provider if provider in SYSTEM_MODEL_DEFAULTS_BY_PROVIDER else "gemini"
     return (stored.get(side) or {}).get(key) or SYSTEM_MODEL_DEFAULTS_BY_PROVIDER[side][key]
+
+
+def auto_tier(value: Optional[str]) -> Optional[str]:
+    """The MimicAI Auto tier a stored response slot names, or None for any other value."""
+    text = str(value or "")
+    return text[len(AUTO_MODEL_PREFIX):] if text.startswith(AUTO_MODEL_PREFIX) else None
+
+
+def resolve_auto_model(cog, value: Optional[str], role: str = "primary") -> Optional[str]:
+    """`value` itself, or for `AUTO/<tier>` the model the bot owner runs that tier's `role`
+    on today. A tier with nothing set -- or one this build does not know -- is NO_FALLBACK,
+    which `_instantiate_model` refuses: never another tier's model, which may cost money."""
+    tier = auto_tier(value)
+    if tier is None:
+        return value
+    keys = AUTO_TIER_KEYS.get(tier)
+    return system_model(cog, keys[role == "fallback"]) if keys else NO_FALLBACK
+
+
+def resolve_auto_models(cog, config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """`config` with its Auto response slots turned into models, for `model_chain`. A copy
+    when one is Auto, never written back: a stored model id is what Auto exists to avoid."""
+    config = config or {}
+    if not (auto_tier(config.get("primary_model")) or auto_tier(config.get("fallback_model"))):
+        return config
+    return {**config,
+            "primary_model": resolve_auto_model(cog, config.get("primary_model")),
+            "fallback_model": resolve_auto_model(cog, config.get("fallback_model"), "fallback")}
+
+
+def openrouter_routing(cog, config: Optional[Dict[str, Any]],
+                       raw_model_name: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """(pinned endpoint, service tier) an OpenRouter model is sent with under `config`.
+
+    A model one of the profile's response slots runs through MimicAI Auto is routed as the
+    bot owner set that tier in /mod, the profile's own pins and tier aside: the owner chose
+    the model, so the owner chooses its host. By model name, as a pin is, because
+    `_instantiate_model` is never told the slot.
+    """
+    config = config or {}
+    model_id = str(raw_model_name or "").removeprefix("OPENROUTER/")
+    for key, role in (("primary_model", "primary"), ("fallback_model", "fallback")):
+        tier = auto_tier(config.get(key))
+        if tier and resolve_auto_model(cog, config.get(key), role) == raw_model_name:
+            stored = getattr(cog, "system_models", None) or {}
+            config = {"openrouter_endpoints": stored.get(AUTO_ENDPOINTS_KEY),
+                      "openrouter_service_tier": (stored.get(AUTO_SERVICE_TIERS_KEY) or {}).get(tier)}
+            break
+    return resolve_openrouter_endpoint(config, model_id), resolve_openrouter_service_tier(config)
 
 
 def is_gateway_shutdown(exc: BaseException) -> bool:

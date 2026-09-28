@@ -1,0 +1,26 @@
+v0.7.0 Beta — 2026-09-28
+Characters wait for you to finish, run on more of OpenRouter, remember birthdays and can speak in a cloned voice.
+
+**Added**
+- **Settle Window** (`/session config` → Config): quick messages in a row get one reply. Quiet gap 3 s, maximum wait 8 s and typing wait 15 s by default.
+- **MimicAI Auto** (Set Models → Response → OpenRouter's Browse dropdown): Free, Budget and Recommended tiers whose models, hosts and service tier the bot owner sets in `/mod` and keeps current. New OpenRouter profiles start on Auto · Free.
+- **OpenRouter** keys now run image generation, speech, Native grounding and URL Context, and memory search. RAG is now a search the character calls itself; the old behaviour is Legacy RAG.
+- **Final Fallback** (Params): once both models fail, one more try on the other provider's shipped model. Off by default.
+- **Birthdays**: a character's on its Persona tab, yours in `/settings` → About Me. It is told the day before, on the day and the day after.
+- **`/profile voice_sample`**: a cloned voice from a 10–30 s recording, in three slots per profile.
+- **Gemini 3.8 speech** for new Google profiles, with Search Voice Library, Use Voice ID and Design a Voice.
+- **Edit Profile Message** (right-click → Apps): server admins rewrite a profile's reply in the channel and its log. Replies now split at 1,934 characters.
+- **Library intros**: up to 300 characters, set in Misc or Profile Sharing; `/profile generate` drafts one.
+- **Unreadable attachments** no longer fail a turn: the fallback reads the file, or the character is told it could not. Params → Unreadable Attachments → Simulated has a cheap model describe it first.
+- **`/news`**: these notes, from this release on. `/whoami` reads its version from them.
+
+**Changed**
+- **`/start`**: choosing a provider registers you, and nothing is stored before. The key step works in servers, and `/settings` is no longer DM-only.
+- **`/profile hub` → Profile Sharing**: offer a borrow or a clone to up to ten users directly. Codes are gone; offers wait in Incoming Shares.
+- **`/profile manage`** has nine tabs: Images, Audio, Training and Misc now have their own.
+- **Content safety**: Adult 18+ profiles can't be shared or cloned, and leave the Library if re-rated Adult or Unrated.
+- **Timezones**: set yours in About Me. Each character reads every message on its own clock, time awareness is always on, and a profile with no timezone runs on UTC.
+
+**Performance**
+- **Prompt caching**: per-turn context moved into the newest message and the history window steps in halves, so providers can cache the rest. `/session audit` shows cached tokens.
+- **Placeholders** go up as soon as a message lands. The wait happens behind them, and a slow step says what it is doing.

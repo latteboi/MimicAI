@@ -294,11 +294,11 @@ class SpeakAsMixin:
 
         status = "api_error"
         try:
+            primary_model, fallbacks = self.cog.api_service.model_chain(
+                {**p_settings, "primary_model": primary_model, "fallback_model": fallback_model},
+                "primary_model", owner_id)
             result, model_used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                *self.cog.api_service.model_chain(
-                    {**p_settings, "primary_model": primary_model, "fallback_model": fallback_model},
-                    "primary_model", owner_id),
-                _attempt, label="Speak rewrite")
+                primary_model, fallbacks, _attempt, label="Speak rewrite")
             response, _state = result
         except asyncio.CancelledError:
             raise

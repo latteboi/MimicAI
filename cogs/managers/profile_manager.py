@@ -42,9 +42,10 @@ from ..utils.constants import (
     IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_CONSENT_FILES, VOICE_SAMPLE_SLOT_FILES, VOICE_SAMPLE_SLOT_KEY, VOICE_SAMPLE_SLOTS,
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_MODES, GREEDY_SAMPLING, SYSTEM_PROFILE_MODEL,
     MODEL_PROVIDERS, PROVIDER_CHOICES, NOT_REGISTERED, )
-from ..utils.helpers import (image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
+from ..utils.helpers import (auto_tier, image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
                             ltm_auto_recall_enabled, resolve_critic_settings,
                             grounding_mode_display, resolve_image_output_params,
+                            resolve_auto_model, resolve_auto_models,
                             resolve_image_tools, resolve_thinking_params,
                             resolve_unreadable_media_mode,
                             resolve_url_mode, suppress_link_previews, system_model)
@@ -4010,7 +4011,12 @@ class ProfileManager:
         # the label line, then each fallback on a subtext line of its own, as `GO/`/`OR/`/`OL/`
         # and the bare model: the full ids ran three to a line and wrapped into a wall.
         preferred = self.provider_preference(user_id)
-        response_config = {**config, "primary_model": prim_model, "fallback_model": fall_model}
+        response_config = resolve_auto_models(
+            self.cog, {**config, "primary_model": prim_model, "fallback_model": fall_model})
+        # A MimicAI Auto slot reads as its tier, with the model it runs on today beside it.
+        auto_names = {resolve_auto_model(self.cog, value, role): short_model_name(value)
+                      for value, role in ((prim_model, "primary"), (fall_model, "fallback"))
+                      if auto_tier(value)}
         model_lines = []
         providers = {}
         for label, key in (("Response", "primary_model"), ("Image", "image_generation_model"),
@@ -4020,8 +4026,11 @@ class ProfileManager:
                 response_config if key == "primary_model" else config, key, preferred)
             providers[key] = {model_provider(m) for m in (primary, *fallbacks)}
             rest = [m for m in dict.fromkeys(fallbacks) if m != primary]
-            model_lines.append(f"**{label}** \u2192 **`{short_model_name(primary)}`**")
-            model_lines.extend(f"-# \u21b3 `{short_model_name(m)}`" for m in rest)
+            tiers = auto_names if key == "primary_model" else {}
+            shown = lambda m: (f"{tiers[m]} ({short_model_name(m)})" if m in tiers
+                               else short_model_name(m))
+            model_lines.append(f"**{label}** \u2192 **`{shown(primary)}`**")
+            model_lines.extend(f"-# \u21b3 `{shown(m)}`" for m in rest)
 
         embed.add_field(name="Models", value="\n".join(model_lines)[:1024], inline=False)
 

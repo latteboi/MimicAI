@@ -1019,6 +1019,34 @@ OPENROUTER_SHIPPED_MODELS = {
     'grounding_rag_model': ('OPENROUTER/deepseek/deepseek-v4-flash-0731',),
 }
 
+#: MimicAI Auto: a response model the bot owner points at models in /mod -> System Models,
+#: per tier, so a profile follows the owner's pick instead of holding the day's id -- a
+#: stealth or `:free` model is withdrawn, and a profile pinned to one outlives it. Stored in
+#: a response slot as `AUTO/<tier>` and turned into a model at the call
+#: (`helpers.resolve_auto_model`). OpenRouter models only, so `model_provider` can answer
+#: for the prefix without resolving it.
+AUTO_MODEL_PREFIX = 'AUTO/'
+#: (tier, wording, what it is for), cheapest first.
+AUTO_TIERS = (
+    ('free', 'Free', 'Free models. OpenRouter caps how many requests a day.'),
+    ('budget', 'Budget', 'Low-cost models.'),
+    ('recommended', 'Recommended', "The bot owner's pick for most characters."),
+)
+#: What a new profile on OpenRouter starts on.
+AUTO_DEFAULT = AUTO_MODEL_PREFIX + 'free'
+#: Each tier's System Models keys, Primary then Fallback. Free ships the OpenRouter response
+#: Primary and OpenRouter's own free router, not the shipped Fallback, which costs; Budget and
+#: Recommended ship unset, and a tier with no Primary is offered to no one.
+AUTO_TIER_KEYS = {tier: (f'auto_{tier}_model', f'auto_{tier}_fallback_model')
+                  for tier, _wording, _desc in AUTO_TIERS}
+SYSTEM_MODEL_DEFAULTS.update({key: NO_FALLBACK for keys in AUTO_TIER_KEYS.values() for key in keys})
+SYSTEM_MODEL_DEFAULTS.update(zip(AUTO_TIER_KEYS['free'], (OPENROUTER_SHIPPED_MODELS['primary_model'][0],
+                                                          'OPENROUTER/openrouter/free')))
+#: The owner's Hosts & Tier for Auto, in the System Models file: pins keyed by model id, as
+#: a profile's are, and a Default Tier per Auto tier. A profile's own never reach an Auto model.
+AUTO_ENDPOINTS_KEY = 'auto_endpoints'
+AUTO_SERVICE_TIERS_KEY = 'auto_service_tiers'
+
 #: Greedy, for every pass that transcribes rather than writes -- the describer, the
 #: classifier, the critic, the LTM summariser and compaction: a second character reading a cached
 #: description should read what the first one did. `top_k` twice because the OpenRouter
