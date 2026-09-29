@@ -26,8 +26,7 @@ HELP_CATEGORIES = {
         "What MimicAI Is": (
             "MimicAI runs AI characters -- called **profiles** -- inside Discord.\n\n"
             "A profile holds a persona, a set of instructions, a model choice, sampling parameters, and its own memory. "
-            "Profiles speak either through **webhooks** (a distinct name and avatar with no extra bot application) or as a "
-            "**child bot** (a real Discord application with its own presence in the member list).\n\n"
+            "Profiles speak through **webhooks**: a distinct name and avatar, with no extra bot application.\n\n"
             "Profiles talk inside **sessions**. A session is bound to one channel, holds a cast of profiles, and keeps a single "
             "shared transcript that each participant sees from its own point of view.\n\n"
             "Use the dropdowns below to browse the documentation. For a question you would rather just ask, use `/help ask:<your question>`."
@@ -273,8 +272,8 @@ HELP_CATEGORIES = {
     "5. Sessions": {
         "Starting and Shaping a Session": (
             "`/session config` (administrators) opens the session dashboard.\n\n"
-            "**Cast** adds and removes participants -- personal, borrowed, System, or child bots. Up to 200. "
-            "A profile speaks as a child bot **or** as a webhook, never both, so seating the same one twice is refused.\n\n"
+            "**Cast** adds and removes participants -- personal, borrowed, or System. Up to 200. "
+            "A profile has one seat, so seating the same one twice is refused.\n\n"
             "Choosing a profile seats it and saves it at once; **Start / Update Session** is what makes the channel live. "
             "Until then the dashboard footer reads *Draft* and nothing in the channel runs. An empty cast is a valid "
             "session -- it simply has nobody to answer.\n\n"
@@ -478,8 +477,8 @@ HELP_CATEGORIES = {
             "character, and any edit you make reaches them. If you delete or rename the original, their copy is severed.\n\n"
             "**Send as Clone** offers an *independent copy* -- a new Class A profile the recipient owns and can edit "
             "freely, with no link back to you.\n\n"
-            "Cloning deliberately scrubs Long-Term Memories and any child-bot configuration. Memories are conversation history and are not "
-            "yours to hand on; child-bot config contains a token.\n\n"
+            "Cloning deliberately scrubs Long-Term Memories, which are conversation history and not "
+            "yours to hand on.\n\n"
             "Both require the profile to be rated **General** (or Exempt). An **Adult 18+** "
             "profile cannot be shared, cloned or published, and an **Unrated** one cannot either until you rate it. **Profile Sharing** "
             "lists only the profiles that qualify."
@@ -520,14 +519,6 @@ HELP_CATEGORIES = {
             "three minutes, a listed or borrowed profile is re-checked automatically and any other is set to Unrated.\n\n"
             "**Disputes.** A classifier Adult verdict can only be cleared by the bot operator. Editing the persona lets you "
             "submit again, which is usually faster."
-        ),
-        "Child Bots": (
-            "A child bot gives a profile its own Discord application -- its own member-list entry, presence and status -- instead of a webhook.\n\n"
-            "Registration is restricted to the bot operator, since it means handing over a bot token. Configure at `/settings` -> **Child Bots**.\n\n"
-            "Each child runs inside the same process as the main bot, sharing its event loop; there is no separate program to run. The parent "
-            "synchronises the profile's display name and avatar to the application automatically.\n\n"
-            "Discord limits application avatar changes to roughly two per ten minutes. The bot enforces its own cooldown to stay under that, so "
-            "an appearance edit may not appear immediately."
         ),
         "Export, Import and Deletion": (
             "**`/export`** (DM only) writes selected profiles, and optionally their memories and training examples, to an encrypted "
@@ -814,7 +805,7 @@ DEFAULT_HELP_DOCS = {
     "profiles/sharing_and_cloning.txt": (
         "Concept: 'Sharing' offers a read-only link to someone who has set MimicAI up: pick them in `/profile hub` -> Profile Sharing and press Send. The offer waits in their Incoming Shares until they accept or reject it, and nobody is messaged either way. 'Cloning' is offered the same way with Send as Clone, and accepting it copies the configuration into a brand-new, independent Class A profile. Accepted profiles keep the original's name, with a number added only if the recipient already has one called that.\n"
         "Choosing between them: share when you want the recipient to keep receiving your edits; clone when you want them to have their own copy to change freely.\n"
-        "Limitations: Cloning severs the link to the original, allowing full editing. However, Long-Term Memories (LTM) and Child Bot configurations are deliberately scrubbed during clones -- memories are conversation history that is not the cloner's to receive, and child bot config contains a bot token.\n"
+        "Limitations: Cloning severs the link to the original, allowing full editing. However, Long-Term Memories (LTM) are deliberately scrubbed during clones -- memories are conversation history that is not the cloner's to receive.\n"
         "Location: Both are sent from `/profile hub` -> Profile Sharing, or from `/profile manage` -> Misc -> Share Profile.\n"
         "Requirement: Both need the profile rated General, or Exempt by the bot operator. Adult 18+, Unrated and Pending profiles cannot be shared or cloned, and Profile Sharing lists only the profiles that qualify. The rating is checked again when a share or clone is accepted.\n"
         "Troubleshooting / Symptoms:\n"
@@ -833,13 +824,6 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'Publishing was refused because the profile is Unrated.' Fix: Submit it for a rating from the Content Safety dashboard, then publish.\n"
         "- Symptom: 'Publishing used to fail with an avatar or URL error.' Fix: That download is gone. Publishing no longer fetches the avatar.\n"
         "- Symptom: 'The Declare Adult 18+ action disappeared after I published.' Fix: It is hidden for published profiles. Unpublish first."
-    ),
-    "profiles/child_bot_sync.txt": (
-        "Concept: A Child Bot gives a profile its own Discord application, so it appears in the member list with its own presence rather than speaking through a webhook. Registration is restricted to the bot operator because it requires a bot token. Configure at `/settings` -> Child Bots.\n"
-        "Sync: The parent instance automatically pushes the profile's display name and avatar to the child application whenever they change.\n"
-        "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'Child bot appearance changed too frequently.' Fix: Discord strictly limits application avatar updates (2 changes per 10 minutes). The system enforces cooldowns to prevent API bans. Wait 10 minutes before trying again.\n"
-        "- Symptom: 'I cannot create a child bot.' Fix: Only the bot operator can register child bot applications. Ask them, or use webhook delivery, which needs no extra application."
     ),
     "profiles/generating_profiles.txt": (
         "Command: `/profile generate` (also Generate in `/start` and in `/profile hub` -> Public Library)\n"
@@ -963,21 +947,19 @@ DEFAULT_HELP_DOCS = {
     # --- SESSIONS ---
     "sessions/session_config.txt": (
         "Command: `/session config` (server administrators)\n"
-        "Capabilities: Configures the multi-profile chat session in this channel. The Cast tab adds and removes participants (up to 200). The Source button cycles through four sources: personal, borrowed, System and child bot. The Config tab's dropdown opens each of its settings on its own screen: execution order, the Master Prompt, TTS, the per-round response limit and the Settle Window, with Cast access below it.\n"
-        "One profile, one seat: a profile speaks either as a child bot or as a webhook, never both. Seating the same profile the other way is refused, and the dropdown marks it 'Already seated as a webhook' (or as a child bot) so the clash is visible before it is attempted. Remove it and add it back the other way to change how it speaks.\n"
+        "Capabilities: Configures the multi-profile chat session in this channel. The Cast tab adds and removes participants (up to 200). The Source dropdown switches between personal, borrowed and System profiles; administrators also get In This Session, which lists other members' seated characters so they can be removed. The Config tab's dropdown opens each of its settings on its own screen: execution order, the Master Prompt, TTS, the per-round response limit and the Settle Window, with Cast access below it.\n"
+        "One profile, one seat: a profile can be in the cast only once, so seating it again is refused.\n"
         "System profiles: profiles published by the bot operator, addressable by everyone. They are seated like any other participant. A personal or borrowed profile of the same name takes precedence and the System one is not offered.\n"
         "Execution Modes: 'Sequential' forces participants to speak in a strict order. 'Random' shuffles the speaker order every round.\n"
         "Master Prompt: A scene prompt shared by every participant in the session -- the setting, the situation, what is happening. Distinct from any individual profile's persona.\n"
         "Response Limit: Caps how many profiles reply in a single round, so a large cast does not answer every message all at once.\n"
         "Settle Window: How long a round waits before it reads the channel, so several quick messages -- from one person or several -- get one reply instead of one each. The replying character's placeholder is already up while it waits. Quiet gap (0-10 seconds, default 3) is how long the channel must be quiet after the last message; 0 starts the round at once. Maximum wait (up to 30, default 8) caps the wait while messages keep arriving. Typing wait (0-30, default 15, 0 for off) is how long the first person typing can hold the round so a follow-up still being written makes it in. Who answers is decided by the message that opened the round. Messages sent while a character is replying always go into the next round together. Reset to Defaults clears all three.\n"
-        "Seating versus starting: choosing a profile on the Cast tab seats it immediately -- it appears on the Reactivity tab and can have its chance and wakewords set straight away, with no button press in between. It does not make the channel live. Until 'Start / Update Session' is pressed the session is a draft: the footer reads 'Draft', ordinary messages pass through untouched and the AI Director stays quiet. The button, on every tab, starts it -- saving the configuration, loading the transcript, and telling every child bot in the cast which channel it is in. Pressing it again on a live session re-saves and re-announces.\n"
+        "Seating versus starting: choosing a profile on the Cast tab seats it immediately -- it appears on the Reactivity tab and can have its chance and wakewords set straight away, with no button press in between. It does not make the channel live. Until 'Start / Update Session' is pressed the session is a draft: the footer reads 'Draft', ordinary messages pass through untouched and the AI Director stays quiet. The button, on every tab, starts it -- saving the configuration and loading the transcript. Pressing it again on a live session re-saves it.\n"
         "An empty cast is allowed. A started session with nobody in it keeps its transcript, Master Prompt and settings and simply has no one to answer, which is what 'Clear Cast' leaves behind. `/suspend` is what ends a session outright.\n"
         "Rolling Synopsis (Compaction tab): once a conversation reaches 50 public turns, the oldest 25 are folded into one running synopsis that every participant is given with each reply, so a long scene keeps its thread after it scrolls out of Short-Term Memory. Sessions created now start with it on; a session made before keeps what it had. 'Edit Settings' sets when it folds, how many turns go each time, the synopsis length (100-800 words, 220 by default) and the summariser -- left blank, it runs the same models as the LTM Summariser. Turning it off puts the folded turns back into the prompt and stops sending the synopsis. Whispers are never summarised, and a folded turn is only left out of the prompt -- the transcript, regeneration and `/session audit` still have it. To fold now rather than wait, run `/compact` (or press Compact Now): everything but the newest 10 turns (`keep` sets how many) goes into the synopsis, including the pages people linked and the files they pasted, and the Rolling Synopsis is switched on if it was off. `/compact undo:True` (or Uncompact) unfolds every turn and removes the synopsis; while the Rolling Synopsis stays on, it starts folding again once the session is past its trigger.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I configured a session but nothing happens.' Fix: Press 'Start / Update Session'. Seating a cast does not start it -- check the footer, which reads 'Draft' until you do.\n"
-        "- Symptom: 'A child bot is in the cast but ignores the channel.' Fix: Press 'Start / Update Session'. It re-announces the channel to every child bot in the cast, which a restored session does not do on its own.\n"
-        "- Symptom: 'A profile is missing from the dropdown, or shows Already seated.' Fix: It is already in the cast the other way round -- as a child bot if you are looking at a webhook source, or the reverse. Remove it first.\n"
-        "- Symptom: 'Select All did not clear everything.' Fix: The Select All and Unselect All options only affect the source currently shown; 'Clear Cast' empties all four.\n"
+        "- Symptom: 'Select All did not clear everything.' Fix: The Select All and Unselect All options only affect the source currently shown; 'Clear Cast' empties every source.\n"
         "- Symptom: 'My characters post under the bot's own name and avatar.' Fix: The bot needs Manage Webhooks in that channel; without it there is no way to give a character its own name and face. If it has the permission and someone deleted the webhook, it now notices and makes a new one on the next message rather than falling back forever. A character with no Appearance set still speaks under its own name, with one of Discord's default avatars.\n"
         "- Symptom: 'A character's avatar vanished a day after I set it.' Fix: Discord attachment links (an image uploaded to Discord, then 'Copy Link') expire after about a day. The bot now hands Discord the link without its expiry, so Discord keeps it working, as long as the message the image was posted in still exists. Links from other image hosts are unaffected.\n"
         "- Symptom: 'Only some of my cast replies each round.' Fix: That is the Response Limit. Raise it in the Config tab.\n"
@@ -988,10 +970,10 @@ DEFAULT_HELP_DOCS = {
         "Capabilities: Dynamically inject, remove, or swap characters inside an active session without interrupting the conversation. Users can assign specific slots to override a specific participant.\n"
         "With no options at all: lists the current participants and their slot numbers.\n"
         "Adding: name a profile that is not in the session. Without a slot it takes the next free seat (or replaces the only participant, if the session has one); with a slot it replaces that seat, or is appended if the slot is past the end.\n"
-        "Removing: two equivalent forms. Name a profile that is already a participant, or give a slot with no profile name. Either drops that participant and stands its child bot down. The last remaining participant can be removed; the session stays as it is with an empty cast, and `/suspend` is what ends it outright.\n"
+        "Removing: two equivalent forms. Name a profile that is already a participant, or give a slot with no profile name. Either drops that participant. The last remaining participant can be removed; the session stays as it is with an empty cast, and `/suspend` is what ends it outright.\n"
         "Starting a session this way starts it: run it in a channel with no session and the profile is seated and the session goes live at once, with no button press in between -- send a message and it answers. Run against a session that is already live and the change applies live, as it always has. (The cast editor still seats a draft, because a half-built cast should not be live.)\n"
         "Naming a seated profile *together with* a slot or use_child_bot does not remove it: those say where or how someone sits, not whether they should be there, so the command reports the seat it is already in rather than deleting it. Run the bare form to remove.\n"
-        "Delivery Method: The `use_child_bot` parameter forces the profile to reply using a dedicated Discord bot application (Child Bot) instead of a Webhook. To change it for someone already seated, remove them and add them back with the value you want.\n"
+        "Delivery Method: `use_child_bot` only matters for a profile the bot operator has linked to its own Discord application; for every other profile it does nothing.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I named a profile and it vanished from the session instead of being added.' Fix: That profile was already a participant. Naming a seated profile is the removal form; add a different profile, or re-run the command to bring it back.\n"
         "- Symptom: 'I added a profile and it still does not reply.' Fix: If the session was built on the Cast tab it is a draft until 'Start / Update Session' is pressed -- the dashboard footer says which. A session created by `/session swap` is live immediately, so check the profile's reactivity and chance instead."
@@ -1040,7 +1022,7 @@ DEFAULT_HELP_DOCS = {
     "sessions/whisper_and_speak.txt": (
         "Commands: `/whisper` and `/speak`\n"
         "Whisper: Sends a private message to one participant in an active multi-profile session. The reply is ephemeral -- only you see it -- and neither your whisper nor the reply appears in the other profiles' view of the transcript. Use it to direct a character without the rest of the cast reacting to your instruction.\n"
-        "Speak: Posts a message as one of your profiles under its own name and avatar. Requires administrator permission, and webhook or child bot delivery.\n"
+        "Speak: Posts a message as one of your profiles under its own name and avatar. Requires administrator permission.\n"
         "Speak styles: `verbatim` (default) sends your text exactly as written, with no generation. `in_character` has the profile rewrite your line in its own voice first and shows it to you privately, with Send, Reroll, Edit, Switch fidelity and Cancel -- nothing is posted until you press Send. `fidelity:strict` preserves your meaning and length; `fidelity:loose` plays your line as a beat and improvises. Both styles append a spoiler-tagged authorship note to the posted message.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Whisper says there is no active session.' Fix: Whisper targets a participant in a running multi-profile session. Start one with `/session config` first.\n"
@@ -1162,7 +1144,7 @@ DEFAULT_HELP_DOCS = {
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Audio sounds garbled or erratic.' Fix: Lower the speech temperature back towards its default.\n"
         "- Symptom: 'No audio is generated.' Fix: The warning under the reply names the reason. Most often the server has no key for the speech model's provider -- Google for a Gemini speech model, OpenRouter for an OpenRouter one; the profile's own text model does not matter.\n"
-        "- Symptom: 'The channel goes quiet for a long time before the voice arrives.' Fix: Synthesis takes ten to thirty seconds. The placeholder reads 'Synthesising speech...' with a running timer for that whole stretch, and a child bot that had no placeholder gets one created for it once the wait passes ten seconds.\n"
+        "- Symptom: 'The channel goes quiet for a long time before the voice arrives.' Fix: Synthesis takes ten to thirty seconds. The placeholder reads 'Synthesising speech...' with a running timer for that whole stretch.\n"
         "- Symptom: 'The voice stops before the end of a very long reply.' Fix: A Gemini voice line is capped at the audio its words can need and at the largest file the server can upload, because Gemini bills every second it generates and a model can run on past the words. An ordinary reply is voiced whole; one too long for the server's upload limit is cut off there, rather than paid for in full and then refused.\n"
         "- Symptom: 'The voice read my Director's Desk notes out loud.' Fix: This is a documented failure of the speech classifier on vague prompts. Each request already carries a preamble telling the model the notes are direction rather than lines; making the notes more concrete and less like dialogue makes it rarer."
     ),

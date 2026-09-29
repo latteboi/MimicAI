@@ -164,6 +164,13 @@ class SettingsBaseView(TabbedView):
         ("Child Bots", "bots", lambda v: SettingsChildBotView(v.cog, v.original_interaction)),
     )
 
+    @classmethod
+    def _tabs_for(cls, source) -> tuple:
+        # Registering a child bot hands over a bot token, so the tab is the bot owner's alone.
+        if source.user_id == int(defaultConfig.DISCORD_OWNER_ID):
+            return cls.TABS
+        return tuple(t for t in cls.TABS if t[1] != "bots")
+
 class SettingsHomeView(SettingsBaseView):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):
         super().__init__(cog, interaction, "home")
@@ -178,11 +185,10 @@ class SettingsHomeView(SettingsBaseView):
         stat_gemini = "✅ **`Set`**" if has_gem else "❌ `Not Set`"
         stat_or = "✅ **`Set`**" if has_or else "❌ `Not Set`"
         
-        if self.user_id == int(defaultConfig.DISCORD_OWNER_ID):
+        is_owner = self.user_id == int(defaultConfig.DISCORD_OWNER_ID)
+        if is_owner:
             child_bots = [b for b in self.cog.child_bots.values() if b['owner_id'] == self.user_id]
             bot_text = f"You own **{len(child_bots)}** Child Bots." if child_bots else "You do not own any Child Bots."
-        else:
-            bot_text = "Child Bots are restricted to the bot owner."
         
         primary_count = 0
         for g in self.cog.bot.guilds:
@@ -192,11 +198,12 @@ class SettingsHomeView(SettingsBaseView):
                     primary_count += 1
                     break
 
-        embed = discord.Embed(title="MimicAI Control Panel", description="Manage your API keys and personal bots from one place.", color=discord.Color.dark_teal())
+        embed = discord.Embed(title="MimicAI Control Panel", description="Manage your API keys and defaults from one place.", color=discord.Color.dark_teal())
         embed.set_thumbnail(url=THINKING_THUMBNAIL_URL)
         
         embed.add_field(name="API Key Slots", value=f"**Google Gemini:** {stat_gemini}\n**OpenRouter:** {stat_or}", inline=True)
-        embed.add_field(name="Child Bots", value=bot_text, inline=True)
+        if is_owner:
+            embed.add_field(name="Child Bots", value=bot_text, inline=True)
         embed.add_field(name="Server Contributions", value=f"Active Assignments: `{primary_count} servers`", inline=False)
         
         await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)

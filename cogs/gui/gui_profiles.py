@@ -229,11 +229,14 @@ class _Toggle:
     has to drag its legacy companion flag along with it.
     """
 
-    __slots__ = ("key", "label", "read", "to_payload")
+    __slots__ = ("key", "label", "read", "to_payload", "owner_only")
 
-    def __init__(self, key, label, *, read=None, to_payload=None):
+    def __init__(self, key, label, *, read=None, to_payload=None, owner_only=False):
         self.key = key
         self.label = label
+        #: Shown only where the profile's owner is the bot owner: the setting steers
+        #: something only the bot owner can have (a child bot).
+        self.owner_only = owner_only
         self.read = read or (lambda config: bool(config.get(key, False)))
         self.to_payload = to_payload or (lambda on: {key: on})
 
@@ -487,7 +490,8 @@ def _bulk_modal(factory_name: str, *, action_key: str = "update_config",
         if pass_borrowed:
             args.append(False)
         await interaction.response.send_modal(
-            globals()[factory_name](*args, callback=modal_callback))
+            globals()[factory_name](*args, callback=modal_callback,
+                                    target_user_id=interaction.user.id))
     return run
 
 
@@ -833,12 +837,16 @@ _MEMORY_BULK_PAYLOADS = {
 
 
 
+def _is_bot_owner(user_id) -> bool:
+    return int(user_id) == int(defaultConfig.DISCORD_OWNER_ID)
+
+
 def _render_generation_visual(ctx):
     config = ctx["config"]
-    return "Generation Visual", (
-        f"Placeholder: {config.get('placeholder_emoji') or '`Default`'}\n"
-        f"Child Bot Placeholder: {_flag(config.get('child_bot_placeholder', False))}"
-    ), True
+    text = f"Placeholder: {config.get('placeholder_emoji') or '`Default`'}"
+    if _is_bot_owner(ctx["owner_id"]):
+        text += f"\nChild Bot Placeholder: {_flag(config.get('child_bot_placeholder', False))}"
+    return "Generation Visual", text, True
 
 
 
@@ -1322,10 +1330,10 @@ PROFILE_ACTIONS = (
             _method("_act_error_response", wants_profile=True),
             bulk=_Bulk(_bulk_method("_bulk_error_response"), scope="all",
                        keys=("error_response",))),
-    _Action("generation_visual", "misc", "Generation Visual", "Set custom placeholder emoji and child bot behavior.",
+    _Action("generation_visual", "misc", "Generation Visual", "Set the custom placeholder emoji.",
             _open_screen("generation_visual"),
             render=_render_generation_visual,
-            screen=_Screen(_Toggle("child_bot_placeholder", "Child Bot Placeholder"),
+            screen=_Screen(_Toggle("child_bot_placeholder", "Child Bot Placeholder", owner_only=True),
                            modal="ProfileGenerationVisualModal", modal_label="Edit emoji…"),
             bulk=_Bulk(_bulk_modal("ProfileGenerationVisualModal"), scope="all",
                        keys=("placeholder_emoji", "child_bot_placeholder"))),
@@ -1792,6 +1800,7 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
                           colour=discord.Colour.blurple())
         field = self.action.render and self.action.render({
             "config": self._config, "is_borrowed": self.parent.is_borrowed,
+            "owner_id": self.parent.user_id,
             "voice_sample": await self.cog.profile_manager.voice_sample_summary(
                 self.parent.user_id, self.parent.profile_name)})
         if field:
@@ -1814,6 +1823,8 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         config = self._config
         live = self.screen.when is None or self.screen.when(config)
         controls = self.screen.controls if live else self.screen.controls[:1]
+        if not _is_bot_owner(self.parent.user_id):
+            controls = tuple(c for c in controls if not getattr(c, "owner_only", False))
 
         row = 0
         for choice in (c for c in controls if isinstance(c, _Choice)):
@@ -5351,7 +5362,7 @@ def ProfileGenerationVisualModal(cog, profile_name: str, current_params: Dict[st
         {"label": "Emote Name (or Native Emote)", "custom_id": "name", "default": name_val, "required": False, "max_length": 100, "placeholder": "e.g. mimic_thinking or 🤔"},
         {"label": "Emote ID (Blank if native)", "custom_id": "id", "default": id_val, "required": False, "max_length": 30, "placeholder": "e.g. 1441782350752120874"},
     ]
-    if not values_only:
+    if not values_only and target_user_id is not None and _is_bot_owner(target_user_id):
         fields.append(
             {"label": "Placeholder for Child Bot (on/off)", "custom_id": "child_bot_placeholder", "default": "on" if current_params.get("child_bot_placeholder") else "off", "required": True, "max_length": 10}
         )
@@ -5527,8 +5538,8 @@ class BulkDeleteView(_BulkSubView):
             title="Delete Profiles",
             colour=discord.Colour.red(),
             description=(f"⚠️ **{len(names)} profile(s) and all of their data are deleted "
-                         f"permanently.** Personas, memories, training examples and child-bot "
-                         f"links go with them, and deleting a personal profile also removes "
+                         f"permanently.** Personas, memories and training examples "
+                         f"go with them, and deleting a personal profile also removes "
                          f"every copy other users borrowed from it."))
         e.add_field(name=f"Affected ({len(names)})", value=_cap_names(names) or "*none*",
                     inline=False)

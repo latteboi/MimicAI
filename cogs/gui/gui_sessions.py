@@ -1409,9 +1409,27 @@ class SessionConfigView(BlockedGuard, ui.View):
         other members' cast entries. A non-admin under Open Casting seats and unseats
         their own characters from the four sources that read their own indexes.
         """
-        if self._viewer_is_admin():
-            return self.SOURCES
-        return tuple(s for s in self.SOURCES if s != 'session')
+        hidden = set() if self._viewer_is_admin() else {'session'}
+        if not self._child_bots_here():
+            hidden.add('child_bot')
+        return tuple(s for s in self.SOURCES if s not in hidden)
+
+    def _child_bots_here(self) -> bool:
+        """Whether the Child Bots source has anything to offer in this server.
+
+        Only the bot owner can have a child bot, so for everyone else this is False
+        and the option never appears. A seated one keeps the source open even if its
+        bot has left the server: this is the only place its owner can unseat it.
+        """
+        viewer_id = int(self.original_interaction.user.id)
+        if any(p.get('method') == 'child_bot' and int(p.get('owner_id', 0)) == viewer_id
+               for p in self.session.get('profiles', [])):
+            return True
+        clients = self.cog.child_bot_manager.clients
+        guild_id = self.original_interaction.guild_id
+        return any(b['owner_id'] == viewer_id and (c := clients.get(bid)) is not None
+                   and c.get_guild(guild_id) is not None
+                   for bid, b in self.cog.child_bots.items())
 
     def _load_lists(self):
         user_id = self.original_interaction.user.id

@@ -22,9 +22,9 @@ rest with a key only your instance holds.
 - **Three providers.** Google Gemini and OpenRouter over their HTTP APIs, plus **Ollama**
   for models running on your own machine.
 - **Two ways to appear.** Automatic webhook management gives every profile a distinct name
-  and avatar with no extra bot applications. Or provision a *child bot* — a real Discord
-  application with its own presence, status and member-list entry — managed from the same
-  process.
+  and avatar with no extra bot applications. The operator can also link a profile to a
+  *child bot* — a real Discord application with its own presence, status and member-list
+  entry — managed from the same process.
 - **Multi-profile sessions.** Put up to 200 profiles in a channel's cast and let them take
   turns, sequentially or randomly, up to a per-round response limit.
 - **Three memory layers.** Short-term conversation history, long-term memories written by

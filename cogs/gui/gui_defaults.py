@@ -530,13 +530,18 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
 
         `_create_model_options` marks whichever option matches `current` as default, so
         passing None when nothing is stored leaves every model unselected and lets this
-        one carry the tick.
+        one carry the tick -- bar NONE, which it ticks on a Fallback for any `current`
+        that is not a real model, None included. A select with two ticked options is
+        refused by Discord, so an unset slot takes the tick back off it.
         """
         options = [discord.SelectOption(
             label="Platform default", value=UNSET,
             description="Follow the bot's own choice, including if it changes.",
             default=current is None)]
         options.extend(self._create_model_options(current, key))
+        if current is None:
+            for option in options[1:]:
+                option.default = False
         return options[:25]
 
     class _DefaultModelSelect(ModelPickerMixin.GenericModelSelect):

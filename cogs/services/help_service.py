@@ -115,6 +115,23 @@ class HelpService:
             manifest[rel_path] = shipped_digest
             changed = True
 
+        # A shard this build no longer ships is retired, or the page it replaced would keep
+        # answering Help Mode forever. One the operator has edited is theirs: only forgotten.
+        for rel_path in [p for p in manifest if p not in DEFAULT_HELP_DOCS]:
+            filepath = os.path.join(DOCS_DIR, rel_path)
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    untouched = _digest(f.read()) == manifest[rel_path]
+                if untouched:
+                    os.remove(filepath)
+                    changed = True
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f"Failed to retire documentation shard {rel_path}: {e}")
+                continue
+            del manifest[rel_path]
+
         try:
             import orjson
             os.makedirs(DOCS_DIR, exist_ok=True)

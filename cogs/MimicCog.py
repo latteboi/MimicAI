@@ -2260,7 +2260,7 @@ class MimicCog(EventListeners, commands.Cog):
 
     # Not DM-only: every screen here answers ephemerally, and a key is typed into a
     # modal, which nobody but its submitter sees wherever it is opened.
-    @app_commands.command(name="settings", description="Your API keys, defaults, About Me and Child Bots.")
+    @app_commands.command(name="settings", description="Your API keys, defaults and About Me.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     async def settings_slash(self, interaction: discord.Interaction):
         if not self.fernet:

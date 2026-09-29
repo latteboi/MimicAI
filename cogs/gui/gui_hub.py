@@ -600,7 +600,7 @@ class HubShareManagerView(HubBaseView):
             desc += ("**Private Mode:** Offer profiles to people who have set MimicAI up. An offer "
                      "waits in their Incoming Shares until they answer it; nobody is messaged.\n"
                      "**Send** lends a borrow that follows your edits. **Send as Clone** gives them "
-                     "an independent copy of their own, without memories or child bot.\n"
+                     "an independent copy of their own, without memories.\n"
                      "Only profiles rated **General** or **Exempt** are listed.")
         else:
             desc += ("**Public Mode:** Publish your profiles to the global library for anyone to borrow.\n"

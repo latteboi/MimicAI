@@ -65,7 +65,7 @@ _STATIC_DASHBOARDS = [
     (
         "`/settings` (anywhere; answers only you)",
         [
-            ("Home", ["Integration summary: key slots, child bots, server assignments"]),
+            ("Home", ["Integration summary: key slots, server assignments (and child bots, for the bot owner)"]),
             ("API Keys", [
                 "Four key slots: Google Gemini 1-2, OpenRouter 1-2",
                 "Submit Key / Edit Key / Delete Key on the selected slot",
@@ -93,7 +93,7 @@ _STATIC_DASHBOARDS = [
                 "Saved as chosen -- there is no Save button on this tab",
                 "Does not change existing profiles; /profile bulk manage does that",
             ]),
-            ("Child Bots", [
+            ("Child Bots (tab shown to the bot owner only)", [
                 "Create New Child Bot (bot owner only; links a PID to a bot token)",
                 "Unlink & Delete (disconnects the client and deletes its config)",
                 "Set presence: online status and activity",
@@ -104,13 +104,13 @@ _STATIC_DASHBOARDS = [
         "`/session config` (server administrators)",
         [
             ("Cast", ["Add or remove participants (max 200)",
-                      "Source cycles personal -> borrowed -> System -> child bot",
+                      "Source: personal, borrowed, System; administrators also get In This Session, and the bot owner Child Bots",
                       "Choosing a profile seats and saves it; it does not start the session",
-                      "A profile speaks as a child bot or a webhook, never both",
+                      "A profile can be seated only once",
                       "Clear Cast empties every source at once"]),
             ("(on every tab)", [
                 "Start / Update Session: marks the session started, saves the configuration, "
-                "loads the transcript, and announces the channel to every child bot in the cast. "
+                "and loads the transcript. "
                 "Until it is pressed the footer reads Draft and nothing in the channel runs. "
                 "An empty cast is allowed.",
             ]),

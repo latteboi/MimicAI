@@ -280,6 +280,11 @@ class TabbedView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         self.attach_nav(self, self.current_tab, source=self)
 
     @classmethod
+    def _tabs_for(cls, source) -> tuple:
+        """The tabs `source`'s viewer is shown. Override to hide one from some viewers."""
+        return cls.TABS
+
+    @classmethod
     def attach_nav(cls, target_view: ui.View, current_tab: str, *, source):
         """Render this screen's nav bar onto `target_view`.
 
@@ -294,7 +299,7 @@ class TabbedView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             return callback
 
         build_tab_nav_bar(target_view, current_tab,
-                          [(label, key, nav(factory)) for label, key, factory in cls.TABS])
+                          [(label, key, nav(factory)) for label, key, factory in cls._tabs_for(source)])
 
     def _add_page_controls(self, num_pages: int, row: int, *, repaint: bool = True):
         """Attach prev/next page buttons.
