@@ -31,14 +31,15 @@ from ..utils.helpers import (
     restamp_turn, turn_posted_at,
     _format_history_entry, _get_user_hash, _resolve_safety_settings,
     _split_into_sentences_with_abbreviations, generated_image_attachment,
-    resolve_critic_settings,
+    resolve_critic_settings, ltm_flag_enabled,
     image_command_prompt, image_rag_enabled, is_gateway_shutdown, kickstart_note, whisper_recap,
     resolve_grounding_mode,
     resolve_thinking_params, resolve_url_mode,
     resolve_typing_cursor,
 )
 from ..utils import mem_probe
-from ..managers.session_manager import intern_turn, keep_url_context, log_user_turn, pin_grounding
+from ..managers.session_manager import (director_enabled, director_model_config, intern_turn,
+                                        keep_url_context, log_user_turn, pin_grounding)
 
 from .generation.heartbeat import HeartbeatMixin
 from .generation.prompt_builder import PromptBuilderMixin
@@ -432,12 +433,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         """The AI Director's note for a proactive round, or None when it is off or fails.
 
         Its model runs the LTM summariser's chain, like the session synopsis: a model the
-        session chose goes first, "on" means the shipped one, and either falls back rather
-        than leaving the round with no event because one provider was busy.
+        session chose goes first, none chosen means the shipped one, and either falls back
+        rather than leaving the round with no event because one provider was busy.
         """
         pro = session.get("proactivity") or {}
-        chosen = str(pro.get("director_model") or "off").strip()
-        if chosen.lower() == "off":
+        if not director_enabled(pro):
             return None
         channel = self.cog.bot.get_channel(channel_id)
         guild_id = channel.guild.id if channel and getattr(channel, 'guild', None) else 0
@@ -456,10 +456,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
         try:
             resp, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                *self.cog.api_service.model_chain(
-                    {"ltm_model": None if chosen.lower() == "on" else chosen,
-                     "final_fallback_enabled": True},
-                    "ltm_model", owner_id),
+                *self.cog.api_service.model_chain(director_model_config(pro), "ltm_model", owner_id),
                 _attempt, label="AI Director")
         except Exception as e:
             print(f"AI Director failed: {e}")
@@ -471,7 +468,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
     #: How often a settling round looks at the queue and the typers.
     SETTLE_POLL_SECONDS = 0.25
 
-    async def _settle_round(self, session: dict) -> None:
+    async def _settle_round(self, session: dict, handoff: bool = False) -> None:
         """Wait until the channel has settled, per the session's Settle Window.
 
         Holds while the channel has not been quiet for the quiet gap (each message
@@ -481,8 +478,14 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         seen, and stays the only one: a chatty channel cannot pass the hold along. The
         listener drops a typer's entry when their message lands, which is the only way
         to learn they stopped.
+
+        `handoff` is the turn between one speaker and the next. The channel has had the
+        last reply's whole generation to go quiet, so only a typer holds it, and nobody
+        typing waits not at all; once one has, it settles as a round does.
         """
         quiet, burst_cap, typing_cap = self.cog.session_manager.settle_window(session)
+        if handoff and not typing_cap:
+            return
         queue = session['task_queue']
         start = quiet_since = time.monotonic()
         seen = queue.qsize()
@@ -495,7 +498,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                       if now - last < TYPING_INDICATOR_SECONDS}
             if anchor is None and typers:
                 anchor = min(typers, key=typers.get)
-            settling = now - quiet_since < quiet and now - start < burst_cap
+            settling = ((anchor is not None or not handoff)
+                        and now - quiet_since < quiet and now - start < burst_cap)
             held = anchor in typers and now - start < typing_cap
             if not (settling or held):
                 return
@@ -995,6 +999,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     ltm_recall_text = None
                     training_examples_list = []
                     parsed_neuro_state = None
+                    parsed_ltm_flag = False
                     
                     # Resolve Real-time settings
                     p_owner_id = participant['owner_id']
@@ -1349,6 +1354,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                         reply = self._reply_text(attempt, p_settings, owner_id, profile_name, all_participant_names)
                         response_text, was_blocked, parsed_neuro_state = reply.text, reply.blocked, reply.neuro_state
+                        # A blocked reply is not one worth remembering. On the seat, in memory
+                        # like `_ltm_retry_at`, for `_ltm_due` at this round's end.
+                        parsed_ltm_flag = reply.ltm_flag and not was_blocked and ltm_flag_enabled(p_settings)
+                        if parsed_ltm_flag:
+                            participant["_ltm_flag"] = True
                         turn_warnings.extend(reply.warnings)
                         if reply.sources is not None:
                             turn_grounding_sources.extend(reply.sources)
@@ -1450,7 +1460,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     meta = reply_meta(
                         attempt, duration=duration, training_examples=training_examples_list,
                         ltm_recall_text=ltm_recall_text, sources=turn_grounding_sources,
-                        neuro_state=parsed_neuro_state, critic=critic)
+                        neuro_state=parsed_neuro_state, critic=critic,
+                        ltm_flag=parsed_ltm_flag)
 
                     turn_object = {
                         "turn_id": turn_id,
@@ -1853,6 +1864,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # their head start on this placeholder.
                         pending_state_container = await self._open_turn_feedback(
                             session, channel, next_p)
+
+                        # Someone who began typing while this seat was writing is waited
+                        # for behind the next placeholder, as the round's opening is.
+                        await self._settle_round(session, handoff=True)
 
                         batched_triggers = []
                         while not session['task_queue'].empty():

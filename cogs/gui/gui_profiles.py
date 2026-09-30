@@ -15,7 +15,7 @@ from ..utils.helpers import (
     _pf, _pi, _ps, _pb, clean_model_name, is_real_model, is_shipped_ltm_prompt,
     image_model_caps,
     openrouter_image_ratios, resolve_critic_settings,
-    google_thinking_caps, grounding_mode_display, ltm_auto_recall_enabled,
+    google_thinking_caps, grounding_mode_display, ltm_auto_recall_enabled, ltm_creation_mode,
     resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
     resolve_unreadable_media_mode, system_model, auto_tier, resolve_auto_model,
@@ -787,11 +787,12 @@ def _render_memory(ctx):
     archive it was filling could never be read back.
     """
     config = ctx["config"]
+    every = f"every `{config.get('ltm_creation_interval', 10)}` replies"
     # Resolved, not read: absent means on, so a profile written before the toggle
     # existed reads as what it actually does.
     return "Memory", (
         f"Auto-Creation: {_flag(config.get('ltm_creation_enabled', False))} "
-        f"· every `{config.get('ltm_creation_interval', 10)}` replies\n"
+        f"· {'when flagged, or ' if ltm_creation_mode(config) == 'flag' else ''}{every}\n"
         f"Auto-Recall: {_flag(ltm_auto_recall_enabled(config))} "
         f"· `{config.get('ltm_context_size', 3)}` @ `{config.get('ltm_relevance_threshold', 0.75)}`\n"
         f"Memory Search: {_flag(config.get('ltm_recall_tool_enabled', False))}"
@@ -810,7 +811,7 @@ def _ltm_creation_payload(on: bool) -> Dict[str, Any]:
             else {"ltm_creation_enabled": False})
 
 
-#: The consolidated memory row in bulk. Six options rather than three rows of two,
+#: The consolidated memory row in bulk. Eight options rather than four rows of two,
 #: because one `_Action` carries one select -- and the alternative, three rows on the
 #: dashboard and three in the wizard, is what this row was built to stop.
 #:
@@ -824,6 +825,8 @@ _MEMORY_BULK_PAYLOADS = {
     "recall_off": {"ltm_recall_enabled": False},
     "search_on": {"ltm_recall_tool_enabled": True},
     "search_off": {"ltm_recall_tool_enabled": False},
+    "mode_interval": {"ltm_creation_mode": "interval"},
+    "mode_flag": {"ltm_creation_mode": "flag"},
 }
 
 
@@ -1250,8 +1253,15 @@ PROFILE_ACTIONS = (
                         to_payload=_ltm_creation_payload),
                 _Toggle("ltm_recall_enabled", "Auto-Recall", read=ltm_auto_recall_enabled),
                 _Toggle("ltm_recall_tool_enabled", "Memory Search"),
+                _Choice("ltm_creation_mode", "Creation Mode",
+                        (("Every N replies", "interval", "A memory once the character has replied N times."),
+                         ("When flagged", "flag", "Sooner, when the character marks a reply. N is the most it waits.")),
+                        read=ltm_creation_mode,
+                        placeholder="Creation mode..."),
                 modal="ProfileLTMParamsModal", modal_label="Parameters…",
-                note="-# **Auto-Creation** writes a memory every so many messages. "
+                note="-# **Auto-Creation** writes a memory every so many messages, or -- "
+                     "in **When flagged** mode -- as soon as the character marks a reply as "
+                     "worth keeping, with the same count as the longest it waits. "
                      "**Auto-Recall** matches the archive against what was just said and "
                      "injects what fits, every turn, at no API cost beyond one embedding. "
                      "Turning creation on turns recall on with it.\n"
@@ -1266,13 +1276,15 @@ PROFILE_ACTIONS = (
                                      ("Enable Auto-Recall", "recall_on"),
                                      ("Disable Auto-Recall", "recall_off"),
                                      ("Enable Memory Search", "search_on"),
-                                     ("Disable Memory Search", "search_off")],
+                                     ("Disable Memory Search", "search_off"),
+                                     ("Creation: Every N Replies", "mode_interval"),
+                                     ("Creation: When Flagged", "mode_flag")],
                                     to_payload=lambda v: dict(_MEMORY_BULK_PAYLOADS[v])),
                        scope="all", label="Set Memory Switches",
                        keys=("ltm_creation_enabled", "ltm_recall_enabled",
-                             "ltm_recall_tool_enabled"),
+                             "ltm_recall_tool_enabled", "ltm_creation_mode"),
                        description="Turn auto-creation, automatic recall or memory search "
-                                   "on or off.")),
+                                   "on or off, or choose when a memory is written.")),
     _Action("ltm_params", "memory", "Set LTM Parameters", "Set creation frequency and recall settings.",
             _modal("ProfileLTMParamsModal", pass_borrowed=False),
             bulk=_Bulk(_bulk_modal("ProfileLTMParamsModal", pass_borrowed=False), scope="all",

@@ -27,8 +27,7 @@ PERSONA_SECTIONS = {
     "appearance": "persona_appearance",
 }
 
-SECTIONS = ("display_name", "library_intro", "placeholder_emoji",
-            *PERSONA_SECTIONS.values(), "ai_instructions")
+SECTIONS = ("display_name", "library_intro", *PERSONA_SECTIONS.values(), "ai_instructions")
 
 #: AppearanceModal's input cap, which is what a user editing the name afterwards meets.
 DISPLAY_NAME_MAX_CHARS = 20
@@ -94,15 +93,6 @@ def clean_display_name(value: Optional[str]) -> Optional[str]:
     return name
 
 
-def clean_emoji(value: Optional[str]) -> Optional[str]:
-    """One unicode emoji or None. Custom `<:name:id>` emoji are the user's to pick."""
-    tokens = (value or "").split()
-    token = tokens[0] if tokens else ""
-    if not token or len(token) > 10 or any(c.isascii() for c in token):
-        return None
-    return token
-
-
 def clean_intro(value: Optional[str]) -> Optional[str]:
     """Collapsed to one paragraph and cut at a word inside LIBRARY_INTRO_MAX_CHARS."""
     text = " ".join((value or "").split())
@@ -115,7 +105,6 @@ def draft_from_sections(sections: Dict[str, str]) -> Dict[str, Any]:
     return {
         "display_name": clean_display_name(sections.get("display_name")),
         "library_intro": clean_intro(sections.get("library_intro")),
-        "placeholder_emoji": clean_emoji(sections.get("placeholder_emoji")),
         "persona": {key: sections.get(header, "") for key, header in PERSONA_SECTIONS.items()},
         "ai_instructions": sections.get("ai_instructions", ""),
     }
@@ -125,7 +114,6 @@ def render_draft(draft: Dict[str, Any]) -> str:
     """A draft written back out in the section format the model produced it in."""
     values = {"display_name": draft.get("display_name"),
               "library_intro": draft.get("library_intro"),
-              "placeholder_emoji": draft.get("placeholder_emoji"),
               "ai_instructions": draft.get("ai_instructions")}
     for key, header in PERSONA_SECTIONS.items():
         values[header] = (draft.get("persona") or {}).get(key)
@@ -244,7 +232,6 @@ def save_draft(cog, user_id: int, profile_name: str, draft: Dict[str, Any]) -> O
 
     extras = {"custom_display_name": draft.get("display_name"),
               "custom_avatar_url": draft.get("avatar_url"),
-              "placeholder_emoji": draft.get("placeholder_emoji"),
               "library_intro": draft.get("library_intro")}
     extras = {key: value for key, value in extras.items() if value}
     if extras:

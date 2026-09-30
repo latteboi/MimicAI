@@ -8,11 +8,12 @@ from .utils.constants import (
     PURGE_BUSY_WAIT_TIMEOUT_SECONDS, SERVERS_DIR, COMPACT_KEEP_DEFAULT, COMPACT_KEEP_MAX,
     SESSIONS_GLOBAL_DIR, SESSION_BUSY_FLAGS, TRAIN_ARMED_CACHE_MAX_SIZE, TRAIN_INPUT_EMOJI,
     TRAIN_COMMAND_ENABLED, TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check,
-    is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
+    cooldown_unless_refused, is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
     IMPORT_FILE_TOO_LARGE, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
 )
-from .services.profile_generation import ProfileGenerationError, clean_display_name, generate_draft
+from .services.profile_generation import (ProfileGenerationError, clean_display_name, generate_draft,
+                                           generator_models)
 from .listeners.event_listeners import EventListeners
 from .gui.base_components import ActionTextInputModal, DropdownContentView, InviteView, refuse_unregistered
 from .gui.gui_data import PrivacyDashboardView, ImportPassphraseModal, BulkExportView
@@ -91,6 +92,25 @@ class LRUCache(OrderedDict):
 # Discord showed its three-second "did not respond" notice in place of the deny
 # message. Listener registration is unaffected either way: it scans members for
 # __cog_listener__ rather than resolving by name.
+def _unregistered(cog, interaction: discord.Interaction) -> bool:
+    return not cog.profile_manager.is_registered(interaction.user.id)
+
+
+def _no_session_key(cog, interaction: discord.Interaction) -> bool:
+    return cog._session_key_block(interaction.guild, interaction.user.id) is not None
+
+
+def _cannot_generate(cog, interaction: discord.Interaction) -> bool:
+    """Not registered, or no key a draft could run on: `generate_draft`'s own refusals."""
+    if _unregistered(cog, interaction):
+        return True
+    try:
+        generator_models(cog, interaction.user.id)
+    except ProfileGenerationError:
+        return True
+    return False
+
+
 class MimicCog(EventListeners, commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -342,18 +362,6 @@ class MimicCog(EventListeners, commands.Cog):
         if not system_profile and await refuse_unregistered(self, interaction):
             return
 
-        has_access = await self.storage_manager._has_api_key_access(interaction.user.id, interaction.guild_id)
-        if not has_access:
-            error_msg = (
-                "**Cannot Create Profile**\n"
-                "To create profiles, you must have a way to use them. Please do one of the following:\n\n"
-                "1. **Join a Server:** Be in a server where an administrator has already configured an API key for MimicAI.\n"
-                "2. **Configure Your Server:** If you are a server administrator, run `/start` or `/settings` to add an API key and assign it to your server.\n"
-                "3. **Provide a Personal Key:** Run `/start` or `/settings` to add your own OpenRouter or Google Gemini API key."
-            )
-            await interaction.followup.send(error_msg, ephemeral=True)
-            return
-
         profile_name = profile_name.lower().strip()
         
         is_valid, err_msg = self.profile_manager._is_valid_profile_name(profile_name)
@@ -394,7 +402,7 @@ class MimicCog(EventListeners, commands.Cog):
         await interaction.followup.send(f"Successfully created new profile '{profile_name}'.\nUse `/profile manage profile_name:{profile_name}` to start editing it.", ephemeral=True)
 
     @profile_group.command(name="generate", description="Uses AI to draft a new profile from a concept, for you to review before saving.")
-    @app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
+    @cooldown_unless_refused(1, 60.0, _cannot_generate)
     @app_commands.rename(profile_name="internal_name")
     @app_commands.describe(
         prompt="The character concept (e.g., 'A cynical noir detective').",
@@ -600,7 +608,7 @@ class MimicCog(EventListeners, commands.Cog):
         await interaction.response.send_message("### 📤 Profile Export\nSelect profiles and components to export.\n\n*The file will contain encrypted data. Tampered files cannot be imported.*\n", view=view, ephemeral=True)
 
     @app_commands.command(name="import", description="Import profiles and memories from a MimicAI export file (DM Only).")
-    @app_commands.checks.cooldown(1, 30.0, key=lambda i: i.user.id)
+    @cooldown_unless_refused(1, 30.0, _unregistered)
     @app_commands.dm_only()
     @app_commands.describe(file="The .mimic file exported from a MimicAI instance.")
     async def import_command(self, interaction: discord.Interaction, file: discord.Attachment):
@@ -637,7 +645,7 @@ class MimicCog(EventListeners, commands.Cog):
         await self.profile_manager._execute_import(interaction, file_bytes)
 
     @app_commands.command(name="privacy", description="Export or delete your data, and see this server's data policy.")
-    @app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
+    @app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
     async def privacy_slash(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         # `get_guild`, not `interaction.guild`: only a server the bot is in has a data
@@ -1319,6 +1327,11 @@ class MimicCog(EventListeners, commands.Cog):
             await interaction.followup.send("There is nobody in the cast to trigger.", ephemeral=True)
             return
 
+        block = self._session_key_block(interaction.guild, interaction.user.id)
+        if block:
+            await interaction.followup.send(block, ephemeral=True)
+            return
+
         # Trigger logic: push a null trigger to simulate automated continuation
         await session['task_queue'].put(None)
         if not session.get('worker_task') or session['worker_task'].done():
@@ -1502,13 +1515,30 @@ class MimicCog(EventListeners, commands.Cog):
         
         ch_id = interaction.channel_id
 
+        # Suspending deletes the log, and with it every turn since a seat's last memory.
+        # Best effort and keyless-safe: a suspend must work on a stuck session, on a
+        # server with no key, and with the API down -- it just saves nothing.
+        saved = []
+        session = self.multi_profile_channels.get(ch_id)
+        if session and not self._session_key_block(interaction.guild, interaction.user.id):
+            try:
+                if not session.get("is_hydrated"):
+                    session = await self.session_manager._ensure_session_hydrated(ch_id, session.get("type", "multi"))
+                if session:
+                    saved, _, _ = await self.generation_service.memorise_seats(
+                        session, list(session.get("profiles", [])), interaction.guild.id,
+                        interaction.user.display_name, interaction.user.id, interaction.channel)
+            except Exception as e:
+                print(f"Memory flush before suspending {ch_id} failed: {e}")
+
         if not await self.session_manager.suspend_channel_session(ch_id):
             await interaction.followup.send("There is no active session in this channel to suspend.", ephemeral=True)
             return
 
         self.session_manager._save_multi_profile_sessions()
 
-        await interaction.followup.send(f"Session suspended for {interaction.channel.mention}. The bot will be silent until configured again.", ephemeral=True)
+        note = f" Saved a memory first for {', '.join(saved)}." if saved else ""
+        await interaction.followup.send(f"Session suspended for {interaction.channel.mention}. The bot will be silent until configured again.{note}", ephemeral=True)
 
     @app_commands.command(name="purge", description="Deletes this session's latest turns, every message of each, from channel and memory (Admin Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -1607,7 +1637,7 @@ class MimicCog(EventListeners, commands.Cog):
                 session['is_purging'] = False
 
     @app_commands.command(name="memorise", description="Forces long-term memory summarisation for this session's cast, right now (Admin Only).")
-    @app_commands.checks.cooldown(2, 60.0, key=lambda i: i.user.id)
+    @cooldown_unless_refused(2, 60.0, _no_session_key)
     @app_commands.guild_only()
     @is_admin_or_owner_check()
     @app_commands.describe(profile="Optional: summarise only this participant. Leave blank for the whole cast.")
@@ -1619,6 +1649,11 @@ class MimicCog(EventListeners, commands.Cog):
         session = self.multi_profile_channels.get(interaction.channel_id)
         if not session:
             await interaction.followup.send("No active session found in this channel.", ephemeral=True)
+            return
+
+        block = self._session_key_block(interaction.guild, interaction.user.id)
+        if block:
+            await interaction.followup.send(block, ephemeral=True)
             return
 
         target_participant = None
@@ -1660,35 +1695,9 @@ class MimicCog(EventListeners, commands.Cog):
             guild_id = interaction.guild.id
             targets = [target_participant] if target_participant else list(session.get("profiles", []))
 
-            summarised, skipped, failed = [], [], []
-            for p in targets:
-                owner_id = p['owner_id']
-                p_name = p['profile_name']
-                p_index = self.profile_manager._get_user_index(owner_id)
-                p_is_borrowed = p_name in p_index.get("borrowed", [])
-                p_settings = self.profile_manager._get_profile_config(owner_id, p_name, p_is_borrowed) or {}
-
-                if not p_settings.get("ltm_creation_enabled", False):
-                    skipped.append(f"{p_name} (LTM disabled)")
-                    continue
-
-                if p.get("_ltm_running"):
-                    skipped.append(f"{p_name} (a memory is already being written)")
-                    continue
-
-                p["_ltm_running"] = True
-                try:
-                    created, detail = await self.generation_service._summarize_and_store_ltm(
-                        session, p, p_settings,
-                        guild_id, interaction.user.display_name, interaction.user.id,
-                        warning_channel=interaction.channel, source="memorise",
-                    )
-                except Exception as e:
-                    created, detail = False, str(e)
-                finally:
-                    p.pop("_ltm_running", None)
-
-                (summarised if created else failed).append(p_name if created else f"{p_name} ({detail})")
+            summarised, skipped, failed = await self.generation_service.memorise_seats(
+                session, targets, guild_id, interaction.user.display_name, interaction.user.id,
+                interaction.channel, source="memorise")
 
             lines = []
             if summarised:
@@ -1706,7 +1715,7 @@ class MimicCog(EventListeners, commands.Cog):
                 session['is_memorising'] = False
 
     @app_commands.command(name="compact", description="Folds this session's conversation into its synopsis, or unfolds it again (Admin Only).")
-    @app_commands.checks.cooldown(2, 60.0, key=lambda i: i.user.id)
+    @cooldown_unless_refused(2, 60.0, _no_session_key)
     @app_commands.guild_only()
     @is_admin_or_owner_check()
     @app_commands.describe(keep=f"Newest turns left as they are (0-{COMPACT_KEEP_MAX}). Default {COMPACT_KEEP_DEFAULT}.",
@@ -1717,6 +1726,11 @@ class MimicCog(EventListeners, commands.Cog):
         """The same operation as the Compaction tab's Compact Now and Uncompact buttons."""
         if not self.has_lock: return
         await interaction.response.defer(ephemeral=True)
+        # Unfolding is no model call, so it needs no key.
+        block = None if undo else self._session_key_block(interaction.guild, interaction.user.id)
+        if block:
+            await interaction.followup.send(block, ephemeral=True)
+            return
         self.session_last_accessed[interaction.channel_id] = time.time()
         message = await self.generation_service.manual_compaction(
             interaction.channel_id, undo=undo, keep=keep)
@@ -1934,6 +1948,13 @@ class MimicCog(EventListeners, commands.Cog):
                 f"Open `/profile manage profile_name:{profile_name_lower}` and choose "
                 f"**Content Safety** to rate it.",
                 ephemeral=True)
+            return
+
+        _gemini, _openrouter, block = self.generation_service.global_chat_keys(
+            user_id, interaction.guild_id,
+            self.profile_manager._get_profile_config(user_id, profile_name_lower, is_borrowed) or {})
+        if block:
+            await interaction.response.send_message(block, ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=False)
@@ -2386,6 +2407,12 @@ class MimicCog(EventListeners, commands.Cog):
             await interaction.response.send_message("You can only speak as your own personal or borrowed profiles.", ephemeral=True)
             return
 
+        # Verbatim posts the text as written; only in character calls a model.
+        block = self._session_key_block(interaction.guild, interaction.user.id) if style == 'in_character' else None
+        if block:
+            await interaction.response.send_message(block, ephemeral=True)
+            return
+
         if message:
             await interaction.response.defer(ephemeral=True)
             await self.generation_service._execute_speak_as(
@@ -2463,6 +2490,11 @@ class MimicCog(EventListeners, commands.Cog):
                     defer_on_pick=False,
                 )
                 return
+
+        block = self._session_key_block(interaction.guild, interaction.user.id) if profile else None
+        if block:
+            await interaction.response.send_message(block, ephemeral=True)
+            return
 
         if profile and message:
             await interaction.response.defer(ephemeral=True, thinking=True)

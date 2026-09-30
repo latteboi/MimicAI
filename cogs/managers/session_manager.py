@@ -178,6 +178,31 @@ def round_reserve(earlier: List[Dict[str, Any]], speaker_pid: str) -> int:
 
 
 #: A stored turn's identity, `<Name> [ID: x]`, as its header shows it to the model.
+def director_enabled(proactivity: Optional[Dict[str, Any]]) -> bool:
+    """Whether the AI Director writes a note for a proactive round.
+
+    `director_enabled` is the switch once the Director Model screen has written it. Before
+    that the model field was the switch -- "off", or absent -- and a session that never
+    opened the screen still reads that way.
+    """
+    pro = proactivity or {}
+    if "director_enabled" in pro:
+        return bool(pro["director_enabled"])
+    return str(pro.get("director_model") or "off").strip().lower() != "off"
+
+
+def director_model_config(proactivity: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The Director's choice as LTM slots, None where it made none: it runs the LTM
+    summariser's chain, like the session synopsis. "on" and "off" are switches from
+    before the screen, not models, so neither is one. With its Final Fallback always,
+    for the reason `compaction_model_config` gives."""
+    pro = proactivity or {}
+    chosen = str(pro.get("director_model") or "").strip()
+    return {"ltm_model": None if chosen.lower() in ("", "on", "off") else chosen,
+            "ltm_fallback_model": pro.get("director_fallback_model") or None,
+            "final_fallback_enabled": True}
+
+
 _TURN_IDENTITY = re.compile(r'<([^>\r\n]+)> \[ID: ([^\]\r\n]+)\]')
 
 

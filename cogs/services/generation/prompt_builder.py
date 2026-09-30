@@ -10,11 +10,13 @@ from ...utils.constants import (
     NEURO_AXES,
     DEFAULT_TRAINING_DATA_INJECTION, DEFAULT_CURRENT_TIME, DEFAULT_NEGATIVE_CONSTRAINTS,
     DEFAULT_CONTENT_POLICY, DEFAULT_BIRTHDAY_CONTEXT, DEFAULT_NEURO_DEFINITION,
+    DEFAULT_MEMORY_CAPTURE_INSTRUCTION, DEFAULT_MEMORY_WRITTEN_NOTE,
 )
 from ...utils.birthdays import birthday_offset, describe_birthday
 from ...utils.helpers import (TURN_TIME_FORMAT, Timeout, _get_user_hash, _resolve_zoneinfo,
-                              default_profile_avatar_url)
+                              default_profile_avatar_url, ltm_flag_enabled)
 from ._shared import NEURO_BARE_PATTERN, NEURO_TAG_PATTERN
+from .ltm_capture import memory_written_ago
 
 #: One axis as a model writes it inside the tag: a letter or the whole name, `:` or `=`,
 #: then the number. Found one at a time, so the separators between them are free.
@@ -266,6 +268,13 @@ class PromptBuilderMixin:
         for function in functions:
             stable_parts.append(function.instruction(self.cog.global_prompts))
 
+        # Static, so it sits with them. Only in a session round, the one place a flag is
+        # acted on: elsewhere it would be a marker asked for and thrown away. Written
+        # nowhere per turn -- what the character flagged lives on its seat.
+        if is_multi_profile and ltm_flag_enabled(profile_data):
+            stable_parts.append(self.cog.global_prompts.get(
+                "MEMORY_CAPTURE_INSTRUCTION", DEFAULT_MEMORY_CAPTURE_INSTRUCTION))
+
         if is_multi_profile:
             # Standing context, not a history turn: the synopsis summarises turns that
             # have already left the STM window, so competing for a slot inside that
@@ -335,6 +344,16 @@ class PromptBuilderMixin:
 
         if recalled_ltm:
             turn_parts.append(recalled_ltm)
+
+        # Per turn, so it rides the turn: true for two replies after a memory and then
+        # gone. The brief in the instruction is what stays static.
+        if session and ltm_flag_enabled(profile_data):
+            back = memory_written_ago(
+                session.get("unified_log", []),
+                self.cog.profile_manager._get_pid_from_name_any(profile_owner_id, profile_name_to_use))
+            if back:
+                turn_parts.append(self.cog.global_prompts.get("MEMORY_WRITTEN_NOTE", DEFAULT_MEMORY_WRITTEN_NOTE).format(
+                    when="just after your last reply" if back == 1 else f"{back} replies ago"))
 
         # The critic's constraints, placed here rather than appended by the caller after
         # <content_policy>. This parameter existed and no caller passed it: the worker

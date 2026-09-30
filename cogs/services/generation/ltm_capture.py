@@ -5,8 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import discord
 
 from ...utils.constants import (LTM_DUPLICATE_SIMILARITY, LTM_EXCERPT_TURNS,
-                                MIN_HISTORY_FOR_LTM_CREATION)
-from ...utils.helpers import _resolve_zoneinfo, restamp_turn, turn_posted_at
+                                LTM_FLAG_MIN_REPLIES, MIN_HISTORY_FOR_LTM_CREATION)
+from ...utils.helpers import _resolve_zoneinfo, ltm_flag_enabled, restamp_turn, turn_posted_at
 from ...managers.memory_manager import encode_embedding_b64
 from ...managers.session_manager import reply_tags, turn_lookup, with_reply
 
@@ -53,6 +53,26 @@ def ltm_backlog(log: List[Dict[str, Any]], pid: str, read_through: Optional[str]
     return turns, sum(t.get("speaker_pid") == pid for t in turns)
 
 
+def memory_written_ago(log: List[Dict[str, Any]], pid: str) -> Optional[int]:
+    """How many of a seat's own replies back the memory it last wrote was made after
+    (1 = its latest reply), or None once that is more than `LTM_FLAG_MIN_REPLIES` ago.
+
+    Read off the turn `_summarize_and_store_ltm` stamps `ltm_created` on, so it is derived
+    from the log like everything else here. Past the floor a flag is honoured at once, and
+    there is nothing left to tell the character.
+    """
+    back = 0
+    for turn in reversed(log):
+        if turn.get("speaker_pid") != pid:
+            continue
+        back += 1
+        if (turn.get("meta") or {}).get("ltm_created"):
+            return back
+        if back >= LTM_FLAG_MIN_REPLIES:
+            return None
+    return None
+
+
 class LtmCaptureMixin:
     """Owns the summarise -> embed -> store chain for one seat's long-term memory.
 
@@ -67,14 +87,61 @@ class LtmCaptureMixin:
     def _ltm_due(self, session: Dict[str, Any], seat: Dict[str, Any],
                  p_settings: Dict[str, Any]) -> bool:
         """Whether this seat has replied `ltm_creation_interval` times since its last
-        memory, or since a failed one's retry point. A deleted turn uncounts itself."""
+        memory, or since a failed one's retry point. A deleted turn uncounts itself.
+
+        In flag mode (`ltm_flag_enabled`) a seat whose character flagged a reply is due
+        sooner -- `LTM_FLAG_MIN_REPLIES` replies in -- and the interval is the ceiling,
+        so the mode only ever brings a memory earlier. The retry point holds either way.
+
+        Either mode is also due once the backlog fills the excerpt window: the interval
+        counts replies and the window counts turns, so a big cast reaches the window first
+        and the oldest turns would fall off the front of every capture, unread for good.
+        """
         if seat.get("_ltm_running"):
             return False
         pid = self.cog.profile_manager._get_pid_from_name_any(seat["owner_id"], seat["profile_name"])
-        _, own = ltm_backlog(session.get("unified_log", []), pid, seat.get("ltm_read_through"),
-                             seat.get("ltm_read_through_id"))
-        return own >= max(int(p_settings.get("ltm_creation_interval", 10)),
-                          seat.get("_ltm_retry_at", 0))
+        turns, own = ltm_backlog(session.get("unified_log", []), pid, seat.get("ltm_read_through"),
+                                 seat.get("ltm_read_through_id"))
+        need = int(p_settings.get("ltm_creation_interval", 10))
+        if seat.get("_ltm_flag") and ltm_flag_enabled(p_settings):
+            need = min(need, LTM_FLAG_MIN_REPLIES)
+        if own < seat.get("_ltm_retry_at", 0):
+            return False
+        return own >= need or (own > 0 and len(turns) >= LTM_EXCERPT_TURNS)
+
+    async def memorise_seats(
+        self, session: Dict[str, Any], seats: List[Dict[str, Any]], guild_id: Optional[int],
+        author: str, user_id: int, channel: Optional[discord.abc.Messageable] = None,
+        source: str = "auto",
+    ) -> Tuple[List[str], List[str], List[str]]:
+        """Writes a memory now for each of `seats`: (made, skipped, none) as display names.
+
+        The body of `/memorise`, and what `/suspend` runs before it deletes the log: the
+        turns since a seat's last memory are held nowhere else.
+        """
+        made, skipped, none = [], [], []
+        for seat in seats:
+            name = seat["profile_name"]
+            index = self.cog.profile_manager._get_user_index(seat["owner_id"])
+            settings = self.cog.profile_manager._get_profile_config(
+                seat["owner_id"], name, name in index.get("borrowed", [])) or {}
+            if not settings.get("ltm_creation_enabled", False):
+                skipped.append(f"{name} (LTM disabled)")
+                continue
+            if seat.get("_ltm_running"):
+                skipped.append(f"{name} (a memory is already being written)")
+                continue
+            seat["_ltm_running"] = True
+            try:
+                created, detail = await self._summarize_and_store_ltm(
+                    session, seat, settings, guild_id, author, user_id,
+                    warning_channel=channel, source=source)
+            except Exception as e:
+                created, detail = False, str(e)
+            finally:
+                seat.pop("_ltm_running", None)
+            (made if created else none).append(name if created else f"{name} ({detail})")
+        return made, skipped, none
 
     async def _summarize_and_store_ltm(
         self, session: Dict[str, Any], seat: Dict[str, Any], p_settings: Dict[str, Any],
@@ -84,6 +151,9 @@ class LtmCaptureMixin:
         owner_id, profile_name = seat["owner_id"], seat["profile_name"]
         pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
         log = session.get("unified_log", [])
+        # Spent whatever the verdict, like the bookmark. A flag raised while this runs
+        # is the next memory's, so it is cleared here, before the awaits.
+        seat.pop("_ltm_flag", None)
         turns, own = ltm_backlog(log, pid, seat.get("ltm_read_through"), seat.get("ltm_read_through_id"))
         turns = turns[-LTM_EXCERPT_TURNS:]
         if len(turns) < MIN_HISTORY_FOR_LTM_CREATION:

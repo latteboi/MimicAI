@@ -366,7 +366,8 @@ channel. Its shape:
    burst produces one reply, not one to its first message and another to the rest, and the
    reply lands below the burst (delivery replaces the placeholder with a fresh message).
    Who speaks is rolled before the wait. Messages arriving mid-round are drained
-   again at each handoff. Every drain goes through `withdraw_cancelled_triggers`, which drops
+   again at each handoff, after a typing-only `_settle_round(handoff=True)` that waits for
+   whoever began typing while the last seat wrote. Every drain goes through `withdraw_cancelled_triggers`, which drops
    reactions pulled back and messages deleted while they waited; a round left with nothing
    ends there. The round's messages are exempt from STM only up to
    `ROUND_EXEMPT_USER_TURNS` / `ROUND_EXEMPT_USER_CHARS` (`_bound_reserved_tail`), and each
@@ -657,7 +658,8 @@ with that turn's moment `ltm_read_through` standing in once the turn is deleted,
 in the session blueprint. It is a turn rather than a time because a message sent mid-reply
 is logged after the reply but stamped before it. Everything else is derived from the log
 against it (`generation/ltm_capture.py`): a memory is due once the character has replied
-`ltm_creation_interval` times since, and it reads the public turns since — never whispers,
+`ltm_creation_interval` times since (or once the backlog fills the `LTM_EXCERPT_TURNS` window,
+which a big cast does first), and it reads the public turns since — never whispers,
 since a memory is recalled in every channel — up to the newest `LTM_EXCERPT_TURNS`, on the
 character's clock, with the session synopsis as background. The summariser writes up to
 `LTM_MAX_PER_CAPTURE` memories, one a line, each embedded and stored as its own entry, all
@@ -666,6 +668,19 @@ has) moves the bookmark on; a failure leaves it and waits another interval. The 
 test is one product against the cached unit rows of the guild the memory formed in, plus
 those stored earlier in the same batch. Recall prefixes each memory with the date it was
 made, on the character's calendar.
+
+**Two triggers, one writer.** `ltm_creation_mode` is `flag` (absent) or `interval`. In `flag`
+the character may end a reply with `<memory_flag/>` (`take_memory_flag`, always stripped),
+which sets `_ltm_flag` on its seat and makes `_ltm_due` true `LTM_FLAG_MIN_REPLIES` replies in;
+`ltm_creation_interval` stays as the ceiling, so the mode only ever brings a memory earlier.
+A tag rather than a function -- a marker has nothing to answer, and a call would re-bill the
+whole conversation -- and it carries no text: the summariser is the only thing that decides
+what is kept, and a hint written beside a transcript that may hold a whisper is a leak. Its
+brief is a static block (`memory_capture`) in the system instruction, and only in a session
+round. What the character cannot see for itself -- that a memory was written -- is a per-turn
+`memory_written` note (`memory_written_ago`, read off the `ltm_created` stamp), told for two replies
+after one so it does not flag the same moment again. `/memorise` and `/suspend` both go through `memorise_seats`; `/suspend` runs it before
+the log is deleted.
 
 An entry is `id`, `created_ts`, `sum` (plain text: the shard is sealed whole),
 `s_emb_b64`, `context_id`, and sparsely `modified_ts`, `usr` and `src`

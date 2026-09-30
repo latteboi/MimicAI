@@ -352,6 +352,7 @@ SETTING_LABELS = {
     "ltm_recall_enabled": "LTM Auto-Recall",
     "ltm_recall_tool_enabled": "Memory Search",
     "ltm_creation_interval": "LTM Creation Interval",
+    "ltm_creation_mode": "LTM Creation Mode",
     "ltm_context_size": "LTM Recall Depth",
     "ltm_relevance_threshold": "LTM Relevance Threshold",
     "thinking_level": "Reasoning Effort",

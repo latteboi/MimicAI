@@ -1764,6 +1764,26 @@ def ltm_auto_recall_enabled(config: Optional[Dict[str, Any]]) -> bool:
     return True if raw is None else bool(raw)
 
 
+def ltm_creation_mode(config: Optional[Dict[str, Any]]) -> str:
+    """"flag" or "interval": when this profile's memories are written.
+
+    Sparse, and "flag" is the shipped default: only an explicit "interval" opts out, so a
+    profile that never chose reads as what it does and a better default reaches it. The
+    interval stays the ceiling either way.
+    """
+    return "interval" if (config or {}).get("ltm_creation_mode") == "interval" else "flag"
+
+
+def ltm_flag_enabled(config: Optional[Dict[str, Any]]) -> bool:
+    """Whether this profile writes memories when its character flags a reply.
+
+    Creation must also be on -- a flag with nothing to act on it would be a character
+    asked to mark replies for a summariser that never runs.
+    """
+    config = config or {}
+    return bool(config.get("ltm_creation_enabled")) and ltm_creation_mode(config) == "flag"
+
+
 def resolve_critic_settings(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """The Anti-Repetition Critic's effective settings for one profile.
 

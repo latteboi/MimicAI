@@ -127,7 +127,9 @@ _STATIC_DASHBOARDS = [
             ("Reactivity", ["Edit Chance & Wakewords (probability rolls and exact-match interjection)"]),
             ("Proactivity", [
                 "Toggle Proactivity (the autonomous round timer)",
-                "Edit Settings & AI Director (chance, cooldown, director model)",
+                "Edit Settings & AI Director (chance, cooldown, director instructions)",
+                "Director Model: opens Set Models for the AI Director on the same message, with Back "
+                "(Primary and Fallback, the API button, Browse on OpenRouter, Director ON/OFF, Reset to Default)",
             ]),
         ],
     ),
@@ -138,9 +140,10 @@ _STATIC_DASHBOARDS = [
             ("Public Library", ["Browse, search and borrow published profiles"]),
             ("Incoming Shares", ["Accept, reject or block the sender of profiles offered to you",
                                  "Open/Closed toggle for new offers; a user dropdown of who is blocked"]),
-            ("Profile Sharing", ["Offer profiles to registered users as a borrow or, with Send as "
-                                 "Clone, an independent copy (no message is sent)",
+            ("Profile Sharing", ["Offer profiles to registered users as a borrow (no message is sent)",
                                  "Publish and unpublish"]),
+            ("Profile Cloning", ["Offer profiles to registered users as an independent copy with "
+                                 "Send as Clone (no message is sent)"]),
         ],
     ),
     (

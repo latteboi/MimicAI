@@ -17,7 +17,7 @@ from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PA
                               add_select, build_pagination_controls,
                               bulk_select_options, resolve_bulk_select)
 from ..services.generation.compaction import compaction_model_config, resolve_compaction_settings
-from ..managers.session_manager import turn_lookup, with_reply
+from ..managers.session_manager import director_enabled, director_model_config, turn_lookup, with_reply
 from ..services.generation.global_chat import build_global_chat_embed
 from ..services.generation.tool_loop import functions_for
 
@@ -1026,7 +1026,6 @@ class ReactivitySettingsModal(ui.Modal, title="Edit Reactivity"):
 class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
     chance_input = ui.TextInput(label="Trigger Chance (0-100%)", placeholder="Default: 10", required=True, max_length=3)
     cooldown_input = ui.TextInput(label="Cooldown (Seconds)", placeholder="Default: 300", required=True, max_length=5)
-    model_input = ui.TextInput(label="Director Model (on/off or Model ID)", placeholder="Default: off", required=False, max_length=100)
     instructions_input = ui.TextInput(label="Director Instructions (Blank = Default)", style=discord.TextStyle.paragraph, required=False, max_length=1000)
     def __init__(self, view: 'SessionConfigView'):
         super().__init__()
@@ -1034,26 +1033,13 @@ class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
         pro = view.session.get("proactivity", {})
         self.chance_input.default = str(pro.get("chance", 10))
         self.cooldown_input.default = str(pro.get("cooldown", 300))
-        self.model_input.default = pro.get("director_model", "off")
         self.instructions_input.default = pro.get("director_instructions") or DEFAULT_DIRECTOR_INSTRUCTIONS
     async def on_submit(self, interaction: discord.Interaction):
         try:
             pro = self.view.session.setdefault("proactivity", {})
             pro["chance"] = max(0, min(100, int(self.chance_input.value)))
             pro["cooldown"] = max(60, int(self.cooldown_input.value))
-            
-            model_val = self.model_input.value.strip().lower()
-            if model_val in ["", "off"]:
-                pro["director_model"] = "off"
-            elif model_val == "on":
-                # The LTM summariser's chain, resolved when it runs -- see _director_note.
-                pro["director_model"] = "on"
-            else:
-                model_val_orig = self.model_input.value.strip()
-                if not (model_val_orig.upper().startswith("GOOGLE/") or model_val_orig.upper().startswith("OPENROUTER/")):
-                    model_val_orig = "GOOGLE/" + model_val_orig
-                pro["director_model"] = model_val_orig
-            
+
             # Blank, or the shipped wording left as it was, is "the default": resolved
             # when it runs, so a better wording reaches this session too.
             ins_val = self.instructions_input.value.strip()
@@ -1109,9 +1095,8 @@ class CompactionSettingsModal(ui.Modal, title="Rolling Synopsis"):
             cfg.pop("max_words", None)
         else:
             cfg["max_words"] = length
-        # Unprefixed ids default to Google, matching the Director model field. Both
-        # providers are valid here -- unlike image, speech and grounding, summarisation
-        # is an ordinary text slot.
+        # Unprefixed ids default to Google. Both providers are valid here -- unlike image,
+        # speech and grounding, summarisation is an ordinary text slot.
         for field, key in ((self.model_input, "model"), (self.fallback_input, "fallback_model")):
             raw = field.value.strip()
             if not raw:
@@ -2308,16 +2293,27 @@ class SessionConfigView(BlockedGuard, ui.View):
         embed.add_field(name="Status", value="**`ON`**" if enabled else "`OFF`", inline=True)
         embed.add_field(name="Chance & Cooldown", value=f"`{pro.get('chance', 10)}%` every `{pro.get('cooldown', 300)}s`", inline=True)
         
-        # Absent is off: what the worker reads, not a model it would never call.
-        dir_mod = pro.get("director_model") or "off"
+        dir_on = director_enabled(pro)
+        primary, fallbacks = self.cog.api_service.model_chain(
+            director_model_config(pro), "ltm_model", self.session.get("owner_id"))
+        models = f"`{primary}`" + ("\nFallbacks: " + " \u2192 ".join(f"`{m}`" for m in fallbacks)
+                                  if fallbacks else "")
         dir_ins = pro.get("director_instructions", "(Default)") or "(Default)"
-        embed.add_field(name="AI Director", value=f"Model: `{dir_mod}`\nInstructions: ```{dir_ins[:200]}```", inline=False)
+        embed.add_field(name="AI Director", value=f"{'**`ON`**' if dir_on else '`OFF`'}\n{models}\n"
+                                                  f"Instructions: ```{dir_ins[:200]}```", inline=False)
 
         self._add_toggle(
             "Toggle Proactivity", enabled,
             lambda on: self.session.setdefault("proactivity", {}).__setitem__("enabled", on),
             on_off_style=True)
         self._add_modal_button("Edit Settings & AI Director", ProactivitySettingsModal)
+
+        async def open_director_models(i: discord.Interaction):
+            # Imported here: gui_director adopts ModelPickerMixin from gui_profiles, which imports this module.
+            from .gui_director import DirectorModelView
+            view = DirectorModelView(self.cog, self)
+            await i.response.edit_message(embed=view.embed(), view=view)
+        add_button(self, "Director Model\u2026", open_director_models)
 
     def _render_compaction(self, embed: discord.Embed):
         """The rolling synopsis: how a long scene is folded down."""
@@ -2661,6 +2657,12 @@ def add_generation_fields(embed: discord.Embed, cog, turn: dict) -> None:
             lines.append(f"\u2514\u2500\u2500 {note}")
             lines[-2] = lines[-2].replace("\u2514\u2500\u2500", "\u251c\u2500\u2500", 1)
         embed.add_field(name="Function Calls", value="\n".join(lines), inline=False)
+
+    # Only on a turn that flagged: how often each model does is the one thing Creation
+    # Mode "When flagged" cannot show from anywhere else.
+    if meta.get("ltm_flag"):
+        embed.add_field(name="Long-Term Memory", value="\u2514\u2500\u2500 Flagged this reply as worth remembering",
+                        inline=False)
 
     neuro = meta.get("neuro_state")
     if isinstance(neuro, dict) and neuro:

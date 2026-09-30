@@ -4,7 +4,7 @@ import asyncio
 import discord
 import traceback
 import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ...utils.constants import (
     defaultConfig, STM_LIMIT_MAX, PLACEHOLDER_EMOJI,
@@ -140,6 +140,30 @@ class GlobalChatMixin:
     "global" -- the same conversation continues in any server, or in a DM.
     """
 
+    def global_chat_keys(self, host_user_id: int, guild_id: Optional[int],
+                         profile_data: Dict) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """(Gemini key, OpenRouter key, why none can run this) for a conversation on the host's own keys.
+
+        Asked when the card opens as well as on each reply, so it does not open into a
+        Reply button that can only refuse. The host's own key, carrying a conversation
+        others can be let into wherever the card was opened: a free Gemini tier answers to
+        that server's policy, and is refused with no server at all. See cogs/utils/data_policy.
+        """
+        storage = self.cog.storage_manager
+        user_api_key = storage._get_api_key_for_user(host_user_id, "gemini")
+        or_key = storage._get_api_key_for_user(host_user_id, "openrouter")
+        has_ollama = (str(profile_data.get("primary_model") or "").upper().startswith("OLLAMA/")
+                      and self.cog.profile_manager.may_use_ollama(host_user_id))
+        gemini_blocked = bool(user_api_key) and not storage.personal_gemini_allowed_in_conversation(
+            host_user_id, guild_id)
+        if gemini_blocked:
+            user_api_key = None
+        block = None
+        if not user_api_key and not or_key and not has_ollama:
+            block = (GEMINI_FREE_TIER_BLOCKED if gemini_blocked else
+                     "The host of this session needs to submit a personal API key using `/settings` to use this feature.")
+        return user_api_key, or_key, block
+
     async def _execute_global_chat(self, interaction: discord.Interaction, host_user_id: int, profile_name: str, queued_turns: List[Dict]):
         t1_start_mono = time.monotonic()
         t1_start_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -169,24 +193,9 @@ class GlobalChatMixin:
         is_borrowed = profile_name in self.cog.profile_manager._get_user_index(host_user_id).get("borrowed", [])
         profile_data = self.cog.profile_manager._get_profile_config(host_user_id, profile_name, is_borrowed) or {}
 
-        user_api_key = self.cog.storage_manager._get_api_key_for_user(host_user_id, "gemini")
-        or_key = self.cog.storage_manager._get_api_key_for_user(host_user_id, "openrouter")
-        has_ollama = (str(profile_data.get("primary_model") or "").upper().startswith("OLLAMA/")
-                      and self.cog.profile_manager.may_use_ollama(host_user_id))
-
-        # The host's own key, carrying a conversation others can be let into wherever the
-        # card was opened: a free Gemini tier answers to that server's policy, and is
-        # refused with no server at all. See cogs/utils/data_policy.
-        gemini_blocked = bool(user_api_key) and not self.cog.storage_manager.personal_gemini_allowed_in_conversation(
-            host_user_id, interaction.guild_id)
-        if gemini_blocked:
-            user_api_key = None
-
-        if not user_api_key and not or_key and not has_ollama:
-            await interaction.followup.send(
-                GEMINI_FREE_TIER_BLOCKED if gemini_blocked else
-                "The host of this session needs to submit a personal API key using `/settings` to use this feature.",
-                ephemeral=True)
+        user_api_key, or_key, block = self.global_chat_keys(host_user_id, interaction.guild_id, profile_data)
+        if block:
+            await interaction.followup.send(block, ephemeral=True)
             return
 
         model_cache_key = ('global', host_user_id, profile_name)

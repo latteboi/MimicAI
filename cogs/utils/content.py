@@ -249,6 +249,9 @@ HELP_CATEGORIES = {
             "**Memory Search.** Auto-Recall searches on your wording. Turn on **Memory Search** and the character can also search for "
             "itself, phrasing the query in its own words when a reply needs something it cannot see. The automatic recall then tightens to "
             "its surest matches, since anything below that is reachable by asking.\n\n"
+            "**Creation Mode.** *When flagged* is the default. It lets the character end a reply with a marker, invisible in the "
+            "channel, that has a memory written at that round's end instead of waiting -- the same background model still decides what is kept, "
+            "and N becomes the most it waits. It costs nothing extra per reply. *Every N replies* writes one on the count alone.\n\n"
             "**Where a memory applies.** Every memory belongs to the server it was formed in, and is only ever recalled there. A profile "
             "used in two servers keeps two separate archives, and neither is visible in global chat.\n\n"
             "All three switches are on one screen: `/profile manage` -> **Memory** -> **Memory Settings**, with the numbers behind "
@@ -470,18 +473,18 @@ HELP_CATEGORIES = {
     "7. Sharing and Publishing": {
         "Sharing, Borrowing and Cloning": (
             "There are two ways to give someone a profile, and they are not the same thing.\n\n"
-            "Both are offered from **Profile Sharing** in `/profile hub` to someone who has set MimicAI up. The offer waits in their "
+            "A borrow is offered from **Profile Sharing** in `/profile hub` and a clone from **Profile Cloning**, each to someone who has set MimicAI up. The offer waits in their "
             "Incoming Shares until they accept or reject it, and nobody is messaged either way. Accepted profiles keep their name, "
             "with a number added only if the recipient already has one called that.\n\n"
             "**Send** offers a *borrow*: a read-only link back to your master profile. The borrower gets your "
             "character, and any edit you make reaches them. If you delete or rename the original, their copy is severed.\n\n"
-            "**Send as Clone** offers an *independent copy* -- a new Class A profile the recipient owns and can edit "
+            "**Send as Clone** (on the Profile Cloning tab) offers an *independent copy* -- a new Class A profile the recipient owns and can edit "
             "freely, with no link back to you.\n\n"
             "Cloning deliberately scrubs Long-Term Memories, which are conversation history and not "
             "yours to hand on.\n\n"
             "Both require the profile to be rated **General** (or Exempt). An **Adult 18+** "
-            "profile cannot be shared, cloned or published, and an **Unrated** one cannot either until you rate it. **Profile Sharing** "
-            "lists only the profiles that qualify."
+            "profile cannot be shared, cloned or published, and an **Unrated** one cannot either until you rate it. Both tabs "
+            "list only the profiles that qualify."
         ),
         "The Public Library": (
             "`/profile hub` -> **Public Library** lists every profile published on this instance. Browse or search it, and borrow anything you "
@@ -783,7 +786,7 @@ DEFAULT_HELP_DOCS = {
         "Naming: Your own profiles always win a name clash. If you create a personal profile with the same name as a System Profile, yours is the one that runs; the System Profile is only reached when you have no profile of your own by that name.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'A borrowed profile vanished from my list.' Fix: The owner deleted or renamed the original. Borrows are links, not copies; ask them to share it again.\n"
-        "- Symptom: 'I cannot edit the persona of a profile I borrowed.' Fix: That is by design. Ask its owner to send it with Send as Clone from `/profile hub` -> Profile Sharing instead, which gives you an independent Class A copy you own."
+        "- Symptom: 'I cannot edit the persona of a profile I borrowed.' Fix: That is by design. Ask its owner to send it with Send as Clone from `/profile hub` -> Profile Cloning instead, which gives you an independent Class A copy you own."
     ),
     "profiles/default_settings.txt": (
         "Command: `/settings` -> Override Defaults, open once `/start` has set you up. Sets standing preferences applied to profiles created afterwards and offered on borrows. Existing profiles are not changed; `/profile bulk manage` changes those.\n"
@@ -803,15 +806,15 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'I want to stop using a default.' Fix: Choose 'Platform default' on that row. That is different from selecting the shipped value by hand, which pins it."
     ),
     "profiles/sharing_and_cloning.txt": (
-        "Concept: 'Sharing' offers a read-only link to someone who has set MimicAI up: pick them in `/profile hub` -> Profile Sharing and press Send. The offer waits in their Incoming Shares until they accept or reject it, and nobody is messaged either way. 'Cloning' is offered the same way with Send as Clone, and accepting it copies the configuration into a brand-new, independent Class A profile. Accepted profiles keep the original's name, with a number added only if the recipient already has one called that.\n"
+        "Concept: 'Sharing' offers a read-only link to someone who has set MimicAI up: pick them in `/profile hub` -> Profile Sharing and press Send. The offer waits in their Incoming Shares until they accept or reject it, and nobody is messaged either way. 'Cloning' is offered from `/profile hub` -> Profile Cloning with Send as Clone, and accepting it copies the configuration into a brand-new, independent Class A profile. Accepted profiles keep the original's name, with a number added only if the recipient already has one called that.\n"
         "Choosing between them: share when you want the recipient to keep receiving your edits; clone when you want them to have their own copy to change freely.\n"
         "Limitations: Cloning severs the link to the original, allowing full editing. However, Long-Term Memories (LTM) are deliberately scrubbed during clones -- memories are conversation history that is not the cloner's to receive.\n"
-        "Location: Both are sent from `/profile hub` -> Profile Sharing, or from `/profile manage` -> Misc -> Share Profile.\n"
-        "Requirement: Both need the profile rated General, or Exempt by the bot operator. Adult 18+, Unrated and Pending profiles cannot be shared or cloned, and Profile Sharing lists only the profiles that qualify. The rating is checked again when a share or clone is accepted.\n"
+        "Location: Sharing is sent from `/profile hub` -> Profile Sharing (or `/profile manage` -> Misc -> Share Profile); cloning from `/profile hub` -> Profile Cloning.\n"
+        "Requirement: Both need the profile rated General, or Exempt by the bot operator. Adult 18+, Unrated and Pending profiles cannot be shared or cloned, and Profile Sharing and Profile Cloning list only the profiles that qualify. The rating is checked again when a share or clone is accepted.\n"
         "Troubleshooting / Symptoms:\n"
         "Receiving: Incoming Shares can be closed to everyone with its Open/Closed toggle, and anyone can be blocked from its user list or with Block Sender while reviewing their shares. Blocking also takes back what they have waiting; closing leaves waiting shares to be answered.\n"
         "- Symptom: 'It says my share was not sent.' Fix: The recipient has not run `/start`, has closed Incoming Shares, has blocked you, or already has 25 of your profiles waiting. The bot does not say which.\n"
-        "- Symptom: 'My profile is missing from Profile Sharing.' Fix: It is not rated General. Rate it from `/profile manage` -> Home -> Content Safety. Adult 18+ profiles cannot be shared at all.\n"
+        "- Symptom: 'My profile is missing from Profile Sharing or Profile Cloning.' Fix: It is not rated General. Rate it from `/profile manage` -> Home -> Content Safety. Adult 18+ profiles cannot be shared at all.\n"
         "- Symptom: 'I cloned a profile but it has no memories.' Fix: Intended. LTM is never transferred by a clone."
     ),
     "profiles/public_hub_publishing.txt": (
@@ -1005,7 +1008,7 @@ DEFAULT_HELP_DOCS = {
     "sessions/proactivity_and_director.txt": (
         "Setup: Enabled via `/session config` -> Proactivity.\n"
         "Mechanism: When Proactivity is active, an asynchronous system loop monitors the channel. Based on your configured Trigger Chance (0-100%) and Cooldown, the bot can autonomously initiate conversation with no user message at all.\n"
-        "AI Director: If configured, the system uses a secondary model to read the scene prompt, the rolling synopsis and the last ten public messages, and generate a brief environmental change or sudden event (e.g., 'A loud noise is heard outside'). It never reads whispers or private replies: its note goes to the whole cast. Set the model to 'on' for the shipped default, or give a model ID; either falls back to the next model if the first is busy. Blank instructions use the default wording.\n"
+        "AI Director: If configured, the system uses a secondary model to read the scene prompt, the rolling synopsis and the last ten public messages, and generate a brief environmental change or sudden event (e.g., 'A loud noise is heard outside'). It never reads whispers or private replies: its note goes to the whole cast. Its Primary and Fallback are chosen at `/session config` -> Proactivity -> Director Model, which works like Set Models and has the Director's on/off switch; until you choose, it runs the LTM Summariser's models. It falls back to the next model if the first is busy. Blank instructions (Edit Settings & AI Director) use the default wording.\n"
         "Payload: This scene update is injected as an <internal_note> directly to the cast list, forcing the AI characters to dynamically react to the new situation autonomously.\n"
         "Cost: Proactive rounds consume API quota without anyone prompting them, and the Director is an extra call on top. Start with a low chance and a long cooldown.\n"
         "Troubleshooting / Symptoms:\n"
@@ -1077,8 +1080,8 @@ DEFAULT_HELP_DOCS = {
     ),
     "memory/ltm_archive.txt": (
         "Concept: Long-Term Memory (LTM) is a persistent, vector-embedded archive of past conversations. Maximum 5,000 memories per profile.\n"
-        "Settings: Auto-Creation, Auto-Recall and Memory Search are three switches on one screen at `/profile manage` -> Memory -> Memory Settings, with Creation Interval, Recall Context Size and Relevance Threshold behind its Parameters button.\n"
-        "Creation: Each character keeps its own place in the conversation. Once it has replied 'Creation Interval' times since its last memory, an auxiliary model reads everything said since then (the newest 40 turns at most) and keeps up to three things worth remembering, each stored and recalled on its own, or nothing. It reads public turns only -- never whispers -- with every time shown on that character's clock, and the scene's synopsis as background. A memory too close to one the character already has is dropped. If the model cannot be reached, the same turns are tried again one interval later. Toggle this off from 'Auto-Creation' if you would rather curate by hand.\n"
+        "Settings: Auto-Creation, Auto-Recall and Memory Search are three switches on one screen at `/profile manage` -> Memory -> Memory Settings, with a Creation Mode select and Creation Interval, Recall Context Size and Relevance Threshold behind its Parameters button.\n"
+        "Creation: Each character keeps its own place in the conversation. Once it has replied 'Creation Interval' times since its last memory -- or 40 turns have passed, in a busy scene -- an auxiliary model reads everything said since then (the newest 40 turns at most) and keeps up to three things worth remembering, each stored and recalled on its own, or nothing. It reads public turns only -- never whispers -- with every time shown on that character's clock, and the scene's synopsis as background. A memory too close to one the character already has is dropped. If the model cannot be reached, the same turns are tried again one interval later. In 'When flagged' mode a character can end a reply with a marker (never shown, and carrying no text) that makes a memory due two replies in rather than at the interval; the Creation Interval is then the longest it waits, and for its next two replies the character is told a memory was written, so it does not flag the same moment twice. Only the timing changes: the same model reads the same public turns and may still keep nothing. Whispers, regenerations and Global Chat never flag. Toggle this off from 'Auto-Creation' if you would rather curate by hand. `/suspend` writes one last memory for each character before it clears the session.\n"
         "Auto-Recall: When a user speaks, their prompt is embedded and compared against the LTM archive. If the score exceeds the 'Relevance Threshold', the memory is injected as `<archive_context>`, dated on the character's clock. New profiles start with this off, and turning Auto-Creation on turns it on with it; a profile created before the switch existed keeps recalling as it always did. Turning it off costs nothing per turn -- no shard read and no embedding.\n"
         "Memory Search: Retrieval above is automatic and searches on the turn's own wording. Turning on 'Memory Search' also lets the character run its own search, with a query it writes, when a reply needs something it cannot see -- which finds what the turn's wording would miss. While it is on the automatic pass tightens to its surest matches and the rest is reached by asking, so the stored Relevance Threshold applies again the moment it goes off. It costs one extra model request on the turns it actually searches, and needs a Google or OpenRouter model.\n"
         "Keys: Embedding uses the server's Google key, or its OpenRouter key when there is none or the Google request fails. Both ask for the same Google model, so one archive holds memories embedded either way.\n"

@@ -1491,6 +1491,38 @@ RECALL_TOOL_MAX = 5
 #: the retrieval is sure of and the rest is available by asking.
 LTM_AUTO_THRESHOLD_WITH_TOOL = 0.85
 
+#: Memory creation's default mode (`ltm_creation_mode` "flag"; "interval" opts out): the character marks a reply
+#: worth remembering and a capture runs at that round's end, instead of waiting out
+#: `ltm_creation_interval`. Only the *when* moves. The summariser still decides what is
+#: kept and can still find nothing, and `ltm_creation_interval` stays as the ceiling --
+#: a model told it *may* mark something under-calls, and a flag alone would never fire.
+#:
+#: A tag, not a declared function, for the reason the neuro engine is one: a function's
+#: answer costs another whole request, and a marker has nothing to answer. It also works
+#: on the Ollama slots, which take no functions.
+#:
+#: The tag carries no text. Whatever the character typed there would be read by the
+#: summariser beside a transcript it may not have been entitled to (a whisper), and would
+#: hand a user one more sentence that ends up in a permanent memory.
+LTM_FLAG_MIN_REPLIES = 2
+
+DEFAULT_MEMORY_CAPTURE_INSTRUCTION = (
+    "<memory_capture>\n"
+    "When something happens that you will want to remember in a month -- who someone is, "
+    "a change between you, a date that comes round again -- end that reply with "
+    "<memory_flag/>. Most replies need none.\n"
+    "It is only a marker. Never mention it, and never write anything inside it.\n"
+    "</memory_capture>"
+)
+
+# Per turn, unlike the brief above, and only while it is true: the character has no other
+# way to learn a memory was written, and would flag the same moment again.
+DEFAULT_MEMORY_WRITTEN_NOTE = (
+    "<memory_written>\n"
+    "You wrote a memory of this scene {when}. Flag another only for something new.\n"
+    "</memory_written>"
+)
+
 DEFAULT_TRAINING_DATA_INJECTION = (
     "<training_data>\nExamples of your own past speech. They are not part of the current conversation -- match the style, personality and voice they show, not their content.\n\n{examples_block}\n</training_data>"
 )
@@ -2470,21 +2502,18 @@ DEFAULT_PROFILE_GENERATOR_PROMPT = (
     "Design an original character from this concept: '{prompt}'\n\n"
     "Favour concrete, specific detail over genre cliche: a particular history, habits, contradictions and a voice of their own.\n\n"
     "Your response MUST be plain text formatted with specific section headers. Do not use JSON or markdown.\n"
-    "The required headers are exactly, in this order: [SECTION:display_name], [SECTION:library_intro], [SECTION:placeholder_emoji], "
+    "The required headers are exactly, in this order: [SECTION:display_name], [SECTION:library_intro], "
     "[SECTION:persona_backstory], [SECTION:persona_personality_traits], [SECTION:persona_likes], [SECTION:persona_dislikes], "
     "[SECTION:persona_appearance] and [SECTION:ai_instructions].\n"
     "Each header must be on its own line.\n"
     "display_name is the name the character goes by, at most 20 characters.\n"
     "library_intro is two or three sentences introducing the character to someone browsing a library of characters, at most 300 characters.\n"
-    "placeholder_emoji is exactly one emoji that suits the character.\n"
     "For every other section, provide unrestricted, concise, structured, and low-verbose text. Each specific instruction or piece of information should be on its own line.\n\n"
     "Example:\n"
     "[SECTION:display_name]\n"
     "Vesper Crane\n"
     "[SECTION:library_intro]\n"
     "An exiled archivist from a city of eternal twilight who trades forbidden knowledge for favours. Guarded, dry, and more hopeful than she admits.\n"
-    "[SECTION:placeholder_emoji]\n"
-    "🕯️\n"
     "[SECTION:persona_backstory]\n"
     "Born in a city of eternal twilight.\n"
     "Exiled for forbidden knowledge.\n"
@@ -2689,6 +2718,19 @@ def is_admin_or_owner_check():
     return app_commands.check(predicate)
 
 
+def cooldown_unless_refused(rate: int, per: float, refused):
+    """`checks.cooldown` per user, for a command that can refuse before it does anything.
+
+    discord.py spends a use in the check, ahead of the body, so a refusal from inside it
+    -- not registered, no key -- cost a use the user got nothing for, and at one a minute
+    made them wait it out after fixing the cause. `refused(cog, interaction)` is asked
+    first, and True means this call has no cooldown. It runs on every call: keep it cheap.
+    """
+    def factory(interaction: discord.Interaction):
+        return None if refused(interaction.command.binding, interaction) else app_commands.Cooldown(rate, per)
+    return app_commands.checks.dynamic_cooldown(factory, key=lambda i: i.user.id)
+
+
 # --- Context tags and the patterns that strip them ----------------------------
 
 #: Every tag the prompt assembly emits. One missing from here survives
@@ -2706,7 +2748,7 @@ SYSTEM_XML_TAGS = [
     "technical_manual", "training_data", "session_rules", "image_context",
     "system_note", "reply_context", "negative_constraints", "content_policy",
     "session_synopsis", "game_context", "birthday_context", "attachment_description",
-    "memory_search", "web_search", "neuro_state",
+    "memory_search", "web_search", "neuro_state", "memory_capture", "memory_flag", "memory_written",
     # The old names of <session_rules> and <current_time>, which a /mod override saved
     # before the rename still sends.
     "context_rules", "time_context",
@@ -2728,9 +2770,14 @@ PATTERN_REASONING_BLOCKS = re.compile(r'<(think|thought|reasoning)>.*?</\1>', fl
 PATTERN_REASONING_ORPHANS = re.compile(r'</?(think|thought|reasoning)>', flags=re.IGNORECASE)
 #: The colon is optional only where the header ends its line: a model copying the header
 #: sometimes drops it, and the ID and time then reached the channel.
-#: The time may be followed by the turn's `[#n]`, which every public turn now carries.
-PATTERN_SYSTEM_HEADER = re.compile(r'(?i)(?:^|\n)(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[ID:[^\]\r\n]+\](?:\s*\[[^\]\r\n]+\]){0,2}(?::\s*|[ \t]*(?:\r?\n|$))')
-PATTERN_TIMESTAMP_HEADER = re.compile(r'(?i)(?:^|\n)(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\]\r\n]+\](?:\s*\[#\d+\])?:\s*')
+#: The time may be followed by the turn's `[#n]`, which every public turn now carries, and a
+#: model copying the numbering sometimes puts one in front of the name as well: `[#1] <Name>
+#: [ID: x] [time] [#2]:`. The leading tag is the only bracket allowed ahead of the name, so
+#: only a line shaped like a header is taken. The timestamp form wants an `hh:mm` inside its
+#: brackets: "Notes [Mon 5pm]: bring cookies" is a sentence, and lost its opening to the
+#: looser test.
+PATTERN_SYSTEM_HEADER = re.compile(r'(?i)(?:^|\n)(?:\[#\d+\][ \t]*)?(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[ID:[^\]\r\n]+\](?:\s*\[[^\]\r\n]+\]){0,3}(?::\s*|[ \t]*(?:\r?\n|$))')
+PATTERN_TIMESTAMP_HEADER = re.compile(r'(?i)(?:^|\n)(?:\[#\d+\][ \t]*)?(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\]\r\n]*\d{1,2}:\d{2}[^\]\r\n]*\](?:\s*\[#\d+\])?:\s*')
 #: Wrappers no prompt contains, which models close their reply with anyway: `</response>`,
 #: `</...>`. Tags only, never what they enclose -- a whole reply inside `<response>` is still
 #: the reply.

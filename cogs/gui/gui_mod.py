@@ -834,6 +834,8 @@ MOD_PROMPT_CATEGORIES = [
         # Read by prompt_builder since Memory Search shipped, but never listed here, so
         # the one prompt an operator would most want to retune was unreachable.
         ("Memory Search \u00b7 Character Brief", "RECALL_INSTRUCTION", DEFAULT_RECALL_INSTRUCTION),
+        ("Memory Flag \u00b7 Character Brief", "MEMORY_CAPTURE_INSTRUCTION", DEFAULT_MEMORY_CAPTURE_INSTRUCTION),
+        ("Memory Flag \u00b7 Written Note", "MEMORY_WRITTEN_NOTE", DEFAULT_MEMORY_WRITTEN_NOTE),
         ("Training Analyst", "TRAINING_ANALYST", DEFAULT_TRAINING_ANALYST_PROMPT),
     ]),
     ("Bot Utilities", [
@@ -857,6 +859,7 @@ MOD_PROMPT_PLACEHOLDERS: Dict[str, Tuple[Set[str], str]] = {
     "CONTEXT_RULES": ({"profile_id_placeholder"}, "format"),
     "TIME_CONTEXT": ({"time_str"}, "format"),
     "BIRTHDAY_CONTEXT": ({"birthdays"}, "format"),
+    "MEMORY_WRITTEN_NOTE": ({"when"}, "format"),
     "NEGATIVE_CONSTRAINTS": ({"constraints"}, "format"),
     "TRAINING_DATA_INJECTION": ({"examples_block"}, "format"),
     "NEURO_ENGINE": ({"d", "c", "o", "a"}, "format"),

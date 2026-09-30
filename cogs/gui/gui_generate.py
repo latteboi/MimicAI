@@ -94,8 +94,7 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             lines.append(f"*{draft['library_intro']}*")
 
         title = draft.get("display_name") or self.profile_name
-        emoji = draft.get("placeholder_emoji")
-        embed = discord.Embed(title=_clip(f"{emoji} {title}" if emoji else title, 256),
+        embed = discord.Embed(title=_clip(title, 256),
                               description="\n\n".join(lines), color=discord.Color.blurple())
         if draft.get("avatar_url"):
             embed.set_thumbnail(url=draft["avatar_url"])

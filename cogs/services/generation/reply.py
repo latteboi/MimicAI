@@ -29,7 +29,7 @@ from ...utils.helpers import (
     unreadable_media_modality,
 )
 from ..api_service import MissingKeyError
-from ._shared import _strip_neuro_update_and_scrub
+from ._shared import _strip_neuro_update_and_scrub, take_memory_flag
 from . import latency, tool_loop
 from .tool_loop import FunctionContext
 
@@ -204,6 +204,8 @@ class ReplyText:
     blocked: bool = False
     neuro_state: Optional[Dict[str, int]] = None
     sources: Optional[List[Dict[str, str]]] = None
+    #: The reply ended in `<memory_flag/>`. Only a session round acts on it.
+    ltm_flag: bool = False
 
 
 def reply_gen_config(p_settings: Dict, temperature, top_p, top_k) -> Dict:
@@ -238,7 +240,7 @@ def _merge_sources(*groups: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 
 def reply_meta(attempt: ReplyAttempt, *, duration: float, training_examples, ltm_recall_text,
-               sources, neuro_state, critic: Optional[Dict] = None) -> Dict:
+               sources, neuro_state, critic: Optional[Dict] = None, ltm_flag: bool = False) -> Dict:
     """The trace a generated turn carries. Small: it rides in every turn of the log."""
     response = attempt.response
     meta = {
@@ -271,6 +273,8 @@ def reply_meta(attempt: ReplyAttempt, *, duration: float, training_examples, ltm
         meta["neuro_state"] = neuro_state
     if critic:
         meta["critic"] = critic
+    if ltm_flag:
+        meta["ltm_flag"] = True
     # Sparse, like everything else here: a turn that read its attachments itself says
     # nothing at all about them.
     if attempt.media_dropped:
@@ -664,6 +668,7 @@ class ReplyMixin:
                     raw_text = _add_inline_citations(raw_text, candidate.grounding_metadata)
                 raw_text, reply.neuro_state = self._extract_and_apply_neuro_state(
                     raw_text.strip(), owner_id, profile_name)
+                raw_text, reply.ltm_flag = take_memory_flag(raw_text)
                 text = _scrub_response_text(raw_text, participant_names=participant_names)
                 if text:
                     # Both halves: what the answering response cited natively, and what

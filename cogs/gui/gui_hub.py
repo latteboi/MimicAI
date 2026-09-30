@@ -23,6 +23,7 @@ class HubBaseView(TabbedView):
         ("Public Library", "library", lambda v: HubPublicLibraryView(v.cog, v.original_interaction)),
         ("Incoming Shares", "incoming", lambda v: HubIncomingView(v.cog, v.original_interaction)),
         ("Profile Sharing", "manage", lambda v: HubShareManagerView(v.cog, v.original_interaction)),
+        ("Profile Cloning", "clone", lambda v: HubCloneManagerView(v.cog, v.original_interaction)),
     )
 
 class HubHomeView(HubBaseView):
@@ -494,8 +495,13 @@ class HubIncomingView(HubBaseView):
         await self.update_display()
 
 class HubShareManagerView(HubBaseView):
+    #: Sharing and cloning are separate tabs so the two send buttons never sit side by
+    #: side: one lends a borrow, the other gives a copy away for good.
+    TAB = "manage"
+    CLONE = False
+
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):
-        super().__init__(cog, interaction, "manage")
+        super().__init__(cog, interaction, self.TAB)
         self.mode = "private"
         self.selected_profiles = []
         self.selected_users = []
@@ -536,10 +542,11 @@ class HubShareManagerView(HubBaseView):
         for item in self.children[:]:
             if item.row != 4: self.remove_item(item)
 
-        # Row 0: Mode
-        style = discord.ButtonStyle.blurple if self.mode == "private" else discord.ButtonStyle.green
-        label = "Mode: Private Sharing" if self.mode == "private" else "Mode: Public Publishing"
-        add_button(self, label, self.toggle_mode, style=style, row=0)
+        # Row 0: Mode. Cloning has no public half, so nothing to toggle.
+        if not self.CLONE:
+            style = discord.ButtonStyle.blurple if self.mode == "private" else discord.ButtonStyle.green
+            label = "Mode: Private Sharing" if self.mode == "private" else "Mode: Public Publishing"
+            add_button(self, label, self.toggle_mode, style=style, row=0)
 
         # Row 0 holds Clear and the page controls too, directly above the select they
         # act on: rows 2 and 3 are recipients then Send, so Send reads as sending to them.
@@ -580,8 +587,10 @@ class HubShareManagerView(HubBaseView):
             user_sel = ui.UserSelect(placeholder="Select recipients...", min_values=1, max_values=10, row=2)
             user_sel.callback = self.select_users
             self.add_item(user_sel)
-            add_button(self, "Send", self.send_private, style=discord.ButtonStyle.green, row=3)
-            add_button(self, "Send as Clone", self.send_clone, style=discord.ButtonStyle.blurple, row=3)
+            if self.CLONE:
+                add_button(self, "Send as Clone", self.send_clone, style=discord.ButtonStyle.blurple, row=3)
+            else:
+                add_button(self, "Send", self.send_private, style=discord.ButtonStyle.green, row=3)
         else:
             add_button(self, "Apply Changes", self.apply_public, style=discord.ButtonStyle.green,
                        row=2)
@@ -596,11 +605,18 @@ class HubShareManagerView(HubBaseView):
 
     def build_embed(self) -> discord.Embed:
         desc = "Manage how you share your profiles.\n\n"
-        if self.mode == "private":
+        if self.CLONE:
+            desc = "Give your profiles away as copies.\n\n"
+            desc += ("**Send as Clone** offers people who have set MimicAI up an independent copy of "
+                     "their own, without memories: they can edit it freely and it never follows your "
+                     "edits. The offer waits in their Incoming Shares until they answer it; nobody is "
+                     "messaged. To lend a profile that follows your edits, use **Profile Sharing**.\n"
+                     "Only profiles rated **General** or **Exempt** are listed.")
+        elif self.mode == "private":
             desc += ("**Private Mode:** Offer profiles to people who have set MimicAI up. An offer "
                      "waits in their Incoming Shares until they answer it; nobody is messaged.\n"
-                     "**Send** lends a borrow that follows your edits. **Send as Clone** gives them "
-                     "an independent copy of their own, without memories.\n"
+                     "**Send** lends a borrow that follows your edits. To give them an independent "
+                     "copy instead, use **Profile Cloning**.\n"
                      "Only profiles rated **General** or **Exempt** are listed.")
         else:
             desc += ("**Public Mode:** Publish your profiles to the global library for anyone to borrow.\n"
@@ -850,6 +866,11 @@ class HubShareManagerView(HubBaseView):
         if not (published_list or unpublished_list or failed_list): report_embed.description = "No changes were made."
 
         await i.followup.send(embed=report_embed, ephemeral=True)
+
+class HubCloneManagerView(HubShareManagerView):
+    TAB = "clone"
+    CLONE = True
+
 
 class BorrowDefaultsView(BlockedGuard, ui.View):
     """Asked by `_accept_share_request` when the borrower's defaults would change what the
