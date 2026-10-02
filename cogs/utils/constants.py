@@ -2778,6 +2778,10 @@ PATTERN_REASONING_ORPHANS = re.compile(r'</?(think|thought|reasoning)>', flags=r
 #: looser test.
 PATTERN_SYSTEM_HEADER = re.compile(r'(?i)(?:^|\n)(?:\[#\d+\][ \t]*)?(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[ID:[^\]\r\n]+\](?:\s*\[[^\]\r\n]+\]){0,3}(?::\s*|[ \t]*(?:\r?\n|$))')
 PATTERN_TIMESTAMP_HEADER = re.compile(r'(?i)(?:^|\n)(?:\[#\d+\][ \t]*)?(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\]\r\n]*\d{1,2}:\d{2}[^\]\r\n]*\](?:\s*\[#\d+\])?:\s*')
+#: The turn number alone, which a model copies onto the front of its reply with no header
+#: after it: "[#2] If you value...". Line-leading, and not when a lowercase word follows:
+#: "[#1] is what I called him" is the model naming a turn on purpose.
+PATTERN_BARE_TURN_TAG = re.compile(r'(?m)^[ \t]*\[#\d+\]:?(?![ \t]*[a-z])[ \t]*')
 #: Wrappers no prompt contains, which models close their reply with anyway: `</response>`,
 #: `</...>`. Tags only, never what they enclose -- a whole reply inside `<response>` is still
 #: the reply.

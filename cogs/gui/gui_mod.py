@@ -537,9 +537,15 @@ class ModBlacklistView(ModBaseView):
 #: Read at import, which is boot: close enough for an uptime line.
 _STARTED_AT = time.time()
 
+UNREGISTERED_LABEL = "⚠️ Not registered"
 
-def _scan_registered_users() -> List[Tuple[int, str, int, int]]:
-    """(id, provider, personal, borrowed) for every registered user. Run off the loop.
+
+def _scan_users() -> List[Tuple[int, Optional[str], int, int]]:
+    """(id, provider, personal, borrowed) for every user directory. Run off the loop.
+
+    `provider` is None for a directory that predates `/start` -- data, but never registered,
+    so locked out of creating more until they run it. Listed, not skipped: a mod who cannot
+    see them cannot tell them why.
 
     `is_registered`'s test against the raw `index.json`, never `_get_user_index`: that
     caches each one, pushing every active user out of the LRU, and may repair -- a
@@ -552,11 +558,12 @@ def _scan_registered_users() -> List[Tuple[int, str, int, int]]:
         if not name.isdigit():
             continue
         index = IOManager.read_json(os.path.join(USERS_DIR, name, "index.json"))
-        about = index.get("about") if isinstance(index, dict) else None
+        if not isinstance(index, dict):
+            index = {}
+        about = index.get("about")
         provider = about.get("provider") if isinstance(about, dict) else None
-        if provider in PROVIDER_CHOICES:
-            rows.append((int(name), provider, len(index.get("personal") or {}),
-                         len(index.get("borrowed") or {})))
+        rows.append((int(name), provider if provider in PROVIDER_CHOICES else None,
+                     len(index.get("personal") or {}), len(index.get("borrowed") or {})))
     return rows
 
 
@@ -572,7 +579,7 @@ class ModStatsView(ModBaseView):
         self.selected_category = "Servers"
         self.current_page = 0
         # Read from disk when Users is first opened, not on every /mod.
-        self._users: Optional[List[Tuple[int, str, int, int]]] = None
+        self._users: Optional[List[Tuple[int, Optional[str], int, int]]] = None
         self._build_view()
 
     def _pages(self) -> List[str]:
@@ -593,8 +600,9 @@ class ModStatsView(ModBaseView):
         for j, (uid, provider, personal, borrowed) in enumerate(rows, start=1):
             user = self.cog.bot.get_user(uid)
             lines.append(f"{j}. **{user.name if user else 'Unknown User'}** (`{uid}`) — "
-                         f"{PROVIDER_CHOICES[provider]} · Personal: `{personal}` · Borrowed: `{borrowed}`")
-        return _paginate(lines, "No registered users.")
+                         f"{PROVIDER_CHOICES.get(provider, UNREGISTERED_LABEL)} · "
+                         f"Personal: `{personal}` · Borrowed: `{borrowed}`")
+        return _paginate(lines, "No users.")
 
     def _build_view(self):
         self.clear_items()
@@ -605,7 +613,7 @@ class ModStatsView(ModBaseView):
             self.selected_category = i.data['values'][0]
             self.current_page = 0
             if self.selected_category == "Users" and self._users is None:
-                self._users = await asyncio.to_thread(_scan_registered_users)
+                self._users = await asyncio.to_thread(_scan_users)
             self._build_view()
             await self.update_display()
         add_select(self, cat_opts, cat_cb, placeholder="Select Category...", row=0)
@@ -672,9 +680,11 @@ class ModStatsView(ModBaseView):
 
         if self.selected_category == "Users" and self._users is not None:
             by_provider = Counter(r[1] for r in self._users)
+            unregistered = by_provider.pop(None, 0)
             embed.add_field(name="Users", inline=False, value=(
-                f"Registered `{len(self._users)}` — "
-                + " · ".join(f"{PROVIDER_CHOICES[p]} `{n}`" for p, n in by_provider.most_common()) + "\n"
+                f"Registered `{by_provider.total()}` — "
+                + " · ".join(f"{PROVIDER_CHOICES[p]} `{n}`" for p, n in by_provider.most_common())
+                + (f" · {UNREGISTERED_LABEL} `{unregistered}`" if unregistered else "") + "\n"
                 f"Personal profiles `{sum(r[2] for r in self._users)}` · "
                 f"Borrows `{sum(r[3] for r in self._users)}`"))
         return embed

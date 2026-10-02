@@ -19,7 +19,7 @@ from .constants import (
     PATTERN_SYSTEM_XML_BLOCKS, PATTERN_SYSTEM_XML_ORPHANS,
     PATTERN_REASONING_BLOCKS, PATTERN_REASONING_ORPHANS, PATTERN_SYSTEM_HEADER,
     PATTERN_TIMESTAMP_HEADER, PATTERN_METADATA, PATTERN_MESSAGE_LINK,
-    PATTERN_SPEAKER_CLOSE, PATTERN_STRAY_WRAPPERS,
+    PATTERN_SPEAKER_CLOSE, PATTERN_STRAY_WRAPPERS, PATTERN_BARE_TURN_TAG,
     PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK, SYSTEM_MODEL_DEFAULTS,
     SYSTEM_MODEL_DEFAULTS_BY_PROVIDER, AUTO_MODEL_PREFIX, AUTO_TIER_KEYS,
     AUTO_ENDPOINTS_KEY, AUTO_SERVICE_TIERS_KEY,
@@ -409,6 +409,7 @@ def _scrub_response_text(text: str, participant_names: Optional[List[str]] = Non
             scrubbed_text = PATTERN_REASONING_ORPHANS.sub('', scrubbed_text)
             scrubbed_text = PATTERN_SYSTEM_HEADER.sub('', scrubbed_text)
             scrubbed_text = PATTERN_TIMESTAMP_HEADER.sub('', scrubbed_text)
+            scrubbed_text = PATTERN_BARE_TURN_TAG.sub('', scrubbed_text)
             scrubbed_text = PATTERN_METADATA.sub('', scrubbed_text)
             scrubbed_text = PATTERN_STRAY_WRAPPERS.sub('', scrubbed_text)
 
