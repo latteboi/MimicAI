@@ -5,9 +5,12 @@ import time
 import discord
 from discord import ui
 import datetime
+from collections import Counter
 from string import Formatter
 from typing import TYPE_CHECKING, Dict, List, Set, Tuple, Optional, get_args
+from ..managers.storage_manager import IOManager
 from ..utils.helpers import _sanitise_filename, resolve_openrouter_endpoint, system_model
+from ..utils.loop_probe import rss_bytes
 from ..utils.user_defaults import auto_wording, model_slot_defaults, other_provider
 from .base_components import (BlockedGuard, TabbedView, TimeoutCleanupMixin, add_button,
                               add_select, build_confirm_view, invalidate_model_cache)
@@ -531,70 +534,83 @@ class ModBlacklistView(ModBaseView):
         await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
 
 
+#: Read at import, which is boot: close enough for an uptime line.
+_STARTED_AT = time.time()
+
+
+def _scan_registered_users() -> List[Tuple[int, str, int, int]]:
+    """(id, provider, personal, borrowed) for every registered user. Run off the loop.
+
+    `is_registered`'s test against the raw `index.json`, never `_get_user_index`: that
+    caches each one, pushing every active user out of the LRU, and may repair -- a
+    stats screen must not write.
+    """
+    rows = []
+    if not os.path.isdir(USERS_DIR):
+        return rows
+    for name in os.listdir(USERS_DIR):
+        if not name.isdigit():
+            continue
+        index = IOManager.read_json(os.path.join(USERS_DIR, name, "index.json"))
+        about = index.get("about") if isinstance(index, dict) else None
+        provider = about.get("provider") if isinstance(about, dict) else None
+        if provider in PROVIDER_CHOICES:
+            rows.append((int(name), provider, len(index.get("personal") or {}),
+                         len(index.get("borrowed") or {})))
+    return rows
+
+
+def _paginate(lines: List[str], empty: str) -> List[str]:
+    return ["\n".join(lines[i:i + 25]) for i in range(0, len(lines), 25)] or [empty]
+
+
 class ModStatsView(ModBaseView):
+    CATEGORIES = ("Servers", "Users")
+
     def __init__(self, cog, interaction, target_user_id: Optional[int] = None):
         super().__init__(cog, interaction, "stats", target_user_id=target_user_id)
         self.selected_category = "Servers"
         self.current_page = 0
-        self.content_dict = {}
-        self._load_data()
+        # Read from disk when Users is first opened, not on every /mod.
+        self._users: Optional[List[Tuple[int, str, int, int]]] = None
         self._build_view()
 
-    def _load_data(self):
-        guilds_sorted = sorted(self.cog.bot.guilds, key=lambda g: g.me.joined_at if (g.me and g.me.joined_at) else datetime.datetime.now(datetime.timezone.utc))
-        
-        servers_pages = []
-        if not guilds_sorted:
-            servers_pages.append("No server data available.")
-        else:
-            for i in range(0, len(guilds_sorted), 25):
-                chunk = guilds_sorted[i:i + 25]
-                lines = []
-                for j, guild in enumerate(chunk, start=i + 1):
-                    join_str = guild.me.joined_at.strftime("%d/%m/%Y") if (guild.me and guild.me.joined_at) else "Unknown"
-                    lines.append(f"{j}. **{guild.name}** (`{guild.id}`) — Joined: `{join_str}`")
-                servers_pages.append("\n".join(lines))
-        
-        user_stats = []
-        if os.path.isdir(self.cog.USERS_DIR):
-            for user_id_str in os.listdir(self.cog.USERS_DIR):
-                if user_id_str.isdigit():
-                    user_id = int(user_id_str)
-                    index = self.cog.profile_manager._get_user_index(user_id)
-                    profile_count = len(index.get("personal", {}))
-                    if profile_count > 0:
-                        user_obj = self.cog.bot.get_user(user_id)
-                        user_name = user_obj.name if user_obj else "Unknown User"
-                        user_stats.append({"id": user_id, "name": user_name, "count": profile_count})
-        
-        user_stats.sort(key=lambda x: x["count"], reverse=True)
-        
-        users_pages = []
-        if not user_stats:
-            users_pages.append("No user data available.")
-        else:
-            for i in range(0, len(user_stats), 25):
-                chunk = user_stats[i:i + 25]
-                lines = []
-                for j, u_stat in enumerate(chunk, start=i + 1):
-                    lines.append(f"{j}. **{u_stat['name']}** (`{u_stat['id']}`) — Personal Profiles: `{u_stat['count']}`")
-                users_pages.append("\n".join(lines))
+    def _pages(self) -> List[str]:
+        if self.selected_category == "Servers":
+            now = datetime.datetime.now(datetime.timezone.utc)
+            guilds = sorted(self.cog.bot.guilds, key=lambda g: (g.me and g.me.joined_at) or now)
+            live = Counter(getattr(getattr(self.cog.bot.get_channel(ch), "guild", None), "id", None)
+                           for ch in self.cog.multi_profile_channels)
+            lines = []
+            for j, guild in enumerate(guilds, start=1):
+                joined = guild.me.joined_at.strftime("%d/%m/%Y") if (guild.me and guild.me.joined_at) else "Unknown"
+                lines.append(f"{j}. **{guild.name}** (`{guild.id}`) — Members: `{guild.member_count or '?'}` · "
+                             f"Sessions: `{live[guild.id]}` · Joined: `{joined}`")
+            return _paginate(lines, "No server data available.")
 
-        self.content_dict = {"Servers": servers_pages, "Users": users_pages}
+        rows = sorted(self._users or [], key=lambda r: (r[2], r[3]), reverse=True)
+        lines = []
+        for j, (uid, provider, personal, borrowed) in enumerate(rows, start=1):
+            user = self.cog.bot.get_user(uid)
+            lines.append(f"{j}. **{user.name if user else 'Unknown User'}** (`{uid}`) — "
+                         f"{PROVIDER_CHOICES[provider]} · Personal: `{personal}` · Borrowed: `{borrowed}`")
+        return _paginate(lines, "No registered users.")
 
     def _build_view(self):
         self.clear_items()
 
-        cat_opts = [discord.SelectOption(label=cat, value=cat, default=(cat == self.selected_category)) for cat in self.content_dict.keys()]
+        cat_opts = [discord.SelectOption(label=cat, value=cat, default=(cat == self.selected_category)) for cat in self.CATEGORIES]
         async def cat_cb(i: discord.Interaction):
+            await i.response.defer()
             self.selected_category = i.data['values'][0]
             self.current_page = 0
+            if self.selected_category == "Users" and self._users is None:
+                self._users = await asyncio.to_thread(_scan_registered_users)
             self._build_view()
-            await i.response.edit_message(embed=self._get_embed(), view=self)
+            await self.update_display()
         add_select(self, cat_opts, cat_cb, placeholder="Select Category...", row=0)
 
-        pages = self.content_dict[self.selected_category]
-        num_pages = len(pages)
+        num_pages = len(self._pages())
         if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
 
         self._add_page_controls(num_pages, 1)
@@ -642,8 +658,25 @@ class ModStatsView(ModBaseView):
 
     def _get_embed(self):
         embed = discord.Embed(title="MimicAI Statistics", color=discord.Color.gold())
-        pages = self.content_dict[self.selected_category]
+        pages = self._pages()
         embed.description = pages[self.current_page]
+
+        sessions = self.cog.multi_profile_channels.values()
+        clients = self.cog.child_bot_manager.clients.values()
+        rss = rss_bytes()
+        embed.add_field(name="Instance", inline=False, value=(
+            f"Up since <t:{int(_STARTED_AT)}:R>"
+            + (f" · Memory `{rss / 2**20:.0f} MB`" if rss else "") + "\n"
+            f"Sessions `{len(sessions)}` live, `{sum(map(self.cog.session_manager.is_started, sessions))}` started · "
+            f"Child bots `{sum(c.is_ready() for c in clients)}` online of `{len(self.cog.child_bots)}`"))
+
+        if self.selected_category == "Users" and self._users is not None:
+            by_provider = Counter(r[1] for r in self._users)
+            embed.add_field(name="Users", inline=False, value=(
+                f"Registered `{len(self._users)}` — "
+                + " · ".join(f"{PROVIDER_CHOICES[p]} `{n}`" for p, n in by_provider.most_common()) + "\n"
+                f"Personal profiles `{sum(r[2] for r in self._users)}` · "
+                f"Borrows `{sum(r[3] for r in self._users)}`"))
         return embed
 
     async def update_display(self):

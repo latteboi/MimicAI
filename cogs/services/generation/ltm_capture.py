@@ -116,8 +116,8 @@ class LtmCaptureMixin:
     ) -> Tuple[List[str], List[str], List[str]]:
         """Writes a memory now for each of `seats`: (made, skipped, none) as display names.
 
-        The body of `/memorise`, and what `/suspend` runs before it deletes the log: the
-        turns since a seat's last memory are held nowhere else.
+        The body of `/memorise`, and what `/suspend` runs once the log is deleted, from the
+        session it still holds: the turns since a seat's last memory are held nowhere else.
         """
         made, skipped, none = [], [], []
         for seat in seats:

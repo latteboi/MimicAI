@@ -37,7 +37,9 @@ class EventListeners:
             await self.session_manager._load_multi_profile_sessions()
             self.sessions_loaded = True
 
-        self.child_bot_manager._load_child_bots()
+        # A stat of every profile shard. on_ready fires again on every unresumed
+        # reconnect, with the parent and every child bot waiting on this loop.
+        await asyncio.to_thread(self.child_bot_manager._load_child_bots)
         self.all_bot_ids = {self.bot.user.id} | {int(bot_id) for bot_id in self.child_bots.keys()}
         await self.child_bot_manager.start_all_child_bots()
 
@@ -66,7 +68,7 @@ class EventListeners:
             activity = self.server_manager._build_activity_from_dict(presence)
             await self.bot.change_presence(status=status_map.get(status_val, discord.Status.online), activity=activity)
             
-            self.storage_manager._purge_legacy_default_profile()
+            await asyncio.to_thread(self.storage_manager._purge_legacy_default_profile)
 
             # Before the repair, not after: the repair reads names through the sidecar,
             # so backfilling first is what makes this boot's repair -- and every one

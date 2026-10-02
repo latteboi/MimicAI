@@ -197,7 +197,6 @@ class MimicCog(EventListeners, commands.Cog):
         
         # Memory-bounded caches to prevent RAM growth on long uptime
         self.user_appearances: LRUCache = LRUCache(max_size=50)
-        self.child_bot_edit_cooldowns: LRUCache = LRUCache(max_size=50)
         
         self.server_manager._load_channel_webhooks()
 
@@ -1350,6 +1349,7 @@ class MimicCog(EventListeners, commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         ch_id = interaction.channel_id
+        held = await self._session_to_memorise(interaction)
         session = self.multi_profile_channels.get(ch_id)
 
         if not session:
@@ -1364,10 +1364,6 @@ class MimicCog(EventListeners, commands.Cog):
                         "action": "send_to_child", "bot_id": bot_id,
                         "payload": {"action": "stop_typing", "channel_id": ch_id}
                     })
-
-        session_type = session.get("type", "multi")
-        dummy_session_key = (ch_id, None, None)
-        await self.session_manager._delete_session_from_disk(dummy_session_key, session_type)
 
         # [NEW] Reset LTM recall history (penalty system) for this channel
         for p in session.get("profiles", []):
@@ -1389,8 +1385,49 @@ class MimicCog(EventListeners, commands.Cog):
                 session['task_queue'].task_done()
             except asyncio.QueueEmpty:
                 break
-        
+
+        # Last, once nothing is left to write: the delete is the teardown's only await,
+        # and a round that delivered during it would flush its log back over the delete.
+        await self.session_manager._delete_session_from_disk((ch_id, None, None), session.get("type", "multi"))
+
         await interaction.followup.send("The session memory for this channel has been cleared. The conversation will start from scratch.", ephemeral=True)
+        await self._memorise_held(interaction, held)
+
+    async def _session_to_memorise(self, interaction: discord.Interaction) -> Optional[Dict]:
+        """This channel's session, hydrated, for `_memorise_held` once a teardown has
+        emptied it: the turns since a seat's last memory are held nowhere else.
+
+        None without a key -- `/suspend` and `/refresh` must work on a server with none,
+        on a stuck session and with the API down; they just save nothing.
+        """
+        ch_id = interaction.channel_id
+        if self._session_key_block(interaction.guild, interaction.user.id):
+            return None
+        session = self.multi_profile_channels.get(ch_id)
+        if session and not session.get("is_hydrated"):
+            try:
+                session = await self.session_manager._ensure_session_hydrated(ch_id, session.get("type", "multi"))
+            except Exception as e:
+                print(f"Hydrating {ch_id} before tearing it down failed: {e}")
+                return None
+        # A copy: /refresh empties the live dict's log in place. The seats are shared, so
+        # their memory bookmarks still land on the session that keeps them.
+        return dict(session) if session else None
+
+    async def _memorise_held(self, interaction: discord.Interaction, held: Optional[Dict]):
+        """Run after the teardown, never before: the flush is a model call per seat, and
+        a session left live meanwhile took every message, command and cast change sent
+        in that window -- and a cast configured then was suspended along with it."""
+        if not held:
+            return
+        try:
+            saved, _, _ = await self.generation_service.memorise_seats(
+                held, list(held.get("profiles", [])), interaction.guild.id,
+                interaction.user.display_name, interaction.user.id, interaction.channel)
+            if saved:
+                await interaction.followup.send(f"Saved a memory for {', '.join(saved)}.", ephemeral=True)
+        except Exception as e:
+            print(f"Memory flush after tearing down {interaction.channel_id} failed: {e}")
 
     @app_commands.command(name="cancel", description="Stops the bot's current generation or typing in this channel (Admin Only).")
     @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
@@ -1515,30 +1552,14 @@ class MimicCog(EventListeners, commands.Cog):
         
         ch_id = interaction.channel_id
 
-        # Suspending deletes the log, and with it every turn since a seat's last memory.
-        # Best effort and keyless-safe: a suspend must work on a stuck session, on a
-        # server with no key, and with the API down -- it just saves nothing.
-        saved = []
-        session = self.multi_profile_channels.get(ch_id)
-        if session and not self._session_key_block(interaction.guild, interaction.user.id):
-            try:
-                if not session.get("is_hydrated"):
-                    session = await self.session_manager._ensure_session_hydrated(ch_id, session.get("type", "multi"))
-                if session:
-                    saved, _, _ = await self.generation_service.memorise_seats(
-                        session, list(session.get("profiles", [])), interaction.guild.id,
-                        interaction.user.display_name, interaction.user.id, interaction.channel)
-            except Exception as e:
-                print(f"Memory flush before suspending {ch_id} failed: {e}")
-
+        held = await self._session_to_memorise(interaction)
         if not await self.session_manager.suspend_channel_session(ch_id):
             await interaction.followup.send("There is no active session in this channel to suspend.", ephemeral=True)
             return
 
         self.session_manager._save_multi_profile_sessions()
-
-        note = f" Saved a memory first for {', '.join(saved)}." if saved else ""
-        await interaction.followup.send(f"Session suspended for {interaction.channel.mention}. The bot will be silent until configured again.{note}", ephemeral=True)
+        await interaction.followup.send(f"Session suspended for {interaction.channel.mention}. The bot will be silent until configured again.", ephemeral=True)
+        await self._memorise_held(interaction, held)
 
     @app_commands.command(name="purge", description="Deletes this session's latest turns, every message of each, from channel and memory (Admin Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)

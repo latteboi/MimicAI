@@ -21,12 +21,10 @@ from ..utils.helpers import (_resolve_safety_settings, _split_into_sentences_wit
                              apply_typing_cursor, attachment_mime, image_command_prompt, image_rag_enabled,
                              typing_cursor_cost, upload_too_large)
 from ..utils.attachment_limits import over_attachment_limit
-from ..utils.discord_cdn import signed_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager
 from .session_manager import NEW_SESSION_COMPACTION
 
-MAX_AVATAR_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 MAX_EMOJI_SIZE_BYTES = 256 * 1024  # Discord's limit on an uploaded emoji, app or guild.
 # The placeholder to fall back to when a custom one cannot be made to render on a child.
 # Not PLACEHOLDER_EMOJI: that is the value this whole path exists to translate, and it is
@@ -150,9 +148,10 @@ class ChildBotManager:
         self._child_bot_scan_signature = signature
 
     async def start_all_child_bots(self):
-        """Launches all configured child bots directly into the shared asyncio event loop."""
-        # Cheap now: returns immediately unless a shard changed since the caller's scan.
-        self._load_child_bots()
+        """Launches all configured child bots directly into the shared asyncio event loop.
+
+        Reads `cog.child_bots` as the caller last loaded it -- on_ready, its only caller,
+        loads first, off the loop."""
         if not self.queue_worker_task or self.queue_worker_task.done():
             self.queue_worker_task = asyncio.create_task(self._manager_queue_listener())
 
@@ -563,8 +562,6 @@ class ChildBotManager:
                         if t_key in self.typing_tasks:
                             self.typing_tasks[t_key].cancel()
                             self.typing_tasks.pop(t_key, None)
-                    elif child_action in ["update_username", "update_avatar"]:
-                        asyncio.create_task(self.update_appearance(bot_id, payload))
 
             except asyncio.CancelledError:
                 break
@@ -814,46 +811,6 @@ class ChildBotManager:
                     self.typing_tasks.pop(task_key, None)
 
         self.typing_tasks[task_key] = asyncio.create_task(typing_loop())
-
-    async def update_appearance(self, bot_id: str, payload: Dict[str, Any]):
-        bot = self.clients.get(str(bot_id))
-        if not bot or not bot.is_ready():
-            return
-
-        action = payload.get("action")
-        try:
-            if action == "update_username":
-                await bot.user.edit(username=payload.get("username"))
-            elif action == "update_avatar":
-                url = payload.get("avatar_url")
-                if url:
-                    url = await signed_attachment_url(bot.http, url)
-                    # Was a per-call aiohttp.ClientSession, which built its own SSL
-                    # context and connector for one GET. Shares the pool now.
-                    resp = await get_capped(get_shared_client(), url, MAX_AVATAR_SIZE_BYTES,
-                                            timeout=15.0)
-                    if resp.content is not None:
-                        data = resp.content
-                        if data:
-                            # Imported here rather than at module scope: Pillow
-                            # costs ~6 MB of RSS and this -- a child bot having its
-                            # avatar changed -- is the only path in the process
-                            # that decodes an image.
-                            from PIL import Image
-                            try:
-                                with Image.open(io.BytesIO(data)) as img:
-                                    if img.mode != 'RGBA':
-                                        img = img.convert('RGBA')
-                                    with io.BytesIO() as out_buffer:
-                                        img.save(out_buffer, format='PNG')
-                                        png_data = out_buffer.getvalue()
-                                await bot.user.edit(avatar=png_data)
-                            except Exception:
-                                await bot.user.edit(avatar=data)
-                else:
-                    await bot.user.edit(avatar=None)
-        except Exception as e:
-            print(f"[ChildBotManager] Appearance update error for {bot_id}: {e}")
 
     async def execute_delete(self, bot_id: str, payload: Dict[str, Any]):
         bot = self.clients.get(str(bot_id))

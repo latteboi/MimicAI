@@ -33,7 +33,11 @@ class HubHomeView(HubBaseView):
     async def update_display(self):
         total_public = len(self.cog.public_profiles)
         
-        unique_creators = {d["owner_id"] for d in self.cog.profile_manager._iter_public_entries()}
+        # Off the raw entries: describing one reads its owner's index, and this runs on
+        # every /hub. Tombstones are swept at boot, so this counts what total_public does.
+        unique_creators = {self.cog.profile_manager._public_entry_owner(p)
+                           for p in self.cog.public_profiles.values()}
+        unique_creators.discard(None)
         unique_creators_count = len(unique_creators)
         
         index = self.cog.profile_manager._get_user_index(self.user_id)
@@ -75,6 +79,8 @@ class HubPublicLibraryView(HubBaseView):
         self.setup_items()
 
     def _load_public_data(self):
+        # ponytail: one owner-index read per creator, on the loop, every Library open --
+        # cheap until creators outgrow the 200-entry user_indices LRU; then cache this list.
         raw_list = list(self.cog.profile_manager._iter_public_entries())
         raw_list.sort(key=lambda x: x['published_at'], reverse=True)
         self.all_public = raw_list

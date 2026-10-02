@@ -9,8 +9,8 @@ these runs on the way out, chosen by who reads the link:
   no query at all, Discord signs a fresh one whenever it draws it. That is the API
   reference's own answer ("Signed Attachment CDN URLs"), and costs no request:
   `unsigned_attachment_url`.
-- **The bot** -- the content classifier and a child bot's avatar download the image, so
-  they need a signature that is still good: `signed_attachment_url`.
+- **The bot** -- the content classifier downloads the image, so it needs a signature
+  that is still good: `signed_attachment_url`.
 """
 import asyncio
 import re

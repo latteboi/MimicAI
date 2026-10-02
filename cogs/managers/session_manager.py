@@ -323,15 +323,30 @@ class SessionManager:
             return pathlib.Path(SESSIONS_GLOBAL_DIR) / str(user_id)
 
         channel_id, _, _ = session_key
-        channel = self.cog.bot.get_channel(channel_id)
-        server_id = channel.guild.id if channel and getattr(channel, 'guild', None) else None
-        if not server_id:
-            # An archived thread is not cached, but its log is filed under the same server
-            # as its blueprint -- which is how a deleted channel's log is found to remove.
-            server_id = self._blueprint_homes().get(str(channel_id))
+        # An archived thread is not cached, but its log is filed under the same server
+        # as its blueprint -- which is how a deleted channel's log is found to remove.
+        server_id = self._session_server(channel_id)
         if not server_id:
             raise ValueError("Sessions are not supported in Direct Messages.")
-        return pathlib.Path(SERVERS_DIR) / str(server_id) / "sessions" / str(channel_id) / session_type
+        return pathlib.Path(SERVERS_DIR) / server_id / "sessions" / str(channel_id) / session_type
+
+    def _session_server(self, channel_id: int) -> Optional[str]:
+        """The server a session's channel is filed under, or None.
+
+        Off the cached channel, else remembered on the session: discord.py drops an
+        archived thread from its cache, and `_blueprint_homes` -- a walk of every server
+        index -- then ran on every save and every flush of it. A channel never changes
+        server, so a home once found holds for the session's life.
+        """
+        session = self.cog.multi_profile_channels.get(channel_id)
+        channel = self.cog.bot.get_channel(channel_id)
+        if channel is not None and getattr(channel, "guild", None):
+            home = str(channel.guild.id)
+        else:
+            home = (session or {}).get("_home") or self._blueprint_homes().get(str(channel_id))
+        if home and session is not None:
+            session["_home"] = home
+        return home
 
     def _get_session_path(self, session_key: Any, session_type: str) -> pathlib.Path:
         if session_type == 'global_chat':
@@ -1094,8 +1109,6 @@ class SessionManager:
     def _save_multi_profile_sessions(self):
         try:
             current_server_sessions = collections.defaultdict(lambda: {"regular": {}})
-            #: Where each blueprint is filed, read only once a session's channel is not cached.
-            homes = None
 
             for channel_id, session_data in self.cog.multi_profile_channels.items():
                 # A shell opened by `/session config` and abandoned before anyone was
@@ -1104,19 +1117,13 @@ class SessionManager:
                 if not session_data.get("profiles") and not session_data.get("started"):
                     continue
 
-                channel = self.cog.bot.get_channel(channel_id)
-                if channel is not None and getattr(channel, 'guild', None):
-                    server_id_str = str(channel.guild.id)
-                else:
-                    # Not cached: an archived thread, or a guild in an outage. Filing it
-                    # under "dm" wrote it nowhere, so the save dropped it from its guild's
-                    # index and the next restart lost the session. It stays where it is
-                    # filed; one never filed has nowhere to go.
-                    if homes is None:
-                        homes = self._blueprint_homes()
-                    server_id_str = homes.get(str(channel_id))
-                    if server_id_str is None:
-                        continue
+                # Not cached -- an archived thread, or a guild in an outage -- it stays
+                # where it is filed. Filing it under "dm" wrote it nowhere, so the save
+                # dropped it from its guild's index and the next restart lost the
+                # session. One never filed has nowhere to go.
+                server_id_str = self._session_server(channel_id)
+                if server_id_str is None:
+                    continue
 
                 category = "regular"
 
@@ -1688,14 +1695,6 @@ class SessionManager:
 
             # Remove from tracking dict after processing
             self.cog.session_last_accessed.pop(key, None)
-
-        # Prune stale child bot edit cooldown timestamps
-        for bot_id in list(self.cog.child_bot_edit_cooldowns.keys()):
-            timestamps = [ts for ts in self.cog.child_bot_edit_cooldowns[bot_id] if now - ts < 600]
-            if timestamps:
-                self.cog.child_bot_edit_cooldowns[bot_id] = timestamps
-            else:
-                self.cog.child_bot_edit_cooldowns.pop(bot_id, None)
 
     @tasks.loop(seconds=60.0)
     async def proactive_session_task(self):

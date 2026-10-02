@@ -5644,23 +5644,8 @@ class AppearanceModal(ui.Modal):
                 if user_id_str in self.cog.user_appearances:
                     self.cog.user_appearances[user_id_str].pop(self.profile_name, None)
 
-        linked_bot_id = next((bot_id for bot_id, data in self.cog.child_bots.items() if str(data.get("owner_id")) == user_id_str and data.get("profile_name") == self.profile_name), None)
-        if linked_bot_id:
-            now = time.time()
-            cooldown_window = 600
-            max_changes = 2
-            timestamps = self.cog.child_bot_edit_cooldowns.get(linked_bot_id, [])
-            valid_timestamps = [ts for ts in timestamps if now - ts < cooldown_window]
-
-            if len(valid_timestamps) >= max_changes:
-                remaining = int(cooldown_window - (now - valid_timestamps[0]))
-                await interaction.followup.send(f"Child bot appearance changed too frequently. Wait {remaining // 60}m.", ephemeral=True)
-            else:
-                await self.cog.manager_queue.put({"action": "send_to_child", "bot_id": linked_bot_id, "payload": {"action": "update_avatar", "avatar_url": new_avatar_url}})
-                await self.cog.manager_queue.put({"action": "send_to_child", "bot_id": linked_bot_id, "payload": {"action": "update_username", "username": new_display_name}})
-                valid_timestamps.append(now)
-                self.cog.child_bot_edit_cooldowns[linked_bot_id] = valid_timestamps
-
+        # A linked child bot is not touched: its name and avatar are set on its own
+        # application in the Discord Developer Portal.
         new_embed = await self.cog.profile_manager._build_profile_manage_embed(
             self.original_interaction, self.profile_name, target_user_id=owner_id)
         await self.original_interaction.edit_original_response(embed=new_embed)

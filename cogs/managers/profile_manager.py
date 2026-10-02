@@ -853,15 +853,30 @@ class ProfileManager:
 
         Orphans are withheld by default so a tombstone can never be listed,
         borrowed, or counted, even between prunes.
+
+        Filtered by owner *before* describing: describing reads the owner's index, so
+        filtering after made every one-owner call pay for the whole catalogue.
         """
+        wanted = None if owner_id is None else int(owner_id)
         for entry_id, p_info in list(self.cog.public_profiles.items()):
+            if wanted is not None and self._public_entry_owner(p_info) != wanted:
+                continue
             desc = self._describe_public_entry(entry_id, p_info)
             if not desc:
                 continue
             if desc["orphaned"] and not include_orphaned:
                 continue
-            if owner_id is None or desc["owner_id"] == int(owner_id):
-                yield desc
+            yield desc
+
+    @staticmethod
+    def _public_entry_owner(p_info: Any) -> Optional[int]:
+        """The owner a public entry names, read off the entry alone -- no index lookup."""
+        owner = (p_info.split(":", 1)[0] if isinstance(p_info, str)
+                 else p_info.get("owner_id") if isinstance(p_info, dict) else None)
+        try:
+            return int(owner)
+        except (TypeError, ValueError):
+            return None
 
     def _prune_public_index(self) -> List[Dict[str, Any]]:
         """Drops public entries whose source profile no longer exists.
