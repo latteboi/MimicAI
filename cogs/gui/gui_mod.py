@@ -568,8 +568,9 @@ def _scan_users() -> List[Tuple[int, Optional[str], int, int]]:
 
 
 def _paginate(lines: List[str], empty: str) -> List[str]:
-    # 20 two-line rows, worst case (100-character server name) ~3.7k of the embed's 4096.
-    return ["\n".join(lines[i:i + 20]) for i in range(0, len(lines), 20)] or [empty]
+    # 20 two-line rows split by a blank line, worst case (100-character server name) ~3.8k of
+    # the embed's 4096.
+    return ["\n\n".join(lines[i:i + 20]) for i in range(0, len(lines), 20)] or [empty]
 
 
 class ModStatsView(ModBaseView):
