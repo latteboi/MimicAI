@@ -162,7 +162,7 @@ class SpeakAsMixin:
                     return None
 
         speaker_display_name = effective_profile_name
-        appearance_data = self.cog.profile_manager._get_user_appearance(effective_owner_id, effective_profile_name)
+        appearance_data = self.cog.profile_manager._get_user_appearance(user_id, profile_name)
         if appearance_data.get("custom_display_name"):
             speaker_display_name = appearance_data["custom_display_name"]
 

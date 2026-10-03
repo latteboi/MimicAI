@@ -197,6 +197,9 @@ class MimicCog(EventListeners, commands.Cog):
         
         # Memory-bounded caches to prevent RAM growth on long uptime
         self.user_appearances: LRUCache = LRUCache(max_size=50)
+        #: (owner id, profile name) of a speaker -> the mood avatar axis it shows, for
+        #: `pick_mood_avatar`'s margin.
+        self.mood_avatars_shown: LRUCache = LRUCache(max_size=500)
         
         self.server_manager._load_channel_webhooks()
 

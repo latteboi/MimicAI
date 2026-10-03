@@ -1173,14 +1173,27 @@ _PROFILE_KEYS = ("primary_model", "fallback_model", "ollama_host_url")
 #: The categories shipping a chain per provider preference, which the audience button switches.
 _BY_PROVIDER_CATEGORIES = ("describer", "classifier")
 
-#: MimicAI Auto's tiers, one category each: a tier is a Primary and a Fallback, and a tab
-#: holds three slots at most.
-_AUTO_CATEGORIES = {f"auto_{tier}": tier for tier, _wording, _desc in AUTO_TIERS}
+#: MimicAI Auto, one category per tier and slot: each is a Primary and a Fallback, and a tab
+#: holds three slots at most. Response's tab is the tier's own `auto_<tier>`; the others
+#: follow it. (tab, wording, description, tier, slot).
+_AUTO_SLOT_TABS = {
+    "grounding_rag_model": ("Grounding", "The researcher behind RAG web searches."),
+    "critic_model": ("Critic", "Screens replies for semantic repetition."),
+    "ltm_model": ("LTM", "Turns conversations into long-term memories."),
+}
+_AUTO_TABS = tuple(
+    tab for tier, _wording, desc in AUTO_TIERS
+    for tab in ((f"auto_{tier}", auto_wording(AUTO_MODEL_PREFIX + tier), desc, tier, "primary_model"),
+                *((f"auto_{tier}_{wording.lower()}", f"{auto_wording(AUTO_MODEL_PREFIX + tier)} · {wording}",
+                   slot_desc, tier, slot) for slot, (wording, slot_desc) in _AUTO_SLOT_TABS.items())))
+_AUTO_CATEGORIES = {tab: tier for tab, _w, _d, tier, _slot in _AUTO_TABS}
 _AUTO_KEYS = frozenset(key for keys in AUTO_TIER_KEYS.values() for key in keys)
 _AUTO_NOTE = ("OpenRouter models only. Every profile on this tier runs your choice from its next "
-              "reply, sent with this tab's Hosts & Tier rather than its own.")
+              "reply, sent with this tier's Hosts & Tier rather than its own.")
 _AUTO_UNSET_NOTE = (" A Primary of None stops offering the tier, and refuses the profiles already "
                     "on it until one is set.")
+_AUTO_SLOT_NOTES = {"grounding_rag_model": " Pick a model that calls the web search: one that "
+                                           "answers without searching does so silently."}
 
 #: What each category tells the operator before they choose.
 _SYSTEM_MODEL_NOTES = {
@@ -1195,9 +1208,9 @@ _SYSTEM_MODEL_NOTES = {
                "Its other settings are in `/profile`."),
     "key_check": ("Called on Google's API with the pasted key, so Google models only. The billing "
                   "check must be one an unbilled key is refused: an image model."),
-    "auto_free": _AUTO_NOTE + " New profiles on OpenRouter start on this tier.",
-    "auto_budget": _AUTO_NOTE + _AUTO_UNSET_NOTE,
-    "auto_recommended": _AUTO_NOTE + _AUTO_UNSET_NOTE,
+    **{tab: _AUTO_NOTE + _AUTO_SLOT_NOTES.get(slot, "")
+            + (" New profiles on OpenRouter start on this tier." if tier == "free" else _AUTO_UNSET_NOTE)
+       for tab, _w, _d, tier, slot in _AUTO_TABS},
 }
 
 
@@ -1214,8 +1227,7 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         ("embedding", "Embeddings", "The vectors behind memory, training-example and /help recall."),
         ("system", "System Profiles", "The models behind each System profile's replies."),
         ("key_check", "Key Checks", "Tests a pasted Gemini key, then whether it has billing."),
-        *((f"auto_{tier}", auto_wording(AUTO_MODEL_PREFIX + tier), desc)
-          for tier, _wording, desc in AUTO_TIERS),
+        *((tab, wording, desc) for tab, wording, desc, _tier, _slot in _AUTO_TABS),
     )
     _CATEGORY_KEYS = {
         "describer": _slots(("describer_model", "Primary"), ("describer_fallback_model", "Fallback"),
@@ -1226,15 +1238,16 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         "system": _slots(("primary_model", "Primary"), ("fallback_model", "Fallback")),
         "key_check": _slots(("key_check_model", "Validity Check"),
                             ("key_tier_probe_model", "Billing Check")),
-        **{category: _slots((AUTO_TIER_KEYS[tier][0], "Primary"), (AUTO_TIER_KEYS[tier][1], "Fallback"))
-           for category, tier in _AUTO_CATEGORIES.items()},
+        **{tab: _slots(*zip(AUTO_TIER_KEYS[tier, slot], ("Primary", "Fallback")))
+           for tab, _w, _d, tier, slot in _AUTO_TABS},
     }
     #: Everything but the System profiles runs for every user, and Ollama answers the bot
     #: owner's own profiles only -- which the System profiles are.
     _NO_OLLAMA_CATEGORIES = ("describer", "classifier", "embedding", "key_check")
     _NO_RETRY_KEYS = ("describer_fallback_model", "describer_final_model",
                       "classifier_fallback_model", "classifier_final_model",
-                      *(key for key in _AUTO_KEYS if key != AUTO_TIER_KEYS["free"][0]))
+                      *(key for (tier, _slot), keys in AUTO_TIER_KEYS.items()
+                        for key in keys if tier != "free" or key != keys[0]))
     #: No tab has a row to spare for a browse list: three slots and a button row fill
     #: Discord's five, the System Profiles tab spends one on choosing its profile, and no
     #: list holds embedding models. The model list pages on its own.

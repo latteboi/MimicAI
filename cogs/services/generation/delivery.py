@@ -107,7 +107,9 @@ class DeliveryMixin:
             effective_owner_id, effective_profile_name = self.cog.profile_manager._resolve_effective_profile(profile_owner_id_for_appearance, profile_name_for_appearance)
 
             owner_id_str = str(effective_owner_id)
-            appearance_data = self.cog.profile_manager._get_user_appearance(effective_owner_id, effective_profile_name)
+            # The speaker, not its source: a borrow's mood avatar follows the borrow's levels.
+            appearance_data = self.cog.profile_manager._get_user_appearance(
+                profile_owner_id_for_appearance, profile_name_for_appearance)
 
             # Seeded before the branch below reads it. The `or custom_display_name_to_use`
             # fallback on the custom_display_name line is only reached when the profile has

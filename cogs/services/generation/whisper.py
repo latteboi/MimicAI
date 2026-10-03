@@ -190,7 +190,7 @@ class WhisperMixin:
         effective_owner_id, effective_profile_name = self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)
         display_name = effective_profile_name
         avatar_url = self.cog.bot.user.display_avatar.url
-        appearance = self.cog.profile_manager._get_user_appearance(effective_owner_id, effective_profile_name)
+        appearance = self.cog.profile_manager._get_user_appearance(owner_id, profile_name)
         if appearance:
             display_name = appearance.get("custom_display_name") or display_name
             avatar_url = appearance.get("custom_avatar_url") or avatar_url

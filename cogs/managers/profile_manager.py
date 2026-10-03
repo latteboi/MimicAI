@@ -45,11 +45,11 @@ from ..utils.constants import (
 from ..utils.helpers import (auto_tier, image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
                             ltm_auto_recall_enabled, resolve_critic_settings,
                             grounding_mode_display, resolve_image_output_params,
-                            resolve_auto_model, resolve_auto_models,
+                            resolve_auto_models, pick_mood_avatar,
                             resolve_image_tools, resolve_thinking_params,
                             resolve_unreadable_media_mode,
                             resolve_url_mode, suppress_link_previews, system_model)
-from ..utils.discord_cdn import signed_attachment_url, unsigned_attachment_url
+from ..utils.discord_cdn import is_web_url, signed_attachment_url, unsigned_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager, _get_compressor, _get_decompressor
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
@@ -2058,6 +2058,15 @@ class ProfileManager:
 
         return await asyncio.to_thread(_load)
 
+    @staticmethod
+    def _appearance_entry(config: Dict[str, Any]) -> Dict[str, Any]:
+        """What `cog.user_appearances` holds for one profile. Every writer builds it here, so
+        an entry written by one edit never drops what another edit set."""
+        return {"custom_display_name": config.get("custom_display_name"),
+                "custom_avatar_url": config.get("custom_avatar_url"),
+                "mood_avatars": config.get("mood_avatars") or {},
+                "mood_avatar_threshold": config.get("mood_avatar_threshold")}
+
     def _get_user_appearance(self, owner_id: int, profile_name: str) -> Dict[str, Optional[str]]:
         """The name and avatar a profile shows, with the avatar ready for Discord to draw.
 
@@ -2065,6 +2074,10 @@ class ProfileManager:
         Discord attachment is handed out without its signature, which expires a day
         after issue -- see `cogs/utils/discord_cdn.py`. Anything that downloads the
         avatar itself reads the config and signs it.
+
+        The avatar is the mood avatar `pick_mood_avatar` chooses where one applies, read off
+        the neuro state of the profile named here -- so a caller drawing a borrow's avatar
+        passes the borrow, not its source, whose appearance this resolves either way.
         """
         eff_owner_id, eff_name = self._resolve_effective_profile(owner_id, profile_name)
         owner_id_str = str(eff_owner_id)
@@ -2072,15 +2085,23 @@ class ProfileManager:
             data = self.cog.user_appearances[owner_id_str][eff_name]
         else:
             config = self._get_profile_config(eff_owner_id, eff_name, False) or {}
-            disp = config.get("custom_display_name")
-            ava = config.get("custom_avatar_url")
-
-            data = {"custom_display_name": disp, "custom_avatar_url": ava}
+            data = self._appearance_entry(config)
             self.cog.user_appearances.setdefault(owner_id_str, {})[eff_name] = data
 
         avatar = data.get("custom_avatar_url")
-        drawable = unsigned_attachment_url(avatar)
-        return data if drawable == avatar else {**data, "custom_avatar_url": drawable}
+        if data.get("mood_avatars"):
+            # Read only for a profile that has mood avatars: everyone else pays nothing.
+            is_borrowed = profile_name in self._get_user_index(owner_id).get("borrowed", [])
+            speaker = self._get_profile_config(owner_id, profile_name, is_borrowed)
+            moods = {axis: url for axis, url in data["mood_avatars"].items() if is_web_url(url)}
+            # ponytail: in memory, so a restart forgets the mood showing and may switch once.
+            key = (str(owner_id), profile_name)
+            shown = self.cog.mood_avatars_shown[key] = pick_mood_avatar(
+                moods, data.get("mood_avatar_threshold"), speaker, self.cog.mood_avatars_shown.get(key))
+            avatar = moods.get(shown) or avatar
+        # A link saved before the modals checked one would fail every embed and message it rides.
+        drawable = unsigned_attachment_url(avatar) if is_web_url(avatar) else None
+        return data if drawable == data.get("custom_avatar_url") else {**data, "custom_avatar_url": drawable}
 
     def _get_profile_prompts(self, user_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
         eff_owner, pid = self._resolve_prompt_owner_and_pid(user_id, profile_name)
@@ -2328,6 +2349,9 @@ class ProfileManager:
         avatar = config.get("custom_avatar_url")
         if avatar:
             parts.append(f"avatar_url: {avatar}")
+        # Shown as often as the usual one, so a mood avatar set after the verdict makes it stale.
+        for axis, url in sorted((config.get("mood_avatars") or {}).items()):
+            parts.append(f"mood_avatar_{axis}: {url}")
         # Shown to everyone browsing the Public Library, which is the audience the
         # rating answers to -- so an intro written after the verdict makes it stale.
         intro = config.get("library_intro")
@@ -2740,8 +2764,25 @@ class ProfileManager:
             return None, False
         return storage._get_api_key_for_user(bot_owner, provider), True
 
-    async def _fetch_avatar_part(self, owner_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
-        """The profile's avatar as an inline image part, or None.
+    async def _fetch_avatar_parts(self, owner_id: int, profile_name: str) -> List[Dict[str, Any]]:
+        """Every avatar the profile can speak under as inline image parts, its usual one first:
+        a mood avatar is shown as often, so it is judged with the rest. One at a time, so the
+        downloads are never all in flight at once."""
+        eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
+        config = self._get_profile_config(eff_owner, eff_name, False) or {}
+        urls = dict.fromkeys(url for url in (config.get("custom_avatar_url"),
+                                             *(config.get("mood_avatars") or {}).values()) if url)
+        parts = []
+        for url in urls:
+            part = await self._fetch_avatar_part(eff_owner, eff_name, url)
+            if part:
+                parts.append(part)
+        return parts
+
+    async def _fetch_avatar_part(self, owner_id: int, profile_name: str,
+                                 avatar_url: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """The profile's avatar -- or `avatar_url`, one of its mood avatars -- as an inline
+        image part, or None.
 
         Absorbed from the retired auto-moderator, with one behavioural change that
         was a standing bug: a download failure is no longer fatal.
@@ -2756,8 +2797,9 @@ class ProfileManager:
         if it cannot be had, the text is judged alone.
         """
         eff_owner, eff_name = self._resolve_effective_profile(owner_id, profile_name)
-        config = self._get_profile_config(eff_owner, eff_name, False) or {}
-        avatar_url = config.get("custom_avatar_url")
+        if avatar_url is None:
+            config = self._get_profile_config(eff_owner, eff_name, False) or {}
+            avatar_url = config.get("custom_avatar_url")
         if not avatar_url:
             return None
 
@@ -2813,9 +2855,7 @@ class ProfileManager:
             "CONTENT_CLASSIFIER", DEFAULT_CONTENT_CLASSIFIER_PROMPT)
 
         parts = [f"<target_profile>\n{truncated}\n</target_profile>"]
-        avatar_part = await self._fetch_avatar_part(owner_id, profile_name)
-        if avatar_part:
-            parts.append(avatar_part)
+        parts.extend(await self._fetch_avatar_parts(owner_id, profile_name))
 
         payload = [{"role": "user", "parts": parts}]
         gen_cfg = dict(GREEDY_SAMPLING)
@@ -4026,22 +4066,19 @@ class ProfileManager:
         # the label line, then each fallback on a subtext line of its own, as `GO/`/`OR/`/`OL/`
         # and the bare model: the full ids ran three to a line and wrapped into a wall.
         preferred = self.provider_preference(user_id)
-        response_config = resolve_auto_models(
-            self.cog, {**config, "primary_model": prim_model, "fallback_model": fall_model})
-        # A MimicAI Auto slot reads as its tier, with the model it runs on today beside it.
-        auto_names = {resolve_auto_model(self.cog, value, role): short_model_name(value)
-                      for value, role in ((prim_model, "primary"), (fall_model, "fallback"))
-                      if auto_tier(value)}
+        stored = {**config, "primary_model": prim_model, "fallback_model": fall_model}
+        resolved = resolve_auto_models(self.cog, stored)
         model_lines = []
         providers = {}
         for label, key in (("Response", "primary_model"), ("Image", "image_generation_model"),
                            ("Audio", "speech_model"), ("Grounding", "grounding_rag_model"),
                            ("Critic", "critic_model"), ("LTM", "ltm_model")):
-            primary, fallbacks = model_chain(
-                response_config if key == "primary_model" else config, key, preferred)
+            primary, fallbacks = model_chain(resolved, key, preferred)
             providers[key] = {model_provider(m) for m in (primary, *fallbacks)}
             rest = [m for m in dict.fromkeys(fallbacks) if m != primary]
-            tiers = auto_names if key == "primary_model" else {}
+            # A MimicAI Auto slot reads as its tier, with the model it runs on today beside it.
+            tiers = {resolved[k]: short_model_name(stored[k])
+                     for k in (key, MODEL_SLOT_PAIRS[key]) if auto_tier(stored.get(k))}
             shown = lambda m: (f"{tiers[m]} ({short_model_name(m)})" if m in tiers
                                else short_model_name(m))
             model_lines.append(f"**{label}** \u2192 **`{shown(primary)}`**")
@@ -4667,13 +4704,8 @@ class ProfileManager:
                 }
                 self._save_profile_by_pid(recipient_id, new_pid, new_data)
 
-                disp = config_data.get("custom_display_name")
-                ava = config_data.get("custom_avatar_url")
-                if disp or ava:
-                    self.cog.user_appearances.setdefault(recip_id_str, {})[desired_name] = {
-                        "custom_display_name": disp,
-                        "custom_avatar_url": ava
-                    }
+                self.cog.user_appearances.setdefault(recip_id_str, {})[desired_name] = \
+                    self._appearance_entry(config_data)
 
                 if not isinstance(index.get("personal"), dict):
                     legacy_personal = index.get("personal", [])

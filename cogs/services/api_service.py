@@ -441,10 +441,8 @@ class APIService:
     def model_chain(self, config: Optional[Dict[str, Any]], primary_key: str,
                     owner_id: Optional[int]) -> Tuple[str, Tuple[str, ...]]:
         """`user_defaults.model_chain` under the provider preference of `config`'s owner, with
-        a MimicAI Auto response slot turned into the models its tier runs on today."""
-        if primary_key == "primary_model":
-            config = resolve_auto_models(self.cog, config)
-        return model_chain(config, primary_key,
+        a MimicAI Auto slot turned into the models its tier runs on today."""
+        return model_chain(resolve_auto_models(self.cog, config), primary_key,
                            self.cog.profile_manager.provider_preference(owner_id))
 
     def get_top_models(self, provider: str, target_config_key: str,

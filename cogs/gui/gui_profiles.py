@@ -40,6 +40,7 @@ from ..services.api.openrouter_catalogue import (
 )
 from ..services.api.openrouter_endpoints import option_description, option_label
 from ..services.api.google_rest import voice_id_of
+from ..utils.discord_cdn import is_web_url
 from ..utils.data_policy import may_pick_training_models
 from .gui_data import DataManageView
 from .gui_hub import HubShareManagerView
@@ -1869,6 +1870,10 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         if self.screen.modal and live:
             add_button(self, self.screen.modal_label, self._modal_callback,
                        style=discord.ButtonStyle.primary, row=row)
+        # Appearance, so a borrow shows its source's -- on its own levels, see `pick_mood_avatar`.
+        if self.action.value == "neuro" and live and not self.parent.is_borrowed:
+            add_button(self, "Mood avatars…", self._mood_avatars_callback,
+                       style=discord.ButtonStyle.primary, row=row)
 
         add_button(self, "◀ Back", self._back_callback, style=discord.ButtonStyle.secondary,
                    row=row)
@@ -1904,6 +1909,10 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         await interaction.response.send_modal(factory(
             *args, values_only=True, callback=self._after_modal,
             target_user_id=self.parent.user_id))
+
+    async def _mood_avatars_callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(MoodAvatarModal(
+            self.cog, self.parent.user_id, self.parent.profile_name, on_saved=self._after_modal))
 
     async def _after_modal(self, interaction: discord.Interaction):
         self._build_view()
@@ -2187,11 +2196,11 @@ def ProfileTypingSettingsModal(cog, profile_name: str, current_params: Dict[str,
     fields = [] if values_only else [
         {"label": "Enable Realistic Typing (on/off)", "custom_id": "realistic_typing_enabled", "default": "on" if current_params.get("realistic_typing_enabled") else "off", "required": True},
         {"label": "Mode (sentence/line)", "custom_id": "typing_mode", "default": current_params.get("typing_mode", "sentence"), "required": False, "placeholder": "Default: sentence"},
+        {"label": "Cursor (below/prefix/off)", "custom_id": "typing_cursor", "default": str(current_params.get("typing_cursor") or DEFAULT_TYPING_CURSOR), "required": False, "placeholder": f"Default: {DEFAULT_TYPING_CURSOR}"},
     ]
     fields.extend([
         {"label": "Characters per Second", "custom_id": "typing_cps", "default": str(current_params.get("typing_cps", 30.0)), "required": False, "placeholder": "Default: 30.0"},
         {"label": "Max Delay per Chunk (Seconds)", "custom_id": "typing_max_delay", "default": str(current_params.get("typing_max_delay", 2.5)), "required": False, "placeholder": "Default: 2.5"},
-        {"label": "Cursor (below/prefix/off)", "custom_id": "typing_cursor", "default": str(current_params.get("typing_cursor") or DEFAULT_TYPING_CURSOR), "required": False, "placeholder": f"Default: {DEFAULT_TYPING_CURSOR}"}
     ])
     def parser(v):
         c = {}
@@ -2904,12 +2913,19 @@ class ModelPickerMixin(ReportErrorMixin):
         return cls.strip_prefix(value)
 
     def _auto_label(self, value, key: str) -> str:
-        """`display_model`, and for MimicAI Auto the model its tier runs this slot on today."""
+        """`display_model`, and for MimicAI Auto the model its tier runs this slot on today.
+        Not on the tier choices themselves, which read as the tier alone."""
         shown = self.display_model(value)
         if not auto_tier(value):
             return shown
-        model = resolve_auto_model(self.cog, value, "fallback" if key == "fallback_model" else "primary")
+        slot = next((s for s, fallback in AUTO_SLOT_PAIRS.items() if key in (s, fallback)), key)
+        model = resolve_auto_model(self.cog, value, "primary" if key == slot else "fallback", slot)
         return f"{shown} ({self.display_model(model)})"
+
+    #: Category -> the AUTO_SLOT_PAIRS Primary key its MimicAI Auto tiers fill. Read off this
+    #: mixin's table, so /mod's System Models tabs -- whose own table it is not -- offer none.
+    _AUTO_SLOTS = {category: slots[0][0] for category, slots in _CATEGORY_KEYS.items()
+                   if slots[0][0] in AUTO_SLOT_PAIRS}
 
     @staticmethod
     def strip_prefix(value) -> str:
@@ -2980,9 +2996,9 @@ class ModelPickerMixin(ReportErrorMixin):
                 await interaction.response.send_modal(CustomModelModal(view, self.target_config_key))
             else: 
                 view._save_changes(self.target_config_key, self.values[0])
-                if self.target_config_key == "primary_model" and auto_tier(self.values[0]):
+                if self.target_config_key in AUTO_SLOT_PAIRS and auto_tier(self.values[0]):
                     # A tier is a Primary and a Fallback: choosing it for one takes both.
-                    view._save_changes("fallback_model", self.values[0])
+                    view._save_changes(AUTO_SLOT_PAIRS[self.target_config_key], self.values[0])
                 view._build_view()
                 await interaction.response.edit_message(**view._picker_render())
 
@@ -3048,7 +3064,7 @@ class ModelPickerMixin(ReportErrorMixin):
 
         opts = paged_nav_options(page, num_pages, values=self._MODEL_NAV_VALUES, nav_suffix=" of models")
         if not self._shows_openrouter_browse():
-            opts += self._auto_tier_options(target_config_key, skip=current_val)
+            opts += self._auto_tier_options(skip=current_val)
         opts.append(discord.SelectOption(label="Custom Model...", value="custom_option",
                                          description="Enter manually via modal"))
         if self._allows_no_fallback(target_config_key):
@@ -3089,7 +3105,7 @@ class ModelPickerMixin(ReportErrorMixin):
         self.or_browse_page = page
 
         opts = paged_nav_options(page, num_pages, values=self._BROWSE_NAV_VALUES, nav_suffix=" of authors")
-        opts += self._auto_tier_options("primary_model")
+        opts += self._auto_tier_options()
         for value, label, description in self._browse_general():
             opts.append(discord.SelectOption(label=label, value=value, description=description,
                                              default=(browse == value)))
@@ -3108,8 +3124,9 @@ class ModelPickerMixin(ReportErrorMixin):
                 return
             if auto_tier(value):
                 # A tier is a Primary and a Fallback, so choosing one takes both slots.
-                self._save_changes("primary_model", value)
-                self._save_changes("fallback_model", value)
+                slot = self._AUTO_SLOTS[self.category]
+                self._save_changes(slot, value)
+                self._save_changes(AUTO_SLOT_PAIRS[slot], value)
                 self._build_view()
                 await interaction.response.edit_message(**self._picker_render())
                 return
@@ -3219,25 +3236,26 @@ class ModelPickerMixin(ReportErrorMixin):
             
         return opts
 
-    def _auto_tier_options(self, key: str, skip=None) -> List[discord.SelectOption]:
-        """MimicAI Auto's tiers the bot owner has given a Primary, each named with the model it
-        runs `key` on today. The Browse dropdown lists them first, or the model rows on a
-        screen with no Browse row. Response only, for now."""
-        if self.category != 'response':
+    def _auto_tier_options(self, skip=None) -> List[discord.SelectOption]:
+        """MimicAI Auto's tiers the bot owner has given this category a Primary on, by tier
+        alone: the model behind one is the owner's to change. The Browse dropdown lists them
+        first, or the model rows on a screen with no Browse row."""
+        slot = self._AUTO_SLOTS.get(self.category)
+        if slot is None:
             return []
         opts = []
         for tier, _wording, description in AUTO_TIERS:
             value = AUTO_MODEL_PREFIX + tier
-            if value != skip and is_real_model(resolve_auto_model(self.cog, value)):
-                opts.append(discord.SelectOption(label=self._auto_label(value, key)[:100],
+            if value != skip and is_real_model(resolve_auto_model(self.cog, value, slot=slot)):
+                opts.append(discord.SelectOption(label=self.display_model(value),
                                                  value=value, description=description))
         return opts
 
     def _authors_per_page(self) -> int:
-        return self._OPENROUTER_AUTHORS_PER_PAGE - (len(AUTO_TIERS) if self.category == 'response' else 0)
+        return self._OPENROUTER_AUTHORS_PER_PAGE - (len(AUTO_TIERS) if self.category in self._AUTO_SLOTS else 0)
 
     def _models_per_page(self) -> int:
-        tiers = self.category == 'response' and not self._shows_openrouter_browse()
+        tiers = self.category in self._AUTO_SLOTS and not self._shows_openrouter_browse()
         return self._OPENROUTER_MODELS_PER_PAGE - (len(AUTO_TIERS) if tiers else 0)
 
     async def _update_ollama_status(self):
@@ -5611,6 +5629,9 @@ class AppearanceModal(ui.Modal):
             if any(r in new_display_name.lower() for r in ["clyde", "@everyone", "@here"]):
                 await interaction.followup.send("❌ **Invalid Display Name:** Contains a reserved keyword or mention.", ephemeral=True)
                 return
+        if new_avatar_url and not is_web_url(new_avatar_url):
+            await interaction.followup.send("❌ **Invalid Avatar URL:** It must be a link starting with https://.", ephemeral=True)
+            return
 
         # The published-profile safety re-check that used to run here is gone with the
         # auto-moderator. It downloaded the avatar from this host and refused the edit
@@ -5634,15 +5655,8 @@ class AppearanceModal(ui.Modal):
             # them. Invalidate only -- the rating going stale is resolved the same
             # way a persona edit is, rather than spending a call here.
             self.cog.profile_manager._invalidate_content_rating(owner_id, self.profile_name)
-            
-            if new_display_name or new_avatar_url:
-                self.cog.user_appearances.setdefault(user_id_str, {})[self.profile_name] = {
-                    "custom_display_name": new_display_name,
-                    "custom_avatar_url": new_avatar_url
-                }
-            else:
-                if user_id_str in self.cog.user_appearances:
-                    self.cog.user_appearances[user_id_str].pop(self.profile_name, None)
+            self.cog.user_appearances.setdefault(user_id_str, {})[self.profile_name] = \
+                self.cog.profile_manager._appearance_entry(config)
 
         # A linked child bot is not touched: its name and avatar are set on its own
         # application in the Discord Developer Portal.
@@ -5653,6 +5667,68 @@ class AppearanceModal(ui.Modal):
         # The display name and avatar are part of the classified surface, so an
         # appearance edit invalidates a rating exactly as a persona edit does.
         await maybe_prompt_rating_after_edit(self.cog, interaction, owner_id, self.profile_name)
+
+
+class MoodAvatarModal(ui.Modal):
+    """`config["mood_avatars"]` and its threshold: one avatar per Neuro Engine level, five
+    fields, Discord's most. Saved like Edit Appearance, and rated with it. Opened from the
+    Neuro Engine screen, which `on_saved` redraws."""
+
+    def __init__(self, cog: 'MimicCog', owner_id: int, profile_name: str, on_saved):
+        super().__init__(title=f"Mood Avatars: '{profile_name[:20]}'")
+        self.cog = cog
+        self.profile_name = profile_name
+        self.owner_id = owner_id
+        self.on_saved = on_saved
+        config = cog.profile_manager._get_profile_config(self.owner_id, profile_name, False) or {}
+        avatars = config.get("mood_avatars") or {}
+        self.inputs = {}
+        for axis, reads_as in MOOD_AVATAR_LABELS:
+            self.inputs[axis] = ui.TextInput(label=f"High {axis.title()} ({reads_as}): avatar URL",
+                                             required=False, default=avatars.get(axis),
+                                             placeholder="Blank for none")
+            self.add_item(self.inputs[axis])
+        threshold = config.get("mood_avatar_threshold")
+        self.threshold_input = ui.TextInput(
+            label="Switch at level (0-100)", required=False, max_length=3,
+            default=None if threshold is None else str(threshold),
+            placeholder=f"Blank for {MOOD_AVATAR_THRESHOLD}")
+        self.add_item(self.threshold_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        text = self.threshold_input.value.strip()
+        if text and not (text.isdigit() and 0 <= int(text) <= 100):
+            await interaction.response.send_message("❌ The level must be a whole number from 0 to 100.",
+                                                    ephemeral=True)
+            return
+        # Sparse, as Edit Appearance is: an unset avatar or level is no key.
+        avatars = {axis: field.value.strip() for axis, field in self.inputs.items() if field.value.strip()}
+        bad = next((axis for axis, url in avatars.items() if not is_web_url(url)), None)
+        if bad:
+            await interaction.response.send_message(
+                f"❌ **Invalid Avatar URL:** High {bad.title()} must be a link starting with https://.",
+                ephemeral=True)
+            return
+        await interaction.response.defer()
+        pm = self.cog.profile_manager
+        config = pm._get_profile_config(self.owner_id, self.profile_name, False)
+        if not config:
+            return
+        for key, value in (("mood_avatars", avatars), ("mood_avatar_threshold", int(text) if text else None)):
+            if value or value == 0:
+                config[key] = value
+            else:
+                config.pop(key, None)
+        pm._save_profile_config(self.owner_id, self.profile_name, config, False)
+        pm._invalidate_content_rating(self.owner_id, self.profile_name)
+        self.cog.user_appearances.setdefault(str(self.owner_id), {})[self.profile_name] = \
+            pm._appearance_entry(config)
+
+        await self.on_saved(interaction)
+        await interaction.followup.send("Mood avatars saved.", ephemeral=True)
+        # Every mood avatar is judged with the usual one -- see `_fetch_avatar_parts`.
+        await maybe_prompt_rating_after_edit(self.cog, interaction, self.owner_id, self.profile_name)
+
 
 class LibraryIntroModal(ui.Modal):
     """The creator's introduction on a Public Library listing, `config["library_intro"]`.

@@ -82,7 +82,7 @@ def build_global_chat_embed(cog, host_user_id: int, profile_name: str,
     log = session_data.get("unified_log") or []
 
     eff_owner, eff_name = cog.profile_manager._resolve_effective_profile(host_user_id, profile_name)
-    appearance = cog.profile_manager._get_user_appearance(eff_owner, eff_name) or {}
+    appearance = cog.profile_manager._get_user_appearance(host_user_id, profile_name) or {}
     display_name = appearance.get("custom_display_name") or profile_name
     avatar_url = appearance.get("custom_avatar_url") or default_profile_avatar_url(eff_name)
 

@@ -1100,7 +1100,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         gen_owner_id, gen_profile_name = generator_profile_key
                         gen_effective_owner_id, gen_effective_profile_name = self.cog.profile_manager._resolve_effective_profile(gen_owner_id, gen_profile_name)
                         
-                        gen_appearance_data = self.cog.profile_manager._get_user_appearance(gen_effective_owner_id, gen_effective_profile_name)
+                        gen_appearance_data = self.cog.profile_manager._get_user_appearance(gen_owner_id, gen_profile_name)
                         if gen_appearance_data.get("custom_display_name"):
                             generator_display_name = gen_appearance_data["custom_display_name"]
                         else:
