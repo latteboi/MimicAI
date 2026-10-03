@@ -43,7 +43,7 @@ _STATIC_DASHBOARDS = [
         [
             ("Setup", [
                 "A context banner: where you are, your role there, whether that server has a key",
-                "A five-step checklist, probed live: provider, key, character, seat, speak",
+                "A five-step checklist, probed live: provider, key, character, add to channel, speak",
                 "Under it, the current step's text and buttons; a dropdown jumps to any step",
                 "Steps that cannot be done from here are greyed with the reason, not hidden",
                 "Step 1 Choose a provider: OpenRouter (recommended), Google (paid key) or None "
@@ -52,7 +52,7 @@ _STATIC_DASHBOARDS = [
                 "both providers' with None; "
                 "servers you administer, ticked in a paged dropdown and saved as ticked",
                 "Step 3 Get a character: Browse Library or Generate one (after step 1)",
-                "Step 4 Seat it in this channel: opens the cast editor (administrators, or Open casting)",
+                "Step 4 Add it to this channel: opens the cast editor (administrators, or Open casting)",
                 "Step 5 Say something to it: no button; just talk in the channel",
                 "Refresh re-probes; Guide opens /guide at the current step's page",
             ]),

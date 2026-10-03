@@ -111,9 +111,9 @@ class _Step:
 # step table rather than inside `_Step` so a new gate is one line in each of two
 # places that sit together, and never a message assembled in the renderer.
 _GATE_REASONS = {
-    "provider": "choose a provider first -- None counts",
+    "provider": "pick a provider first (None is fine)",
     "server_key": "needs an API key assigned to this server",
-    "can_cast": "needs administrator, or Open casting",
+    "can_cast": "needs an administrator, or Open casting (anyone may add characters)",
 }
 
 
@@ -138,7 +138,7 @@ WIZARD_STEPS = (
           lambda s: s["has_written"], requires="provider", repeatable=True,
           actions=("_act_library", "_act_generate"),
           done_detail=lambda s: f"`{s['written_name']}` is ready"),
-    _Step("seat", "Seat it in this channel",
+    _Step("seat", "Add it to this channel",
           ("5. Sessions", "Starting and Shaping a Session"),
           lambda s: s["seated"], context="guild", requires=("server_key", "can_cast"),
           actions=("_act_cast",), repeatable=True,
@@ -372,7 +372,7 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
             admin_line = f"admin of **{admins}**" if admins else "not an admin anywhere yet"
             return (f"📍 **You're in** a direct message with me\n"
                     f"👤 **You** are in {len(self.cog.bot.guilds)} server(s) I'm in, {admin_line}\n\n"
-                    "Seating a character happens in a server channel: run `/start` there "
+                    "Adding a character to a channel happens in a server: run `/start` there "
                     "when you reach it.")
 
         guild, channel = s["guild"], s["channel"]
@@ -391,10 +391,10 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
             return f"{where}🛡️ **Your role** Server administrator\n{key_line}"
         role = "👤 **Your role** Member (not an administrator)\n"
         if s["can_cast"]:
-            note = ("This channel is on **Open casting** — you can seat characters here "
-                    "yourself.")
+            note = ("This channel is on **Open casting** (anyone may add characters) — you "
+                    "can add them here yourself.")
         else:
-            note = ("Only admins can seat characters in this channel.\n\n"
+            note = ("Only admins can add characters to this channel.\n\n"
                     "💡 **Want somewhere to test freely?** Make your own server — it's free "
                     "and takes about thirty seconds (**+** in your server list → *Create My "
                     "Own*). You'll be its admin, and `/invite` adds me to it. Your profiles "

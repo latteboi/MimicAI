@@ -614,16 +614,15 @@ HELP_CATEGORIES = {
 
 WIZARD_COPY = {
     "provider": (
-        "Where your characters' models run. Google runs Gemini; OpenRouter ships Ling for replies, Ming "
-        "for images and Fish Audio for speech.\n\n"
-        "**OpenRouter** is the one to start with. One key also reaches Claude, GPT, DeepSeek and a few "
-        "hundred others, some free to run, and only hosts known **not to train on what they are sent** "
-        "are offered.\n"
-        "**Google** adds Gemini's own speech and image models. "
-        "It needs a **billing-enabled** key.\n"
-        "**None** ships no models: new profiles start with none, and you choose your own in "
+        "Which company's AI models your characters run on.\n\n"
+        "**OpenRouter** is the one to start with. One key reaches Claude, GPT, DeepSeek and a few "
+        "hundred others, some free to run, and it covers replies, images and speech. Only hosts known "
+        "**not to train on your messages** are offered.\n"
+        "**Google** runs Gemini, and adds Gemini's own image and speech models. "
+        "It needs a key with **billing turned on**.\n"
+        "**None** sets no default models: new characters start without one, and you choose in "
         "`/settings` → Override Defaults.\n\n"
-        "Choosing is how you set MimicAI up -- nothing is stored for you before it. New profiles "
+        "Choosing is how you set MimicAI up — nothing is stored for you before it. New characters "
         "start on your choice; a model you pick yourself stays picked. Change it any time here or in "
         "`/settings` → Override Defaults."
     ),
@@ -636,50 +635,56 @@ WIZARD_COPY = {
     # One per provider: the step says only what the provider chosen before it needs.
     "key": {
         "openrouter": (
-            "**1.** Press **Get a key ↗**, sign in to OpenRouter and create a key. It starts `sk-or-`.\n"
-            "**2.** Press **Paste key**. It goes into a private form nobody else sees, and becomes your "
-            "**Personal** key: your Global Chat and your characters' background work.\n"
-            "**3.** Run a server? Tick it in the dropdown that appears, and its channels use the key too.\n\n"
-            "Credit is bought on OpenRouter; free models cost nothing. **Never paste a key into the chat.**"
+            "**1.** Press **Get a key ↗**, sign in to OpenRouter and create a key. It starts with `sk-or-`.\n"
+            "**2.** Press **Paste key** and paste it into the form. Only you can see it. It becomes your "
+            "**Personal** key, which covers your Global Chat (`/profile global_chat`) and your characters' "
+            "behind-the-scenes work, such as memory.\n"
+            "**3.** Run a server? Tick it in the dropdown that appears, and its channels use your key too.\n\n"
+            "Free models cost nothing; for the rest you buy credit on OpenRouter. "
+            "**Never paste a key into the chat.**"
         ),
         "gemini": (
-            "**1.** Press **Get a key ↗**, create a key in Google AI Studio, and turn on **billing** for its "
-            "project. Google may train on what a free-tier key is sent, so free-tier keys are refused.\n"
-            "**2.** Press **Paste key**. It goes into a private form nobody else sees, and becomes your "
-            "**Personal** key: your Global Chat and your characters' background work.\n"
-            "**3.** Run a server? Tick it in the dropdown that appears, and its channels use the key too.\n\n"
+            "**1.** Press **Get a key ↗**, create a key in Google AI Studio, then turn on **billing** for its "
+            "project. Google may train on what a free key sends, so only keys with billing on are accepted.\n"
+            "**2.** Press **Paste key** and paste it into the form. Only you can see it. It becomes your "
+            "**Personal** key, which covers your Global Chat (`/profile global_chat`) and your characters' "
+            "behind-the-scenes work, such as memory.\n"
+            "**3.** Run a server? Tick it in the dropdown that appears, and its channels use your key too.\n\n"
             "**Never paste a key into the chat.**"
         ),
         # No provider chosen: either key will do, and both are offered.
         "none": (
-            "With no provider chosen, add whichever key you have -- or both.\n"
-            "**1.** Press **Get OpenRouter key ↗** (its keys start `sk-or-`) or **Get Google key ↗** (turn "
-            "on **billing** for the key's project: free-tier Google keys are refused).\n"
-            "**2.** Press the matching **Paste** button. It goes into a private form nobody else sees, and becomes "
-            "your **Personal** key: your Global Chat and your characters' background work.\n"
-            "**3.** Run a server? Tick it in the dropdown that appears, and its channels use the key too.\n\n"
+            "With no provider chosen, add whichever key you have — or both.\n"
+            "**1.** Press **Get OpenRouter key ↗** (its keys start with `sk-or-`) or **Get Google key ↗** (turn "
+            "on **billing** for the key's project: only keys with billing on are accepted).\n"
+            "**2.** Press the matching **Paste** button and paste the key into the form. Only you can see it. "
+            "It becomes your **Personal** key, which covers your Global Chat (`/profile global_chat`) and your "
+            "characters' behind-the-scenes work, such as memory.\n"
+            "**3.** Run a server? Tick it in the dropdown that appears, and its channels use your key too.\n\n"
             "**Never paste a key into the chat.**"
         ),
     },
     "profile": (
-        "A **profile** is one character: a persona, a set of instructions, a model, and its own memory. "
-        "Profiles belong to you, not to a server, so they follow you everywhere.\n\n"
+        "A **profile** is one character: its personality, how it should behave, the AI model behind it, "
+        "and its own memory. Profiles belong to you, not to a server, so they follow you everywhere.\n\n"
         "• **Browse Library** borrows a finished character — no writing at all.\n"
-        "• **Generate one** drafts a whole character from a concept like *a cynical noir detective*.\n\n"
-        "Writing one yourself? `/profile create`, then `/profile manage` → Persona. It counts here once "
-        "it has a persona or instructions."
+        "• **Generate one** drafts a character from a short idea like *a cynical noir detective*.\n\n"
+        "Writing your own? `/profile create`, then `/profile manage` → Persona. It counts here once "
+        "it has a persona (its personality) or instructions."
     ),
     "seat": (
-        "A **session** binds a cast of characters to one channel, sharing a single transcript that each "
-        "sees from its own point of view.\n\n"
-        "Open the cast editor and pick your character on the **Cast** tab — it is seated the moment you "
-        "choose it — then press **Start / Update Session**. This is an administrator's job, since a "
-        "channel is the server's, unless an admin has set the channel to **Open casting**."
+        "A **session** is a channel's conversation. You choose which characters take part (the **cast**), "
+        "and they all read the same chat.\n\n"
+        "Open the Cast Editor and pick your character on the **Cast** tab — it is added the moment you "
+        "choose it — then press **Start / Update Session**. In a server this is an administrator's job, "
+        "unless an admin has set the channel to **Open casting**, which lets anyone edit it."
     ),
     "speak": (
         "Nothing else to configure. Send a message in the channel and the cast will answer.\n\n"
-        "If it stays quiet, that is usually **reactivity** — replies are a dice roll by default, so it does "
-        "not talk over everything. `/trigger` forces a round, and wakewords make it always answer."
+        "If it stays quiet, that is by design: characters do not answer every message, so they do not "
+        "talk over everyone. `/trigger` makes them answer now, and a **wakeword** (a word you choose) "
+        "makes a character always answer when it appears. The chance is set in `/session config` → "
+        "Reactivity."
     ),
 }
 
@@ -749,19 +754,19 @@ DEFAULT_HELP_DOCS = {
     # --- GETTING STARTED ---
     "start/setup_wizard.txt": (
         "Command: `/start` opens a guided setup wizard. It is the first thing a new user should run.\n"
-        "Concept: Five steps -- choose a provider (OpenRouter, Google or None), add your API key for it, get a character, seat it in a channel, say something to it. The wizard checks which are already done every time it is opened, so it can be closed and reopened freely and always resumes correctly. No progress is stored anywhere.\n"
+        "Concept: Five steps -- choose a provider (OpenRouter, Google or None), add your API key for it, get a character, add it to a channel, say something to it. The wizard checks which are already done every time it is opened, so it can be closed and reopened freely and always resumes correctly. No progress is stored anywhere.\n"
         "One screen: the checklist, then the step you are on with its buttons. The dropdown jumps to any step; a finished step you pick keeps its buttons where that makes sense -- switch provider, get another character, reopen the cast.\n"
         "Adding a key: works anywhere, a server channel included. 'Get a key' opens the provider's key page; 'Paste key' opens a private form, validates the key, saves it and makes it your Personal key. If you administer any servers, a dropdown under the step lists them -- the one you ran it in first, 21 per page with Previous, Next and jump-to-page -- and each tick is saved as you make it, with a confirmation first if another key already serves that server. `/settings` -> API Keys still manages all four slots.\n"
-        "Context awareness: The wizard states where you are and what you can do there. Seating a character in a channel requires server administrator permission, or a channel on Open casting. Steps that cannot be done from where you ran it are shown greyed out with the reason rather than hidden.\n"
-        "Non-administrators: You can complete the first three steps anywhere and build characters freely, but only an administrator can seat them in a channel. Profiles belong to you rather than to a server, so the fastest way to test your own is to create your own server -- you are its administrator -- and add the bot with `/invite`.\n"
+        "Context awareness: The wizard states where you are and what you can do there. Adding a character to a channel requires server administrator permission, or a channel on Open casting. Steps that cannot be done from where you ran it are shown greyed out with the reason rather than hidden.\n"
+        "Non-administrators: You can complete the first three steps anywhere and build characters freely, but only an administrator can add them to a channel. Profiles belong to you rather than to a server, so the fastest way to test your own is to create your own server -- you are its administrator -- and add the bot with `/invite`.\n"
         "Second track: Once setup is done, 'Using it' covers talking to characters, `/whisper`, memory commands, images and voice, and what to do when something is wrong. These are not setup steps and have no completion state.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I do not know where to begin.' Fix: Run `/start`.\n"
         "- Symptom: 'Which API key should I get first?' or 'Do I have to pay to use this?' Fix: OpenRouter. One key reaches a few hundred models and some of them are free to run (Space Bunny Alpha, DeepSeek V4 0731, and OpenRouter's Free Models Router), and only models some host is known to serve without training on prompts are offered. Add a paid Google Gemini key afterwards for Gemini's speech and image models.\n"
-        "- Symptom: 'The key step is locked.' or 'It says to run /start first.' Fix: Choose a provider first -- None counts. Choosing is how you set MimicAI up: nothing can be created, borrowed or saved for you before it. The key step then asks for that provider's key, or either with None.\n"
+        "- Symptom: 'The key step is locked.' or 'It says to run /start first.' Fix: Pick a provider first (None is fine). Choosing is how you set MimicAI up: nothing can be created, borrowed or saved for you before it. The key step then asks for that provider's key, or either with None.\n"
         "- Symptom: 'Google refused my key.' Fix: Only a billing-enabled (paid) Google key is accepted. Turn billing on for the key's project, or choose OpenRouter instead.\n"
-        "- Symptom: 'Seating is locked: needs an API key assigned to this server.' Fix: An administrator ticks the server in the key step's dropdown, or assigns a key in `/settings` -> API Keys.\n"
-        "- Symptom: 'Seating is locked: needs administrator.' Fix: Seating a cast needs server administrator permission. Ask an admin to run `/session config`, or make your own server to test in.\n"
+        "- Symptom: 'Add it to this channel is locked: needs an API key assigned to this server.' Fix: An administrator ticks the server in the key step's dropdown, or assigns a key in `/settings` -> API Keys.\n"
+        "- Symptom: 'Add it to this channel is locked: needs an administrator.' Fix: Choosing a channel's cast needs server administrator permission, or Open casting. Ask an admin to run `/session config`, or make your own server to test in.\n"
         "- Symptom: 'I finished a step but the wizard still shows it undone.' Fix: Press Refresh. The wizard reads live state and only re-reads it when asked.\n"
         "- Symptom: 'The wizard stopped responding to clicks.' Fix: It times out after fifteen minutes. Run `/start` again; it resumes exactly where you were because nothing was stored.\n"
         "- Symptom: 'The bot says an API key was not found.' Fix: Either no key is set, or a key was saved but never assigned. Run `/start`, which checks assignment rather than just presence.\n"

@@ -568,7 +568,8 @@ def _scan_users() -> List[Tuple[int, Optional[str], int, int]]:
 
 
 def _paginate(lines: List[str], empty: str) -> List[str]:
-    return ["\n".join(lines[i:i + 25]) for i in range(0, len(lines), 25)] or [empty]
+    # 20 two-line rows, worst case (100-character server name) ~3.7k of the embed's 4096.
+    return ["\n".join(lines[i:i + 20]) for i in range(0, len(lines), 20)] or [empty]
 
 
 class ModStatsView(ModBaseView):
@@ -591,17 +592,18 @@ class ModStatsView(ModBaseView):
             lines = []
             for j, guild in enumerate(guilds, start=1):
                 joined = guild.me.joined_at.strftime("%d/%m/%Y") if (guild.me and guild.me.joined_at) else "Unknown"
-                lines.append(f"{j}. **{guild.name}** (`{guild.id}`) — Members: `{guild.member_count or '?'}` · "
-                             f"Sessions: `{live[guild.id]}` · Joined: `{joined}`")
+                lines.append(f"{j}. **{guild.name}** · `{guild.id}`\n"
+                             f"Members `{guild.member_count or '?'}` · Sessions `{live[guild.id]}` · "
+                             f"Joined `{joined}`")
             return _paginate(lines, "No server data available.")
 
         rows = sorted(self._users or [], key=lambda r: (r[2], r[3]), reverse=True)
         lines = []
         for j, (uid, provider, personal, borrowed) in enumerate(rows, start=1):
             user = self.cog.bot.get_user(uid)
-            lines.append(f"{j}. **{user.name if user else 'Unknown User'}** (`{uid}`) — "
+            lines.append(f"{j}. **{user.name if user else 'Unknown User'}** · `{uid}`\n"
                          f"{PROVIDER_CHOICES.get(provider, UNREGISTERED_LABEL)} · "
-                         f"Personal: `{personal}` · Borrowed: `{borrowed}`")
+                         f"Personal `{personal}` · Borrowed `{borrowed}`")
         return _paginate(lines, "No users.")
 
     def _build_view(self):
