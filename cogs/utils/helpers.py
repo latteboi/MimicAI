@@ -21,8 +21,9 @@ from .constants import (
     PATTERN_TIMESTAMP_HEADER, PATTERN_METADATA, PATTERN_MESSAGE_LINK,
     PATTERN_SPEAKER_CLOSE, PATTERN_STRAY_WRAPPERS, PATTERN_BARE_TURN_TAG,
     PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK, SYSTEM_MODEL_DEFAULTS,
-    SYSTEM_MODEL_DEFAULTS_BY_PROVIDER, AUTO_MODEL_PREFIX, AUTO_TIER_KEYS,
+    SYSTEM_MODEL_DEFAULTS_BY_PROVIDER, AUTO_MODEL_PREFIX, AUTO_SLOT_PAIRS, AUTO_TIER_KEYS,
     AUTO_ENDPOINTS_KEY, AUTO_SERVICE_TIERS_KEY,
+    NEURO_AXES, NEURO_DEFAULT_STATE, MOOD_AVATAR_THRESHOLD, MOOD_AVATAR_MARGIN,
     IMAGE_COMMAND_PREFIXES, IMAGE_MODEL_CAPS, IMAGE_MODEL_CAPS_DEFAULT, IMAGE_THINKING_LEVELS,
     OPENROUTER_IMAGE_CAPS_UNKNOWN, IMAGE_MIME_SUFFIXES, IMAGE_SUFFIX_MIMES,
     IMAGE_GROUNDING_TOOL_MODES, DEFAULT_TYPING_CURSOR,
@@ -1620,47 +1621,76 @@ def auto_tier(value: Optional[str]) -> Optional[str]:
     return text[len(AUTO_MODEL_PREFIX):] if text.startswith(AUTO_MODEL_PREFIX) else None
 
 
-def resolve_auto_model(cog, value: Optional[str], role: str = "primary") -> Optional[str]:
-    """`value` itself, or for `AUTO/<tier>` the model the bot owner runs that tier's `role`
-    on today. A tier with nothing set -- or one this build does not know -- is NO_FALLBACK,
-    which `_instantiate_model` refuses: never another tier's model, which may cost money."""
+def resolve_auto_model(cog, value: Optional[str], role: str = "primary",
+                       slot: str = "primary_model") -> Optional[str]:
+    """`value` itself, or for `AUTO/<tier>` the model the bot owner runs that tier's `role` of
+    `slot` (an AUTO_SLOT_PAIRS Primary key) on today. A tier with nothing set -- or one this
+    build does not know -- is NO_FALLBACK, which `_instantiate_model` refuses: never another
+    tier's model, which may cost money."""
     tier = auto_tier(value)
     if tier is None:
         return value
-    keys = AUTO_TIER_KEYS.get(tier)
+    keys = AUTO_TIER_KEYS.get((tier, slot))
     return system_model(cog, keys[role == "fallback"]) if keys else NO_FALLBACK
 
 
 def resolve_auto_models(cog, config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """`config` with its Auto response slots turned into models, for `model_chain`. A copy
-    when one is Auto, never written back: a stored model id is what Auto exists to avoid."""
+    """`config` with its Auto slots turned into models, for `model_chain`. A copy when one is
+    Auto, never written back: a stored model id is what Auto exists to avoid."""
     config = config or {}
-    if not (auto_tier(config.get("primary_model")) or auto_tier(config.get("fallback_model"))):
-        return config
-    return {**config,
-            "primary_model": resolve_auto_model(cog, config.get("primary_model")),
-            "fallback_model": resolve_auto_model(cog, config.get("fallback_model"), "fallback")}
+    resolved = {key: resolve_auto_model(cog, config[key], role, slot)
+                for slot, fallback in AUTO_SLOT_PAIRS.items()
+                for key, role in ((slot, "primary"), (fallback, "fallback"))
+                if auto_tier(config.get(key))}
+    return {**config, **resolved} if resolved else config
 
 
 def openrouter_routing(cog, config: Optional[Dict[str, Any]],
                        raw_model_name: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """(pinned endpoint, service tier) an OpenRouter model is sent with under `config`.
 
-    A model one of the profile's response slots runs through MimicAI Auto is routed as the
-    bot owner set that tier in /mod, the profile's own pins and tier aside: the owner chose
-    the model, so the owner chooses its host. By model name, as a pin is, because
-    `_instantiate_model` is never told the slot.
+    A model one of the profile's slots runs through MimicAI Auto is routed as the bot owner
+    set that tier in /mod, the profile's own pins and tier aside: the owner chose the model,
+    so the owner chooses its host. By model name, as a pin is, because `_instantiate_model`
+    is never told the slot.
     """
     config = config or {}
     model_id = str(raw_model_name or "").removeprefix("OPENROUTER/")
-    for key, role in (("primary_model", "primary"), ("fallback_model", "fallback")):
-        tier = auto_tier(config.get(key))
-        if tier and resolve_auto_model(cog, config.get(key), role) == raw_model_name:
-            stored = getattr(cog, "system_models", None) or {}
-            config = {"openrouter_endpoints": stored.get(AUTO_ENDPOINTS_KEY),
-                      "openrouter_service_tier": (stored.get(AUTO_SERVICE_TIERS_KEY) or {}).get(tier)}
-            break
+    tier = next((auto_tier(config.get(key)) for slot, fallback in AUTO_SLOT_PAIRS.items()
+                 for key, role in ((slot, "primary"), (fallback, "fallback"))
+                 if auto_tier(config.get(key))
+                 and resolve_auto_model(cog, config.get(key), role, slot) == raw_model_name), None)
+    if tier:
+        stored = getattr(cog, "system_models", None) or {}
+        config = {"openrouter_endpoints": stored.get(AUTO_ENDPOINTS_KEY),
+                  "openrouter_service_tier": (stored.get(AUTO_SERVICE_TIERS_KEY) or {}).get(tier)}
     return resolve_openrouter_endpoint(config, model_id), resolve_openrouter_service_tier(config)
+
+
+def pick_mood_avatar(avatars: Optional[Dict[str, str]], threshold: Optional[int],
+                     config: Optional[Dict[str, Any]], shown: Optional[str] = None) -> Optional[str]:
+    """The neuro axis whose mood avatar the speaking profile's `config` shows, or None for
+    its usual one.
+
+    `avatars` and `threshold` are the appearance's -- a borrow's source's -- and `config` the
+    speaker's own, whose neuro state the borrow keeps. The highest level with an avatar wins
+    once it reaches the threshold, a tie going to the earlier axis in NEURO_AXES (the modal's
+    order). `shown`, the axis showing now, holds within MOOD_AVATAR_MARGIN. With the engine
+    off the levels never move, so no mood shows.
+    """
+    config = config or {}
+    if not avatars or not config.get("neuro_engine_enabled"):
+        return None
+    state = config.get("neuro_state") or {}
+    levels = {a: state.get(a, NEURO_DEFAULT_STATE[a]) for a in NEURO_AXES if avatars.get(a)}
+    if not levels:
+        return None
+    floor = MOOD_AVATAR_THRESHOLD if threshold is None else threshold
+    top = max(levels, key=levels.__getitem__)  # the first of equals
+    if (shown in levels and levels[shown] >= floor - MOOD_AVATAR_MARGIN
+            and levels[top] < levels[shown] + MOOD_AVATAR_MARGIN):
+        return shown
+    return top if levels[top] >= floor else None
 
 
 def is_gateway_shutdown(exc: BaseException) -> bool:

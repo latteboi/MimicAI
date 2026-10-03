@@ -38,7 +38,7 @@ a default than it is a thing to propagate in bulk.
 import functools
 from typing import Any, Dict, List, Optional, Tuple
 
-from .constants import (AUTO_DEFAULT, AUTO_MODEL_PREFIX, AUTO_TIERS, MODEL_PROVIDERS,
+from .constants import (AUTO_DEFAULT, AUTO_MODEL_PREFIX, AUTO_SLOT_PAIRS, AUTO_TIERS, MODEL_PROVIDERS,
                         OPENROUTER_SHIPPED_MODELS, UTILITY_FALLBACK_KEYS)
 from .helpers import is_real_model
 
@@ -277,7 +277,7 @@ def model_slot_defaults(preferred: Optional[str]) -> Dict[str, str]:
             out[fallback_key] = chain[1]
     if preferred == "openrouter":
         # Auto rather than the day's ids, which OpenRouter withdraws -- see AUTO_MODEL_PREFIX.
-        out["primary_model"] = out["fallback_model"] = AUTO_DEFAULT
+        out.update(dict.fromkeys((key for pair in AUTO_SLOT_PAIRS.items() for key in pair), AUTO_DEFAULT))
     return out
 
 

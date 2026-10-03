@@ -1019,10 +1019,10 @@ OPENROUTER_SHIPPED_MODELS = {
     'grounding_rag_model': ('OPENROUTER/deepseek/deepseek-v4-flash-0731',),
 }
 
-#: MimicAI Auto: a response model the bot owner points at models in /mod -> System Models,
-#: per tier, so a profile follows the owner's pick instead of holding the day's id -- a
+#: MimicAI Auto: a text model the bot owner points at models in /mod -> System Models,
+#: per tier and slot, so a profile follows the owner's pick instead of holding the day's id -- a
 #: stealth or `:free` model is withdrawn, and a profile pinned to one outlives it. Stored in
-#: a response slot as `AUTO/<tier>` and turned into a model at the call
+#: a slot of AUTO_SLOT_PAIRS as `AUTO/<tier>` and turned into a model at the call
 #: (`helpers.resolve_auto_model`). OpenRouter models only, so `model_provider` can answer
 #: for the prefix without resolving it.
 AUTO_MODEL_PREFIX = 'AUTO/'
@@ -1032,16 +1032,27 @@ AUTO_TIERS = (
     ('budget', 'Budget', 'Low-cost models.'),
     ('recommended', 'Recommended', "The bot owner's pick for most characters."),
 )
-#: What a new profile on OpenRouter starts on.
+#: What a new profile on OpenRouter starts on, in every slot Auto fills.
 AUTO_DEFAULT = AUTO_MODEL_PREFIX + 'free'
-#: Each tier's System Models keys, Primary then Fallback. Free ships the OpenRouter response
-#: Primary and OpenRouter's own free router, not the shipped Fallback, which costs; Budget and
-#: Recommended ship unset, and a tier with no Primary is offered to no one.
-AUTO_TIER_KEYS = {tier: (f'auto_{tier}_model', f'auto_{tier}_fallback_model')
-                  for tier, _wording, _desc in AUTO_TIERS}
+#: The profile slots Auto fills, by Primary key -> its Fallback key: the text categories, each
+#: with models of its own per tier, since grounding's must search.
+AUTO_SLOT_PAIRS = {'primary_model': 'fallback_model',
+                   **{key: UTILITY_FALLBACK_KEYS[key] for key in ('grounding_rag_model', 'critic_model', 'ltm_model')}}
+#: (tier, slot) -> its System Models keys, Primary then Fallback. Response keeps the bare
+#: `auto_<tier>_model` it shipped with.
+AUTO_TIER_KEYS = {(tier, slot): (f'auto_{tier}_{stem}model', f'auto_{tier}_{stem}fallback_model')
+                  for tier, _wording, _desc in AUTO_TIERS
+                  for slot, stem in zip(AUTO_SLOT_PAIRS, ('', 'grounding_', 'critic_', 'ltm_'))}
+#: Free ships each slot's OpenRouter Primary and OpenRouter's own free router, not the shipped
+#: Fallback, which costs -- bar grounding, which has no Fallback: the router picks any model,
+#: and one that never calls the search answers anyway. Budget and Recommended ship unset, and a
+#: tier with no Primary is offered to no one.
 SYSTEM_MODEL_DEFAULTS.update({key: NO_FALLBACK for keys in AUTO_TIER_KEYS.values() for key in keys})
-SYSTEM_MODEL_DEFAULTS.update(zip(AUTO_TIER_KEYS['free'], (OPENROUTER_SHIPPED_MODELS['primary_model'][0],
-                                                          'OPENROUTER/openrouter/free')))
+SYSTEM_MODEL_DEFAULTS.update(
+    (key, value) for slot in AUTO_SLOT_PAIRS
+    for key, value in zip(AUTO_TIER_KEYS['free', slot], (
+        OPENROUTER_SHIPPED_MODELS[slot][0],
+        NO_FALLBACK if slot == 'grounding_rag_model' else 'OPENROUTER/openrouter/free')))
 #: The owner's Hosts & Tier for Auto, in the System Models file: pins keyed by model id, as
 #: a profile's are, and a Default Tier per Auto tier. A profile's own never reach an Auto model.
 AUTO_ENDPOINTS_KEY = 'auto_endpoints'
@@ -1573,6 +1584,19 @@ DEFAULT_NEURO_INSTRUCTION = (
 #: back the reply beside the call, Ollama cannot carry one -- so the mood worked two
 #: ways depending on the route, for the minority of turns. One spelling everywhere.
 NEURO_AXES = ("dopamine", "cortisol", "oxytocin", "adrenaline")
+#: Where a profile's levels start, and what an axis missing from its state reads as.
+NEURO_DEFAULT_STATE = {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20}
+
+#: Mood avatars, `config["mood_avatars"]` ({axis: url}): the profile speaks under the avatar
+#: of its highest level at or above `mood_avatar_threshold`, else its own. Above every
+#: starting level, so a fresh state shows the usual face.
+MOOD_AVATAR_THRESHOLD = 70
+#: The mood showing holds until its level drops this far below the threshold, or another
+#: passes it by this much -- so two levels trading the lead by a point keep one face.
+MOOD_AVATAR_MARGIN = 10
+#: (axis, what a high level reads as) in NEURO_AXES order, for the modal's labels.
+MOOD_AVATAR_LABELS = (("dopamine", "joy"), ("cortisol", "stress"),
+                      ("oxytocin", "affection"), ("adrenaline", "excitement"))
 
 
 # --- Anti-repetition critic ---------------------------------------------------
@@ -1652,8 +1676,9 @@ DEFAULT_CONTENT_CLASSIFIER_PROMPT = (
     "You classify a roleplay character profile for a Discord bot. Decide whether the "
     "character, as written, is intended for adult audiences and should therefore be "
     "confined to age-restricted (18+) channels.\n\n"
-    "You may be given the profile's avatar image alongside its text. Judge the two "
-    "together: an explicit image makes the profile ADULT whatever the text says, and "
+    "You may be given the profile's avatar images alongside its text: its usual one, and "
+    "any it switches to with its mood. Judge them together: any explicit image makes the "
+    "profile ADULT whatever the text says, and "
     "a suggestive or revealing image on its own does not. If no image is provided, "
     "judge the text alone and do not treat the absence as suspicious.\n\n"
     "Answer ADULT if the profile does any of the following:\n"

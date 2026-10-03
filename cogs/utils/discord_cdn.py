@@ -40,6 +40,13 @@ def _attachment_path(url: Optional[str]) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def is_web_url(url: Any) -> bool:
+    """Whether Discord will take `url` as an image link. Anything else is a 400 on the whole
+    message or embed carrying it, not a missing picture."""
+    return (isinstance(url, str) and url.startswith(("https://", "http://"))
+            and not any(c.isspace() for c in url))
+
+
 def unsigned_attachment_url(url: Optional[str]) -> Optional[str]:
     """`url` for Discord to draw: a Discord attachment on the CDN with no query, anything
     else untouched. The media proxy's `format`/`width` go with the signature."""
