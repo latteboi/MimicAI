@@ -42,7 +42,7 @@ from ..utils.constants import (
     IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_CONSENT_FILES, VOICE_SAMPLE_SLOT_FILES, VOICE_SAMPLE_SLOT_KEY, VOICE_SAMPLE_SLOTS,
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_MODES, GREEDY_SAMPLING, SYSTEM_PROFILE_MODEL,
     MODEL_PROVIDERS, PROVIDER_CHOICES, NOT_REGISTERED, )
-from ..utils.helpers import (auto_tier, image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
+from ..utils.helpers import (auto_tier, birth_time, image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
                             ltm_auto_recall_enabled, resolve_critic_settings,
                             grounding_mode_display, resolve_image_output_params,
                             resolve_auto_models, pick_mood_avatar,
@@ -1640,6 +1640,10 @@ class ProfileManager:
         if provider not in PROVIDER_CHOICES:
             raise ValueError(f"Not a provider choice: {provider!r}")
         about = self.get_user_about(user_id)
+        if about.get("provider") not in PROVIDER_CHOICES:
+            # The first choice registers, and stamps when -- a later switch never moves it.
+            # A directory that predates /start keeps its own date, not today's.
+            about["registered_at"] = int(birth_time(os.path.join(USERS_DIR, str(user_id))) or time.time())
         about["provider"] = provider
         self.save_user_about(user_id, about)
 

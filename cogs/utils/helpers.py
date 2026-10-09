@@ -330,6 +330,41 @@ def _sanitise_filename(name: str) -> str:
     """Removes any special characters or directory traversal dots/slashes."""
     return re.sub(r'[^a-zA-Z0-9_-]', '', name)
 
+@functools.cache
+def _statx_fn():
+    """libc's `statx`, or None off Linux (and on a libc too old to have it)."""
+    import ctypes
+    try:
+        fn = ctypes.CDLL(None).statx
+    except (OSError, AttributeError):
+        return None
+    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p]
+    return fn
+
+def birth_time(path: str) -> Optional[float]:
+    """When `path` was created, in epoch seconds, or None where the filesystem does not say.
+
+    Python exposes `st_birthtime` on macOS alone; Linux takes `statx`. Read a *directory's*:
+    every write here is an atomic replace, so a file's own is reset by each save, where a
+    directory's outlives all of them. A copy (`cp -r`, an extract) stamps the copy time.
+    """
+    import ctypes
+    import struct
+    try:
+        born = getattr(os.stat(path), "st_birthtime", None)
+        if born is not None:
+            return born
+        statx = _statx_fn()
+        if statx is None:
+            return None
+        buf = ctypes.create_string_buffer(256)  # struct statx
+        # AT_FDCWD, no flags, STATX_BTIME. A filesystem without birth times leaves the bit unset.
+        if statx(-100, os.fsencode(path), 0, 0x800, buf) != 0 or not struct.unpack_from("=I", buf)[0] & 0x800:
+            return None
+        return float(struct.unpack_from("=q", buf, 80)[0])  # stx_btime.tv_sec
+    except OSError:
+        return None
+
 def _pf(val): return float(val) if val and val.strip() else None
 def _pi(val): return int(val) if val and val.strip() else None
 def _ps(val): return val.strip() if val and val.strip() else None

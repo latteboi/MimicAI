@@ -9,7 +9,7 @@ from collections import Counter
 from string import Formatter
 from typing import TYPE_CHECKING, Dict, List, Set, Tuple, Optional, get_args
 from ..managers.storage_manager import IOManager
-from ..utils.helpers import _sanitise_filename, resolve_openrouter_endpoint, system_model
+from ..utils.helpers import _sanitise_filename, birth_time, resolve_openrouter_endpoint, system_model
 from ..utils.loop_probe import rss_bytes
 from ..utils.user_defaults import auto_wording, model_slot_defaults, other_provider
 from .base_components import (BlockedGuard, TabbedView, TimeoutCleanupMixin, add_button,
@@ -540,8 +540,11 @@ _STARTED_AT = time.time()
 UNREGISTERED_LABEL = "⚠️ Not registered"
 
 
-def _scan_users() -> List[Tuple[int, Optional[str], int, int]]:
-    """(id, provider, personal, borrowed) for every user directory. Run off the loop.
+def _scan_users() -> List[Tuple[int, Optional[str], int, int, Optional[float]]]:
+    """(id, provider, personal, borrowed, joined) for every user directory. Run off the loop.
+
+    `joined` is `about.registered_at`, else the directory's birth time (None if the
+    filesystem will not say) -- the case for everyone who registered before the stamp.
 
     `provider` is None for a directory that predates `/start` -- data, but never registered,
     so locked out of creating more until they run it. Listed, not skipped: a mod who cannot
@@ -561,9 +564,11 @@ def _scan_users() -> List[Tuple[int, Optional[str], int, int]]:
         if not isinstance(index, dict):
             index = {}
         about = index.get("about")
-        provider = about.get("provider") if isinstance(about, dict) else None
+        about = about if isinstance(about, dict) else {}
+        provider = about.get("provider")
         rows.append((int(name), provider if provider in PROVIDER_CHOICES else None,
-                     len(index.get("personal") or {}), len(index.get("borrowed") or {})))
+                     len(index.get("personal") or {}), len(index.get("borrowed") or {}),
+                     about.get("registered_at") or birth_time(os.path.join(USERS_DIR, name))))
     return rows
 
 
@@ -581,7 +586,7 @@ class ModStatsView(ModBaseView):
         self.selected_category = "Servers"
         self.current_page = 0
         # Read from disk when Users is first opened, not on every /mod.
-        self._users: Optional[List[Tuple[int, Optional[str], int, int]]] = None
+        self._users: Optional[List[Tuple[int, Optional[str], int, int, Optional[float]]]] = None
         self._build_view()
 
     def _pages(self) -> List[str]:
@@ -600,11 +605,13 @@ class ModStatsView(ModBaseView):
 
         rows = sorted(self._users or [], key=lambda r: (r[2], r[3]), reverse=True)
         lines = []
-        for j, (uid, provider, personal, borrowed) in enumerate(rows, start=1):
+        for j, (uid, provider, personal, borrowed, joined) in enumerate(rows, start=1):
             user = self.cog.bot.get_user(uid)
+            when = (datetime.datetime.fromtimestamp(joined, datetime.timezone.utc).strftime("%d/%m/%Y")
+                    if joined else "Unknown")
             lines.append(f"{j}. **{user.name if user else 'Unknown User'}** · `{uid}`\n"
                          f"{PROVIDER_CHOICES.get(provider, UNREGISTERED_LABEL)} · "
-                         f"Personal `{personal}` · Borrowed `{borrowed}`")
+                         f"Personal `{personal}` · Borrowed `{borrowed}` · Joined `{when}`")
         return _paginate(lines, "No users.")
 
     def _build_view(self):
