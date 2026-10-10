@@ -38,6 +38,11 @@ from ..utils.helpers import (
     resolve_typing_cursor,
 )
 from ..utils import mem_probe
+from ..utils.attachment_limits import upload_limit_bytes
+
+#: How long a refused send keeps its sender out of that channel's rounds, unless a send
+#: lands first. Long enough to stop a run of paid replies, short enough to notice a fix.
+SEND_REFUSAL_HOLD_SECONDS = 600
 from ..managers.session_manager import (director_enabled, director_model_config, intern_turn,
                                         keep_url_context, log_user_turn, pin_grounding)
 
@@ -505,6 +510,25 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 return
             await asyncio.sleep(self.SETTLE_POLL_SECONDS)
 
+    def _delivery_refused(self, participant, channel) -> Optional[str]:
+        """Why Discord would refuse this seat's reply in `channel`, or None if it should land.
+
+        A timed-out member keeps every permission bit, so only the member says so; that is
+        asked of a child bot alone, since a webhook is not a member. Anything else is known
+        only once it happens, and `refused_sends` remembers it.
+        """
+        bot_id = participant.get('bot_id') if participant.get('method') == 'child_bot' else None
+        bot_id = str(bot_id) if bot_id else None
+        if bot_id:
+            child = self.cog.child_bot_manager.clients.get(bot_id)
+            guild = child.get_guild(channel.guild.id) if child else None
+            if guild and guild.me and guild.me.is_timed_out():
+                return "its bot is timed out in this server"
+        refused_at = self.cog.refused_sends.get((bot_id, channel.id))
+        if refused_at is not None and time.monotonic() - refused_at < SEND_REFUSAL_HOLD_SECONDS:
+            return "Discord refused its last message here"
+        return None
+
     async def _multi_profile_worker(self, channel_id: int):
         session = self.cog.multi_profile_channels.get(channel_id)
         if not session: return
@@ -689,6 +713,15 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 ]
                 if blocked_participants:
                     profile_order = [p for p in profile_order if p not in blocked_participants]
+
+                # --- Delivery gate, here for the same reason ---
+                # A seat Discord will refuse still costs a full generation, thrown away at
+                # the send, on every round it is picked for.
+                for p in list(profile_order):
+                    refusal = self._delivery_refused(p, channel)
+                    if refusal:
+                        print(f"Skipping '{p['profile_name']}' in channel {channel.id}: {refusal}.")
+                        profile_order.remove(p)
 
                 # --- Synchronised Feedback Step ---
                 # As early as it can safely go. Everything that decides who speaks is settled
@@ -1573,7 +1606,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     final_fallback=profile_settings.get("final_fallback_enabled") is True,
                                     # Audio past it is paid for and then refused, so a model
                                     # billed by the second is capped here, not only checked below.
-                                    max_bytes=channel.guild.filesize_limit,
+                                    max_bytes=upload_limit_bytes(channel.guild),
                                 )
                                 round_audio_paths.append(turn_audio_path)
                             except asyncio.CancelledError:
@@ -1590,7 +1623,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 # Checked before sending, so a file over the limit is never
                                 # uploaded only to be refused.
                                 audio_size = os.path.getsize(turn_audio_path)
-                                upload_limit = channel.guild.filesize_limit
+                                upload_limit = upload_limit_bytes(channel.guild)
                                 if audio_size > upload_limit:
                                     turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(
                                         reason=ERR_REASON_AUDIO_TOO_LARGE.format(

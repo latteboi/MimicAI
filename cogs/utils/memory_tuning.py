@@ -131,6 +131,24 @@ def trim_malloc() -> bool:
         return False
 
 
+#: MemAvailable below which media work is refused. The e2-micro has about 965 MiB and
+#: the bot holds about 120 at rest, so this is the last stretch before the host swaps.
+LOW_MEMORY_BYTES = 128 * 1024 * 1024
+
+
+def low_memory(meminfo: str = "/proc/meminfo") -> bool:
+    """True when the host is nearly out of memory. Linux only: False wherever there is no
+    /proc. MemAvailable, not this process's RSS, because what swaps is the whole host."""
+    try:
+        with open(meminfo, "rb") as f:
+            for line in f:
+                if line.startswith(b"MemAvailable:"):
+                    return int(line.split()[1]) * 1024 < LOW_MEMORY_BYTES
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
+
+
 def maybe_trim_malloc(min_interval: float = 30.0) -> bool:
     """Rate-limited `trim_malloc`, for call sites that fire several times in a
     round — a four-participant turn sharing one attachment should trim once, not

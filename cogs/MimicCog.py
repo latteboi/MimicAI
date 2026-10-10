@@ -200,6 +200,10 @@ class MimicCog(EventListeners, commands.Cog):
         #: (owner id, profile name) of a speaker -> the mood avatar axis it shows, for
         #: `pick_mood_avatar`'s margin.
         self.mood_avatars_shown: LRUCache = LRUCache(max_size=500)
+        #: (child bot id, or None for the webhook path; channel id) -> monotonic time of a
+        #: send Discord refused (403). Cleared by the next send that lands; read by the
+        #: round's delivery gate.
+        self.refused_sends: LRUCache = LRUCache(max_size=500)
         
         self.server_manager._load_channel_webhooks()
 

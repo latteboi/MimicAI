@@ -2683,6 +2683,7 @@ VOICE_SAMPLE_SLOTS_FULL = (
 
 ERR_REASON_AUDIO_TOO_LARGE = "{size} MB of audio, over this server's {limit} MB upload limit"
 ERR_REASON_AUDIO_NOT_UPLOADED = "Discord refused the audio file as too large"
+ERR_REASON_LOW_MEMORY = "the server is low on memory right now; try again shortly"
 
 #: Stands in a user's turn for an attachment over LIMIT_ATTACHMENT_BYTES, which is never
 #: downloaded, so the character knows a file was sent instead of answering as if none was.

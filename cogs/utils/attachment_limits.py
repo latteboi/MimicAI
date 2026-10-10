@@ -11,6 +11,14 @@ from .constants import ATTACHMENT_SKIPPED_NOTE, DOCUMENT_MIME_TYPES, defaultConf
 from .helpers import attachment_mime
 
 _MB = 1024 * 1024
+# Discord's default since 2026-09-03, for bots and webhooks too. discord.py (2.7.1 and
+# master) still reports 10 MiB for an unboosted or Level 1 server.
+_DISCORD_DEFAULT_UPLOAD_BYTES = 20 * _MB
+
+
+def upload_limit_bytes(guild: Any) -> int:
+    """The largest file the bot may post in `guild` -- the outbound limit, not the one above."""
+    return max(guild.filesize_limit, _DISCORD_DEFAULT_UPLOAD_BYTES)
 
 
 def attachment_size(attachment: Any) -> Optional[int]:

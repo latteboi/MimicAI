@@ -42,15 +42,23 @@ class DeliveryMixin:
                       profile_owner_id_for_appearance=profile_owner_id_for_appearance,
                       profile_name_for_appearance=profile_name_for_appearance,
                       bypass_typing=bypass_typing)
+        # Only a character's own line counts: a plain notice the bot is barred from says
+        # nothing about the webhook its characters speak through.
+        refusal_key = (None, channel.id) if profile_name_for_appearance else None
         try:
-            return await self._send_channel_message_once(channel, content, file=file, **kwargs)
+            sent = await self._send_channel_message_once(channel, content, file=file, **kwargs)
         except discord.HTTPException as e:
+            if refusal_key and isinstance(e, discord.Forbidden):
+                self.cog.refused_sends[refusal_key] = time.monotonic()
             if file is None or not upload_too_large(e):
                 raise
             print(f"Discord refused {file.filename} as too large; sending the message without it.")
             if not content.strip() and not embeds:
                 return []
-            return await self._send_channel_message_once(channel, content, **kwargs)
+            sent = await self._send_channel_message_once(channel, content, **kwargs)
+        if refusal_key and sent:
+            self.cog.refused_sends.pop(refusal_key, None)
+        return sent
 
     async def _send_channel_message_once(self,
                                          channel: discord.abc.Messageable,

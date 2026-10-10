@@ -766,6 +766,8 @@ class ChildBotManager:
 
             return sent_messages
         except Exception as e:
+            if isinstance(e, discord.Forbidden):
+                self.cog.refused_sends[(str(bot_id), channel_id)] = time.monotonic()
             if file_to_send is not None and not sent_messages and upload_too_large(e):
                 # The file was refused, not the message. It only rides the first send, so
                 # nothing has posted: send the text on its own rather than lose both.
@@ -778,6 +780,8 @@ class ChildBotManager:
             print(f"[ChildBotManager] Delivery error for {bot_id}: {e}")
             return sent_messages
         finally:
+            if sent_messages:
+                self.cog.refused_sends.pop((str(bot_id), channel_id), None)
             if file_to_send:
                 file_to_send.close()
 

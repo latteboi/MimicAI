@@ -15,7 +15,7 @@ from ..utils.constants import (
     DEFAULT_IMAGE_PRESENT, DEFAULT_IMAGE_FAILED, DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING,
     DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_MODEL, DEFAULT_SPEECH_VOICE,
     IMAGE_COMMAND_PREFIXES, IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS, STATUS_IMAGINING_IMAGE,
-    TEXT_ATTACHMENT_EXTENSIONS, GOOGLE_VOICE_PREFIX, VOICE_KEY_REUSE_SECONDS,
+    TEXT_ATTACHMENT_EXTENSIONS, GOOGLE_VOICE_PREFIX, VOICE_KEY_REUSE_SECONDS, ERR_REASON_LOW_MEMORY,
     VOICE_SAMPLE_GEMINI_ACCEPTED, VOICE_SAMPLE_GEMINI_REFUSED, VOICE_SAMPLE_GEMINI_UNCHECKED,
 )
 from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, generated_image_attachment, image_command_prefix, image_command_prompt, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor, speaks_verbatim
@@ -24,7 +24,14 @@ from .api.google_rest import GoogleSpeechModel
 from .generation import tool_loop
 from .generation.reply import _merge_sources
 from ..utils.http_client import get_capped
-from ..utils.memory_tuning import maybe_trim_malloc
+from ..utils.memory_tuning import low_memory, maybe_trim_malloc
+
+
+class LowMemory(RuntimeError):
+    """Raised in place of generated media while the host is nearly out of memory: an image or
+    a voice line is the largest transfer a round makes, and the reply's text goes out without it."""
+    formatted_reason = ERR_REASON_LOW_MEMORY
+    retryable = False  # the fallback model would be refused the same way
 
 
 class MediaService:
@@ -59,6 +66,8 @@ class MediaService:
         a validated payload: validation depends on `raw_name`, and the factory is the one
         place that knows both.
         """
+        if low_memory():
+            raise LowMemory(ERR_REASON_LOW_MEMORY)
         return self.cog.api_service._instantiate_model(
             raw_name, guild_id, user_id, system_instruction=system_instruction,
             safety_settings=safety_settings, image_config=image_config or {},
@@ -100,6 +109,8 @@ class MediaService:
         builds through the model factory, so the data policy's key gate and the rate-limit
         cooldown reach speech as they reach every other slot.
         """
+        if low_memory():
+            raise LowMemory(ERR_REASON_LOW_MEMORY)
         timeout_retries = 1
 
         async def load_voice_sample():
