@@ -500,9 +500,13 @@ class ReplyMixin:
                                                   and not r.task.done()], failed)
 
             if raced_after is not None:
-                who = "the primary" if winner is primary else "the fallback" if winner is fallback else "neither"
+                # No winner is both runs failing, which is a lost reply: say why, not "neither".
+                outcome = (f"{'the primary' if winner is primary else 'the fallback'} answered first"
+                           if winner is not None else
+                           f"neither answered ({_reason(primary.error)}; "
+                           f"{_reason(fallback.error) if fallback else 'no fallback run'})")
                 print(f"Fallback race: '{primary_model}' gave no reply in {raced_after:.0f}s, "
-                      f"so '{fallback_names[0]}' was started beside it; {who} answered first.")
+                      f"so '{fallback_names[0]}' was started beside it; {outcome}.")
 
             if winner is primary:
                 attempt.status = "success"

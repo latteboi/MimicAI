@@ -427,14 +427,19 @@ class APIService:
                     raise
                 if last_error is None or not isinstance(e, MissingKeyError):
                     last_error = e
-                if i + 1 < len(attempts) and (label, name) not in _FALLBACK_LOGGED:
+                # Traffic and a timeout clear by themselves, and the fallback answering is
+                # the chain working. Neither is recorded, so a model that later fails for
+                # good still gets its one line.
+                reason = _format_api_error(e)
+                transient = "Rate Limit" in reason or isinstance(e, (asyncio.TimeoutError, TimeoutError))
+                if i + 1 < len(attempts) and not transient and (label, name) not in _FALLBACK_LOGGED:
                     _FALLBACK_LOGGED[(label, name)] = None
                     while len(_FALLBACK_LOGGED) > _FALLBACK_LOGGED_MAX:
                         _FALLBACK_LOGGED.popitem(last=False)
                     # The phrased reason, not the exception: a provider's error body is a
                     # JSON document, and a journal on a 1 GB box is not where it belongs.
                     print(f"{label}: {'fallback' if is_fallback else 'primary'} '{name}' failed "
-                          f"({type(e).__name__}: {_format_api_error(e)}); "
+                          f"({type(e).__name__}: {reason}); "
                           f"retrying on '{attempts[i + 1][0]}'.")
         raise last_error
 

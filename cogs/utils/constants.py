@@ -1941,6 +1941,9 @@ ROUND_SETTLE_WAIT_LIMIT = 30
 #: How long Discord shows a typing indicator after its last typing event. There is no
 #: "stopped typing" event, so a typer is "still typing" for this long after the last one.
 TYPING_INDICATOR_SECONDS = 10.0
+#: How long one person's @ of the bot, outside a live session, goes unanswered after
+#: the last one was -- the pointer says the same thing every time.
+MENTION_POINTER_COOLDOWN_SECONDS = 600
 
 # Archive depth for a session's unified_log, which is NOT its context window --
 # _build_history_for_participant windows to stm_length. These bound what regeneration,

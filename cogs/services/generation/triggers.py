@@ -56,6 +56,54 @@ async def referenced_message(message: Any) -> Optional[Dict[str, Any]]:
     return reply_snapshot(target)
 
 
+def mentioned_seat(profiles: Sequence[Dict[str, Any]], mentioned_ids: Sequence[int]
+                   ) -> Optional[Dict[str, Any]]:
+    """The seat of the first child bot `mentioned_ids` names, or None.
+
+    Fed `message.raw_mentions`: the mentions typed, in the order typed. `message.mentions`
+    also carries the author of a message being replied to, so a reply to one child bot
+    would be read as an @ of it. A profile seated as a webhook is not its child bot's
+    seat -- that account is not the one speaking in this channel.
+    """
+    for uid in mentioned_ids:
+        for seat in profiles:
+            if seat.get('method') == 'child_bot' and str(seat.get('bot_id')) == str(uid):
+                return seat
+    return None
+
+
+class BatchedMessage(NamedTuple):
+    """What the mid-round intake reads off a batched trigger, whichever shape it came in."""
+    typed: str
+    attachments: Sequence[Any]
+    author_id: int
+    author_name: str
+    guild_id: int
+    message_id: int
+    created_at: datetime.datetime
+    reply_ref: Optional[Dict[str, Any]]
+
+
+async def batched_message(trigger: Any) -> Optional[BatchedMessage]:
+    """The message a trigger batched mid-round carries, or None for one that carries none.
+
+    A message, or a child bot's payload -- the same message, taken whole by its
+    listener. The intake used to read a discord.Message alone, so a payload batched
+    mid-round was answered by nobody and never reached the log. Keyed on the tuple's
+    kind, not on its holding a dict: a game beat carries one too, with no author.
+    """
+    if isinstance(trigger, tuple) and len(trigger) > 1 and trigger[0] == 'child_mention':
+        p = trigger[1]
+        return BatchedMessage(p['content'], p['attachments'], p['author_id'], p['author_name'],
+                              p['guild_id'], p['id'], datetime.datetime.fromisoformat(p['timestamp']),
+                              p.get('replied_to'))
+    if not isinstance(trigger, discord.Message):
+        return None
+    return BatchedMessage(trigger.clean_content, trigger.attachments, trigger.author.id,
+                          trigger.author.display_name, trigger.guild.id, trigger.id,
+                          trigger.created_at, await referenced_message(trigger))
+
+
 def reply_record(unified_log: List[Dict[str, Any]], ref: Optional[Dict[str, Any]]
                  ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, str]]]:
     """What a turn stores about the message it replies to, and that message's media to

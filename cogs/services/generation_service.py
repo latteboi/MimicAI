@@ -50,7 +50,7 @@ from .generation.speak import SpeakAsMixin
 from .generation.global_chat import GlobalChatMixin
 from .generation.whisper import WhisperMixin
 from .generation.image_round import ImageRoundMixin
-from .generation.triggers import TriggerIntakeMixin, referenced_message, reply_record
+from .generation.triggers import TriggerIntakeMixin, batched_message, referenced_message, reply_record
 from .generation.compaction import SessionCompactionMixin
 from .generation.ltm_capture import LtmCaptureMixin
 from .generation.turn_deletion import TurnDeletionMixin
@@ -1882,22 +1882,23 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 if isinstance(trigger, tuple) and len(trigger) > 1 and isinstance(trigger[1], discord.Message):
                                     trigger = trigger[1]
 
-                                if isinstance(trigger, discord.Message):
+                                msg = await batched_message(trigger)
+                                if msg is not None:
                                     # None when there is nothing to draw, which queues no
                                     # image round: the message still reaches the round as
                                     # an ordinary turn.
-                                    batched_image_prompt = image_command_prompt(trigger.clean_content)
+                                    batched_image_prompt = image_command_prompt(msg.typed)
                                     if batched_image_prompt:
                                         session['pending_image_gen_data'] = {
                                             'prompt': batched_image_prompt,
                                             'anchor_message': trigger
                                         }
 
-                                    author_name = trigger.author.display_name
+                                    author_name = msg.author_name
                                     reply_to, reply_media = reply_record(
-                                        session.get("unified_log", []), await referenced_message(trigger))
+                                        session.get("unified_log", []), msg.reply_ref)
                                     batch_turn = await self._compose_user_turn(
-                                        trigger.clean_content, trigger.attachments)
+                                        msg.typed, msg.attachments)
                                     content, batch_msg_media = batch_turn.content, batch_turn.media_parts
                                     
                                     # [NEW] Batch URL Context Logic
@@ -1920,23 +1921,23 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     if any_url_enabled_batch:
                                         # The message's own text, not the quoted reply folded into
                                         # `content` above -- see _collect_round_triggers.
-                                        url_text_list, url_media, _ = await self.cog.tools_service._process_urls_in_content(trigger.clean_content, trigger.guild.id, {"url_fetching_enabled": True}, warning_channel=channel)
+                                        url_text_list, url_media, _ = await self.cog.tools_service._process_urls_in_content(msg.typed, msg.guild_id, {"url_fetching_enabled": True}, warning_channel=channel)
                                         if url_text_list: url_text_batch = "\n".join(url_text_list)
                                         url_media_batch = url_media
 
                                     # The batched turn's author, same source as the
                                     # single-turn path in triggers.py.
-                                    batch_tz = self.cog.profile_manager.user_timezone(trigger.author.id)
-                                    batch_hash = _get_user_hash(trigger.author.id)
+                                    batch_tz = self.cog.profile_manager.user_timezone(msg.author_id)
+                                    batch_hash = _get_user_hash(msg.author_id)
 
-                                    user_line = _format_history_entry(author_name, trigger.created_at, content, batch_tz, entity_id=batch_hash)
+                                    user_line = _format_history_entry(author_name, msg.created_at, content, batch_tz, entity_id=batch_hash)
 
                                     new_turn_id = str(uuid.uuid4())
                                     new_turn_object = {
                                         "turn_id": new_turn_id,
                                         "is_user": True,
-                                        "speaker_pid": str(trigger.author.id),
-                                        "message_ids": [trigger.id],
+                                        "speaker_pid": str(msg.author_id),
+                                        "message_ids": [msg.message_id],
                                         "content": user_line
                                     }
                                     if reply_to:
@@ -1950,7 +1951,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     # Before the reply that was still being delivered when
                                     # this was sent, which is the order the channel shows.
                                     insert_index = log_user_turn(
-                                        session, new_turn_object, trigger.created_at)
+                                        session, new_turn_object, msg.created_at)
                                     batch_start_index = min(batch_start_index, insert_index)
                                     # Into the round's turn data as well, or its pictures reach
                                     # no one: the log keeps text only, and the characters still

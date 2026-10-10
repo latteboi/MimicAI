@@ -170,7 +170,11 @@ class ImageRoundMixin:
 
         except Exception as e:
             image_gen_error_msg = _format_api_error(e)
-            print(f"Error generating image in multi-profile round: {e}")
+            # A host refusing the content (`retryable = False`) is a decision about the
+            # prompt, and the channel is already told it in the host's words. Anything
+            # else is a fault worth a line, phrased: `{e}` is the provider's JSON body.
+            if getattr(e, "retryable", True) is not False:
+                print(f"Error generating image in multi-profile round: {image_gen_error_msg}")
         finally:
             # The heartbeat spawns its own placeholder when the generator is a
             # child bot that sends none of its own — in that case feedback_task

@@ -315,8 +315,12 @@ HELP_CATEGORIES = {
         ),
         "Reactivity and Proactivity": (
             "**Reactivity** decides whether a profile interjects when it is not its turn. Each participant has a **Chance** percentage rolled "
-            "against every user message, and a list of **Wakewords** -- an exact match jumps the queue immediately. Configured under "
+            "against every user message, and a list of **Wakewords** -- one appearing anywhere in a message, in any case, makes the profile answer whatever its chance, "
+            "in its usual place in the order. Configured under "
             "`/session config` -> Reactivity.\n\n"
+            "**Mentioning** a seated child bot puts it first in the round, as replying to a character does -- if its chance lets it answer "
+            "at all; a wakeword set to its name makes a ping always land. Sent while a round is under way, either is read as an ordinary "
+            "message. Mentioning the main bot does nothing in a session.\n\n"
             "**Proactivity** lets the cast start talking with nobody prompting them. A timer rolls against your configured chance and cooldown; "
             "when it fires, the **AI Director** -- a separate model -- reads the scene and the recent public conversation and writes a short environmental beat ('a loud noise "
             "outside'), injected as an `<internal_note>` that the cast reacts to.\n\n"
@@ -551,7 +555,8 @@ HELP_CATEGORIES = {
             "`/session config` and `/session swap` refuse until a key is assigned.\n\n"
             "**The profile is rated Adult 18+ and the channel is not age-restricted.** It is blocked before generation. Mark the channel NSFW "
             "in Discord's settings, or use a different profile.\n\n"
-            "**Response Mode is set to Mention or Reply.** The profile is waiting to be addressed that way.\n\n"
+            "**Its chance roll said no.** Characters do not answer every message: `/session config` -> Reactivity sets each one's "
+            "chance, and a wakeword makes it always answer.\n\n"
             "**The session was suspended or the channel purged.** Run `/session view` to see whether a session is actually live.\n\n"
             "**Generation is stuck.** `/cancel` stops whatever the bot is doing in this channel."
         ),
@@ -1008,7 +1013,7 @@ DEFAULT_HELP_DOCS = {
         "- Reply: The bot uses the native Discord Reply feature to visually link its response to the user's prompt.\n"
         "- Mention+Reply: A hybrid behavior combining both.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'The profile only responds sometimes, or seems to ignore me.' Fix: Check the response mode. Mention and Reply modes wait to be addressed that way."
+        "- Symptom: 'The profile only responds sometimes, or seems to ignore me.' Fix: Response Mode only changes how a reply is posted, never whether one comes. How often a profile answers is its Chance, under `/session config` -> Reactivity."
     ),
     "sessions/proactivity_and_director.txt": (
         "Setup: Enabled via `/session config` -> Proactivity.\n"
@@ -1022,10 +1027,11 @@ DEFAULT_HELP_DOCS = {
     "sessions/reactivity_and_wakewords.txt": (
         "Setup: `/session config` -> Reactivity.\n"
         "Concept: Reactivity governs whether a profile interjects when it is not its turn in the rotation. Each participant carries a Chance percentage, rolled against user messages, and a list of Wakewords.\n"
-        "Wakewords: An exact match in a user's message causes that profile to bypass normal turn order and respond immediately. Useful for calling a specific character by name in a large cast.\n"
+        "Wakewords: A wakeword anywhere in a user's message, in any case, makes that profile answer whatever its Chance. It speaks in its usual place in the turn order, not first -- replying to it or @-mentioning its child bot is what puts it first. Useful for calling a specific character by name in a large cast.\n"
+        "Mentions: @-mentioning a seated child bot puts it first in the round, as replying to it does, if its Chance roll passes. Sent mid-round it is read as an ordinary message. Mentioning the main bot, or a child bot that is not seated, does nothing in a session. A wakeword set to the bot's name makes a ping always answer.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Profiles keep interrupting each other.' Fix: Lower the Chance percentage for those participants.\n"
-        "- Symptom: 'My wakeword does not trigger.' Fix: Wakeword matching is exact. Check spelling and that the word actually appears in the message."
+        "- Symptom: 'My wakeword does not trigger.' Fix: Matching ignores case and finds the word inside longer ones ('Al' fires on 'Alice'), so one that never fires is misspelt or not in the message."
     ),
     "sessions/whisper_and_speak.txt": (
         "Commands: `/whisper` and `/speak`\n"
@@ -1284,6 +1290,14 @@ WELCOME_MESSAGE = (
     "**New to this bot? Run {start}.** This will guide you through setting up MimicAI in your server.\n\n"
     "Activating a character *in a channel* requires a user with **Administrator** permissions — so if you do not have them here, feel free to build yours in a server of your own.\n\n"
     "{help} is a system profile that can assist with your queries, but only use this after you've set up MimicAI!"
+)
+
+#: The answer to an @ of the bot outside a live session (`_answer_bot_mention`), with
+#: {start} and {help} substituted as for the welcome.
+MENTION_POINTER_UNREGISTERED = "Pinging me doesn't start a chat. New here? Run {start} to set up MimicAI."
+MENTION_POINTER_REGISTERED = (
+    "Pinging me doesn't start a chat -- characters answer in channels with a session running, "
+    "which an administrator starts with `/session config`. Stuck? Ask {help}."
 )
 
 #: Channel names worth trying when a server has no system channel set. Matched as a

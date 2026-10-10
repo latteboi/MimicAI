@@ -14,12 +14,15 @@ from discord.ext import commands
 from ..utils.constants import *
 from ..utils.member_probe import start_member_probe
 from ..utils import mem_probe
-from ..utils.content import WELCOME_MESSAGE, WELCOME_CHANNEL_HINTS
+from ..utils.content import (
+    MENTION_POINTER_REGISTERED, MENTION_POINTER_UNREGISTERED, WELCOME_MESSAGE,
+    WELCOME_CHANNEL_HINTS,
+)
 from ..utils.helpers import (
     _format_history_entry, _get_user_hash, image_command_prompt, is_media_attachment,
     is_text_attachment,
 )
-from ..services.generation.triggers import referenced_message, reply_record
+from ..services.generation.triggers import mentioned_seat, referenced_message, reply_record
 from ..utils.fuzzy import MAX_CHOICES, rank_keyed
 
 
@@ -387,13 +390,48 @@ class EventListeners:
             if 'task_queue' not in session or session['task_queue'] is None:
                 session['task_queue'] = asyncio.Queue()
 
-            await session['task_queue'].put(message)
-            
+            # An @ of a seated child bot asks it to answer first, as replying to it does --
+            # and is the same trigger, so it rolls its chance like a reply and, landing
+            # mid-round, is read as an ordinary message like one. Not 'child_mention',
+            # which seats its bot first whatever its chance rolled.
+            seat = mentioned_seat(session.get('profiles', []), message.raw_mentions)
+            await session['task_queue'].put(('reply', message, seat) if seat else message)
+
             if not session.get('worker_task') or session['worker_task'].done():
                 task = self.bot.loop.create_task(self.generation_service._multi_profile_worker(message.channel.id))
                 session['worker_task'] = task
                 self.background_tasks.add(task)
             return
+
+        # --- 4. The bot itself, pinged where nothing is listening ---
+        # Typed mentions only: a reply to the bot pings it too, and is not a question.
+        if self.bot.user.id in message.raw_mentions:
+            await self._answer_bot_mention(message)
+
+    async def _answer_bot_mention(self, message: discord.Message):
+        """Point whoever @-mentioned the bot outside a live session at the way in.
+
+        Answered because a ping met with silence reads as a broken bot, which makes this
+        an asked message rather than a second unasked one beside the join greeting.
+        `/start` until they have used it. The throttle lives in memory alone: a stored
+        "already told" would be data kept under the id of someone NOT_REGISTERED
+        promises nothing is stored for.
+        """
+        now = time.monotonic()
+        last = self.mention_pointers_sent.get(message.author.id)
+        if last is not None and now - last < MENTION_POINTER_COOLDOWN_SECONDS:
+            return
+        # Claimed before the first await, so a burst of pings is answered once.
+        self.mention_pointers_sent[message.author.id] = now
+
+        await self._cache_command_ids()
+        text = (MENTION_POINTER_REGISTERED.format(help=self.command_mention("help"))
+                if self.profile_manager.is_registered(message.author.id)
+                else MENTION_POINTER_UNREGISTERED.format(start=self.command_mention("start")))
+        try:
+            await message.reply(text, mention_author=False)
+        except discord.HTTPException:
+            pass
 
     def _child_bot_runs_on_ollama(self, bot_id: str) -> bool:
         """Whether this child bot's profile answers on Ollama, which no server key gates."""

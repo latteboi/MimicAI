@@ -311,6 +311,8 @@ class MimicCog(EventListeners, commands.Cog):
         self.session_manager.evict_inactive_sessions_task.start()
         self.session_manager.flush_dirty_sessions_task.start()
         self.processed_child_messages: LRUCache = LRUCache(max_size=25)
+        # user id -> when an @ of the bot was last answered (`_answer_bot_mention`).
+        self.mention_pointers_sent: LRUCache = LRUCache(max_size=256)
         self.all_bot_ids: Set[int] = set()
         self.image_gen_semaphore = asyncio.Semaphore(3)
         self.ltm_recall_history: Dict[Any, Dict[str, Tuple[int, float]]] = {}
