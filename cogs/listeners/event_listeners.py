@@ -236,7 +236,8 @@ class EventListeners:
         if message.author.id in self.generation_blocked:
             return
 
-        if not message.guild or not self.has_lock or message.author.bot:
+        # Before boot loads the sessions every session channel looks like a plain one.
+        if not message.guild or not self.has_lock or message.author.bot or not self.sessions_loaded:
             return
 
         # Sending ends a typing indicator, and Discord says nothing when it does. A round
@@ -1153,6 +1154,22 @@ class EventListeners:
             return False
         command = interaction.command
         return command is None or command.qualified_name not in BLACKLIST_EXEMPT_COMMANDS
+
+    async def boot_gate(self, interaction: discord.Interaction) -> bool:
+        """The tree's check: every command, context menu and autocomplete waits for boot.
+
+        discord.py dispatches interactions from the gateway's READY, while guilds are
+        still chunking and before `on_ready` has loaded the session blueprints -- a
+        command then reads a server with no sessions, and saving one wipes the rest.
+        Components need no gate: no view is persistent, so none exists at boot.
+        """
+        if self.sessions_loaded:
+            return True
+        if (interaction.type is discord.InteractionType.application_command
+                and not self._refused_by_blacklist(interaction)):
+            await interaction.response.send_message(
+                "MimicAI is still starting up -- try again in a few seconds.", ephemeral=True)
+        return False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Gates this cog's app commands; `BLACKLIST_EXEMPT_COMMANDS` stay open.

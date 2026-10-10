@@ -350,6 +350,7 @@ class MimicCog(EventListeners, commands.Cog):
             callback=self.edit_profile_message
         )
         self.bot.tree.add_command(self.edit_ctx_menu)
+        self.bot.tree.interaction_check = self.boot_gate
 
     profile_group = app_commands.Group(name="profile", description="Manage your personal bot profiles (persona, instructions).")
 

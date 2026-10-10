@@ -1048,6 +1048,9 @@ class SessionManager:
                 except Exception as e:
                     print(f"Unexpected error reloading multi-profile sessions for server {server_id_str}, channel {ch_id_str}: {e}")
 
+        # Ahead of the save below: memory now holds every blueprint, so a save is safe.
+        self.cog.sessions_loaded = True
+
         if repaired_any:
             self._save_multi_profile_sessions()
 
@@ -1107,6 +1110,11 @@ class SessionManager:
         return homes
 
     def _save_multi_profile_sessions(self):
+        # This rebuilds every server's map from memory, and until boot has loaded the
+        # blueprints memory holds none: a save then -- a command, a listener, the
+        # eviction sweep -- writes every guild's sessions away.
+        if not self.cog.sessions_loaded:
+            return
         try:
             current_server_sessions = collections.defaultdict(lambda: {"regular": {}})
 
