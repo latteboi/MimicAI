@@ -44,7 +44,8 @@ from ..utils.attachment_limits import upload_limit_bytes
 #: lands first. Long enough to stop a run of paid replies, short enough to notice a fix.
 SEND_REFUSAL_HOLD_SECONDS = 600
 from ..managers.session_manager import (director_enabled, director_model_config, intern_turn,
-                                        keep_url_context, log_user_turn, pin_grounding)
+                                        keep_url_context, log_user_turn, pin_grounding,
+                                        rotated_cast)
 
 from .generation.heartbeat import HeartbeatMixin
 from .generation.prompt_builder import PromptBuilderMixin
@@ -55,7 +56,8 @@ from .generation.speak import SpeakAsMixin
 from .generation.global_chat import GlobalChatMixin
 from .generation.whisper import WhisperMixin
 from .generation.image_round import ImageRoundMixin
-from .generation.triggers import TriggerIntakeMixin, batched_message, referenced_message, reply_record
+from .generation.triggers import (TriggerIntakeMixin, batched_message, referenced_message,
+                                  reply_record, wakeword_position)
 from .generation.compaction import SessionCompactionMixin
 from .generation.ltm_capture import LtmCaptureMixin
 from .generation.turn_deletion import TurnDeletionMixin
@@ -231,6 +233,46 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         except discord.HTTPException:
             pass
 
+    @staticmethod
+    def _is_single_turn_round(initial_trigger, triggers, game_beat_participant, game_beat_cast) -> bool:
+        """Whether the round is one character's turn and nobody else's."""
+        if isinstance(initial_trigger, tuple) and initial_trigger[0] == 'reaction_single':
+            return True
+        # A beat on its own is one character's moment, not a cue for the
+        # whole cast -- five profiles all reacting to one Draw Four is the
+        # noise the batched narrator was removed for. A beat batched with
+        # real conversation is different: the others are answering the
+        # people, not the card, so they keep their turn.
+        #
+        # A finale carries a cast, and is the one beat that is meant for all
+        # of them: the game has ended, and a table that empties in silence
+        # is what this whole path exists to prevent.
+        return game_beat_participant is not None and not game_beat_cast and all(
+            isinstance(t, tuple) and t[0] == 'game_beat' for t in triggers if t is not None)
+
+    @staticmethod
+    def _trigger_text(t) -> str:
+        """A trigger's text, lowered, for wakewords to be found in; "" if it carries none."""
+        if isinstance(t, tuple) and len(t) > 1:
+            t = t[1]
+        if isinstance(t, discord.Message):
+            return t.clean_content.lower()
+        if isinstance(t, dict) and 'content' in t:
+            return t['content'].lower()
+        return t.lower() if isinstance(t, str) else ""
+
+    def _seat_wakewords(self, session, seat) -> list:
+        """The words that call this seat: its own, and its names unless the session says not.
+
+        The names are read here, at match time, never written into `wakewords`: stored,
+        they would go on answering to a name the profile has since been renamed from.
+        """
+        words = list(seat.get('wakewords') or ())
+        if session.get('name_wakewords', True):
+            words.append(seat['profile_name'])
+            words.append(self._resolve_appearance_data(seat['owner_id'], seat['profile_name'])[0])
+        return words
+
     def _select_round_speakers(self, session, initial_trigger, triggers, game_beat_participant,
                                game_beat_cast, starting_profile_override):
         """The round's speaking order: the roll, the override, the cap and the ephemeral seat.
@@ -240,46 +282,26 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         up on its result, before the trigger intake spends any network round trips. The
         worker still runs that intake for an empty order, so a message nobody answers is
         recorded all the same.
+
+        A wakeword makes its seat answer whatever its chance, and where nothing else named
+        who goes first, the seat called earliest in the text does.
         """
         session_mode = session.get("session_mode", "sequential")
+        is_single_turn_only = self._is_single_turn_round(
+            initial_trigger, triggers, game_beat_participant, game_beat_cast)
 
-        is_single_turn_only = False
-        if isinstance(initial_trigger, tuple) and initial_trigger[0] == 'reaction_single':
-            is_single_turn_only = True
-        elif game_beat_participant is not None and not game_beat_cast and all(
-                isinstance(t, tuple) and t[0] == 'game_beat'
-                for t in triggers if t is not None):
-            # A beat on its own is one character's moment, not a cue for the
-            # whole cast -- five profiles all reacting to one Draw Four is the
-            # noise the batched narrator was removed for. A beat batched with
-            # real conversation is different: the others are answering the
-            # people, not the card, so they keep their turn.
-            #
-            # A finale carries a cast, and is the one beat that is meant for all
-            # of them: the game has ended, and a table that empties in silence
-            # is what this whole path exists to prevent.
-            is_single_turn_only = True
-
-        trigger_content_lower = ""
-        for t in triggers:
-            if isinstance(t, discord.Message): trigger_content_lower += t.clean_content.lower() + " "
-            elif isinstance(t, tuple) and len(t) > 1:
-                if isinstance(t[1], discord.Message): trigger_content_lower += t[1].clean_content.lower() + " "
-                elif isinstance(t[1], dict) and 'content' in t[1]: trigger_content_lower += t[1]['content'].lower() + " "
-            elif isinstance(t, str): trigger_content_lower += t.lower() + " "
+        trigger_content_lower = " ".join(self._trigger_text(t) for t in triggers)
 
         active_participants = []
+        called = []  # (position, seat) for each seat a wakeword called
         for p in session['profiles']:
             if p.get('is_skipped', False): continue
-            chance = p.get('chance', 100)
-            wakewords = p.get('wakewords', [])
-            will_respond = False
-            if wakewords and any(w.lower() in trigger_content_lower for w in wakewords if w.strip()):
-                will_respond = True
-            else:
-                will_respond = (random.randint(1, 100) <= chance)
-
-            if will_respond: active_participants.append(p)
+            position = wakeword_position(self._seat_wakewords(session, p), trigger_content_lower)
+            if position is not None:
+                called.append((position, p))
+                active_participants.append(p)
+            elif random.randint(1, 100) <= p.get('chance', 100):
+                active_participants.append(p)
 
         # The seat the beat landed on speaks regardless of its response chance.
         # A reaction that rolls a die against `chance` is a reaction that
@@ -320,13 +342,14 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             profile_order = [p for p in session['profiles'] if p in active_participants]
             if session_mode == 'random':
                 random.shuffle(profile_order)
-            elif session.get('last_speaker_key'):
-                try:
-                    last_speaker_index = next(i for i, p in enumerate(session['profiles']) if (p['owner_id'], p['profile_name']) == session['last_speaker_key'])
-                    start_index = (last_speaker_index + 1) % len(session['profiles'])
-                    rotated = session['profiles'][start_index:] + session['profiles'][:start_index]
-                    profile_order = [p for p in rotated if p in active_participants]
-                except (ValueError, StopIteration): pass
+            else:
+                profile_order = [p for p in rotated_cast(session) if p in active_participants]
+            if called:
+                # Moved, not rotated in as a reply's seat is: that saves the cast, and a
+                # name is said on most rounds.
+                first = min(called, key=lambda c: c[0])[1]
+                profile_order.remove(first)
+                profile_order.insert(0, first)
 
         # Apply response limit if set
         max_responses = session.get("max_responses", 10)
@@ -356,6 +379,72 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 profile_order.insert(0, ephemeral_participant)
 
         return profile_order
+
+    def _give_next_turn(self, session, channel, profile_order, i, seat, capped=True) -> bool:
+        """Puts `seat` at `profile_order[i + 1]`, moved up if it is waiting, brought in if
+        not. False, and nothing moved, where it may not speak.
+
+        Brought in past `max_responses` while `capped`, it takes the last waiting seat's
+        turn, and with nobody waiting it is not brought in.
+        """
+        waiting = profile_order[i + 1:]
+        if seat in waiting:
+            # By index: a seat a user called back can also be in the order behind `i`.
+            del profile_order[i + 1 + waiting.index(seat)]
+        elif (seat.get('is_skipped')
+              or not self.cog.profile_manager._check_unrestricted_safety_policy(
+                  seat['owner_id'], seat['profile_name'], channel)
+              or self._delivery_refused(seat, channel)):
+            return False
+        elif capped and len(profile_order) >= session.get("max_responses", 10):
+            if not waiting:
+                return False
+            profile_order.pop()
+        profile_order.insert(i + 1, seat)
+        return True
+
+    def _hand_on(self, session, channel, profile_order, i, reply_text) -> None:
+        """Gives the next turn to the seat that `profile_order[i]`'s reply names first.
+
+        A wakeword beats a seat's chance here as it does in a user's message. Only a seat
+        that has not spoken this round: one turn each is what ends a round that two
+        characters keep naming each other in.
+        """
+        spoken = {(p['owner_id'], p['profile_name']) for p in profile_order[:i + 1]}
+        waiting = profile_order[i + 1:]
+        candidates = waiting + [p for p in session.get('profiles', []) if p not in waiting]
+        text = reply_text.lower()
+        called = []
+        for p in candidates:
+            if (p['owner_id'], p['profile_name']) in spoken:
+                continue
+            position = wakeword_position(self._seat_wakewords(session, p), text)
+            if position is not None:
+                called.append((position, p))
+        for _, seat in sorted(called, key=lambda c: c[0]):
+            if self._give_next_turn(session, channel, profile_order, i, seat):
+                return
+
+    def _user_called_seat(self, session, triggers):
+        """The seat the first message in `triggers` to call one calls, or None.
+
+        A reply to a character or an @ of its child bot names its seat outright; otherwise
+        it is the seat whose wakeword comes earliest in the text.
+        """
+        for t in triggers:
+            if isinstance(t, tuple):
+                if t[0] not in ('reply', 'child_mention'):
+                    continue
+                if len(t) > 2 and t[2]:
+                    return t[2]
+            elif not isinstance(t, discord.Message):
+                continue
+            text = self._trigger_text(t)
+            called = [(position, p) for p in session.get('profiles', []) if not p.get('is_skipped')
+                      and (position := wakeword_position(self._seat_wakewords(session, p), text)) is not None]
+            if called:
+                return min(called, key=lambda c: c[0])[1]
+        return None
 
     #: Sent to the channel and logged verbatim. Names the rating the way the dashboard
     #: does -- "Adult 18+", the content rating -- rather than the retired
@@ -693,6 +782,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 # choice reads only the raw triggers and the cast, and the placeholder waits
                 # on it; the intake waits on the network.
                 starting_profile_override = self._starting_override(all_triggers_for_round)
+                single_turn_round = self._is_single_turn_round(
+                    initial_trigger, all_triggers_for_round, game_beat_participant, game_beat_cast)
                 profile_order = self._select_round_speakers(
                     session, initial_trigger, all_triggers_for_round,
                     game_beat_participant, game_beat_cast, starting_profile_override)
@@ -722,6 +813,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     if refusal:
                         print(f"Skipping '{p['profile_name']}' in channel {channel.id}: {refusal}.")
                         profile_order.remove(p)
+
+                # The order and whose turn it is, for the turn-order dashboards (`turn_order`).
+                # The list itself, so the handoffs that move seats in it show as they land.
+                session['round_order'] = (profile_order, 0)
 
                 # --- Synchronised Feedback Step ---
                 # As early as it can safely go. Everything that decides who speaks is settled
@@ -985,6 +1080,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         )
 
                 for i, participant in enumerate(profile_order):
+                    session['round_order'] = (profile_order, i)
                     turn_warnings = []
                     if i == 0:
                         turn_warnings.extend(pre_generation_warnings)
@@ -1873,8 +1969,29 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     if not session.get('is_running') and not session.get('is_regenerating'):
                         break
 
+                    # Ahead of `next_p`, so the placeholder that goes up is the named seat's.
+                    if not was_blocked and not single_turn_round:
+                        self._hand_on(session, channel, profile_order, i, response_text)
+
                     is_last_participant = (participant == profile_order[-1])
                     if not is_last_participant:
+                        # What arrived while this seat was writing is taken ahead of the next
+                        # placeholder, so that placeholder goes up once, for the right seat:
+                        # a message in it that calls a seat gives it the next turn, even one
+                        # that has spoken -- this round is the one that answers it -- and past
+                        # the response limit, as its own round would have been. What arrives
+                        # while it settles is read as history, as at the round's opening.
+                        batched_triggers = []
+                        while not session['task_queue'].empty():
+                            try: batched_triggers.append(session['task_queue'].get_nowait())
+                            except asyncio.QueueEmpty: break
+                        batched_triggers = self.cog.session_manager.withdraw_cancelled_triggers(
+                            session, batched_triggers)
+                        called = self._user_called_seat(session, batched_triggers)
+                        if called is not None:
+                            self._give_next_turn(session, channel, profile_order, i, called,
+                                                 capped=False)
+
                         # Pipelined visual feedback for next participant
                         next_p = profile_order[i + 1]
                         if next_p.get('method') == 'child_bot':
@@ -1902,10 +2019,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # for behind the next placeholder, as the round's opening is.
                         await self._settle_round(session, handoff=True)
 
-                        batched_triggers = []
                         while not session['task_queue'].empty():
                             try: batched_triggers.append(session['task_queue'].get_nowait())
                             except asyncio.QueueEmpty: break
+                        # The whole batch again: a message taken above can be deleted while
+                        # it settles.
                         batched_triggers = self.cog.session_manager.withdraw_cancelled_triggers(
                             session, batched_triggers)
 
@@ -2002,6 +2120,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     # the pass only ever reclaimed reference cycles the automatic collector
                     # would have caught anyway.
 
+                session.pop('round_order', None)
                 self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
 
                 for trigger in all_triggers_for_round:
@@ -2105,6 +2224,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             finally:
                 # Round has concluded, AI is no longer active
                 session['is_running'] = False
+                session.pop('round_order', None)
                 # Speech files a turn made but never reached its own cleanup for: a delivery
                 # that raised. Each is a whole reply as WAV, so /tmp would fill with them.
                 for audio_path in round_audio_paths:

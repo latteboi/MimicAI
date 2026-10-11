@@ -393,8 +393,8 @@ class EventListeners:
 
             # An @ of a seated child bot asks it to answer first, as replying to it does --
             # and is the same trigger, so it rolls its chance like a reply and, landing
-            # mid-round, is read as an ordinary message like one. Not 'child_mention',
-            # which seats its bot first whatever its chance rolled.
+            # mid-round, takes the next turn like one (`_user_called_seat`). Not
+            # 'child_mention', which seats its bot first whatever its chance rolled.
             seat = mentioned_seat(session.get('profiles', []), message.raw_mentions)
             await session['task_queue'].put(('reply', message, seat) if seat else message)
 

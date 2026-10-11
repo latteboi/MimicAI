@@ -384,7 +384,10 @@ channel. Its shape:
 7. **Optionally generate one image** (`image_round.py`) *before* any participant speaks, so
    every turn in the round can see it.
 8. **Rotate.** Each participant in turn: build its prompt, call its model, deliver. The
-   next participant's placeholder goes up at the handoff, not at the top of its turn.
+   next participant's placeholder goes up at the handoff, not at the top of its turn. A
+   reply that names another seat by a wakeword — names included — gives it that next
+   turn (`_hand_on`), and so does a message sent mid-round that calls one
+   (`_user_called_seat`), so the order can change mid-round.
 
 ### A turn is deleted whole
 

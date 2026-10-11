@@ -295,7 +295,7 @@ HELP_CATEGORIES = {
             "everything but the newest turns at once, links and files included, and **Uncompact** unfolds it all again -- the same as `/compact`.\n\n"
             "`/session swap` changes the cast live without interrupting the conversation, including into a specific slot. In an empty channel it also starts the session outright -- naming the first profile is the fastest way in. Naming a profile "
             "that is already in the session removes it, which is the same thing giving a slot with no profile name does. "
-            "`/session view` dumps the current configuration and participant status. `/trigger` forces a round. "
+            "`/session view` dumps the current configuration and the speaking order. `/trigger` forces a round. "
             "`/session audit` reports token usage and diagnostics for the active session."
         ),
         "Reaction Controls": (
@@ -315,12 +315,13 @@ HELP_CATEGORIES = {
         ),
         "Reactivity and Proactivity": (
             "**Reactivity** decides whether a profile interjects when it is not its turn. Each participant has a **Chance** percentage rolled "
-            "against every user message, and a list of **Wakewords** -- one appearing anywhere in a message, in any case, makes the profile answer whatever its chance, "
-            "in its usual place in the order. Configured under "
+            "against every user message, and a list of **Wakewords** -- one appearing as a whole word in a message, in any case, makes the profile answer "
+            "whatever its chance, and the one named earliest answers first. A character's name counts as a wakeword unless the session turns "
+            "**Names as Wakewords** off, and a character naming another in its reply hands that one the next turn. Configured under "
             "`/session config` -> Reactivity.\n\n"
             "**Mentioning** a seated child bot puts it first in the round, as replying to a character does -- if its chance lets it answer "
-            "at all; a wakeword set to its name makes a ping always land. Sent while a round is under way, either is read as an ordinary "
-            "message. Mentioning the main bot does nothing in a session.\n\n"
+            "at all; a wakeword set to its name makes a ping always land. Sent while a round is under way, a mention, a reply or a name "
+            "gives that character the next turn, even if it has already spoken. Mentioning the main bot does nothing in a session.\n\n"
             "**Proactivity** lets the cast start talking with nobody prompting them. A timer rolls against your configured chance and cooldown; "
             "when it fires, the **AI Director** -- a separate model -- reads the scene and the recent public conversation and writes a short environmental beat ('a loud noise "
             "outside'), injected as an `<internal_note>` that the cast reacts to.\n\n"
@@ -687,8 +688,8 @@ WIZARD_COPY = {
     "speak": (
         "Nothing else to configure. Send a message in the channel and the cast will answer.\n\n"
         "If it stays quiet, that is by design: characters do not answer every message, so they do not "
-        "talk over everyone. `/trigger` makes them answer now, and a **wakeword** (a word you choose) "
-        "makes a character always answer when it appears. The chance is set in `/session config` → "
+        "talk over everyone. `/trigger` makes them answer now, and a **wakeword** (its name, or a word you "
+        "choose) makes a character always answer when it appears. The chance is set in `/session config` → "
         "Reactivity."
     ),
 }
@@ -981,7 +982,7 @@ DEFAULT_HELP_DOCS = {
     "sessions/session_swap.txt": (
         "Command: `/session swap [profile_name] [use_child_bot] [slot]`\n"
         "Capabilities: Dynamically inject, remove, or swap characters inside an active session without interrupting the conversation. Users can assign specific slots to override a specific participant.\n"
-        "With no options at all: lists the current participants and their slot numbers.\n"
+        "With no options at all: lists the participants in speaking order with their slot numbers -- a running round's order as names and replies move it (✓ spoke, ▶ speaking), otherwise the next round's, from the seat after the last speaker. 🔄 Refresh re-reads it; `/session view` shows the same list.\n"
         "Adding: name a profile that is not in the session. Without a slot it takes the next free seat (or replaces the only participant, if the session has one); with a slot it replaces that seat, or is appended if the slot is past the end.\n"
         "Removing: two equivalent forms. Name a profile that is already a participant, or give a slot with no profile name. Either drops that participant. The last remaining participant can be removed; the session stays as it is with an empty cast, and `/suspend` is what ends it outright.\n"
         "Starting a session this way starts it: run it in a channel with no session and the profile is seated and the session goes live at once, with no button press in between -- send a message and it answers. Run against a session that is already live and the change applies live, as it always has. (The cast editor still seats a draft, because a half-built cast should not be live.)\n"
@@ -1027,11 +1028,13 @@ DEFAULT_HELP_DOCS = {
     "sessions/reactivity_and_wakewords.txt": (
         "Setup: `/session config` -> Reactivity.\n"
         "Concept: Reactivity governs whether a profile interjects when it is not its turn in the rotation. Each participant carries a Chance percentage, rolled against user messages, and a list of Wakewords.\n"
-        "Wakewords: A wakeword anywhere in a user's message, in any case, makes that profile answer whatever its Chance. It speaks in its usual place in the turn order, not first -- replying to it or @-mentioning its child bot is what puts it first. Useful for calling a specific character by name in a large cast.\n"
-        "Mentions: @-mentioning a seated child bot puts it first in the round, as replying to it does, if its Chance roll passes. Sent mid-round it is read as an ordinary message. Mentioning the main bot, or a child bot that is not seated, does nothing in a session. A wakeword set to the bot's name makes a ping always answer.\n"
+        "Wakewords: A wakeword in a user's message, in any case, makes that profile answer whatever its Chance, and the profile named earliest speaks first. Replying to a character or @-mentioning its child bot still takes precedence. A character's name -- its display name and its profile name -- is a wakeword too, unless 'Names as Wakewords' on the Reactivity tab is turned off. Typing 'none' in the Wakewords field clears a profile's own words.\n"
+        "Characters calling each other: When a character's reply names another seated character (by a wakeword, its name included), that one speaks next, moved up from later in the round or brought in even if its Chance roll failed. Each character still speaks at most once per round, and the response limit still holds.\n"
+        "Mentions: @-mentioning a seated child bot puts it first in the round, as replying to it does, if its Chance roll passes. Sent while a round is under way, a mention, a reply or a wakeword gives that character the next turn instead, even if it has already spoken this round. Mentioning the main bot, or a child bot that is not seated, does nothing in a session. A wakeword set to the bot's name makes a ping always answer.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Profiles keep interrupting each other.' Fix: Lower the Chance percentage for those participants.\n"
-        "- Symptom: 'My wakeword does not trigger.' Fix: Matching ignores case and finds the word inside longer ones ('Al' fires on 'Alice'), so one that never fires is misspelt or not in the message."
+        "- Symptom: 'My wakeword does not trigger.' Fix: Matching ignores case but wants the whole word ('Al' does not fire on 'Alice'), so one that never fires is misspelt, part of a longer word, or not in the message.\n"
+        "- Symptom: 'A character answers whenever someone mentions it, even at 0% Chance.' Fix: Its name is a wakeword. Turn off 'Names as Wakewords' on the Reactivity tab."
     ),
     "sessions/whisper_and_speak.txt": (
         "Commands: `/whisper` and `/speak`\n"
@@ -1068,7 +1071,7 @@ DEFAULT_HELP_DOCS = {
         "- `/memorise`: Administrators (or a participant's owner, for a single named profile). Forces long-term memory summarisation for the session's cast right now, instead of waiting for the automatic creation interval.\n"
         "- `/compact`: Administrators. Folds everything but the newest turns (10 unless `keep` says otherwise) into the session synopsis now, including linked pages and pasted files, and turns the Rolling Synopsis on if it was off. `undo:True` unfolds every turn and removes the synopsis. The session waits while it runs.\n"
         "- `/clear`: Clears the bot's own messages from a DM channel.\n"
-        "- `/session view`: Shows the current session configuration and participant status.\n"
+        "- `/session view`: Shows the current session configuration and the speaking order, the same list `/session swap` with no options gives.\n"
         "- `/trigger`: Forces a new round immediately without waiting for a user message. Renamed from `/session trigger`.\n"
         "- `/session audit`: Reports token usage and diagnostics for the active session. Use it when you want to know what is actually filling the context window.\n"
         "Troubleshooting / Symptoms:\n"

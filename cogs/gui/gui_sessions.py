@@ -17,7 +17,8 @@ from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PA
                               add_select, build_pagination_controls,
                               bulk_select_options, resolve_bulk_select)
 from ..services.generation.compaction import compaction_model_config, resolve_compaction_settings
-from ..managers.session_manager import director_enabled, director_model_config, turn_lookup, with_reply
+from ..managers.session_manager import (director_enabled, director_model_config, rotated_cast,
+                                        turn_lookup, with_reply)
 from ..services.generation.global_chat import build_global_chat_embed
 from ..services.generation.tool_loop import functions_for
 
@@ -990,7 +991,7 @@ class ReactivitySettingsModal(ui.Modal, title="Edit Reactivity"):
             self.chance_input.default = str(p.get("chance", 100))
             self.keywords_input.default = ", ".join(p.get("wakewords", []))
             self.chance_input.placeholder = "Default: 100"
-            self.keywords_input.placeholder = "e.g. hey bot, look at this"
+            self.keywords_input.placeholder = "e.g. hey bot, look at this ('none' clears them)"
 
     async def on_submit(self, interaction: discord.Interaction):
         chance_val_str = self.chance_input.value.strip()
@@ -1008,7 +1009,9 @@ class ReactivitySettingsModal(ui.Modal, title="Edit Reactivity"):
                 return
         
         parsed_keywords = None
-        if keywords_val_str:
+        if keywords_val_str.lower() == "none":
+            parsed_keywords = []
+        elif keywords_val_str:
             parsed_keywords = [w.strip().lower() for w in keywords_val_str.split(',') if w.strip()]
 
         for p in self.participants:
@@ -1220,118 +1223,148 @@ class SettleWindowModal(ui.Modal, title="Settle Window"):
         await interaction.response.defer()
         await self.view.update_display()
 
-class SessionSwapListView(BlockedGuard, ui.View):
-    def __init__(self, cog, interaction, session_data_idx):
-        super().__init__(timeout=180)
+def turn_order(session: Dict) -> List[Tuple[Optional[int], str]]:
+    """Who speaks in what order, as (seat index, line); a heading's index is None.
+
+    A running round shows its own order as the names, replies and handoffs move it
+    (`round_order`, kept by the worker); otherwise the next round's before its roll --
+    from the seat after the last speaker (`rotated_cast`), or the cast as seated in
+    Random mode. The seat index, plus one, is what `/session swap slot:` takes.
+    """
+    profiles = session.get('profiles') or []
+    seat_of = {(p['owner_id'], p['profile_name']): n for n, p in enumerate(profiles)}
+
+    def line(p, lead):
+        n = seat_of.get((p['owner_id'], p['profile_name']))
+        how = "Child Bot" if p.get('method') == 'child_bot' else "Webhook"
+        state = "skipped" if p.get('is_skipped') else f"{p.get('chance', 100)}%"
+        slot = f"slot {n + 1}" if n is not None else "guest"
+        return n, f"{lead} `{p['profile_name']}` · {how} · {state} · {slot}"
+
+    order, at = session.get('round_order') or ((), 0)
+    if session.get('is_running') and order:
+        entries = [(None, "**This round**")]
+        entries += [line(p, "✓" if i < at else "▶" if i == at else f"{i + 1}.")
+                    for i, p in enumerate(order)]
+        in_round = {(p['owner_id'], p['profile_name']) for p in order}
+        rest = [p for p in profiles if (p['owner_id'], p['profile_name']) not in in_round]
+        if rest:
+            entries.append((None, "**Not in this round**"))
+            entries += [line(p, "·") for p in rest]
+        return entries
+
+    if session.get('session_mode', 'sequential') == 'random':
+        return [(None, "**Next round** — random order; a seat named goes first")] + [
+            line(p, "·") for p in profiles]
+    entries, n = [(None, "**Next round** — each at its chance; a seat named goes first")], 0
+    for p in rotated_cast(session):
+        n += not p.get('is_skipped')
+        entries.append(line(p, "·" if p.get('is_skipped') else f"{n}."))
+    return entries
+
+
+TURN_ORDER_LEGEND = "✓ spoke · ▶ speaking · slot = /session swap slot:"
+
+
+class _TurnOrderView(BlockedGuard, ui.View):
+    """A paged turn-order list (`turn_order`) over the channel's live session, re-read on
+    every render: the order moves turn by turn, and the dict is replaced by a new session.
+    Subclasses build `self.embed` from `self.page` in `render`."""
+
+    def __init__(self, cog, interaction, session, timeout):
+        super().__init__(timeout=timeout)
         self.cog = cog
-        self.interaction = interaction
-        self.session_data_idx = session_data_idx
+        self.channel_id = interaction.channel_id
+        self.session = session
         self.current_page = 0
         self.items_per_page = 20
         self.update_view()
 
     def update_view(self):
         self.clear_items()
-        profiles = self.session_data_idx.get("profiles", [])
-        total_items = len(profiles)
-        num_pages = max(1, (total_items - 1) // self.items_per_page + 1)
-        
-        if self.current_page >= num_pages:
-            self.current_page = num_pages - 1
-            
+        self.session = self.cog.multi_profile_channels.get(self.channel_id) or self.session
+        entries = turn_order(self.session)
+        self.num_pages = max(1, (len(entries) - 1) // self.items_per_page + 1)
+        self.current_page = min(self.current_page, self.num_pages - 1)
         start = self.current_page * self.items_per_page
-        end = start + self.items_per_page
-        page_profiles = profiles[start:end]
-        
-        profile_list = []
-        for i, p_data in enumerate(page_profiles, start=start + 1):
-            p_name = p_data.get('profile_name')
-            pid = p_data.get('pid', 'Unknown PID')
-            method_str = "Child Bot" if p_data.get('method') == 'child_bot' else "Webhook"
-            profile_list.append(f"**{i}.** `{p_name}` ({method_str}) [PID: {pid}]")
-            
-        owner_user = self.cog.bot.get_user(self.session_data_idx.get('owner_id'))
+        self.page = entries[start:start + self.items_per_page]
+        self.render()
+
+        async def turn(i, step):
+            self.current_page += step
+            self.update_view()
+            await i.response.edit_message(embed=self.embed, view=self)
+        build_pagination_controls(self, self.current_page, self.num_pages, 1,
+                                  lambda i: turn(i, -1), lambda i: turn(i, 1))
+        add_button(self, "Refresh", lambda i: turn(i, 0), emoji="🔄", row=2)
+
+    def render(self):
+        raise NotImplementedError
+
+    def order_text(self) -> str:
+        if not self.session.get('profiles'):
+            return "*No participants*"
+        return "\n".join(text for _, text in self.page)
+
+    def footer(self) -> str:
+        return f"Page {self.current_page + 1} of {self.num_pages} · {TURN_ORDER_LEGEND}"
+
+
+class SessionSwapListView(_TurnOrderView):
+    def __init__(self, cog, interaction, session):
+        super().__init__(cog, interaction, session, timeout=180)
+
+    def render(self):
+        owner_user = self.cog.bot.get_user(self.session.get('owner_id'))
         admin_name = owner_user.name if owner_user else "Unknown Admin"
-        
         self.embed = discord.Embed(
-            title=f"Current Participants ({total_items})",
-            description=f"**Session Admin:** {admin_name}\n\n" + ("\n".join(profile_list) if profile_list else "*No participants*"),
+            title=f"Current Participants ({len(self.session.get('profiles') or [])})",
+            description=f"**Session Admin:** {admin_name}\n\n{self.order_text()}",
             color=discord.Color.purple()
         )
-        self.embed.set_footer(text=f"Page {self.current_page + 1} of {num_pages}")
-        
-        if num_pages > 1:
-            async def prev_cb(i):
-                self.current_page -= 1
-                self.update_view()
-                await i.response.edit_message(embed=self.embed, view=self)
-            async def next_cb(i):
-                self.current_page += 1
-                self.update_view()
-                await i.response.edit_message(embed=self.embed, view=self)
-            
-            build_pagination_controls(self, self.current_page, num_pages, 0, prev_cb, next_cb)
+        self.embed.set_footer(text=self.footer())
 
-class SessionView(BlockedGuard, ui.View):
+
+class SessionView(_TurnOrderView):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, session: Dict):
-        super().__init__(timeout=600)
-        self.cog = cog
-        self.session = session
-        self.channel_id = interaction.channel_id
-        self.current_page = 0
-        self.items_per_page = 20
-        self.update_view()
+        self.channel_name = interaction.channel.name
+        super().__init__(cog, interaction, session, timeout=600)
 
-    def update_view(self):
-        self.clear_items()
-        profiles = self.session.get("profiles", [])
-        total_items = len(profiles)
-        num_pages = max(1, (total_items - 1) // self.items_per_page + 1)
-        
-        if self.current_page >= num_pages:
-            self.current_page = num_pages - 1
-            
-        start = self.current_page * self.items_per_page
-        end = start + self.items_per_page
-        page_profiles = profiles[start:end]
+    def render(self):
+        session = self.session
+        owner_id = session.get("owner_id")
+        owner = self.cog.bot.get_user(owner_id)
+        started = session.get("started", True)
+        embed = discord.Embed(title=f"Session Info: #{self.channel_name}",
+                              description=self.order_text(), color=discord.Color.gold())
+        embed.add_field(name="Status", value="`Live`" if started else "`Draft`", inline=True)
+        embed.add_field(name="Session Type", value="Chat Session", inline=True)
+        embed.add_field(name="Session Admin", value=owner.name if owner else f"ID: {owner_id}", inline=True)
+        embed.add_field(name="Participants", value=str(len(session.get("profiles") or [])), inline=True)
+        if session.get("session_prompt"):
+            prompt_val = session["session_prompt"]
+            embed.add_field(name="Master Prompt", value=prompt_val[:200] + "..." if len(prompt_val) > 200 else prompt_val, inline=False)
+        pro = session.get("proactivity", {})
+        if pro.get("enabled"):
+            embed.add_field(name="Proactivity", value=f"**ON** | Chance: {pro.get('chance')}% | Cooldown: {pro.get('cooldown')}s", inline=False)
+        embed.set_footer(text=("Draft — start it from /session config. · " if not started else "")
+                         + self.footer())
+        self.embed = embed
 
+        # dict.fromkeys: a seat called back is in a round twice, and Discord refuses a
+        # select with two options of one value.
         options = []
-        for i, p in enumerate(page_profiles, start=start):
-            p_name = p.get("profile_name")
-            method = p.get("method", "webhook")
-            label = p_name
-            description = f"Owner ID: {p.get('owner_id')}"
-            
-            if method == 'child_bot':
-                bot_id = p.get("bot_id")
-                bot_user = self.cog.bot.get_user(int(bot_id)) if bot_id else None
-                if bot_user: 
-                    label = f"{bot_user.name} ({p_name})"
-                    description = "Child Bot"
-                else:
-                    label = f"Bot {bot_id} ({p_name})"
-            
-            options.append(discord.SelectOption(label=label[:100], value=str(i), description=description))
-
+        for n in dict.fromkeys(n for n, _ in self.page if n is not None):
+            p = session['profiles'][n]
+            # Resolved as the save stamps it: a seat seated before stamping has none yet.
+            pid = p.get("pid") or self.cog.profile_manager._get_pid_from_name_any(
+                p["owner_id"], p["profile_name"])
+            options.append(discord.SelectOption(label=f"{n + 1}. {p['profile_name']}"[:100],
+                                                value=str(n), description=f"PID: {pid}"[:100]))
         if options:
-            self.select = ui.Select(placeholder="Select a participant to view details...", options=options)
+            self.select = ui.Select(placeholder="Select a participant to view details...", options=options, row=0)
             self.select.callback = self.callback
             self.add_item(self.select)
-
-        if num_pages > 1:
-            async def prev_cb(i):
-                self.current_page -= 1
-                self.update_view()
-                await i.response.edit_message(view=self)
-            add_button(self, "◀", prev_cb, style=discord.ButtonStyle.secondary, row=1,
-                       disabled=self.current_page == 0)
-            
-            async def next_cb(i):
-                self.current_page += 1
-                self.update_view()
-                await i.response.edit_message(view=self)
-            add_button(self, "▶", next_cb, style=discord.ButtonStyle.secondary, row=1,
-                       disabled=self.current_page == num_pages - 1)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -2191,7 +2224,12 @@ class SessionConfigView(BlockedGuard, ui.View):
 
     def _render_reactivity(self, embed: discord.Embed):
         """Per-participant response chance and wakewords."""
-        embed.description = "Manage how likely participants are to respond to messages."
+        names_on = self.session.get('name_wakewords', True)
+        embed.description = (
+            "Manage how likely participants are to respond to messages.\n\n"
+            + ("A character's **name** is also a wakeword: said in a message, or by another "
+               "character, it makes that character answer next."
+               if names_on else "Names are **not** wakewords: only the words set below call a character."))
         profiles = self.session.get('profiles', [])
         total_items = len(profiles)
         num_pages = max(1, (total_items - 1) // 20 + 1)
@@ -2284,6 +2322,16 @@ class SessionConfigView(BlockedGuard, ui.View):
             await i.response.send_modal(modal)
         add_button(self, btn_label, edit_callback, style=btn_style, row=2,
                    disabled=btn_disabled)
+
+        async def names_callback(i: discord.Interaction):
+            if self._viewer_is_admin():
+                self.session['name_wakewords'] = not names_on
+                self.cog.session_manager._save_multi_profile_sessions()
+            await i.response.defer()
+            await self.update_display()
+        add_button(self, f"Names as Wakewords: {'On' if names_on else 'Off'}", names_callback,
+                   style=discord.ButtonStyle.success if names_on else discord.ButtonStyle.secondary,
+                   row=2)
 
     def _render_proactivity(self, embed: discord.Embed):
         """The timer that lets the cast open a conversation unprompted."""

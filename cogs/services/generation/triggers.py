@@ -1,6 +1,7 @@
 import uuid
 import discord
 import datetime
+import unicodedata
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from ...utils.helpers import (
@@ -70,6 +71,39 @@ def mentioned_seat(profiles: Sequence[Dict[str, Any]], mentioned_ids: Sequence[i
             if seat.get('method') == 'child_bot' and str(seat.get('bot_id')) == str(uid):
                 return seat
     return None
+
+
+#: Scripts written without spaces between words: a name in one runs straight into the
+#: next word (アリスさん), so it needs no gap there to count as a whole word.
+_UNSPACED_SCRIPTS = ("CJK", "HIRAGANA", "KATAKANA", "THAI", "LAO", "KHMER", "MYANMAR")
+
+
+def _spaced_letter(char: str) -> bool:
+    return char.isalnum() and not unicodedata.name(char, "").startswith(_UNSPACED_SCRIPTS)
+
+
+def wakeword_position(words: Sequence[str], text_lower: str) -> Optional[int]:
+    """Where the earliest of `words` appears in `text_lower` as a whole word, or None.
+
+    Whole words, because a character's name is a wakeword too: found inside longer words,
+    "Sam" fired on "same" and "Max" on "maximum". Only two letters of spaced scripts
+    side by side join a word -- "Aliceさん" and "アリスさん" both hold a name.
+    """
+    best = None
+    for word in words:
+        word = word.strip().lower()
+        if not word:
+            continue
+        start = text_lower.find(word)
+        while start != -1 and (best is None or start < best):
+            end = start + len(word)
+            if not ((start and _spaced_letter(word[0]) and _spaced_letter(text_lower[start - 1]))
+                    or (end < len(text_lower) and _spaced_letter(word[-1])
+                        and _spaced_letter(text_lower[end]))):
+                best = start
+                break
+            start = text_lower.find(word, start + 1)
+    return best
 
 
 class BatchedMessage(NamedTuple):

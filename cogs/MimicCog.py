@@ -837,6 +837,7 @@ class MimicCog(EventListeners, commands.Cog):
                 "audio_mode": session_config.get("audio_mode", "off"),
                 "max_responses": session_config.get("max_responses", 10),
                 "settle": session_config.get("settle", {}),
+                "name_wakewords": session_config.get("name_wakewords", True),
             }
         else:
             # Blank session
@@ -932,20 +933,13 @@ class MimicCog(EventListeners, commands.Cog):
         session = self.multi_profile_channels.get(interaction.channel_id)
 
         if not profile_name and not slot:
-            server_id_str = str(interaction.guild_id) if interaction.guild_id else "dm"
-            server_index = self.server_manager._get_server_index(server_id_str)
-            channel_str = str(interaction.channel_id)
-            
-            active_sessions = server_index.get("active_sessions", {})
-            session_data_idx = {}
-            if isinstance(active_sessions, dict):
-                session_data_idx = active_sessions.get("regular", {}).get(channel_str)
-
-            if not session_data_idx or not session_data_idx.get("profiles"):
+            # The live session, not its saved blueprint: slot numbers index this cast, and
+            # the turn order is only known here.
+            if not session or not session.get("profiles"):
                 await interaction.followup.send("There is no active session in this channel.", ephemeral=True)
                 return
             
-            view = SessionSwapListView(self, interaction, session_data_idx)
+            view = SessionSwapListView(self, interaction, session)
             await interaction.followup.send(embed=view.embed, view=view, ephemeral=True)
             return
 
@@ -1187,56 +1181,22 @@ class MimicCog(EventListeners, commands.Cog):
     async def session_view_slash(self, interaction: discord.Interaction):
         if not self.has_lock: return
         
-        server_id_str = str(interaction.guild_id) if interaction.guild_id else "dm"
-        server_index = self.server_manager._get_server_index(server_id_str)
-        channel_str = str(interaction.channel_id)
-        
-        active_sessions = server_index.get("active_sessions", {})
-        session_data_idx = None
-        
-        if isinstance(active_sessions, dict):
-            if channel_str in active_sessions.get("regular", {}):
-                session_data_idx = active_sessions["regular"][channel_str]
+        # The live session, as /session swap's list reads it; the blueprint only where an
+        # empty cast has been dropped from memory.
+        session = self.multi_profile_channels.get(interaction.channel_id)
+        if not session:
+            server_index = self.server_manager._get_server_index(
+                str(interaction.guild_id) if interaction.guild_id else "dm")
+            active_sessions = server_index.get("active_sessions", {})
+            if isinstance(active_sessions, dict):
+                session = active_sessions.get("regular", {}).get(str(interaction.channel_id))
 
-        if not session_data_idx:
+        if not session:
             await interaction.response.send_message("No active session in this channel.", ephemeral=True)
             return
 
-        type_display = "Chat Session"
-        
-        owner_id = session_data_idx.get("owner_id")
-        owner = self.bot.get_user(owner_id)
-        owner_name = owner.name if owner else f"ID: {owner_id}"
-        
-        profiles_for_display = session_data_idx.get("profiles", [])
-        participant_count = len(profiles_for_display)
-        
-        started = session_data_idx.get("started", True)
-        embed = discord.Embed(title=f"Session Info: #{interaction.channel.name}", color=discord.Color.gold())
-        embed.add_field(name="Status", value="`Live`" if started else "`Draft`", inline=True)
-        embed.add_field(name="Session Type", value=type_display, inline=True)
-        embed.add_field(name="Session Admin", value=owner_name, inline=True)
-        embed.add_field(name="Participants", value=str(participant_count), inline=True)
-        
-        if session_data_idx.get("session_prompt"):
-            prompt_val = session_data_idx["session_prompt"]
-            embed.add_field(name="Master Prompt", value=prompt_val[:200] + "..." if len(prompt_val) > 200 else prompt_val, inline=False)
-
-        pro = session_data_idx.get("proactivity", {})
-        if pro.get("enabled"):
-            embed.add_field(name="Proactivity", value=f"**ON** | Chance: {pro.get('chance')}% | Cooldown: {pro.get('cooldown')}s", inline=False)
-
-        session_view_data = {
-            "type": "multi",
-            "owner_id": owner_id,
-            "profiles": profiles_for_display
-        }
-
-        if not started:
-            embed.set_footer(text="Draft — start it from /session config.")
-
-        view = SessionView(self, interaction, session_view_data)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        view = SessionView(self, interaction, session)
+        await interaction.response.send_message(embed=view.embed, view=view, ephemeral=True)
 
     play_group = app_commands.Group(name="play", description="Table games with this channel's cast.", guild_only=True)
 

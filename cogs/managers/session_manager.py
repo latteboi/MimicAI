@@ -177,6 +177,17 @@ def round_reserve(earlier: List[Dict[str, Any]], speaker_pid: str) -> int:
     return len(earlier) - start
 
 
+def rotated_cast(session: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The cast from the seat after the last speaker: a sequential round's order before
+    its roll, and what the turn-order dashboards show for the next round. The cast as
+    seated while nobody has spoken, or the last speaker has left it."""
+    profiles = session.get('profiles') or []
+    last_key = session.get('last_speaker_key')
+    last = next((n for n, p in enumerate(profiles)
+                 if (p['owner_id'], p['profile_name']) == last_key), None)
+    return profiles if last is None else profiles[last + 1:] + profiles[:last + 1]
+
+
 #: A stored turn's identity, `<Name> [ID: x]`, as its header shows it to the model.
 def director_enabled(proactivity: Optional[Dict[str, Any]]) -> bool:
     """Whether the AI Director writes a note for a proactive round.
@@ -1042,6 +1053,7 @@ class SessionManager:
                         "audio_mode": session_data.get("audio_mode", "off"),
                         "max_responses": session_data.get("max_responses", 10),
                         "settle": session_data.get("settle", {}),
+                        "name_wakewords": session_data.get("name_wakewords", True),
                     }
                     if channel is None and not guild.unavailable:
                         uncached.append(channel_id)
@@ -1179,6 +1191,7 @@ class SessionManager:
                     "audio_mode": session_data.get("audio_mode", "off"),
                     "max_responses": session_data.get("max_responses", 10),
                     "settle": session_data.get("settle", {}),
+                    "name_wakewords": bool(session_data.get("name_wakewords", True)),
                 }
 
                 current_server_sessions[server_id_str][category][str(channel_id)] = blueprint
@@ -1478,6 +1491,7 @@ class SessionManager:
                             "audio_mode": session_config.get("audio_mode", "off"),
                             "max_responses": session_config.get("max_responses", 10),
                             "settle": session_config.get("settle", {}),
+                            "name_wakewords": session_config.get("name_wakewords", True),
                         }
                         self.cog.multi_profile_channels[channel_id] = session
                     else:
@@ -1493,6 +1507,7 @@ class SessionManager:
                         session["audio_mode"] = session_config.get("audio_mode", "off")
                         session["max_responses"] = session_config.get("max_responses", 10)
                         session["settle"] = session_config.get("settle", {})
+                        session["name_wakewords"] = session_config.get("name_wakewords", True)
 
         if not session: return None
 
