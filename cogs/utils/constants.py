@@ -2353,6 +2353,14 @@ TYPING_CURSOR_NOTES = {
     'below': 'On its own line underneath. Nothing on screen moves.',
 }
 
+#: Line Spacing (Misc tab), read by `tighten_line_spacing`: what happens to the gap at
+#: each end of a reply once its blank lines are being removed. `merge` drops it, `keep`
+#: leaves one the model wrote, `always` writes one where it did not. Absent is `merge`;
+#: an absent Markdown mode is `protect`.
+LINE_SPACING_GAP_MODES = ('merge', 'keep', 'always')
+
+LINE_SPACING_MARKDOWN_MODES = ('protect', 'merge')
+
 # The "thinking" thumbnail on the hub and settings embeds, named once so a swap is one
 # edit. Bare, with no `?ex=`: a signed attachment link expires a day after issue (this
 # one did, on 2 Sept 2026), and Discord signs a bare one itself.

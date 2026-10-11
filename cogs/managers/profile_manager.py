@@ -1864,6 +1864,15 @@ class ProfileManager:
 
         return user_id, profile_name
 
+    def author_config(self, owner_id: int, profile_name: str) -> Dict[str, Any]:
+        """The config of the profile whose prompts this name speaks with.
+
+        A borrow's own config is its borrower's. A setting that only means something
+        beside the prompt -- Line Spacing shapes the format a prompt asks for -- is read
+        where the prompt is: the source, which is what `_resolve_effective_profile` finds.
+        """
+        return self._get_profile_config(*self._resolve_effective_profile(owner_id, profile_name), False) or {}
+
     # --- Voice samples -------------------------------------------------------------------
 
     def _voice_sample_dir(self, user_id: int, profile_name: str) -> Optional[str]:

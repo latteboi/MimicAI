@@ -471,6 +471,62 @@ def _scrub_response_text(text: str, participant_names: Optional[List[str]] = Non
         print(f"Warning: {e}. Returning original text.")
         return raw_original
 
+
+#: A line Discord draws as empty: whitespace, or the zero-width characters a model pads with.
+_BLANK_LINE = re.compile(r"[\s​-‍⁠﻿]*")
+#: A heading (never `-# ` subtext), a quote or a list item, whose gaps are layout. A list
+#: marker needs a space after it, so an `*action*` is not one.
+_MARKDOWN_LINE = re.compile(r"\s*(?:#{1,3}\s|>|[-*+]\s|\d+[.)]\s)")
+
+
+def tighten_line_spacing(text: str, config: Dict[str, Any]) -> str:
+    """The reply with its blank lines removed, bar the gaps the profile keeps.
+
+    Line Spacing (Misc tab), for the weaker models that pad a tight format with blank
+    lines however its prompt asks. Each gap between two lines is decided alone, and kept
+    -- as exactly one blank line -- if any rule keeps it: the first and last gaps by
+    their own `LINE_SPACING_GAP_MODES`, and, while Markdown is protected, any gap the
+    model wrote beside a heading, quote, list or code block. A fenced code block is one
+    line here, never touched inside.
+
+    `config` is the author's (`author_config`): the setting shapes the format a prompt
+    asks for, so a borrow follows the prompt it speaks with.
+    """
+    if not text or not config.get("line_spacing_enabled"):
+        return text
+
+    units = []  # [text, blank line written above it, Markdown]
+    fence = None
+    blank = False
+    for line in text.split("\n"):
+        if fence is not None:
+            fence[0] += "\n" + line
+            if line.lstrip().startswith("```"):
+                fence = None
+            continue
+        if _BLANK_LINE.fullmatch(line):
+            blank = True
+            continue
+        opens = line.lstrip().startswith("```") and line.count("```") % 2 == 1
+        units.append([line, blank, opens or bool(_MARKDOWN_LINE.match(line))])
+        blank = False
+        if opens:
+            fence = units[-1]
+
+    def wants(key, written):
+        mode = config.get(key)
+        return mode == "always" or (mode == "keep" and written)
+
+    protect = config.get("line_spacing_markdown") != "merge"
+    last = len(units) - 1
+    out = []
+    for i, (line, written, markdown) in enumerate(units):
+        keep = i > 0 and ((i == 1 and wants("line_spacing_opening", written))
+                          or (i == last and wants("line_spacing_closing", written))
+                          or (protect and written and (markdown or units[i - 1][2])))
+        out.append("\n" + line if keep else line)
+    return "\n".join(out)
+
 TIMEZONE_ALIASES: Dict[str, str] = {
     "AEST": "Australia/Sydney",
     "AEDT": "Australia/Sydney",

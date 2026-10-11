@@ -14,6 +14,7 @@ from ...utils.constants import (
 from ...utils.helpers import (
     _format_history_entry, _resolve_safety_settings, _scrub_response_text,
     resolve_native_tools, resolve_thinking_params, split_turn, suppress_link_previews,
+    tighten_line_spacing,
 )
 from ...managers.session_manager import intern_turn
 from . import tool_loop
@@ -332,7 +333,8 @@ class SpeakAsMixin:
                 other_name, _ = self._resolve_appearance_data(p['owner_id'], p['profile_name'])
                 names.append(other_name)
 
-        text = _scrub_response_text(text, participant_names=names).strip()
+        text = tighten_line_spacing(_scrub_response_text(text, participant_names=names).strip(),
+                                    self.cog.profile_manager.author_config(owner_id, profile_name))
         if not text:
             return None, "The response was empty after cleanup."
         return text, None

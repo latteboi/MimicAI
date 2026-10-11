@@ -26,6 +26,7 @@ from ...utils.helpers import (
     clean_model_name, is_real_model, media_kinds, record_billed_usage,
     resolve_native_tools,
     resolve_thinking_params, resolve_unreadable_media_mode, split_media_parts,
+    tighten_line_spacing,
     unreadable_media_modality,
 )
 from ..api_service import MissingKeyError
@@ -673,7 +674,9 @@ class ReplyMixin:
                 raw_text, reply.neuro_state = self._extract_and_apply_neuro_state(
                     raw_text.strip(), owner_id, profile_name)
                 raw_text, reply.ltm_flag = take_memory_flag(raw_text)
-                text = _scrub_response_text(raw_text, participant_names=participant_names)
+                text = tighten_line_spacing(
+                    _scrub_response_text(raw_text, participant_names=participant_names),
+                    self.cog.profile_manager.author_config(owner_id, profile_name))
                 if text:
                     # Both halves: what the answering response cited natively, and what
                     # the character's own `search_web` calls brought back. Deduplicated

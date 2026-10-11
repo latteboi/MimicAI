@@ -337,7 +337,9 @@ HELP_CATEGORIES = {
             "**Realistic Typing** (Tools -> Realistic Typing) splits the reply on sentence boundaries and streams it with a delay based "
             "on length and your configured characters-per-second, instead of posting one block. A **cursor** -- the profile's own placeholder "
             "emoji -- sits on the message between edits so a half-written reply does not read as a finished one; it is on by default, below "
-            "the text, and can be moved in front of it or turned off."
+            "the text, and can be moved in front of it or turned off.\n\n"
+            "**Line Spacing** (Misc -> Line Spacing) removes the blank lines a model pads a reply with, keeping only the gaps you choose: "
+            "above the closing line, below the opening one, or beside Markdown. Off by default; a borrow follows its owner's."
         ),
         "Private and One-Off Speech": (
             "**`/whisper`** sends a private message to one participant in an active session. Its reply is ephemeral -- only you see it -- and both "
@@ -1196,6 +1198,18 @@ DEFAULT_HELP_DOCS = {
         "Cursor: While the reply is still being edited in, the profile's placeholder emoji is attached to the message so a partial reply is not mistaken for a finished one. 'below' puts it on its own line underneath (the default -- nothing already on screen moves), 'prefix' puts it in front of the text, and 'off' restores the old behaviour. The final edit removes it. The emoji is the profile's own placeholder (Tools -> Placeholder), falling back to the bot-wide one.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Messages take far too long to arrive.' Fix: Raise the characters-per-second value or lower the maximum delay cap. Long replies multiply the effect."
+    ),
+    "features/line_spacing.txt": (
+        "Concept: Line Spacing removes the blank lines a model pads a reply with, before the reply is posted or saved. It is off until switched on, and changes nothing about what the model is asked to write.\n"
+        "Configuration: `/profile manage` -> Misc -> Line Spacing. Turn on Remove Blank Lines, and every blank line goes; three options then decide which gaps come back. Also in `/profile bulk manage` and `/settings` -> Override Defaults (new profiles only).\n"
+        "Opening and Closing line: each is Merge (no gap), Keep if written (a gap the model wrote above the closing line, or below the opening line, stays; none is added), or Always apart (the gap is written in even when the model forgot it). Closing 'Always apart' suits a format that ends on an internal thought set apart from the rest.\n"
+        "Markdown blocks: Protect (the default) keeps a gap the model wrote beside a heading, quote, list or code block, never adding one; Merge removes those too. `-# ` subtext and `*actions*` are not Markdown.\n"
+        "Fixed rules: text inside a code block is never touched; a line of only spaces or invisible characters counts as blank; a one-line reply never gets a gap; a gap that stays is exactly one blank line.\n"
+        "Borrowed profiles: a borrow follows its owner's Line Spacing, since the setting only makes sense beside the owner's prompt, so the row shows on the owner's dashboard only.\n"
+        "Troubleshooting / Symptoms:\n"
+        "- Symptom: 'The model keeps putting empty lines between dialogue and actions.' Fix: Turn on Misc -> Line Spacing. Older replies already in the history keep their blank lines until they age out of it.\n"
+        "- Symptom: 'The gap moved above the wrong line.' Fix: Closing 'Always apart' sets apart whatever line comes last. If the model skipped the closing thought, use 'Keep if written' instead.\n"
+        "- Symptom: 'Line Spacing does nothing on a borrowed profile.' Fix: Expected. A borrow follows the owner's setting; ask the owner to change it."
     ),
     "features/repetition_critic.txt": (
         "Concept: The Anti-Repetition Critic is a secondary evaluation layer that detects a profile falling into linguistic loops.\n"

@@ -18,7 +18,7 @@ from ..utils.constants import (
     TEXT_ATTACHMENT_EXTENSIONS, GOOGLE_VOICE_PREFIX, VOICE_KEY_REUSE_SECONDS, ERR_REASON_LOW_MEMORY,
     VOICE_SAMPLE_GEMINI_ACCEPTED, VOICE_SAMPLE_GEMINI_REFUSED, VOICE_SAMPLE_GEMINI_UNCHECKED,
 )
-from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, generated_image_attachment, image_command_prefix, image_command_prompt, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor, speaks_verbatim
+from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, generated_image_attachment, image_command_prefix, image_command_prompt, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor, speaks_verbatim, tighten_line_spacing
 from ..utils.attachment_limits import over_attachment_limit, skipped_attachment_note
 from .api.google_rest import GoogleSpeechModel
 from .generation import tool_loop
@@ -504,7 +504,9 @@ class MediaService:
 
                             raw_text, _ = self.cog.generation_service._extract_and_apply_neuro_state(raw_text, package['effective_profile_owner_id'], package['effective_profile_name'])
 
-                            response_text = _scrub_response_text(raw_text.strip(), participant_names=[package['bot_display_name']])
+                            response_text = tighten_line_spacing(
+                                _scrub_response_text(raw_text.strip(), participant_names=[package['bot_display_name']]),
+                                self.cog.profile_manager.author_config(owner_id, profile_name))
 
                             if not response_text:
                                 custom_main = profile_settings.get("error_response", ERR_GENERAL_ERROR)

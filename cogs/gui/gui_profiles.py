@@ -853,6 +853,17 @@ def _render_generation_visual(ctx):
     return "Generation Visual", text, True
 
 
+def _gap_choice(key, label, where):
+    """One end of a reply on the Line Spacing screen. A stored value the remover does not
+    know behaves as `merge`, so the select shows it as that."""
+    return _Choice(key, label,
+                   (("Merge", "merge", f"No gap {where}."),
+                    ("Keep if written", "keep", f"Leave a gap the model wrote {where}; add none."),
+                    ("Always apart", "always", f"Always one blank line {where}.")),
+                   read=lambda c: c.get(key) if c.get(key) in LINE_SPACING_GAP_MODES else "merge",
+                   placeholder=f"{label}...")
+
+
 
 
 #: The dropdown, in render order, grouped by tab. Order within a tab is the order the
@@ -1350,6 +1361,31 @@ PROFILE_ACTIONS = (
                            modal="ProfileGenerationVisualModal", modal_label="Edit emoji…"),
             bulk=_Bulk(_bulk_modal("ProfileGenerationVisualModal"), scope="all",
                        keys=("placeholder_emoji", "child_bot_placeholder"))),
+    # `_own` and scope="personal" because a borrow follows its author's spacing
+    # (`author_config`): the setting shapes the format the prompt asks for, and a borrower
+    # cannot change the prompt. No `render`: it has no line on the dashboard.
+    _Action("line_spacing", "misc", "Line Spacing",
+            "Remove the blank lines a model pads replies with.",
+            _open_screen("line_spacing"), _own,
+            screen=_Screen(
+                _Toggle("line_spacing_enabled", "Remove Blank Lines"),
+                _gap_choice("line_spacing_opening", "Opening line", "after the first line"),
+                _gap_choice("line_spacing_closing", "Closing line", "before the last line"),
+                _Choice("line_spacing_markdown", "Markdown blocks",
+                        (("Protect", "protect",
+                          "Leave gaps the model wrote around headings, quotes, lists and code."),
+                         ("Merge", "merge", "Remove those too. Code is never touched inside.")),
+                        read=lambda c: "merge" if c.get("line_spacing_markdown") == "merge" else "protect",
+                        placeholder="Markdown blocks..."),
+                when=lambda c: bool(c.get("line_spacing_enabled")),
+                note="-# Every blank line in a reply goes, then each option decides one gap: "
+                     "after the first line, before the last, and around Markdown. A gap that "
+                     "stays is one blank line. Borrowed copies of this profile follow it."),
+            bulk=_Bulk(_bulk_modal("ProfileLineSpacingModal"), scope="personal",
+                       label="Set Line Spacing",
+                       description="Remove blank lines, keeping the gaps you choose.",
+                       keys=("line_spacing_enabled", "line_spacing_opening",
+                             "line_spacing_closing", "line_spacing_markdown"))),
 )
 
 PROFILE_ACTIONS_BY_VALUE = {a.value: a for a in PROFILE_ACTIONS}
@@ -2221,6 +2257,35 @@ def ProfileTypingSettingsModal(cog, profile_name: str, current_params: Dict[str,
             c["typing_cursor"] = cur
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Realistic Typing Settings", fields, parser, callback, target_user_id)
+
+def ProfileLineSpacingModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, callback=None, target_user_id: Optional[int] = None):
+    """Line Spacing as text, for the bulk wizard and Override Defaults alone: one profile
+    is set on the row's own screen, whose switch and selects hold every value."""
+    def mode(key, default):
+        return str(current_params.get(key) or default)
+
+    fields = [
+        {"label": "Remove Blank Lines (on/off)", "custom_id": "line_spacing_enabled", "default": "on" if current_params.get("line_spacing_enabled") else "off", "required": True},
+        {"label": "Opening Line (merge/keep/always)", "custom_id": "line_spacing_opening", "default": mode("line_spacing_opening", "merge"), "required": False, "placeholder": "Default: merge"},
+        {"label": "Closing Line (merge/keep/always)", "custom_id": "line_spacing_closing", "default": mode("line_spacing_closing", "merge"), "required": False, "placeholder": "Default: merge"},
+        {"label": "Markdown Blocks (protect/merge)", "custom_id": "line_spacing_markdown", "default": mode("line_spacing_markdown", "protect"), "required": False, "placeholder": "Default: protect"},
+    ]
+
+    def parser(v):
+        c = {}
+        if "line_spacing_enabled" in v:
+            c["line_spacing_enabled"] = _pb(v["line_spacing_enabled"])
+        for key, name, modes in (("line_spacing_opening", "Opening Line", LINE_SPACING_GAP_MODES),
+                                 ("line_spacing_closing", "Closing Line", LINE_SPACING_GAP_MODES),
+                                 ("line_spacing_markdown", "Markdown Blocks", LINE_SPACING_MARKDOWN_MODES)):
+            value = (_ps(v.get(key)) or "").lower()
+            if not value:
+                continue
+            if value not in modes:
+                raise ValueError(f"{name} must be one of: {', '.join(modes)}")
+            c[key] = value
+        return {"config": c}
+    return ConfigModal(cog, profile_name, is_borrowed, "Line Spacing", fields, parser, callback, target_user_id)
 
 def ProfileImageSamplingModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     """Temperature / Top P / Top K for the *image* slot only.
