@@ -391,6 +391,7 @@ SETTING_LABELS = {
     "critic_lookback": "Critic Lookback",
     "critic_persistence": "Critic Persistence",
     "neuro_engine_enabled": "Neuro Engine",
+    "bond_engine_enabled": "Bonds",
     "image_generation_enabled": "Image Generation",
     "speech_tts_enabled": "Text-to-Speech",
     "speech_temperature": "Speech Temperature",

@@ -1,11 +1,13 @@
 from ..utils.constants import *
 
+import asyncio
 import discord
 from discord import ui
 import datetime
 import traceback
 from typing import TYPE_CHECKING, List, Dict, Tuple, Optional
 from ..utils.helpers import _resolve_zoneinfo, suppress_link_previews
+from ..utils import lorebook
 from ..managers.memory_manager import (EMBEDDING_FAILED_MSG, NO_EMBEDDING_KEY_MSG,
                                        encode_embedding_b64, entry_date)
 
@@ -157,6 +159,35 @@ class EditTrainingExampleModal(ui.Modal, title="Edit Profile Training Example"):
         traceback.print_exc()
         await i.followup.send("An error occurred with the edit form.", ephemeral=True)
 
+class LoreEntryModal(ui.Modal):
+    """Adds a lore entry, or with `entry` rewrites it. Blank keywords: always in mind."""
+    keys_field = ui.TextInput(label="Keywords, comma-separated (blank: always on)", required=False,
+                              max_length=LORE_KEYS_MAX_CHARS,
+                              placeholder="e.g. the Black Tower, tower, Vael")
+    content_field = ui.TextInput(label="What the character knows", style=discord.TextStyle.paragraph,
+                                 required=True, max_length=LORE_ENTRY_MAX_CHARS)
+
+    def __init__(self, cog, profile_owner_id: int, profile_name: str, entry: Optional[Dict] = None):
+        super().__init__(title="Edit Lore Entry" if entry else "Add Lore Entry")
+        self.cog: MimicCog = cog
+        self.profile_owner_id = profile_owner_id
+        self.profile_name = profile_name
+        self.entry_id = entry.get("id") if entry else None
+        if entry:
+            self.keys_field.default = ", ".join(entry.get("keys") or [])
+            self.content_field.default = entry.get("content", "")
+
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True, thinking=True)
+        _ok, message = await asyncio.to_thread(
+            self.cog.profile_manager.put_lore_entry, self.profile_owner_id, self.profile_name,
+            self.entry_id, self.keys_field.value, self.content_field.value)
+        await i.followup.send(message, ephemeral=True)
+
+    async def on_error(self, i: discord.Interaction, e: Exception):
+        print(f"LoreEntryModal error: {e}"); traceback.print_exc()
+        await i.followup.send("An error occurred with the lore entry form.", ephemeral=True)
+
 class SearchDataModal(ui.Modal, title="Search"):
     search_input = ui.TextInput(label="Search term (leave blank to clear)", required=False, max_length=100)
 
@@ -202,7 +233,7 @@ def _code(text: str) -> str:
     return "```\n" + text.replace("`", "ˋ") + "\n```"
 
 class DataManageView(BlockedGuard, ui.View):
-    """A profile's long-term memories or training examples: a page of five, or one opened.
+    """A profile's long-term memories, training examples or lorebook: a page of five, or one opened.
 
     Memories are listed one server at a time, since a memory is only ever recalled in
     the server it formed in -- so a server is chosen before anything is shown, starting
@@ -211,7 +242,7 @@ class DataManageView(BlockedGuard, ui.View):
     LIMIT_LTM entries.
     """
 
-    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str, is_borrowed: bool, mode: Optional[Literal['training', 'ltm']] = None, parent_manage_view: Optional['ProfileManageView'] = None, target_user_id: Optional[int] = None):
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str, is_borrowed: bool, mode: Optional[Literal['training', 'ltm', 'lore']] = None, parent_manage_view: Optional['ProfileManageView'] = None, target_user_id: Optional[int] = None):
         super().__init__(timeout=600)
         self.cog = cog
         self.original_interaction = interaction
@@ -222,7 +253,7 @@ class DataManageView(BlockedGuard, ui.View):
         self.profile_name = profile_name
         self.is_borrowed = is_borrowed
         self.parent_manage_view = parent_manage_view
-        self.mode: Literal['training', 'ltm'] = mode or ('ltm' if is_borrowed else 'training')
+        self.mode: Literal['training', 'ltm', 'lore'] = mode or ('ltm' if is_borrowed else 'training')
         self.entries: List[Dict] = []                  # newest first, plain text
         self.servers: List[Tuple[str, str, int]] = []  # (guild id, name, memories), LTM only
         self.server_id: Optional[str] = None
@@ -238,6 +269,9 @@ class DataManageView(BlockedGuard, ui.View):
         mm = self.cog.memory_manager
         if self.mode == 'training':
             self.entries = await mm.load_training_examples(self.user_id, self.profile_name)
+            return
+        if self.mode == 'lore':
+            self.entries = await asyncio.to_thread(self.cog.profile_manager.lorebook, self.user_id, self.profile_name)
             return
         self.entries = await mm.load_ltms(self.user_id, self.profile_name)
         counts: Dict[str, int] = {}
@@ -256,7 +290,17 @@ class DataManageView(BlockedGuard, ui.View):
             self.server_id = here if here in ids else None
 
     def _text(self, e: Dict) -> str:
+        if self.mode == 'lore':
+            return f"{', '.join(e.get('keys') or [])} {e.get('content', '')}"
         return e.get("sum", "") if self.mode == 'ltm' else f"{e.get('u_in', '')} {e.get('b_out', '')}"
+
+    @staticmethod
+    def _keys(e: Dict) -> str:
+        return ", ".join(e.get("keys") or []) or "Always on"
+
+    def _subtitle(self, e: Dict) -> str:
+        """An entry's line under its label: when it was made, or for lore, what wakes it."""
+        return self._keys(e) if self.mode == 'lore' else self._date(e)
 
     def _visible(self) -> List[Dict]:
         items = self.entries
@@ -292,10 +336,13 @@ class DataManageView(BlockedGuard, ui.View):
         opened = self._opened()
         if opened:
             return self._detail_embed(opened)
-        noun = "Long-Term Memories" if self.mode == 'ltm' else "Training Examples"
+        noun, limit, unit = {
+            'ltm': ("Long-Term Memories", defaultConfig.LIMIT_LTM, "memories across every server"),
+            'training': ("Training Examples", defaultConfig.LIMIT_TRAINING, "examples"),
+            'lore': ("Lorebook", LIMIT_LORE_ENTRIES, "entries"),
+        }[self.mode]
         embed = discord.Embed(title=f"{noun} · {self.profile_name}", color=discord.Color.dark_teal())
-        limit = defaultConfig.LIMIT_LTM if self.mode == 'ltm' else defaultConfig.LIMIT_TRAINING
-        embed.set_footer(text=f"{len(self.entries)} / {limit} {'memories across every server' if self.mode == 'ltm' else 'examples'}")
+        embed.set_footer(text=f"{len(self.entries)} / {limit} {unit}")
 
         if self.mode == 'ltm' and not self.server_id:
             embed.description = ("Choose a server. A memory is only ever recalled in the server it formed in."
@@ -313,11 +360,16 @@ class DataManageView(BlockedGuard, ui.View):
             if self.mode == 'ltm':
                 meta = " · ".join(x for x in (self._date(e), self._source(e)) if x)
                 lines.append(f"**{n}.** {meta}\n{_code(_clip(e.get('sum', ''), MAX_LTM_SUMMARY_CHARACTERS))}")
+            elif self.mode == 'lore':
+                lines.append(f"**{n}.** {_clip(self._keys(e), 200)}\n{_code(_clip(e.get('content', ''), 500))}")
             else:
                 lines.append(f"**{n}.** {self._date(e)}\n" + _code(
                     f"User: {_clip(e.get('u_in', ''), 200)}\n"
                     f"{_clip(self.profile_name, 40)}: {_clip(e.get('b_out', ''), 400)}"))
-        body = "\n\n".join(lines) or ("Nothing matches." if self.search_term else "Nothing here yet.")
+        empty = ("Nothing here yet. An entry with keywords is handed to the character when one comes "
+                 "up in the conversation; one without is always in mind."
+                 if self.mode == 'lore' else "Nothing here yet.")
+        body = "\n\n".join(lines) or ("Nothing matches." if self.search_term else empty)
         embed.description = "\n".join(header + ([""] if header else []) + [body])
         return embed
 
@@ -331,6 +383,11 @@ class DataManageView(BlockedGuard, ui.View):
             embed.add_field(name="Server", value=self._server_name(str(e.get("context_id"))), inline=True)
             if self._source(e):
                 embed.add_field(name="Source", value=self._source(e), inline=True)
+        elif self.mode == 'lore':
+            embed = discord.Embed(title=f"Lore Entry `{e.get('id')}`", description=e.get("content", "")[:4000],
+                                  color=discord.Color.dark_teal())
+            embed.add_field(name="Keywords", value=_clip(self._keys(e), 1000), inline=False)
+            return embed
         else:
             embed = discord.Embed(title=f"Example `{e.get('id')}`",
                                   description=f"**User**\n{e.get('u_in', '')}\n\n**{self.profile_name}**\n{e.get('b_out', '')}"[:4000],
@@ -365,7 +422,7 @@ class DataManageView(BlockedGuard, ui.View):
             def options():   # once per dropdown, so the two share no option objects
                 return paged_nav_options(self.page, self._pages(items)) + [
                     discord.SelectOption(label=_clip(f"{n}. {self._text(e)}", 100),
-                                         value=str(e.get("id")), description=self._date(e))
+                                         value=str(e.get("id")), description=_clip(self._subtitle(e), 100))
                     for n, e in enumerate(page_items, first)]
             add_select(self, options(), self.open_callback, placeholder="Open…", row=1)
             delete = options()
@@ -382,7 +439,7 @@ class DataManageView(BlockedGuard, ui.View):
             add_select(self, delete, self.delete_selected_callback, placeholder="Delete…",
                        max_values=len(delete), row=2)
 
-        showing = self.mode == 'training' or self.server_id
+        showing = self.mode != 'ltm' or self.server_id
         if showing:
             add_button(self, "Search", self.search_callback, row=3, emoji="\U0001f50d")
             add_button(self, "Test recall" if self.mode == 'ltm' else "Test match", self.test_callback,
@@ -480,6 +537,8 @@ class DataManageView(BlockedGuard, ui.View):
     async def add_callback(self, interaction: discord.Interaction):
         if self.mode == 'training':
             modal = AddTrainingExampleModal(self.cog, self.user_id, self.profile_name, self.guild_id)
+        elif self.mode == 'lore':
+            modal = LoreEntryModal(self.cog, self.user_id, self.profile_name)
         else:
             modal = AddLtmModal(self.cog, self.user_id, self.profile_name, self.guild_id)
 
@@ -503,6 +562,8 @@ class DataManageView(BlockedGuard, ui.View):
         if self.mode == 'training':
             modal = EditTrainingExampleModal(self.cog, self.user_id, self.profile_name, item["id"],
                                              item.get("u_in", ""), item.get("b_out", ""), self.guild_id)
+        elif self.mode == 'lore':
+            modal = LoreEntryModal(self.cog, self.user_id, self.profile_name, item)
         else:
             modal = EditLtmModal(self.cog, self.user_id, self.profile_name, item["id"], item.get("sum", ""))
         original_on_submit = modal.on_submit
@@ -515,8 +576,12 @@ class DataManageView(BlockedGuard, ui.View):
     async def _confirm_delete(self, interaction: discord.Interaction, ids: List[str], prompt: str):
         async def confirm(i: discord.Interaction):
             mm = self.cog.memory_manager
-            delete = mm.delete_ltms if self.mode == 'ltm' else mm.delete_training_examples
-            gone = await delete(self.user_id, self.profile_name, ids)
+            if self.mode == 'lore':
+                gone = await asyncio.to_thread(self.cog.profile_manager.delete_lore_entries,
+                                               self.user_id, self.profile_name, ids)
+            else:
+                delete = mm.delete_ltms if self.mode == 'ltm' else mm.delete_training_examples
+                gone = await delete(self.user_id, self.profile_name, ids)
             await i.response.edit_message(content=f"Deleted {gone} item(s)." if gone else "Nothing was found to delete.",
                                           view=None, embed=None)
             await self._refresh()
@@ -553,7 +618,19 @@ class DataManageView(BlockedGuard, ui.View):
 
     async def run_test(self, interaction: discord.Interaction, query: str):
         """Test recall / Test match: the stored entries nearest `query`, scored, against
-        the profile's own threshold -- which is what decides what a turn is sent."""
+        the profile's own threshold -- which is what decides what a turn is sent. For the
+        lorebook, the entries `query` would wake: a keyword match, no model involved."""
+        if self.mode == 'lore':
+            woken = set(lorebook.triggered(self.entries, query, limit=len(self.entries) or 1))
+            lines = [f"{'✅' if e['content'] in woken else '▫️'} {_clip(self._keys(e), 60)}: "
+                     f"{_clip(e['content'], 100)}" for e in self.entries if e.get("keys")]
+            embed = discord.Embed(title="Test Match",
+                                  description=f"> {_clip(query, 200)}\n\n" + ("\n".join(lines[:25]) or "No entry has keywords."),
+                                  color=discord.Color.dark_teal())
+            embed.set_footer(text=f"Up to {LORE_PER_TURN} woken entries ride a turn, in list order. "
+                                  "Entries with no keywords are always on.")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
         if not self.cog.storage_manager._embedding_routes(interaction.guild_id, self.user_id):
             await interaction.followup.send(NO_EMBEDDING_KEY_MSG, ephemeral=True)
             return

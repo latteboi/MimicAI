@@ -5,6 +5,9 @@ see what came back was to open the dashboard of a profile that already existed, 
 only way to try again was to delete it first. The draft now sits on this view: Save writes
 it, Regenerate rolls a fresh one from the same concept, Refine rewrites it to a request,
 and Discard -- or simply walking away -- leaves nothing behind.
+
+`/import` of a character card shows its draft here too (`card`): Regenerate sorts the card
+again, and Save also adds its example exchanges as training examples.
 """
 import asyncio
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -50,7 +53,7 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
 
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str,
                  concept: str, draft: Dict[str, Any], model_used: str,
-                 appearance: Optional[Dict[str, str]] = None):
+                 appearance: Optional[Dict[str, Any]] = None, card: Optional[Dict[str, Any]] = None):
         # Ten minutes, inside the fifteen an interaction token lasts, so the expiry
         # notice can still be written onto the message.
         super().__init__(timeout=600)
@@ -59,8 +62,14 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         self.user_id = interaction.user.id
         self.profile_name = profile_name
         self.concept = concept
-        #: The display name and avatar the user gave, laid over every draft.
+        #: The display name and avatar the user gave, laid over every draft -- and for a
+        #: card, its lorebook and 18+ tag, which no redraft changes.
         self.appearance = appearance or {}
+        #: The card being imported (`character_card.read_card`), or None for a concept.
+        self.card = card
+        self.template_key = "CARD_IMPORT" if card else "PROFILE_GENERATOR"
+        if card:
+            self.timeout_message = "This draft expired, and nothing was saved. Run `/import` again."
         self.draft = {**draft, **self.appearance}
         self.model_used = model_used
         self.busy = False
@@ -108,7 +117,20 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             embed.add_field(name="Instructions",
                             value=_clip(draft["ai_instructions"], FIELD_PREVIEW_CHARS), inline=False)
 
-        embed.set_footer(text=_clip(f"Concept: {self.concept} · Written by {self.model_used}", 300))
+        if self.card:
+            extras = []
+            if draft.get("lorebook"):
+                extras.append(f"**Lorebook:** {len(draft['lorebook'])} entries")
+            if self.card["examples"]:
+                extras.append(f"**Training examples:** {len(self.card['examples'])}, added on Save")
+            if draft.get("adult"):
+                extras.append("**Adult 18+:** the card is tagged NSFW, so it is declared 18+ on Save")
+            if extras:
+                embed.add_field(name="Also from the card", value="\n".join(extras), inline=False)
+            sorted_by = f"Sorted by {self.model_used}" if self.model_used else "Filed as written"
+            embed.set_footer(text=_clip(f"Imported from {self.card['name']} · {sorted_by}", 300))
+        else:
+            embed.set_footer(text=_clip(f"Concept: {self.concept} · Written by {self.model_used}", 300))
         return embed
 
     async def _refuse_while_busy(self, interaction: discord.Interaction) -> bool:
@@ -132,7 +154,8 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         try:
             draft, self.model_used = await generate_draft(
                 self.cog, self.user_id, self.concept,
-                previous=self.draft if request else None, request=request)
+                previous=self.draft if request else None, request=request,
+                template_key=self.template_key)
             self.draft = {**draft, **self.appearance}
         except ProfileGenerationError as e:
             failure = suppress_link_previews(str(e))
@@ -172,6 +195,21 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         await interaction.edit_original_response(embed=self.build_embed(), view=self)
         if failure:
             await interaction.followup.send(f"❌ {failure}", ephemeral=True)
+        elif self.card and self.card["examples"]:
+            await interaction.followup.send(await self._add_card_examples(), ephemeral=True)
+
+    async def _add_card_examples(self) -> str:
+        """The card's example exchanges, as training examples. Each is an embedding call on
+        the owner's key, so the first refusal -- no key, the limit -- ends the run."""
+        examples, added, reason = self.card["examples"], 0, ""
+        for said, answer in examples:
+            ok, reason = await self.cog.memory_manager.add_new_training_example(
+                self.user_id, self.profile_name, said, answer, None)
+            if not ok:
+                break
+            added += 1
+        line = f"Added {added} of {len(examples)} example exchanges as training examples."
+        return line if added == len(examples) else f"{line} {reason}"
 
     async def discard(self, interaction: discord.Interaction):
         self.stop()

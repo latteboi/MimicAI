@@ -9,7 +9,8 @@ from ...utils.constants import (
     SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS, WHISPER_WAITING_NOTICE,
 )
 from ...utils.helpers import (_format_citation_subtext, _format_history_entry, _get_user_hash,
-                             _resolve_zoneinfo, restamp_turn, turn_posted_at)
+                             _resolve_zoneinfo, restamp_turn, server_context_guild,
+                             turn_posted_at)
 from . import tool_loop
 from .reply import ReplyText, reply_gen_config
 from ...gui.gui_sessions import WhisperActionView
@@ -145,7 +146,8 @@ class WhisperMixin:
                 log_context=log_context, functions=functions, private=True)
         finally:
             await self._safe_delete_placeholder(interaction.channel, state_container.get('msg_b_id'))
-        return self._reply_text(attempt, p_settings, owner_id, profile_name, names)
+        return self._reply_text(attempt, p_settings, owner_id, profile_name, names,
+                                guild=server_context_guild(session, interaction.channel))
 
     @staticmethod
     def _whisper_display(reply: ReplyText) -> str:

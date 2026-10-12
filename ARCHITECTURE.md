@@ -218,6 +218,7 @@ users/<user_id>/
     name.json                         plaintext sidecar: {name, class} -- see below
     ltm.json.gz                       long-term memories + b64 float16 embeddings
     training.json.gz                  few-shot examples + embeddings
+    bonds.json.gz                     {speaker ID: [affection, resentment]}, cogs/utils/bonds.py
     global_chat.json.gz               `/profile global_chat` log, keyed (host, profile)
 servers/<guild_id>/
   index.json                          active sessions, user profile prefs, key pointers
@@ -387,7 +388,9 @@ channel. Its shape:
    next participant's placeholder goes up at the handoff, not at the top of its turn. A
    reply that names another seat by a wakeword — names included — gives it that next
    turn (`_hand_on`), and so does a message sent mid-round that calls one
-   (`_user_called_seat`), so the order can change mid-round.
+   (`_user_called_seat`), so the order can change mid-round. In a sequential session a
+   seat called either way, or at the round's start, keeps the place: `_turn_cast_to` turns
+   the cast to start at it, so the rounds after go on from it as for a reply's seat.
 
 ### A turn is deleted whole
 
@@ -715,8 +718,8 @@ Two destinations, and the choice is not stylistic.
 
 | Where | Blocks | Why there |
 |---|---|---|
-| system instruction | `scene_prompt`, `persona_profile`, `character_instructions`, `memory_search`, `web_search`, `neuro_endocrine_engine` (what the levels mean), `session_rules`, then `session_synopsis`, `content_policy` | changes only when someone edits it; the synopsis (once per compaction pass) comes after the rules so it re-bills only what follows; the policy is last |
-| turn context | `current_time` (first), `game_context`, `neuro_state`, `birthday_context`, `training_data`, `archive_context`, `negative_constraints` | changes per turn |
+| system instruction | `server_context` (session toggle), `scene_prompt`, `persona_profile`, `character_instructions`, `lorebook` (keyless entries), `memory_search`, `web_search`, `neuro_endocrine_engine` (what the levels mean), `bond_engine` (what the two scores mean), `session_rules`, then `session_synopsis`, `content_policy` | changes only when someone edits it; the synopsis (once per compaction pass) comes after the rules so it re-bills only what follows; the policy is last |
+| turn context | `current_time` (first), `game_context`, `neuro_state`, `birthday_context`, `bonds` (the last five speakers' scores), `training_data`, `lorebook` (keyed entries a recent turn mentions), `archive_context`, `negative_constraints` | changes per turn |
 
 Providers cache on a shared prefix — system instruction, then transcript — so **the first
 block that changes invalidates every token after it**, the whole transcript included. With

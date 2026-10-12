@@ -11,9 +11,12 @@ from .utils.constants import (
     cooldown_unless_refused, is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
     IMPORT_FILE_TOO_LARGE, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
+    PERSONA_TEXT_INPUT_MAX_LENGTH,
 )
-from .services.profile_generation import (ProfileGenerationError, clean_display_name, generate_draft,
-                                           generator_models)
+from .services.profile_generation import (ProfileGenerationError, clean_display_name, draft_from_card,
+                                           generate_draft, generator_models)
+from .utils.character_card import (PNG_SIGNATURE, CardError, prompt_text, profile_name_for, read_card,
+                                   read_lorebook)
 from .listeners.event_listeners import EventListeners
 from .gui.base_components import ActionTextInputModal, DropdownContentView, InviteView, refuse_unregistered
 from .gui.gui_data import PrivacyDashboardView, ImportPassphraseModal, BulkExportView
@@ -51,6 +54,7 @@ import discord
 from discord import app_commands, ui
 
 import asyncio
+import io
 import os
 import orjson as json
 import datetime
@@ -616,15 +620,26 @@ class MimicCog(EventListeners, commands.Cog):
         view = BulkExportView(self, interaction.user.id)
         await interaction.response.send_message("### 📤 Profile Export\nSelect profiles and components to export.\n\n*The file will contain encrypted data. Tampered files cannot be imported.*\n", view=view, ephemeral=True)
 
-    @app_commands.command(name="import", description="Import profiles and memories from a MimicAI export file (DM Only).")
+    @app_commands.command(name="import", description="Import a MimicAI export, or a character card (PNG or JSON) (DM Only).")
     @cooldown_unless_refused(1, 30.0, _unregistered)
     @app_commands.dm_only()
-    @app_commands.describe(file="The .mimic file exported from a MimicAI instance.")
-    async def import_command(self, interaction: discord.Interaction, file: discord.Attachment):
+    @app_commands.describe(file="A .mimic file from a MimicAI instance, or a character card: a card PNG or its JSON.",
+                           profile_name="Optional: add the file's lorebook to this profile of yours, not import a new one.")
+    @app_commands.autocomplete(profile_name=EventListeners.master_autocomplete)
+    async def import_command(self, interaction: discord.Interaction, file: discord.Attachment,
+                             profile_name: Optional[str] = None):
         if await refuse_unregistered(self, interaction):
             return
+        if profile_name:
+            await self._import_lorebook(interaction, file, profile_name)
+            return
+        if file.filename.lower().endswith(('.png', '.json')):
+            await self._import_card(interaction, file)
+            return
         if not file.filename.endswith('.mimic'):
-            await interaction.response.send_message("❌ Invalid file type. Please upload a `.mimic` file.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ Invalid file type. Upload a `.mimic` export, or a character card as a PNG or JSON.",
+                ephemeral=True)
             return
         # On the size Discord states, before read() holds the whole file in memory.
         if file.size > defaultConfig.LIMIT_ATTACHMENT_BYTES:
@@ -637,12 +652,7 @@ class MimicCog(EventListeners, commands.Cog):
             file_bytes = await file.read()
             container = json.loads(file_bytes)
             auth_mode = container.get("auth_mode")
-            
-            is_official = (self.bot.user and self.bot.user.id == 1376696185947164854)
-            if is_official and auth_mode != "master":
-                await interaction.response.send_message("❌ The official MimicAI instance strictly rejects third-party or self-hosted profile imports. You can only import files exported directly from this official bot.", ephemeral=True)
-                return
-                
+
             if auth_mode == "passphrase":
                 await interaction.response.send_modal(ImportPassphraseModal(self, file_bytes))
                 return
@@ -652,6 +662,84 @@ class MimicCog(EventListeners, commands.Cog):
         
         await interaction.response.defer(ephemeral=True, thinking=True)
         await self.profile_manager._execute_import(interaction, file_bytes)
+
+    async def _import_lorebook(self, interaction: discord.Interaction, file: discord.Attachment,
+                               profile_name: str):
+        """`/import profile_name:`: a lorebook file (SillyTavern World Info), or a card's book,
+        added to a profile the user owns. `add_lore_entries` checks the ownership."""
+        limit = discord.utils.DEFAULT_FILE_SIZE_LIMIT_BYTES
+        if not file.filename.lower().endswith(('.png', '.json')) or file.size > limit:
+            await interaction.response.send_message(
+                f"❌ A lorebook is a JSON file, or a card PNG carrying one, of at most {limit // (1024 * 1024)} MB.",
+                ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        user_id = interaction.user.id
+        name = self.profile_manager._get_user_appearance(user_id, profile_name).get("custom_display_name") or profile_name
+        try:
+            book = await asyncio.to_thread(read_lorebook, await file.read(), file.filename, name)
+        except CardError as e:
+            await interaction.followup.send(f"❌ **Import Rejected:** {suppress_link_previews(str(e))}",
+                                            ephemeral=True)
+            return
+        message = await asyncio.to_thread(self.profile_manager.add_lore_entries, user_id, profile_name, book)
+        await interaction.followup.send(message, ephemeral=True)
+
+    async def _import_card(self, interaction: discord.Interaction, file: discord.Attachment):
+        """`/import` of a character card: read it, sort it into a draft, and show the draft
+        (`GeneratedProfileView`) for Save. Nothing is written before Save.
+
+        Capped at what the bot may send back, because a PNG card is re-posted as a plain
+        message in this DM: the profile's avatar is that message's attachment. The one on
+        the command is an interaction's, which Discord deletes after a while."""
+        limit = discord.utils.DEFAULT_FILE_SIZE_LIMIT_BYTES
+        if file.size > limit:
+            await interaction.response.send_message(
+                f"❌ That card is {file.size / (1024 * 1024):.1f} MB. A card can be at most "
+                f"{limit // (1024 * 1024)} MB.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        user_id = interaction.user.id
+        if len(self.profile_manager._get_user_index(user_id).get("personal", [])) >= defaultConfig.LIMIT_PROFILES:
+            await interaction.followup.send(
+                f"You have reached the maximum of {defaultConfig.LIMIT_PROFILES} personal profiles.", ephemeral=True)
+            return
+
+        data = await file.read()
+        try:
+            card = await asyncio.to_thread(read_card, data, file.filename)
+        except CardError as e:
+            await interaction.followup.send(f"❌ **Import Rejected:** {suppress_link_previews(str(e))}",
+                                            ephemeral=True)
+            return
+
+        profile_name = self.profile_manager._generate_unique_local_name(
+            user_id, profile_name_for(card["name"], self.profile_manager._is_valid_profile_name))
+        # Laid over every draft, so Regenerate keeps them: the card's own name, its book, its tag.
+        appearance: Dict[str, Any] = {"lorebook": card["lore"], "adult": card["adult"]}
+        display_name = clean_display_name(card["name"])
+        if display_name:
+            appearance["display_name"] = display_name
+        if data.startswith(PNG_SIGNATURE):
+            try:
+                portrait = await interaction.user.send(
+                    f"🖼️ **{card['name']}**'s portrait, from the card. If you save the profile, "
+                    "this image is its avatar: deleting this message removes it.",
+                    file=discord.File(io.BytesIO(data), filename="avatar.png"))
+                appearance["avatar_url"] = portrait.attachments[0].url
+            except (discord.HTTPException, IndexError):
+                pass   # Saved without an avatar; one can be set under Appearance.
+        del data
+
+        draft, model_used, unsorted = await draft_from_card(self, user_id, card)
+        view = GeneratedProfileView(self, interaction, profile_name, prompt_text(card), draft,
+                                    model_used, appearance, card=card)
+        await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
+        if unsorted:
+            await interaction.followup.send(
+                f"-# The card was filed as written, not sorted into sections, and each section keeps "
+                f"its first {PERSONA_TEXT_INPUT_MAX_LENGTH:,} characters: {suppress_link_previews(unsorted)}",
+                ephemeral=True)
 
     @app_commands.command(name="privacy", description="Export or delete your data, and see this server's data policy.")
     @app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
@@ -838,6 +926,7 @@ class MimicCog(EventListeners, commands.Cog):
                 "max_responses": session_config.get("max_responses", 10),
                 "settle": session_config.get("settle", {}),
                 "name_wakewords": session_config.get("name_wakewords", True),
+                "server_context": session_config.get("server_context", True),
             }
         else:
             # Blank session
@@ -1531,11 +1620,12 @@ class MimicCog(EventListeners, commands.Cog):
         await interaction.followup.send(f"Session suspended for {interaction.channel.mention}. The bot will be silent until configured again.", ephemeral=True)
         await self._memorise_held(interaction, held)
 
-    @app_commands.command(name="purge", description="Deletes this session's latest turns, every message of each, from channel and memory (Admin Only).")
+    @app_commands.command(name="purge", description="Deletes a session's latest turns from channel and memory (Admin Only), or my latest DMs.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
-    @app_commands.guild_only()
-    @is_admin_or_owner_check()
-    @app_commands.describe(amount="Turns to delete, newest first (1-100). Messages, with whole_channel.",
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=False)
+    # Anyone in their own DM with the bot: only the bot's messages go, and only theirs to see.
+    @app_commands.check(lambda i: i.guild_id is None or i.permissions.administrator)
+    @app_commands.describe(amount="Turns to delete, newest first (1-100). Messages, with whole_channel or in a DM.",
                            whole_channel="Count every message in the channel, not only the session's turns.")
     async def purge_slash(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100],
                           whole_channel: bool = False):
@@ -1550,6 +1640,9 @@ class MimicCog(EventListeners, commands.Cog):
         if not self.has_lock: return
         await interaction.response.defer(ephemeral=True)
 
+        if isinstance(interaction.channel, discord.DMChannel):
+            await self._purge_dm(interaction, amount)
+            return
         if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
             await interaction.followup.send("Purge is not supported in this channel type.", ephemeral=True)
             return
@@ -1626,6 +1719,24 @@ class MimicCog(EventListeners, commands.Cog):
         finally:
             if session:
                 session['is_purging'] = False
+
+    async def _purge_dm(self, interaction: discord.Interaction, amount: int):
+        """The bot's own latest `amount` messages in this DM, newest first. A DM has no bulk
+        delete, so one at a time; discord.py waits out the rate limit."""
+        deleted = 0
+        # ponytail: looks through the newest 1,000 messages; a DM that buries the bot's
+        # deeper than that keeps them.
+        async for message in interaction.channel.history(limit=1000, before=interaction.created_at):
+            if deleted >= amount:
+                break
+            if message.author.id != self.bot.user.id:
+                continue
+            try:
+                await message.delete()
+                deleted += 1
+            except discord.HTTPException:
+                pass   # Gone already, or a system message nobody can delete.
+        await interaction.followup.send(f"Deleted {deleted} of my messages from this DM.", ephemeral=True)
 
     @app_commands.command(name="memorise", description="Forces long-term memory summarisation for this session's cast, right now (Admin Only).")
     @cooldown_unless_refused(2, 60.0, _no_session_key)
@@ -1962,46 +2073,6 @@ class MimicCog(EventListeners, commands.Cog):
         await view.initialize()
         await interaction.followup.send(embed=view.get_embed(), view=view)
 
-    @app_commands.command(name="clear", description="Clears all of the bot's messages from this DM channel.")
-    @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
-    @app_commands.dm_only()
-    async def clear_dm_slash(self, interaction: discord.Interaction):
-        # Defer immediately to acknowledge the interaction within Discord's 3-second window.
-        await interaction.response.defer(ephemeral=True)
-        
-        dm_channel = interaction.channel
-        deleted_count = 0
-        
-        try:
-            while True:
-                messages_to_delete = []
-                async for message in dm_channel.history(limit=100):
-                    if message.author.id == self.bot.user.id:
-                        messages_to_delete.append(message)
-                
-                if not messages_to_delete:
-                    break # No more messages to delete
-
-                # Delete messages in bulk (as much as the API allows for DMs)
-                # This is faster than one by one with a sleep
-                delete_tasks = [msg.delete() for msg in messages_to_delete]
-                results = await asyncio.gather(*delete_tasks, return_exceptions=True)
-                
-                for result in results:
-                    if not isinstance(result, Exception):
-                        deleted_count += 1
-
-                if len(messages_to_delete) < 100:
-                    break # Reached the end of the history
-            
-            await interaction.followup.send(f"Successfully deleted {deleted_count} of my messages from this DM.", ephemeral=True)
-
-        except Exception as e:
-            print(f"Error during DM clear for user {interaction.user.id}: {e}")
-            traceback.print_exc()
-            if not interaction.response.is_done():
-                await interaction.followup.send("An unexpected error occurred while trying to clear my messages.", ephemeral=True)
-            
     @app_commands.command(name="viewavatar", description="Displays the avatar of a specified user.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     @app_commands.describe(user="The user whose avatar you want to view.")

@@ -8,15 +8,27 @@ anything is written. A draft lives only on that view: nothing touches disk until
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..utils.constants import (DEFAULT_PROFILE_GENERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS,
-                               LIBRARY_INTRO_MAX_CHARS, defaultConfig)
-from ..utils.helpers import _format_api_error, resolve_auto_models, resolve_thinking_params
-from ..utils.user_defaults import (apply_defaults, model_chain, model_provider,
-                                   model_slot_defaults)
+from ..utils import lorebook
+from ..utils.character_card import prompt_text
+from ..utils.constants import (AI_INSTRUCTIONS_PART_MAX_LENGTH, DEFAULT_CARD_IMPORT_PROMPT,
+                               DEFAULT_PROFILE_GENERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS,
+                               GENERATOR_KEYS, LIBRARY_INTRO_MAX_CHARS,
+                               PERSONA_TEXT_INPUT_MAX_LENGTH, defaultConfig)
+from ..utils.helpers import (_format_api_error, resolve_auto_models, resolve_thinking_params,
+                             system_model)
+from ..utils.user_defaults import apply_defaults, model_chain, model_provider
 
 #: A character is creative work. This was 0.3, a form-filling temperature, and every
 #: concept came back as the same genre-average character.
 GENERATOR_TEMPERATURE = 0.9
+#: Sorting a card into sections is filing: the author's words, moved, not rewritten.
+CARD_IMPORT_TEMPERATURE = 0.3
+
+#: /mod key -> (shipped template, temperature). Both take `{prompt}` and answer in sections.
+TEMPLATES = {
+    "PROFILE_GENERATOR": (DEFAULT_PROFILE_GENERATOR_PROMPT, GENERATOR_TEMPERATURE),
+    "CARD_IMPORT": (DEFAULT_CARD_IMPORT_PROMPT, CARD_IMPORT_TEMPERATURE),
+}
 
 #: Persona section -> the header that carries it, in the persona modal's order.
 PERSONA_SECTIONS = {
@@ -130,18 +142,18 @@ def build_prompt(template: str, concept: str, previous: Optional[Dict[str, Any]]
 
 
 def generator_models(cog, user_id: int) -> Tuple[str, Tuple[str, ...]]:
-    """(primary, fallbacks) for a draft: the chain the new profile itself would run on.
+    """(primary, fallbacks) for a draft.
 
-    The shipped models on the user's effective provider -- a draft needs a model before
-    any provider is chosen, so a key counts here as it does not for a profile -- their
-    own defaults over them once they have chosen one, rescued onto a provider they hold,
-    then the Final Fallback behind. Only models on a provider the user holds a key for
-    are kept: a draft is billed to the user alone.
+    The generator's System Models on the user's effective provider -- a draft needs a model
+    before any provider is chosen, so a key counts here as it does not for a profile --
+    their own defaults over them once they have chosen one, rescued onto a provider they
+    hold, then the Final Fallback behind. Only models on a provider the user holds a key
+    for are kept: a draft is billed to the user alone.
     """
     pm = cog.profile_manager
     provider = pm.effective_provider(user_id)
-    shipped = model_slot_defaults(provider)
-    config = {"primary_model": shipped["primary_model"], "fallback_model": shipped["fallback_model"]}
+    config = dict(zip(("primary_model", "fallback_model"),
+                      (system_model(cog, key, provider) for key in GENERATOR_KEYS)))
     if pm.provider_preference(user_id):
         apply_defaults(config, pm._get_user_defaults(user_id), borrowed=False)
     pm._rescue_unusable_models(user_id, config)
@@ -156,13 +168,16 @@ def generator_models(cog, user_id: int) -> Tuple[str, Tuple[str, ...]]:
 
 async def generate_draft(cog, user_id: int, concept: str,
                          previous: Optional[Dict[str, Any]] = None,
-                         request: Optional[str] = None) -> Tuple[Dict[str, Any], str]:
+                         request: Optional[str] = None,
+                         template_key: str = "PROFILE_GENERATOR") -> Tuple[Dict[str, Any], str]:
     """(draft, model used). `previous` and `request` together make it a refinement.
+    `template_key` is one of TEMPLATES: a concept to design from, or a card to sort.
 
     Raises ProfileGenerationError, and nothing else, for anything the user should be told.
     """
     primary, fallbacks = generator_models(cog, user_id)
-    template = cog.global_prompts.get("PROFILE_GENERATOR", DEFAULT_PROFILE_GENERATOR_PROMPT)
+    default, temperature = TEMPLATES[template_key]
+    template = cog.global_prompts.get(template_key, default)
     try:
         prompt = build_prompt(template, concept, previous, request)
     except (KeyError, IndexError, ValueError):
@@ -174,7 +189,7 @@ async def generate_draft(cog, user_id: int, concept: str,
             model_name, None, user_id, None, DEFAULT_SAFETY_SETTINGS,
             resolve_thinking_params(None, "utility"), config_owner_id=user_id)
         response = await model.generate_content_async(
-            [prompt], generation_config={"temperature": GENERATOR_TEMPERATURE})
+            [prompt], generation_config={"temperature": temperature})
         if not response or not response.candidates:
             # A decision about the concept, not the model being down: the fallback
             # would be asked the same thing, so this is not retried.
@@ -188,7 +203,8 @@ async def generate_draft(cog, user_id: int, concept: str,
         except Exception:
             text = ""
         draft = draft_from_sections(parse_sections(text))
-        if not draft["persona"]["personality_traits"]:
+        # A format test, not a content one: a card may say nothing about a section.
+        if not any(draft["persona"].values()):
             raise ProfileGenerationError(
                 "The model's reply was not in the expected format. Press Regenerate to try again.")
         return draft
@@ -203,11 +219,29 @@ async def generate_draft(cog, user_id: int, concept: str,
     return draft, used
 
 
+async def draft_from_card(cog, user_id: int, card: Dict[str, Any]) -> Tuple[Dict[str, Any], str, Optional[str]]:
+    """(draft, model that sorted it or "", why it was not sorted). The card's text sorted
+    into sections by the user's own models -- or, when none will (no key, a refusal, a
+    reply in no format), the card as written: description and scenario as backstory,
+    personality as personality. An import never fails for want of a model."""
+    try:
+        draft, used = await generate_draft(cog, user_id, prompt_text(card), template_key="CARD_IMPORT")
+        return draft, used, None
+    except ProfileGenerationError as e:
+        backstory = "\n\n".join(t for t in (card["description"], card["scenario"]) if t)
+        persona = {key: "" for key in PERSONA_SECTIONS}
+        persona.update(backstory=backstory, personality_traits=card["personality"])
+        return ({"display_name": None, "library_intro": None, "persona": persona,
+                 "ai_instructions": ""}, "", str(e))
+
+
 def save_draft(cog, user_id: int, profile_name: str, draft: Dict[str, Any]) -> Optional[str]:
     """Write an accepted draft as a new personal profile. None on success, else the reason.
 
     Blocking file I/O; callers run it through `asyncio.to_thread`. The name and the
-    profile limit are checked again because a draft can sit open for minutes.
+    profile limit are checked again because a draft can sit open for minutes. Every field
+    is cut to the editor's own cap, which an imported card can run past. A card's
+    lorebook and its 18+ tag (`adult`) are written here too, before anyone can seat it.
     """
     pm = cog.profile_manager
     index = pm._get_user_index(user_id)
@@ -223,12 +257,16 @@ def save_draft(cog, user_id: int, profile_name: str, draft: Dict[str, Any]) -> O
 
     encrypt = cog.storage_manager._encrypt_data
     prompts = profile.get("prompts") or {}
-    prompts["persona"] = {key: [encrypt(line) for line in value.splitlines()]
+    prompts["persona"] = {key: [encrypt(line) for line in value[:PERSONA_TEXT_INPUT_MAX_LENGTH].splitlines()]
                           for key, value in draft["persona"].items()}
     if not isinstance(prompts.get("ai_instructions"), list):
         prompts["ai_instructions"] = ["", "", "", ""]
-    prompts["ai_instructions"][0] = encrypt(draft["ai_instructions"])
+    prompts["ai_instructions"][0] = encrypt(draft["ai_instructions"][:AI_INSTRUCTIONS_PART_MAX_LENGTH])
+    if draft.get("lorebook"):
+        prompts["lorebook"] = lorebook.normalise(draft["lorebook"])
     pm._save_profile_prompts(user_id, profile_name, prompts)
+    if draft.get("adult"):
+        pm.set_owner_adult_declaration(user_id, profile_name, True)
 
     extras = {"custom_display_name": draft.get("display_name"),
               "custom_avatar_url": draft.get("avatar_url"),

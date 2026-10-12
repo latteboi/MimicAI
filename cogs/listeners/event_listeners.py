@@ -518,11 +518,12 @@ class EventListeners:
 
         is_regen = (emoji_str == REGENERATE_EMOJI)
         is_next = (emoji_str == NEXT_SPEAKER_EMOJI)
+        is_again = (emoji_str == SPEAK_AGAIN_EMOJI)
         is_continue = (emoji_str == CONTINUE_ROUND_EMOJI)
         is_mute = (emoji_str == MUTE_TURN_EMOJI)
         is_skip = (emoji_str == SKIP_PARTICIPANT_EMOJI)
 
-        if not any([is_regen, is_next, is_continue, is_mute, is_skip]):
+        if not any([is_regen, is_next, is_again, is_continue, is_mute, is_skip]):
             return
 
         # Muting is deliberately open: it hides one turn from the transcript, which is
@@ -670,7 +671,12 @@ class EventListeners:
 
             # A draft session runs no rounds, whichever way one is asked for.
             next_participant = None
-            if (is_continue or is_next) and self.session_manager.is_started(session):
+            if is_again and self.session_manager.is_started(session):
+                # The message's own author, so a profile that has left or been skipped has
+                # nobody to hand the turn to: the worker would start someone else instead.
+                if reacted_to_participant and not reacted_to_participant.get("is_skipped"):
+                    next_participant = reacted_to_participant
+            elif (is_continue or is_next) and self.session_manager.is_started(session):
                 try:
                     next_participant = self.session_manager.next_reaction_speaker(
                         session, reacted_to_participant)
@@ -678,16 +684,8 @@ class EventListeners:
                     pass
 
             if next_participant:
-                session_mode = session.get("session_mode", "sequential")
-                if session_mode == 'sequential':
-                    try:
-                        start_idx = session['profiles'].index(next_participant)
-                        new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
-                        session['profiles'] = new_order
-                        self.session_manager._save_multi_profile_sessions()
-                    except ValueError:
-                        pass
-
+                # The round turns the cast to it as it starts (`_turn_cast_to`), as for every
+                # seat a round is started for.
                 is_busy = any(session.get(flag) for flag in SESSION_BUSY_FLAGS)
 
                 async def _ack_nav_reaction(busy: bool):
@@ -703,7 +701,7 @@ class EventListeners:
 
                 asyncio.create_task(_ack_nav_reaction(is_busy))
 
-                trigger_type = 'reaction_single' if is_next else 'reaction'
+                trigger_type = 'reaction_single' if (is_next or is_again) else 'reaction'
                 reaction_trigger = (trigger_type, payload, next_participant)
 
                 if 'task_queue' not in session or session['task_queue'] is None:
@@ -719,7 +717,8 @@ class EventListeners:
                 return
 
             # Nothing this reaction asks for can happen: 🔁 or ❌ on a profile that has left
-            # the cast, or ⏯️/🍿 on a draft or an empty session. It comes back off rather
+            # the cast, ⏯️ on one that has left or is skipped, or ▶️/⏯️/🍿 on a draft or an
+            # empty session. It comes back off rather
             # than sitting on the message looking ignored, which is what invited pulling it
             # off and pressing it again.
             asyncio.create_task(self._pull_back_reaction(payload))
@@ -742,7 +741,7 @@ class EventListeners:
         is_mute = (emoji_str == MUTE_TURN_EMOJI)
         is_skip = (emoji_str == SKIP_PARTICIPANT_EMOJI)
         is_regen = (emoji_str == REGENERATE_EMOJI)
-        is_next = (emoji_str == NEXT_SPEAKER_EMOJI)
+        is_next = (emoji_str in (NEXT_SPEAKER_EMOJI, SPEAK_AGAIN_EMOJI))
         is_continue = (emoji_str == CONTINUE_ROUND_EMOJI)
 
         # Unskipping lives on the removal, so gating only the add would have left the

@@ -10,11 +10,15 @@ from ...utils.constants import (
     NEURO_AXES,
     DEFAULT_TRAINING_DATA_INJECTION, DEFAULT_CURRENT_TIME, DEFAULT_NEGATIVE_CONSTRAINTS,
     DEFAULT_CONTENT_POLICY, DEFAULT_BIRTHDAY_CONTEXT, DEFAULT_NEURO_DEFINITION,
-    DEFAULT_MEMORY_CAPTURE_INSTRUCTION, DEFAULT_MEMORY_WRITTEN_NOTE,
+    DEFAULT_MEMORY_CAPTURE_INSTRUCTION, DEFAULT_MEMORY_WRITTEN_NOTE, LORE_SCAN_TURNS,
+    DEFAULT_BOND_DEFINITION, DEFAULT_BOND_INSTRUCTION, BOND_ROSTER_SIZE,
 )
+from ...managers.session_manager import _TURN_IDENTITY
+from ...utils import lorebook
+from ...utils.bonds import render as render_bonds, take_updates as take_bond_updates
 from ...utils.birthdays import birthday_offset, describe_birthday
 from ...utils.helpers import (TURN_TIME_FORMAT, Timeout, _get_user_hash, _resolve_zoneinfo,
-                              default_profile_avatar_url, ltm_flag_enabled)
+                              default_profile_avatar_url, ltm_flag_enabled, server_context_block)
 from ._shared import NEURO_BARE_PATTERN, NEURO_TAG_PATTERN
 from .ltm_capture import memory_written_ago
 
@@ -97,6 +101,24 @@ class PromptBuilderMixin:
             if len(users) >= BIRTHDAY_USERS_MAX:
                 break
         return list(users.items())
+
+    def _bond_roster(self, session: Optional[Dict], profile_data: Dict[str, Any],
+                     self_id: str) -> List[Tuple[str, str]]:
+        """(ID, name) for the last BOND_ROSTER_SIZE others with a public turn in this
+        profile's history window, humans and characters alike, newest first. Read off each
+        turn's header, so the ID is the one the model sees there."""
+        log = (session or {}).get("unified_log") or []
+        stm_length = int(profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
+        people: Dict[str, str] = {}
+        for turn in itertools.islice(reversed(log), max(stm_length, 0)):
+            if turn.get("type") or turn.get("is_hidden"):
+                continue
+            match = _TURN_IDENTITY.match(turn.get("content") or "")
+            if match and match.group(2) != self_id and match.group(2) not in people:
+                people[match.group(2)] = match.group(1)
+                if len(people) >= BOND_ROSTER_SIZE:
+                    break
+        return list(people.items())
 
     def _birthday_lines(self, profile_owner_id: Optional[int], profile_name: str,
                         profile_today: datetime.date,
@@ -189,6 +211,7 @@ class PromptBuilderMixin:
         fallback_model = FALLBACK_MODEL_NAME
         timezone_str = "UTC"
         neuro_enabled = False
+        bond_enabled = False
         neuro_state = {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20}
 
         if profile_owner_id is not None:
@@ -201,6 +224,7 @@ class PromptBuilderMixin:
         if profile_data:
             timezone_str = profile_data.get("timezone", "UTC")
             neuro_enabled = profile_data.get("neuro_engine_enabled", False)
+            bond_enabled = profile_data.get("bond_engine_enabled", False)
             neuro_state = profile_data.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
 
         # Split by how often a block changes, and that is a cost decision rather than a
@@ -221,6 +245,12 @@ class PromptBuilderMixin:
 
         session = self.cog.multi_profile_channels.get(channel_id) if is_multi_profile else None
         if is_multi_profile:
+            # Where the conversation is, ahead of what is going on in it: both belong to the
+            # channel and read the same for every character in the cast.
+            if session and session.get("server_context", True):
+                server_block = server_context_block(self.cog.bot.get_channel(channel_id))
+                if server_block:
+                    stable_parts.append(server_block)
             if session and session.get("session_prompt"):
                 stable_parts.append(f"<scene_prompt>\n{session['session_prompt']}\n</scene_prompt>")
 
@@ -259,6 +289,14 @@ class PromptBuilderMixin:
             stable_parts.append("<character_instructions>\n"
                                 + "\n\n".join(decrypted_parts).strip()
                                 + "\n</character_instructions>")
+
+        # The lorebook's always-in-mind entries are part of the character, so they sit with
+        # its persona; the keyed ones change per turn and ride it, below.
+        lore = (self.cog.profile_manager.lorebook(profile_owner_id, profile_name_to_use)
+                if profile_owner_id is not None else [])
+        always = lorebook.constant(lore)
+        if always:
+            stable_parts.append(lorebook.render(always))
 
         # Stable, so they sit with the persona rather than among the per-turn blocks:
         # they never change, and anything volatile placed ahead of them would
@@ -308,6 +346,8 @@ class PromptBuilderMixin:
                 a=neuro_state.get('adrenaline', 20)
             )
             turn_parts.append(neuro_block)
+        if bond_enabled:
+            stable_parts.append(self.cog.global_prompts.get("BOND_DEFINITION", DEFAULT_BOND_DEFINITION))
 
         # Always sent. `time_tracking_enabled` used to switch this block off; that mode is
         # retired and the key is no longer read, so a profile still carrying False gets
@@ -336,11 +376,35 @@ class PromptBuilderMixin:
             birthday_template = self.cog.global_prompts.get("BIRTHDAY_CONTEXT", DEFAULT_BIRTHDAY_CONTEXT)
             turn_parts.append(birthday_template.format(birthdays="\n".join(birthday_lines)))
 
+        # Only the people in the conversation, so a reply costs the same however many the
+        # character has ever met. Global Chat has no log to read: its one user is passed in.
+        if bond_enabled and profile_owner_id is not None:
+            self_id = self.cog.profile_manager._get_profile_id(profile_owner_id, profile_name_to_use)
+            people = (self._bond_roster(session, profile_data, self_id) if session
+                      else [(_get_user_hash(uid), name) for uid, name in present_users][:BOND_ROSTER_SIZE])
+            if people:
+                held = self.cog.profile_manager.bonds(profile_owner_id, profile_name_to_use)
+                turn_parts.append(self.cog.global_prompts.get("BOND_STATE", DEFAULT_BOND_INSTRUCTION)
+                                  .format(bonds=render_bonds(people, held)))
+
         if training_examples_list:
             examples_block = "\n---\n".join(training_examples_list)
             turn_parts.append(
                 self.cog.global_prompts.get("TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION)
                 .format(examples_block=examples_block))
+
+        # Keyed entries, matched against the last few public turns -- the message being
+        # answered is already in the log. Only in a session: elsewhere there is no log to read.
+        if session and any(e.get("keys") for e in lore):
+            recent = []
+            for turn in reversed(session.get("unified_log") or []):
+                if not turn.get("type") and not turn.get("is_hidden"):
+                    recent.append(str(turn.get("content") or ""))
+                    if len(recent) >= LORE_SCAN_TURNS:
+                        break
+            hits = lorebook.triggered(lore, "\n".join(recent))
+            if hits:
+                turn_parts.append(lorebook.render(hits))
 
         if recalled_ltm:
             turn_parts.append(recalled_ltm)
@@ -441,16 +505,21 @@ class PromptBuilderMixin:
         An axis the tag leaves out keeps its stored value: a partial update means "the
         rest did not move". Nothing is written when nothing was reported, which is most
         turns.
+
+        A `<bond_update>` is taken out the same way, and applied when the profile's bonds are on.
         """
+        raw_text, bond_updates = take_bond_updates(raw_text)
         clean_text, new_state = self._neuro_state_from_text(raw_text)
 
         final_state = None
-        if new_state:
+        if new_state or bond_updates:
             index = self.cog.profile_manager._get_user_index(owner_id)
             is_borrowed = profile_name in index.get("borrowed", [])
             p_config = self.cog.profile_manager._get_profile_config(owner_id, profile_name, is_borrowed)
 
-            if p_config and p_config.get("neuro_engine_enabled"):
+            if bond_updates and p_config and p_config.get("bond_engine_enabled"):
+                self.cog.profile_manager.apply_bonds(owner_id, profile_name, bond_updates)
+            if new_state and p_config and p_config.get("neuro_engine_enabled"):
                 current_state = p_config.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20}).copy()
                 current_state.update(new_state)
                 p_config["neuro_state"] = current_state

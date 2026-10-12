@@ -41,14 +41,18 @@ from ..utils.constants import (
     NEW_PROFILE_SPEECH_TEMPERATURE, SPEECH_LANGUAGE_NAMES,
     IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_CONSENT_FILES, VOICE_SAMPLE_SLOT_FILES, VOICE_SAMPLE_SLOT_KEY, VOICE_SAMPLE_SLOTS,
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_MODES, GREEDY_SAMPLING, SYSTEM_PROFILE_MODEL,
-    MODEL_PROVIDERS, PROVIDER_CHOICES, NOT_REGISTERED, )
+    MODEL_PROVIDERS, PROVIDER_CHOICES, NOT_REGISTERED,
+    LIMIT_LORE_ENTRIES, PERSONA_TEXT_INPUT_MAX_LENGTH, )
 from ..utils.helpers import (auto_tier, birth_time, image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
                             ltm_auto_recall_enabled, resolve_critic_settings,
                             grounding_mode_display, resolve_image_output_params,
                             resolve_auto_models, pick_mood_avatar,
                             resolve_image_tools, resolve_thinking_params,
                             resolve_unreadable_media_mode,
-                            resolve_url_mode, suppress_link_previews, system_model)
+                            resolve_url_mode, suppress_link_previews, system_model,
+                            clean_imported_text)
+from ..utils import lorebook
+from ..utils.bonds import apply_updates as apply_bond_updates
 from ..utils.discord_cdn import is_web_url, signed_attachment_url, unsigned_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager, _get_compressor, _get_decompressor
@@ -74,6 +78,26 @@ _UNKNOWN_SOURCE_PID = "00000000"
 _IMPORT_MAX_INFLATED_BYTES = 64 * 1024 * 1024
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 _GZIP_MAGIC = b"\x1f\x8b"
+
+#: A borrow's pointer at its source. Written only by a borrow being made, so an import --
+#: always a personal profile -- that carries one is carrying a claim on someone else's
+#: profile, which `_pid_class`'s pre-PID fallback and the borrow index would read.
+_BORROW_POINTER_KEYS = ("original_owner_id", "original_pid", "original_profile_id",
+                        "original_profile_name", "pointer")
+
+
+def _clean_imported_prompts(value: Any) -> Any:
+    """A .mimic profile's prompts as a person could have typed them: every string through
+    `clean_imported_text` at the editor's cap, and the lorebook normalised. A passphrase
+    file is anyone's to write."""
+    if isinstance(value, str):
+        return clean_imported_text(value, PERSONA_TEXT_INPUT_MAX_LENGTH)
+    if isinstance(value, list):
+        return [_clean_imported_prompts(v) for v in value]
+    if isinstance(value, dict):
+        return {k: lorebook.normalise(v) if k == "lorebook" else _clean_imported_prompts(v)
+                for k, v in value.items()}
+    return value
 
 
 def _passphrase_fernet(passphrase: str, salt: bytes) -> Fernet:
@@ -172,7 +196,8 @@ def feature_fields(config: Dict[str, Any], speech_providers: Set[str]) -> Tuple[
                  f"Realistic Typing: {flag(config.get('realistic_typing_enabled'))}",
                  f"Placeholder: {config.get('placeholder_emoji') or 'Default'}",
                  f"Timezone: `{config.get('timezone', 'UTC')}`",
-                 feature("Neuro Engine", "neuro_engine_enabled", neuro)]
+                 feature("Neuro Engine", "neuro_engine_enabled", neuro),
+                 f"Bonds: {flag(config.get('bond_engine_enabled'))}"]
     media = [feature("Image Gen", "image_generation_enabled", image),
              feature("Speech TTS", "speech_tts_enabled", speech)]
     return "\n".join(tools), "\n".join(behaviour), "\n".join(media)
@@ -2141,6 +2166,86 @@ class ProfileManager:
             return (data.get("prompts") or {}).get("birthday")
         return (self._get_profile_prompts(user_id, profile_name) or {}).get("birthday")
 
+    def lorebook(self, user_id: int, profile_name: str) -> List[Dict[str, Any]]:
+        """The lorebook this name speaks with. A borrow's is its source's, as its persona is:
+        a borrow's own prompts are written empty."""
+        eff_owner, eff_name = self._resolve_effective_profile(user_id, profile_name)
+        return lorebook.entries((self._get_profile_prompts(eff_owner, eff_name) or {}).get("lorebook"))
+
+    def put_lore_entry(self, user_id: int, profile_name: str, entry_id: Optional[str],
+                       keys: str, content: str) -> Tuple[bool, str]:
+        """Adds an entry, or with `entry_id` rewrites that one. Blocking: run it in a thread."""
+        prompts = self._get_profile_prompts(user_id, profile_name)
+        if prompts is None:
+            return False, "That profile could not be found."
+        book = lorebook.entries(prompts.get("lorebook"))
+        entry = {"id": entry_id or lorebook.new_id(), "keys": keys, "content": content}
+        if entry_id:
+            if not any(e.get("id") == entry_id for e in book):
+                return False, "That entry no longer exists."
+            book = [entry if e.get("id") == entry_id else e for e in book]
+        elif len(book) >= LIMIT_LORE_ENTRIES:
+            return False, f"This lorebook is full ({LIMIT_LORE_ENTRIES} entries). Delete one first."
+        else:
+            book.append(entry)
+        prompts["lorebook"] = lorebook.normalise(book)
+        self._save_profile_prompts(user_id, profile_name, prompts)
+        return True, "Lore entry saved." if entry_id else "Lore entry added."
+
+    def add_lore_entries(self, user_id: int, profile_name: str, new: List[Dict[str, Any]]) -> str:
+        """An imported book's entries, after the profile's own: one it already holds word for
+        word is skipped, and as many as fit. Only on a personal profile. Blocking."""
+        if profile_name not in self._get_user_index(user_id).get("personal", []):
+            return "❌ You can only add a lorebook to a personal profile you own."
+        prompts = self._get_profile_prompts(user_id, profile_name)
+        if prompts is None:
+            return "❌ That profile could not be found."
+        book = lorebook.entries(prompts.get("lorebook"))
+        held = {e["content"] for e in book}
+        fresh = [e for e in new if e["content"] not in held]
+        added = fresh[:max(0, LIMIT_LORE_ENTRIES - len(book))]
+        if added:
+            prompts["lorebook"] = lorebook.normalise(book + added)
+            self._save_profile_prompts(user_id, profile_name, prompts)
+        message = f"Added {len(added)} lore entr{'y' if len(added) == 1 else 'ies'} to **{profile_name}**."
+        if len(new) > len(fresh):
+            message += f" {len(new) - len(fresh)} it already had were skipped."
+        if len(fresh) > len(added):
+            message += f" {len(fresh) - len(added)} did not fit: a lorebook holds {LIMIT_LORE_ENTRIES}."
+        return message
+
+    def bonds(self, user_id: int, profile_name: str) -> Dict[str, List[int]]:
+        """What this profile feels about each person it has scored: ID -> [affection,
+        resentment]. Its own, a borrow's included, as its neuro levels are."""
+        data = self.cog.storage_manager._load_shard("bonds", user_id, profile_name)
+        return data if isinstance(data, dict) else {}
+
+    def apply_bonds(self, user_id: int, profile_name: str, updates: Dict[str, Dict[str, int]]) -> None:
+        """A reply's `<bond_update>`, applied and saved. Only where this owner holds the
+        profile's folder: a System profile read from someone else's seat has none here, and
+        the write would mint one. Blocking, like the neuro save beside it."""
+        path = self.cog.storage_manager._get_shard_path("bonds", user_id, profile_name, strict=True)
+        if not path or not os.path.exists(os.path.join(os.path.dirname(path), "profile.json.gz")):
+            return
+        self.cog.storage_manager._save_shard(
+            "bonds", user_id, apply_bond_updates(self.bonds(user_id, profile_name), updates), profile_name)
+
+    def reset_bonds(self, user_id: int, profile_name: str) -> None:
+        self.cog.storage_manager._delete_shard("bonds", user_id, profile_name)
+
+    def delete_lore_entries(self, user_id: int, profile_name: str, ids: List[str]) -> int:
+        """Removes the entries with these ids and returns how many went. Blocking."""
+        prompts = self._get_profile_prompts(user_id, profile_name)
+        if prompts is None:
+            return 0
+        book = lorebook.entries(prompts.get("lorebook"))
+        drop = set(ids)
+        kept = [e for e in book if e.get("id") not in drop]
+        if len(kept) != len(book):
+            prompts["lorebook"] = kept
+            self._save_profile_prompts(user_id, profile_name, prompts)
+        return len(book) - len(kept)
+
     def _save_profile_prompts(self, user_id: int, profile_name: str, data: Dict[str, Any]):
         """Persists prompts and invalidates any cached content rating.
 
@@ -2391,6 +2496,11 @@ class ProfileManager:
         img_prompt = prompts.get("image_generation_prompt")
         if isinstance(img_prompt, str) and img_prompt.strip():
             parts.append(f"image_prompt:\n{self.cog.storage_manager._decrypt_data(img_prompt).strip()}")
+
+        # What the character is handed alongside its persona, so it is judged with it.
+        lore = "\n\n".join(e["content"] for e in lorebook.entries(prompts.get("lorebook")))
+        if lore:
+            parts.append(f"lorebook:\n{lore}")
 
         return "\n\n".join(parts)
 
@@ -3605,6 +3715,15 @@ class ProfileManager:
         data = json.loads(_inflate_export(decrypted))
         if not isinstance(data, dict) or not isinstance(data.get("profiles"), dict):
             raise ValueError("Decrypted payload is missing the profiles object.")
+        # Here, off the loop: cleaning is a scrub over every string the file holds.
+        for p_data in data["profiles"].values():
+            if not isinstance(p_data, dict):
+                continue
+            if isinstance(p_data.get("config"), dict):
+                for key in _BORROW_POINTER_KEYS:
+                    p_data["config"].pop(key, None)
+            if isinstance(p_data.get("prompts"), dict):
+                p_data["prompts"] = _clean_imported_prompts(p_data["prompts"])
         return data
 
     async def _execute_import(self, interaction: discord.Interaction, file_bytes: bytes, passphrase: Optional[str] = None):

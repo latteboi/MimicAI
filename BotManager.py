@@ -59,7 +59,12 @@ intents.dm_typing = False  # only session channels read typing, and sessions are
 # the gateway payload's `referenced_message` field rather than from the cache. Left on,
 # the deque fills with full Message objects -- author, embeds, attachments, reactions --
 # and never shrinks, which on a 24/7 e2-micro is the one baseline term that grows.
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None, max_messages=None)
+#
+# allowed_mentions: a reply is model output, and a persona or a user can ask for
+# "@everyone" in it. Webhooks built with client=bot inherit this default too, so no
+# character ever pings the whole server or a role. Users stay pingable.
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None, max_messages=None,
+                   allowed_mentions=discord.AllowedMentions(everyone=False, roles=False))
 
 # --- Event: Bot Ready ---
 @bot.event

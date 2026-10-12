@@ -276,10 +276,10 @@ class _Screen:
     operations (rename, duplicate, delete, the data managers) are not settings at all.
     """
 
-    __slots__ = ("controls", "modal", "modal_label", "note", "when")
+    __slots__ = ("controls", "modal", "modal_label", "note", "when", "always")
 
     def __init__(self, *controls, modal=None, modal_label="Edit values…",
-                 note=None, when=None):
+                 note=None, when=None, always=1):
         self.controls = tuple(controls)
         self.modal = modal
         self.modal_label = modal_label
@@ -290,6 +290,9 @@ class _Screen:
         #: screen offers only its first control -- that switch -- and Back: a speed or a
         #: scope for a feature that is off is a setting nothing reads.
         self.when = when
+        #: How many leading controls stay while `when` is false: more than one where a
+        #: second switch stands on its own (Bonds, beside the Neuro Engine).
+        self.always = always
 
     @property
     def choices(self):
@@ -758,16 +761,18 @@ def _render_critic(ctx):
 
 def _render_neuro(ctx):
     config = ctx["config"]
-    if not config.get("neuro_engine_enabled", False):
-        return "Neuro Engine", _OFF, True
-    state = config.get("neuro_state") or {}
-    return "Neuro Engine", (
-        f"{_ON}\n"
-        f"Dopamine: `{state.get('dopamine', 50)}`\n"
-        f"Cortisol: `{state.get('cortisol', 20)}`\n"
-        f"Oxytocin: `{state.get('oxytocin', 50)}`\n"
-        f"Adrenaline: `{state.get('adrenaline', 20)}`"
-    ), True
+    text = _OFF
+    if config.get("neuro_engine_enabled", False):
+        state = config.get("neuro_state") or {}
+        text = (f"{_ON}\n"
+                f"Dopamine: `{state.get('dopamine', 50)}`\n"
+                f"Cortisol: `{state.get('cortisol', 20)}`\n"
+                f"Oxytocin: `{state.get('oxytocin', 50)}`\n"
+                f"Adrenaline: `{state.get('adrenaline', 20)}`")
+    if config.get("bond_engine_enabled", False):
+        known = ctx.get("bonds_known")
+        text += "\nBonds: On" + (f", `{known}` people known" if known is not None else "")
+    return "Neuro Engine", text, True
 
 
 
@@ -1168,11 +1173,12 @@ PROFILE_ACTIONS = (
                        prompt_keys=("critic_instructions",),
                        warning="Every selected profile's **critic prompt** is replaced. "
                                "Profiles using a customised prompt lose it.")),
-    _Action("neuro", "tools", "Neuro-Endocrine Engine", "Simulate hormonal states for dynamic emotions.",
+    _Action("neuro", "tools", "Neuro-Endocrine Engine", "Simulate hormonal states for dynamic emotions, and feelings about each person.",
             _open_screen("neuro"), render=_render_neuro,
             screen=_Screen(_Toggle("neuro_engine_enabled", "Neuro Engine"),
+                           _Toggle("bond_engine_enabled", "Bonds"),
                            modal="ProfileNeuroModal", modal_label="Edit hormones…",
-                           when=lambda c: bool(c.get("neuro_engine_enabled"))),
+                           when=lambda c: bool(c.get("neuro_engine_enabled")), always=2),
             bulk=_Bulk(_bulk_modal("ProfileNeuroModal"), scope="all",
                        keys=("neuro_engine_enabled", "neuro_state"))),
     _Action("help_mode", "tools", "Help Mode (Guide RAG)", "Allow profile to answer technical bot questions.",
@@ -1315,6 +1321,8 @@ PROFILE_ACTIONS = (
     # --- Training (tab hidden entirely for borrowed profiles: every row is owner-only) ---
     _Action("manage_training", "training", "Manage Training Examples", "Add, list, edit, or delete training examples.",
             _method("_act_manage_training", wants_profile=True), _own),
+    _Action("manage_lore", "training", "Manage Lorebook", "What the character knows, handed to it when a keyword comes up.",
+            _method("_act_manage_lore", wants_profile=True), _own),
     _Action("train_params", "training", "Set Training Parameters", "Set training context size and relevance threshold.",
             _modal("ProfileTrainingParamsModal", pass_borrowed=False), _own,
             bulk=_Bulk(_bulk_modal("ProfileTrainingParamsModal", pass_borrowed=False),
@@ -1622,6 +1630,11 @@ class ProfileManageView(BlockedGuard, ui.View):
                               mode='training', parent_manage_view=self, target_user_id=self.user_id)
         await view.start()
 
+    async def _act_manage_lore(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        view = DataManageView(self.cog, interaction, self.profile_name, self.is_borrowed,
+                              mode='lore', parent_manage_view=self, target_user_id=self.user_id)
+        await view.start()
+
     async def _act_critic_instructions(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         # Resolved, not read raw: the box has to show what this profile actually screens
         # with today -- its own prompt, else the instance-wide one, else the default --
@@ -1824,8 +1837,9 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     Layout is forced by Discord's five-components-per-row: a select occupies a whole
     row, so the choices take rows 0..n and everything that is a button -- the toggles,
     the Edit button, Back -- shares the row after them. No declared screen has more than
-    three choices, and the widest button row is Memory Settings at five (three toggles,
-    the parameters modal, Back) -- which is the cap, not a margin. A fourth toggle on
+    three choices, and the widest button row is five -- Memory Settings (three toggles,
+    the parameters modal, Back) and the Neuro Engine (two, hormones, mood avatars, Back,
+    with Reset bonds on the next row) -- which is the cap, not a margin. A fourth toggle on
     one screen, or a toggle added beside three choices, needs this to wrap first.
     """
 
@@ -1851,7 +1865,10 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             "config": self._config, "is_borrowed": self.parent.is_borrowed,
             "owner_id": self.parent.user_id,
             "voice_sample": await self.cog.profile_manager.voice_sample_summary(
-                self.parent.user_id, self.parent.profile_name)})
+                self.parent.user_id, self.parent.profile_name),
+            "bonds_known": len(await asyncio.to_thread(
+                self.cog.profile_manager.bonds, self.parent.user_id, self.parent.profile_name))
+                if self.action.value == "neuro" else None})
         if field:
             e.add_field(name=field[0], value=str(field[1])[:1024], inline=False)
         note = self.screen.note
@@ -1871,7 +1888,7 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         self.clear_items()
         config = self._config
         live = self.screen.when is None or self.screen.when(config)
-        controls = self.screen.controls if live else self.screen.controls[:1]
+        controls = self.screen.controls if live else self.screen.controls[:self.screen.always]
         if not _is_bot_owner(self.parent.user_id):
             controls = tuple(c for c in controls if not getattr(c, "owner_only", False))
 
@@ -1910,6 +1927,10 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         if self.action.value == "neuro" and live and not self.parent.is_borrowed:
             add_button(self, "Mood avatars…", self._mood_avatars_callback,
                        style=discord.ButtonStyle.primary, row=row)
+        # A row of its own: the one above is full with both switches on. A borrow's are its own.
+        if self.action.value == "neuro" and config.get("bond_engine_enabled"):
+            add_button(self, "Reset bonds", self._reset_bonds_callback,
+                       style=discord.ButtonStyle.danger, row=row + 1)
 
         add_button(self, "◀ Back", self._back_callback, style=discord.ButtonStyle.secondary,
                    row=row)
@@ -1945,6 +1966,11 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         await interaction.response.send_modal(factory(
             *args, values_only=True, callback=self._after_modal,
             target_user_id=self.parent.user_id))
+
+    async def _reset_bonds_callback(self, interaction: discord.Interaction):
+        await asyncio.to_thread(self.cog.profile_manager.reset_bonds,
+                                self.parent.user_id, self.parent.profile_name)
+        await interaction.response.edit_message(embed=await self.embed(), view=self)
 
     async def _mood_avatars_callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(MoodAvatarModal(

@@ -44,6 +44,7 @@ from .constants import (
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_KEYS, UNREADABLE_MEDIA_LABELS,
     UNREADABLE_MEDIA_VALUES,
     GOOGLE_VOICE_PREFIX, PROSE_DIRECTED_TTS_MODELS, TTS_VOICE_LOOKUP,
+    LIMIT_SERVER_EMOJIS, SERVER_TOPIC_MAX_CHARS,
 )
 
 
@@ -1981,3 +1982,95 @@ def resolve_critic_settings(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "persistence": _clamp("critic_persistence", DEFAULT_CRITIC_PERSISTENCE,
                               CRITIC_PERSISTENCE_MIN, CRITIC_PERSISTENCE_MAX),
     }
+
+
+# --- Server context (`/session config` -> Server Context) ---------------------------
+
+def server_context_guild(session: Optional[Dict], channel) -> Optional[discord.Guild]:
+    """The guild a session's characters are told about, or None while its Server Context
+    is off. The one test for both halves: the block in the prompt and the emoji swap on
+    the reply, so a character is never shown a list it cannot use, or the reverse."""
+    if not session or not session.get("server_context", True):
+        return None
+    return getattr(channel, "guild", None)
+
+
+def server_emojis(guild) -> Dict[str, str]:
+    """name -> markup for the custom emojis a character may write in `guild`.
+
+    Sorted and capped, so the list is identical on every call and the system instruction
+    it sits in stays cached. Role-restricted emojis are left out -- a webhook holds no
+    role -- and so is one the server lost with its boost level (`available`)."""
+    out: Dict[str, str] = {}
+    for emoji in sorted(guild.emojis, key=lambda e: e.name):
+        if emoji.available and not emoji.roles:
+            out.setdefault(emoji.name, str(emoji))
+            if len(out) >= LIMIT_SERVER_EMOJIS:
+                break
+    return out
+
+
+#: `:name:` written for a custom emoji. Not the middle of `<:name:id>` or `<a:name:id>`,
+#: and not `1:30:` -- a colon run touching a word character is not a shortcode.
+_EMOJI_SHORTCODE = re.compile(r"(?<![<\w]):(\w{2,32}):(?!\d)")
+
+
+def expand_server_emojis(text: str, guild) -> str:
+    """Each `:name:` naming one of `guild`'s custom emojis, written as Discord's markup. A
+    bot's message is never converted by the client the way a person's is, so without
+    this the shortcode the prompt asked for posts as text. Unknown names are left as typed."""
+    if not text or ":" not in text:
+        return text
+    emojis = server_emojis(guild)
+    if not emojis:
+        return text
+    return _EMOJI_SHORTCODE.sub(lambda m: emojis.get(m.group(1), m.group(0)), text)
+
+
+def server_context_block(channel) -> Optional[str]:
+    """`<server_context>`: where the conversation is, for the system instruction.
+
+    Everything in it changes only when an admin edits it -- names, the topic, the emoji
+    list -- so it costs one cache miss per edit. Nothing live (members, presence) belongs
+    here: it would re-bill the whole transcript behind it on every call."""
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        return None
+    parent = getattr(channel, "parent", None)
+    where = (f"#{parent.name} › {channel.name}" if isinstance(channel, discord.Thread) and parent
+             else f"#{channel.name}")
+    lines = [f"Server: {guild.name}", f"Channel: {where}"]
+    topic = getattr(channel, "topic", None) or getattr(parent, "topic", None)
+    if topic:
+        lines.append(f"Channel topic: {' '.join(topic.split())[:SERVER_TOPIC_MAX_CHARS]}")
+    emojis = server_emojis(guild)
+    if emojis:
+        lines.append("Custom emojis you may use, written as :name: -- "
+                     + " ".join(f":{name}:" for name in emojis))
+    return "<server_context>\n" + "\n".join(lines) + "\n</server_context>"
+
+
+# --- Imported text -------------------------------------------------------------------
+
+#: An HTML comment, which a renderer hides and a model reads in full. Closed by `-->` or
+#: the end of the text, so an unclosed one is one match rather than a rescan per `<!--`.
+_HTML_COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
+#: The format characters real writing needs: the joiners Persian, Indic scripts and emoji
+#: are spelled with, and the left-to-right and right-to-left marks. None of them hides a word.
+_KEPT_FORMAT_CHARS = frozenset("\u200c\u200d\u200e\u200f")
+
+
+def clean_imported_text(text: Any, limit: int) -> str:
+    """Text from a file someone else wrote, as no more than a person could have typed.
+
+    Cut to `limit` first -- the editor's own cap, and what bounds the tag scrub below.
+    Then drops HTML comments; invisible format characters (Unicode Cf: zero-width spaces,
+    bidi overrides that reorder what a reviewer sees, and the U+E0000 tag block, which a
+    model reads and a person never sees), bar `_KEPT_FORMAT_CHARS`; and this bot's own
+    prompt tags, so imported text cannot close `<persona_profile>` and open something it is not.
+    """
+    if not isinstance(text, str):
+        return ""
+    text = _HTML_COMMENT.sub("", text[:limit])
+    text = "".join(c for c in text if c in _KEPT_FORMAT_CHARS or unicodedata.category(c) != "Cf")
+    return PATTERN_SYSTEM_XML_ORPHANS.sub("", text).strip()

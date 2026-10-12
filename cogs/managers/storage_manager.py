@@ -428,7 +428,7 @@ class StorageManager:
         Returns None under `strict` when the name resolves to no PID, and the write
         callers below turn that into a no-op rather than a phantom directory.
         """
-        if shard_type in ["ltm", "training"]:
+        if shard_type in ["ltm", "training", "bonds"]:
             pm = self.cog.profile_manager
             pid = (pm._get_pid_from_name(int(entity_id), sub_key) if strict
                    else pm._get_pid_from_name_any(int(entity_id), sub_key))

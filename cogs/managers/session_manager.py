@@ -1054,6 +1054,7 @@ class SessionManager:
                         "max_responses": session_data.get("max_responses", 10),
                         "settle": session_data.get("settle", {}),
                         "name_wakewords": session_data.get("name_wakewords", True),
+                        "server_context": session_data.get("server_context", True),
                     }
                     if channel is None and not guild.unavailable:
                         uncached.append(channel_id)
@@ -1192,6 +1193,7 @@ class SessionManager:
                     "max_responses": session_data.get("max_responses", 10),
                     "settle": session_data.get("settle", {}),
                     "name_wakewords": bool(session_data.get("name_wakewords", True)),
+                    "server_context": bool(session_data.get("server_context", True)),
                 }
 
                 current_server_sessions[server_id_str][category][str(channel_id)] = blueprint
@@ -1492,6 +1494,7 @@ class SessionManager:
                             "max_responses": session_config.get("max_responses", 10),
                             "settle": session_config.get("settle", {}),
                             "name_wakewords": session_config.get("name_wakewords", True),
+                            "server_context": session_config.get("server_context", True),
                         }
                         self.cog.multi_profile_channels[channel_id] = session
                     else:
@@ -1508,6 +1511,7 @@ class SessionManager:
                         session["max_responses"] = session_config.get("max_responses", 10)
                         session["settle"] = session_config.get("settle", {})
                         session["name_wakewords"] = session_config.get("name_wakewords", True)
+                        session["server_context"] = session_config.get("server_context", True)
 
         if not session: return None
 
@@ -1991,7 +1995,8 @@ class SessionManager:
 
     @staticmethod
     def next_reaction_speaker(session: Dict, reacted_to: Optional[Dict]) -> Optional[Dict]:
-        """Who a 🍿 or ⏯️ hands the floor to, or None when nobody is seated.
+        """Who a 🍿 or ▶️ hands the floor to, or None when nobody is seated. (⏯️ hands it to
+        the message's own author, in the listener.)
 
         `reacted_to` is the seated participant who wrote the message, or None when that
         profile has since left the cast. The press still asks the scene to carry on, so
@@ -2048,7 +2053,7 @@ class SessionManager:
 
     @staticmethod
     def note_reaction_queued(session: Dict, key: Tuple[int, str]) -> None:
-        """Record a 🍿 or ⏯️ trigger as waiting in the queue, keyed `(message_id, emoji)`."""
+        """Record a 🍿, ▶️ or ⏯️ trigger as waiting in the queue, keyed `(message_id, emoji)`."""
         session.setdefault('queued_reaction_triggers', set()).add(key)
 
     @staticmethod

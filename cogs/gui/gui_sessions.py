@@ -2135,6 +2135,12 @@ class SessionConfigView(BlockedGuard, ui.View):
                    "this off.\n\n"
                    "Messages sent while a character is replying always go into the next "
                    "round together, whatever this is set to."),
+        "server": ("Server Context",
+                   "Tells every character in the cast where it is: this server's name, the "
+                   "channel's name and topic, and the server's custom emojis, which it can then "
+                   "use in its replies.\n\n"
+                   "It changes only when the server does, so providers keep caching it. "
+                   "Emojis limited to certain roles are left out."),
     }
 
     def _config_summary(self, key: str) -> str:
@@ -2147,6 +2153,8 @@ class SessionConfigView(BlockedGuard, ui.View):
             return "On" if self.session.get("audio_mode", "off") == "on" else "Off"
         if key == "limit":
             return f"{self.session.get('max_responses', 10)} per round"
+        if key == "server":
+            return "On" if self.session.get("server_context", True) else "Off"
         quiet, burst_cap, typing_cap = self.cog.session_manager.settle_window(self.session)
         typing = f"typing {typing_cap:g}s" if typing_cap else "typing off"
         return f"{quiet:g}s quiet · {burst_cap:g}s max · {typing}"
@@ -2204,6 +2212,12 @@ class SessionConfigView(BlockedGuard, ui.View):
             embed.add_field(name="Current", value=f"`{session.get('max_responses', 10)}` per round",
                             inline=False)
             self._add_modal_button("Edit", ResponseLimitModal)
+        elif key == "server":
+            on = bool(session.get("server_context", True))
+            self._screen_button(
+                f"Server Context: {'On' if on else 'Off'}",
+                lambda: session.__setitem__("server_context", not on),
+                style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary)
         elif key == "settle":
             stored = session.get("settle") or {}
             values = self.cog.session_manager.settle_window(session)

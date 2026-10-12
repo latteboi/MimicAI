@@ -13,8 +13,8 @@ from ...utils.constants import (
 )
 from ...utils.helpers import (
     _format_history_entry, _resolve_safety_settings, _scrub_response_text,
-    resolve_native_tools, resolve_thinking_params, split_turn, suppress_link_previews,
-    tighten_line_spacing,
+    expand_server_emojis, resolve_native_tools, resolve_thinking_params, server_context_guild,
+    split_turn, suppress_link_previews, tighten_line_spacing,
 )
 from ...managers.session_manager import intern_turn
 from . import tool_loop
@@ -335,6 +335,9 @@ class SpeakAsMixin:
 
         text = tighten_line_spacing(_scrub_response_text(text, participant_names=names).strip(),
                                     self.cog.profile_manager.author_config(owner_id, profile_name))
+        guild = server_context_guild(session, channel)
+        if guild is not None:
+            text = expand_server_emojis(text, guild)
         if not text:
             return None, "The response was empty after cleanup."
         return text, None

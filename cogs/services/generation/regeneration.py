@@ -11,7 +11,8 @@ from ...utils.constants import (
 )
 from ...utils.helpers import (_format_history_entry, image_command_prefix,
                              is_citation_subtext, kickstart_note,
-                             resolve_critic_settings, turn_posted_at, whisper_recap)
+                             resolve_critic_settings, server_context_guild, turn_posted_at,
+                             whisper_recap)
 from ...managers.session_manager import round_reserve
 from ...utils.attachment_limits import over_attachment_limit
 from .reply import reply_gen_config, reply_meta
@@ -330,7 +331,8 @@ class RegenerationMixin:
             await self._update_sending_placeholder(
                 channel, participant.get('method', 'webhook'), bot_id, state_container, time.monotonic())
 
-            reply = self._reply_text(attempt, p_settings, owner_id, profile_name, participant_names)
+            reply = self._reply_text(attempt, p_settings, owner_id, profile_name, participant_names,
+                                     guild=server_context_guild(session, channel))
             # The warnings are shown, never recorded: the model would read them back as
             # something the character said.
             display_text = reply.text

@@ -28,7 +28,7 @@ from ..utils.constants import (
 )
 from ..utils.helpers import (
     _format_api_error, _format_citation_subtext, _resolve_zoneinfo, _scrub_response_text,
-    restamp_turn, turn_posted_at,
+    restamp_turn, turn_posted_at, server_context_guild,
     _format_history_entry, _get_user_hash, _resolve_safety_settings,
     _split_into_sentences_with_abbreviations, generated_image_attachment, sent_file_name,
     resolve_critic_settings, ltm_flag_enabled,
@@ -317,18 +317,18 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         if not active_participants:
             return []
 
+        # Where nothing else named who goes first, the seat called earliest does -- and as a
+        # reply's seat does, so it keeps that place in the rounds after.
+        if called and not starting_profile_override:
+            starting_profile_override = min(called, key=lambda c: c[0])[1]
+
         if starting_profile_override:
             start_p = starting_profile_override
             if start_p.get('is_skipped') or start_p not in active_participants:
                 start_p = active_participants[0]
 
             if session_mode == 'sequential':
-                try:
-                    start_idx = session['profiles'].index(start_p)
-                    new_order = session['profiles'][start_idx:] + session['profiles'][:start_idx]
-                    session['profiles'] = new_order
-                    self.cog.session_manager._save_multi_profile_sessions()
-                except ValueError: pass
+                self._turn_cast_to(session, start_p)
 
             if is_single_turn_only:
                 profile_order = [start_p]
@@ -344,12 +344,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 random.shuffle(profile_order)
             else:
                 profile_order = [p for p in rotated_cast(session) if p in active_participants]
-            if called:
-                # Moved, not rotated in as a reply's seat is: that saves the cast, and a
-                # name is said on most rounds.
-                first = min(called, key=lambda c: c[0])[1]
-                profile_order.remove(first)
-                profile_order.insert(0, first)
 
         # Apply response limit if set
         max_responses = session.get("max_responses", 10)
@@ -380,27 +374,49 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
         return profile_order
 
+    def _turn_cast_to(self, session, seat) -> None:
+        """Turns the cast to start at `seat`, and saves it: the place a seat that was called
+        on -- replied to, @'d, reacted to, named -- keeps, so the rounds after go on from it
+        rather than from where the cast stood. Sequential sessions only; the caller asks.
+        A seat outside the cast (a reply's ephemeral one) changes nothing."""
+        profiles = session.get('profiles') or []
+        if seat in profiles:
+            start = profiles.index(seat)
+            if start:
+                session['profiles'] = profiles[start:] + profiles[:start]
+                self.cog.session_manager._save_multi_profile_sessions()
+
     def _give_next_turn(self, session, channel, profile_order, i, seat, capped=True) -> bool:
         """Puts `seat` at `profile_order[i + 1]`, moved up if it is waiting, brought in if
         not. False, and nothing moved, where it may not speak.
+
+        In a sequential session the seats still waiting then go on round the cast from it,
+        and the cast turns to start there (`_turn_cast_to`), as a round started by a reply
+        to it would: a seat called mid-round keeps the place it was called to.
 
         Brought in past `max_responses` while `capped`, it takes the last waiting seat's
         turn, and with nobody waiting it is not brought in.
         """
         waiting = profile_order[i + 1:]
-        if seat in waiting:
-            # By index: a seat a user called back can also be in the order behind `i`.
-            del profile_order[i + 1 + waiting.index(seat)]
+        brought_in = seat not in waiting
+        if not brought_in:
+            # By value from `waiting`: a seat a user called back can also be in the order
+            # behind `i`, and that copy has spoken.
+            waiting.remove(seat)
         elif (seat.get('is_skipped')
               or not self.cog.profile_manager._check_unrestricted_safety_policy(
                   seat['owner_id'], seat['profile_name'], channel)
               or self._delivery_refused(seat, channel)):
             return False
-        elif capped and len(profile_order) >= session.get("max_responses", 10):
-            if not waiting:
-                return False
-            profile_order.pop()
-        profile_order.insert(i + 1, seat)
+        elif capped and len(profile_order) >= session.get("max_responses", 10) and not waiting:
+            return False
+        if session.get("session_mode", "sequential") == 'sequential' and seat in session.get('profiles', []):
+            self._turn_cast_to(session, seat)
+            ring = session['profiles']
+            waiting.sort(key=lambda p: ring.index(p) if p in ring else len(ring))
+        if brought_in and capped and len(profile_order) >= session.get("max_responses", 10):
+            waiting.pop()
+        profile_order[i + 1:] = [seat] + waiting
         return True
 
     def _hand_on(self, session, channel, profile_order, i, reply_text) -> None:
@@ -1481,7 +1497,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             raise
                         response = attempt.response
 
-                        reply = self._reply_text(attempt, p_settings, owner_id, profile_name, all_participant_names)
+                        reply = self._reply_text(attempt, p_settings, owner_id, profile_name, all_participant_names,
+                                                 guild=server_context_guild(session, channel))
                         response_text, was_blocked, parsed_neuro_state = reply.text, reply.blocked, reply.neuro_state
                         # A blocked reply is not one worth remembering. On the seat, in memory
                         # like `_ltm_retry_at`, for `_ltm_due` at this round's end.

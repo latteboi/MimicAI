@@ -848,6 +848,8 @@ MOD_PROMPT_CATEGORIES = [
         ("Training Data Injection", "TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION),
         ("Neuro-Endocrine Engine", "NEURO_DEFINITION", DEFAULT_NEURO_DEFINITION),
         ("Neuro-Endocrine State", "NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION),
+        ("Bonds", "BOND_DEFINITION", DEFAULT_BOND_DEFINITION),
+        ("Bond State", "BOND_STATE", DEFAULT_BOND_INSTRUCTION),
         ("Content Policy (non-18+ channels)", "CONTENT_POLICY", DEFAULT_CONTENT_POLICY),
     ]),
     ("Turn Flow", [
@@ -893,6 +895,7 @@ MOD_PROMPT_CATEGORIES = [
     ]),
     ("Bot Utilities", [
         ("Profile Generator", "PROFILE_GENERATOR", DEFAULT_PROFILE_GENERATOR_PROMPT),
+        ("Character Card Import", "CARD_IMPORT", DEFAULT_CARD_IMPORT_PROMPT),
         ("Help Mode Protocol", "HELP_MODE_INJECTION", DEFAULT_HELP_MODE_INJECTION),
     ]),
 ]
@@ -916,6 +919,7 @@ MOD_PROMPT_PLACEHOLDERS: Dict[str, Tuple[Set[str], str]] = {
     "NEGATIVE_CONSTRAINTS": ({"constraints"}, "format"),
     "TRAINING_DATA_INJECTION": ({"examples_block"}, "format"),
     "NEURO_ENGINE": ({"d", "c", "o", "a"}, "format"),
+    "BOND_STATE": ({"bonds"}, "format"),
     "WHISPER_INJECTION": ({"whisper_content"}, "format"),
     "WHISPER_RECAP": ({"whispers"}, "format"),
     "DIRECTOR_USER_PROMPT": ({"history"}, "format"),
@@ -932,6 +936,7 @@ MOD_PROMPT_PLACEHOLDERS: Dict[str, Tuple[Set[str], str]] = {
     "ANTI_REPETITION": ({"char_name"}, "format"),
     "TRAINING_ANALYST": ({"verbosity", "examples_block"}, "format"),
     "PROFILE_GENERATOR": ({"prompt"}, "format"),
+    "CARD_IMPORT": ({"prompt"}, "format"),
     "HELP_MODE_INJECTION": ({"docs"}, "replace"),
 }
 
@@ -1178,7 +1183,7 @@ def _slots(*pairs) -> tuple:
 _PROFILE_KEYS = ("primary_model", "fallback_model", "ollama_host_url")
 
 #: The categories shipping a chain per provider preference, which the audience button switches.
-_BY_PROVIDER_CATEGORIES = ("describer", "classifier")
+_BY_PROVIDER_CATEGORIES = ("describer", "classifier", "generator")
 
 #: MimicAI Auto, one category per tier and slot: each is a Primary and a Fallback, and a tab
 #: holds three slots at most. Response's tab is the tier's own `auto_<tier>`; the others
@@ -1208,6 +1213,8 @@ _SYSTEM_MODEL_NOTES = {
     "classifier": ("Sees the persona and the avatar, so pick models that read images. Runs on the "
                    "profile owner's key, else yours; on yours, OpenRouter is sent "
                    "`data_collection: deny`."),
+    "generator": ("Writes `/profile generate` drafts and sorts imported character cards, on the "
+                  "user's own key. A user's Override Defaults for Response win over these."),
     "embedding": ("⚠️ Changing this degrades recall of **every existing memory and "
                   "training example**. A Google model also runs through OpenRouter's `google/` "
                   "copy; any other OpenRouter model runs on OpenRouter keys only."),
@@ -1231,6 +1238,7 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
     _CATEGORY_LABELS = (
         ("describer", "Attachment Describer", "Reads an attachment for a profile whose models cannot."),
         ("classifier", "Content Classifier", "Rates every profile General or 18+."),
+        ("generator", "Profile Generator", "Drafts profiles, and sorts imported character cards."),
         ("embedding", "Embeddings", "The vectors behind memory, training-example and /help recall."),
         ("system", "System Profiles", "The models behind each System profile's replies."),
         ("key_check", "Key Checks", "Tests a pasted Gemini key, then whether it has billing."),
@@ -1241,6 +1249,7 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
                             ("describer_final_model", "Final Fallback")),
         "classifier": _slots(("classifier_model", "Primary"), ("classifier_fallback_model", "Fallback"),
                              ("classifier_final_model", "Final Fallback")),
+        "generator": _slots(("generator_model", "Primary"), ("generator_fallback_model", "Fallback")),
         "embedding": _slots(("embedding_model", "Embedding Model")),
         "system": _slots(("primary_model", "Primary"), ("fallback_model", "Fallback")),
         "key_check": _slots(("key_check_model", "Validity Check"),
@@ -1250,9 +1259,9 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
     }
     #: Everything but the System profiles runs for every user, and Ollama answers the bot
     #: owner's own profiles only -- which the System profiles are.
-    _NO_OLLAMA_CATEGORIES = ("describer", "classifier", "embedding", "key_check")
+    _NO_OLLAMA_CATEGORIES = ("describer", "classifier", "generator", "embedding", "key_check")
     _NO_RETRY_KEYS = ("describer_fallback_model", "describer_final_model",
-                      "classifier_fallback_model", "classifier_final_model",
+                      "classifier_fallback_model", "classifier_final_model", "generator_fallback_model",
                       *(key for (tier, _slot), keys in AUTO_TIER_KEYS.items()
                         for key in keys if tier != "free" or key != keys[0]))
     #: No tab has a row to spare for a browse list: three slots and a button row fill

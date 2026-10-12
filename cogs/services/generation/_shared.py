@@ -1,6 +1,7 @@
 import re
 from typing import Tuple
 
+from ...utils.bonds import BOND_TAG_PATTERN
 from ...utils.helpers import _scrub_response_text
 
 #: The neuro engine's report, as the prompt asks for it, and bare, as a model that drops
@@ -30,8 +31,8 @@ def take_memory_flag(raw_text: str) -> Tuple[str, bool]:
 
 
 def _strip_neuro_update_and_scrub(raw_text: str, participant_names) -> str:
-    """Strips <neuro_update> blocks, D:/C:/O:/A: state headers and a memory flag before running the standard response scrub."""
-    temp_clean = NEURO_TAG_PATTERN.sub('', raw_text)
+    """Strips <neuro_update> and <bond_update> blocks, D:/C:/O:/A: state headers and a memory flag before running the standard response scrub."""
+    temp_clean = BOND_TAG_PATTERN.sub('', NEURO_TAG_PATTERN.sub('', raw_text))
     temp_clean = NEURO_BARE_PATTERN.sub('', temp_clean)
     temp_clean = MEMORY_FLAG_PATTERN.sub('', temp_clean)
     return _scrub_response_text(temp_clean, participant_names=participant_names)

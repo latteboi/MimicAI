@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import discord
+
 from ...utils import mem_probe
 from ...utils.constants import (
     ERR_GENERAL_ERROR, ERR_REASON_EMPTY_RESPONSE, ERR_REASON_EMPTY_STOPPED, ERR_REASON_STALLED,
@@ -23,7 +25,7 @@ from ...utils.constants import (
 )
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _resolve_safety_settings, _scrub_response_text,
-    clean_model_name, is_real_model, media_kinds, record_billed_usage,
+    clean_model_name, expand_server_emojis, is_real_model, media_kinds, record_billed_usage,
     resolve_native_tools,
     resolve_thinking_params, resolve_unreadable_media_mode, split_media_parts,
     tighten_line_spacing,
@@ -637,10 +639,13 @@ class ReplyMixin:
             attempt.status = "success"
 
     def _reply_text(self, attempt: ReplyAttempt, p_settings: Dict, owner_id: int,
-                    profile_name: str, participant_names: List[str]) -> ReplyText:
+                    profile_name: str, participant_names: List[str],
+                    guild: Optional[discord.Guild] = None) -> ReplyText:
         """The text to post and record, the warnings to show under it, and what it cites.
 
-        Applies the neuro state the reply carries, as a side effect of reading it.
+        Applies the neuro state the reply carries, as a side effect of reading it. `guild` is
+        `server_context_guild`'s: the server whose custom emojis `:name:` is written as, so
+        the log holds what was posted.
         """
         error_text = p_settings.get("error_response", ERR_GENERAL_ERROR)
         reply = ReplyText(text=error_text)
@@ -677,6 +682,8 @@ class ReplyMixin:
                 text = tighten_line_spacing(
                     _scrub_response_text(raw_text, participant_names=participant_names),
                     self.cog.profile_manager.author_config(owner_id, profile_name))
+                if guild is not None:
+                    text = expand_server_emojis(text, guild)
                 if text:
                     # Both halves: what the answering response cited natively, and what
                     # the character's own `search_web` calls brought back. Deduplicated

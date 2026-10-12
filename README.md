@@ -145,7 +145,7 @@ neuro-endocrine engine that carries four emotional variables between turns.
 
 `/export` and `/import` move profiles and memories as encrypted `.mimic` files. A standard
 export imports only on the instance that made it; a passphrase export moves to a
-self-hosted one. The official instance imports nothing from other instances.
+self-hosted one. `/import` also reads SillyTavern and Chub character cards, PNG or JSON.
 `/privacy` covers data deletion. Server administrators get channel suspension and purge;
 the bot owner gets a `/mod` dashboard with a blacklist, an automatic moderator, and a
 content classifier that confines profiles declared 18+ to age-restricted channels.
