@@ -1,0 +1,20 @@
+v0.7.1 Beta — 2026-10-12 (UTC)
+Characters remember how they feel about each person, change face with their mood, know the server they are in and answer to their names.
+## **Added**
+- **Bonds** (`/profile manage` → Neuro Engine): a second switch beside the hormones. The character keeps Affection and Resentment, 0–100, for each person it talks to, characters included. A first meeting sets both freely; after that each moves 15 at most a reply. Up to 100 people; Reset bonds clears them.
+- **Mood avatars** (Neuro Engine → Mood avatars…): an avatar each for high joy, stress, affection and excitement, worn while that level is at or above 70, or a level you set.
+- **Server Context** (`/session config` → Server Context): characters know the server's name, the channel's name and topic, and the server's custom emojis, which they can use. On by default.
+- **Character cards**: `/import` takes a SillyTavern or Chub card, PNG or JSON. Its text becomes a draft to review, its example exchanges training examples, its picture the avatar. A card tagged NSFW is saved as Adult 18+.
+- **Lorebooks** (`/profile manage` → Training → Manage Lorebook): up to 50 entries a character is handed when a keyword comes up. A card's lorebook comes with it; `/import` with `profile_name` adds a SillyTavern World Info file to a profile you own.
+- **Line Spacing** (`/profile manage` → Misc → Line Spacing): removes the blank lines a model pads a reply with, keeping only the gaps you choose. Off by default.
+- **Names as Wakewords** (`/session config` → Reactivity): a character's name is a wakeword, so saying it gets an answer whatever its Chance. A character naming another in its reply hands that one the next turn. On by default.
+- **⏯️ Speak Again**: react to give that message's own author one more turn. ▶️ still gives the next participant one.
+- **`/mod` → System Models → Profile Generator**: the bot owner picks the models `/profile generate` drafts with.
+## **Changed**
+- **Called characters keep their place** in sequential sessions: one called by a reply, mention, reaction or name speaks from there, and the rest follow round the cast from it, in this round and later ones. Random sessions only move it up.
+- **Speech and generated images are named** after the speaker and how their words begin, `Mira_hello-there-traveller.wav`, so a reply to one tells the model what it said.
+- **`/purge`** works in a DM with the bot, where anyone can delete its latest messages. `/clear` is gone.
+- **Export for Self-Hosted** files now import into the official bot too.
+- **OpenRouter's shipped models**: Ling 3.0 Flash VL, then OpenRouter's free router, replace Space Bunny for describing media, the critic and memory. Auto · Free runs the free router alone.
+## **Fixed**
+- **Characters can no longer ping @everyone or roles**, whatever a persona or a message tells them to write.
