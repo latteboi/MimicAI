@@ -1136,6 +1136,8 @@ class ChildBotManager:
                 "is_child_bot": True, "bot_id": bot_id, "author_id": message_data['author_id'],
                 "channel_id": channel_id, "guild_id": guild_id, "original_message_id": message_data['id'],
                 "original_content": message_data['content'], "prompt_text": final_prompt_text,
+                # The prompt as asked, before appearance or grounding: what the file is named after.
+                "image_prompt": prompt_text,
                 "effective_profile_owner_id": owner_id, "effective_profile_name": profile_name,
                 "bot_display_name": bot_display_name, "safety_settings": dynamic_safety_settings,
                 "system_instruction": system_instruction, "reference_image_urls": reference_image_urls,

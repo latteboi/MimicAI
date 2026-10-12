@@ -30,7 +30,7 @@ from ..utils.helpers import (
     _format_api_error, _format_citation_subtext, _resolve_zoneinfo, _scrub_response_text,
     restamp_turn, turn_posted_at,
     _format_history_entry, _get_user_hash, _resolve_safety_settings,
-    _split_into_sentences_with_abbreviations, generated_image_attachment,
+    _split_into_sentences_with_abbreviations, generated_image_attachment, sent_file_name,
     resolve_critic_settings, ltm_flag_enabled,
     image_command_prompt, image_rag_enabled, is_gateway_shutdown, kickstart_note, whisper_recap,
     resolve_grounding_mode,
@@ -1728,14 +1728,16 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 else:
                                     audio_file_for_send = discord.File(
                                         turn_audio_path,
-                                        filename=f"voice_{turn_id[:4]}{os.path.splitext(turn_audio_path)[1]}")
+                                        filename=sent_file_name(speaker_display_name, response_text,
+                                                                os.path.splitext(turn_audio_path)[1], "voice"))
 
                     file_to_send = None
                     extra_audio_file = None
                     if is_generator and generated_image_path_for_round:
                         file_to_send = discord.File(
                             generated_image_path_for_round,
-                            filename=generated_image_attachment(generated_image_path_for_round)[0])
+                            filename=generated_image_attachment(
+                                generated_image_path_for_round, generator_display_name, image_gen_prompt)[0])
                         if audio_file_for_send:
                             extra_audio_file = audio_file_for_send
                     elif audio_file_for_send:
@@ -1807,7 +1809,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             attachment_data = None
                             if is_generator and generated_image_path_for_round:
                                 attachment_data = {
-                                    "filename": generated_image_attachment(generated_image_path_for_round)[0],
+                                    "filename": generated_image_attachment(
+                                        generated_image_path_for_round, generator_display_name, image_gen_prompt)[0],
                                     "path": generated_image_path_for_round
                                 }
                             elif audio_file_for_send:

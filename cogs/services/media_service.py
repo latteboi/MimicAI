@@ -547,7 +547,9 @@ class MediaService:
                         if package.get('generated_image_path') and not package.get('failure_reason'):
                             image_file_to_send = discord.File(
                                 package['generated_image_path'],
-                                filename=generated_image_attachment(package['generated_image_path'])[0])
+                                filename=generated_image_attachment(
+                                    package['generated_image_path'], package.get('bot_display_name', ''),
+                                    package.get('image_prompt', ''))[0])
 
                         final_response_text = response_text
                         is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
@@ -602,7 +604,9 @@ class MediaService:
                             # in-process asyncio.Queue cost ~4x its size in live
                             # copies and bought nothing.
                             payload["attachment"] = {
-                                "filename": generated_image_attachment(package['generated_image_path'])[0],
+                                "filename": generated_image_attachment(
+                                    package['generated_image_path'], package.get('bot_display_name', ''),
+                                    package.get('image_prompt', ''))[0],
                                 "path": package['generated_image_path'],
                             }
                         await self.cog.manager_queue.put({"action": "send_to_child", "bot_id": package['bot_id'], "payload": payload})
@@ -912,9 +916,9 @@ class MediaService:
             appearance_lines_encrypted = persona.get("appearance", [])
             appearance_text = "\n".join([self.cog.storage_manager._decrypt_data(line) for line in appearance_lines_encrypted])
 
-            bot_display_name = self.cog.bot.user.display_name
-            appearance_data = self.cog.user_appearances.get(str(effective_profile_owner_id), {}).get(effective_profile_name, {})
-            if appearance_data and appearance_data.get("custom_display_name"): bot_display_name = appearance_data.get("custom_display_name")
+            # The profile's own name and face, set or not -- never the bot's.
+            bot_display_name, avatar_url = self.cog.generation_service._resolve_appearance_data(
+                effective_profile_owner_id, effective_profile_name)
 
             final_prompt_text = prompt_text
             if appearance_text.strip():
@@ -928,8 +932,6 @@ class MediaService:
                     final_prompt_text = appearance_template.format(appearance=appearance_text.strip(), prompt=prompt_text)
 
             system_instruction = self._get_image_gen_system_instruction(effective_profile_owner_id, effective_profile_name)
-            appearance_data = self.cog.user_appearances.get(str(effective_profile_owner_id), {}).get(effective_profile_name, {})
-            if appearance_data and appearance_data.get("custom_display_name"): bot_display_name = appearance_data.get("custom_display_name")
 
             reference_image_urls = []
             if message.reference and message.reference.message_id:
@@ -986,8 +988,10 @@ class MediaService:
             request_data = {
                 "is_child_bot": False, "author_id": message.author.id, "channel_id": message.channel.id, "guild_id": message.guild.id,
                 "original_message_id": message.id, "original_content": message.content, "prompt_text": final_prompt_text, 
+                # The prompt as asked, before appearance or grounding: what the file is named after.
+                "image_prompt": prompt_text,
                 "effective_profile_owner_id": effective_profile_owner_id, "effective_profile_name": effective_profile_name, 
-                "bot_display_name": bot_display_name, "safety_settings": dynamic_safety_settings,
+                "bot_display_name": bot_display_name, "avatar_url": avatar_url, "safety_settings": dynamic_safety_settings,
                 "system_instruction": system_instruction, "reference_image_urls": reference_image_urls, "placeholder_message": placeholder_message,
                 "grounding_sources": grounding_sources,
                 "image_generation_model": profile_data.get("image_generation_model", DEFAULT_IMAGE_MODEL),

@@ -1,6 +1,7 @@
 import os
 import re
 import zlib
+import unicodedata
 import hashlib
 import asyncio
 import platform
@@ -1053,6 +1054,32 @@ def speakable_text(text: str, keep_tags: bool = False, vocal_tags: bool = False)
     return _SPACES.sub(" ", text).strip()
 
 
+#: A spoiler, `||like this||`.
+_SPOILER = re.compile(r"\|\|.+?\|\|", re.DOTALL)
+
+
+def _filename_slug(text: str, limit: int) -> str:
+    """`text` as ASCII words joined by hyphens, cut at a word boundary to `limit` characters."""
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().replace("'", "")
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-")
+    return slug if len(slug) <= limit else slug[:limit + 1].rsplit("-", 1)[0][:limit]
+
+
+def sent_file_name(speaker: str, text: str, suffix: str, fallback: str) -> str:
+    """What a file a character sends is called: who sent it and how it starts,
+    `Mira_hello-there-traveller.wav`.
+
+    Discord titles an audio player with it, and a reply to the message hands it to the model
+    as `[Attached Audio: ...]` -- all a model that cannot hear the clip gets of it. A spoiler
+    in the text spoils the file too, and stays out of its name: speech reads one out in clear.
+    ASCII only, since non-ASCII names are not known to survive Discord.
+    """
+    text = text or ""
+    words = _filename_slug(speakable_text(_SPOILER.sub(" ", text)).lower(), 40)
+    name = "_".join(part for part in (_filename_slug(speaker or "", 24), words) if part) or fallback
+    return ("SPOILER_" if _SPOILER.search(text) else "") + name + suffix
+
+
 #: model id -> `image_model_caps` for OpenRouter's image models, installed whole by the image
 #: catalogue each time it loads or syncs. A registry rather than a catalogue lookup because
 #: the pickers, the request path and /profile manage all ask `image_model_caps`, and a utils
@@ -1199,14 +1226,16 @@ def image_suffix_for_mime(mime_type: Optional[str]) -> str:
     return IMAGE_MIME_SUFFIXES.get(str(mime_type or "").split(";", 1)[0].strip().lower(), ".png")
 
 
-def generated_image_attachment(path: Optional[str]) -> Tuple[str, str]:
-    """(filename, mime type) for a generated image, read back off the suffix it was saved under.
+def generated_image_attachment(path: Optional[str], speaker: str = "", prompt: str = "") -> Tuple[str, str]:
+    """(filename, mime type) for a generated image, read back off the suffix it was saved under,
+    and named by `sent_file_name` after the first line of its prompt: grounding goes below it.
 
     The suffix is the one place the type survives from the response to the send: a path is
     all that moves between the image workers, the round and the child bots.
     """
     mime_type = IMAGE_SUFFIX_MIMES.get(os.path.splitext(path or "")[1].lower(), "image/png")
-    return f"generated_image{IMAGE_MIME_SUFFIXES[mime_type]}", mime_type
+    return (sent_file_name(speaker, (prompt or "").split("\n", 1)[0], IMAGE_MIME_SUFFIXES[mime_type],
+                           "generated_image"), mime_type)
 
 
 def google_thinking_caps(model_name: Optional[str]) -> Dict[str, Any]:
