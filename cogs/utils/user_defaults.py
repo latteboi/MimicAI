@@ -249,19 +249,18 @@ def _served(primary_key: str, provider: str) -> List[str]:
 
 @functools.lru_cache(maxsize=None)
 def shipped_chain(primary_key: str, preferred: Optional[str]) -> Tuple[str, ...]:
-    """Primary, Fallback and Final Fallback, as a category ships them for this preference.
+    """Primary and Fallback, as a category ships them for this preference.
 
     The preferred provider's models, then the other's. A provider serving fewer than two
-    -- OpenRouter ships one researcher -- gives its places to the next in line, so the
-    chain is as long as there are models to fill it. Cached: the table is fixed at
-    import and this is read on every utility call.
+    -- OpenRouter ships one researcher -- gives the Fallback's place to the other. Cached:
+    the table is fixed at import and this is read on every utility call.
     """
     preferred = preferred if preferred in MODEL_PROVIDERS else "gemini"
     chain: List[str] = []
     for name in _served(primary_key, preferred) + _served(primary_key, other_provider(preferred)):
         if name not in chain:
             chain.append(name)
-    return tuple(chain[:3])
+    return tuple(chain[:2])
 
 
 def model_slot_defaults(preferred: Optional[str]) -> Dict[str, str]:
@@ -281,17 +280,11 @@ def model_slot_defaults(preferred: Optional[str]) -> Dict[str, str]:
     return out
 
 
-def final_fallback_enabled(config: Optional[Dict[str, Any]]) -> bool:
-    """A profile's Final Fallback switch. Unset is off: the Final runs on the provider the
-    Primary is not on, which its owner may never have meant to spend on."""
-    return (config or {}).get("final_fallback_enabled") is True
-
-
-def final_fallback(primary_key: str, primary: str, fallback: Optional[str],
-                   preferred: Optional[str]) -> Optional[str]:
+def cross_provider_model(primary_key: str, primary: str, fallback: Optional[str],
+                         preferred: Optional[str]) -> Optional[str]:
     """The category's first shipped model on the provider `primary` is not on.
 
-    Keyed to the Primary rather than to the preference: a profile someone moved onto the
+    Keyed to the Primary rather than to the preference: a summariser someone moved onto the
     other provider by hand is still left with a way out when that provider fails.
     """
     side = model_provider(primary)
@@ -304,10 +297,12 @@ def model_chain(config: Optional[Dict[str, Any]], primary_key: str,
                 preferred: Optional[str]) -> Tuple[str, Tuple[str, ...]]:
     """(primary, fallbacks) for one category of one profile, as `run_with_fallback` takes them.
 
-    The profile's own Primary and Fallback, or the shipped ones where it set none, then the
-    Final Fallback where `config` turns it on. An explicit NO_FALLBACK stops at the Primary,
-    Final included: it has always meant "do not retry on anything". `config` must be the
-    profile's own, or carry its `final_fallback_enabled`: a partial one reads as off.
+    The profile's own Primary and Fallback, or the shipped ones where it set none. An
+    explicit NO_FALLBACK stops at the Primary: it has always meant "do not retry on anything".
+
+    `cross_provider_fallback` is no profile's setting: compaction and the Director put it in
+    the config they build, for a chain billed to a server key that may hold either provider
+    (`compaction_model_config`). It adds `cross_provider_model` behind the Fallback.
     """
     config = config or {}
     shipped = shipped_chain(primary_key, preferred)
@@ -316,9 +311,9 @@ def model_chain(config: Optional[Dict[str, Any]], primary_key: str,
     if stored and not is_real_model(stored):
         return primary, ()
     fallback = stored or (shipped[1] if len(shipped) > 1 else None)
-    final = (final_fallback(primary_key, primary, fallback, preferred)
-             if final_fallback_enabled(config) else None)
-    return primary, tuple(name for name in (fallback, final) if name)
+    other = (cross_provider_model(primary_key, primary, fallback, preferred)
+             if config.get("cross_provider_fallback") is True else None)
+    return primary, tuple(name for name in (fallback, other) if name)
 
 
 def model_slot_labels() -> Dict[str, str]:
@@ -398,7 +393,6 @@ SETTING_LABELS = {
     "speech_speed": "Speech Speed",
     "speech_language": "Speech Language",
     "show_fallback_indicator": "Fallback Indicator",
-    "final_fallback_enabled": "Final Fallback",
     "openrouter_service_tier": "OpenRouter Service Tier",
     "openrouter_endpoints": "OpenRouter Host Pins",
     "child_bot_placeholder": "Child Bot Placeholder",

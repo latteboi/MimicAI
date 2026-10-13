@@ -66,8 +66,7 @@ class DirectorModelView(BlockedGuard, ModelPickerMixin, ui.View):
 
     def _default(self, key: str) -> str:
         """The model a slot with no choice runs: the LTM summariser's, under the owner's provider."""
-        primary, fallbacks = self.cog.api_service.model_chain(
-            {"final_fallback_enabled": False}, "ltm_model", self.user_id)
+        primary, fallbacks = self.cog.api_service.model_chain({}, "ltm_model", self.user_id)
         return primary if key == "director_model" else (fallbacks[0] if fallbacks else NO_FALLBACK)
 
     def _chosen(self, key: str) -> Optional[str]:

@@ -25,14 +25,14 @@ def compaction_model_config(session: Dict[str, Any]) -> Dict[str, Optional[str]]
 
     Compaction is the LTM summariser's job on a whole scene, so it runs that category's
     chain -- `model_chain(this, "ltm_model", ...)` -- under the session owner's preference.
-    With its Final Fallback always: it is billed to the server's key, which may hold
-    either provider, and there is no profile to hang the switch on.
+    With the cross-provider fallback (`model_chain`): it is billed to the server's key,
+    which may hold either provider, and a failure here is silent.
     """
     raw = session.get("compaction") or {}
     chosen = {key: (str(raw.get(key) or "").strip() or None) for key in _SEEDED_MODELS}
     return {**{slot: None if chosen[key] == _SEEDED_MODELS[key] else chosen[key]
                for key, slot in (("model", "ltm_model"), ("fallback_model", "ltm_fallback_model"))},
-            "final_fallback_enabled": True}
+            "cross_provider_fallback": True}
 
 
 def resolve_compaction_settings(session: Dict[str, Any]) -> Dict[str, Any]:

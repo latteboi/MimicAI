@@ -347,9 +347,9 @@ class GlobalChatMixin:
             state_container = {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg,
                                "message_type": "embed"}
 
-            # The session reply's own path -- primary, fallback race, Final Fallback, the
-            # warnings -- on the host's key. It used to be a copy of it with the fallback
-            # retried by hand and no Final, and it drifted the way copies do.
+            # The session reply's own path -- primary, fallback race, the warnings -- on
+            # the host's key. It used to be a copy of it with the fallback retried by hand,
+            # and it drifted the way copies do.
             try:
                 attempt = await self._attempt_reply(
                     channel=interaction.channel,

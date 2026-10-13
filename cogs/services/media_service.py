@@ -80,7 +80,6 @@ class MediaService:
                                 voice_sample_of: Optional[tuple] = None,
                                 model_id: str = DEFAULT_SPEECH_MODEL, voice_name: str = DEFAULT_SPEECH_VOICE,
                                 temperature: float = 1.0, fallback_model_id: Optional[str] = None,
-                                final_fallback: bool = False,
                                 max_bytes: Optional[int] = None, speed: Optional[float] = None,
                                 language_code: Optional[str] = None) -> str:
         """Returns the path of an audio file of `transcript` spoken, and hands the file to the caller.
@@ -148,11 +147,8 @@ class MediaService:
                     timeout_retries -= 1
                     print(f"Text-to-speech: {name} timed out; retrying once for this turn.")
 
-        # The profile's two slots, then the Final Fallback on the other provider where
-        # `final_fallback` carries the profile's switch on.
         model_id, fallbacks = self.cog.api_service.model_chain(
-            {"speech_model": model_id, "speech_fallback_model": fallback_model_id,
-             "final_fallback_enabled": final_fallback},
+            {"speech_model": model_id, "speech_fallback_model": fallback_model_id},
             "speech_model", config_owner_id)
         path, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
             model_id, fallbacks, _attempt, label="Text-to-speech")
@@ -996,7 +992,6 @@ class MediaService:
                 "grounding_sources": grounding_sources,
                 "image_generation_model": profile_data.get("image_generation_model", DEFAULT_IMAGE_MODEL),
                 "image_generation_fallback_model": profile_data.get("image_generation_fallback_model"),
-                "final_fallback_enabled": profile_data.get("final_fallback_enabled"),
                 # Carried rather than re-read off the profile in the worker: the request
                 # may sit in the queue behind others while its owner edits the profile,
                 # and the image should come back the shape it was asked for.

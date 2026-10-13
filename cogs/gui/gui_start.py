@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from ..utils.constants import (CAST_POLICY_OPEN, DEFAULT_CAST_POLICY, MODEL_PROVIDERS,
                                PROVIDER_CHOICES, PROVIDER_NONE, defaultConfig)
 from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
-from ..utils.content import HELP_CATEGORIES, WIZARD_COPY, WIZARD_TOUR
+from ..utils.content import HELP_CATEGORIES, SERVER_KEY_PITCH, WIZARD_COPY, WIZARD_TOUR
 from .base_components import (BlockedGuard, DropdownContentView, TimeoutCleanupMixin, add_button,
                               add_select)
 from .gui_settings import (KEY_SLOTS, SLOT_PROVIDER, KeyScopeMixin, OverrideConfirmView,
@@ -388,7 +388,9 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
             key_line = "🔑 **This server** has no API key assigned yet — nothing here can generate"
 
         if s["is_admin"]:
-            return f"{where}🛡️ **Your role** Server administrator\n{key_line}"
+            # In the banner, not the key step: that field is near Discord's 1024 cap.
+            pitch = "" if s["server_has_key"] else f"\n\n{SERVER_KEY_PITCH}"
+            return f"{where}🛡️ **Your role** Server administrator\n{key_line}{pitch}"
         role = "👤 **Your role** Member (not an administrator)\n"
         if s["can_cast"]:
             note = ("This channel is on **Open casting** (anyone may add characters) — you "

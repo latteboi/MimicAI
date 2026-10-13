@@ -4192,11 +4192,11 @@ class ProfileManager:
 
         embed.add_field(name="\u200b", value="\u200b", inline=False)
 
-        # Each category's whole chain -- Primary, Fallback, then the Final Fallback on the
-        # other provider -- read from `model_chain`, the resolver its generation path calls,
-        # so this cannot name a model it skips or leave out one it tries. The Primary in bold on
-        # the label line, then each fallback on a subtext line of its own, as `GO/`/`OR/`/`OL/`
-        # and the bare model: the full ids ran three to a line and wrapped into a wall.
+        # Each category's whole chain, read from `model_chain`, the resolver its generation
+        # path calls, so this cannot name a model it skips or leave out one it tries. The
+        # Primary in bold on the label line, then each fallback on a subtext line of its own,
+        # as `GO/`/`OR/`/`OL/` and the bare model: the full ids ran three to a line and
+        # wrapped into a wall.
         preferred = self.provider_preference(user_id)
         stored = {**config, "primary_model": prim_model, "fallback_model": fall_model}
         resolved = resolve_auto_models(self.cog, stored)

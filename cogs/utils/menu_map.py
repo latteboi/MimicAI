@@ -78,9 +78,8 @@ _STATIC_DASHBOARDS = [
             ("Override Defaults", [
                 "Open once /start has registered you, as all of /settings is",
                 "Provider: Google, OpenRouter or None, stepped through by a button beside Clear. "
-                "Google and OpenRouter run every model Primary -> Fallback, then the Final "
-                "Fallback on the other where a profile turns it on; None ships no models, so "
-                "new profiles start on what Set Models here names",
+                "Google and OpenRouter run every model Primary -> Fallback; None ships no "
+                "models, so new profiles start on what Set Models here names",
                 "Standing preferences applied to profiles created LATER, and offered on borrows "
                 "(Use my defaults / Keep the original's)",
                 "The same tabs and settings as `/profile manage`: Params, Tools, Images, "

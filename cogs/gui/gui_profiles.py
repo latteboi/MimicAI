@@ -21,7 +21,7 @@ from ..utils.helpers import (
     resolve_unreadable_media_mode, system_model, auto_tier, resolve_auto_model,
     _format_api_error, speaks_verbatim, stored_google_voice,
 )
-from ..utils.user_defaults import auto_wording, final_fallback_enabled, model_provider, setting_label
+from ..utils.user_defaults import auto_wording, model_provider, setting_label
 from ..utils.birthdays import MONTH_NAMES, parse_birthday, valid_birthday
 
 if TYPE_CHECKING:
@@ -563,7 +563,7 @@ def _to_personal(view):
 def _images_on(config): return bool(config.get("image_generation_enabled"))
 def _tts_on(config):    return bool(config.get("speech_tts_enabled"))
 def _providers(view, key):
-    """Every provider `key`'s chain can reach, Final Fallback included."""
+    """Every provider `key`'s chain can reach."""
     primary, rest = view.cog.api_service.model_chain(view.config, key, view.user_id)
     return {model_provider(m) for m in (primary, *rest)}
 def _images(view): return _images_on(view.config)
@@ -712,10 +712,6 @@ def _render_grounding(ctx):
 
 def _render_url(ctx):
     return "URL Context", _mode_display(_url_mode(ctx["config"])), True
-
-
-def _render_final_fallback(ctx):
-    return "Final Fallback", _flag(final_fallback_enabled(ctx["config"])), True
 
 
 def _render_help_mode(ctx):
@@ -946,23 +942,6 @@ PROFILE_ACTIONS = (
                              "ltm_model", "ltm_fallback_model",
                              "ollama_host_url", "openrouter_service_tier",
                              "openrouter_endpoints"))),
-    # Unset is off. On, every category but grounding tries one more model after its
-    # Fallback, on the provider its Primary is not on -- `user_defaults.model_chain`.
-    _Action("final_fallback", "params", "Final Fallback",
-            "After the Fallback, try once more on the other provider.",
-            _open_screen("final_fallback"), render=_render_final_fallback,
-            screen=_Screen(_Toggle("final_fallback_enabled", "Final Fallback",
-                                   read=final_fallback_enabled),
-                           note="When the Primary and the Fallback both fail, try one more model "
-                                "on the other provider: Google when the Primary is on OpenRouter, "
-                                "OpenRouter when it is on Google. Off unless turned on here. "
-                                "Grounding has none -- only Google runs its search."),
-            bulk=_Bulk(_bulk_choice("Select action...",
-                                    [("Enable Final Fallback", "true"),
-                                     ("Disable Final Fallback", "false")],
-                                    to_payload=lambda v: {"final_fallback_enabled": v == "true"}),
-                       scope="all", label="Set Final Fallback", keys=("final_fallback_enabled",),
-                       description="Turn the Final Fallback on the other provider on or off.")),
     _Action("gen_params", "params", "Set Generation Parameters & STM", "Set Temp, Top P, Top K, and STM Length.",
             _modal("ProfileParamsModal"),
             bulk=_Bulk(_bulk_modal("ProfileParamsModal"), scope="all",

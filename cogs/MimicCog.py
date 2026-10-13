@@ -2221,8 +2221,8 @@ class MimicCog(EventListeners, commands.Cog):
                     raise ValueError("Empty or blocked response")
                 return getattr(resp, 'text', "")
 
-            # Primary, Fallback, then the Final Fallback on the other provider -- the chain
-            # every other model call runs, in place of a primary-then-fallback of its own.
+            # Primary then Fallback -- the chain every other model call runs, in place of
+            # one of its own.
             try:
                 response_text, _used, _was_fallback = await self.api_service.run_with_fallback(
                     *self.api_service.model_chain(p_config, "primary_model", owner_id), _ask,

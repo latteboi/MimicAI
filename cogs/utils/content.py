@@ -62,8 +62,7 @@ HELP_CATEGORIES = {
             "this; only the bot's owner can, one server at a time, from `/privacy`. Paid tier also escapes the rate limits that "
             "throttle long-term memory, grounding and the content classifier, and image generation is blocked on free keys entirely.\n\n"
             "**Preferred provider** (`/start`, or `/settings` -> Override Defaults): every model a character uses runs Primary -> Fallback on "
-            "this provider. A profile with its **Final Fallback** turned on (`/profile manage` -> Params, off unless you turn it on) "
-            "then tries once more on the other, so an outage or a spent key on one does not silence it. "
+            "this provider. A Fallback you set on the other provider keeps a character speaking through an outage or a spent key on one. "
             "New profiles start on it, and until one is chosen they start with **no models at all**: an API key alone does not choose. "
             "Google runs Gemini. OpenRouter ships its own: Ling for replies, long-term memories, session compaction and the critic, "
             "Ming then Recraft for images, Fish Audio then Deepgram for speech, DeepSeek for grounding's searches -- "
@@ -136,10 +135,6 @@ HELP_CATEGORIES = {
             "**Fallback** is not optional infrastructure you can ignore. If the primary request fails -- rate limit, timeout, safety block -- "
             "the payload is immediately re-sent to the fallback. Choose something cheap and fast; a profile with a good fallback stays alive "
             "through an outage that would otherwise silence it.\n\n"
-            "**Final Fallback** comes after both, on the provider your primary is not on, and is off unless you turn it on at "
-            "`/profile manage` -> Params -> Final Fallback. Its model is not chosen: it is the category's shipped model there. Every "
-            "category has one -- replies, image, TTS, grounding, critic, LTM. The profile dashboard's Models line shows it "
-            "when it is on. Setting any fallback to *NONE* turns off the Final for that category as well.\n\n"
             "**Thinking** opens from the same screen, on whichever slot the category dropdown is showing -- choosing a model and choosing "
             "how hard it thinks are one decision. See *Thinking and Reasoning* below."
         ),
@@ -210,7 +205,7 @@ HELP_CATEGORIES = {
             "values can dilute the model's adherence to its instructions."
         ),
         "Advanced Sampling and Penalties": (
-            "At `/profile manage` -> **Params** -> Set Advanced Parameters. These are honoured by OpenRouter models; Google models ignore them, so the row appears only once the profile's response models -- Final Fallback included -- can leave Google.\n\n"
+            "At `/profile manage` -> **Params** -> Set Advanced Parameters. These are honoured by OpenRouter models; Google models ignore them, so the row appears only once the profile's response models can leave Google.\n\n"
             "• **Min P (0.0 - 1.0):** an adaptive floor scaled to the top token's confidence. If the best token is at 50% and Min P is 0.1, "
             "anything under 5% is dropped. It generally holds coherence better than Top P at high temperature.\n"
             "• **Top A (0.0 - 1.0):** truncates based on the square of the top token's probability -- prunes hard when the model is confident, "
@@ -632,6 +627,13 @@ HELP_CATEGORIES = {
 # fourth thing to keep in sync. A step whose blurb starts growing paragraphs is a step
 # whose help_ref is pointing at the wrong page.
 
+#: Most servers stall before anyone adds a key, not on members lacking one. Said in the
+#: welcome and in an administrator's `/start` banner until the server has one, in the same words.
+SERVER_KEY_PITCH = (
+    "**One API key covers the whole server.** Once an administrator adds theirs and assigns "
+    "it to this server, everyone here can talk to the characters, with no key of their own."
+)
+
 WIZARD_COPY = {
     "provider": (
         "Which company's AI models your characters run on.\n\n"
@@ -965,11 +967,11 @@ DEFAULT_HELP_DOCS = {
         "- 404 (Model Not Found): The selected model has been deprecated or renamed by the provider.\n"
         "- 413 (File Too Large): An attachment exceeded what the provider accepts.\n"
         "- Empty Response: The model returned no text, most often a silent safety block.\n"
-        "Failover Protocol: When a request fails, the bot temporarily marks the key as cooling down and immediately redirects the payload to your designated Fallback Model, then -- if the profile has it turned on at Params -> Final Fallback -- to the Final Fallback on the other provider. Setting a cheap, reliable fallback at `/profile manage` -> Params -> Set Models is what keeps a profile alive through an outage.\n"
+        "Failover Protocol: When a request fails, the bot temporarily marks the key as cooling down and immediately redirects the payload to your designated Fallback Model. Setting a cheap, reliable fallback at `/profile manage` -> Params -> Set Models -- on the other provider, if you hold keys for both -- is what keeps a profile alive through an outage.\n"
         "Stalls: A primary model that has not answered in three times its usual time (at least 45 seconds, at most 3 minutes; 90 seconds for a model the bot has not timed yet) has the Fallback Model started beside it. Whichever answers first is posted and the other is cancelled, so a hung host costs a minute or two rather than four. Both requests may be billed.\n"
         "Custom wording: `/profile manage` -> Misc -> Custom Error Message sets what users see when generation fails.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'The bot keeps replying with my error message.' Fix: The primary and the fallback failed, and so did the Final Fallback if the profile has it on (it is skipped when nobody holds a key for its provider). Check the key is valid and has quota, and that the model names are current."
+        "- Symptom: 'The bot keeps replying with my error message.' Fix: The primary and the fallback both failed. Check the key is valid and has quota, and that the model names are current."
     ),
 
     # --- SESSIONS ---
@@ -1199,7 +1201,7 @@ DEFAULT_HELP_DOCS = {
         "Images: Web Grounding applies to replies only. Image generation has its own Search grounding at `/profile manage` -> Images -> Set Image Output: Legacy RAG for any image model, or Web search on a Gemini image model.\n"
         "Links: URL Context in RAG mode reads only links typed in the message itself, not links inside an attached text file or in the message being replied to. A site that answers with an error is reported by its status, such as 'HTTP 404 Not Found'.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'RAG grounding does nothing on my OpenRouter profile.' Fix: Check Set Models -> Grounding Summariser. A Google model there needs a Google key on the server; switch it to an OpenRouter model, or turn on Final Fallback.\n"
+        "- Symptom: 'RAG grounding does nothing on my OpenRouter profile.' Fix: Check Set Models -> Grounding Summariser. A Google model there needs a Google key on the server; switch it to an OpenRouter model.\n"
         "- Symptom: 'My profile searches the web far more often than it needs to.' Fix: That is LEGACY RAG, which asks before every round. Switch to RAG so the character searches only when it reaches for one.\n"
         "- Symptom: 'My profile never searches now that I switched to RAG.' Fix: RAG is the character's own call, so it searches only when a reply turns on a fact it lacks -- and never for anything inside the story. Check `/session audit`, where a search shows in Function Calls with the query it ran.\n"
         "- Symptom: 'Links are ignored on my Gemini 2.5 profile.' Fix: On Google, Gemini 2.5 cannot open links natively while RAG grounding or Memory Search is on, and Native URL Context is dropped to keep them. Set URL Context to RAG, or use a Gemini 3 model.\n"
@@ -1313,7 +1315,7 @@ OLLAMA_GUIDE_TEXT = (
 
 # The one unprompted message the bot ever sends. It goes out once per invite, into a
 # server, and nowhere else -- never a DM, and never a second time in a channel it has
-# already greeted. Three lines, because there is a whole wizard behind `/start` and a
+# already greeted. Kept short, because there is a whole wizard behind `/start` and a
 # whole manual behind `/help`; anything longer here is documentation in the wrong place.
 #
 # {start} and {help} are substituted with clickable command mentions where the ids are
@@ -1321,6 +1323,7 @@ OLLAMA_GUIDE_TEXT = (
 WELCOME_MESSAGE = (
     "Hey! I run AI characters (profiles) — each with its own persona, memory, name, and face in your channels.\n\n"
     "**New to this bot? Run {start}.** This will guide you through setting up MimicAI in your server.\n\n"
+    + SERVER_KEY_PITCH + "\n\n"
     "Activating a character *in a channel* requires a user with **Administrator** permissions — so if you do not have them here, feel free to build yours in a server of your own.\n\n"
     "{help} is a system profile that can assist with your queries, but only use this after you've set up MimicAI!"
 )

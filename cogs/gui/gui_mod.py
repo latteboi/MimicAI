@@ -1218,8 +1218,7 @@ _SYSTEM_MODEL_NOTES = {
     "embedding": ("⚠️ Changing this degrades recall of **every existing memory and "
                   "training example**. A Google model also runs through OpenRouter's `google/` "
                   "copy; any other OpenRouter model runs on OpenRouter keys only."),
-    "system": ("Saved to the System profile itself, so its Final Fallback follows that profile. "
-               "Its other settings are in `/profile`."),
+    "system": "Saved to the System profile itself. Its other settings are in `/profile`.",
     "key_check": ("Called on Google's API with the pasted key, so Google models only. The billing "
                   "check must be one an unbilled key is refused: an image model."),
     **{tab: _AUTO_NOTE + _AUTO_SLOT_NOTES.get(slot, "")

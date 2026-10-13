@@ -103,8 +103,8 @@ class WhisperMixin:
                              target_participant: Dict, p_settings: Dict, history,
                              placeholder_msg, custom_emoji: str, display_name: str, avatar_url,
                              log_context: str) -> ReplyText:
-        """One whispered reply, made the way a session reply is: `_attempt_reply`'s primary,
-        fallback race and Final Fallback, then `_reply_text`'s text, sources and warnings.
+        """One whispered reply, made the way a session reply is: `_attempt_reply`'s primary
+        and fallback race, then `_reply_text`'s text, sources and warnings.
 
         Whispers used to build one model and call it: no fallback at all, though they read
         one, and a block reason of their own wording. Private by construction still -- the

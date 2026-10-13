@@ -230,15 +230,15 @@ FALLBACK_MODEL_NAME = 'GOOGLE/gemini-3.1-flash-lite'
 
 #: The critic's and the LTM summariser's shipped Primary on Google, ahead of
 #: FALLBACK_MODEL_NAME: the cheaper of the two first, for passes that run unattended on
-#: every round or every few messages. Also their Final Fallback behind Ling for anyone
-#: who prefers OpenRouter -- `user_defaults` takes the first Google model a category
-#: ships. A value, not an alias, for the reason GROUNDING_RESEARCHER_MODEL gives.
+#: every round or every few messages. Also the cross-provider fallback compaction and the
+#: Director put behind Ling for anyone who prefers OpenRouter -- `user_defaults` takes the
+#: first Google model a category ships. A value, not an alias, for the reason
+#: GROUNDING_RESEARCHER_MODEL gives.
 UTILITY_MODEL = 'GOOGLE/gemini-2.5-flash-lite'
 
-#: Every model category runs Primary -> Fallback -> Final Fallback: the first two on
-#: the user's preferred provider, the last on the other one, so an outage or a spent key
-#: on one provider cannot silence the category. Google ships the table below; OpenRouter
-#: ships OPENROUTER_SHIPPED_MODELS. `user_defaults.model_chain`.
+#: Every model category runs Primary -> Fallback, on the user's preferred provider where
+#: it ships two. Google ships the table below; OpenRouter ships OPENROUTER_SHIPPED_MODELS.
+#: `user_defaults.model_chain`.
 MODEL_PROVIDERS = {"gemini": "Google", "openrouter": "OpenRouter"}
 
 #: What `/start` offers, stored as `index.json["about"]["provider"]`: a provider, or
@@ -265,7 +265,6 @@ NOT_REGISTERED = ("Run `/start` first and choose a provider -- it is how you set
 #: this, and read it as a pair -- one no-citation run proves nothing.
 GROUNDING_RESEARCHER_MODEL = 'GOOGLE/gemini-2.5-flash-lite'
 #: Its Fallback, measured by the same probe to ground with an instruction attached.
-#: The Final Fallback, where on, is OpenRouter's (OPENROUTER_SHIPPED_MODELS).
 GROUNDING_RESEARCHER_FALLBACK = 'GOOGLE/gemini-3.5-flash-lite'
 
 #: Google models measured to ignore the search tool once a system instruction is
@@ -312,7 +311,7 @@ SEARCH_MODEL_KEYS = frozenset({
     'grounding_rag_model', 'grounding_rag_fallback_model',
 })
 
-#: "Do not retry on anything" -- the Final Fallback included. Offered by every Fallback
+#: "Do not retry on anything". Offered by every Fallback
 #: slot; a Primary holds it only when `/start`'s None shipped no model. An *absent*
 #: fallback slot is the shipped one, not this.
 NO_FALLBACK = 'NONE'
@@ -984,9 +983,10 @@ SYSTEM_MODEL_DEFAULTS = {
 
 #: The describer's and the classifier's chains, which ship -- and are overridden, under the
 #: provider's name in the file -- per provider preference: the preferred side's two, then
-#: the other's as the Final Fallback, as a profile's categories run. The classifier ships
-#: the describer's chain: both read one file -- an avatar, an attachment -- and answer in a
-#: line. Google's second is FALLBACK_MODEL_NAME, which hears audio as the first does.
+#: the other's as the Final Fallback, so a file is still read where only the other side
+#: holds a key. The classifier ships the describer's chain: both read one file -- an
+#: avatar, an attachment -- and answer in a line. Google's second is FALLBACK_MODEL_NAME,
+#: which hears audio as the first does.
 _MEDIA_READER_CHAINS = {
     'gemini': (MEDIA_DESCRIBER_FALLBACK, FALLBACK_MODEL_NAME, MEDIA_DESCRIBER_MODEL),
     'openrouter': (MEDIA_DESCRIBER_MODEL, OPENROUTER_FREE_ROUTER, MEDIA_DESCRIBER_FALLBACK),
@@ -2673,16 +2673,12 @@ DEFAULT_CARD_IMPORT_PROMPT = (
 PLEASE_TRY_AGAIN_ERROR_MESSAGE = 'There was an issue with your question please try again...'
 
 WARN_FALLBACK_USED = "**Fallback Model Used**"
-WARN_FINAL_FALLBACK_USED = "**Final Fallback Model Used**"
 
 WARN_MAIN_MODEL_FAILED = "**Main Model Failed** ({reason})"
 WARN_BOTH_MODELS_FAILED = "**Main & Fallback Model Failed** ({reason})"
-#: Every model in the chain failed alike: Main, Fallback and the Final Fallback.
-WARN_ALL_MODELS_FAILED = "**Main, Fallback & Final Fallback Model Failed** ({reason})"
 #: Beside WARN_MAIN_MODEL_FAILED when the models failed for different reasons, which the
 #: combined lines can only say one of. One line per model tried.
 WARN_FALLBACK_MODEL_FAILED = "**Fallback Model Failed** ({reason})"
-WARN_FINAL_MODEL_FAILED = "**Final Fallback Model Failed** ({reason})"
 WARN_VOICE_SYNTHESIS_FAILED = "**Text-To-Speech Failed** ({reason})"
 WARN_URL_FETCHING_FAILED = "**URL Fetching Failed** ({reason})"
 WARN_GROUNDING_FAILED = "**Grounding Failed** ({reason})"

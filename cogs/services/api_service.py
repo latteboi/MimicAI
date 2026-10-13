@@ -163,9 +163,10 @@ def _refusal(message: str) -> ValueError:
 class MissingKeyError(ValueError):
     """No key for this provider where the call would be billed, raised before any request.
 
-    Its own type so `run_with_fallback` can tell it apart: a Final Fallback on a
-    provider nobody here holds is skipped this way on every call, and its "key not found"
-    must not stand in for the failure that actually ended the chain.
+    Its own type so `run_with_fallback` can tell it apart: a fallback on a provider nobody
+    here holds -- the cross-provider one compaction and the Director carry -- is skipped
+    this way, and its "key not found" must not stand in for the failure that actually
+    ended the chain.
     """
 
 
@@ -271,7 +272,7 @@ class APIService:
             raise TypeError("a model is an image model or a speech model, not both")
         if not is_real_model(raw_model_name):
             # A profile made before its owner chose a provider has none. MissingKeyError,
-            # so a Final Fallback behind it is still tried and this is not what is reported.
+            # so a fallback behind it is still tried and this is not what is reported.
             raise MissingKeyError(NO_MODEL_SET)
         # System prefixes 'GOOGLE/', 'OPENROUTER/', and 'OLLAMA/' are strictly case-sensitive.
         # OpenRouter hosts models under lowercase creator namespaces like 'google/gemini-2.5-flash'.
@@ -385,9 +386,8 @@ class APIService:
                                 *, label: str = "utility"):
         """Runs one utility generation on `primary`, retrying once on `fallback`.
 
-        `fallback` is a name, None, or a tuple of names tried in order -- a category's
-        Fallback then its Final Fallback (see `model_chain`), or the attachment
-        describer's free model, then the same model paid, then Google.
+        `fallback` is a name, None, or a tuple of names tried in order -- `model_chain`'s,
+        or the describer's and classifier's System Models.
 
         `attempt(model_name, is_fallback)` owns the construction and the response
         handling; this owns only which name to try and when to stop. That puts the five

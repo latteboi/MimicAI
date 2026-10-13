@@ -147,8 +147,8 @@ def generator_models(cog, user_id: int) -> Tuple[str, Tuple[str, ...]]:
     The generator's System Models on the user's effective provider -- a draft needs a model
     before any provider is chosen, so a key counts here as it does not for a profile --
     their own defaults over them once they have chosen one, rescued onto a provider they
-    hold, then the Final Fallback behind. Only models on a provider the user holds a key
-    for are kept: a draft is billed to the user alone.
+    hold. Only models on a provider the user holds a key for are kept: a draft is billed
+    to the user alone.
     """
     pm = cog.profile_manager
     provider = pm.effective_provider(user_id)

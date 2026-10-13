@@ -205,13 +205,13 @@ def director_enabled(proactivity: Optional[Dict[str, Any]]) -> bool:
 def director_model_config(proactivity: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """The Director's choice as LTM slots, None where it made none: it runs the LTM
     summariser's chain, like the session synopsis. "on" and "off" are switches from
-    before the screen, not models, so neither is one. With its Final Fallback always,
+    before the screen, not models, so neither is one. With the cross-provider fallback,
     for the reason `compaction_model_config` gives."""
     pro = proactivity or {}
     chosen = str(pro.get("director_model") or "").strip()
     return {"ltm_model": None if chosen.lower() in ("", "on", "off") else chosen,
             "ltm_fallback_model": pro.get("director_fallback_model") or None,
-            "final_fallback_enabled": True}
+            "cross_provider_fallback": True}
 
 
 _TURN_IDENTITY = re.compile(r'<([^>\r\n]+)> \[ID: ([^\]\r\n]+)\]')
