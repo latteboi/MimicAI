@@ -21,14 +21,15 @@ from .listeners.event_listeners import EventListeners
 from .gui.base_components import ActionTextInputModal, DropdownContentView, InviteView, refuse_unregistered
 from .gui.gui_data import PrivacyDashboardView, ImportPassphraseModal, BulkExportView
 from .gui.gui_generate import GeneratedProfileView
-from .gui.gui_hub import HubHomeView
+from .gui.gui_hub import HubPublicLibraryView
 from .gui.gui_sessions import (
     GlobalChatPlayView, GlobalChatHistoryView, WhisperHistoryView, SessionSwapListView,
     SessionView, SessionConfigView, SessionAuditView, GenerationTraceView, last_user_message_id
 )
 from .gui.gui_settings import (SettingsHomeView, ParentPresenceView, ShutdownConfirmView,
                                 build_about_embed)
-from .gui.gui_profiles import ProfileManageView, BulkManageView, VoiceSampleConsentView
+from .gui.gui_profiles import (ProfileManageView, BulkManageView, VoiceSampleConsentView,
+                               maybe_prompt_rating_after_edit)
 from .gui.gui_resolve import (
     autocorrect_profile, gather_owned_candidates, gather_participant_candidates,
     suggest_profile,
@@ -128,6 +129,9 @@ class MimicCog(EventListeners, commands.Cog):
         self.manager_queue = bot.manager_queue
         self.cog_id = str(uuid.uuid4()) 
         self.has_lock = False
+        #: Set first thing in `cog_unload`, which closes the HTTP clients under any call
+        #: still in flight. What fails after it is the shutdown, not something to report.
+        self.shutting_down = False
         
         # Client placeholder for session-specific usage
         self.client = None
@@ -227,6 +231,8 @@ class MimicCog(EventListeners, commands.Cog):
         self.profile_manager._load_profile_shares()
         self.public_profiles: Dict[str, Dict[str, Any]] = {}
         self.profile_manager._load_public_profiles()
+        # PID -> (profile file mtime, its listing's searchable text): `library_search_text`.
+        self.library_text: LRUCache = LRUCache(max_size=2000)
         # Reverse index: "<owner_id>:<pid>" -> {borrower_id: [local names]}, with the
         # borrower-side inverse derived in memory. Bounded by the number of borrows
         # that exist, which LIMIT_BORROWED already caps per user. See the block above
@@ -613,16 +619,16 @@ class MimicCog(EventListeners, commands.Cog):
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="export", description="Export selected profiles and memories to an encrypted .mimic file (DM Only).")
+    # Anywhere, not a DM only: every reply below is ephemeral, so the file reaches the
+    # person who asked for it and nobody else in the channel.
+    @app_commands.command(name="export", description="Export selected profiles and memories to an encrypted .mimic file.")
     @app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
-    @app_commands.dm_only()
     async def export_command(self, interaction: discord.Interaction):
         view = BulkExportView(self, interaction.user.id)
         await interaction.response.send_message("### 📤 Profile Export\nSelect profiles and components to export.\n\n*The file will contain encrypted data. Tampered files cannot be imported.*\n", view=view, ephemeral=True)
 
-    @app_commands.command(name="import", description="Import a MimicAI export, or a character card (PNG or JSON) (DM Only).")
+    @app_commands.command(name="import", description="Import a MimicAI export, or a character card (PNG or JSON).")
     @cooldown_unless_refused(1, 30.0, _unregistered)
-    @app_commands.dm_only()
     @app_commands.describe(file="A .mimic file from a MimicAI instance, or a character card: a card PNG or its JSON.",
                            profile_name="Optional: add the file's lorebook to this profile of yours, not import a new one.")
     @app_commands.autocomplete(profile_name=EventListeners.master_autocomplete)
@@ -684,14 +690,16 @@ class MimicCog(EventListeners, commands.Cog):
             return
         message = await asyncio.to_thread(self.profile_manager.add_lore_entries, user_id, profile_name, book)
         await interaction.followup.send(message, ephemeral=True)
+        await maybe_prompt_rating_after_edit(self, interaction, user_id, profile_name)
 
     async def _import_card(self, interaction: discord.Interaction, file: discord.Attachment):
         """`/import` of a character card: read it, sort it into a draft, and show the draft
         (`GeneratedProfileView`) for Save. Nothing is written before Save.
 
         Capped at what the bot may send back, because a PNG card is re-posted as a plain
-        message in this DM: the profile's avatar is that message's attachment. The one on
-        the command is an interaction's, which Discord deletes after a while."""
+        message in the user's DMs, wherever /import ran: the profile's avatar is that
+        message's attachment. The one on the command is an interaction's, which Discord
+        deletes after a while."""
         limit = discord.utils.DEFAULT_FILE_SIZE_LIMIT_BYTES
         if file.size > limit:
             await interaction.response.send_message(
@@ -816,7 +824,7 @@ class MimicCog(EventListeners, commands.Cog):
                                       consent_mime_type=consent_mime_type, guild_id=interaction.guild_id)
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
-    @profile_group.command(name="hub", description="The unified dashboard for managing profiles, sharing, and the public library.")
+    @profile_group.command(name="hub", description="The Public Library, plus sharing, publishing and your stats.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     async def hub_slash(self, interaction: discord.Interaction):
         # [FIX] Defer immediately to prevent interaction timeout (Error 10062)
@@ -825,7 +833,7 @@ class MimicCog(EventListeners, commands.Cog):
         # Lazy Deletion Check (Disk I/O) happens safely after defer
         removed = await self.profile_manager._validate_and_clean_borrowed_profiles(interaction.user.id)
 
-        view = HubHomeView(self, interaction)
+        view = HubPublicLibraryView(self, interaction)
         await view.update_display()
 
         if removed > 0:
@@ -2041,8 +2049,11 @@ class MimicCog(EventListeners, commands.Cog):
         # Rating, not publication. Requiring a profile to be listed in the Public
         # Library to talk to it privately was a proxy for "somebody has vetted this",
         # and a poor one -- it forced users to publish a profile they only wanted for
-        # themselves. The rating is the vetting, so it is what gets checked.
-        allowed, deny_reason = self.profile_manager.content_capability(
+        # themselves. The rating is the vetting, so it is what gets checked -- settled
+        # first, so an edit no prompt caught is not opened on the verdict before it. Not
+        # waited on: this answers inside Discord's three seconds, so a re-check of a shared
+        # profile leaves its verdict standing until it lands, as a session start does.
+        allowed, deny_reason = await self.profile_manager.settled_capability(
             user_id, profile_name_lower, "global_chat")
         if not allowed:
             await interaction.response.send_message(

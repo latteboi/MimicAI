@@ -26,7 +26,8 @@ from ...utils.constants import (
     DEFAULT_SPEECH_VOICE, ERR_REASON_NO_AUDIO, ERR_REASON_NOTHING_TO_SPEAK,
     ERR_REASON_SPEECH_PROHIBITED, ERR_REASON_SPEECH_REFUSED, GOOGLE_VOICE_PREFIX,
     TTS_VOICE_CHARACTER, ERR_REASON_SPEECH_TIMED_OUT, THINKING_BUDGET_MAX,
-    THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY, TTS_VOICE_LOOKUP,
+    THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
+    THINKING_LEVELS_TO_GOOGLE_NO_MINIMAL, TTS_VOICE_LOOKUP,
     defaultConfig,
 )
 from ...utils.helpers import (
@@ -462,8 +463,9 @@ class GoogleRESTModel:
         caps = google_thinking_caps(self.model_name)
         if caps["mode"] == "level":
             lvl = self.thinking_params.get("thinking_level", "high").lower()
-            table = (THINKING_LEVELS_TO_GOOGLE_BINARY if caps["levels"] == "binary"
-                     else THINKING_LEVELS_TO_GOOGLE)
+            table = {"binary": THINKING_LEVELS_TO_GOOGLE_BINARY,
+                     "no_minimal": THINKING_LEVELS_TO_GOOGLE_NO_MINIMAL,
+                     }.get(caps["levels"], THINKING_LEVELS_TO_GOOGLE)
             mapped_lvl = table.get(lvl, "HIGH")
             cfg["thinkingConfig"] = {"includeThoughts": include_thoughts, "thinkingLevel": mapped_lvl}
         elif caps["mode"] == "budget":

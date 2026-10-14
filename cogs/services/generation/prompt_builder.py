@@ -12,6 +12,7 @@ from ...utils.constants import (
     DEFAULT_CONTENT_POLICY, DEFAULT_BIRTHDAY_CONTEXT, DEFAULT_NEURO_DEFINITION,
     DEFAULT_MEMORY_CAPTURE_INSTRUCTION, DEFAULT_MEMORY_WRITTEN_NOTE, LORE_SCAN_TURNS,
     DEFAULT_BOND_DEFINITION, DEFAULT_BOND_INSTRUCTION, BOND_ROSTER_SIZE,
+    CONTENT_RATING_EXEMPT,
 )
 from ...managers.session_manager import _TURN_IDENTITY
 from ...utils import lorebook
@@ -68,7 +69,9 @@ class PromptBuilderMixin:
             return False
 
     async def _send_session_warning(self, channel: discord.abc.Messageable, message: str):
-        if not channel: return
+        # Not while shutting down: Discord is still connected, but `delete_after` would
+        # never run, and the notice would stay in the channel for good.
+        if not channel or self.cog.shutting_down: return
         try:
             await channel.send(f"⚠️ **Session Notice:** {message}", delete_after=10)
         except Exception:
@@ -443,7 +446,14 @@ class PromptBuilderMixin:
         # now move together. Appended last for recency, and it is the only one of
         # them with any effect on OpenRouter and Ollama, which ignore
         # safety_settings entirely.
-        if not self._channel_allows_adult_content(channel_id):
+        #
+        # An operator Exemption stands it down everywhere, Global Chat included, as it
+        # stands down the provider filter: the exemption is a standing statement that the
+        # profile needs no filtering. Read off the source, so a borrow of one is exempt too.
+        exempt = (profile_owner_id is not None
+                  and self.cog.profile_manager._content_rating_state(
+                      profile_owner_id, profile_name_to_use)[0] == CONTENT_RATING_EXEMPT)
+        if not exempt and not self._channel_allows_adult_content(channel_id):
             policy_block = self.cog.global_prompts.get("CONTENT_POLICY", DEFAULT_CONTENT_POLICY).strip()
             if policy_block:
                 trailing_parts.append(policy_block)

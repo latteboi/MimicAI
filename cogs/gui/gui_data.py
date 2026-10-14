@@ -183,6 +183,9 @@ class LoreEntryModal(ui.Modal):
             self.cog.profile_manager.put_lore_entry, self.profile_owner_id, self.profile_name,
             self.entry_id, self.keys_field.value, self.content_field.value)
         await i.followup.send(message, ephemeral=True)
+        # The lorebook is rated text. Deferred: gui_profiles imports this module.
+        from .gui_profiles import maybe_prompt_rating_after_edit
+        await maybe_prompt_rating_after_edit(self.cog, i, self.profile_owner_id, self.profile_name)
 
     async def on_error(self, i: discord.Interaction, e: Exception):
         print(f"LoreEntryModal error: {e}"); traceback.print_exc()
@@ -585,6 +588,9 @@ class DataManageView(BlockedGuard, ui.View):
             await i.response.edit_message(content=f"Deleted {gone} item(s)." if gone else "Nothing was found to delete.",
                                           view=None, embed=None)
             await self._refresh()
+            if self.mode == 'lore' and gone:
+                from .gui_profiles import maybe_prompt_rating_after_edit
+                await maybe_prompt_rating_after_edit(self.cog, i, self.user_id, self.profile_name)
         await interaction.response.send_message(prompt, view=build_confirm_view(f"Delete {len(ids)}", confirm),
                                                 ephemeral=True)
 

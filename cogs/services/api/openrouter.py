@@ -393,7 +393,8 @@ class OpenRouterModel:
                 cached_toks=(usage_obj.get('prompt_tokens_details') or {}).get('cached_tokens') or 0,
             )
         except httpx.RequestError as e:
-            raise Exception(f"OpenRouter Network Error: {str(e)}")
+            # httpx's ReadError and its kin carry no message: name the class instead.
+            raise Exception(f"OpenRouter Network Error: {str(e) or type(e).__name__}")
         except asyncio.CancelledError:
             raise
         finally:

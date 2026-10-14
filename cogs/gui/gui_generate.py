@@ -74,6 +74,7 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         self.model_used = model_used
         self.busy = False
         self.saved = False
+        self.published = False
         self._build_view()
 
     def _build_view(self):
@@ -81,6 +82,11 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         if self.saved:
             add_button(self, "Open Dashboard", self.open_dashboard,
                        style=discord.ButtonStyle.blurple)
+            # A concept's draft only: a card is someone else's character, and one tagged
+            # 18+ could not be published anyway.
+            if not self.card and not self.published:
+                add_button(self, "Publish to Library", self.publish, style=discord.ButtonStyle.green,
+                           emoji="🌐", disabled=self.busy)
             return
         add_button(self, "Save", self.save, style=discord.ButtonStyle.green, emoji="✅",
                    disabled=self.busy)
@@ -95,7 +101,8 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         if status:
             lines.append(f"**{status}**")
         elif self.saved:
-            lines.append(f"✅ **Saved as `{self.profile_name}`.**")
+            lines.append(f"✅ **Saved as `{self.profile_name}`.**"
+                         + (" 🌐 Listed in the Public Library." if self.published else ""))
         else:
             lines.append(f"A draft, to be saved as `{self.profile_name}`. "
                          f"Nothing is written until you press **Save**.")
@@ -210,6 +217,22 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             added += 1
         line = f"Added {added} of {len(examples)} example exchanges as training examples."
         return line if added == len(examples) else f"{line} {reason}"
+
+    async def publish(self, interaction: discord.Interaction):
+        """Rates the new profile -- it is Unrated -- and lists it if the verdict allows."""
+        if await self._refuse_while_busy(interaction):
+            return
+        self.busy = True
+        self._build_view()
+        await interaction.response.edit_message(
+            embed=self.build_embed("\U0001F310 Rating and publishing…"), view=self)
+        self.published, reason = await self.cog.profile_manager.publish_profile(
+            self.user_id, self.profile_name)
+        self.busy = False
+        self._build_view()
+        await interaction.edit_original_response(embed=self.build_embed(), view=self)
+        if not self.published:
+            await interaction.followup.send(f"Not published. {reason or ''}".strip(), ephemeral=True)
 
     async def discard(self, interaction: discord.Interaction):
         self.stop()

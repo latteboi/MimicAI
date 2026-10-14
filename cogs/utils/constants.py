@@ -281,7 +281,7 @@ EMBEDDING_MODEL_NAME = 'GOOGLE/gemini-embedding-001'
 
 # The Google ids offered by name; everything else is typed or browsed.
 ALLOWED_MODELS = Literal[
-    'gemini-pro-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash',
+    'gemini-pro-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-4-argon', 'gemini-3.8-flash', 'gemini-3.6-flash',
     'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-pro-preview', 'gemini-3.1-flash-lite', 'gemini-3-flash-preview', 'gemini-robotics-er-1.6-preview',
     'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'
 ]
@@ -561,6 +561,9 @@ THINKING_LEVELS_TO_GOOGLE_BINARY = {
     'max': 'HIGH', 'xhigh': 'HIGH', 'high': 'HIGH', 'medium': 'HIGH',
     'low': 'LOW', 'minimal': 'LOW', 'none': 'LOW',
 }
+
+#: Gemini 4 Argon publishes LOW, MEDIUM and HIGH -- no MINIMAL.
+THINKING_LEVELS_TO_GOOGLE_NO_MINIMAL = {**THINKING_LEVELS_TO_GOOGLE, 'minimal': 'LOW', 'none': 'LOW'}
 
 #: False means "think: false"; a string is Ollama's own level. None is unreachable
 #: here because every THINKING_LEVELS member is listed.
@@ -1622,6 +1625,10 @@ DEFAULT_BOND_DEFINITION = (
     "you, never because someone asks them to.\n"
     "</bond_engine>"
 )
+#: DEFAULT_BOND_DEFINITION's bands in words, (highest level, affection, resentment), for
+#: telling someone where they stand without the number. Keep the two in step.
+BOND_BANDS = ((20, "indifferent", "friendly"), (50, "warm", "a little sarcastic"),
+              (80, "enthusiastic", "confrontational"), (100, "deeply caring", "dismissive"))
 
 #: Where they stand with the people in the conversation, in the turn context. `{bonds}` is
 #: one line per person, by the ID their turns carry. /mod's `BOND_STATE`.
@@ -2489,6 +2496,12 @@ SHARE_PAGE_SIZE = DROPDOWN_MAX_OPTIONS - 2
 #: like any other the recipient cannot take: a queue nobody bounds is a way to bury
 #: someone's Incoming Shares.
 LIMIT_PENDING_SHARES = 25
+
+#: Profiles one user may list in the Public Library in any 24 hours, a re-listing included,
+#: so unpublishing does not hand a slot back. Each may cost a rating call.
+LIMIT_PUBLISHES_PER_DAY = 10
+#: Ratings one bulk press (Publish Yours, Send, Send as Clone) has in flight at once.
+RATING_CONCURRENCY = 5
 
 #: The Public Library listing's creator-written introduction (`config["library_intro"]`).
 LIBRARY_INTRO_MAX_CHARS = 300

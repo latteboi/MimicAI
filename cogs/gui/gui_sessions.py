@@ -1371,7 +1371,9 @@ class SessionView(_TurnOrderView):
         idx = int(self.select.values[0])
         participant = self.session["profiles"][idx]
         
-        embed = await self.cog.profile_manager._build_profile_embed(participant['owner_id'], participant['profile_name'], self.channel_id)
+        embed = await self.cog.profile_manager._build_profile_embed(
+            participant['owner_id'], participant['profile_name'], self.channel_id,
+            viewer_id=interaction.user.id)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 class SessionConfigView(BlockedGuard, ui.View):

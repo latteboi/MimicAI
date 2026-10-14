@@ -1161,7 +1161,8 @@ class MemoryManager:
             # failure -- same treatment as the rate-limit/unavailable cases below, since
             # both primary and fallback routinely miss a key on a server that has only
             # configured one provider, and that should not read as a crash.
-            if ("429" not in err_str and "RESOURCE_EXHAUSTED" not in err_str and "503" not in err_str
+            if (not self.cog.shutting_down
+                    and "429" not in err_str and "RESOURCE_EXHAUSTED" not in err_str and "503" not in err_str
                     and "UNAVAILABLE" not in err_str and "API Key not found" not in err_str
                     and not getattr(e, "rate_limited", False)):
                 print(f"LTM Gen err {user_dn}: {e}")

@@ -1214,6 +1214,7 @@ class EventListeners:
                 pass
 
     async def cog_unload(self):
+        self.shutting_down = True
         if self.has_lock:
             try:
                 if os.path.exists(COG_LOCK_FILE_PATH):

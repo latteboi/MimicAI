@@ -33,7 +33,8 @@ _TAB_TITLES = {
     "audio": "Audio (how the character sounds)",
     "memory": "Memory (what the character remembers, and how it recalls it)",
     "training": "Training (example replies that shape how it writes)",
-    "misc": "Misc (sharing, the library intro, error wording and the typing placeholder)",
+    "sharing": "Sharing (publish to the Public Library, offer as a borrow or a clone, and the library intro)",
+    "misc": "Misc (error wording, the typing placeholder and line spacing)",
 }
 
 # Dashboards whose views are built imperatively. Kept as (heading, [(tab, [actions])]).
@@ -135,14 +136,19 @@ _STATIC_DASHBOARDS = [
     (
         "`/profile hub`",
         [
-            ("Home", ["Library statistics and your own publication status"]),
-            ("Public Library", ["Browse, search and borrow published profiles"]),
+            ("Public Library (opens here)", [
+                "Browse and borrow published profiles; Sort switches Newest and Most Borrowed",
+                "Search by profile name, creator, display name or intro; Generate",
+                "Publish Yours: list or unlist your profiles (Apply Changes), Edit Intro with one "
+                "selected; a profile not rated yet is rated by the press"]),
             ("Incoming Shares", ["Accept, reject or block the sender of profiles offered to you",
                                  "Open/Closed toggle for new offers; a user dropdown of who is blocked"]),
-            ("Profile Sharing", ["Offer profiles to registered users as a borrow (no message is sent)",
-                                 "Publish and unpublish"]),
+            ("Profile Sharing", ["Offer profiles to registered users as a borrow (no message is sent); "
+                                 "a profile not rated yet is rated by Send"]),
             ("Profile Cloning", ["Offer profiles to registered users as an independent copy with "
                                  "Send as Clone (no message is sent)"]),
+            ("Stats", ["Library totals and its most borrowed profile; your profiles, how many "
+                       "are published, and how many people borrow them"]),
         ],
     ),
     (

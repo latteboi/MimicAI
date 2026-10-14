@@ -738,6 +738,11 @@ class APIService:
     #: Official Google Gemini standard-tier pricing, per 1M tokens in USD. OpenRouter's
     #: come from its own listing on every sync.
     GOOGLE_RATES = {
+        # Launch price, to 2026-11-30; Google doubles it to 4.00 / 20.00 on 2026-12-01.
+        "GOOGLE/gemini-4-argon": {"input_1m": 2.00, "output_1m": 10.00},
+        # Launch price, to 2026-12-31; Google doubles it to 1.50 / 7.50 on 2027-01-01.
+        "GOOGLE/gemini-3.8-flash": {"input_1m": 0.75, "output_1m": 3.75},
+        # No longer offered; kept so profiles still set to it estimate right.
         "GOOGLE/gemini-3.7-flash": {"input_1m": 0.75, "output_1m": 3.75},
         "GOOGLE/gemini-3.6-flash": {"input_1m": 1.50, "output_1m": 7.50},
         "GOOGLE/gemini-3.5-flash": {"input_1m": 1.50, "output_1m": 9.00},

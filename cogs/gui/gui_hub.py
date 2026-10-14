@@ -4,7 +4,7 @@ import discord
 from discord import ui
 import asyncio
 import datetime
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from ..utils.discord_cdn import unsigned_attachment_url
 from .base_components import (BlockedGuard, PageJumpModal, TabbedView, add_button, add_select,
@@ -18,45 +18,69 @@ if TYPE_CHECKING:
 
 
 class HubBaseView(TabbedView):
+    #: The Library first: browsing is what most people open the hub for, and publishing
+    #: lives on it (Publish Yours) rather than behind a mode toggle on the Sharing tab.
+    #: Five tabs is Discord's five to a row, so a sixth needs a home inside one of these.
     TABS = (
-        ("Home", "home", lambda v: HubHomeView(v.cog, v.original_interaction)),
         ("Public Library", "library", lambda v: HubPublicLibraryView(v.cog, v.original_interaction)),
         ("Incoming Shares", "incoming", lambda v: HubIncomingView(v.cog, v.original_interaction)),
         ("Profile Sharing", "manage", lambda v: HubShareManagerView(v.cog, v.original_interaction)),
         ("Profile Cloning", "clone", lambda v: HubCloneManagerView(v.cog, v.original_interaction)),
+        ("Stats", "stats", lambda v: HubStatsView(v.cog, v.original_interaction)),
     )
 
-class HubHomeView(HubBaseView):
+
+def _borrower_count(pm, owner_id: int, pid: Optional[str]) -> int:
+    """People borrowing one profile, counted once each: one borrow-index lookup."""
+    return len({borrower_id for borrower_id, _ in pm._borrowers_of(owner_id, pid)}) if pid else 0
+
+
+class HubStatsView(HubBaseView):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):
-        super().__init__(cog, interaction, "home")
+        super().__init__(cog, interaction, "stats")
+
+    def build_embed(self) -> discord.Embed:
+        """Blocking: one owner-index read per creator, as the Library's own open."""
+        pm = self.cog.profile_manager
+        listings = list(pm._iter_public_entries())
+        reach = {d["id"]: _borrower_count(pm, d["owner_id"], d["original_pid"]) for d in listings}
+        creators = {d["owner_id"] for d in listings}
+
+        index = pm._get_user_index(self.user_id)
+        personal = list(index.get("personal", {}))
+        borrowed = len(index.get("borrowed", {}))
+        waiting = len(pm._pending_shares(self.user_id))
+        mine = [d for d in listings if d["owner_id"] == self.user_id]
+        # Every profile of yours, listed or only shared privately: reach is reach.
+        yours = {name: {b for b, _ in pm._borrowers_of(self.user_id, pm._get_pid_from_name(self.user_id, name))}
+                 for name in personal}
+        borrowers = set().union(*yours.values()) if yours else set()
+
+        embed = discord.Embed(title="Profile Hub Stats", description=defaultConfig.MIMIC_NEWS or None,
+                              color=discord.Color.gold())
+        embed.set_thumbnail(url=THINKING_THUMBNAIL_URL)
+        library = (f"`{len(listings)} Public Profiles`\n`{len(creators)} Creators`\n"
+                   f"`{sum(reach.values())} Borrows`")
+        top = max(listings, key=lambda d: reach[d["id"]], default=None)
+        if top and reach[top["id"]]:
+            owner = self.cog.bot.get_user(top["owner_id"])
+            library += (f"\nMost borrowed: **{top['profile_name']}**"
+                        f"{f' by {owner.name}' if owner else ''} ({reach[top['id']]})")
+        embed.add_field(name="The Library", value=library, inline=True)
+        embed.add_field(name="Yours", value=(
+            f"`{len(personal)} Personal Profiles`\n`{borrowed} Borrowed Profiles`\n"
+            f"`{waiting} Shares Waiting`\n`{len(mine)} Published`"), inline=True)
+        favourite = max(yours, key=lambda n: len(yours[n]), default=None)
+        reach_text = (f"`{len(borrowers)} {'person borrows' if len(borrowers) == 1 else 'people borrow'} "
+                      f"your profiles`")
+        if favourite and yours[favourite]:
+            reach_text += f"\nMost borrowed: **{favourite}** ({len(yours[favourite])})"
+        embed.add_field(name="Your Reach", value=reach_text, inline=False)
+        embed.set_footer(text="Publish from Public Library → Publish Yours, or from /profile manage → Sharing.")
+        return embed
 
     async def update_display(self):
-        total_public = len(self.cog.public_profiles)
-        
-        # Off the raw entries: describing one reads its owner's index, and this runs on
-        # every /hub. Tombstones are swept at boot, so this counts what total_public does.
-        unique_creators = {self.cog.profile_manager._public_entry_owner(p)
-                           for p in self.cog.public_profiles.values()}
-        unique_creators.discard(None)
-        unique_creators_count = len(unique_creators)
-        
-        index = self.cog.profile_manager._get_user_index(self.user_id)
-        
-        user_owned_dict = index.get("personal", {})
-        user_owned = len(user_owned_dict) if isinstance(user_owned_dict, dict) else len(user_owned_dict)
-        
-        user_borrowed_dict = index.get("borrowed", {})
-        user_borrowed = len(user_borrowed_dict) if isinstance(user_borrowed_dict, dict) else len(user_borrowed_dict)
-        
-        embed = discord.Embed(title="MimicAI Profile Hub", description=defaultConfig.MIMIC_NEWS, color=discord.Color.gold())
-        embed.set_thumbnail(url=THINKING_THUMBNAIL_URL)
-        
-        embed.add_field(name="Global Stats", value=f"`{total_public} Public Profiles`\n`{unique_creators_count} Creators`", inline=True)
-        waiting = len(self.cog.profile_manager._pending_shares(self.user_id))
-        embed.add_field(name="Your Stats", value=f"`{user_owned} Personal Profiles`\n`{user_borrowed} Borrowed Profiles`\n`{waiting} Shares Waiting`", inline=True)
-        
-        embed.set_footer(text="Use the navigation buttons below to explore.")
-
+        embed = await asyncio.to_thread(self.build_embed)
         await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
 
 class HubPublicLibraryView(HubBaseView):
@@ -65,6 +89,8 @@ class HubPublicLibraryView(HubBaseView):
 
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, filtered_list=None):
         super().__init__(cog, interaction, "library")
+        #: "borrowed" (most borrowers first) or "new" (newest first).
+        self.sort = "borrowed"
         self.all_public = []
         self._load_public_data()
         self.filtered_list = filtered_list if filtered_list is not None else self.all_public
@@ -81,9 +107,16 @@ class HubPublicLibraryView(HubBaseView):
     def _load_public_data(self):
         # ponytail: one owner-index read per creator, on the loop, every Library open --
         # cheap until creators outgrow the 200-entry user_indices LRU; then cache this list.
-        raw_list = list(self.cog.profile_manager._iter_public_entries())
-        raw_list.sort(key=lambda x: x['published_at'], reverse=True)
-        self.all_public = raw_list
+        self.all_public = self._sorted(self.cog.profile_manager._iter_public_entries())
+
+    def _sorted(self, entries):
+        """Newest first, or most borrowed first with newest breaking ties."""
+        newest = sorted(entries, key=lambda x: x['published_at'], reverse=True)
+        if self.sort != "borrowed":
+            return newest
+        pm = self.cog.profile_manager
+        return sorted(newest, key=lambda x: _borrower_count(pm, x['owner_id'], x.get('original_pid')),
+                      reverse=True)
 
     def _num_pages(self) -> int:
         return max(1, (len(self.filtered_list) - 1) // self.PER_PAGE + 1)
@@ -137,6 +170,10 @@ class HubPublicLibraryView(HubBaseView):
         add_button(self, "Search", self.search_cb, row=1)
         add_button(self, "Generate", self.generate_cb, row=1,
                    style=discord.ButtonStyle.blurple, emoji="✨")
+        add_button(self, "Sort: Most Borrowed" if self.sort == "borrowed" else "Sort: Newest",
+                   self.sort_cb, row=2)
+        add_button(self, "Publish Yours", self.publish_cb, row=2,
+                   style=discord.ButtonStyle.green, emoji="🌐")
 
     async def update_display(self):
         if not self.filtered_list:
@@ -255,22 +292,49 @@ class HubPublicLibraryView(HubBaseView):
     async def generate_cb(self, i: discord.Interaction):
         await i.response.send_modal(NewProfileModal(self.cog))
 
+    def _matches(self, entry, term: str) -> bool:
+        """The term in the profile's name, its creator's, its display name or its intro.
+        Blocking: the last two can read the profile's file."""
+        owner = self.cog.bot.get_user(entry['owner_id'])
+        return (term in entry['profile_name'].lower()
+                or (owner is not None and term in owner.name.lower())
+                or term in self.cog.profile_manager.library_search_text(
+                    entry['owner_id'], entry.get('original_pid')))
+
     async def search_cb(self, i: discord.Interaction):
         modal = ui.Modal(title="Search Public Library")
-        inp = ui.TextInput(label="Search Term", required=False)
+        inp = ui.TextInput(label="Name, creator or words from the intro", required=False)
         modal.add_item(inp)
         async def on_submit(mi: discord.Interaction):
-            term = inp.value.lower()
+            await mi.response.defer()
+            term = inp.value.lower().strip()
             if term:
-                self.filtered_list = [p for p in self.all_public if term in p['profile_name'].lower()]
+                self.filtered_list = await asyncio.to_thread(
+                    lambda: [p for p in self.all_public if self._matches(p, term)])
             else:
                 self.filtered_list = self.all_public
             self.selected_index = self.current_page = 0
             self.setup_items()
-            await mi.response.defer()
             await self.update_display()
         modal.on_submit = on_submit
         await i.response.send_modal(modal)
+
+    async def sort_cb(self, i: discord.Interaction):
+        self.sort = "new" if self.sort == "borrowed" else "borrowed"
+        searching = self.filtered_list is not self.all_public
+        self.all_public = self._sorted(self.all_public)
+        self.filtered_list = self._sorted(self.filtered_list) if searching else self.all_public
+        self.selected_index = self.current_page = 0
+        self.setup_items()
+        await i.response.defer()
+        await self.update_display()
+
+    async def publish_cb(self, i: discord.Interaction):
+        if await refuse_unregistered(self.cog, i):
+            return
+        await i.response.defer()
+        view = HubPublishView(self.cog, self.original_interaction)
+        await view.update_display()
 
 class HubIncomingView(HubBaseView):
     """Shares waiting for you, and who may send them.
@@ -501,42 +565,56 @@ class HubIncomingView(HubBaseView):
         await self.update_display()
 
 class HubShareManagerView(HubBaseView):
-    #: Sharing and cloning are separate tabs so the two send buttons never sit side by
-    #: side: one lends a borrow, the other gives a copy away for good.
+    """Profile Sharing: offer your profiles as borrows. Its two siblings share the screen
+    and flip one class attribute each -- Profile Cloning (`CLONE`) and the Library's
+    Publish Yours (`PUBLISH`) -- so the three send buttons never sit side by side: one
+    lends a borrow, one gives a copy away for good, one lists it for everyone."""
     TAB = "manage"
     CLONE = False
+    PUBLISH = False
 
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):
         super().__init__(cog, interaction, self.TAB)
-        self.mode = "private"
         self.selected_profiles = []
         self.selected_users = []
         self.processing = False
         
-        #: What the dropdown offers in the current mode, filled by `load_profiles`: only
-        #: profiles whose rating lets them be shared (or published), because listing the
-        #: rest offered a choice every button then refused.
+        #: What the dropdown offers, filled by `load_profiles`: whatever is rated for it,
+        #: plus whatever has no verdict yet -- rated by the press that sends it. Adult is
+        #: left out, because listing it offered a choice every button then refused.
         self.personal_profiles: List[str] = []
-        self._loaded_mode: Optional[str] = None
+        #: The listed ones a press will rate first, so the dropdown can say so.
+        self.needs_rating: Set[str] = set()
+        self._loaded = False
         self.current_page = 0
         
         self.setup_items()
 
-    def _eligible_profiles(self) -> List[str]:
-        """Blocking: one rating read per personal profile."""
+    @property
+    def capability(self) -> str:
+        return "publish" if self.PUBLISH else "share"
+
+    def _eligible_profiles(self) -> Tuple[List[str], Set[str]]:
+        """(offered, of those the ones needing a rating). Blocking: one rating read each."""
         pm = self.cog.profile_manager
-        capability = "share" if self.mode == "private" else "publish"
         names = sorted(pm._get_user_index(self.user_id).get("personal", []))
-        eligible = {name for name in names if pm.content_capability(self.user_id, name, capability)[0]}
-        if self.mode == "public":
+        offered, unrated = set(), set()
+        for name in names:
+            verdict, _ = pm._content_rating_state(self.user_id, name)
+            if CONTENT_RATING_CAPABILITIES[verdict][self.capability]:
+                offered.add(name)
+            elif verdict in (CONTENT_RATING_UNRATED, CONTENT_RATING_PENDING):
+                offered.add(name)
+                unrated.add(name)
+        if self.PUBLISH:
             # Already listed stays offered whatever its rating, or it could not be
             # deselected to unpublish it.
-            eligible |= {name for name, _ in self._get_user_public_profiles()} & set(names)
-        return sorted(eligible)
+            offered |= {name for name, _ in self._get_user_public_profiles()} & set(names)
+        return sorted(offered), unrated
 
     async def load_profiles(self):
-        self.personal_profiles = await asyncio.to_thread(self._eligible_profiles)
-        self._loaded_mode = self.mode
+        self.personal_profiles, self.needs_rating = await asyncio.to_thread(self._eligible_profiles)
+        self._loaded = True
         self.setup_items()
 
     def _get_user_public_profiles(self):
@@ -548,15 +626,8 @@ class HubShareManagerView(HubBaseView):
         for item in self.children[:]:
             if item.row != 4: self.remove_item(item)
 
-        # Row 0: Mode. Cloning has no public half, so nothing to toggle.
-        if not self.CLONE:
-            style = discord.ButtonStyle.blurple if self.mode == "private" else discord.ButtonStyle.green
-            label = "Mode: Private Sharing" if self.mode == "private" else "Mode: Public Publishing"
-            add_button(self, label, self.toggle_mode, style=style, row=0)
-
-        # Row 0 holds Clear and the page controls too, directly above the select they
-        # act on: rows 2 and 3 are recipients then Send, so Send reads as sending to them.
-        # Mode, Clear and three page controls are exactly Discord's five.
+        # Row 0 holds Clear and the page controls, directly above the select they act on:
+        # rows 2 and 3 are recipients then Send, so Send reads as sending to them.
         if self.selected_profiles:
             add_button(self, f"Clear ({len(self.selected_profiles)})", self.clear_selection,
                        style=discord.ButtonStyle.secondary, row=0)
@@ -581,58 +652,65 @@ class HubShareManagerView(HubBaseView):
                 page_description="Toggle selection for every profile on this page.",
                 all_description="Toggle selection for every profile you own.")
 
+            press = "publish" if self.PUBLISH else "send"
             for p in page_profiles:
                 options.append(discord.SelectOption(
-                    label=p, value=p, default=(p in self.selected_profiles)))
+                    label=p, value=p, default=(p in self.selected_profiles),
+                    description=f"Not rated yet: rated when you {press}" if p in self.needs_rating else None))
 
         if options:
             add_select(self, options, self.select_profiles, placeholder="Select profiles...",
                        min_values=0, max_values=len(options), row=1)
 
-        if self.mode == "private":
-            user_sel = ui.UserSelect(placeholder="Select recipients...", min_values=1, max_values=10, row=2)
-            user_sel.callback = self.select_users
-            self.add_item(user_sel)
-            if self.CLONE:
-                add_button(self, "Send as Clone", self.send_clone, style=discord.ButtonStyle.blurple, row=3)
-            else:
-                add_button(self, "Send", self.send_private, style=discord.ButtonStyle.green, row=3)
-        else:
+        if self.PUBLISH:
             add_button(self, "Apply Changes", self.apply_public, style=discord.ButtonStyle.green,
                        row=2)
             # One intro at a time, so only with one profile selected.
             add_button(self, "Edit Intro", self.edit_intro, row=2,
                        disabled=len(self.selected_profiles) != 1)
+            add_button(self, "← Library", self.back_to_library, row=2)
+            return
+        user_sel = ui.UserSelect(placeholder="Select recipients...", min_values=1, max_values=10, row=2)
+        user_sel.callback = self.select_users
+        self.add_item(user_sel)
+        if self.CLONE:
+            add_button(self, "Send as Clone", self.send_clone, style=discord.ButtonStyle.blurple, row=3)
+        else:
+            add_button(self, "Send", self.send_private, style=discord.ButtonStyle.green, row=3)
 
     async def update_display(self):
-        if self._loaded_mode != self.mode:
+        if not self._loaded:
             await self.load_profiles()
         await self.original_interaction.edit_original_response(content=None, embed=self.build_embed(), view=self)
 
     def build_embed(self) -> discord.Embed:
-        desc = "Manage how you share your profiles.\n\n"
-        if self.CLONE:
-            desc = "Give your profiles away as copies.\n\n"
-            desc += ("**Send as Clone** offers people who have set MimicAI up an independent copy of "
-                     "their own, without memories: they can edit it freely and it never follows your "
-                     "edits. The offer waits in their Incoming Shares until they answer it; nobody is "
-                     "messaged. To lend a profile that follows your edits, use **Profile Sharing**.\n"
-                     "Only profiles rated **General** or **Exempt** are listed.")
-        elif self.mode == "private":
-            desc += ("**Private Mode:** Offer profiles to people who have set MimicAI up. An offer "
-                     "waits in their Incoming Shares until they answer it; nobody is messaged.\n"
-                     "**Send** lends a borrow that follows your edits. To give them an independent "
-                     "copy instead, use **Profile Cloning**.\n"
-                     "Only profiles rated **General** or **Exempt** are listed.")
+        rating = ("Profiles not rated yet are rated when you press it, which takes a few "
+                  "seconds; Adult 18+ profiles cannot be ")
+        if self.PUBLISH:
+            title = "Publish to the Library"
+            desc = ("List your profiles in the Public Library for anyone to borrow, and deselect "
+                    "one to take it out. Existing borrows keep working either way.\n"
+                    f"{rating}published. Select a single profile to give it an intro.")
+        elif self.CLONE:
+            title = "Profile Cloning"
+            desc = ("Give your profiles away as copies.\n\n"
+                    "**Send as Clone** offers people who have set MimicAI up an independent copy of "
+                    "their own, without memories: they can edit it freely and it never follows your "
+                    "edits. The offer waits in their Incoming Shares until they answer it; nobody is "
+                    "messaged. To lend a profile that follows your edits, use **Profile Sharing**.\n"
+                    f"{rating}cloned.")
         else:
-            desc += ("**Public Mode:** Publish your profiles to the global library for anyone to borrow.\n"
-                     "Only profiles rated **General** or **Exempt** are listed, with any already published. "
-                     "Select a single profile to give it an intro for its listing.")
+            title = "Profile Sharing"
+            desc = ("Offer profiles to people who have set MimicAI up. An offer waits in their "
+                    "Incoming Shares until they answer it; nobody is messaged.\n"
+                    "**Send** lends a borrow that follows your edits. To give them an independent "
+                    "copy instead, use **Profile Cloning**; to list a profile for everyone, "
+                    "**Public Library** → **Publish Yours**.\n"
+                    f"{rating}shared.")
         if not self.personal_profiles:
-            desc += (f"\n\nNone of your profiles can be {'shared' if self.mode == 'private' else 'published'} "
-                     f"yet. Rate one from `/profile manage` → Home → **Content Safety**.")
+            desc += "\n\nYou have no profiles that can be offered here."
             
-        embed = discord.Embed(title="Profile Sharing", description=desc, color=discord.Color.teal())
+        embed = discord.Embed(title=title, description=desc, color=discord.Color.teal())
         
         full_text = ", ".join(self.selected_profiles)
         # A field value, so 1024. This cut at 4000, the description's limit, and Select All
@@ -641,7 +719,7 @@ class HubShareManagerView(HubBaseView):
         if not full_text: full_text = "None"
         embed.add_field(name="Selected Profiles", value=full_text, inline=False)
 
-        if self.mode == "public":
+        if self.PUBLISH:
             public_names = [f"{name}{' (Locked)' if is_locked else ''}" for name, is_locked in self._get_user_public_profiles()]
 
             val = ", ".join(public_names) if public_names else "None"
@@ -650,20 +728,6 @@ class HubShareManagerView(HubBaseView):
 
         return embed
 
-    async def toggle_mode(self, i: discord.Interaction):
-        # [UPDATED] Free users CAN toggle to Public to UNPUBLISH. Validation happens on Apply.
-        if self.mode == "private":
-            self.mode = "public"
-            self.selected_profiles = [name for name, _ in self._get_user_public_profiles()]
-        else:
-            self.mode = "private"
-            self.selected_profiles = []
-        
-        self.current_page = 0
-        self.setup_items()
-        await i.response.defer()
-        await self.update_display()
-
     async def edit_intro(self, i: discord.Interaction):
         # Deferred: gui_profiles imports this module at load time.
         from .gui_profiles import LibraryIntroModal
@@ -671,6 +735,10 @@ class HubShareManagerView(HubBaseView):
         if len(self.selected_profiles) != 1:
             return
         await i.response.send_modal(LibraryIntroModal(self.cog, self.user_id, self.selected_profiles[0]))
+
+    async def back_to_library(self, i: discord.Interaction):
+        await i.response.defer()
+        await HubPublicLibraryView(self.cog, self.original_interaction).update_display()
 
     async def select_profiles(self, i: discord.Interaction):
         start = self.current_page * SHARE_PAGE_SIZE
@@ -696,6 +764,45 @@ class HubShareManagerView(HubBaseView):
     async def send_clone(self, i: discord.Interaction):
         await self.send_private(i, kind="clone")
 
+    async def _rate_selection(self, i: discord.Interaction, names) -> Tuple[List[str], Dict[str, str]]:
+        """Splits a selection into (allowed, {name: reason}) for this screen's gate.
+
+        Through `rate_for_distribution`, so a profile with no verdict is rated by the
+        press rather than refused, and one edited since its verdict is not let out on it.
+        Its refusal wording is the sentence the Content Safety dashboard shows. At most
+        RATING_CONCURRENCY at once, each may wait on the classifier; while any needs a
+        rating, one ephemeral message counts them off as they land.
+        """
+        pm = self.cog.profile_manager
+        unrated = [n for n in names if n in self.needs_rating]
+        progress = None
+        if unrated:
+            progress = await i.followup.send(
+                f"Rating {len(unrated)} profile{'s' if len(unrated) != 1 else ''}, "
+                f"{RATING_CONCURRENCY} at a time. This takes a few seconds each.",
+                ephemeral=True, wait=True)
+        gate = asyncio.Semaphore(RATING_CONCURRENCY)
+
+        async def rate(name):
+            async with gate:
+                return name, await pm.rate_for_distribution(self.user_id, name, self.capability)
+
+        answers, lines = {}, []
+        # Edited from here, not inside `rate`: a rate-limited edit must not hold a slot.
+        for done in asyncio.as_completed([rate(n) for n in names]):
+            name, answer = await done
+            answers[name] = answer
+            if progress and name in self.needs_rating:
+                lines.append(f"{'✅' if answer[0] else '⚠️'} **{name}**")
+                try:
+                    await progress.edit(content=f"Rated {len(lines)} of {len(unrated)}\n"
+                                                + "\n".join(lines)[-1800:])
+                except discord.HTTPException:
+                    progress = None   # Gone or refused: the report still lands.
+        allowed = [name for name in names if answers[name][0]]
+        refused = {name: answers[name][1] or "Not available." for name in names if not answers[name][0]}
+        return allowed, refused
+
     async def send_private(self, i: discord.Interaction, kind: Optional[str] = None):
         """Offers the selection to each recipient; `kind` is the share's, sparse as
         `ProfileManager._is_share_of` reads it."""
@@ -713,7 +820,8 @@ class HubShareManagerView(HubBaseView):
             await self.update_display()
             return
         
-        shareable, refused = self._partition_shareable(self.selected_profiles)
+        shareable, refused = await self._rate_selection(i, self.selected_profiles)
+        self._loaded = False   # A rating may have landed: re-read what needs one.
         if not shareable:
             self.processing = False
             self.setup_items()
@@ -762,102 +870,44 @@ class HubShareManagerView(HubBaseView):
             report += f"\n\n**Left out:**\n{lines}"
         await i.followup.send(report, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
-    def _partition_shareable(self, names):
-        """Splits a selection into (allowed, {name: reason}) for the share gates.
-
-        Sharing is the point at which a profile stops being only its owner's
-        business, so it is gated on the rating exactly as publishing is: Adult may be
-        neither. Both gates read content_capability so the refusal wording is the
-        same sentence the Content Safety dashboard shows. The dropdown already hides
-        what fails here; this catches a rating that changed after it was drawn.
-        """
-        allowed, refused = [], {}
-        for name in names:
-            ok, reason = self.cog.profile_manager.content_capability(self.user_id, name, "share")
-            if ok:
-                allowed.append(name)
-            else:
-                refused[name] = reason
-        return allowed, refused
-
     async def apply_public(self, i: discord.Interaction):
         if self.processing: return
         self.processing = True
 
         for item in self.children:
-            if isinstance(item, ui.Button) and item.label in ["Apply Changes", "Apply Publishing Changes"]: item.disabled = True
+            if isinstance(item, ui.Button) and item.label == "Apply Changes": item.disabled = True
         await i.response.edit_message(view=self)
 
-        user_id_str = str(self.user_id)
-        
-        # Names of everything this user already has published. Read through the
-        # normaliser: the old inline version resolved string entries via a
-        # name.txt that is never written, so this set came back empty and every
-        # already-public profile landed in `to_publish` -- re-running the paid
-        # moderator on it and, if it had since been set to 18+, reporting a
-        # failure for a profile that was published all along.
-        current_public_set = {d["profile_name"]
-                              for d in self.cog.profile_manager._iter_public_entries(self.user_id)}
-        
+        pm = self.cog.profile_manager
+        # Read through the normaliser: the old inline version resolved string entries via
+        # a name.txt that is never written, so every already-public profile landed in
+        # `to_publish` and was judged again.
+        current_public_set = {d["profile_name"] for d in pm._iter_public_entries(self.user_id)}
         target_set = set(self.selected_profiles)
-        to_publish = target_set - current_public_set
-        to_unpublish = current_public_set - target_set
-        
+        to_publish = sorted(target_set - current_public_set)
+        to_unpublish = sorted(current_public_set - target_set)
+
+        # Past the day's limit is refused before rating, so it spends no classifier call.
+        left, refusal = pm.publishes_left(self.user_id)
+        over_limit = {name: refusal for name in to_publish[left:]}
+        # Publishing analyses nothing of its own. It reads the rating, because that rating
+        # *is* the safety analysis -- a profile with none is rated here, by this press.
+        allowed, failed_list = await self._rate_selection(i, to_publish[:left])
+        failed_list.update(over_limit)
         published_list = []
-        failed_list = {}
+        for name in allowed:
+            pid_entry = pm._get_pid_from_name_any(self.user_id, name)
+            self.cog.public_profiles[pid_entry] = f"{self.user_id}:{pid_entry}"
+            published_list.append(name)
+        if published_list:
+            pm._save_public_index()
+            pm.note_publishes(self.user_id, len(published_list))
 
-        if to_publish:
-            # Publishing no longer analyses anything. It reads the rating the owner
-            # already obtained, because that rating *is* the safety analysis -- the
-            # separate auto-moderator pass that used to run here answered an adjacent
-            # question with a second prompt, and the two could disagree on the same
-            # profile with no way for the owner to tell which had objected.
-            #
-            # The consequence is that publishing is now instant and free: no API call,
-            # no avatar download, no "Analysing profiles for safety..." wait. A
-            # profile that has not been rated is refused with the same sentence the
-            # Content Safety dashboard shows, and rating it is a click away there.
-            def evaluate_profile(name: str):
-                allowed, reason = self.cog.profile_manager.content_capability(
-                    self.user_id, name, "publish")
-                return name, allowed, reason
-
-            results = [evaluate_profile(name) for name in to_publish]
-
-            for name, is_safe, reason in results:
-                if is_safe:
-                    pid_entry = self.cog.profile_manager._get_pid_from_name_any(self.user_id, name)
-                    self.cog.public_profiles[pid_entry] = f"{self.user_id}:{pid_entry}"
-                    published_list.append(name)
-                else:
-                    failed_list[name] = reason
-            
-            if published_list:
-                self.cog.profile_manager._save_public_index()
-
-        unpublished_list = []
-        for name in to_unpublish:
-            target_pid = self.cog.profile_manager._get_pid_from_name_any(self.user_id, name)
-            ids_to_del = []
-            for pid, info in self.cog.public_profiles.items():
-                if isinstance(info, str) and ":" in info:
-                    if info == f"{self.user_id}:{target_pid}":
-                        ids_to_del.append(pid)
-                # By PID, as the string form above: the entry's name is a snapshot from
-                # publishing, so a profile renamed since could not be unpublished, and
-                # a later profile given the old name unpublished the renamed one.
-                elif (isinstance(info, dict) and str(info.get("owner_id")) == user_id_str
-                      and (info.get("original_pid") or info.get("original_profile_id")) == target_pid):
-                    ids_to_del.append(pid)
-                    
-            for pid in ids_to_del:
-                del self.cog.public_profiles[pid]
-                unpublished_list.append(name)
-        
-        if unpublished_list:
-            self.cog.profile_manager._save_public_index()
+        unpublished_list = [name for name in to_unpublish if pm.unpublish_profile(self.user_id, name)]
 
         self.processing = False
+        self._loaded = False
+        self.selected_profiles = [name for name, _ in self._get_user_public_profiles()]
         self.setup_items()
         await self.update_display()
 
@@ -876,6 +926,18 @@ class HubShareManagerView(HubBaseView):
 class HubCloneManagerView(HubShareManagerView):
     TAB = "clone"
     CLONE = True
+
+
+class HubPublishView(HubShareManagerView):
+    """The Library's Publish Yours: opens on what is already listed, so deselecting one
+    and pressing Apply Changes unpublishes it."""
+    TAB = "library"
+    PUBLISH = True
+
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):
+        super().__init__(cog, interaction)
+        self.selected_profiles = [name for name, _ in self._get_user_public_profiles()]
+        self.setup_items()
 
 
 class BorrowDefaultsView(BlockedGuard, ui.View):

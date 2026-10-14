@@ -5,6 +5,7 @@ import hashlib
 import re
 import uuid
 import shutil
+import threading
 import base64
 import zlib
 import zstandard as zstd
@@ -42,7 +43,7 @@ from ..utils.constants import (
     IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_CONSENT_FILES, VOICE_SAMPLE_SLOT_FILES, VOICE_SAMPLE_SLOT_KEY, VOICE_SAMPLE_SLOTS,
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_MODES, GREEDY_SAMPLING, SYSTEM_PROFILE_MODEL,
     MODEL_PROVIDERS, PROVIDER_CHOICES, NOT_REGISTERED,
-    LIMIT_LORE_ENTRIES, PERSONA_TEXT_INPUT_MAX_LENGTH, )
+    LIMIT_LORE_ENTRIES, LIMIT_PUBLISHES_PER_DAY, PERSONA_TEXT_INPUT_MAX_LENGTH, )
 from ..utils.helpers import (auto_tier, birth_time, image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
                             ltm_auto_recall_enabled, resolve_critic_settings,
                             grounding_mode_display, resolve_image_output_params,
@@ -50,12 +51,15 @@ from ..utils.helpers import (auto_tier, birth_time, image_rag_enabled, is_real_m
                             resolve_image_tools, resolve_thinking_params,
                             resolve_unreadable_media_mode,
                             resolve_url_mode, suppress_link_previews, system_model,
-                            clean_imported_text)
+                            clean_imported_text, _get_user_hash)
 from ..utils import lorebook
-from ..utils.bonds import apply_updates as apply_bond_updates
+from ..utils.bonds import apply_updates as apply_bond_updates, describe as describe_bond
 from ..utils.discord_cdn import is_web_url, signed_attachment_url, unsigned_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager, _get_compressor, _get_decompressor
+
+#: Two searches run in two worker threads, and LRUCache's eviction is several steps.
+_LIBRARY_TEXT_LOCK = threading.Lock()
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
 
 try:
@@ -957,6 +961,14 @@ class ProfileManager:
         verdict, _ = self._content_rating_state(owner_id, profile_name)
         if verdict == CONTENT_RATING_PENDING or CONTENT_RATING_CAPABILITIES[verdict]["publish"]:
             return False
+        return self.unpublish_profile(owner_id, profile_name)
+
+    def unpublish_profile(self, owner_id: int, profile_name: str) -> bool:
+        """Takes a profile out of the Public Library. True if it was listed.
+
+        By PID: an entry's stored name is a snapshot from publishing, so a profile renamed
+        since could not be found by name. Existing borrows are untouched. Blocking.
+        """
         pid = self._get_pid_from_name(owner_id, profile_name)
         if not pid:
             return False
@@ -967,6 +979,30 @@ class ProfileManager:
         if entry_ids:
             self._save_public_index()
         return bool(entry_ids)
+
+    def library_search_text(self, owner_id: int, pid: str) -> str:
+        """A listing's display name and intro, lower-cased, for the Library's search.
+
+        Read uncached -- a search touches every listing, which is no reason to fill the
+        shard cache -- and kept per version of the file, keyed by its mtime, so an edit is
+        picked up without a hook in every config write.
+        """
+        # ponytail: one stat per listing per search, and a decrypt per listing the first
+        # time; copy the text into the public index if the Library outgrows that.
+        path = os.path.join(USERS_DIR, str(owner_id), "profiles", pid, "profile.json.gz")
+        try:
+            version = os.path.getmtime(path)
+        except OSError:
+            return ""
+        cached = self.cog.library_text.get(pid)
+        if cached and cached[0] == version:
+            return cached[1]
+        config = (IOManager.read_json_gzip(path, self.cog.fernet) or {}).get("config") or {}
+        text = "\n".join(filter(None, (config.get("custom_display_name"),
+                                       config.get("library_intro")))).lower()
+        with _LIBRARY_TEXT_LOCK:
+            self.cog.library_text[pid] = (version, text)
+        return text
 
     def distribution_of(self, owner_id: int, profile_name: str) -> Tuple[bool, int]:
         """(listed in the Public Library, number of users borrowing it), for copy that
@@ -3216,9 +3252,9 @@ class ProfileManager:
         An exempt profile is treated as 'general' for placement -- it runs in any
         channel -- and no classifier job is ever queued for it. It is also the one
         carve-out in _resolve_safety_settings: an exemption is a standing statement
-        that this profile does not need filtering, so it sends BLOCK_NONE even in a
-        general channel, where every other profile sends BLOCK_ONLY_HIGH. The
-        <content_policy> block is all that shapes it there.
+        that this profile does not need filtering, so it sends OFF even in a general
+        channel, where every other profile sends BLOCK_ONLY_HIGH -- and prompt_builder
+        sends it no <content_policy> block either. Nothing shapes it but its persona.
 
         Unlike a moderator override, the exemption is NOT tied to a content hash:
         it is a standing decision about the profile, so editing the persona does
@@ -3452,6 +3488,86 @@ class ProfileManager:
         self.schedule_content_classification(owner_id, profile_name)
         return True, "Submitted. The verdict usually lands within a few seconds."
 
+    async def settled_capability(self, owner_id: int, profile_name: str, capability: str,
+                                 *, wait: bool = False) -> Tuple[bool, Optional[str]]:
+        """`content_capability`, once a rating the profile has outgrown is settled.
+
+        The stored verdict is read without re-hashing (`_content_rating_state`), so an edit
+        no prompt caught was shared, published or opened in Global Chat on a verdict about
+        other text. The deliberate distribution paths ask this instead. It hashes the
+        persona: never on the turn path. `wait` holds for the re-check a distributed
+        profile is given, for a caller that has already answered its interaction.
+        """
+        outcome = await self.resolve_stale_rating(owner_id, profile_name)
+        if outcome == "reclassify" and wait:
+            await self.await_classification(*self._resolve_effective_profile(owner_id, profile_name))
+        return self.content_capability(owner_id, profile_name, capability)
+
+    async def rate_for_distribution(self, owner_id: int, profile_name: str,
+                                    capability: str) -> Tuple[bool, Optional[str]]:
+        """`settled_capability`, with an Unrated profile submitted and its verdict awaited.
+
+        What Publish, Send and Send as Clone call, so rating is part of the press rather
+        than a trip to Content Safety first: asking to distribute a profile is asking for
+        the verdict that permits it. The caller must have answered its interaction -- the
+        wait runs up to CONTENT_CLASSIFY_UI_WAIT_SECONDS.
+        """
+        allowed, reason = await self.settled_capability(owner_id, profile_name, capability, wait=True)
+        verdict, _ = self._content_rating_state(owner_id, profile_name)
+        if allowed or verdict not in (CONTENT_RATING_UNRATED, CONTENT_RATING_PENDING):
+            return allowed, reason
+        if (int(owner_id), profile_name) not in self.cog.pending_classifications:
+            # Unrated, or a Pending submission that failed: submit_for_rating refuses one
+            # still inside its retry window, and says when it will retry.
+            ok, message = await self.submit_for_rating(owner_id, profile_name)
+            if not ok:
+                return False, message
+        await self.await_classification(owner_id, profile_name)
+        return self.content_capability(owner_id, profile_name, capability)
+
+    async def publish_profile(self, owner_id: int, profile_name: str) -> Tuple[bool, Optional[str]]:
+        """Lists one of the owner's profiles in the Public Library, rating it first if it
+        has no verdict. (listed, reason_if_not); one already listed is a success."""
+        if self._is_profile_public(owner_id, profile_name):
+            return True, None
+        left, refusal = self.publishes_left(owner_id)
+        if not left:
+            return False, refusal
+        allowed, reason = await self.rate_for_distribution(owner_id, profile_name, "publish")
+        if not allowed:
+            return False, reason
+        pid = self._get_pid_from_name(owner_id, profile_name)
+        if not pid:
+            return False, "Profile not found."
+        self.cog.public_profiles[pid] = f"{owner_id}:{pid}"
+        # On the loop: write_json's temp name is fixed, so two threads saving the index at
+        # once would trip over each other, and the dict is the loop's to mutate.
+        self._save_public_index()
+        self.note_publishes(owner_id, 1)
+        return True, None
+
+    # Publishes in the last 24 hours, as epoch seconds, in About Me's sparse block beside
+    # the share settings: `published_times` only while it holds one.
+
+    def _recent_publishes(self, owner_id: int) -> List[int]:
+        cutoff = time.time() - 86400
+        return [t for t in self.get_user_about(owner_id).get("published_times") or [] if t > cutoff]
+
+    def publishes_left(self, owner_id: int) -> Tuple[int, str]:
+        """(listings this user may still make, why one past those is refused). A rolling
+        day: each publish holds its slot for 24 hours."""
+        recent = self._recent_publishes(owner_id)
+        frees = int(min(recent, default=time.time())) + 86400
+        return (max(0, LIMIT_PUBLISHES_PER_DAY - len(recent)),
+                f"You can publish {LIMIT_PUBLISHES_PER_DAY} profiles a day; the next slot opens "
+                f"<t:{frees}:R>.")
+
+    def note_publishes(self, owner_id: int, count: int) -> None:
+        if count:
+            about = self.get_user_about(owner_id)
+            about["published_times"] = self._recent_publishes(owner_id) + [int(time.time())] * count
+            self.save_user_about(owner_id, about)
+
     def drop_to_unrated(self, owner_id: int, profile_name: str) -> bool:
         """Returns a profile to Unrated without spending a call.
 
@@ -3608,7 +3724,7 @@ class ProfileManager:
         pids = {name: self._get_pid_from_name(user_id, name) for name in profile_names}
         file_data = await asyncio.to_thread(self._build_export, user_id, pids, filters, passphrase)
 
-        # Export is DM-only, and a DM takes Discord's default upload.
+        # Discord's default upload: what every channel takes, a DM or an unboosted server.
         limit = discord.utils.DEFAULT_FILE_SIZE_LIMIT_BYTES
         if len(file_data) > limit:
             await interaction.followup.send(
@@ -3975,114 +4091,10 @@ class ProfileManager:
             return (len(ltm.get("guild", [])) if ltm else 0), (len(training) if training else 0)
         return await asyncio.to_thread(_read)
 
-    async def _build_participant_embed(self, participant: Dict, channel_id: int) -> discord.Embed:
-        owner_id = participant['owner_id']
-        profile_name = participant['profile_name']
-        
-        _, _, _, temp, topp, topk, training_ctx, training_rel, prim_model, fall_model = await asyncio.to_thread(
-            self.cog.session_manager._get_user_profile_for_model, owner_id, channel_id, profile_name
-        )
-
-        effective_owner_id, effective_profile_name = self._resolve_effective_profile(owner_id, profile_name)
-        
-        index = self._get_user_index(owner_id)
-        is_borrowed = profile_name in index.get("borrowed", [])
-        
-        profile_data = self._get_profile_config(owner_id, profile_name, is_borrowed) or {}
-
-        appearance = self._get_user_appearance(effective_owner_id, effective_profile_name)
-        display_name = appearance.get("custom_display_name") or effective_profile_name
-        appearance_text = f"`{effective_profile_name}`" if appearance else "None"
-        
-        ltm_count, training_count = await self._memory_counts(
-            owner_id, profile_name, effective_owner_id, effective_profile_name)
-
-        realistic_typing = profile_data.get("realistic_typing_enabled", False)
-        timezone_str = profile_data.get("timezone", "UTC")
-        
-        grounding_display = grounding_mode_display(profile_data)
-
-        stm_length = profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
-        ltm_ctx = profile_data.get("ltm_context_size", 3)
-        ltm_rel = profile_data.get("ltm_relevance_threshold", 0.75)
-        access_display = CHANNEL_ACCESS_LABELS[self._resolve_enforced_safety_level(owner_id, profile_name)]
-        ltm_creation_status = "**`ON`**" if profile_data.get("ltm_creation_enabled", False) else "`OFF`"
-
-        created_str = profile_data.get('created_at')
-        created_display = "Unknown"
-        if created_str:
-            try:
-                dt = datetime.datetime.fromisoformat(created_str)
-                ts = int(dt.timestamp())
-                created_display = f"<t:{ts}:D>\n(<t:{ts}:R>)"
-            except: pass
-
-        profile_type = "Personal"
-        if is_borrowed:
-            owner_user = self.cog.bot.get_user(effective_owner_id)
-            owner_name = owner_user.name if owner_user else "Unknown User"
-            profile_type = f"Borrowed (from {owner_name})"
-
-        embed = discord.Embed(title=f"Participant: {display_name}", color=discord.Color.blue())
-        
-        embed.add_field(name="Profile Type", value=f"`{profile_type}`", inline=True)
-        embed.add_field(name="Created", value=created_display, inline=True)
-        embed.add_field(name="Display Name", value=f"`{display_name}`", inline=True)
-        
-        # Same column discipline as the profile dashboard: identity on the left,
-        # Public Library in the middle, channel access on the right. Borrowed
-        # profiles carry a second identity field and fill the row on their own.
-        is_public = self._is_profile_public(owner_id, profile_name)
-        library_display = "🌐 `Published`" if is_public else "`Not published`"
-
-        if is_borrowed:
-            borrowed_config = self._get_profile_config(owner_id, profile_name, True) or {}
-            # Not "A class" and "B class": the source of a borrow can be a personal
-            # profile (A) or a System one (X), and the local PID is B or C depending
-            # on whether the borrow came through a private share or the Public Library.
-            source_pid = borrowed_config.get("original_profile_id", "Unknown")
-            local_pid = self._get_pid_from_name_any(owner_id, profile_name)
-            embed.add_field(name="Profile ID (Source)", value=f"`{source_pid}`", inline=True)
-            embed.add_field(name="Profile ID (Local)", value=f"`{local_pid}`", inline=True)
-            embed.add_field(name="\u200b", value="\u200b", inline=True)
-            embed.add_field(name="\u200b", value="\u200b", inline=True)
-        else:
-            profile_id = self._get_profile_id(effective_owner_id, effective_profile_name)
-            embed.add_field(name="Profile ID (PID)", value=f"`{profile_id}`", inline=True)
-
-        embed.add_field(name="Public Library", value=library_display, inline=True)
-        embed.add_field(name="Channel Access", value=f"`{access_display}`", inline=True)
-
-        embed.add_field(name="\u200b", value="**Core Settings**", inline=False)
-        embed.add_field(name="Primary Model", value=f"`{prim_model}`", inline=True)
-        embed.add_field(name="Fallback Model", value=f"`{fall_model}`", inline=True)
-        embed.add_field(name="Appearance", value=appearance_text, inline=True)
-        
-        embed.add_field(name="Grounding", value=grounding_display, inline=True)
-        embed.add_field(name="Realistic Typing", value="**`ON`**" if realistic_typing else "`OFF`", inline=True)
-        embed.add_field(name="Timezone", value=f"`{timezone_str}`", inline=True)
-
-        embed.add_field(name="\u200b", value="**Generation Parameters**", inline=False)
-        embed.add_field(name="Temperature", value=f"`{temp}`", inline=True)
-        embed.add_field(name="Top P", value=f"`{topp}`", inline=True)
-        embed.add_field(name="Top K", value=f"`{topk}`", inline=True)
-        embed.add_field(name="STM Length", value=f"`{stm_length}`", inline=True)
-
-        embed.add_field(name="\u200b", value="**Training & Memory**", inline=False)
-        embed.add_field(name="Train Ctx", value=f"`{training_ctx}`", inline=True)
-        embed.add_field(name="Train Rel", value=f"`{training_rel}`", inline=True)
-        embed.add_field(name="Train Count", value=f"`{training_count}`", inline=True)
-        embed.add_field(name="LTM Ctx", value=f"`{ltm_ctx}`", inline=True)
-        embed.add_field(name="LTM Rel", value=f"`{ltm_rel}`", inline=True)
-        embed.add_field(name="LTM Info", value=f"Count: `{ltm_count}`\nAuto-Creation: {ltm_creation_status}", inline=True)
-        
-        if appearance.get("custom_avatar_url"):
-            embed.set_thumbnail(url=appearance["custom_avatar_url"])
-            
-        return embed
-    
-
-    async def _build_profile_embed(self, user_id: int, profile_name: str, channel_id: int) -> discord.Embed:
+    async def _build_profile_embed(self, user_id: int, profile_name: str, channel_id: int,
+                                   viewer_id: Optional[int] = None) -> discord.Embed:
+        """`viewer_id`, for a card shown to someone other than its owner, adds how the
+        character feels about them, where Bonds is on."""
         index = self._get_user_index(user_id)
         is_borrowed = profile_name in index.get("borrowed", [])
 
@@ -4119,11 +4131,15 @@ class ProfileManager:
         embed.add_field(name="Profile Type", value=f"`{profile_type}`", inline=True)
         embed.add_field(name="Created", value=created_display, inline=True)
         embed.add_field(name="Display Name", value=f"`{display_name}`", inline=True)
+        if viewer_id is not None and config.get("bond_engine_enabled"):
+            held = await asyncio.to_thread(self.bonds, user_id, profile_name)
+            embed.add_field(name=f"How {display_name} feels about you"[:256],
+                            value=describe_bond(held.get(_get_user_hash(viewer_id))), inline=False)
 
         enforced = self._resolve_enforced_safety_level(user_id, profile_name)
         verdict, verdict_reason = self._content_rating_state(user_id, profile_name)
         declared = self._is_owner_declared_adult(user_id, profile_name)
-        is_public = self._is_profile_public(user_id, profile_name)
+        is_public, borrowers = self.distribution_of(user_id, profile_name)
 
         rating_display = (f"{CONTENT_RATING_EMOJI[verdict]} "
                           f"`{CONTENT_RATING_LABELS[verdict]}`")
@@ -4159,8 +4175,11 @@ class ProfileManager:
                         value=f"`{CHANNEL_ACCESS_LABELS[enforced]}`", inline=True)
 
         embed.add_field(name=left_column[1][0], value=left_column[1][1], inline=True)
-        embed.add_field(name="Public Library",
-                        value="\U0001f310 `Published`" if is_public else "`Not published`", inline=True)
+        library_value = "\U0001f310 `Published`" if is_public else "`Not published`"
+        # The owner's reach; on a borrow the count would be the source's.
+        if borrowers and not is_borrowed:
+            library_value += f"\n{borrowers} borrowing"
+        embed.add_field(name="Public Library", value=library_value, inline=True)
         embed.add_field(name="\u200b", value="\u200b", inline=True)
 
         if verdict == CONTENT_RATING_PENDING and verdict_reason:

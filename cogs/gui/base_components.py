@@ -254,7 +254,7 @@ class TabbedView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     tab whose body -- defer, construct the sibling, repaint -- differed only in the
     class it named. Subclasses declare `TABS` instead:
 
-        TABS = (("Home", "home", lambda v: HubHomeView(v.cog, v.original_interaction)),)
+        TABS = (("Stats", "stats", lambda v: HubStatsView(v.cog, v.original_interaction)),)
 
     The factory is handed the view it is navigating away from, so a screen that
     ferries state between its tabs (the moderated user id, say) reads it off there.
@@ -457,14 +457,20 @@ class ConfigModal(ui.Modal):
                 self.cog.profile_manager._save_profile_config(uid, self.profile_name, target, self.is_borrowed)
                 invalidate_model_cache(self.cog, uid, self.profile_name)
 
+        prompts_saved = False
         if prompt_updates and not self.is_borrowed:
             prompts = self.cog.profile_manager._get_profile_prompts(uid, self.profile_name)
             if prompts:
                 prompts.update(prompt_updates)
                 self.cog.profile_manager._save_profile_prompts(uid, self.profile_name, prompts)
+                prompts_saved = True
 
         await interaction.followup.send(f"✅ Settings updated for '{self.profile_name}'.", ephemeral=True)
         if self.callback: await self.callback(interaction)
+        if prompts_saved:
+            # The image prompt is rated text. Deferred: gui_profiles imports this module.
+            from .gui_profiles import maybe_prompt_rating_after_edit
+            await maybe_prompt_rating_after_edit(self.cog, interaction, uid, self.profile_name)
 
 class ActionTextInputModal(ui.Modal):
     def __init__(self, title: str, label: str, placeholder: str, on_submit_callback, default: Optional[str] = None, required: bool = True):

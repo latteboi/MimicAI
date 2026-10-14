@@ -1247,6 +1247,8 @@ def google_thinking_caps(model_name: Optional[str]) -> Dict[str, Any]:
     * Gemini 3 takes `thinkingLevel`. 3 Pro collapses the six levels to two -- it
       publishes LOW and HIGH and nothing between -- so `levels` says which mapping the
       caller should use.
+    * Gemini 4 takes `thinkingLevel` too, but Argon publishes LOW, MEDIUM and HIGH and
+      no MINIMAL, so Minimal and None read as LOW.
     * Gemini 2.5 takes `thinkingBudget`, except Flash Lite, which takes neither. 2.5
       Pro refuses a budget under 128 while still allowing -1 (dynamic), hence
       `budget_floor` rather than a plain clamp.
@@ -1267,6 +1269,8 @@ def google_thinking_caps(model_name: Optional[str]) -> Dict[str, Any]:
 
     if any(suffix in lowered for suffix in ("-image", "-tts", "-embedding")):
         return {"mode": None, "levels": "full", "budget_floor": 0}
+    if "gemini-4" in lowered:
+        return {"mode": "level", "levels": "no_minimal", "budget_floor": 0}
     if "gemini-3" in lowered:
         return {"mode": "level",
                 "levels": "binary" if "pro" in lowered else "full",

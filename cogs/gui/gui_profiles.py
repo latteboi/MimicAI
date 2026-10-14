@@ -19,8 +19,9 @@ from ..utils.helpers import (
     resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
     resolve_unreadable_media_mode, system_model, auto_tier, resolve_auto_model,
-    _format_api_error, speaks_verbatim, stored_google_voice,
+    _format_api_error, speaks_verbatim, stored_google_voice, _get_user_hash,
 )
+from ..utils.bonds import describe as describe_bond
 from ..utils.user_defaults import auto_wording, model_provider, setting_label
 from ..utils.birthdays import MONTH_NAMES, parse_birthday, valid_birthday
 
@@ -43,7 +44,7 @@ from ..services.api.google_rest import voice_id_of
 from ..utils.discord_cdn import is_web_url
 from ..utils.data_policy import may_pick_training_models
 from .gui_data import DataManageView
-from .gui_hub import HubShareManagerView
+from .gui_hub import HubCloneManagerView, HubShareManagerView
 from .gui_sessions import CustomModelModal
 from .gui_settings import OllamaHostModal
 
@@ -154,7 +155,7 @@ def ProfileBirthdayModal(cog, profile_name: str, current: Optional[Dict[str, int
 #: operations on the profile itself, so the rows that are neither identity nor an
 #: operation sit apart from Delete rather than above it.
 PROFILE_TABS = ("home", "persona", "params", "tools", "images", "audio", "memory",
-                "training", "misc")
+                "training", "sharing", "misc")
 
 #: Tab buttons to an action row, for both the dashboard's strip and the bulk wizard's.
 #: Discord's own limit, and the two strips share it so they cannot wrap differently.
@@ -547,6 +548,8 @@ def _bulk_method(name: str):
 # Gates. Named rather than inlined as lambdas so the table below reads as data.
 def _own(view):        return not view.is_borrowed
 def _own_not_mod(view): return not view.is_borrowed and not view.is_mod_view
+# A System profile is everyone's already: there is nobody to offer it to.
+def _shareable(view):  return _own_not_mod(view) and not view.is_system
 def _to_system(view):
     return (not view.is_borrowed and not view.is_mod_view
             and view.original_interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)
@@ -766,8 +769,10 @@ def _render_neuro(ctx):
                 f"Oxytocin: `{state.get('oxytocin', 50)}`\n"
                 f"Adrenaline: `{state.get('adrenaline', 20)}`")
     if config.get("bond_engine_enabled", False):
-        known = ctx.get("bonds_known")
-        text += "\nBonds: On" + (f", `{known}` people known" if known is not None else "")
+        held = ctx.get("bonds")
+        text += "\nBonds: On" + (f", `{len(held)}` people known\nWith you: "
+                                 f"{describe_bond(held.get(_get_user_hash(ctx['owner_id'])), numbers=True)}"
+                                 if held is not None else "")
     return "Neuro Engine", text, True
 
 
@@ -1308,23 +1313,33 @@ PROFILE_ACTIONS = (
                        scope="personal",
                        keys=("training_context_size", "training_relevance_threshold"))),
 
+    # --- Sharing (everything that lets a profile out to other people) ---
+    #
+    # Publish, Share and Clone act on behalf of the profile's owner -- each opens or
+    # writes the invoker's own -- so they stay owner-only rather than being silently
+    # wrong under /mod. Each rates a profile with no verdict as part of the press.
+    _Action("publish", "sharing",
+            lambda v: "Unpublish from Library" if v.cog.profile_manager._is_profile_public(
+                v.user_id, v.profile_name) else "Publish to Library",
+            "List this profile in the Public Library, rating it first if it needs one.",
+            _method("_handle_publish"), _shareable, menu_label="Publish / Unpublish"),
+    _Action("share", "sharing", "Share Profile",
+            "Offer it to people you choose, as a borrow that follows your edits.",
+            _method("_handle_share"), _shareable),
+    _Action("clone", "sharing", "Send as Clone",
+            "Offer it as an independent copy, without memories, that never follows your edits.",
+            _method("_handle_share", True), _shareable),
+    # No bulk form, which is also what keeps it out of /settings -> Defaults: one intro
+    # stamped across forty characters describes none of them.
+    _Action("library_intro", "sharing", "Library Intro",
+            "Write the introduction shown on this profile's Public Library listing.",
+            _method("_act_library_intro"), _own),
+
     # --- Misc (neither identity nor an operation on the profile) ---
     #
     # Home is what you do *to* a profile -- rename, duplicate, copy, rate, delete. These
-    # four are settings that belong to no other tab, and sitting among those operations
-    # they read as part of them: Library Intro one row above Delete Profile is a listing
-    # you are about to lose rather than a paragraph you are about to write.
-    #
-    # Share acts on behalf of the profile's owner -- _handle_share opens the invoker's
-    # own share manager -- so it stays owner-only rather than being silently wrong
-    # under /mod.
-    _Action("share", "misc", "Share Profile", "Share this profile with others or publish it.",
-            _method("_handle_share"), _own_not_mod),
-    # No bulk form, which is also what keeps it out of /settings -> Defaults: one intro
-    # stamped across forty characters describes none of them.
-    _Action("library_intro", "misc", "Library Intro",
-            "Write the introduction shown on this profile's Public Library listing.",
-            _method("_act_library_intro"), _own),
+    # are settings that belong to no other tab, and sitting among those operations they
+    # would read as part of them.
     # These two were `_own` on the row and scope="all" in bulk, so a borrower could
     # set their placeholder emoji on forty profiles at once and on none individually
     # -- the same drift, running backwards, that co-declaring bulk beside single was
@@ -1680,6 +1695,7 @@ class ProfileManageView(BlockedGuard, ui.View):
                 invalidate_model_cache(self.cog, self.user_id, old_name)
                 
                 await self.original_interaction.edit_original_response(content=f"Profile '{old_name}' renamed to '{new_name}'.", view=None, embed=None)
+                await maybe_prompt_rating_after_edit(self.cog, i, self.user_id, new_name)
         modal.on_submit = rename_submit
         await interaction.response.send_modal(modal)
 
@@ -1744,9 +1760,9 @@ class ProfileManageView(BlockedGuard, ui.View):
         modal.on_submit = convert_submit
         await interaction.response.send_modal(modal)
 
-    async def _handle_share(self, interaction):
+    async def _handle_share(self, interaction, clone: bool = False):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        view = HubShareManagerView(self.cog, interaction)
+        view = (HubCloneManagerView if clone else HubShareManagerView)(self.cog, interaction)
         await view.load_profiles()
         if self.profile_name in view.personal_profiles:
             view.selected_profiles = [self.profile_name]
@@ -1759,6 +1775,23 @@ class ProfileManageView(BlockedGuard, ui.View):
             embed.add_field(name=f"'{self.profile_name}' cannot be shared"[:256],
                             value=reason or "Not available.", inline=False)
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+    async def _handle_publish(self, interaction):
+        """Publish or unpublish this one profile, rating it first if it has no verdict."""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        pm = self.cog.profile_manager
+        if pm._is_profile_public(self.user_id, self.profile_name):
+            pm.unpublish_profile(self.user_id, self.profile_name)
+            message = (f"**{self.profile_name}** is out of the Public Library. Anyone already "
+                       "borrowing it keeps it.")
+        else:
+            listed, reason = await pm.publish_profile(self.user_id, self.profile_name)
+            message = (f"🌐 **{self.profile_name}** is in the Public Library. Give it an intro "
+                       "from **Library Intro** on this tab." if listed
+                       else f"**{self.profile_name}** was not published. {reason or ''}".strip())
+        await interaction.followup.send(message, ephemeral=True)
+        self._build_view()
+        await self._refresh_dashboard(interaction)
 
     async def _handle_delete(self, interaction):
         async def confirm_delete(i: discord.Interaction):
@@ -1845,8 +1878,8 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             "owner_id": self.parent.user_id,
             "voice_sample": await self.cog.profile_manager.voice_sample_summary(
                 self.parent.user_id, self.parent.profile_name),
-            "bonds_known": len(await asyncio.to_thread(
-                self.cog.profile_manager.bonds, self.parent.user_id, self.parent.profile_name))
+            "bonds": await asyncio.to_thread(
+                self.cog.profile_manager.bonds, self.parent.user_id, self.parent.profile_name)
                 if self.action.value == "neuro" else None})
         if field:
             e.add_field(name=field[0], value=str(field[1])[:1024], inline=False)
@@ -3995,6 +4028,8 @@ class ThinkingPickerMixin:
         if caps["mode"] == "level":
             if caps["levels"] == "binary":
                 return "takes **effort** only, in two steps -- Low/Minimal/None read as LOW, the rest as HIGH"
+            if caps["levels"] == "no_minimal":
+                return "takes **effort** only, Minimal/None read as Low; the budget is stored, not sent"
             return "takes **effort** only; the budget is stored, not sent"
         if caps["mode"] == "budget":
             floor = caps["budget_floor"]
@@ -5075,6 +5110,10 @@ async def _apply_bulk_session(cog, user_id: int, session: _BulkSession) -> Dict[
                     prompts.update(session.prompts)
                     cog.profile_manager._save_profile_prompts(user_id, name, prompts)
                     touched = True
+                    # A prompt per profile across forty would be noise, so the rule the
+                    # ignored prompt applies is applied outright: listed or borrowed are
+                    # re-checked, anything else drops to Unrated.
+                    asyncio.create_task(cog.profile_manager.resolve_stale_rating(user_id, name))
 
         if session.config or session.pins:
             profile = cog.profile_manager._get_profile_config(user_id, name, is_borrowed)

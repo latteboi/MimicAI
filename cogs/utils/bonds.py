@@ -9,7 +9,7 @@ Insertion order is recency: an update re-inserts, and past LIMIT_BONDS the oldes
 import re
 from typing import Any, Dict, Iterable, List, Tuple
 
-from .constants import BOND_FIRST_MEETING, BOND_ROSTER_SIZE, BOND_STEP_MAX, LIMIT_BONDS
+from .constants import BOND_BANDS, BOND_FIRST_MEETING, BOND_ROSTER_SIZE, BOND_STEP_MAX, LIMIT_BONDS
 
 #: The report, as DEFAULT_BOND_INSTRUCTION asks for it, or cut off at the end of a reply
 #: that ran out of tokens. One pattern for the parser and the scrub, as the neuro engine's.
@@ -68,3 +68,14 @@ def render(people: Iterable[Tuple[str, str]], store: Dict[str, Any]) -> str:
                  else "first meeting: set both")
         lines.append(f"{name} [ID: {bond_id}]: {state}")
     return "\n".join(lines)
+
+
+def describe(held: Any, numbers: bool = False) -> str:
+    """Where a character stands with one person, in BOND_BANDS' words, for that person to
+    read: "Affection: **warm** · Resentment: **friendly**". `numbers` adds each level."""
+    if not (isinstance(held, list) and len(held) == 2):
+        return "Not met yet: the first conversation sets both."
+    return " · ".join(
+        f"{axis}: **{next(band[col] for band in BOND_BANDS if level <= band[0])}**"
+        + (f" (`{level}`)" if numbers else "")
+        for axis, level, col in (("Affection", held[0], 1), ("Resentment", held[1], 2)))
