@@ -886,8 +886,8 @@ PROFILE_ACTIONS = (
             _method("_handle_convert_copy", True), _to_system),
     _Action("convert_to_personal", "home", "Copy to Personal Profile", "Create a Personal Profile copy from this System Profile.",
             _method("_handle_convert_copy", False), _to_personal),
-    # One row where there were three. Declaring 18+, clearing a verdict and granting
-    # an exemption are all answers to "why can this profile not do X", and as bare
+    # One row where there were several. Declaring 18+ and clearing a verdict are
+    # both answers to "why can this profile not do X", and as bare
     # dropdown rows none of them said what X was -- a user refused a publish had to
     # guess which applied to them. They now live inside the Content Safety dashboard,
     # next to the rating that explains them.
@@ -896,7 +896,7 @@ PROFILE_ACTIONS = (
             _method("_handle_content_safety"),
             # The dashboard itself is per-profile, but the one action inside it that
             # is the owner's to set in bulk -- the 18+ declaration -- is not. A
-            # classifier verdict and an exemption are deliberately excluded.
+            # classifier verdict is deliberately excluded.
             bulk=_Bulk(_bulk_method("_bulk_adult_declaration"), scope="personal",
                        label="Set Adult 18+ Declaration",
                        description="Declare or withdraw 18+ across multiple profiles.")),
@@ -6663,8 +6663,8 @@ class BulkManageView(_ActionStagingHost, BaseBulkProfileView):
                          f"instructions and prompts — those belong to the profile's owner.")
         if counts["skipped_declaration"]:
             notes.append(f"• {counts['skipped_declaration']} profile(s) kept their content "
-                         f"rating — a published profile, a classifier verdict and an exemption "
-                         f"are none of them the owner's to overwrite in bulk.")
+                         f"rating — neither a published profile nor a classifier verdict "
+                         f"is the owner's to overwrite in bulk.")
         if notes:
             e.add_field(name="Skipped", value="\n".join(notes)[:1024], inline=False)
 
@@ -6729,8 +6729,8 @@ class ContentSafetyView(BlockedGuard, ui.View):
 
     Replaces the profile dashboard rather than opening beside it, because it is not
     a settings page -- it is the explanation of why the profile can or cannot do
-    things, and it needs the room to say so. The three actions it absorbed
-    (declare 18+, clear verdict, exemption) previously sat as unexplained rows in
+    things, and it needs the room to say so. The actions it absorbed (declare
+    18+, clear verdict) previously sat as unexplained rows in
     the Home dropdown, where a user who hit "this profile cannot be published" had
     no way to find out which of them applied.
 
@@ -6804,17 +6804,19 @@ class ContentSafetyView(BlockedGuard, ui.View):
                 verdict == CONTENT_RATING_GENERAL and self.stale):
             add_button(self, "Try Again" if stalled else "Submit for Rating", self.submit_cb,
                        style=discord.ButtonStyle.success, row=0)
+        if verdict == CONTENT_RATING_REFUSED:
+            add_button(self, "Submit for Re-rating", self.submit_cb,
+                       style=discord.ButtonStyle.success, row=0)
 
         if verdict == CONTENT_RATING_PENDING and not stalled:
             add_button(self, "Check for a Verdict", self.recheck_cb,
                        style=discord.ButtonStyle.primary, row=0)
 
         # The declaration is withheld exactly where it has nothing to move: on a
-        # published profile, while a classifier verdict stands, and on an exemption.
+        # published profile, and while a classifier verdict stands.
         declared = pm._is_owner_declared_adult(self.user_id, self.profile_name)
-        can_declare = verdict != CONTENT_RATING_EXEMPT and not pm._is_profile_public(
-            self.user_id, self.profile_name)
-        if verdict == CONTENT_RATING_ADULT and not declared:
+        can_declare = not pm._is_profile_public(self.user_id, self.profile_name)
+        if verdict in (CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED) and not declared:
             can_declare = False
         if can_declare:
             label = "Withdraw 18+ Declaration" if declared else "Declare Adult 18+"
@@ -6822,18 +6824,22 @@ class ContentSafetyView(BlockedGuard, ui.View):
             add_button(self, label, self.declare_cb, style=style, row=0)
 
         if self.is_mod_view and self.is_bot_owner:
-            exempt = verdict == CONTENT_RATING_EXEMPT
-            add_button(self, "Remove Exemption" if exempt else "Exempt From Classification",
-                       self.exempt_cb,
-                       style=discord.ButtonStyle.secondary if exempt else discord.ButtonStyle.primary,
-                       row=1)
-
-            if verdict == CONTENT_RATING_ADULT and not declared:
-                add_button(self, "Clear Adult Verdict", self.clear_cb,
+            if verdict in (CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED) and not declared:
+                add_button(self, "Clear Refusal" if verdict == CONTENT_RATING_REFUSED
+                           else "Clear Adult Verdict", self.clear_cb,
                            style=discord.ButtonStyle.danger, row=1)
 
             add_button(self, "Force Re-classify", self.force_cb,
                        style=discord.ButtonStyle.secondary, row=1)
+
+            # The model gave no verdict, so the operator gives one.
+            if rating.get("flagged"):
+                choices = (((CONTENT_RATING_ADULT, "Approve 18+"),) if declared else
+                           ((CONTENT_RATING_GENERAL, "Rate General"), (CONTENT_RATING_ADULT, "Rate Adult")))
+                for choice, label in (*choices, (CONTENT_RATING_REFUSED, "Refuse")):
+                    add_button(self, label, self._review_cb(choice), row=1,
+                               style=discord.ButtonStyle.danger if choice == CONTENT_RATING_REFUSED
+                               else discord.ButtonStyle.success)
 
     def get_embed(self) -> discord.Embed:
         pm = self.cog.profile_manager
@@ -6844,7 +6850,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
             CONTENT_RATING_PENDING: discord.Color.gold(),
             CONTENT_RATING_GENERAL: discord.Color.green(),
             CONTENT_RATING_ADULT: discord.Color.red(),
-            CONTENT_RATING_EXEMPT: discord.Color.blurple(),
+            CONTENT_RATING_REFUSED: discord.Color.dark_red(),
         }[verdict]
 
         emoji = CONTENT_RATING_EMOJI[verdict]
@@ -6857,10 +6863,30 @@ class ContentSafetyView(BlockedGuard, ui.View):
 
         # Why, when the verdict came from the classifier. A category code, never the
         # model's own words about somebody's persona.
+        if verdict == CONTENT_RATING_REFUSED:
+            embed.add_field(
+                name="Reason", value=(
+                    f"{CONTENT_RATING_REASON_LABELS['MINOR_SAFETY']}.\nOnly the bot operator "
+                    "can clear this. Edit the persona and choose Submit for Re-rating to have "
+                    "it rated again; it stays Refused until then."), inline=False)
         if verdict == CONTENT_RATING_ADULT:
             if pm._is_owner_declared_adult(self.user_id, self.profile_name):
-                embed.add_field(
-                    name="Set by", value="You declared this profile 18+.", inline=False)
+                if rating.get("checked"):
+                    value = "You declared this profile 18+."
+                else:
+                    value = ("You declared this profile 18+. It runs only once the content "
+                             "rating has checked it, on your own API key, for what the Terms "
+                             "of Service forbid outright.")
+                    if (int(self.user_id), self.profile_name) in self.cog.pending_classifications:
+                        value += "\nThe check is running now."
+                    elif rating.get("flagged"):
+                        value += ("\nThe rating model gave no verdict, so the bot operator "
+                                  "will review it.")
+                    elif rating.get("retry_after") and time.time() < rating["retry_after"]:
+                        value += (f"\nThe last check failed and it will retry "
+                                  f"<t:{int(rating['retry_after'])}:R> — check `/settings` "
+                                  f"for an API key.")
+                embed.add_field(name="Set by", value=value, inline=False)
             else:
                 reason = CONTENT_RATING_REASON_LABELS.get(
                     rating.get("reason"), CONTENT_RATING_REASON_FALLBACK)
@@ -6882,6 +6908,13 @@ class ContentSafetyView(BlockedGuard, ui.View):
                     value="The classifier is running now. This page will update "
                           "itself when the verdict lands.",
                     inline=False)
+            elif rating.get("flagged"):
+                embed.add_field(
+                    name="Under review",
+                    value=("The rating model gave no verdict, so the bot operator will review "
+                           "this profile. Until then it stays Pending; editing it and "
+                           "submitting again also asks for a new verdict."),
+                    inline=False)
             elif retry_after and time.time() < retry_after:
                 embed.add_field(
                     name="Held up",
@@ -6897,8 +6930,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
             mark = "✅" if allowed else "❌"
             rows.append(f"{mark} **{cap_label}**" + ("" if allowed else f"\n　　*{reason}*"))
 
-        access = "Age-restricted channels only" if CONTENT_RATING_CAPABILITIES[verdict]["age_restricted_only"] \
-            else "Any channel"
+        access = CHANNEL_ACCESS_LABELS[pm._effective_safety_level({"content_rating": rating})]
         rows.insert(0, f"💬 **Runs in:** {access}")
         embed.add_field(name="What this profile can do", value="\n".join(rows), inline=False)
 
@@ -6930,6 +6962,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
                       f"model: `{rating.get('model') or '—'}`\n"
                       f"hash: `{rating.get('hash') or '—'}`\n"
                       f"at: `{rating.get('at') or '—'}`\n"
+                      f"flagged: `{rating.get('flagged') or '—'}`\n"
                       f"distributed: `{self.distributed}`")
             embed.add_field(name="Operator detail", value=detail, inline=False)
 
@@ -7008,23 +7041,38 @@ class ContentSafetyView(BlockedGuard, ui.View):
         await i.response.defer()
         await asyncio.to_thread(
             pm.set_owner_adult_declaration, self.user_id, self.profile_name, not declared)
-        await self._refresh(i)
-
-    async def exempt_cb(self, i: discord.Interaction):
-        pm = self.cog.profile_manager
-        verdict, _ = self._rating()
-        await i.response.defer()
-        await asyncio.to_thread(
-            pm.set_classification_exempt, self.user_id, self.profile_name,
-            verdict != CONTENT_RATING_EXEMPT)
+        if not declared:
+            # A declaration runs nowhere until it is checked; queue the check now, on the loop.
+            pm.schedule_content_classification(self.user_id, self.profile_name)
+            await self._await_verdict(i)
+            return
         await self._refresh(i)
 
     async def clear_cb(self, i: discord.Interaction):
         await i.response.defer()
-        await asyncio.to_thread(
-            self.cog.profile_manager.clear_adult_verdict,
-            self.user_id, self.profile_name, i.user.id)
+        pm = self.cog.profile_manager
+        verdict, _ = self._rating()
+        cleared = await asyncio.to_thread(
+            pm.clear_classifier_verdict, self.user_id, self.profile_name, i.user.id)
+        if cleared and verdict == CONTENT_RATING_REFUSED:
+            # A refusal cleared as a false positive was never a strike. A block it caused
+            # stays until lifted under Blacklist, which the operator decides.
+            self.cog.server_manager.remove_strikes(
+                self.user_id, pm._get_pid_from_name(self.user_id, self.profile_name))
         await self._refresh(i)
+
+    def _review_cb(self, verdict: str):
+        async def callback(i: discord.Interaction):
+            await i.response.defer()
+            pm = self.cog.profile_manager
+            stored = await asyncio.to_thread(
+                pm.moderator_verdict, self.user_id, self.profile_name, verdict, i.user.id)
+            if stored and verdict == CONTENT_RATING_REFUSED:
+                self.cog.server_manager.add_strike(
+                    self.user_id, pm._get_pid_from_name(self.user_id, self.profile_name),
+                    self.profile_name)
+            await self._refresh(i)
+        return callback
 
     async def force_cb(self, i: discord.Interaction):
         await i.response.defer()
@@ -7194,14 +7242,18 @@ async def maybe_prompt_rating_after_edit(cog, interaction: discord.Interaction,
     """Offers the post-edit choice, if there is one to make.
 
     Silent for the overwhelming majority of edits: an Unrated profile has no rating
-    to invalidate, and a declared or exempt one cannot be moved by an edit. Costs a
-    persona hash, so it is only ever called from an interactive edit path.
+    to invalidate, a Refused one waits for its owner to resubmit, and a declared one is
+    simply checked again -- it runs nowhere meanwhile, so there is no choice to offer.
+    Costs a persona hash, so it is only ever called from an interactive edit path.
     """
     pm = cog.profile_manager
     key = (int(user_id), profile_name)
     view = None
     try:
         if not await pm.rating_is_stale(user_id, profile_name):
+            return
+        if await asyncio.to_thread(pm._is_owner_declared_adult, user_id, profile_name):
+            await pm.resolve_stale_rating(user_id, profile_name)
             return
         verdict, _rating = await asyncio.to_thread(pm._content_rating_state, user_id, profile_name)
         listed, borrowers = await asyncio.to_thread(pm.distribution_of, user_id, profile_name)

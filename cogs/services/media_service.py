@@ -459,7 +459,7 @@ class MediaService:
                         fn_ctx = tool_loop.FunctionContext(
                             owner_id=owner_id, profile_name=profile_name, author_dn=app_name,
                             guild_id=package['guild_id'], triggering_user_id=package['author_id'],
-                            safety_settings=_resolve_safety_settings(channel, profile_settings))
+                            safety_settings=_resolve_safety_settings(channel))
 
                         async def send(turn, cfg, _model=text_model, _state=state_container,
                                        _participant=participant, _msg_a_id=msg_a_id,
@@ -901,7 +901,7 @@ class MediaService:
             index = self.cog.profile_manager._get_user_index(effective_profile_owner_id)
             is_borrowed = effective_profile_name in index.get("borrowed", [])
             profile_data = self.cog.profile_manager._get_profile_config(effective_profile_owner_id, effective_profile_name, is_borrowed) or {}
-            dynamic_safety_settings = _resolve_safety_settings(message.channel, profile_data)
+            dynamic_safety_settings = _resolve_safety_settings(message.channel)
 
             # Get appearance text
             source_owner_id, source_profile_name = self.cog.profile_manager._resolve_effective_profile(

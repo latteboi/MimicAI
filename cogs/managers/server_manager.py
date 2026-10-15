@@ -8,7 +8,8 @@ import discord
 
 from .storage_manager import IOManager
 from ..utils.constants import (BLACKLIST_FILE_PATH, BLACKLIST_FORMAT_VERSION,
-                               BLACKLIST_SCOPE_FULL, BLACKLIST_SCOPE_GENERATION,
+                               BLACKLIST_LIFTED_RETENTION_SECONDS, BLACKLIST_SCOPE_FULL,
+                               STRIKE_LIFETIME_SECONDS, STRIKE_THRESHOLD, BLACKLIST_SCOPE_GENERATION,
                                BLACKLIST_SCOPES, GLOBAL_PROMPTS_FILE_PATH,
                                GUILD_BLOCK_ACTIONS, GUILD_BLOCK_LEAVE,
                                GUILD_BLOCK_QUARANTINE, SYSTEM_MODELS_FILE_PATH)
@@ -24,6 +25,12 @@ try:
     import orjson as json
 except ImportError:
     import json
+
+
+def record_lifted(entry: Dict[str, Any], now: Optional[float] = None) -> bool:
+    """Whether an enforcement record's restriction has ended: kept on file, enforcing nothing."""
+    until = entry.get("until")
+    return until is not None and until <= (time.time() if now is None else now)
 
 
 class ServerManager:
@@ -167,6 +174,14 @@ class ServerManager:
     # `_rebuild_blacklist_sets` is the only thing that writes them, and it is the reason
     # `on_message` still costs one `int in frozenset` however much detail a record grows.
     # Nothing on a hot path may reach into `blacklist_records`.
+    #
+    # A record whose `until` has passed is *lifted*: it enforces nothing, and stays on file
+    # for BLACKLIST_LIFTED_RETENTION_SECONDS before the sweep deletes it. Unblocking sets
+    # `until` to now rather than deleting: Privacy Policy §5 promises the record is kept.
+    #
+    # `strikes`, "<user_id>" -> {pid: {"name", "at"}}: one per Refused profile, live for
+    # STRIKE_LIFETIME_SECONDS, then swept like a lifted record. They enforce nothing
+    # themselves; reaching STRIKE_THRESHOLD writes an ordinary block (`add_strike`).
 
     def _load_blacklist(self):
         """Reads blacklist.json in either format and derives the enforcement sets.
@@ -175,7 +190,7 @@ class ServerManager:
         recorded reason -- the only reading of it that cannot be wrong, since v1 stored
         no scope to narrow and no date to expire.
         """
-        records = {"users": {}, "guilds": {}}
+        records = {"users": {}, "guilds": {}, "strikes": {}}
         try:
             if os.path.exists(BLACKLIST_FILE_PATH):
                 with open(BLACKLIST_FILE_PATH, 'rb') as f:
@@ -188,7 +203,7 @@ class ServerManager:
                             "reason": "", "at": None, "by": None, "until": None,
                         }
                 elif isinstance(data, dict):
-                    for key in ("users", "guilds"):
+                    for key in ("users", "guilds", "strikes"):
                         section = data.get(key)
                         if isinstance(section, dict):
                             records[key] = {str(k): v for k, v in section.items()
@@ -197,7 +212,7 @@ class ServerManager:
             # Refusing to enforce is the safe direction here: an unreadable file must not
             # leave a half-parsed list blocking people it never named.
             print(f"Error loading global blacklist: {e}")
-            records = {"users": {}, "guilds": {}}
+            records = {"users": {}, "guilds": {}, "strikes": {}}
 
         self.cog.blacklist_records = records
         self._rebuild_blacklist_sets()
@@ -209,6 +224,7 @@ class ServerManager:
                 "version": BLACKLIST_FORMAT_VERSION,
                 "users": self.cog.blacklist_records.get("users", {}),
                 "guilds": self.cog.blacklist_records.get("guilds", {}),
+                "strikes": self.cog.blacklist_records.get("strikes", {}),
             }, BLACKLIST_FILE_PATH)
         except Exception as e:
             print(f"Error saving global blacklist: {e}")
@@ -233,6 +249,7 @@ class ServerManager:
             until = entry.get("until")
             if until is not None:
                 if until <= now:
+                    next_expiry = min(next_expiry, until + BLACKLIST_LIFTED_RETENTION_SECONDS)
                     continue
                 next_expiry = min(next_expiry, until)
             # An unrecognised scope reads as a full block: a record written by a newer
@@ -247,10 +264,18 @@ class ServerManager:
                 gid = int(gid_str)
             except (TypeError, ValueError):
                 continue
+            until = entry.get("until")
+            if until is not None and until <= now:
+                next_expiry = min(next_expiry, until + BLACKLIST_LIFTED_RETENTION_SECONDS)
+                continue
             if entry.get("action") == GUILD_BLOCK_QUARANTINE:
                 quarantine.add(gid)
             else:
                 leave.add(gid)
+
+        for strikes in self.cog.blacklist_records.get("strikes", {}).values():
+            for strike in strikes.values():
+                next_expiry = min(next_expiry, (strike.get("at") or 0) + STRIKE_LIFETIME_SECONDS)
 
         self.cog.global_blacklist = frozenset(full)
         self.cog.generation_blocked = frozenset(generation)
@@ -259,20 +284,49 @@ class ServerManager:
         self.cog._next_blacklist_expiry = next_expiry
 
     def expire_blacklist(self) -> bool:
-        """Drops entries whose `until` has passed. True if anything was removed.
+        """Lifts timed blocks whose `until` has passed, and deletes records lifted longer
+        ago than BLACKLIST_LIFTED_RETENTION_SECONDS. True if a record was deleted.
 
-        Called off the lock heartbeat rather than the daily cleanup: a temporary block
-        that lifts up to 24 hours late is not a temporary block. The caller checks
-        `_next_blacklist_expiry` first, so the common case never reaches here.
+        Lifting writes nothing: a record past its `until` enforces nothing once the sets
+        are rebuilt. Called off the lock heartbeat rather than the daily cleanup: a
+        temporary block that lifts up to 24 hours late is not a temporary block. The
+        caller checks `_next_blacklist_expiry` first, so the common case never reaches here.
         """
-        now = time.time()
-        users = self.cog.blacklist_records.get("users", {})
-        expired = [uid for uid, entry in users.items()
-                   if entry.get("until") is not None and entry["until"] <= now]
-        if not expired:
+        cutoff = time.time() - BLACKLIST_LIFTED_RETENTION_SECONDS
+        deleted = False
+        for section in ("users", "guilds"):
+            records = self.cog.blacklist_records.get(section, {})
+            for key in [k for k, e in records.items()
+                        if e.get("until") is not None and e["until"] <= cutoff]:
+                del records[key]
+                deleted = True
+        strike_cutoff = time.time() - STRIKE_LIFETIME_SECONDS
+        accounts = self.cog.blacklist_records.get("strikes", {})
+        for uid in list(accounts):
+            for pid in [p for p, strike in accounts[uid].items() if (strike.get("at") or 0) <= strike_cutoff]:
+                del accounts[uid][pid]
+                deleted = True
+            if not accounts[uid]:
+                del accounts[uid]
+        if deleted:
+            self._save_blacklist()
+        else:
+            self._rebuild_blacklist_sets()
+        return deleted
+
+    def _lift(self, section: str, entry_id: int) -> bool:
+        """Lifts a block, keeping its record; deletes a record already lifted. False if
+        there is none."""
+        records = self.cog.blacklist_records.get(section, {})
+        key = str(int(entry_id))
+        entry = records.get(key)
+        if entry is None:
             return False
-        for uid in expired:
-            users.pop(uid, None)
+        now = time.time()
+        if record_lifted(entry, now):
+            del records[key]
+        else:
+            entry["until"] = now
         self._save_blacklist()
         return True
 
@@ -300,12 +354,55 @@ class ServerManager:
         }
         self._save_blacklist()
 
-    def unblock_user(self, user_id: int) -> bool:
-        removed = self.cog.blacklist_records.get("users", {}).pop(str(int(user_id)), None)
-        if removed is None:
+    def active_strikes(self, user_id: int) -> List[Dict[str, Any]]:
+        """The account's live strikes, oldest first: {"pid", "name", "at"} each."""
+        cutoff = time.time() - STRIKE_LIFETIME_SECONDS
+        strikes = self.cog.blacklist_records.get("strikes", {}).get(str(int(user_id)), {})
+        return sorted(({"pid": pid, **strike} for pid, strike in strikes.items()
+                       if (strike.get("at") or 0) > cutoff), key=lambda s: s["at"])
+
+    def add_strike(self, user_id: int, pid: Optional[str], name: str) -> bool:
+        """Records a strike for a Refused profile, once per profile. True if this one
+        reached STRIKE_THRESHOLD and blocked the account.
+
+        The block is an ordinary Full block with no end date, so the operator keeps or
+        lifts it from /mod like any other. An account already blocked with no end date
+        keeps the operator's own record.
+        """
+        if not pid:
             return False
+        strikes = self.cog.blacklist_records.setdefault("strikes", {}).setdefault(str(int(user_id)), {})
+        if pid in strikes:
+            return False
+        strikes[pid] = {"name": name, "at": time.time()}
+        current = self.blacklist_entry(user_id)
+        if (len(self.active_strikes(user_id)) >= STRIKE_THRESHOLD
+                and not (current and current.get("until") is None)):
+            self.block_user(user_id, scope=BLACKLIST_SCOPE_FULL,
+                            reason=f"Automatic: {STRIKE_THRESHOLD} strikes")
+            return True
+        self._save_blacklist()
+        return False
+
+    def remove_strikes(self, user_id: int, pid: Optional[str] = None) -> bool:
+        """Removes one profile's strike, or all of an account's. True if any was removed.
+        Lifting a block a strike caused is left to the operator."""
+        accounts = self.cog.blacklist_records.get("strikes", {})
+        key = str(int(user_id))
+        strikes = accounts.get(key)
+        if not strikes or (pid is not None and pid not in strikes):
+            return False
+        if pid is None:
+            del accounts[key]
+        else:
+            del strikes[pid]
+            if not strikes:
+                del accounts[key]
         self._save_blacklist()
         return True
+
+    def unblock_user(self, user_id: int) -> bool:
+        return self._lift("users", user_id)
 
     def block_guild(self, guild_id: int, *, action: str = GUILD_BLOCK_LEAVE,
                     reason: str = "", by: Optional[int] = None):
@@ -320,11 +417,7 @@ class ServerManager:
         self._save_blacklist()
 
     def unblock_guild(self, guild_id: int) -> bool:
-        removed = self.cog.blacklist_records.get("guilds", {}).pop(str(int(guild_id)), None)
-        if removed is None:
-            return False
-        self._save_blacklist()
-        return True
+        return self._lift("guilds", guild_id)
 
     async def leave_blocked_guild(self, guild: discord.Guild):
         """Departs one blocked guild, child bots included, and drops what it left behind.

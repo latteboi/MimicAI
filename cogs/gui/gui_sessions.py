@@ -156,13 +156,16 @@ class GlobalChatPlayView(BlockedGuard, ui.View):
         await self._load_current_session()
         self._build_view()
         
-    async def _load_current_session(self):
+    async def _load_current_session(self) -> Dict:
+        # From disk, never an empty shell: the card outlives its cache entry, and an empty
+        # log put back here is what the next Play would find and save over the history.
         session_data = self.cog.global_chat_sessions.get(self.session_key)
         if not session_data:
             session_data = await self.cog.session_manager._load_session_from_disk(self.session_key, 'global_chat')
             if not session_data:
                 session_data = {'unified_log': []}
             self.cog.global_chat_sessions[self.session_key] = session_data
+        return session_data
             
     def _build_view(self):
         self.clear_items()
@@ -223,13 +226,13 @@ class GlobalChatPlayView(BlockedGuard, ui.View):
             await interaction.response.send_message("Only the session owner can lock or unlock this session.", ephemeral=True)
             return
         
-        session_data = self.cog.global_chat_sessions.setdefault(self.session_key, {'unified_log': []})
+        session_data = await self._load_current_session()
         session_data["is_locked"] = not session_data.get("is_locked", True)
         self._build_view()
         await interaction.response.edit_message(view=self)
 
     async def reply_callback(self, interaction: discord.Interaction):
-        session_data = self.cog.global_chat_sessions.setdefault(self.session_key, {'unified_log': []})
+        session_data = await self._load_current_session()
         
         if session_data.get("is_locked", True) and interaction.user.id != self.user_id:
             await interaction.response.send_message("This session is currently locked by the host.", ephemeral=True)

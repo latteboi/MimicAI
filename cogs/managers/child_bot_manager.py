@@ -1064,8 +1064,7 @@ class ChildBotManager:
             if not profile_data.get("image_generation_enabled", False):
                 return
 
-            dynamic_safety_settings = _resolve_safety_settings(
-                self.cog.bot.get_channel(channel_id), profile_data)
+            dynamic_safety_settings = _resolve_safety_settings(self.cog.bot.get_channel(channel_id))
 
             source_owner_id, source_profile_name = \
                 self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)

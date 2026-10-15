@@ -248,10 +248,11 @@ class MimicCog(EventListeners, commands.Cog):
         self.profile_manager._load_borrow_index()
         # Sweep tombstones once at boot. Deletion normally cascades, so a survivor
         # here came from a crash mid-delete or an older build; left alone it renders
-        # in the hub as an unborrowable "Unknown" entry forever.
+        # in the hub as an unborrowable "Unknown" entry forever. A listing whose rating
+        # no longer allows one goes too.
         _pruned = self.profile_manager._prune_public_index()
         if _pruned:
-            print(f"Public hub: pruned {len(_pruned)} orphaned entr"
+            print(f"Public hub: pruned {len(_pruned)} orphaned or unlistable entr"
                   f"{'y' if len(_pruned) == 1 else 'ies'} "
                   f"({', '.join(str(e['profile_name']) for e in _pruned[:10])}"
                   f"{', ...' if len(_pruned) > 10 else ''})")
@@ -313,14 +314,15 @@ class MimicCog(EventListeners, commands.Cog):
         # are what every enforcement site tests, so a check stays one `in` against a
         # set however much detail a record grows. `_rebuild_blacklist_sets` is the
         # only writer of all four; do not mutate them.
-        self.blacklist_records: Dict[str, Dict[str, Any]] = {"users": {}, "guilds": {}}
+        self.blacklist_records: Dict[str, Dict[str, Any]] = {"users": {}, "guilds": {}, "strikes": {}}
         self.global_blacklist: FrozenSet[int] = frozenset()      # scope: full
         self.generation_blocked: FrozenSet[int] = frozenset()    # full + generation
         self.blocked_guilds_leave: FrozenSet[int] = frozenset()
         self.quarantined_guilds: FrozenSet[int] = frozenset()
-        # The earliest `until` still standing, or inf. The heartbeat compares one float
-        # against this before doing anything, so an instance with no timed blocks pays
-        # nothing for having the sweep.
+        # The next moment a record changes state -- a timed block lifting, or a lifted
+        # record's retention running out -- or inf. The heartbeat compares one float
+        # against this before doing anything, so an instance with neither pays nothing
+        # for having the sweep.
         self._next_blacklist_expiry: float = math.inf
         self.server_manager._load_blacklist()
         self.session_last_accessed = {}
@@ -1888,7 +1890,7 @@ class MimicCog(EventListeners, commands.Cog):
                 await settle_status(interaction, "Could not hydrate the session.")
                 return
 
-        self.session_last_accessed[interaction.channel_id] = time.time()
+        self.session_manager._mark_session_accessed(interaction.channel_id)
 
         if not await self.session_manager._wait_for_session_flags(session, SESSION_BUSY_FLAGS, PURGE_BUSY_WAIT_TIMEOUT_SECONDS):
             await settle_status(interaction,
@@ -1936,7 +1938,7 @@ class MimicCog(EventListeners, commands.Cog):
         if block:
             await settle_status(interaction, block)
             return
-        self.session_last_accessed[interaction.channel_id] = time.time()
+        self.session_manager._mark_session_accessed(interaction.channel_id)
         message = await self.generation_service.manual_compaction(
             interaction.channel_id, undo=undo, keep=keep)
         await settle_status(interaction, message)
@@ -2353,7 +2355,7 @@ class MimicCog(EventListeners, commands.Cog):
                 # a lookup, so it keeps its own default rather than the slot's.
                 t_params_worker["thinking_level"] = "none"
             
-            d_safe = _resolve_safety_settings(interaction.channel, p_config)
+            d_safe = _resolve_safety_settings(interaction.channel)
             
             custom_error = p_config.get("error_response", "An error has occurred.")
 

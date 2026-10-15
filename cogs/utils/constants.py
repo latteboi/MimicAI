@@ -171,6 +171,8 @@ SESSIONS_GLOBAL_DIR = os.path.join(SESSIONS_DIR, "global_chat")
 SERVERS_DIR = os.path.join(DATA_DIR, "servers")
 DOCS_DIR = os.path.join(MOD_DATA_DIR, "docs")
 BLACKLIST_FILE_PATH = os.path.join(MOD_DATA_DIR, "blacklist.json")
+#: "<owner_id>:<pid>" -> {"name", "at"}: profiles the content rating refused, for /mod to review.
+REFUSED_INDEX_FILE = os.path.join(MOD_DATA_DIR, "refused.json")
 GLOBAL_PROMPTS_FILE_PATH = os.path.join(MOD_DATA_DIR, "system_prompts.json")
 SYSTEM_MODELS_FILE_PATH = os.path.join(MOD_DATA_DIR, "system_models.json")
 
@@ -1000,17 +1002,16 @@ SYSTEM_MODEL_DEFAULTS = {
 
 #: The describer's and the classifier's chains, which ship -- and are overridden, under the
 #: provider's name in the file -- per provider preference: a Primary and a Fallback on the
-#: preferred side. The classifier ships the describer's chain: both read one file -- an
-#: avatar, an attachment -- and answer in a line -- bar Google's, where the classifier ships
-#: its own pair. The describer's Google pair is the utility one, which hears audio.
+#: preferred side. The describer's Google pair is the utility one, which hears audio.
 _MEDIA_READER_CHAINS = {
     'gemini': (UTILITY_MODEL, UTILITY_FALLBACK_MODEL),
     'openrouter': (MEDIA_DESCRIBER_MODEL, OPENROUTER_FREE_ROUTER),
 }
-#: The classifier's verdict decides who may see a profile, so on Google it judges on a
-#: steadier pair than a transcription needs, both taking the thinking level it ships.
-_CLASSIFIER_CHAINS = {**_MEDIA_READER_CHAINS,
-                      'gemini': ('GOOGLE/gemini-3.5-flash-lite', 'GOOGLE/gemini-3-flash-preview')}
+#: The classifier's verdict decides who may see a profile, so it ships one steady model a
+#: side and no Fallback: a second model is a second opinion an owner could shop for, and
+#: one asked after the first gave no verdict judges exactly what the first would not read.
+_CLASSIFIER_CHAINS = {'gemini': ('GOOGLE/gemini-3-flash-preview', NO_FALLBACK),
+                      'openrouter': ('OPENROUTER/anthropic/claude-haiku-5.5', NO_FALLBACK)}
 #: Each reader's slots, Primary then Fallback.
 DESCRIBER_KEYS = ('describer_model', 'describer_fallback_model')
 CLASSIFIER_KEYS = ('classifier_model', 'classifier_fallback_model')
@@ -1118,6 +1119,9 @@ MEDIA_DESCRIPTION_MAX_CHARS = 3500
 
 # The round's attachments sent with each character's turn. The newest are kept.
 ROUND_MEDIA_MAX = 10
+# The messages in one intake whose links URL Context opens. The newest are kept: each
+# opens up to two pages, all at once, so a burst of links was that many fetches together.
+ROUND_URL_MESSAGES_MAX = 3
 
 #: Suffixes read as text when Discord labelled the upload as something other than
 #: `text/`. One list, because two paths filter on it -- the intake and the child-bot
@@ -1854,14 +1858,17 @@ CONTENT_RATING_UNRATED = "unrated"
 CONTENT_RATING_PENDING = "pending"
 CONTENT_RATING_GENERAL = "general"
 CONTENT_RATING_ADULT = "adult"
-CONTENT_RATING_EXEMPT = "exempt"
+#: The classifier found the profile sexualises a minor (MINOR_SAFETY). It runs nowhere and
+#: nothing but a new verdict or the bot owner's Clear moves it: no edit, declaration,
+#: import or failed re-check relaxes it. Terms of Service §7 promises this.
+CONTENT_RATING_REFUSED = "refused"
 
 CONTENT_RATING_LABELS = {
     CONTENT_RATING_UNRATED: "Unrated",
     CONTENT_RATING_PENDING: "Pending",
     CONTENT_RATING_GENERAL: "General",
     CONTENT_RATING_ADULT: "Adult 18+",
-    CONTENT_RATING_EXEMPT: "Exempt",
+    CONTENT_RATING_REFUSED: "Refused",
 }
 
 CONTENT_RATING_EMOJI = {
@@ -1869,7 +1876,7 @@ CONTENT_RATING_EMOJI = {
     CONTENT_RATING_PENDING: "⏳",
     CONTENT_RATING_GENERAL: "✅",
     CONTENT_RATING_ADULT: "🔞",
-    CONTENT_RATING_EXEMPT: "🛡️",
+    CONTENT_RATING_REFUSED: "⛔",
 }
 
 # What the state *is*, for the Content Safety dashboard. The consequences are rendered
@@ -1893,9 +1900,10 @@ CONTENT_RATING_BLURBS = {
         "channels, and cannot be shared, published to the Public Library, or used in "
         "Global Chat."
     ),
-    CONTENT_RATING_EXEMPT: (
-        "This profile has been exempted from content classification by the bot "
-        "operator. It runs anywhere with no provider content filtering."
+    CONTENT_RATING_REFUSED: (
+        "This profile's content rating found that it sexualises a minor, which the Terms of "
+        "Service forbid. It cannot run anywhere, be shared, published, or used in Global "
+        "Chat until the bot operator reviews it."
     ),
 }
 
@@ -1903,16 +1911,17 @@ CONTENT_RATING_BLURBS = {
 # verdicts inline, so the dashboard renders exactly what is enforced -- the same
 # decision used to be spread across the hub, global chat and the turn gate, and drifted.
 #
-# `age_restricted_only` is the sole runtime gate. Note that UNRATED and GENERAL are
-# deliberately identical at runtime: a rating governs distribution, not execution.
+# `runs` and `age_restricted_only` are the runtime gates (`_effective_safety_level`).
+# Note that UNRATED and GENERAL are deliberately identical at runtime: a rating governs
+# distribution, not execution. Refused alone stops a profile running at all.
 # The provider harm threshold is NOT here -- it follows the destination channel via
-# _resolve_safety_settings, with an exemption carve-out, and always has.
+# _resolve_safety_settings, and always has.
 CONTENT_RATING_CAPABILITIES = {
-    CONTENT_RATING_UNRATED:  {"age_restricted_only": False, "share": False, "publish": False, "global_chat": False},
-    CONTENT_RATING_PENDING:  {"age_restricted_only": False, "share": False, "publish": False, "global_chat": False},
-    CONTENT_RATING_GENERAL:  {"age_restricted_only": False, "share": True,  "publish": True,  "global_chat": True},
-    CONTENT_RATING_ADULT:    {"age_restricted_only": True,  "share": False, "publish": False, "global_chat": False},
-    CONTENT_RATING_EXEMPT:   {"age_restricted_only": False, "share": True,  "publish": True,  "global_chat": True},
+    CONTENT_RATING_UNRATED:  {"runs": True,  "age_restricted_only": False, "share": False, "publish": False, "global_chat": False},
+    CONTENT_RATING_PENDING:  {"runs": True,  "age_restricted_only": False, "share": False, "publish": False, "global_chat": False},
+    CONTENT_RATING_GENERAL:  {"runs": True,  "age_restricted_only": False, "share": True,  "publish": True,  "global_chat": True},
+    CONTENT_RATING_ADULT:    {"runs": True,  "age_restricted_only": True,  "share": False, "publish": False, "global_chat": False},
+    CONTENT_RATING_REFUSED:  {"runs": False, "age_restricted_only": False, "share": False, "publish": False, "global_chat": False},
 }
 
 # Why a capability is unavailable, shown against the failed row and reused verbatim by
@@ -1934,6 +1943,9 @@ CONTENT_CAPABILITY_DENIALS = {
     ("global_chat", CONTENT_RATING_UNRATED): "Submit this profile for a content rating first.",
     ("global_chat", CONTENT_RATING_PENDING): "Waiting on the content rating verdict.",
     ("global_chat", CONTENT_RATING_ADULT): "A Global Chat can be opened in any channel, and none of them is guaranteed age-restricted, so Adult profiles cannot be used here.",
+    ("share", CONTENT_RATING_REFUSED): "This profile was refused by its content rating. Only the bot operator can clear it.",
+    ("publish", CONTENT_RATING_REFUSED): "This profile was refused by its content rating. Only the bot operator can clear it.",
+    ("global_chat", CONTENT_RATING_REFUSED): "This profile was refused by its content rating. Only the bot operator can clear it.",
 }
 
 # What the rating means for placement, phrased as the consequence rather than a second
@@ -1941,6 +1953,20 @@ CONTENT_CAPABILITY_DENIALS = {
 CHANNEL_ACCESS_LABELS = {
     "restricted": "Any channel",
     "unrestricted": "Age-restricted only",
+    "checking": "Nowhere until rated",
+    "refused": "Nowhere",
+}
+
+#: Why the runtime gate refused a profile, by `_effective_safety_level`, written to follow
+#: the profile's name: every path that refuses to speak as one says the same thing.
+PLACEMENT_REFUSALS = {
+    "unrestricted": ("is rated 🔞 **Adult 18+**, which only runs in age-restricted channels. "
+                     "Mark this channel age-restricted (Edit Channel -> Age-Restricted Channel), "
+                     "or seat the character somewhere that already is."),
+    "checking": ("is declared 🔞 **Adult 18+** and is rated before it runs, on its owner's "
+                 "own API key. That usually takes a few seconds."),
+    "refused": ("was ⛔ **Refused** by its content rating and cannot run anywhere until the "
+                "bot operator reviews it."),
 }
 
 DEFAULT_SAFETY_SETTINGS = {
@@ -1958,6 +1984,17 @@ DEFAULT_SAFETY_SETTINGS = {
 #: of user ids until v2 -- `_load_blacklist` still takes that shape, `_save_blacklist`
 #: only emits v2, so the first write converts.
 BLACKLIST_FORMAT_VERSION = 2
+
+#: How long an enforcement record outlives its restriction, so a lifted block is still on
+#: file when the same account turns up again. Privacy Policy §5 states this figure: change
+#: both together.
+BLACKLIST_LIFTED_RETENTION_SECONDS = 365 * 86400
+
+#: A strike lands on an account when one of its profiles is Refused, once per profile, and
+#: counts for this long; STRIKE_THRESHOLD live strikes block the account automatically.
+#: The same period as a lifted record's, so the Privacy Policy states one figure for both.
+STRIKE_LIFETIME_SECONDS = BLACKLIST_LIFTED_RETENTION_SECONDS
+STRIKE_THRESHOLD = 3
 
 #: The scope an operator recorded. "generation" was meant to close only what spends a
 #: model call; it is enforced as "full" because most commands can reach one -- see
@@ -2863,6 +2900,9 @@ ATTACHMENT_SKIPPED_NOTE = "[Attachment not read, over the {limit} MB limit: {fil
 #: Their messages still say "[Attached Image: ...]", and without this the character would
 #: answer as if it had seen them.
 ROUND_MEDIA_SKIPPED_NOTE = "[Older attachments from this round not shown, over the limit of {limit}: {count}]"
+#: The same for messages past ROUND_URL_MESSAGES_MAX: their links are still in the text,
+#: and without this the character would answer as if it had read the pages.
+ROUND_URLS_SKIPPED_NOTE = "[Links in older messages from this round not opened, over the limit of {limit}: {count}]"
 
 #: Sent in place of an attachment both of a profile's models refused. The last sentence
 #: is the point: the turn already says "[Attached Image: cat.png]", and a model handed

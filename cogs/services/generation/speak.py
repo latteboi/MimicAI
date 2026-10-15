@@ -1,5 +1,4 @@
 import re
-import time
 import uuid
 import asyncio
 import datetime
@@ -117,8 +116,9 @@ class SpeakAsMixin:
             profile_data_source = self.cog.profile_manager._get_profile_config(user_id, profile_name, False) or {}
             own_config = profile_data_source
 
-        if not self.cog.profile_manager._check_unrestricted_safety_policy(effective_owner_id, effective_profile_name, channel):
-            await interaction_to_respond.followup.send("This profile is rated 'Adult 18+' and cannot speak in this channel because it is not marked as Age-Restricted.", ephemeral=True)
+        refusal = self.cog.profile_manager.placement_refusal(effective_owner_id, effective_profile_name, channel)
+        if refusal:
+            await interaction_to_respond.followup.send(f"**{effective_profile_name}** {refusal}", ephemeral=True)
             return None
 
         delivery_method = 'webhook'
@@ -256,7 +256,7 @@ class SpeakAsMixin:
         else:
             contents.append({'role': 'user', 'parts': final_parts})
 
-        safety_settings = _resolve_safety_settings(channel, p_settings)
+        safety_settings = _resolve_safety_settings(channel)
         tools = resolve_native_tools(p_settings)
         fn_ctx = tool_loop.FunctionContext(
             owner_id=owner_id, profile_name=profile_name,
@@ -390,7 +390,7 @@ class SpeakAsMixin:
             session.setdefault("unified_log", []).append(intern_turn(turn_object))
 
             session_type = session.get("type", "multi")
-            self.cog.session_last_accessed[channel.id] = time.time()
+            self.cog.session_manager._mark_session_accessed(channel.id)
             # message_ids land below once the send returns, and that flush persists both.
             self.cog.session_manager.mark_session_dirty((channel.id, None, None), session_type)
 

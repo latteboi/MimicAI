@@ -23,8 +23,9 @@ from ..utils.constants import (
     DEFAULT_IMAGE_PRESENT_OTHER, DEFAULT_IMAGE_FAILED,
     DEFAULT_SPEECH_VOICE, TTS_SYNTHESIS_PREAMBLE, CRITIC_AUDIT_TEXT_MAX,
     LOG_TRIM_TARGET, LOG_TRIM_HIGH_WATER,
-    CONTENT_RATING_ADULT, CONTENT_RATING_EMOJI, CONTENT_RATING_LABELS,
+    PLACEMENT_REFUSALS,
     GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB, NO_KEY_NOTICE_FLAG, NO_SERVER_KEY_NOTICE,
+    ROUND_URL_MESSAGES_MAX, ROUND_URLS_SKIPPED_NOTE,
 )
 from ..utils.helpers import (
     _format_api_error, _format_citation_subtext, _resolve_zoneinfo, _scrub_response_text,
@@ -35,7 +36,7 @@ from ..utils.helpers import (
     image_command_prompt, image_rag_enabled, is_gateway_shutdown, kickstart_note, whisper_recap,
     resolve_grounding_mode,
     resolve_thinking_params, resolve_url_mode,
-    resolve_typing_cursor,
+    resolve_typing_cursor, URL_FETCH_PATTERN,
 )
 from ..utils import mem_probe
 from ..utils.attachment_limits import upload_limit_bytes
@@ -468,15 +469,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
     #: not been the thing this gate reads for some time. It also says what to do about
     #: it, because the previous wording stated a rule and left the reader with no next
     #: step.
-    AGE_RESTRICTION_NOTICE = (
-        "**{name}** can't respond in this channel. Its content rating is "
-        "{emoji} **{rating}**, which only runs in age-restricted channels.\n"
-        "Mark this channel age-restricted in its settings (Edit Channel -> Age-Restricted "
-        "Channel), or seat the character somewhere that already is."
-    )
-
-    async def _refuse_age_restricted(self, session, channel, profile_name: str) -> None:
-        """Post the age-restriction refusal and record it as a real turn of the session.
+    async def _refuse_placement(self, session, channel, owner_id: int, profile_name: str) -> None:
+        """Post why the runtime gate refused a participant, and record it as a real turn.
 
         It used to be a bare channel message that nothing wrote down. Everything that
         reads a session back -- `/session view`, `/session audit`, the history browser,
@@ -495,10 +489,14 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         and for a round where *every* participant was blocked there is no later write
         at all.
         """
-        rating = CONTENT_RATING_LABELS.get(CONTENT_RATING_ADULT, "Adult 18+")
-        text = self.AGE_RESTRICTION_NOTICE.format(
-            name=profile_name, rating=rating,
-            emoji=CONTENT_RATING_EMOJI.get(CONTENT_RATING_ADULT, "🔞"))
+        pm = self.cog.profile_manager
+        refusal = (pm.placement_refusal(owner_id, profile_name, channel)
+                   or PLACEMENT_REFUSALS["unrestricted"])
+        if refusal == PLACEMENT_REFUSALS["checking"]:
+            # The check a declaration waits on, queued by the first round it stopped: a
+            # declaration made in bulk, or by `/profile generate`, has nobody else to ask.
+            pm.schedule_content_classification(*pm._resolve_effective_profile(owner_id, profile_name))
+        text = f"**{profile_name}** {refusal}"
 
         sent = await self._send_channel_message(channel, text) or []
 
@@ -761,6 +759,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 url_media_parts = []
                 pre_generation_warnings = []
                 pending_url_fetches = []
+                urls_skipped = 0
 
                 if is_proactive_auto_round and session.get("proactive_initial_rounds") == 1:
                     cast = session['profiles']
@@ -889,7 +888,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     if key in seen_blocked:
                         continue
                     seen_blocked.add(key)
-                    await self._refuse_age_restricted(session, channel, p['profile_name'])
+                    await self._refuse_placement(session, channel, p['owner_id'], p['profile_name'])
 
                 if not profile_order:
                     for trigger in all_triggers_for_round:
@@ -997,7 +996,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             )[-(g_stm_capped * 2):]
 
                         # Safety Logic for Grounding
-                        g_dynamic_safety_settings = _resolve_safety_settings(channel, g_profile_settings)
+                        g_dynamic_safety_settings = _resolve_safety_settings(channel)
 
                         is_for_image_flag = is_image_gen_round
                         grounding_query = image_gen_prompt if is_image_gen_round else initial_round_context
@@ -1010,6 +1009,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 round_url_turns = []
                 
                 url_tasks = []
+                pending_url_fetches, links_skipped = self._round_links(pending_url_fetches)
+                urls_skipped += links_skipped
                 if pending_url_fetches:
                     for fetch in pending_url_fetches:
                         url_tasks.append(self.cog.tools_service._process_urls_in_content(fetch["content"], fetch["guild_id"], {"url_fetching_enabled": True}))
@@ -1182,7 +1183,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     profile_settings = {} # Initialize to prevent UnboundLocalError
                     t1_start_mono = time.monotonic()
                     t1_start_utc = datetime.datetime.now(datetime.timezone.utc)
-                    self.cog.session_last_accessed[channel_id] = time.time()
+                    self.cog.session_manager._mark_session_accessed(channel_id)
                     participant_key = (participant['owner_id'], participant['profile_name'])
                     
                     if participant.get('method') == 'child_bot':
@@ -1219,7 +1220,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     # this fires only if the channel's age-restricted flag is flipped mid-round.
                     if not self.cog.profile_manager._check_unrestricted_safety_policy(owner_id, profile_name, channel):
                         await self._abandon_state_container(channel, state_container, session=session)
-                        await self._refuse_age_restricted(session, channel, profile_name)
+                        await self._refuse_placement(session, channel, owner_id, profile_name)
                         continue
 
                     user_index = self.cog.profile_manager._get_user_index(owner_id)
@@ -1428,6 +1429,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             new_round_turn_data, links=resolve_url_mode(p_settings) != "off")
                         if media_skipped_note:
                             supplementary_parts.append(media_skipped_note)
+                        if urls_skipped and resolve_url_mode(p_settings) == "rag":
+                            supplementary_parts.append(ROUND_URLS_SKIPPED_NOTE.format(
+                                limit=ROUND_URL_MESSAGES_MAX, count=urls_skipped))
                         if all_current_media:
                             supplementary_parts.extend(all_current_media)
                         
@@ -2047,12 +2051,19 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             session, batched_triggers)
 
                         if batched_triggers:
+                            batched = []
                             for trigger in batched_triggers:
                                 # [UPDATED] Unpack structured tuples in mid-round batches to ensure all messages are read
                                 if isinstance(trigger, tuple) and len(trigger) > 1 and isinstance(trigger[1], discord.Message):
                                     trigger = trigger[1]
+                                batched.append((trigger, await batched_message(trigger)))
+                            # The newest linked messages only, as at the round's start.
+                            linked = [n for n, (_, m) in enumerate(batched)
+                                      if m is not None and URL_FETCH_PATTERN.search(m.typed)]
+                            opened, links_skipped = self._round_links(linked)
+                            urls_skipped += links_skipped
 
-                                msg = await batched_message(trigger)
+                            for batch_index, (trigger, msg) in enumerate(batched):
                                 if msg is not None:
                                     # None when there is nothing to draw, which queues no
                                     # image round: the message still reaches the round as
@@ -2088,7 +2099,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     url_text_batch = None
                                     url_media_batch = []
                                     
-                                    if any_url_enabled_batch:
+                                    if any_url_enabled_batch and batch_index in opened:
                                         # The message's own text, not the quoted reply folded into
                                         # `content` above -- see _collect_round_triggers.
                                         url_text_list, url_media, _ = await self.cog.tools_service._process_urls_in_content(msg.typed, msg.guild_id, {"url_fetching_enabled": True}, warning_channel=channel)

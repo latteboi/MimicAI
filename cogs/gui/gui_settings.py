@@ -215,8 +215,12 @@ def _standing_text(cog: 'MimicCog', user_id: int) -> str:
     discloses that a reason is held, not that it is shown. Set membership decides, not
     the record, so an elapsed block reads as lifted before the sweep has pruned it.
     """
+    strikes = cog.server_manager.active_strikes(user_id)
+    strike_line = (f"**{len(strikes)} strike{'s' if len(strikes) != 1 else ''}** of {STRIKE_THRESHOLD}: "
+                   f"a profile of yours was Refused by its content rating. The oldest expires "
+                   f"<t:{int(strikes[0]['at'] + STRIKE_LIFETIME_SECONDS)}:D>." if strikes else None)
     if user_id not in cog.generation_blocked:
-        return "No restrictions."
+        return strike_line or "No restrictions."
     entry = cog.server_manager.blacklist_entry(user_id) or {}
     lines = ["**Restricted.** Only `/privacy`, `/terms` and `/settings` are available to you."]
     try:
@@ -226,6 +230,8 @@ def _standing_text(cog: 'MimicCog', user_id: int) -> str:
         pass
     until = entry.get("until")
     lines.append(f"Lifts <t:{int(until)}:R>" if until else "No end date.")
+    if strike_line:
+        lines.append(strike_line)
     return "\n".join(lines)
 
 

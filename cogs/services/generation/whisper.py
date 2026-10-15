@@ -112,9 +112,9 @@ class WhisperMixin:
         it rather than in the channel.
         """
         owner_id, profile_name = target_participant['owner_id'], target_participant['profile_name']
-        if not self.cog.profile_manager._check_unrestricted_safety_policy(owner_id, profile_name, interaction.channel):
-            return ReplyText(text="This character's content rating is Adult 18+, which only runs in "
-                                  "age-restricted channels.", blocked=True)
+        refusal = self.cog.profile_manager.placement_refusal(owner_id, profile_name, interaction.channel)
+        if refusal:
+            return ReplyText(text=f"**{profile_name}** {refusal}", blocked=True)
 
         # One tuple for the prompt and both models -- see tool_loop.
         functions = tool_loop.functions_for(p_settings)

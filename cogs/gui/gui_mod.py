@@ -9,6 +9,7 @@ from collections import Counter
 from string import Formatter
 from typing import TYPE_CHECKING, Dict, List, Set, Tuple, Optional, get_args
 from ..managers.storage_manager import IOManager
+from ..managers.server_manager import record_lifted
 from ..utils.helpers import (_sanitise_filename, birth_time, is_real_model, prune_openrouter_endpoints,
                              resolve_openrouter_endpoint, resolve_thinking_params, system_model,
                              system_settings)
@@ -380,9 +381,10 @@ class ModBlacklistView(ModBaseView):
     inviting fresh accounts is the case a per-user list cannot answer on its own.
     """
 
-    #: The two halves, in order. These are the record's own section keys, not display
-    #: names -- see _records.
-    MODES = ("users", "guilds")
+    #: The record's sections, in the order the mode button cycles them. These are the
+    #: record's own section keys, not display names -- see _records.
+    MODES = ("users", "guilds", "strikes")
+    MODE_LABELS = {"users": "Users", "guilds": "Servers", "strikes": "Strikes"}
 
     def __init__(self, cog, interaction, target_user_id: Optional[int] = None):
         super().__init__(cog, interaction, "blacklist", target_user_id=target_user_id)
@@ -400,6 +402,10 @@ class ModBlacklistView(ModBaseView):
         return self._records().get(str(entry_id))
 
     def _label_for(self, entry_id: int, entry: Dict) -> str:
+        if self.mode == "strikes":
+            user = self.cog.bot.get_user(entry_id)
+            live = len(self.cog.server_manager.active_strikes(entry_id))
+            return f"⚠️ {user.name if user else 'Unknown User'} ({entry_id}) · {live} of {STRIKE_THRESHOLD}"
         if self.mode == "users":
             user = self.cog.bot.get_user(entry_id)
             name = user.name if user else "Unknown User"
@@ -408,19 +414,22 @@ class ModBlacklistView(ModBaseView):
             guild = self.cog.bot.get_guild(entry_id)
             name = guild.name if guild else "Unknown Server"
             marker = "🚪" if entry.get("action") == GUILD_BLOCK_LEAVE else "🔇"
+        if record_lifted(entry):
+            marker = "✔️"
         return f"{marker} {name} ({entry_id})".strip()
 
     def _build_view(self):
         self.clear_items()
         is_users = self.mode == "users"
+        following = self.MODES[(self.MODES.index(self.mode) + 1) % len(self.MODES)]
 
         async def mode_cb(i: discord.Interaction):
-            self.mode = "guilds" if is_users else "users"
+            self.mode = following
             self.selected_id = None
             self.current_page = 0
             self._build_view()
             await i.response.edit_message(embed=self._get_embed(), view=self)
-        add_button(self, "Servers ▶" if is_users else "◀ Users", mode_cb, row=0,
+        add_button(self, f"{self.MODE_LABELS[following]} ▶", mode_cb, row=0,
                    style=discord.ButtonStyle.secondary)
 
         if is_users:
@@ -429,7 +438,7 @@ class ModBlacklistView(ModBaseView):
                     await i.response.send_modal(ModBlockUserModal(self, scope))
                 add_button(self, f"Block ({BLACKLIST_SCOPE_LABELS[scope]})", block_cb, row=0,
                            style=discord.ButtonStyle.primary)
-        else:
+        elif self.mode == "guilds":
             for action in GUILD_BLOCK_ACTIONS:
                 async def gblock_cb(i: discord.Interaction, action=action):
                     await i.response.send_modal(ModBlockGuildModal(self, action))
@@ -459,15 +468,18 @@ class ModBlacklistView(ModBaseView):
                     self.selected_id = int(i.data['values'][0])
                     self._build_view()
                     await i.response.edit_message(embed=self._get_embed(), view=self)
-                add_select(self, options, sel_cb, row=1,
-                           placeholder=f"Select a blocked {'user' if is_users else 'server'}...")
+                add_select(self, options, sel_cb, row=1, placeholder={
+                    "users": "Select a blocked user...", "guilds": "Select a blocked server...",
+                    "strikes": "Select an account with strikes..."}[self.mode])
 
             if num_pages > 1:
                 self._add_page_controls(num_pages, 2)
 
         async def remove_cb(i: discord.Interaction):
             if self.selected_id is not None:
-                if is_users:
+                if self.mode == "strikes":
+                    self.cog.server_manager.remove_strikes(self.selected_id)
+                elif is_users:
                     self.cog.server_manager.unblock_user(self.selected_id)
                 else:
                     self.cog.server_manager.unblock_guild(self.selected_id)
@@ -489,6 +501,8 @@ class ModBlacklistView(ModBaseView):
         self._add_nav_buttons()
 
     def _get_embed(self):
+        if self.mode == "strikes":
+            return self._strikes_embed()
         is_users = self.mode == "users"
         embed = discord.Embed(
             title="Blocked Users" if is_users else "Blocked Servers",
@@ -508,15 +522,25 @@ class ModBlacklistView(ModBaseView):
                 lines.append(f"Blocked: `{entry['at'][:19].replace('T', ' ')} UTC`")
             if entry.get("by"):
                 lines.append(f"By: <@{entry['by']}>")
-            if entry.get("until"):
-                lines.append(f"Lifts: <t:{int(entry['until'])}:R>")
-            lines.append("\nUse 'Remove' to lift this block.")
+            if record_lifted(entry):
+                until = int(entry["until"])
+                lines.append(f"Lifted: <t:{until}:R> · record deleted "
+                             f"<t:{until + BLACKLIST_LIFTED_RETENTION_SECONDS}:R>")
+                lines.append("\nUse 'Remove' to delete this record now.")
+            else:
+                if entry.get("until"):
+                    lines.append(f"Lifts: <t:{int(entry['until'])}:R>")
+                lines.append("\nUse 'Remove' to lift this block. Its record is kept "
+                             f"{BLACKLIST_LIFTED_RETENTION_SECONDS // 86400} days, as the "
+                             "Privacy Policy says.")
             embed.description = "\n".join(lines)
         else:
-            total = len(self._records())
+            lifted = sum(record_lifted(e) for e in self._records().values())
+            total = len(self._records()) - lifted
+            kept = f" · ✔️ lifted, kept on file: **{lifted}**" if lifted else ""
             if is_users:
                 embed.description = (
-                    f"Blocked users: **{total}**\n\n"
+                    f"Blocked users: **{total}**{kept}\n\n"
                     "A blocked user is never told. They keep `/privacy`, `/terms`, and a "
                     "`/settings` page showing that they are restricted and the dates — "
                     "not the reason, and not who set it.\n\n"
@@ -526,11 +550,33 @@ class ModBlacklistView(ModBaseView):
                     "expiring.")
             else:
                 embed.description = (
-                    f"Blocked servers: **{total}**\n\n"
+                    f"Blocked servers: **{total}**{kept}\n\n"
                     "🚪 **Leave** — departs now, on re-invite, and on boot; child bots go "
                     "too.\n"
                     "🔇 **Quarantine** — stays, generates nothing. Reversible without a "
                     "re-invite.")
+        return embed
+
+    def _strikes_embed(self) -> discord.Embed:
+        embed = discord.Embed(title="Strikes", color=discord.Color.dark_red())
+        sm = self.cog.server_manager
+        if self.selected_id is not None:
+            user = self.cog.bot.get_user(self.selected_id)
+            lines = [f"**{user.name if user else 'Unknown User'}** (`{self.selected_id}`)"]
+            for strike in sm.active_strikes(self.selected_id):
+                lines.append(f"• `{strike['name']}` (`{strike['pid']}`) — refused <t:{int(strike['at'])}:D>, "
+                             f"expires <t:{int(strike['at'] + STRIKE_LIFETIME_SECONDS)}:D>")
+            lines.append("\nUse 'Remove' to remove all of this account's strikes. A block they "
+                         "caused stays until you lift it under Users.")
+            embed.description = "\n".join(lines)
+            return embed
+        embed.description = (
+            f"Accounts with strikes: **{len(self._records())}**\n\n"
+            "A strike lands when one of an account's profiles is Refused by its content rating "
+            f"-- once per profile -- and lasts {STRIKE_LIFETIME_SECONDS // 86400} days. At "
+            f"{STRIKE_THRESHOLD} the account is blocked automatically, with no end date, until "
+            "you lift it. Clear Refusal under a profile's Content Safety removes its strike. "
+            "The account sees its strike count in `/settings`.")
         return embed
 
     async def update_display(self):
@@ -726,6 +772,10 @@ class ModProfilesView(ModBaseView):
     def __init__(self, cog, interaction, target_user_id: Optional[int] = None):
         super().__init__(cog, interaction, "profiles", target_user_id=target_user_id)
         self.current_page = 0
+        #: (owner_id, name, listed at, why flagged or None if Refused), once Review Queue has
+        #: been pressed. Read in a thread on the press: each entry is checked against its
+        #: profile's own rating.
+        self.refused_rows: Optional[List[Tuple[int, str, int, Optional[str]]]] = None
         self._build_view()
 
     def _resolve_profiles(self) -> List[str]:
@@ -776,15 +826,46 @@ class ModProfilesView(ModBaseView):
 
             await i.response.send_message(
                 "**Reset every content rating on this instance?**\n"
-                "Every profile becomes **Unrated** — including Adult and Exempt ones — and the "
+                "Every profile becomes **Unrated** — including Adult and Refused ones — and the "
                 "entire Public Library is delisted, because an Unrated profile cannot be "
                 "published. Existing borrows keep working.\n\n"
-                "Owners re-submit their own profiles afterwards; 18+ declarations and "
-                "exemptions can be re-applied in one click with no API call.\n\n"
+                "Owners re-submit their own profiles afterwards; an 18+ declaration can be "
+                "re-applied in one click with no API call.\n\n"
                 "This cannot be undone.",
                 view=build_confirm_view("Reset Everything", confirm), ephemeral=True)
         add_button(self, "Reset All Content Ratings", reset_cb, style=discord.ButtonStyle.danger,
                    row=0)
+
+        # Profiles the content rating refused (MINOR_SAFETY), or gave no verdict for: the
+        # operator's review queue. Opening one lands on its dashboard in mod view, where
+        # Content Safety offers Clear, or a verdict for a flagged one.
+        async def refused_cb(i: discord.Interaction):
+            await i.response.defer()
+            self.refused_rows = await asyncio.to_thread(self.cog.profile_manager.refused_profiles)
+            self._build_view()
+            await i.edit_original_response(embed=self._get_embed(), view=self)
+        add_button(self, "Review Queue", refused_cb, style=discord.ButtonStyle.secondary,
+                   row=0, emoji="⛔")
+
+        if self.refused_rows:
+            async def refused_sel(i: discord.Interaction):
+                owner, _, pname = i.data['values'][0].partition(":")
+                self.target_user_id = int(owner)
+                await i.response.defer()
+                pm_view = ProfileManageView(self.cog, self.original_interaction, pname, False,
+                                            target_user_id=int(owner), is_mod_view=True)
+                embed = await self.cog.profile_manager._build_profile_manage_embed(
+                    self.original_interaction, pname, target_user_id=int(owner))
+                await self.original_interaction.edit_original_response(embed=embed, view=pm_view)
+            options = []
+            for owner, name, at, flagged in self.refused_rows[:DROPDOWN_MAX_OPTIONS]:
+                user = self.cog.bot.get_user(owner)
+                day = f"{datetime.datetime.fromtimestamp(at, datetime.timezone.utc):%Y-%m-%d}"
+                options.append(discord.SelectOption(
+                    label=f"{name} — {user.name if user else owner}"[:100], value=f"{owner}:{name}",
+                    emoji="⚠️" if flagged else "⛔",
+                    description=(f"Flagged {day}: {flagged}" if flagged else f"Refused {day}")[:100]))
+            add_select(self, options, refused_sel, placeholder="Review a profile...", row=3)
         
         if self.target_user_id:
             index = self.cog.profile_manager._get_user_index(self.target_user_id)
@@ -815,6 +896,16 @@ class ModProfilesView(ModBaseView):
 
     def _get_embed(self):
         embed = discord.Embed(title="Moderator Profile Dashboard", color=discord.Color.red())
+        if self.refused_rows is not None:
+            flagged = sum(1 for row in self.refused_rows if row[3])
+            embed.add_field(
+                name="⛔ Review queue",
+                value=(f"**{len(self.refused_rows) - flagged}** refused and **{flagged}** flagged, "
+                       "oldest first.\n⛔ The content rating found it sexualises a minor; it runs "
+                       "nowhere until you Clear it under Content Safety.\n⚠️ The rating model gave "
+                       "no verdict; it stays Pending until you rate or refuse it there."
+                       if self.refused_rows else "None awaiting review."),
+                inline=False)
         if not self.target_user_id:
             embed.description = "Click the button below to enter a User ID to manage."
             return embed

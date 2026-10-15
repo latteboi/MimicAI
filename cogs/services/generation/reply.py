@@ -314,7 +314,7 @@ class ReplyMixin:
         server_id = getattr(getattr(channel, 'guild', None), 'id', None)
         guild_id = None if conversation else server_id
         policy = {"policy_guild_id": server_id, "conversation": True} if conversation else {}
-        safety_settings = _resolve_safety_settings(None if conversation else channel, p_settings)
+        safety_settings = _resolve_safety_settings(None if conversation else channel)
         tools = resolve_native_tools(p_settings)
 
         def build(name: str, role: str, **key_errors):

@@ -83,7 +83,7 @@ def _channel_is_age_restricted(channel: Any) -> bool:
         return False
 
 
-def _resolve_safety_settings(channel: Any, profile_config: Optional[Dict[str, Any]] = None) -> Dict[HarmCategory, HarmBlockThreshold]:
+def _resolve_safety_settings(channel: Any) -> Dict[HarmCategory, HarmBlockThreshold]:
     """Maps the *destination channel* onto the provider harm thresholds.
 
     This used to key off the profile's own safety_level, which diverged from the
@@ -111,18 +111,12 @@ def _resolve_safety_settings(channel: Any, profile_config: Optional[Dict[str, An
     Neither value reaches Google's non-configurable protections -- core harms such as
     child safety are always blocked -- so no setting here makes a model unfiltered.
 
-    `profile_config` carries the one carve-out: a profile the bot owner marked
-    exempt runs unfiltered wherever it runs. Callers holding a borrowed
-    profile's local copy may not see the exemption, since it is only ever
-    written at the source -- that fails towards the stricter threshold, which is
-    the right direction.
+    No profile is carved out. The bot owner's Exempt rating sent OFF everywhere, a
+    filter no later edit could bring back, and was removed.
     """
-    rating = (profile_config or {}).get("content_rating") or {}
-    exempt = rating.get("verdict") == "exempt"
-
     threshold = (
         HarmBlockThreshold.OFF
-        if exempt or _channel_is_age_restricted(channel)
+        if _channel_is_age_restricted(channel)
         else HarmBlockThreshold.BLOCK_ONLY_HIGH
     )
     return {cat: threshold for cat in HARM_CATEGORIES}
@@ -788,6 +782,9 @@ def _format_and_chunk_thought_summary(thought_text: str) -> List[str]:
 
     return chunks
 
+#: A link URL Context opens: a scheme or a bare `www.`. Also what decides that a message
+#: counts against ROUND_URL_MESSAGES_MAX, so the two cannot disagree.
+URL_FETCH_PATTERN = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+')
 #: A bare link: anchored on its scheme, and stopped at whitespace, a quote or an angle
 #: bracket, since error text quotes the URL it failed on as 'https://...'.
 _BARE_LINK = re.compile(r"https?://[^\s<>'\"]+")

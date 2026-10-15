@@ -6,13 +6,13 @@ from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from ...utils.helpers import (
     _format_history_entry, _get_user_hash, attachment_mime, attachment_tag,
-    image_command_prefix, image_command_prompt, is_media_attachment,
+    image_command_prefix, image_command_prompt, is_media_attachment, URL_FETCH_PATTERN,
 )
 from ...utils.attachment_limits import over_attachment_limit, skipped_attachment_note
 from ...utils.http_client import get_shared_client
 from ...managers.session_manager import intern_turn, log_user_turn, reply_quote
 from ...utils.constants import (
-    defaultConfig, ROUND_MEDIA_MAX, ROUND_MEDIA_SKIPPED_NOTE,
+    defaultConfig, ROUND_MEDIA_MAX, ROUND_MEDIA_SKIPPED_NOTE, ROUND_URL_MESSAGES_MAX,
 )
 from ...utils.discord_cdn import unsigned_attachment_url
 
@@ -286,6 +286,18 @@ class TriggerIntakeMixin:
         note = ROUND_MEDIA_SKIPPED_NOTE.format(limit=ROUND_MEDIA_MAX, count=len(media) - ROUND_MEDIA_MAX)
         return media[-ROUND_MEDIA_MAX:], note
 
+    @staticmethod
+    def _round_links(linked: List[Any]) -> Tuple[List[Any], int]:
+        """The newest ROUND_URL_MESSAGES_MAX of an intake's linked messages, and how many
+        were left out.
+
+        Each opens up to two pages and an intake's open together, so a burst of linked
+        messages was that many fetches in flight at once. The rest still show their links,
+        so the count goes to the character as ROUND_URLS_SKIPPED_NOTE.
+        """
+        kept = linked[-ROUND_URL_MESSAGES_MAX:]
+        return kept, len(linked) - len(kept)
+
     async def _collect_round_triggers(
         self, session, session_type, channel_id, all_triggers_for_round,
         new_round_turn_data, pending_url_fetches, recent_processed_ids,
@@ -462,7 +474,9 @@ class TriggerIntakeMixin:
                 url_text_content = None
                 trigger_media_parts = []
 
-                if any_url_enabled and any_url_rag:
+                # Only a message with a link: each one queued counts against
+                # ROUND_URL_MESSAGES_MAX, and a linkless one would push out one that has.
+                if any_url_enabled and any_url_rag and URL_FETCH_PATTERN.search(typed_text):
                     # Defer URL fetching until after placeholder is sent
                     pending_url_fetches.append({
                         "content": typed_text,

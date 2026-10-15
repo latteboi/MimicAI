@@ -547,7 +547,7 @@ class EventListeners:
             session = await self.session_manager._ensure_session_hydrated(channel_id, session_type)
         if not session: return
 
-        self.session_last_accessed[channel_id] = time.time()
+        self.session_manager._mark_session_accessed(channel_id)
 
         turn_index = -1
         turn_object = None
@@ -996,7 +996,7 @@ class EventListeners:
                                 self.ltm_recall_history.pop(session_key, None)
                             else:
                                 await self.session_manager._save_session_to_disk(session_key, 'global_chat', session_data)
-                                self.session_last_accessed[session_key] = time.time()
+                                self.session_manager._mark_session_accessed(session_key)
                             return
 
         # 2. Multi/Freewill Sessions (Servers). Part of a turn gone means the whole turn
@@ -1134,7 +1134,7 @@ class EventListeners:
             # objects left to refresh, every reader derives from unified_log, and the
             # edit above is already in it. The whisper derivation reads type/target_pid/
             # speaker_pid/is_hidden and never content, so it cannot change either.
-            self.session_last_accessed[channel_id] = time.time()
+            self.session_manager._mark_session_accessed(channel_id)
 
     def _refused_by_blacklist(self, interaction: discord.Interaction) -> bool:
         """True when a block closes this interaction to its user. Nothing is sent.

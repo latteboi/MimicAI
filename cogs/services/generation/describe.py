@@ -121,7 +121,7 @@ class MediaDescriptionMixin:
                 # resolves them. Built with the defaults instead, every attachment in an
                 # age-restricted session comes back refused, which reads as the feature
                 # being broken rather than as a filter doing its job.
-                safety_settings=_resolve_safety_settings(channel, p_settings),
+                safety_settings=_resolve_safety_settings(channel),
                 # Its own slot: a one-shot internal pass with no character in it to
                 # configure, set in /mod rather than on any profile.
                 thinking_params=resolve_thinking_params(

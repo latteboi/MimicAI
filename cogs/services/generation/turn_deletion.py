@@ -148,7 +148,7 @@ class TurnDeletionMixin:
         # Deleting turns can strand or reveal a pending whisper -- the one thing a rebuild
         # derived -- so that is recomputed rather than re-reading the log just written.
         self.cog.session_manager._recompute_pending_whispers(session)
-        self.cog.session_last_accessed[channel_id] = time.time()
+        self.cog.session_manager._mark_session_accessed(channel_id)
 
     async def _delete_channel_messages(self, channel, message_ids: Iterable[int]) -> int:
         """Deletes these messages, whoever posted them. Returns how many are now gone.

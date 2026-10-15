@@ -15,7 +15,7 @@ from ..utils.constants import (
     DEFAULT_GROUNDING_RAG_PAYLOAD,
 )
 from ..utils.helpers import (_format_api_error, _truncate_text_by_char,
-                            resolve_thinking_params)
+                            resolve_thinking_params, URL_FETCH_PATTERN)
 from ..utils.net_guard import UnsafeURL, safe_stream
 from .api_service import MissingKeyError
 
@@ -355,8 +355,7 @@ class ToolsService:
 
         text_contexts = []
         media_parts = []
-        url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
-        found_urls = re.findall(url_pattern, content)
+        found_urls = URL_FETCH_PATTERN.findall(content)
         if not found_urls:
             return [], [], warnings
 

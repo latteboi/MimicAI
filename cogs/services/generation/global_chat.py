@@ -208,8 +208,8 @@ class GlobalChatMixin:
             functions = tool_loop.functions_for(profile_data, has_server=False,
                                                 can_search=bool(user_api_key or or_key))
             # Channel 0 resolves to no channel, so the builder takes the not-age-restricted
-            # branch and injects <content_policy> for all but an Exempt profile: the card can
-            # be opened in any channel, which is why content_capability refuses an Adult one.
+            # branch and injects <content_policy>: the card can be opened in any channel,
+            # which is why content_capability refuses an Adult profile.
             (system_instruction, turn_context, _, temp, top_p, top_k,
              primary_model, fallback_model_name) = await asyncio.to_thread(
                 self._construct_system_instructions, host_user_id, profile_name, 0,
@@ -224,7 +224,7 @@ class GlobalChatMixin:
 
             self.cog.global_chat_sessions[model_cache_key] = session_data
 
-            self.cog.session_last_accessed[model_cache_key] = time.time()
+            self.cog.session_manager._mark_session_accessed(model_cache_key)
 
             # Derived from unified_log on every turn. This used to be written onto a
             # GoogleGenAIChatSession held on session_data, which was then overwritten from
@@ -300,7 +300,7 @@ class GlobalChatMixin:
                 # Always a DM: not age-restricted, so BLOCK_ONLY_HIGH. (`safety_level`
                 # was never defined in this scope -- this line raised NameError for
                 # any global-chat profile with RAG grounding enabled.)
-                d_safe = _resolve_safety_settings(None, profile_data)
+                d_safe = _resolve_safety_settings(None)
 
                 # No owner: guild 0 is falsy, so one here would bill the host's own key
                 # with no data policy -- this call does not take Global Chat's yet.
@@ -341,7 +341,7 @@ class GlobalChatMixin:
                 owner_id=host_user_id, profile_name=profile_name, author_dn=app_name,
                 guild_id=None,
                 triggering_user_id=queued_turns[-1]["user_id"] if queued_turns else host_user_id,
-                safety_settings=_resolve_safety_settings(None, profile_data),
+                safety_settings=_resolve_safety_settings(None),
                 policy={"policy_guild_id": interaction.guild_id, "conversation": True})
             chat_participant_names = [app_name] + [t['display_name'] for t in queued_turns]
             state_container = {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg,

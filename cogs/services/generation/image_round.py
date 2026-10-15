@@ -83,7 +83,7 @@ class ImageRoundMixin:
                 parts.append({"url": ref["url"], "mime_type": ref.get("mime_type", "image/png")})
 
             # Determine safety
-            dynamic_safety_settings = _resolve_safety_settings(channel, gen_cfg)
+            dynamic_safety_settings = _resolve_safety_settings(channel)
 
             # Built per attempt by the model factory, which keys it for whichever provider
             # the attempt names -- so a primary that cannot run here still hands over to its

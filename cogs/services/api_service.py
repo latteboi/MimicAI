@@ -565,8 +565,9 @@ class APIService:
         if not channel:
             return None, True, 0.0, 0.0, 0, "Could not find the channel for this interaction.", None, ""
 
-        if not self.cog.profile_manager._check_unrestricted_safety_policy(profile_owner_id_for_instructions, profile_name_for_instructions, channel):
-            return None, True, 0.0, 0.0, 0, "This character's content rating is Adult 18+, which only runs in age-restricted channels.", None, ""
+        refusal = self.cog.profile_manager.placement_refusal(profile_owner_id_for_instructions, profile_name_for_instructions, channel)
+        if refusal:
+            return None, True, 0.0, 0.0, 0, f"**{profile_name_for_instructions}** {refusal}", None, ""
 
         model_cache_key = (channel_id, profile_owner_id_for_instructions, profile_name_for_instructions)
 
@@ -636,7 +637,7 @@ class APIService:
 
         model_instance, model_init_error = None, True
         
-        dynamic_safety_settings = _resolve_safety_settings(channel, p_settings)
+        dynamic_safety_settings = _resolve_safety_settings(channel)
 
         model_to_create = primary_model
         

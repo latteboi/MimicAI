@@ -228,31 +228,31 @@ class OpenRouterModel:
     async def _dispatch(self, contents, messages, blob_files: List[str], staged_files: List[str],
                         generation_config=None, safety_settings=None, stream_state=None):
         """Builds the request body around `messages` and makes the call."""
-        temp = 1.0
-        top_p = 1.0
+        # Unset is not sent, as on Google: the model's own default, and Claude takes neither.
+        temp = None
+        top_p = None
         advanced = {}
         include_thoughts = self.thinking_params.get("thinking_summary_visible") == "on"
 
         if isinstance(generation_config, dict):
-            temp = generation_config.get("temperature", 1.0)
-            top_p = generation_config.get("top_p", 1.0)
+            temp = generation_config.get("temperature")
+            top_p = generation_config.get("top_p")
             advanced = generation_config.get("_advanced_params", {})
             if generation_config.get("thinking_config"):
                 include_thoughts = generation_config["thinking_config"].get("include_thoughts", include_thoughts)
         elif generation_config:
-            temp = getattr(generation_config, 'temperature', 1.0)
-            top_p = getattr(generation_config, 'top_p', 1.0)
+            temp = getattr(generation_config, 'temperature', None)
+            top_p = getattr(generation_config, 'top_p', None)
             if hasattr(generation_config, '_advanced_params') and generation_config._advanced_params:
                 advanced = generation_config._advanced_params
             if hasattr(generation_config, 'thinking_config') and generation_config.thinking_config:
                 include_thoughts = generation_config.thinking_config.include_thoughts
 
-        payload = {
-            "model": self.model_name,
-            "messages": messages,
-            "temperature": temp,
-            "top_p": top_p,
-        }
+        payload = {"model": self.model_name, "messages": messages}
+        if temp is not None:
+            payload["temperature"] = temp
+        if top_p is not None:
+            payload["top_p"] = top_p
         # See output_cap. Without one, OpenRouter checks the request's affordability
         # against the model's whole output ceiling rather than anything it will produce.
         cap = output_cap(self.model_name)
