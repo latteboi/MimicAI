@@ -9,7 +9,9 @@ from collections import Counter
 from string import Formatter
 from typing import TYPE_CHECKING, Dict, List, Set, Tuple, Optional, get_args
 from ..managers.storage_manager import IOManager
-from ..utils.helpers import _sanitise_filename, birth_time, resolve_openrouter_endpoint, system_model
+from ..utils.helpers import (_sanitise_filename, birth_time, is_real_model, prune_openrouter_endpoints,
+                             resolve_openrouter_endpoint, resolve_thinking_params, system_model,
+                             system_settings)
 from ..utils.loop_probe import rss_bytes
 from ..utils.user_defaults import auto_wording, model_slot_defaults, other_provider
 from .base_components import (BlockedGuard, TabbedView, TimeoutCleanupMixin, add_button,
@@ -19,7 +21,8 @@ if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
     from ..MimicCog import MimicCog
 
-from .gui_profiles import ModelPickerMixin, OpenRouterHostView, ProfileManageView
+from .gui_profiles import (ModelPickerMixin, OpenRouterHostView, ProfileManageView,
+                           SingleProfileThinkingView, ThinkingPickerMixin)
 
 class ModBaseView(TabbedView):
     """Base for every /mod tab.
@@ -1185,9 +1188,9 @@ _PROFILE_KEYS = ("primary_model", "fallback_model", "ollama_host_url")
 #: The categories shipping a chain per provider preference, which the audience button switches.
 _BY_PROVIDER_CATEGORIES = ("describer", "classifier", "generator")
 
-#: MimicAI Auto, one category per tier and slot: each is a Primary and a Fallback, and a tab
-#: holds three slots at most. Response's tab is the tier's own `auto_<tier>`; the others
-#: follow it. (tab, wording, description, tier, slot).
+#: MimicAI Auto, one category per tier and slot: each is a Primary and a Fallback. Response's
+#: tab is the tier's own `auto_<tier>`; the others follow it, as AUTO_TIER_TABS names them.
+#: (tab, wording, description, tier, slot).
 _AUTO_SLOT_TABS = {
     "grounding_rag_model": ("Grounding", "The researcher behind RAG web searches."),
     "critic_model": ("Critic", "Screens replies for semantic repetition."),
@@ -1195,24 +1198,43 @@ _AUTO_SLOT_TABS = {
 }
 _AUTO_TABS = tuple(
     tab for tier, _wording, desc in AUTO_TIERS
-    for tab in ((f"auto_{tier}", auto_wording(AUTO_MODEL_PREFIX + tier), desc, tier, "primary_model"),
-                *((f"auto_{tier}_{wording.lower()}", f"{auto_wording(AUTO_MODEL_PREFIX + tier)} · {wording}",
+    for tab in ((AUTO_TIER_TABS[tier, "primary_model"], auto_wording(AUTO_MODEL_PREFIX + tier), desc,
+                 tier, "primary_model"),
+                *((AUTO_TIER_TABS[tier, slot], f"{auto_wording(AUTO_MODEL_PREFIX + tier)} · {wording}",
                    slot_desc, tier, slot) for slot, (wording, slot_desc) in _AUTO_SLOT_TABS.items())))
 _AUTO_CATEGORIES = {tab: tier for tab, _w, _d, tier, _slot in _AUTO_TABS}
 _AUTO_KEYS = frozenset(key for keys in AUTO_TIER_KEYS.values() for key in keys)
 _AUTO_NOTE = ("OpenRouter models only. Every profile on this tier runs your choice from its next "
-              "reply, sent with this tier's Hosts & Tier rather than its own.")
+              "reply, sent with this tier's Hosts & Tier rather than its own, and any Thinking set "
+              "here in place of its own.")
 _AUTO_UNSET_NOTE = (" A Primary of None stops offering the tier, and refuses the profiles already "
                     "on it until one is set.")
 _AUTO_SLOT_NOTES = {"grounding_rag_model": " Pick a model that calls the web search: one that "
                                            "answers without searching does so silently."}
 
+#: Why a tab greys its Thinking or Hosts & Tier: what its models are sent carries neither.
+#: An embedding has no reasoning, and its OpenRouter hosts are chosen per task type
+#: (`embeddings._OPENROUTER_TASKS`), which a pin would override. A key check is a one-token
+#: ping on Google's API with the pasted key.
+_NO_THINKING = {"embedding": "Thinking: embeddings take none",
+                "key_check": "Thinking: a key check sends none"}
+_NO_HOSTS = {"embedding": "Hosts & Tier: fixed per task for embeddings",
+             "key_check": "Hosts & Tier: Google only"}
+
+
+async def _noop(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+
+def _budget_wording(budget, short: bool = False) -> str:
+    return ("Dyn" if short else "Dynamic") if budget == -1 else str(budget)
+
+
 #: What each category tells the operator before they choose.
 _SYSTEM_MODEL_NOTES = {
     "describer": "Pick models that read images -- and audio, for voice messages to be described.",
     "classifier": ("Sees the persona and the avatar, so pick models that read images. Runs on the "
-                   "profile owner's key, else yours; on yours, OpenRouter is sent "
-                   "`data_collection: deny`."),
+                   "profile owner's own key alone, never yours: a user with none is not rated."),
     "generator": ("Writes `/profile generate` drafts and sorts imported character cards, on the "
                   "user's own key. A user's Override Defaults for Response win over these."),
     "embedding": ("⚠️ Changing this degrades recall of **every existing memory and "
@@ -1244,10 +1266,8 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         *((tab, wording, desc) for tab, wording, desc, _tier, _slot in _AUTO_TABS),
     )
     _CATEGORY_KEYS = {
-        "describer": _slots(("describer_model", "Primary"), ("describer_fallback_model", "Fallback"),
-                            ("describer_final_model", "Final Fallback")),
-        "classifier": _slots(("classifier_model", "Primary"), ("classifier_fallback_model", "Fallback"),
-                             ("classifier_final_model", "Final Fallback")),
+        "describer": _slots(("describer_model", "Primary"), ("describer_fallback_model", "Fallback")),
+        "classifier": _slots(("classifier_model", "Primary"), ("classifier_fallback_model", "Fallback")),
         "generator": _slots(("generator_model", "Primary"), ("generator_fallback_model", "Fallback")),
         "embedding": _slots(("embedding_model", "Embedding Model")),
         "system": _slots(("primary_model", "Primary"), ("fallback_model", "Fallback")),
@@ -1259,11 +1279,10 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
     #: Everything but the System profiles runs for every user, and Ollama answers the bot
     #: owner's own profiles only -- which the System profiles are.
     _NO_OLLAMA_CATEGORIES = ("describer", "classifier", "generator", "embedding", "key_check")
-    _NO_RETRY_KEYS = ("describer_fallback_model", "describer_final_model",
-                      "classifier_fallback_model", "classifier_final_model", "generator_fallback_model",
+    _NO_RETRY_KEYS = ("describer_fallback_model", "classifier_fallback_model", "generator_fallback_model",
                       *(key for (tier, _slot), keys in AUTO_TIER_KEYS.items()
                         for key in keys if tier != "free" or key != keys[0]))
-    #: No tab has a row to spare for a browse list: three slots and a button row fill
+    #: No tab has a row to spare for a browse list: two slots and two button rows fill
     #: Discord's five, the System Profiles tab spends one on choosing its profile, and no
     #: list holds embedding models. The model list pages on its own.
     _BROWSE_ROW_AVAILABLE = False
@@ -1309,13 +1328,16 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
     def _shipped(self, key: str) -> str:
         """What Reset puts back: a new System profile's model, else the build's for this audience."""
         if key in _PROFILE_KEYS:
-            return SYSTEM_PROFILE_MODEL
+            return SYSTEM_PROFILE_FALLBACK_MODEL if key == "fallback_model" else SYSTEM_PROFILE_MODEL
         return SYSTEM_MODEL_DEFAULTS.get(key) or SYSTEM_MODEL_DEFAULTS_BY_PROVIDER[self.audience][key]
 
     def _save_changes(self, key: str, value):
         if key in _PROFILE_KEYS:
             config = self._system_config()
             config[key] = value
+            # A pin goes when its model leaves the profile, as Set Models prunes one.
+            if "openrouter_endpoints" in config:
+                prune_openrouter_endpoints(config)
             self.cog.profile_manager._save_profile_config(self.user_id, self.profile_name, config, False)
             invalidate_model_cache(self.cog, self.user_id, self.profile_name)
         elif value == self._value(key):
@@ -1340,6 +1362,110 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         self.cog.server_manager._save_system_models()
         if key in _AUTO_KEYS:
             self._store_auto_pins(self.cog.system_models.get(AUTO_ENDPOINTS_KEY) or {})
+        elif self.category in _BY_PROVIDER_CATEGORIES:
+            self._prune_pins()
+
+    # --- A tab's own Thinking and Hosts & Tier ---------------------------------
+
+    def _settings(self) -> Dict:
+        """This tab's thinking and Hosts & Tier, under a profile's key names: the System
+        profile's own config, else the file's entry for the tab -- under its audience's name
+        where the tab ships a chain per preference. Read only; `_put_settings` writes."""
+        if self.category == "system":
+            return self._system_config()
+        return system_settings(self.cog, self.category,
+                               self.audience if self.category in _BY_PROVIDER_CATEGORIES else None)
+
+    def _put_settings(self, changes: Dict):
+        """Applies `changes` to this tab's settings, sparse as `_store` is: None or an empty
+        value is no key, a tab left with none is no entry, and no change writes nothing."""
+        system = self.category == "system"
+        target = self._system_config() if system else dict(self._settings())
+        before = dict(target)
+        for key, value in changes.items():
+            if value is None or value == "" or value == {}:
+                target.pop(key, None)
+            else:
+                target[key] = value
+        if target == before:
+            return
+        if system:
+            self.cog.profile_manager._save_profile_config(self.user_id, self.profile_name, target, False)
+            invalidate_model_cache(self.cog, self.user_id, self.profile_name)
+            return
+        files = self.cog.system_models
+        side = self.audience if self.category in _BY_PROVIDER_CATEGORIES else None
+        section = dict(files.get(side) or {}) if side else files
+        if target:
+            section[self.category] = target
+        else:
+            section.pop(self.category, None)
+        if side and section:
+            files[side] = section
+        elif side:
+            files.pop(side, None)
+        self.cog.server_manager._save_system_models()
+
+    def _prune_pins(self):
+        """Drops a pin whose model has left this tab, as `prune_openrouter_endpoints` does a
+        profile's."""
+        pins = self._settings().get("openrouter_endpoints") or {}
+        held = set(self._pinnable_openrouter_models())
+        if any(model not in held for model in pins):
+            self._put_settings({"openrouter_endpoints": {m: t for m, t in pins.items() if m in held}})
+
+    def _tab_wording(self) -> str:
+        wording = next(l for v, l, _d in self._CATEGORY_LABELS if v == self.category)
+        if self.category in _BY_PROVIDER_CATEGORIES:
+            return f"{wording} \u00b7 {MODEL_PROVIDERS[self.audience]} users"
+        return wording
+
+    def _tab_footer(self) -> str:
+        if self.category == "system":
+            return f"{self.profile_name} \u00b7 changes save as you make them"
+        return f"Bot-wide \u00b7 {self._tab_wording()} \u00b7 changes save as you make them"
+
+    def _thinking_line(self) -> Optional[str]:
+        """The tab's thinking, Primary then Fallback, as it runs; None where it takes none."""
+        if self.category in _NO_THINKING:
+            return None
+        settings, parts = self._settings(), []
+        for role, label in (("primary", "Primary"), ("fallback", "Fallback")):
+            if self._auto_tier():
+                level_key, budget_key = THINKING_SLOT_KEYS["response"][role]
+                level, budget = settings.get(level_key), settings.get(budget_key)
+                parts.append(f"{label} `Each profile's own`" if level is None and budget is None else
+                             f"{label} `{level.title() if level else 'Own'}`/"
+                             f"`{'Own' if budget is None else _budget_wording(budget, short=True)}`")
+                continue
+            if self.category == "system":
+                r = resolve_thinking_params(settings, "response", role, cog=self.cog)
+            else:
+                r = resolve_thinking_params(settings, self.category, role, cog=self.cog)
+            parts.append(f"{label} `{r['thinking_level'].title()}`/"
+                         f"`{_budget_wording(r['thinking_budget'], short=True)}`")
+        return " \u2192 ".join(parts)
+
+    def _add_thinking_button(self, row: int):
+        """Thinking, on every tab -- greyed where the tab's models take none. The System
+        profiles open their own, every slot of them, as Set Models does."""
+        if self.category in _NO_THINKING:
+            add_button(self, _NO_THINKING[self.category], _noop, row=row, disabled=True)
+            return
+
+        async def think_cb(i: discord.Interaction):
+            if self.category == "system":
+                view = SingleProfileThinkingView(self.cog, self.original_interaction, self.profile_name,
+                                                 user_id=self.user_id, parent_model_view=self)
+            else:
+                view = ModThinkingView(self)
+            await i.response.edit_message(**view._render())
+
+        lit = self.category != "system" and any(
+            self._settings().get(key) is not None
+            for pair in THINKING_SLOT_KEYS["response"].values() for key in pair)
+        add_button(self, "Thinking\u2026", think_cb, row=row,
+                   style=discord.ButtonStyle.blurple if lit else discord.ButtonStyle.secondary)
 
     # --- MimicAI Auto's Hosts & Tier -------------------------------------------
 
@@ -1368,9 +1494,14 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         return [(key, wording, self._value(key)) for key, wording, _d in self._CATEGORY_KEYS[self.category]]
 
     def _current_service_tier(self):
+        if not self._auto_tier():
+            return self._settings().get("openrouter_service_tier") or ""
         return (self.cog.system_models.get(AUTO_SERVICE_TIERS_KEY) or {}).get(self._auto_tier()) or ""
 
     def _set_service_tier(self, value):
+        if not self._auto_tier():
+            self._put_settings({"openrouter_service_tier": value})
+            return
         tiers = dict(self.cog.system_models.get(AUTO_SERVICE_TIERS_KEY) or {})
         if value:
             tiers[self._auto_tier()] = value
@@ -1379,10 +1510,16 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         self._put(AUTO_SERVICE_TIERS_KEY, tiers)
 
     def _add_openrouter_buttons(self, *, row: int):
-        pins = {"openrouter_endpoints": self._auto_pins()}
+        """Hosts & Tier, on every tab -- greyed where the tab's models take none. Auto's are
+        the owner's per tier; every other tab's are its own (ModHostView)."""
+        if self.category in _NO_HOSTS:
+            add_button(self, _NO_HOSTS[self.category], _noop, row=row, disabled=True)
+            return
+        auto = self._auto_tier() is not None
+        pins = {"openrouter_endpoints": self._auto_pins()} if auto else self._settings()
         lit = bool(self._current_service_tier()) or any(
             resolve_openrouter_endpoint(pins, m) for m in self._pinnable_openrouter_models())
-        self._add_hosts_button(row=row, view_cls=ModAutoHostView, lit=lit)
+        self._add_hosts_button(row=row, view_cls=ModAutoHostView if auto else ModHostView, lit=lit)
 
     def _is_changed(self, key: str) -> bool:
         return self._value(key) != self._shipped(key)
@@ -1407,9 +1544,9 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         return target_config_key in self._NO_RETRY_KEYS
 
     def _tier_applies(self) -> bool:
-        """Hosts & Tier on the Auto tabs alone. Everywhere else a tier and a pin are a
-        profile's settings, and only the System profiles here are profiles."""
-        return self._auto_tier() is not None
+        """Never on the API row: every tab carries Hosts & Tier beside its Thinking, whatever
+        API it is browsing, so `_build_view` adds it."""
+        return False
 
     def _get_top_models(self, provider: str, target_config_key: str) -> List[str]:
         if target_config_key == "key_tier_probe_model":
@@ -1486,6 +1623,9 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         for key, slot, _default in self._CATEGORY_KEYS[self.category]:
             mark = " ✏️" if self._is_changed(key) else ""
             e.add_field(name=f"{slot}{mark}", value=f"`{self.display_model(self._value(key))}`", inline=True)
+        thinking = self._thinking_line()
+        if thinking:
+            e.add_field(name="Thinking", value=thinking, inline=False)
         blind = self._blind_models()
         if blind:
             e.add_field(name="⚠️ Cannot read images", inline=False,
@@ -1551,6 +1691,13 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
                 f"Select {wording} Model...", self._create_model_options(self._value(key), key), row, key))
             row += 1
 
+        # Every tab but System Profiles has two rows left: the API row, then the tab's own
+        # Thinking and Hosts & Tier with Reset and Back. System Profiles has one for all of
+        # them, so its Ollama tab leaves off Hosts & Tier, which pins OpenRouter models, and
+        # the Ollama Guide, which the profile's own Set Models offers, to fit Discord's five.
+        last_row = row if self.category == "system" else row + 1
+        crowded = self.category == "system" and self.view_mode == "ollama"
+
         if self.category in _BY_PROVIDER_CATEGORIES:
             async def audience_cb(i: discord.Interaction):
                 self.audience = other_provider(self.audience)
@@ -1562,7 +1709,10 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
             add_button(self, f"For: {MODEL_PROVIDERS[self.audience]} users", audience_cb,
                        style=discord.ButtonStyle.success, row=row)
 
-        self._add_api_buttons(row=row)
+        self._add_api_buttons(row=row, guide=not crowded)
+        self._add_thinking_button(last_row)
+        if not crowded:
+            self._add_openrouter_buttons(row=last_row)
 
         async def reset_cb(i: discord.Interaction):
             # Through `_save_changes`, so resetting the embedding model is warned about too.
@@ -1571,14 +1721,129 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
             self._build_view()
             await i.response.edit_message(**self._picker_render())
 
-        add_button(self, "Reset to Shipped", reset_cb, row=row,
+        add_button(self, "Reset to Shipped", reset_cb, row=last_row,
                    disabled=not any(self._is_changed(key) for key, _w, _d in slots))
 
         async def back_cb(i: discord.Interaction):
             view = ModPromptsView(self.cog, self.original_interaction, target_user_id=self.target_user_id)
             await i.response.edit_message(embed=view._get_embed(), view=view)
 
-        add_button(self, "Back", back_cb, row=row)
+        add_button(self, "Back", back_cb, row=last_row)
+
+
+class ModThinkingView(BlockedGuard, ThinkingPickerMixin, ui.View):
+    """Thinking for one System Models tab, bot-wide: how hard its Primary and its Fallback
+    reason. Opened onto the same message with a Back, as from Set Models.
+
+    Kept under the response slot's keys in the tab's own settings (`helpers.system_settings`).
+    A describer, classifier or generator tab resolves them as its own slot, whose shipped
+    default an unset key reads. An Auto tab's stand in for each profile's own on that tier
+    (`helpers.auto_thinking`), so unset is "Unchanged": the profile keeps its own.
+    """
+
+    def __init__(self, parent: ModSystemModelsView):
+        super().__init__(timeout=600)
+        self.parent = parent
+        self.cog = parent.cog
+        self.user_id = parent.user_id
+        self.slot = parent.category
+        self._OFFERS_UNCHANGED = parent._auto_tier() is not None
+        self._build_view()
+
+    def _slot_keys(self, role: str = "primary"):
+        return THINKING_SLOT_KEYS["response"][role]
+
+    def _slot_model(self, _slot: str, role: str = "primary"):
+        keys = self.parent._CATEGORY_KEYS[self.parent.category]
+        return self.parent._value(keys[role == "fallback"][0])
+
+    def _current(self, key: str):
+        return self.parent._settings().get(key)
+
+    def _write(self, key: str, value):
+        self.parent._put_settings({key: value})
+
+    def _render(self) -> Dict:
+        return {"content": None, "embed": self.embed(), "view": self}
+
+    def _all_keys(self) -> List[str]:
+        return [key for role, _label in self._ROLE_LABELS for key in self._slot_keys(role)]
+
+    def embed(self) -> discord.Embed:
+        parent, settings = self.parent, self.parent._settings()
+        auto = self._OFFERS_UNCHANGED
+        e = discord.Embed(title="Thinking / Reasoning", colour=discord.Colour.purple())
+        e.description = f"**{parent._tab_wording()}** \u2014 " + (
+            "set here, each runs in place of a profile's own on this tier; left Unchanged, the "
+            "profile keeps its own." if auto else
+            "effort and budget are stored per model, so a cheap fallback need not think as hard "
+            "as the primary it stands in for.")
+        own = "`Each profile's own`"
+        for role, label in self._ROLE_LABELS:
+            level_key, budget_key = self._slot_keys(role)
+            if auto:
+                level, budget = settings.get(level_key), settings.get(budget_key)
+                effort = f"`{level.title()}`" if level else own
+                spend = own if budget is None else f"`{_budget_wording(budget)}`"
+            else:
+                r = resolve_thinking_params(settings, self.slot, role, cog=self.cog)
+                unset = " *(shipped)*" if role == "primary" else " *(inherited)*"
+                effort = f"`{r['thinking_level'].title()}`" + ("" if settings.get(level_key) else unset)
+                spend = (f"`{_budget_wording(r['thinking_budget'])}`"
+                         + ("" if settings.get(budget_key) is not None else unset))
+            model = self._slot_model(self.slot, role)
+            note = f"This model {self._caps_note(role)}." if is_real_model(model) else "No model set."
+            e.add_field(name=f"{label} \u2014 {parent.display_model(model)}"[:256], inline=False,
+                        value=f"Effort: {effort}\nBudget: {spend}\n-# {note}")
+        e.set_footer(text=parent._tab_footer())
+        return e
+
+    def _build_view(self):
+        self.clear_items()
+        self._add_level_select("primary", 0)
+        self._add_level_select("fallback", 1)
+        self._add_budget_button(2)
+
+        async def reset_cb(i: discord.Interaction):
+            self.parent._put_settings(dict.fromkeys(self._all_keys()))
+            self._build_view()
+            await i.response.edit_message(**self._render())
+
+        add_button(self, "Reset to Profiles' Own" if self._OFFERS_UNCHANGED else "Reset to Shipped",
+                   reset_cb, row=2, disabled=all(self._current(k) is None for k in self._all_keys()))
+
+        async def back_cb(i: discord.Interaction):
+            self.parent._build_view()
+            await i.response.edit_message(**self.parent._picker_render())
+
+        add_button(self, "\u2190 Back to Models", back_cb, row=2)
+
+
+class ModHostView(OpenRouterHostView):
+    """Hosts & Tier for a System Models tab other than MimicAI Auto's: its own pins and Default
+    Tier, kept as a profile keeps them -- on the System profile itself, or in the file under
+    the tab (`helpers.system_settings`), where the describer, classifier and generator read
+    them at the call."""
+
+    @property
+    def _TIER_REACH(self) -> str:
+        if self.parent.category == "system":
+            return OpenRouterHostView._TIER_REACH
+        return "Every OpenRouter model on this tab, for every user it runs for."
+
+    def _chosen(self, model_id: str) -> str:
+        return resolve_openrouter_endpoint(self.parent._settings(), model_id) or self._AUTO
+
+    def _choose(self, model_id: str, chosen: str):
+        pins = dict(self.parent._settings().get("openrouter_endpoints") or {})
+        if chosen == self._AUTO:
+            pins.pop(model_id, None)
+        else:
+            pins[model_id] = chosen
+        self.parent._put_settings({"openrouter_endpoints": pins})
+
+    def _footer(self) -> str:
+        return self.parent._tab_footer()
 
 
 class ModAutoHostView(OpenRouterHostView):

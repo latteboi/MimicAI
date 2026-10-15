@@ -675,9 +675,9 @@ class StorageManager:
 
         `owner_id` is opt-in, and only the profile-management paths pass it: turn-time
         retrieval stays guild-billed, because a server pays for its own conversations.
-        There is deliberately no instance-owner fallback here -- unlike
-        `_classifier_api_key`, this runs because a user asked for it, so "add a key"
-        is an answerable error rather than a silent bill to whoever hosts the bot.
+        There is deliberately no instance-owner fallback here, as there is none for the
+        content classifier: this runs because a user asked for it, so "add a key" is an
+        answerable error rather than a silent bill to whoever hosts the bot.
 
         Each payer offers its Gemini key, then its OpenRouter key (the same model -- see
         cogs/services/api/embeddings). A failed request moves on to the next route but

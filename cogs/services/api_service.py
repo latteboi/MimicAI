@@ -642,7 +642,7 @@ class APIService:
         
         # Extract parameters once for either provider
         p_sett_thinking = p_settings
-        t_params = resolve_thinking_params(p_sett_thinking, "response")
+        t_params = resolve_thinking_params(p_sett_thinking, "response", cog=self.cog)
 
         model_tools = resolve_native_tools(p_sett_thinking)
 
@@ -656,7 +656,7 @@ class APIService:
             # expensive primary is the usual shape, and one shared effort made the
             # standby either waste what it was chosen to save or under-think a request
             # the primary was tuned for. Unset still inherits the primary.
-            t_params_fb = resolve_thinking_params(p_sett_thinking, "response", "fallback")
+            t_params_fb = resolve_thinking_params(p_sett_thinking, "response", "fallback", cog=self.cog)
             try:
                 model_instance = self._instantiate_model(model_to_create, guild_id, profile_owner_id_for_instructions, current_instructions, dynamic_safety_settings, t_params_fb, model_tools, p_sett_thinking, config_owner_id=profile_owner_id_for_instructions, functions=functions)
                 model_init_error = False

@@ -1,0 +1,22 @@
+v0.7.2 Beta — 2026-10-15 (UTC)
+One fallback model per slot, and a profile goes into the Public Library in one press.
+## **Added**
+- **Gemini 4 Argon**, Google's new flagship reasoning model, in Set Models for Google profiles. Paid tier only; thinking effort runs Low, Medium or High.
+- **Publish in one press**: **Publish Yours** (`/profile hub` → Public Library), **Publish to Library** (`/profile manage` → Sharing), and on a profile `/profile generate` has just saved. A profile not rated yet is rated by the press, which takes a few seconds, and listed if the verdict is General.
+- **Sharing tab** (`/profile manage` → Sharing): Publish or Unpublish, Share Profile, Send as Clone and Library Intro in one place. The dashboard shows how many people borrow the profile.
+- **Library Sort and Search**: opens on Most Borrowed, and search by creator, display name or intro as well as name.
+- **Stats** (`/profile hub` → Stats): the Library's totals and its most borrowed profile, and how many people borrow yours.
+- **See how a character feels about you**: `/session view` → select a participant shows its Bonds with you in words, and `/profile manage` → Neuro Engine shows you your own levels.
+- **Generate a profile from a picture**: `/profile generate` takes an `image` of the character (PNG, JPEG or WebP, up to 4 MB), with or without a concept, and the Generate form in `/start` and the Public Library takes one too. The draft takes the character's look from it, and the image becomes the avatar.
+- **Delete Profile Message** (right-click → Apps): server admins delete a profile's reply, every message of it, from the channel and the session's memory. In a DM with the bot, anyone can delete one of its messages there, without `/purge` taking the newest ones with it.
+- **Mimic Dice** (`/play dice`): Liar's Dice for the channel's cast and anyone who sits down. Raise the bid or call Liar from your own cup panel. Each character bids and calls by its temperament, and its bluffs show on its mood: an anxious one starts to look rattled, a steady one keeps a straight face. Choose how many dice each player starts with, and whether ones are wild.
+## **Changed**
+- **Slow commands say what they are doing.** `/profile generate`, `/import` of a character card, `/help ask`, `/memorise` and `/compact` answer at once with a status that the result then replaces, instead of "MimicAI is thinking...".
+- **Publishing is capped at 10 profiles a day.** Publish Yours rates up to 5 at a time and shows each verdict as it lands.
+- **Final Fallback is gone** (`/profile manage` → Params). For cover when one provider is down, set a Fallback on the other provider in Set Models.
+- **`/profile hub` opens on the Public Library**, and Home is now Stats, the last tab. Profile Sharing has no mode toggle: it offers borrows only.
+- **Share and Send as Clone list profiles not rated yet** and rate them when sent, rather than leaving them off the list.
+- **`/export` and `/import` work in servers too.** Every reply, the file included, is visible only to you.
+## **Fixed**
+- **A profile edited since its rating could be shared or published on the old one.** Publishing, sharing, cloning and opening Global Chat now settle the rating first, and editing the lorebook, the image prompt or the name asks about the rating as other edits do. A bulk edit applies the same rule without asking.
+- **A character card over 4 MB got an avatar the content rating never saw.** `/import` now leaves such a card's picture off; set an avatar under Appearance instead.

@@ -42,6 +42,7 @@ from ..utils.constants import (
     NEW_PROFILE_SPEECH_TEMPERATURE, SPEECH_LANGUAGE_NAMES,
     IMAGE_GROUNDING_LABELS, VOICE_SAMPLE_CONSENT_FILES, VOICE_SAMPLE_SLOT_FILES, VOICE_SAMPLE_SLOT_KEY, VOICE_SAMPLE_SLOTS,
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_MODES, GREEDY_SAMPLING, SYSTEM_PROFILE_MODEL,
+    SYSTEM_PROFILE_FALLBACK_MODEL,
     MODEL_PROVIDERS, PROVIDER_CHOICES, NOT_REGISTERED,
     LIMIT_LORE_ENTRIES, LIMIT_PUBLISHES_PER_DAY, PERSONA_TEXT_INPUT_MAX_LENGTH, )
 from ..utils.helpers import (auto_tier, birth_time, image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
@@ -51,6 +52,8 @@ from ..utils.helpers import (auto_tier, birth_time, image_rag_enabled, is_real_m
                             resolve_image_tools, resolve_thinking_params,
                             resolve_unreadable_media_mode,
                             resolve_url_mode, suppress_link_previews, system_model,
+                            system_settings, resolve_openrouter_endpoint,
+                            resolve_openrouter_service_tier,
                             clean_imported_text, _get_user_hash)
 from ..utils import lorebook
 from ..utils.bonds import apply_updates as apply_bond_updates, describe as describe_bond
@@ -2426,7 +2429,7 @@ class ProfileManager:
                 "top_k": 40, "training_context_size": 0,
                 "training_relevance_threshold": 0.0,
                 "ltm_context_size": 0, "ltm_relevance_threshold": 1.0, "ltm_creation_interval": 100,
-                "primary_model": SYSTEM_PROFILE_MODEL, "fallback_model": SYSTEM_PROFILE_MODEL,
+                "primary_model": SYSTEM_PROFILE_MODEL, "fallback_model": SYSTEM_PROFILE_FALLBACK_MODEL,
                 "timezone": "UTC", "generation_metadata_enabled": False,
                 "realistic_typing_enabled": False, "ltm_creation_enabled": False,
                 # Written explicitly, and False, where absence means on: recall has been
@@ -2898,31 +2901,6 @@ class ProfileManager:
             except Exception as e:
                 print(f"Error in cascade delete for user {user_id_str}: {e}")
 
-    def _classifier_api_key(self, owner_id: int, provider: str) -> Tuple[Optional[str], bool]:
-        """Personal -> instance-owner key for the classifier, and whether it is the owner's.
-
-        The auto-moderator only ever tried the personal key, which was fine while
-        the only caller was publishing. Classification runs for every profile, so a
-        user with no key of their own would otherwise never get a verdict. Guild
-        keys are deliberately not used: a profile is not owned by a guild, and
-        billing someone's server for another member's profile edit is surprising.
-
-        The fallback sends one user's profile to a provider on the operator's account
-        without that user having directed it, so it must not land where it may be
-        trained on (see cogs/utils/data_policy): a free-tier Gemini key is not used,
-        and the caller makes an OpenRouter request on it deny training hosts.
-        """
-        storage = self.cog.storage_manager
-        key = storage._get_api_key_for_user(owner_id, provider)
-        if key:
-            return key, False
-        bot_owner = int(defaultConfig.DISCORD_OWNER_ID)
-        if int(owner_id) == bot_owner:
-            return None, False
-        if provider == "gemini" and not storage.personal_gemini_is_paid(bot_owner):
-            return None, False
-        return storage._get_api_key_for_user(bot_owner, provider), True
-
     async def _fetch_avatar_parts(self, owner_id: int, profile_name: str) -> List[Dict[str, Any]]:
         """Every avatar the profile can speak under as inline image parts, its usual one first:
         a mood avatar is shown as often, so it is judged with the rest. One at a time, so the
@@ -3020,44 +2998,47 @@ class ProfileManager:
         gen_cfg = dict(GREEDY_SAMPLING)
 
         # Ships the attachment describer's chain, for the same reasons, on the profile
-        # owner's provider: its two models, then the other provider's when there is no
-        # key for them or they refuse. Built here rather than by the model
-        # factory because the key is not the factory's -- see `_classifier_api_key` -- so
-        # only the two providers that function knows are routed; `/mod` offers no other.
-        # A repeat is tried once, as `run_with_fallback` does.
+        # owner's provider: its Primary, then its Fallback, on the owner's own key alone.
+        # Never a server's -- a profile is not owned by one -- and never the bot owner's: a
+        # user with no key gets no verdict, and the profile stays Pending. Built here rather
+        # than by the model factory, so only the two providers this loop knows are routed;
+        # `/mod` offers no other, and the tab's thinking and Hosts & Tier are applied here
+        # too. A repeat is tried once, as `run_with_fallback` does.
         attempts = []
         side = self.effective_provider(owner_id)
-        for value in dict.fromkeys(system_model(self.cog, k, side) for k in CLASSIFIER_KEYS):
+        settings = system_settings(self.cog, "classifier", side)
+        chain = dict.fromkeys(system_model(self.cog, k, side) for k in CLASSIFIER_KEYS)
+        for role, value in zip(("primary", "fallback"), chain):
             if value.startswith("GOOGLE/"):
-                attempts.append(("gemini", value[len("GOOGLE/"):], GoogleGenAIModel))
+                attempts.append(("gemini", value[len("GOOGLE/"):], GoogleGenAIModel, role))
             elif value.startswith("OPENROUTER/"):
-                attempts.append(("openrouter", value[len("OPENROUTER/"):], OpenRouterModel))
+                attempts.append(("openrouter", value[len("OPENROUTER/"):], OpenRouterModel, role))
 
         raw = None
         used_model = None
         status = None
         model_name = None
         failures = []
-        for provider, model_name, model_cls in attempts:
-            key, on_operator_key = self._classifier_api_key(owner_id, provider)
+        for provider, model_name, model_cls, role in attempts:
+            key = self.cog.storage_manager._get_api_key_for_user(owner_id, provider)
             if not key:
-                # No key covers three cases: none assigned for this provider, the
-                # assigned key inside its rate-limit cooldown window, or the operator's
-                # free-tier Gemini key refused as a fallback. Recorded rather than
-                # skipped in silence, so a run that never reached a provider does not
-                # look identical to one that failed at it.
-                failures.append(f"{provider}: no usable key (unassigned, rate-limit cooldown, or a free-tier fallback)")
+                # No key covers two cases: none assigned for this provider, or the
+                # assigned key inside its rate-limit cooldown window. Recorded rather
+                # than skipped in silence, so a run that never reached a provider does
+                # not look identical to one that failed at it.
+                failures.append(f"{provider}: no usable key (unassigned, or in rate-limit cooldown)")
                 continue
             status = "api_error"
             try:
-                # The utility slot, resolved: an adapter handed no thinking params
-                # reasons at "high", which a one-word verdict does not need.
+                # Resolved, never `{}`: an adapter handed no thinking params reasons at
+                # "high". The classifier slot ships Medium, as /mod may change it.
                 kwargs = {"api_key": key, "model_name": model_name, "system_instruction": prompt_text,
-                          "thinking_params": resolve_thinking_params({}, "utility", "primary")}
+                          "thinking_params": resolve_thinking_params(settings, "classifier", role)}
                 if model_cls is GoogleGenAIModel:
                     kwargs["safety_settings"] = DEFAULT_SAFETY_SETTINGS
-                elif on_operator_key:
-                    kwargs["data_collection"] = "deny"
+                else:
+                    kwargs["endpoint"] = resolve_openrouter_endpoint(settings, model_name)
+                    kwargs["service_tier"] = resolve_openrouter_service_tier(settings)
                 model = model_cls(**kwargs)
                 response = await model.generate_content_async(payload, generation_config=gen_cfg)
                 if response and response.candidates:

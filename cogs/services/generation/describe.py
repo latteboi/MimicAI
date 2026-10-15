@@ -18,7 +18,8 @@ from ...utils.constants import (
     DEFAULT_MEDIA_DESCRIPTION, DESCRIBER_KEYS, MEDIA_DESCRIBER_RESOLUTION, GREEDY_SAMPLING,
     MEDIA_DESCRIPTION_MAX_CHARS, MEDIA_DESCRIPTION_NONE,
 )
-from ...utils.helpers import _resolve_safety_settings, resolve_thinking_params, system_model
+from ...utils.helpers import (_resolve_safety_settings, resolve_thinking_params, system_model,
+                              system_settings)
 
 
 def _media_key(part: Any) -> Optional[str]:
@@ -107,8 +108,12 @@ class MediaDescriptionMixin:
         parts = list(media_parts) if len(media_parts) == 1 else [
             item for n, part in enumerate(media_parts, 1) for item in (_file_name(part, n), part)]
         contents = [{"role": "user", "parts": parts}]
+        # The chain the profile owner's provider ships, as their profile's own models are,
+        # with that side's thinking and Hosts & Tier from /mod.
+        side = self.cog.profile_manager.effective_provider(owner_id)
+        settings = system_settings(self.cog, "describer", side)
 
-        async def run(name: str, _is_fallback: bool):
+        async def run(name: str, is_fallback: bool):
             model = self.cog.api_service._instantiate_model(
                 name, channel.guild.id if channel.guild else None, user_id,
                 system_instruction=instruction,
@@ -117,29 +122,27 @@ class MediaDescriptionMixin:
                 # age-restricted session comes back refused, which reads as the feature
                 # being broken rather than as a filter doing its job.
                 safety_settings=_resolve_safety_settings(channel, p_settings),
-                # `utility`: a one-shot internal pass with no character in it to
-                # configure, like the Director's Note and the profile generator.
-                thinking_params=resolve_thinking_params({}, "utility", "primary"),
-                # The one setting this pass overrides. Its own look at the file is the
-                # profile's only look at it, so it is bought at full detail whatever the
+                # Its own slot: a one-shot internal pass with no character in it to
+                # configure, set in /mod rather than on any profile.
+                thinking_params=resolve_thinking_params(
+                    settings, "describer", "fallback" if is_fallback else "primary"),
+                # The one profile setting this pass overrides. Its own look at the file is
+                # the profile's only look at it, so it is bought at full detail whatever the
                 # profile spends on media it can read itself. One setting, both wire
                 # shapes: Google's enum, and OpenRouter's coarser `detail` hint.
-                profile_settings={"media_input_resolution": MEDIA_DESCRIBER_RESOLUTION},
+                profile_settings={**settings, "media_input_resolution": MEDIA_DESCRIBER_RESOLUTION},
                 config_owner_id=owner_id)
             response = await model.generate_content_async(
                 contents, generation_config=dict(GREEDY_SAMPLING))
             answer = (getattr(response, "text", "") or "").strip()
             if not answer or answer.lower().startswith(MEDIA_DESCRIPTION_NONE):
                 # Retried on the next model, unlike the other utility passes, which
-                # treat an empty answer as a decision about the content and stop. The
-                # last sits on another provider behind another filter: the Google one
-                # whose safety settings this channel has already stood down -- a file
-                # the first will not describe is what the last is for.
+                # treat an empty answer as a decision about the content and stop: the
+                # Fallback may sit behind another filter -- a Google one, whose safety
+                # settings this channel has already stood down.
                 raise ValueError("The describer returned no description")
             return response, answer
 
-        # The chain the profile owner's provider ships, as their profile's own models are.
-        side = self.cog.profile_manager.effective_provider(owner_id)
         primary, *fallbacks = (system_model(self.cog, k, side) for k in DESCRIBER_KEYS)
         try:
             (response, text), used, _was_fallback = await self.cog.api_service.run_with_fallback(

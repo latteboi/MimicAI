@@ -318,7 +318,7 @@ class ReplyMixin:
         tools = resolve_native_tools(p_settings)
 
         def build(name: str, role: str, **key_errors):
-            thinking = resolve_thinking_params(p_settings, "response", role)
+            thinking = resolve_thinking_params(p_settings, "response", role, cog=self.cog)
             # Carried across because this dict has always held it. Nothing in any adapter
             # reads it.
             thinking["thinking_persistence"] = p_settings.get("thinking_persistence", 10)

@@ -500,10 +500,9 @@ a record anyone but the bot owner wrote.
   catalogue knows it has one host company and the bot owner's filtering listing kept it. Every
   image path builds through `MediaService.build_image_model` and every voice line through
   `MediaService.synthesise_speech`; both call the factory and resolve no key themselves.
-- **The operator's key:** the content classifier falls back to the bot owner's key for a
-  profile whose owner has none (`_classifier_api_key`). Nobody directed that user's content
-  there, so a free-tier Gemini key is skipped and an OpenRouter request on it denies
-  training hosts.
+- **The operator's key:** never sends one user's content. The content classifier runs on
+  the profile owner's own key alone (`_classify_profile_content`); with none, the profile
+  stays Pending.
 - **Ollama:** a host receives every message a profile sees, so it must be the operator's
   own machine. The factory refuses `OLLAMA/` unless `config_owner_id` — which every call
   passes — is the bot owner.

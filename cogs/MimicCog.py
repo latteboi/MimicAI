@@ -2345,7 +2345,7 @@ class MimicCog(EventListeners, commands.Cog):
             adv_params = {k: v for k, v in adv_params.items() if v is not None}
             gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "_advanced_params": adv_params}
             
-            t_params_worker = resolve_thinking_params(p_config, "response")
+            t_params_worker = resolve_thinking_params(p_config, "response", cog=self)
             if not p_config.get("thinking_level"):
                 # MimicGuide answers documentation questions off retrieved shards. The
                 # shared default for the response slot is "high"; this path has always

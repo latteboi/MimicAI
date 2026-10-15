@@ -23,7 +23,7 @@ from .constants import (
     PATTERN_SPEAKER_CLOSE, PATTERN_STRAY_WRAPPERS, PATTERN_BARE_TURN_TAG,
     PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK, SYSTEM_MODEL_DEFAULTS,
     SYSTEM_MODEL_DEFAULTS_BY_PROVIDER, AUTO_MODEL_PREFIX, AUTO_SLOT_PAIRS, AUTO_TIER_KEYS,
-    AUTO_ENDPOINTS_KEY, AUTO_SERVICE_TIERS_KEY,
+    AUTO_ENDPOINTS_KEY, AUTO_SERVICE_TIERS_KEY, AUTO_TIER_TABS,
     NEURO_AXES, NEURO_DEFAULT_STATE, MOOD_AVATAR_THRESHOLD, MOOD_AVATAR_MARGIN,
     IMAGE_COMMAND_PREFIXES, IMAGE_MODEL_CAPS, IMAGE_MODEL_CAPS_DEFAULT, IMAGE_THINKING_LEVELS,
     OPENROUTER_IMAGE_CAPS_UNKNOWN, IMAGE_MIME_SUFFIXES, IMAGE_SUFFIX_MIMES,
@@ -33,7 +33,8 @@ from .constants import (
     DEFAULT_CRITIC_LOOKBACK, DEFAULT_CRITIC_PERSISTENCE,
     CRITIC_LOOKBACK_MIN, CRITIC_LOOKBACK_MAX,
     CRITIC_PERSISTENCE_MIN, CRITIC_PERSISTENCE_MAX,
-    THINKING_LEVELS, THINKING_SLOT_KEYS, THINKING_SLOT_DEFAULTS,
+    THINKING_LEVELS, THINKING_SLOT_KEYS, THINKING_SLOT_DEFAULTS, SYSTEM_THINKING_SLOTS,
+    THINKING_SLOT_MODELS,
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
     MEDIA_RESOLUTION_VALUES, MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL,
     GROUNDING_MODE_LABELS,
@@ -1285,7 +1286,7 @@ def google_thinking_caps(model_name: Optional[str]) -> Dict[str, Any]:
 
 def resolve_thinking_params(config: Optional[Dict[str, Any]],
                             slot: str = "response",
-                            role: str = "primary") -> Dict[str, Any]:
+                            role: str = "primary", cog=None) -> Dict[str, Any]:
     """The thinking parameters one model of one slot of one profile runs at.
 
     Every generation path builds its `thinking_params` through here, which is what
@@ -1312,14 +1313,24 @@ def resolve_thinking_params(config: Optional[Dict[str, Any]],
     `thinking_summary_visible` is response-only by construction. A utility slot's
     thoughts reach no user -- the critic's verdict is parsed, the summariser's output is
     stored -- so asking for them buys billed tokens nobody reads.
+
+    A SYSTEM_THINKING_SLOTS slot is read off its System Models settings under the
+    response slot's keys. Given `cog`, a profile slot on MimicAI Auto takes what the bot
+    owner set for its tier over the profile's own (`auto_thinking`): every call that
+    sends a profile's slot passes it.
     """
     config = config or {}
+    if cog is not None:
+        overlay = auto_thinking(cog, config, slot)
+        if overlay:
+            config = {**config, **overlay}
     if slot not in THINKING_SLOT_DEFAULTS:
         slot = "response"
     defaults = THINKING_SLOT_DEFAULTS[slot]
     # A slot with no entry here is one nothing can configure -- `compaction` -- and
     # resolves to its default alone.
-    roles = THINKING_SLOT_KEYS.get(slot, {})
+    roles = THINKING_SLOT_KEYS.get(slot) or (
+        THINKING_SLOT_KEYS["response"] if slot in SYSTEM_THINKING_SLOTS else {})
 
     def _read(keys) -> Dict[str, Any]:
         """The level and budget stored under one (level, budget) pair, or None each."""
@@ -1738,6 +1749,39 @@ def system_model(cog, key: str, provider: Optional[str] = None) -> str:
         return stored.get(key) or SYSTEM_MODEL_DEFAULTS[key]
     side = provider if provider in SYSTEM_MODEL_DEFAULTS_BY_PROVIDER else "gemini"
     return (stored.get(side) or {}).get(key) or SYSTEM_MODEL_DEFAULTS_BY_PROVIDER[side][key]
+
+
+def system_settings(cog, category: str, provider: Optional[str] = None) -> Dict[str, Any]:
+    """One `/mod` System Models tab's own settings -- its thinking and its Hosts & Tier, under
+    a profile's key names -- or {} where none are set. `provider` is the preference whose
+    chain the tab shows, for the categories shipping one per preference, as `system_model`
+    reads it; None reads the file's shared tabs, MimicAI Auto's."""
+    stored = getattr(cog, "system_models", None) or {}
+    if provider is not None:
+        stored = stored.get(provider if provider in SYSTEM_MODEL_DEFAULTS_BY_PROVIDER else "gemini") or {}
+    value = stored.get(category)
+    return value if isinstance(value, dict) else {}
+
+
+def auto_thinking(cog, config: Optional[Dict[str, Any]], slot: str) -> Dict[str, Any]:
+    """The thinking keys of profile `slot` that the bot owner set for the MimicAI Auto tier
+    it runs on, under the profile's own key names: they stand in for the profile's, as the
+    tier's Hosts & Tier do. Per role, since a Fallback can be moved off the tier. Empty
+    where the slot is not on Auto or its tab sets nothing."""
+    roles = THINKING_SLOT_KEYS.get(slot)
+    slot_key = THINKING_SLOT_MODELS.get(slot)
+    if not config or not roles or slot_key not in AUTO_SLOT_PAIRS:
+        return {}
+    overlay = {}
+    for role, model_key in (("primary", slot_key), ("fallback", AUTO_SLOT_PAIRS[slot_key])):
+        tab = AUTO_TIER_TABS.get((auto_tier(config.get(model_key)), slot_key))
+        if tab is None:
+            continue
+        stored = system_settings(cog, tab)
+        for tab_key, own_key in zip(THINKING_SLOT_KEYS["response"][role], roles[role]):
+            if stored.get(tab_key) is not None:
+                overlay[own_key] = stored[tab_key]
+    return overlay
 
 
 def auto_tier(value: Optional[str]) -> Optional[str]:

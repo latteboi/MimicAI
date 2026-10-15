@@ -175,10 +175,12 @@ _STATIC_DASHBOARDS = [
             ("Profiles", ["Inspect any user's profiles; clear classifier verdicts",
                           "Reset All Content Ratings (instance-wide, one-off baseline reset)"]),
             ("Prompts", ["Override the global system prompts, including CONTENT_POLICY and HELP_MODE_INJECTION",
-                         "System Models: the attachment describer and content classifier (per "
-                         "provider preference), embeddings, System profiles and Gemini key checks",
+                         "System Models: the attachment describer, content classifier and profile "
+                         "generator (per provider preference), embeddings, System profiles and Gemini "
+                         "key checks; each tab's Primary and Fallback, with its Thinking and Hosts & Tier",
                          "System Models -> Auto · Free, Budget and Recommended: each tier's "
-                         "OpenRouter Primary and Fallback, with Hosts & Tier for every profile on it"]),
+                         "OpenRouter Primary and Fallback, with Thinking and Hosts & Tier for every "
+                         "profile on it"]),
             ("Docs", ["Edit the documentation shards backing Help Mode; re-embeds on save"]),
             ("Blacklist", ["Block users and servers (leave, or quarantine), silently; "
                            "blocks may be temporary",

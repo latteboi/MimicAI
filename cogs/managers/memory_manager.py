@@ -1136,7 +1136,8 @@ class MemoryManager:
                     model_name, effective_guild_id if effective_guild_id else None,
                     profile_owner_id, instructions, DEFAULT_SAFETY_SETTINGS,
                     resolve_thinking_params(
-                        params_source, "ltm", "fallback" if is_fallback else "primary"),
+                        params_source, "ltm", "fallback" if is_fallback else "primary",
+                        cog=self.cog),
                     None, params_source, config_owner_id=profile_owner_id)
                 return await m.generate_content_async(
                     [prompt], generation_config=cfg)

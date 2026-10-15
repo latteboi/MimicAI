@@ -279,7 +279,7 @@ class SpeakAsMixin:
             model = self.cog.api_service._instantiate_model(
                 model_name, guild_id, owner_id, system_instruction, safety_settings,
                 resolve_thinking_params(p_settings, "response",
-                                        "fallback" if is_fallback else "primary"),
+                                        "fallback" if is_fallback else "primary", cog=self.cog),
                 tools, p_settings, config_owner_id=owner_id, functions=functions,
             )
 

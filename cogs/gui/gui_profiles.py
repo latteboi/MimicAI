@@ -18,7 +18,7 @@ from ..utils.helpers import (
     google_thinking_caps, grounding_mode_display, ltm_auto_recall_enabled, ltm_creation_mode,
     resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
-    resolve_unreadable_media_mode, system_model, auto_tier, resolve_auto_model,
+    resolve_unreadable_media_mode, system_model, auto_tier, resolve_auto_model, auto_thinking,
     _format_api_error, speaks_verbatim, stored_google_voice, _get_user_hash,
 )
 from ..utils.bonds import describe as describe_bond
@@ -2987,9 +2987,9 @@ class ModelPickerMixin(ReportErrorMixin):
         'grounding': (("grounding_rag_model", "Grounding Summariser", GROUNDING_RESEARCHER_MODEL),
                       ("grounding_rag_fallback_model", "Grounding Fallback", GROUNDING_RESEARCHER_FALLBACK)),
         'critic':    (("critic_model", "Anti-Repetition Critic", UTILITY_MODEL),
-                      ("critic_fallback_model", "Critic Fallback", FALLBACK_MODEL_NAME)),
+                      ("critic_fallback_model", "Critic Fallback", UTILITY_FALLBACK_MODEL)),
         'ltm':       (("ltm_model", "LTM Summariser", UTILITY_MODEL),
-                      ("ltm_fallback_model", "LTM Fallback", FALLBACK_MODEL_NAME)),
+                      ("ltm_fallback_model", "LTM Fallback", UTILITY_FALLBACK_MODEL)),
     }
 
     _CATEGORY_LABELS = (
@@ -3380,12 +3380,12 @@ class ModelPickerMixin(ReportErrorMixin):
             ['ollama'] if self._may_use_ollama() and self.category not in self._NO_OLLAMA_CATEGORIES
             else [])
 
-    def _add_api_buttons(self, *, row: int = 3):
+    def _add_api_buttons(self, *, row: int = 3, guide: bool = True):
         """The API-mode and Ollama-host buttons, identical in both pickers.
 
         The category button that used to live here is now `_add_category_select`, which
         leaves room on this row for the fallback-indicator toggle that had a row of its
-        own.
+        own. `guide=False` leaves the Ollama Guide off a row with no room for it.
         """
         api_modes = self._api_modes()
         api_labels = {'google': 'API: Google', 'openrouter': 'API: OpenRouter', 'ollama': 'API: Ollama (Local)'}
@@ -3429,7 +3429,8 @@ class ModelPickerMixin(ReportErrorMixin):
             
             async def guide_cb(i: discord.Interaction):
                 await i.response.send_message(OLLAMA_GUIDE_TEXT, ephemeral=True)
-            add_button(self, "Guide", guide_cb, style=discord.ButtonStyle.secondary, row=row)
+            if guide:
+                add_button(self, "Guide", guide_cb, style=discord.ButtonStyle.secondary, row=row)
 
         if self.view_mode == 'openrouter' and self._tier_applies():
             self._add_openrouter_buttons(row=row)
@@ -3629,7 +3630,7 @@ class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
         if self.category in THINKING_SLOT_KEYS:
             parts = []
             for role, role_label in (("primary", "Primary"), ("fallback", "Fallback")):
-                r = resolve_thinking_params(data, self.category, role)
+                r = resolve_thinking_params(data, self.category, role, cog=self.cog)
                 budget = r["thinking_budget"]
                 parts.append(f"{role_label} `{r['thinking_level'].title()}`"
                              f"/`{'Dyn' if budget == -1 else budget}`")
@@ -4102,7 +4103,7 @@ class ThinkingPickerMixin:
         for value, label, _desc in THINKING_SLOT_LABELS:
             parts = []
             for role, role_label in self._ROLE_LABELS:
-                r = resolve_thinking_params(config_reader, value, role)
+                r = resolve_thinking_params(config_reader, value, role, cog=self.cog)
                 budget = r["thinking_budget"]
                 parts.append(f"{role_label} `{r['thinking_level'].title()}`"
                              f"/`{'Dyn' if budget == -1 else budget}`")
@@ -4229,15 +4230,20 @@ class SingleProfileThinkingView(BlockedGuard, ThinkingPickerMixin, ui.View):
                          f"Effort and budget are stored per model, so a cheap fallback "
                          f"need not think as hard as the primary it stands in for.")
 
+        owner_set = auto_thinking(self.cog, data, self.slot)
         for role, role_label in self._ROLE_LABELS:
-            resolved = resolve_thinking_params(data, self.slot, role)
+            resolved = resolve_thinking_params(data, self.slot, role, cog=self.cog)
             level_key, budget_key = self._slot_keys(role)
             budget = resolved["thinking_budget"]
             # "inherited" wherever the value came from somewhere other than this role's
             # own keys -- the whole point of the sparse storage is that the screen can
-            # say so rather than showing a number nobody typed.
-            level_src = "" if data.get(level_key) else " *(inherited)*"
-            budget_src = "" if data.get(budget_key) is not None else " *(inherited)*"
+            # say so rather than showing a number nobody typed. A MimicAI Auto tier's
+            # value runs over the profile's, so the screen says whose it is.
+            auto = " *(set by the bot owner for MimicAI Auto)*"
+            level_src = (auto if level_key in owner_set
+                         else "" if data.get(level_key) else " *(inherited)*")
+            budget_src = (auto if budget_key in owner_set
+                          else "" if data.get(budget_key) is not None else " *(inherited)*")
             e.add_field(
                 name=f"{role_label} \u2014 {self.display_slot_model(role)}",
                 value=(f"Effort: `{resolved['thinking_level'].title()}`{level_src}\n"

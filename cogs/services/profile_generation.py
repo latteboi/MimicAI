@@ -16,7 +16,7 @@ from ..utils.constants import (AI_INSTRUCTIONS_PART_MAX_LENGTH, DEFAULT_CARD_IMP
                                GENERATOR_KEYS, LIBRARY_INTRO_MAX_CHARS,
                                PERSONA_TEXT_INPUT_MAX_LENGTH, defaultConfig)
 from ..utils.helpers import (_format_api_error, resolve_auto_models, resolve_thinking_params,
-                             system_model)
+                             system_model, system_settings)
 from ..utils.user_defaults import apply_defaults, model_chain, model_provider
 
 #: A character is creative work. This was 0.3, a form-filling temperature, and every
@@ -193,6 +193,9 @@ async def generate_draft(cog, user_id: int, concept: str,
     Raises ProfileGenerationError, and nothing else, for anything the user should be told.
     """
     primary, fallbacks = generator_models(cog, user_id)
+    # The generator tab's thinking and Hosts & Tier, from /mod, for the user's side --
+    # whichever models their own defaults put in front of it.
+    settings = system_settings(cog, "generator", cog.profile_manager.effective_provider(user_id))
     default, temperature = TEMPLATES[template_key]
     template = cog.global_prompts.get(template_key, default)
     try:
@@ -207,7 +210,8 @@ async def generate_draft(cog, user_id: int, concept: str,
     async def attempt(model_name: str, is_fallback: bool) -> Dict[str, Any]:
         model = cog.api_service._instantiate_model(
             model_name, None, user_id, None, DEFAULT_SAFETY_SETTINGS,
-            resolve_thinking_params(None, "utility"), config_owner_id=user_id)
+            resolve_thinking_params(settings, "generator", "fallback" if is_fallback else "primary"),
+            profile_settings=settings, config_owner_id=user_id)
         response = await model.generate_content_async(
             contents, generation_config={"temperature": temperature})
         if not response or not response.candidates:

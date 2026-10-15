@@ -330,7 +330,7 @@ class ToolsService:
                 # Resolved inside the attempt so the retry gets the fallback slot's own
                 # effort rather than the primary's.
                 t_params = resolve_thinking_params(
-                    p_config, "critic", "fallback" if is_fallback else "primary")
+                    p_config, "critic", "fallback" if is_fallback else "primary", cog=self.cog)
                 model = self.cog.api_service._instantiate_model(
                     model_name, guild_id, None, system_instruction, None, t_params, None, p_config,
                     config_owner_id=config_owner_id)
@@ -433,7 +433,8 @@ class ToolsService:
         """
         return self.cog.api_service._instantiate_model(
             name, guild_id, owner_id, instruction, safety_settings,
-            resolve_thinking_params(p_cfg, "grounding", "fallback" if is_fallback else "primary"),
+            resolve_thinking_params(p_cfg, "grounding", "fallback" if is_fallback else "primary",
+                                    cog=self.cog),
             [_GOOGLE_SEARCH_TOOL], p_cfg, config_owner_id=owner_id, **(policy or {}))
 
     async def _get_hybrid_grounding_context(self, user_query: str, guild_id: int, conversation_history: List, p_cfg: Optional[Dict[str, Any]], owner_id: Optional[int], safety_settings: Optional[Dict] = None, is_for_image: bool = False, warning_channel: Optional[discord.abc.Messageable] = None) -> Optional[Tuple[str, List[Dict], bool, Optional[str]]]:

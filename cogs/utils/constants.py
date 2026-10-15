@@ -228,13 +228,14 @@ VOICE_SAMPLE_TYPES = {
 PRIMARY_MODEL_NAME = 'GOOGLE/gemini-3.5-flash-lite'
 FALLBACK_MODEL_NAME = 'GOOGLE/gemini-3.1-flash-lite'
 
-#: The critic's and the LTM summariser's shipped Primary on Google, ahead of
-#: FALLBACK_MODEL_NAME: the cheaper of the two first, for passes that run unattended on
-#: every round or every few messages. Also the cross-provider fallback compaction and the
-#: Director put behind Ling for anyone who prefers OpenRouter -- `user_defaults` takes the
-#: first Google model a category ships. A value, not an alias, for the reason
-#: GROUNDING_RESEARCHER_MODEL gives.
-UTILITY_MODEL = 'GOOGLE/gemini-2.5-flash-lite'
+#: The critic's, the LTM summariser's and the attachment describer's shipped pair on Google:
+#: the cheaper of the two first, for passes that run unattended on every round or every few
+#: messages. Both take a thinking level. The Primary is also the cross-provider fallback
+#: compaction and the Director put behind Ling for anyone who prefers OpenRouter --
+#: `user_defaults` takes the first Google model a category ships. Values, not aliases, for
+#: the reason GROUNDING_RESEARCHER_MODEL gives.
+UTILITY_MODEL = 'GOOGLE/gemini-3.1-flash-lite'
+UTILITY_FALLBACK_MODEL = 'GOOGLE/gemini-3.5-flash-lite'
 
 #: Every model category runs Primary -> Fallback, on the user's preferred provider where
 #: it ships two. Google ships the table below; OpenRouter ships OPENROUTER_SHIPPED_MODELS.
@@ -520,14 +521,30 @@ THINKING_BUDGET_MAX = defaultConfig.LIMIT_OUTPUT_TOKENS - 4096
 #:
 #: `utility` has no keys in THINKING_SLOT_KEYS and cannot be configured. It is for the
 #: one-shot internal generations with no profile slot to hang a setting off: the rolling
-#: synopsis, the Director's Note, the profile generator.
+#: synopsis, the Director's Note. The System Models categories below it are /mod's to set
+#: (SYSTEM_THINKING_SLOTS); the classifier's verdict decides who may see a profile, so it
+#: thinks harder than a transcription does.
 THINKING_SLOT_DEFAULTS = {
-    'response':  {'level': 'high', 'budget': -1},
-    'grounding': {'level': 'low',  'budget': 512},
-    'critic':    {'level': 'low',  'budget': 512},
-    'ltm':       {'level': 'low',  'budget': 512},
-    'utility':   {'level': 'low',  'budget': 512},
+    'response':   {'level': 'high',   'budget': -1},
+    'grounding':  {'level': 'low',    'budget': 512},
+    'critic':     {'level': 'low',    'budget': 512},
+    'ltm':        {'level': 'low',    'budget': 512},
+    'utility':    {'level': 'low',    'budget': 512},
+    'describer':  {'level': 'low',    'budget': 512},
+    'classifier': {'level': 'medium', 'budget': -1},
+    'generator':  {'level': 'low',    'budget': 512},
 }
+
+#: The System Models categories that take thinking, each set in `/mod` as a profile sets its
+#: response slot: under that slot's keys, in the category's own settings
+#: (`helpers.system_settings`). Not in THINKING_SLOT_KEYS, which is what a profile holds --
+#: and so what Override Defaults may default.
+SYSTEM_THINKING_SLOTS = ('describer', 'classifier', 'generator')
+
+#: Each profile slot's Primary model key, for the MimicAI Auto tier the slot runs on
+#: (`helpers.auto_thinking`).
+THINKING_SLOT_MODELS = {'response': 'primary_model', 'grounding': 'grounding_rag_model',
+                        'critic': 'critic_model', 'ltm': 'ltm_model'}
 
 #: How each slot reads, and the order it is offered in. Matches
 #: `ModelPickerMixin._CATEGORY_LABELS` where they overlap: one taxonomy, not two.
@@ -941,26 +958,22 @@ UNREADABLE_MEDIA_VALUES = frozenset(v for v, _l, _d in UNREADABLE_MEDIA_MODES)
 #: The floor, and what a profile that has never been configured does.
 UNREADABLE_MEDIA_DEFAULT = 'off'
 
-#: Who describes an attachment in `simulated`, on the `utility` thinking slot: a one-shot
-#: internal pass with no character in it to configure. Transcription, not judgement, so
-#: models costing a fraction of the reply's. The three below are the OpenRouter
-#: preference's chain; SYSTEM_MODEL_DEFAULTS_BY_PROVIDER holds both, and `/mod` overrides.
+#: Who describes an attachment in `simulated`: a one-shot internal pass with no character in
+#: it to configure, on the `describer` thinking slot. Transcription, not judgement, so
+#: models costing a fraction of the reply's. The two below are the OpenRouter preference's
+#: chain; SYSTEM_MODEL_DEFAULTS_BY_PROVIDER holds both sides', and `/mod` overrides.
 #:
-#: Each chain ends on the other provider on purpose. The last answers when there is no key
-#: for the first two, and when they will not describe a file it may: Google's safety
-#: settings are the ones `_resolve_safety_settings` stands down in an age-restricted
-#: channel. With neither key the profile falls to `off`, which is a complete behaviour
-#: rather than an error.
+#: A chain stays on its own provider, as a profile's does: with no key for it, or neither
+#: model describing the file, the profile falls to `off`, which is a complete behaviour
+#: rather than an error. Cover on the other provider is a Fallback `/mod` sets there.
 #:
-#: Neither OpenRouter model hears audio (ling reads images and video), so a voice message
-#: is described by the chain's Google model.
+#: ling reads images and video, not audio, so a voice message on OpenRouter's chain is the
+#: free router's to place.
 MEDIA_DESCRIBER_MODEL = 'OPENROUTER/inclusionai/ling-3.0-flash-vl'
 
 #: OpenRouter's own router over its free models: costs nothing, and picks a model able to
 #: read the request. Its limits are the key owner's account, not the bot's.
 OPENROUTER_FREE_ROUTER = 'OPENROUTER/openrouter/free'
-
-MEDIA_DESCRIBER_FALLBACK = 'GOOGLE/gemini-2.5-flash-lite'
 
 #: What a pasted Gemini key is checked against, over raw REST: the first answers whether
 #: the key works at all, the second whether it has billing -- an unbilled key is refused
@@ -968,10 +981,11 @@ MEDIA_DESCRIBER_FALLBACK = 'GOOGLE/gemini-2.5-flash-lite'
 KEY_CHECK_MODEL = 'GOOGLE/gemini-flash-lite-latest'
 KEY_TIER_PROBE_MODEL = 'GOOGLE/gemini-3.1-flash-image'
 
-#: What a system profile -- MimicGuide -- is created with, for Primary and Fallback. Its
-#: models then live on that profile, which `/mod` -> System Models edits, as it does every
-#: System profile's.
-SYSTEM_PROFILE_MODEL = 'GOOGLE/gemini-2.5-flash-lite'
+#: What a system profile -- MimicGuide -- is created with, Primary then Fallback. Its models
+#: then live on that profile, which `/mod` -> System Models edits, as it does every System
+#: profile's.
+SYSTEM_PROFILE_MODEL = 'GOOGLE/gemini-3.1-flash-lite'
+SYSTEM_PROFILE_FALLBACK_MODEL = 'GOOGLE/gemini-3.5-flash-lite'
 
 #: The models no profile chooses, as `/mod` -> Prompts -> System Models may override them:
 #: key -> shipped value. Stored sparse in SYSTEM_MODELS_FILE_PATH, so an override is the
@@ -985,18 +999,21 @@ SYSTEM_MODEL_DEFAULTS = {
 }
 
 #: The describer's and the classifier's chains, which ship -- and are overridden, under the
-#: provider's name in the file -- per provider preference: the preferred side's two, then
-#: the other's as the Final Fallback, so a file is still read where only the other side
-#: holds a key. The classifier ships the describer's chain: both read one file -- an
-#: avatar, an attachment -- and answer in a line. Google's second is FALLBACK_MODEL_NAME,
-#: which hears audio as the first does.
+#: provider's name in the file -- per provider preference: a Primary and a Fallback on the
+#: preferred side. The classifier ships the describer's chain: both read one file -- an
+#: avatar, an attachment -- and answer in a line -- bar Google's, where the classifier ships
+#: its own pair. The describer's Google pair is the utility one, which hears audio.
 _MEDIA_READER_CHAINS = {
-    'gemini': (MEDIA_DESCRIBER_FALLBACK, FALLBACK_MODEL_NAME, MEDIA_DESCRIBER_MODEL),
-    'openrouter': (MEDIA_DESCRIBER_MODEL, OPENROUTER_FREE_ROUTER, MEDIA_DESCRIBER_FALLBACK),
+    'gemini': (UTILITY_MODEL, UTILITY_FALLBACK_MODEL),
+    'openrouter': (MEDIA_DESCRIBER_MODEL, OPENROUTER_FREE_ROUTER),
 }
-#: Each reader's slots, Primary then Fallback then Final Fallback.
-DESCRIBER_KEYS = ('describer_model', 'describer_fallback_model', 'describer_final_model')
-CLASSIFIER_KEYS = ('classifier_model', 'classifier_fallback_model', 'classifier_final_model')
+#: The classifier's verdict decides who may see a profile, so on Google it judges on a
+#: steadier pair than a transcription needs, both taking the thinking level it ships.
+_CLASSIFIER_CHAINS = {**_MEDIA_READER_CHAINS,
+                      'gemini': ('GOOGLE/gemini-3.5-flash-lite', 'GOOGLE/gemini-3-flash-preview')}
+#: Each reader's slots, Primary then Fallback.
+DESCRIBER_KEYS = ('describer_model', 'describer_fallback_model')
+CLASSIFIER_KEYS = ('classifier_model', 'classifier_fallback_model')
 #: The profile generator's Primary and Fallback -- `/profile generate`, and a card's sorting
 #: on `/import` -- under the user's own Override Defaults. `generator_models`.
 _GENERATOR_CHAINS = {
@@ -1005,7 +1022,7 @@ _GENERATOR_CHAINS = {
 }
 GENERATOR_KEYS = ('generator_model', 'generator_fallback_model')
 SYSTEM_MODEL_DEFAULTS_BY_PROVIDER = {
-    provider: {**dict(zip(DESCRIBER_KEYS, chain)), **dict(zip(CLASSIFIER_KEYS, chain)),
+    provider: {**dict(zip(DESCRIBER_KEYS, chain)), **dict(zip(CLASSIFIER_KEYS, _CLASSIFIER_CHAINS[provider])),
                **dict(zip(GENERATOR_KEYS, _GENERATOR_CHAINS[provider]))}
     for provider, chain in _MEDIA_READER_CHAINS.items()
 }
@@ -1049,11 +1066,15 @@ AUTO_DEFAULT = AUTO_MODEL_PREFIX + 'free'
 #: with models of its own per tier, since grounding's must search.
 AUTO_SLOT_PAIRS = {'primary_model': 'fallback_model',
                    **{key: UTILITY_FALLBACK_KEYS[key] for key in ('grounding_rag_model', 'critic_model', 'ltm_model')}}
+_AUTO_STEMS = dict(zip(AUTO_SLOT_PAIRS, ('', 'grounding_', 'critic_', 'ltm_')))
 #: (tier, slot) -> its System Models keys, Primary then Fallback. Response keeps the bare
 #: `auto_<tier>_model` it shipped with.
 AUTO_TIER_KEYS = {(tier, slot): (f'auto_{tier}_{stem}model', f'auto_{tier}_{stem}fallback_model')
-                  for tier, _wording, _desc in AUTO_TIERS
-                  for slot, stem in zip(AUTO_SLOT_PAIRS, ('', 'grounding_', 'critic_', 'ltm_'))}
+                  for tier, _wording, _desc in AUTO_TIERS for slot, stem in _AUTO_STEMS.items()}
+#: (tier, slot) -> its `/mod` tab, under whose name the file keeps the thinking that tab
+#: sets for every profile on it (`helpers.auto_thinking`).
+AUTO_TIER_TABS = {(tier, slot): f'auto_{tier}_{stem}'.rstrip('_')
+                  for tier, _wording, _desc in AUTO_TIERS for slot, stem in _AUTO_STEMS.items()}
 #: Free ships OpenRouter's free router alone, not the shipped Primary, which costs -- bar
 #: grounding, on its shipped researcher: the router picks any model, and one that never calls
 #: the search answers anyway. Budget and Recommended ship unset, and a tier with no Primary is

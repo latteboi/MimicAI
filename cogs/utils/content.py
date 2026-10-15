@@ -434,10 +434,10 @@ HELP_CATEGORIES = {
             "neither can, the attachment is left out and the character is told the filename and that it cannot read it -- it replies to "
             "what you wrote rather than falling silent for the round, and a note under the reply says the attachment was not read.\n\n"
             "**Simulated vision** (`/profile manage` -> **Params** -> Unreadable Attachments) changes what it is told. On `Simulated`, a "
-            "cheap model reads the file first -- Ling 3.0 Flash VL on OpenRouter, then OpenRouter's free router, "
-            "falling back to Gemini 2.5 Flash Lite, which also hears audio -- and its "
+            "cheap model on the profile owner's provider reads the file first -- Ling 3.0 Flash VL, then OpenRouter's free router, on "
+            "OpenRouter; Gemini 3.1 Flash-Lite, then 3.5 Flash-Lite, which also hear audio, on Google -- and its "
             "description goes into that profile's prompt only, so a text-only character can still discuss the picture while nobody else at "
-            "the table sees the description. One call per round however many characters need it. With a key for neither provider it "
+            "the table sees the description. One call per round however many characters need it. With no key for that provider it "
             "behaves as `Off`."
         ),
         "Anti-Repetition Critic": (
@@ -898,7 +898,7 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'Global Chat says my profile cannot be used.' Fix: Global Chat needs a rating of General, or an operator Exemption; publishing to the Public Library is not required and is not a substitute. Unrated profiles must be submitted first; Adult profiles cannot be used there at all, because a Global Chat can be opened in any channel and none of them is guaranteed age-restricted.\n"
         "- Symptom: 'My profile used to be published and now it is not.' Fix: The bot operator reset every content rating on this instance to establish a clean baseline, because ratings reached automatically by older builds were never something the owner asked for. Submit the profile again from Content Safety and re-publish it.\n"
         "- Symptom: 'Adult profile is silent or throwing errors.' Fix: Adult profiles are blocked in standard channels. Set the channel to Age-Restricted (NSFW) in Discord's settings.\n"
-        "- Symptom: 'Content Rating is stuck on Pending.' Fix: Classification needs an OpenRouter or Google API key -- your own, or the bot operator's. Without one no verdict can be reached. Check `/settings`.\n"
+        "- Symptom: 'Content Rating is stuck on Pending.' Fix: Classification runs on your own OpenRouter or Google API key, never the bot operator's. Without one no verdict can be reached. Check `/settings`.\n"
         "- Symptom: 'The Declare Adult 18+ action is missing.' Fix: It is hidden for borrowed profiles, for published profiles, and while a classifier Adult verdict or an operator Exemption stands. Unpublish the profile first, or edit the original if it is borrowed.\n"
         "- Symptom: 'Publishing failed with a URL or avatar error.' Fix: That check is gone. Publishing no longer downloads anything; it reads the rating you already hold."
     ),
@@ -1258,7 +1258,7 @@ DEFAULT_HELP_DOCS = {
         "Audio & Video: Capable models can process direct audio and video files.\n"
         "File size: Nothing over 25 MB is downloaded -- not an image, audio, video or text attachment, a reference picture for !image, or a `.mimic` import. The character is told a larger attachment was sent and not read, and a larger import is refused. Media is billed by its length, so the limit bounds what one file can cost as well as the memory it takes.\n"
         "Text-only models: Many OpenRouter models cannot read attachments at all. The profile's fallback model is tried first, and answers if it can read the file. If neither model can, the attachment is dropped and the character is told the filename and that it cannot read it, so it answers the message instead of failing the turn; a note under the reply says so.\n"
-        "Unreadable Attachments (`/profile manage` -> Params -> Unreadable Attachments): what that character is told. `Off` (the default) names the file and nothing more, and costs nothing. `Simulated` has gemini-2.5-flash-lite read the file at high resolution first and writes the description into that profile's prompt alone -- other participants never see it, exactly as with grounding and URL context. One describe call per round, shared by every character that needs it, and it requires a Google key: without one, or if the description is refused, the profile behaves as `Off`.\n"
+        "Unreadable Attachments (`/profile manage` -> Params -> Unreadable Attachments): what that character is told. `Off` (the default) names the file and nothing more, and costs nothing. `Simulated` has a cheap model on the profile owner's provider read the file at high resolution first -- Gemini 3.1 Flash-Lite then 3.5 Flash-Lite on Google, Ling 3.0 Flash VL then OpenRouter's free router on OpenRouter -- and writes the description into that profile's prompt alone -- other participants never see it, exactly as with grounding and URL context. One describe call per round, shared by every character that needs it, and it requires a key for that provider: without one, or if the description is refused, the profile behaves as `Off`.\n"
         "Media Input Resolution: `/profile manage` -> Params -> Set Media Input Resolution controls how many tokens the model spends reading an image or PDF you send. On Gemini 3 that is roughly 280 (Low), 560 (Medium), 1120 (High, the model default) and 2240 (Ultra High) tokens per image, charged per attachment per participant per round. This is the opposite direction from the image size under Set Image Output, which is what an image model draws. Google honours it exactly; OpenRouter maps it onto the nearest of its two `detail` steps.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Unsupported File Format.' Fix: The profile's model cannot read that media type. Switch to a vision-capable model, or omit the attachment.\n"
