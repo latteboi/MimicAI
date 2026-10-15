@@ -49,8 +49,9 @@ import discord
 from discord import ui
 
 from .base_components import BlockedGuard, add_button, add_select
-from ..services.games import eights
+from ..services.games import dice, eights
 from ..services.games.eights import COLOURS, Card, Move
+from ..services.games.table import NAMES
 
 if TYPE_CHECKING:
     from ..MimicCog import MimicCog
@@ -157,7 +158,7 @@ def build_lobby_embed(cog: "MimicCog", lobby: "Lobby") -> discord.Embed:
     free = max(0, lobby.limit - len(lobby.humans))
 
     embed = discord.Embed(
-        title="Mimic Eights — table forming",
+        title=f"{NAMES[lobby.kind]} — table forming",
         colour=0x217D47 if lobby.open else 0x2B2F36,
     )
     if free:
@@ -447,6 +448,9 @@ class HandView(BlockedGuard, ui.View):
 
     # -- helpers -------------------------------------------------------------------
 
+    def build_embed(self) -> discord.Embed:
+        return build_hand_embed(self.game, self.seat_id)
+
     def _rebind(self, interaction: discord.Interaction, view=None) -> None:
         """Hand the service the freshest token for this panel, and the view now on it.
 
@@ -469,9 +473,9 @@ class HandView(BlockedGuard, ui.View):
             await interaction.response.edit_message(
                 content="That game has finished.", embed=None, view=None)
             return
-        view = HandView(self.cog, self.game, self.seat_id,
-                        colour_filter=self.colour_filter)
-        embed = build_hand_embed(self.game, self.seat_id)
+        view = type(self)(self.cog, self.game, self.seat_id,
+                          colour_filter=self.colour_filter)
+        embed = view.build_embed()
         await interaction.response.edit_message(content=note, embed=embed, view=view)
         self._rebind(interaction, view)
 
@@ -535,6 +539,116 @@ class HandView(BlockedGuard, ui.View):
         await self.redraw(interaction)
 
 
+# --------------------------------------------------------------------------- dice
+
+def build_cup_embed(game: "Game", seat_id: str) -> discord.Embed:
+    """A seat's own dice, and how many of them count toward each face it could bid."""
+    state = game.state
+    held = state.seat(seat_id).hand
+    wild = state.rules.ones_wild
+
+    def name(sid) -> str:
+        seat = game.seat(sid) if sid else None
+        return seat.display if seat else "someone"
+
+    embed = discord.Embed(
+        title=f"Your cup — {len(held)} {'die' if len(held) == 1 else 'dice'}",
+        colour=0x6B4FA0,
+        description=(f"## {' '.join(dice.GLYPHS[d - 1] for d in held)}\n"
+                     f"{' · '.join(map(str, held))}") if held else "You are out of dice.",
+    )
+    if held:
+        counts = " · ".join(
+            f"{dice.PLURAL[f]} **{sum(dice.matches(d, f, wild) for d in held)}**"
+            for f in dice.biddable_faces(state.rules))
+        embed.add_field(name="Toward a bid" + (", ones counting as wild" if wild else ""),
+                        value=counts, inline=False)
+    bid = (f"{dice.bid_text(*state.bid)} — {name(state.bidder)}" if state.bid
+           else "none yet")
+    embed.add_field(name="Bid", value=bid, inline=True)
+    embed.add_field(name="Dice in play", value=str(state.dice_in_play), inline=True)
+
+    if state.phase == "playing" and held:
+        embed.set_footer(text="Not your turn yet." if state.current.seat_id != seat_id
+                         else "Your turn — open the bidding." if state.bid is None
+                         else "Your turn — raise the bid, or call Liar.")
+    return embed
+
+
+class FaceChoiceView(BlockedGuard, ui.View):
+    """Second step of a bid: the faces the chosen quantity allows. Swapped onto the panel,
+    as `ColourChoiceView` is for a wild."""
+
+    def __init__(self, hand_view: "DiceView", quantity: int, faces: List[int]):
+        super().__init__(timeout=None)
+        self.hand_view = hand_view
+        # Five buttons to a row, and without ones wild there are six faces.
+        for i, face in enumerate(faces):
+            add_button(self, f"{dice.GLYPHS[face - 1]} {dice.bid_text(quantity, face)}",
+                       self._make_callback(quantity, face),
+                       style=discord.ButtonStyle.secondary, row=i // 5)
+        add_button(self, "Back", self._on_back, style=discord.ButtonStyle.secondary, row=2)
+
+    def _make_callback(self, quantity: int, face: int):
+        async def callback(interaction: discord.Interaction):
+            await self.hand_view.submit(interaction, dice.Move("bid", quantity, face))
+        return callback
+
+    async def _on_back(self, interaction: discord.Interaction) -> None:
+        await self.hand_view.redraw(interaction)
+
+
+class DiceView(HandView):
+    """A seat's cup and its two moves: raise the bid, or call Liar.
+
+    A bid is a quantity and a face -- up to thirty by six, far past a select's 25 options
+    -- so it takes two clicks, as a wild does: the select lists the legal quantities, and
+    `FaceChoiceView` offers the faces that quantity allows. Quantities run unbroken from
+    the lowest legal one, so cutting the list at 25 only drops jumps of 25 dice or more.
+    Everything else -- `submit`, `redraw`, the panel binding -- is `HandView`'s.
+    """
+
+    def build_embed(self) -> discord.Embed:
+        return build_cup_embed(self.game, self.seat_id)
+
+    def _build(self) -> None:
+        state = self.game.state
+        legal = dice.legal_moves(state, self.seat_id)
+        quantities = sorted({m.quantity for m in legal if m.kind == "bid"})
+        if quantities:
+            add_select(self, [discord.SelectOption(label=f"{q} {'die' if q == 1 else 'dice'}",
+                                                   value=str(q))
+                              for q in quantities[:MAX_SELECT_OPTIONS]],
+                       self._on_pick_quantity, placeholder="Raise the bid — how many?",
+                       row=0)
+        add_button(self, "Liar!", self._on_liar, style=discord.ButtonStyle.danger, row=1,
+                   disabled=not any(m.kind == "liar" for m in legal))
+        add_button(self, "Refresh", self._on_refresh, style=discord.ButtonStyle.secondary,
+                   row=1, emoji="🔄")
+
+    async def _on_pick_quantity(self, interaction: discord.Interaction) -> None:
+        quantity = int(interaction.data["values"][0])
+        faces = [m.face for m in dice.legal_moves(self.game.state, self.seat_id)
+                 if m.kind == "bid" and m.quantity == quantity]
+        if not faces:
+            await self.redraw(interaction, note="That bid is no longer available — "
+                                                "the turn has moved on.")
+            return
+        faces_view = FaceChoiceView(self, quantity, faces)
+        await interaction.response.edit_message(
+            content=f"Bid {quantity} of which face?", view=faces_view)
+        self._rebind(interaction, faces_view)
+
+    async def _on_liar(self, interaction: discord.Interaction) -> None:
+        await self.submit(interaction, dice.Move("liar"))
+
+
+def panel_for(cog: "MimicCog", game: "Game", seat_id: str):
+    """`(embed, view)` for a seat's private panel at whichever game it is sitting."""
+    view = (DiceView if game.kind == "dice" else HandView)(cog, game, seat_id)
+    return view.build_embed(), view
+
+
 # --------------------------------------------------------------------------- table
 
 class TableView(BlockedGuard, ui.View):
@@ -545,10 +659,12 @@ class TableView(BlockedGuard, ui.View):
     own cards, and neither can see anyone else's.
     """
 
-    def __init__(self, cog: "MimicCog", channel_id: int):
+    def __init__(self, cog: "MimicCog", channel_id: int, kind: str = "eights"):
         super().__init__(timeout=None)
         self.cog = cog
         self.channel_id = channel_id
+        if kind == "dice":
+            self.open_hand.label, self.open_hand.emoji = "Your dice", "🎲"
 
     @ui.button(label="Your hand", emoji="🃏", style=discord.ButtonStyle.primary)
     async def open_hand(self, interaction: discord.Interaction, _button: ui.Button):
@@ -569,7 +685,6 @@ class TableView(BlockedGuard, ui.View):
         # path that still sends -- and it closes the previous panel first, which is what
         # keeps the invariant at one open panel per seat however often it is pressed.
         await self.cog.game_service.close_panel(game, seat_id)
-        view = HandView(self.cog, game, seat_id)
-        await interaction.response.send_message(
-            embed=build_hand_embed(game, seat_id), view=view, ephemeral=True)
+        embed, view = panel_for(self.cog, game, seat_id)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         self.cog.game_service.bind_panel(game, seat_id, interaction, view=view)

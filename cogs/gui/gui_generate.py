@@ -53,7 +53,8 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
 
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str,
                  concept: str, draft: Dict[str, Any], model_used: str,
-                 appearance: Optional[Dict[str, Any]] = None, card: Optional[Dict[str, Any]] = None):
+                 appearance: Optional[Dict[str, Any]] = None, card: Optional[Dict[str, Any]] = None,
+                 image: Optional[Dict[str, str]] = None):
         # Ten minutes, inside the fifteen an interaction token lasts, so the expiry
         # notice can still be written onto the message.
         super().__init__(timeout=600)
@@ -68,6 +69,8 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         #: The card being imported (`character_card.read_card`), or None for a concept.
         self.card = card
         self.template_key = "CARD_IMPORT" if card else "PROFILE_GENERATOR"
+        #: The image drafted from (`generate_draft`'s part), shown again to every redraft.
+        self.image = image
         if card:
             self.timeout_message = "This draft expired, and nothing was saved. Run `/import` again."
         self.draft = {**draft, **self.appearance}
@@ -162,7 +165,7 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             draft, self.model_used = await generate_draft(
                 self.cog, self.user_id, self.concept,
                 previous=self.draft if request else None, request=request,
-                template_key=self.template_key)
+                template_key=self.template_key, image=self.image)
             self.draft = {**draft, **self.appearance}
         except ProfileGenerationError as e:
             failure = suppress_link_previews(str(e))

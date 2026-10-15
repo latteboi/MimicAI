@@ -32,8 +32,8 @@ the multi-profile worker owns the round that follows, which is what gives a reac
 the same instructions, training, LTM, critic, placeholder and typing indicator as any
 other reply -- and what stops it talking over a round the channel was already running.
 
-**A hand never leaves this module.** `eights.private_view` is called here and nowhere
-else, and what it returns goes to `policy.choose` and to the seat's own ephemeral
+**A hand never leaves this module.** A game's `private_view` is called here and nowhere
+else, and what it returns goes to its policy's `choose` and to the seat's own ephemeral
 message. It is never put in a prompt, never logged, and never rendered into the shared
 status embed or `<game_context>`, both of which are built from `public_view` alone.
 """
@@ -43,11 +43,13 @@ import random
 import time
 import traceback
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 import discord
 
 from ..utils.constants import (
+    DEFAULT_DICE_BRIEFING, DEFAULT_DICE_OPENING_LIVE, DEFAULT_DICE_OPENING_OVER,
+    DEFAULT_EIGHTS_BRIEFING,
     DEFAULT_GAME_CONTEXT, DEFAULT_GAME_FINALE_USER, DEFAULT_GAME_OPENING_LIVE,
     DEFAULT_GAME_OPENING_OVER, DEFAULT_GAME_REACTION_USER, GAME_BEAT_STALE_SECONDS,
     GAME_EMBED_MIN_INTERVAL_SECONDS,
@@ -57,9 +59,10 @@ from ..utils.constants import (
     GAME_TURN_PACE_SECONDS, GAME_LAST_CALL_WORDS,
 )
 from .games import ledger as ledger_mod, neuro, policy, eights
+from .games import dice, dice_narration, dice_policy
 #: Re-exported: the dataclasses moved to games/table.py, but `from .game_service
 #: import Game, Lobby` is what gui_games and the channel listener already say.
-from .games.table import Game, Lobby, Panel, Seat
+from .games.table import NAMES, Game, Lobby, Panel, Seat
 from .games import narration, table_view
 from .games._shared import Event, Ev, IllegalMove
 from .games.neuro import PRESETS, Temperament
@@ -72,6 +75,33 @@ TURN_TICK_SECONDS = 5.0
 
 
 card_label = table_view.card_label
+
+
+class _Kit(NamedTuple):
+    """One game's pure modules, and the prompt text that frames it.
+
+    Each game is a rules module (`new_game`, `apply`, `private_view`), a policy
+    (`choose`), a narration module (`describe_*`, `beat_for`, `finale_beat`,
+    `result_line`, `is_dramatic`) and a ledger class, all with the same surface. The
+    loop below is written against that surface, so this is the one place that knows
+    which game is which.
+    """
+
+    rules: Any
+    policy: Any
+    narration: Any
+    ledger: Any
+    opening_live: str
+    opening_over: str
+    briefing: str
+
+
+_KITS = {
+    "eights": _Kit(eights, policy, narration, ledger_mod.Ledger, DEFAULT_GAME_OPENING_LIVE,
+                   DEFAULT_GAME_OPENING_OVER, DEFAULT_EIGHTS_BRIEFING),
+    "dice": _Kit(dice, dice_policy, dice_narration, dice_narration.DiceLedger,
+                 DEFAULT_DICE_OPENING_LIVE, DEFAULT_DICE_OPENING_OVER, DEFAULT_DICE_BRIEFING),
+}
 
 
 
@@ -216,8 +246,9 @@ class GameService:
         self,
         interaction: discord.Interaction,
         seats_wanted: Optional[int] = None,
-        rules: Optional[RuleSet] = None,
+        rules: Optional[Any] = None,
         join: bool = True,
+        kind: str = "eights",
     ) -> Optional[str]:
         """Post a table that has not been dealt yet. Returns an error string, or None.
 
@@ -229,14 +260,9 @@ class GameService:
         from ..gui.gui_games import LobbyView, build_lobby_embed
 
         channel_id = interaction.channel_id
-        blocked = self._table_blocked(channel_id)
-        if blocked:
-            return blocked
-
-        session = self.cog.multi_profile_channels.get(channel_id)
-        if not session or session.get("type") != "multi":
-            return ("There is no active session in this channel. Use `/session config` "
-                    "to build a cast first — the table is drawn from it.")
+        refusal = self.lobby_refusal(channel_id)
+        if refusal:
+            return refusal
 
         lobby = Lobby(
             channel_id=channel_id,
@@ -244,6 +270,7 @@ class GameService:
             host_id=interaction.user.id,
             rules=rules if rules is not None else RuleSet(),
             seats_wanted=seats_wanted,
+            kind=kind,
         )
         if join:
             lobby.humans[interaction.user.id] = getattr(
@@ -259,6 +286,20 @@ class GameService:
         except discord.HTTPException:
             self.cog.pending_lobbies.pop(channel_id, None)
             return "I could not post the table in this channel."
+        return None
+
+    def lobby_refusal(self, channel_id: Optional[int]) -> Optional[str]:
+        """Why `/play` would refuse to open a table here, or None.
+
+        Two dict lookups, so `cooldown_unless_refused` can ask it on every call.
+        """
+        blocked = self._table_blocked(channel_id)
+        if blocked:
+            return blocked
+        session = self.cog.multi_profile_channels.get(channel_id)
+        if not session or session.get("type") != "multi":
+            return ("There is no active session in this channel. Use `/session config` "
+                    "to build a cast first — the table is drawn from it.")
         return None
 
     def roster_preview(self, lobby: Lobby) -> List[Seat]:
@@ -295,15 +336,15 @@ class GameService:
         seats.extend(self._build_roster(session, lobby.limit - len(seats)))
 
         if len(seats) < 2:
-            return ("Mimic Eights needs at least two players. Sit down, unlock the table "
-                    "so others can, or add profiles with `/session config`.")
+            return (f"{NAMES[lobby.kind]} needs at least two players. Sit down, unlock "
+                    "the table so others can, or add profiles with `/session config`.")
 
         self.cog.pending_lobbies.pop(lobby.channel_id, None)
         return self._deal(lobby.channel_id, lobby.guild_id, lobby.host_id,
-                          seats, lobby.rules)
+                          seats, lobby.rules, lobby.kind)
 
     def _deal(self, channel_id: int, guild_id: Optional[int], host_id: int,
-              seats: List[Seat], ruleset: RuleSet) -> Optional[str]:
+              seats: List[Seat], ruleset: Any, kind: str = "eights") -> Optional[str]:
         """Turn a settled seat list into a running game."""
         states, temperaments = {}, {}
         for seat in seats:
@@ -318,15 +359,16 @@ class GameService:
             states[seat.seat_id] = state
             temperaments[seat.seat_id] = temperament
 
+        kit = _KITS[kind]
         seed = random.randrange(1 << 30)
-        state = eights.new_game(
+        state = kit.rules.new_game(
             [s.seat_id for s in seats], rules=ruleset, seed=seed,
             kinds={s.seat_id: s.kind for s in seats},
         )
 
         game = Game(
-            kind="eights", state=state, seats=seats, neuro=states,
-            ledger=ledger_mod.Ledger([s.seat_id for s in seats]),
+            kind=kind, state=state, seats=seats, neuro=states,
+            ledger=kit.ledger([s.seat_id for s in seats]),
             temperaments=temperaments, channel_id=channel_id,
             guild_id=guild_id, started_by=host_id,
             rng=random.Random(seed ^ 0x5EED),
@@ -398,19 +440,19 @@ class GameService:
         game = self.cog.active_games.get(channel_id)
         if not game or game.stopping:
             return self._epilogue_block(channel_id)
-        table = narration.describe_table(game)
+        kit = _KITS[game.kind]
+        table = kit.narration.describe_table(game)
         over = game.state.phase != "playing"
         if over:
-            winner = game.seat(game.state.winner) if game.state.winner else None
-            table += (f" The game is over -- {winner.display} went out and won."
-                      if winner else " The game has ended with no winner.")
+            table += " " + kit.narration.result_line(game)
         return DEFAULT_GAME_CONTEXT.format(
-            opening=DEFAULT_GAME_OPENING_OVER if over else DEFAULT_GAME_OPENING_LIVE,
+            opening=kit.opening_over if over else kit.opening_live,
             table=table,
-            cast=narration.describe_cast(game),
-            ledger=narration.describe_ledger(game),
+            cast=kit.narration.describe_cast(game),
+            ledger=kit.narration.describe_ledger(game),
             events="\n".join(f"- {line}" for line in game.recent) or "- Nothing yet.",
-            rules=narration.describe_rules(game),
+            rules=kit.narration.describe_rules(game),
+            briefing=kit.briefing,
         )
 
     def _epilogue_block(self, channel_id: int) -> Optional[str]:
@@ -474,10 +516,10 @@ class GameService:
         if not panel or not panel.pushable or game.state.phase != "playing":
             return
         try:
-            from ..gui.gui_games import HandView, build_hand_embed
-            view = HandView(self.cog, game, seat_id)
+            from ..gui.gui_games import panel_for
+            embed, view = panel_for(self.cog, game, seat_id)
             await panel.interaction.edit_original_response(
-                content=None, embed=build_hand_embed(game, seat_id), view=view)
+                content=None, embed=embed, view=view)
             if panel.view is not None and panel.view is not view:
                 try:
                     panel.view.stop()
@@ -626,6 +668,7 @@ class GameService:
         game: Optional[Game] = self.cog.active_games.get(channel_id)
         if not game:
             return
+        kit = _KITS[game.kind]
 
         try:
             await self._render(game, force=True)
@@ -642,24 +685,25 @@ class GameService:
                     move, extra = await self._await_human_move(game, seat)
                 else:
                     await asyncio.sleep(GAME_TURN_PACE_SECONDS)
-                    move, extra = policy.choose(
-                        eights.private_view(game.state, seat_id), game.neuro[seat_id],
+                    move, extra = kit.policy.choose(
+                        kit.rules.private_view(game.state, seat_id), game.neuro[seat_id],
                         game.temperaments[seat_id], game.rng), []
 
                 try:
-                    _, events = eights.apply(game.state, move)
+                    _, events = kit.rules.apply(game.state, move)
                 except IllegalMove:
                     # A submitted move that no longer fits the board. The turn cannot
                     # be skipped without stalling the table, so fall back to the
                     # policy's pick rather than dropping it. The call rides across:
                     # a player who shouted Last Card should not lose it because the board
                     # moved under the card they picked.
-                    called = move.call_last
-                    move = policy.choose(
-                        eights.private_view(game.state, seat_id), game.neuro[seat_id],
+                    called = getattr(move, "call_last", False)
+                    move = kit.policy.choose(
+                        kit.rules.private_view(game.state, seat_id), game.neuro[seat_id],
                         PRESETS["steady"], game.rng)
-                    move.call_last = move.call_last or called
-                    _, events = eights.apply(game.state, move)
+                    if called:
+                        move.call_last = True
+                    _, events = kit.rules.apply(game.state, move)
                 events = extra + events
 
                 neuro.apply_events(game.neuro, events, [s.seat_id for s in game.seats],
@@ -670,7 +714,7 @@ class GameService:
                         events,
                         {s.seat_id: len(s.hand) for s in game.state.seats},
                         {s.seat_id: s.display for s in game.seats})
-                game.recent.extend(narration.describe_events(game, events))
+                game.recent.extend(kit.narration.describe_events(game, events))
                 game.turns += 1
                 game.lap += 1
 
@@ -682,14 +726,14 @@ class GameService:
                     game.lap = 0
                     neuro.decay(game.neuro)
 
-                await self._render(game, force=narration.is_dramatic(events))
+                await self._render(game, force=kit.narration.is_dramatic(events))
                 await self._refresh_open_panels(game)
 
                 # The winning move is not reacted to here even though WENT_OUT is loud
                 # enough to qualify. The finale below covers it, and covers it better:
                 # one character crowing and then the same character crowing again in
                 # the aftermath round is the sort of seam nobody can unsee.
-                beat = (narration.beat_for(game, events)
+                beat = (kit.narration.beat_for(game, events)
                         if game.state.phase == "playing" else None)
                 if beat is not None:
                     try:
@@ -774,9 +818,11 @@ class GameService:
                 move.call_last = move.call_last or self.take_last_call(game, seat.seat_id)
             return move, []
 
-        auto = policy.choose(eights.private_view(game.state, seat.seat_id),
-                             game.neuro[seat.seat_id], PRESETS["steady"], game.rng)
-        auto.call_last = auto.call_last or self.take_last_call(game, seat.seat_id)
+        kit = _KITS[game.kind]
+        auto = kit.policy.choose(kit.rules.private_view(game.state, seat.seat_id),
+                                 game.neuro[seat.seat_id], PRESETS["steady"], game.rng)
+        if game.kind == "eights":
+            auto.call_last = auto.call_last or self.take_last_call(game, seat.seat_id)
         return auto, [Event(Ev.TIMED_OUT, seat_id=seat.seat_id)]
 
     # ------------------------------------------------------------------ dialogue
@@ -898,7 +944,7 @@ class GameService:
         queue = session.get("task_queue")
         if queue is None:
             return
-        beat = narration.finale_beat(game)
+        beat = _KITS[game.kind].narration.finale_beat(game)
         if not beat:
             return
 
@@ -951,7 +997,8 @@ class GameService:
         thing that can work, and it is also what people do at a real table.
         """
         game = self.cog.active_games.get(channel_id)
-        if not game or game.stopping or game.state.phase != "playing":
+        if (not game or game.kind != "eights" or game.stopping
+                or game.state.phase != "playing"):
             return False
         if content.strip().lower() not in GAME_LAST_CALL_WORDS:
             return False
@@ -1019,7 +1066,7 @@ class GameService:
         view = None
         if not final and any(s.kind == "human" for s in game.seats):
             from ..gui.gui_games import TableView
-            view = TableView(self.cog, game.channel_id)
+            view = TableView(self.cog, game.channel_id, game.kind)
 
         buried = (game.message_id is not None
                   and getattr(channel, "last_message_id", None) not in (None, game.message_id))

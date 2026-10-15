@@ -73,8 +73,8 @@ neuro engine's four levels at that moment.
 
 <!-- SCREENSHOT 8: 08-follow_up-generation_trace-and-neuro_engine.png -->
 
-**A table game.** `/play eights` deals the cast into Mimic Eights; each character plays its
-own hand, and the table reacts when someone wins.
+**Table games.** `/play eights` deals the cast into Mimic Eights, and `/play dice` sits it
+down to Mimic Dice; each character plays its own hand, and the table reacts when someone wins.
 
 <!-- SCREENSHOT 9: 09-mimic_eights.png -->
 
@@ -108,12 +108,18 @@ participant, `/speak` to post as one of your profiles — either verbatim, or re
 in character with a private preview before it goes out — `/trigger` to force a round,
 and `/session audit` for token telemetry and diagnostics. The **View Generation Trace**
 context menu opens the same telemetry for a single reply, and **Edit Profile Message** lets
-a server admin rewrite any profile's reply, marked as edited by them.
+a server admin rewrite any profile's reply, marked as edited by them; **Delete Profile
+Message** removes one, every message of it, from the channel and memory.
 
 `/play eights` seats the cast, and any people who join, at a table of **Mimic Eights**, a
 Crazy Eights variant for two to six players. Moves cost no model call: each character's
 temperament and neuro state weight what it plays, and it speaks only when something happens
 to it and once more at the end.
+
+`/play dice` is **Mimic Dice**, Liar's Dice for two to six: everyone rolls under a cup, bids
+on how many of one face lie under every cup, or calls Liar. Characters bid and call by
+temperament, and a character's bluffs show on its mood: an anxious one looks rattled, a
+steady one keeps a straight face.
 
 ### Memory
 

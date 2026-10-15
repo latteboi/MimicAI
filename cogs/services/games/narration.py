@@ -175,6 +175,13 @@ def describe_table(game: Game) -> str:
             f"Cards left in the pile: {view['draw_pile_size']}.")
 
 
+def result_line(game: Game) -> str:
+    """How a finished game stands, for `<game_context>` once the table is over."""
+    winner = game.seat(game.state.winner) if game.state.winner else None
+    return (f"The game is over -- {winner.display} went out and won."
+            if winner else "The game has ended with no winner.")
+
+
 def finale_beat(game: Game) -> Optional[str]:
     """How the game ended, in one line, from public information only.
 

@@ -1,7 +1,8 @@
 """Drafting a character from a concept: the prompt, the parse, the model and the save.
 
 `/profile generate` is reached three ways -- the command itself, the /start wizard and the
-Public Library's Generate button -- and all three arrive at the command's callback, which
+Public Library's Generate button, from a concept, an image or both -- and all three arrive
+at the command's callback, which
 drafts through here and shows the draft (`gui_generate.GeneratedProfileView`) before
 anything is written. A draft lives only on that view: nothing touches disk until Save.
 """
@@ -58,6 +59,18 @@ REVISION_TEMPLATE = (
     "the request asks for and keeping everything else.\n\n"
     "<previous_draft>\n{draft}\n</previous_draft>\n\n"
     "<revision_request>\n{request}\n</revision_request>"
+)
+
+#: What the template is handed as `{prompt}` when an image comes with no concept.
+IMAGE_CONCEPT = "the character in the attached image"
+
+#: Appended after the operator's template for the same reason as REVISION_TEMPLATE.
+IMAGE_NOTE = (
+    "\n\nAn image of the character is attached. Take their appearance from what is visible, "
+    "and let the rest of it -- expression, clothing, setting, art style -- suggest who they "
+    "are. Where the concept and the image disagree, follow the concept. The character is "
+    "fictional, inspired by the image: never identify or name a real person, even one you "
+    "recognise."
 )
 
 _HEADER = re.compile(r"\[SECTION:\s*([A-Za-z_]+)\s*\]")
@@ -133,8 +146,10 @@ def render_draft(draft: Dict[str, Any]) -> str:
 
 
 def build_prompt(template: str, concept: str, previous: Optional[Dict[str, Any]] = None,
-                 request: Optional[str] = None) -> str:
+                 request: Optional[str] = None, image: bool = False) -> str:
     prompt = template.format(prompt=concept)
+    if image:
+        prompt += IMAGE_NOTE
     if previous is not None:
         prompt += REVISION_TEMPLATE.format(draft=render_draft(previous),
                                            request=(request or "").strip())
@@ -169,9 +184,11 @@ def generator_models(cog, user_id: int) -> Tuple[str, Tuple[str, ...]]:
 async def generate_draft(cog, user_id: int, concept: str,
                          previous: Optional[Dict[str, Any]] = None,
                          request: Optional[str] = None,
-                         template_key: str = "PROFILE_GENERATOR") -> Tuple[Dict[str, Any], str]:
+                         template_key: str = "PROFILE_GENERATOR",
+                         image: Optional[Dict[str, str]] = None) -> Tuple[Dict[str, Any], str]:
     """(draft, model used). `previous` and `request` together make it a refinement.
     `template_key` is one of TEMPLATES: a concept to design from, or a card to sort.
+    `image` is a `{"url", "mime_type"}` part, shown to the model ahead of the prompt.
 
     Raises ProfileGenerationError, and nothing else, for anything the user should be told.
     """
@@ -179,17 +196,20 @@ async def generate_draft(cog, user_id: int, concept: str,
     default, temperature = TEMPLATES[template_key]
     template = cog.global_prompts.get(template_key, default)
     try:
-        prompt = build_prompt(template, concept, previous, request)
+        prompt = build_prompt(template, concept, previous, request, image=bool(image))
     except (KeyError, IndexError, ValueError):
         raise ProfileGenerationError(
             "The profile generator prompt on this bot is misconfigured. Let the bot operator know.")
+    # A list of turns, not parts: a bare part dict is read as a turn with no parts, and
+    # the model drafts from the words "the attached image" without ever seeing it.
+    contents = [{"role": "user", "parts": [image, prompt]}] if image else [prompt]
 
     async def attempt(model_name: str, is_fallback: bool) -> Dict[str, Any]:
         model = cog.api_service._instantiate_model(
             model_name, None, user_id, None, DEFAULT_SAFETY_SETTINGS,
             resolve_thinking_params(None, "utility"), config_owner_id=user_id)
         response = await model.generate_content_async(
-            [prompt], generation_config={"temperature": temperature})
+            contents, generation_config={"temperature": temperature})
         if not response or not response.candidates:
             # A decision about the concept, not the model being down: the fallback
             # would be asked the same thing, so this is not retried.

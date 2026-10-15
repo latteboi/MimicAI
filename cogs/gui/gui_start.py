@@ -680,7 +680,7 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
 
 
 class NewProfileModal(ui.Modal):
-    """Collects a name and a concept and hands off to `/profile generate`.
+    """Collects a name and a concept, an image or both, and hands off to `/profile generate`.
 
     That command carries name validation, the profile and key-access limits, and ninety
     lines of prompt assembly and parsing. Calling its callback directly means the wizard
@@ -696,9 +696,9 @@ class NewProfileModal(ui.Modal):
             label="Internal Name", placeholder="e.g. detective", max_length=32, required=True)
         self.add_item(self.name_input)
         self.concept_input = ui.TextInput(
-            label="Concept", style=discord.TextStyle.paragraph, max_length=500,
-            placeholder="e.g. A cynical noir detective who never removes his coat.",
-            required=True)
+            label="Concept (optional with an image)", style=discord.TextStyle.paragraph,
+            max_length=500, required=False,
+            placeholder="e.g. A cynical noir detective who never removes his coat.")
         self.add_item(self.concept_input)
         self.display_name_input = ui.TextInput(
             label="Display Name (optional)", max_length=20, required=False,
@@ -707,10 +707,16 @@ class NewProfileModal(ui.Modal):
         self.avatar_url_input = ui.TextInput(
             label="Avatar URL (optional)", required=False, placeholder="https://...")
         self.add_item(self.avatar_url_input)
+        # The fifth component, which is all a modal holds.
+        self.image_input = ui.FileUpload(required=False)
+        self.add_item(ui.Label(
+            text="Image (optional)", component=self.image_input,
+            description="A picture to draft from. It becomes the avatar unless you give a URL."))
 
     async def on_submit(self, interaction: discord.Interaction):
         await self.cog.profile_generate_slash.callback(
-            self.cog, interaction, (self.concept_input.value or "").strip(),
-            (self.name_input.value or "").strip(),
-            (self.display_name_input.value or "").strip() or None,
-            (self.avatar_url_input.value or "").strip() or None)
+            self.cog, interaction, (self.name_input.value or "").strip(),
+            prompt=(self.concept_input.value or "").strip() or None,
+            image=self.image_input.values[0] if self.image_input.values else None,
+            display_name=(self.display_name_input.value or "").strip() or None,
+            avatar_url=(self.avatar_url_input.value or "").strip() or None)

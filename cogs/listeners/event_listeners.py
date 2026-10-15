@@ -1244,6 +1244,7 @@ class EventListeners:
 
         self.bot.tree.remove_command(self.trace_ctx_menu.name, type=self.trace_ctx_menu.type)
         self.bot.tree.remove_command(self.edit_ctx_menu.name, type=self.edit_ctx_menu.type)
+        self.bot.tree.remove_command(self.delete_ctx_menu.name, type=self.delete_ctx_menu.type)
         
         self.refresh_lock_task.cancel()
         self.session_manager.evict_inactive_sessions_task.cancel()

@@ -3,7 +3,7 @@
 Split out of `game_service.py` so the narration and embed modules can name these
 types without importing the service that drives them. Nothing here knows what a
 channel is beyond holding the handles Discord hands back -- the rules live in
-`eights.py`, the orchestration in `game_service.py`.
+`eights.py` and `dice.py`, the orchestration in `game_service.py`.
 """
 
 import asyncio
@@ -18,8 +18,12 @@ import discord
 from ...utils.constants import GAME_CONTEXT_EVENTS_KEEP, GAME_PANEL_PUSH_WINDOW_SECONDS
 from . import ledger as ledger_mod
 from ._shared import Event
-from .eights import GameState, Move, RuleSet
+from .eights import Move
 from .neuro import Temperament
+
+
+#: What each game `kind` is called on its table, its lobby and in a refusal.
+NAMES = {"eights": "Mimic Eights", "dice": "Mimic Dice"}
 
 
 @dataclass
@@ -90,9 +94,11 @@ class Lobby:
     channel_id: int
     guild_id: Optional[int]
     host_id: int
-    rules: RuleSet
+    #: `eights.RuleSet` or `dice.RuleSet`, matching `kind`.
+    rules: Any
     #: Total seats the host asked for, profiles included. None means "as many as fit".
     seats_wanted: Optional[int]
+    kind: str = "eights"
     humans: "OrderedDict[int, str]" = field(default_factory=OrderedDict)
     #: Locked by default, mirroring a global chat session: until the host unlocks it,
     #: nobody else can take a seat. The emoji on the button is the whole UI for this.
@@ -107,8 +113,9 @@ class Lobby:
 
 @dataclass
 class Game:
-    kind: str
-    state: GameState
+    kind: str                             # a key of NAMES
+    #: `eights.GameState` or `dice.GameState`, matching `kind`.
+    state: Any
     seats: List[Seat]
     neuro: Dict[str, Dict[str, int]]
     temperaments: Dict[str, Temperament]

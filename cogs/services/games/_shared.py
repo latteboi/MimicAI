@@ -47,6 +47,20 @@ class Ev:
     #: alongside so the neuro table can tell it apart from a real choice.
     TIMED_OUT      = "TIMED_OUT"
 
+    # -- Mimic Dice. A call is seen from the caller: `seat_id` called Liar on
+    # `target_id`'s bid, `amount` is how many of the bid's `face` the cups held.
+    BID            = "BID"              # a seat raised the bid to `amount` x `face`
+    LIAR_RIGHT     = "LIAR_RIGHT"       # Liar was called and the bid was short
+    LIAR_WRONG     = "LIAR_WRONG"       # Liar was called and the bid stood
+    LOST_DIE       = "LOST_DIE"         # `amount` is the dice the seat has left
+    ELIMINATED     = "ELIMINATED"       # a seat lost its last die
+    WON            = "WON"              # the last seat holding dice
+
+    #: Private: a profile seat bid on a face it holds none of. Only the neuro table
+    #: reads it -- it is the poker tell -- so the ledger and narration must never
+    #: mention it. See `dice.py`.
+    BLUFFED        = "BLUFFED"
+
 
 @dataclass(frozen=True)
 class Event:
@@ -63,6 +77,8 @@ class Event:
     card: Optional[Card] = None
     amount: int = 0
     colour: Optional[str] = None
+    #: A die face, 1-6, for the dice events.
+    face: int = 0
 
     def as_dict(self) -> Dict[str, Any]:
         """Plain-dict form for the ledger and for prompt payloads."""
@@ -72,17 +88,18 @@ class Event:
         if self.card:      d["card"] = f"{self.card[0]}:{self.card[1]}"
         if self.amount:    d["amount"] = self.amount
         if self.colour:    d["colour"] = self.colour
+        if self.face:      d["face"] = self.face
         return d
 
 
 def speaker_for(event: Event) -> Optional[str]:
     """Which seat this event is *about* -- the one worth hearing from.
 
-    A Skip and a Draw land *on* somebody, and their reaction is the interesting one;
-    everything else belongs to whoever acted. This is the whole of what survived the
+    A Skip, a Draw and a Liar call that finds a bid short land *on* somebody, and their
+    reaction is the interesting one; everything else belongs to whoever acted. This is the whole of what survived the
     canned-bark tier: picking the right character was the only part of it that was
     doing real work.
     """
-    if event.kind in (Ev.SKIPPED, Ev.HIT_BY_DRAW):
+    if event.kind in (Ev.SKIPPED, Ev.HIT_BY_DRAW, Ev.LIAR_RIGHT):
         return event.target_id or event.seat_id
     return event.seat_id

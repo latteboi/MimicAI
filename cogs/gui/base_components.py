@@ -4,7 +4,7 @@ import discord
 from discord import ui
 from typing import Awaitable, Callable, Optional
 
-from ..utils.constants import NOT_REGISTERED
+from ..utils.constants import NOT_REGISTERED, PLACEHOLDER_EMOJI
 from ..utils.helpers import suppress_link_previews
 
 def build_tab_nav_bar(target_view: ui.View, current_tab: str, tabs, row: int = 4):
@@ -70,6 +70,25 @@ async def refuse_unregistered(cog, interaction: discord.Interaction) -> bool:
     else:
         await interaction.response.send_message(NOT_REGISTERED, ephemeral=True)
     return True
+
+
+async def send_status(interaction: discord.Interaction, text: str) -> None:
+    """Our own "is thinking...": an ephemeral embed saying what a slow command is doing.
+
+    Discord draws "<bot> is thinking..." for a defer and takes no text for it, so this is
+    the response itself. The reply must then *replace* it, through `settle_status`: a
+    followup would leave this sitting above it, and a view's timeout edits the original
+    response, which has to be that reply.
+    """
+    await interaction.response.send_message(
+        embed=discord.Embed(description=f"{PLACEHOLDER_EMOJI} {text}", colour=discord.Colour.blurple()),
+        ephemeral=True)
+
+
+async def settle_status(interaction: discord.Interaction, content: Optional[str] = None, *,
+                        embed: Optional[discord.Embed] = None, view=discord.utils.MISSING) -> None:
+    """Replace `send_status`'s embed with the reply -- what the first followup after a defer does."""
+    await interaction.edit_original_response(content=content, embed=embed, view=view)
 
 
 def invalidate_model_cache(cog, user_id: int, profile_name: Optional[str] = None):

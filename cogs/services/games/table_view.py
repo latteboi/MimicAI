@@ -13,9 +13,9 @@ from typing import Optional
 
 import discord
 
-from . import eights, neuro
+from . import dice, eights, neuro
 from .eights import RuleSet
-from .table import Game
+from .table import Game, NAMES
 
 #: Colour swatches for the status embed. Wild shows the declared colour, so the black
 #: square only ever appears for the top card itself, never for `active_colour`.
@@ -49,6 +49,9 @@ def panel_signature(game: Game, seat_id: str) -> tuple:
     """
     state = game.state
     seat_state = state.seat(seat_id)
+    if game.kind == "dice":
+        return (tuple(seat_state.hand), state.bid, state.current.seat_id
+                if state.phase == "playing" else None, state.phase, state.round_no)
     hand = tuple(sorted(seat_state.hand)) if seat_state else ()
     return (hand, state.top, state.active_colour, state.pending_draw,
             state.current.seat_id if state.phase == "playing" else None,
@@ -61,6 +64,8 @@ def house_rule_summary(rules: RuleSet) -> str:
     Only the deviations: a table running the defaults says nothing, and everyone
     can see at a glance what they actually agreed to when it is not.
     """
+    if isinstance(rules, dice.RuleSet):
+        return _dice_rule_summary(rules)
     default = RuleSet()
     bits = []
     if not rules.stack_draw_two: bits.append("no stacking")
@@ -73,9 +78,92 @@ def house_rule_summary(rules: RuleSet) -> str:
     return " · ".join(bits)
 
 
+def _dice_rule_summary(rules: "dice.RuleSet") -> str:
+    default = dice.RuleSet()
+    bits = []
+    if rules.dice_per_seat != default.dice_per_seat:
+        bits.append(f"{rules.dice_per_seat} dice each")
+    if not rules.ones_wild: bits.append("ones not wild")
+    if rules.turn_seconds != default.turn_seconds:
+        bits.append(f"{int(rules.turn_seconds)}s turns")
+    return " · ".join(bits)
+
+
+def _footer(game: Game, text: str, final: bool) -> str:
+    house = house_rule_summary(game.state.rules)
+    if house:
+        text += f" · {house}"
+    if game.deadline and not final:
+        text += f" · {max(0, int(game.deadline - time.monotonic()))}s to play"
+    return text
+
+
+def _dice_cups(held) -> str:
+    return " ".join(dice.GLYPHS[d - 1] for d in held)
+
+
+def build_dice_embed(game: Game, final: bool = False,
+                     note: Optional[str] = None) -> discord.Embed:
+    """The shared Mimic Dice table. Built from `public_view` only -- never a cup this
+    round. The last cups lifted are shown in full: the table has already seen them."""
+    view = dice.public_view(game.state)
+
+    def name(seat_id) -> str:
+        seat = game.seat(seat_id) if seat_id else None
+        return seat.display if seat else "someone"
+
+    if final:
+        title = (f"{NAMES['dice']} — {name(view['winner'])} wins" if view["winner"]
+                 else f"{NAMES['dice']} — game over")
+    else:
+        title = f"{NAMES['dice']} — {len(game.seats)} at the table"
+    embed = discord.Embed(title=title, colour=0x6B4FA0)
+
+    board = []
+    if view["bid"]:
+        quantity, face = view["bid"]
+        board.append(f"**Bid** {dice.GLYPHS[face - 1]} {dice.bid_text(quantity, face)}"
+                     f" — {name(view['bidder'])}")
+    elif view["current_seat"]:
+        board.append(f"**Bid** none yet — {name(view['current_seat'])} opens")
+    board.append(f"**Dice in play** {view['dice_in_play']}"
+                 + (" · ones are wild" if view["ones_wild"] else ""))
+    embed.add_field(name="Board", value="\n".join(board), inline=False)
+
+    reveal = view["reveal"]
+    if reveal:
+        verdict = ("short" if reveal["loser"] == reveal["bidder"] else "good")
+        head = (f"{name(reveal['caller'])} called Liar on {name(reveal['bidder'])}'s "
+                f"{dice.bid_text(*reveal['bid'])} — **{reveal['found']}** there, the "
+                f"bid was {verdict}. {name(reveal['loser'])} lost a die.")
+        cups = "\n".join(f"{name(sid)} {_dice_cups(held)}"
+                         for sid, held in reveal["dice"].items())
+        embed.add_field(name="Last cups lifted", value=f"{head}\n{cups}"[:1024],
+                        inline=False)
+
+    lines = []
+    for seat_view in view["seats"]:
+        held = seat_view["dice"]
+        if not held:
+            lines.append(f" ~~{name(seat_view['seat_id'])}~~ · out")
+            continue
+        here = "▸ " if seat_view["seat_id"] == view["current_seat"] else " "
+        mood = neuro.describe(game.neuro.get(seat_view["seat_id"], neuro.BASELINE))
+        lines.append(f"{here}**{name(seat_view['seat_id'])}** · 🎲 {held}  *{mood}*")
+    embed.add_field(name="Seats", value="\n".join(lines) or "—", inline=False)
+
+    if note:
+        embed.add_field(name="​", value=note, inline=False)
+    embed.set_footer(text=_footer(
+        game, f"round {view['round_no']} · turn {view['turn_no']}", final))
+    return embed
+
+
 def build_embed(game: Game, final: bool = False,
                 note: Optional[str] = None) -> discord.Embed:
     """The shared table view. Built from `public_view` only -- never a hand."""
+    if game.kind == "dice":
+        return build_dice_embed(game, final=final, note=note)
     view = eights.public_view(game.state)
     colour = _EMBED_COLOUR.get(view["active_colour"], 0x2B2F36)
 
@@ -115,12 +203,6 @@ def build_embed(game: Game, final: bool = False,
     if note:
         embed.add_field(name="​", value=note, inline=False)
 
-    footer = f"turn {view['turn_no']} · {view['draw_pile_size']} in the pile"
-    house = house_rule_summary(game.state.rules)
-    if house:
-        footer += f" · {house}"
-    if game.deadline and not final:
-        left = max(0, int(game.deadline - time.monotonic()))
-        footer += f" · {left}s to play"
-    embed.set_footer(text=footer)
+    embed.set_footer(text=_footer(
+        game, f"turn {view['turn_no']} · {view['draw_pile_size']} in the pile", final))
     return embed

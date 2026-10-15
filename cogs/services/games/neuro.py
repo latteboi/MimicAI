@@ -121,6 +121,22 @@ _TABLE: Dict[str, Dict[str, Delta]] = {
     Ev.COLOUR_CHOSEN: {},
     Ev.PENALTY:    {},
     Ev.GAME_OVER:  {},
+
+    # Mimic Dice. A call is one moment seen from both ends, so the caller and the bid it
+    # landed on move in opposite directions. The die it costs rides on those two rather
+    # than on LOST_DIE, which would count the same moment twice.
+    Ev.BID:        {"actor": Delta(a=2)},
+    #: The tell. Stress a bluff costs, scaled by temperament: an anxious profile drifts
+    #: visibly toward "rattled" while a steady one barely moves. See `dice.py`.
+    Ev.BLUFFED:    {"actor": Delta(c=12, a=8)},
+    Ev.LIAR_RIGHT: {"actor": Delta(d=12, c=-6, a=6),
+                    "target": Delta(d=-10, c=12, o=-4, a=8)},
+    Ev.LIAR_WRONG: {"actor": Delta(d=-10, c=12, o=-3, a=6),
+                    "target": Delta(d=10, c=-6, a=4)},
+    Ev.LOST_DIE:   {},
+    Ev.ELIMINATED: {"actor": Delta(d=-20, c=10, o=-5, a=-10)},
+    Ev.WON:        {"actor": Delta(d=35, c=-25, o=5, a=-10),
+                    "others": Delta(d=-10, c=8, a=-8)},
 }
 
 #: HIT_BY_DRAW and STACKED both scale with what was played, so they resolve from the

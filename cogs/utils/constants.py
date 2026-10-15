@@ -2325,6 +2325,13 @@ DEFAULT_GAME_CONTEXT = (
     "{ledger}\n\n"
     "Recently:\n{events}\n\n"
     "How this table runs:\n{rules}\n\n"
+    "{briefing}"
+)
+
+# What a character at each kind of table is and is not shown. Most of `<game_context>`'s
+# weight, and spent deliberately: a character asked about a game it sees only in outline
+# will otherwise invent the detail -- see `GameService.context_block`.
+DEFAULT_EIGHTS_BRIEFING = (
     "WHAT YOU CAN SEE: everything above, and nothing else -- the top card, the active "
     "colour, how many cards are left in the pile, how many cards each player is "
     "holding, and the handful of things listed under Recently.\n"
@@ -2356,6 +2363,37 @@ DEFAULT_GAME_OPENING_LIVE = (
 DEFAULT_GAME_OPENING_OVER = (
     "You have just been playing Mimic Eights at a table in this channel -- a Crazy "
     "Eights variant -- and the game has finished. This is how it ended."
+)
+
+DEFAULT_DICE_BRIEFING = (
+    "WHAT YOU CAN SEE: everything above, and nothing else -- the standing bid, how many "
+    "dice each player has left, the cups lifted at the last call, how everyone looks, "
+    "and the handful of things listed under Recently.\n"
+    "WHAT YOU CANNOT SEE: any die under any cup this round, your own included. You do "
+    "not know what you rolled, so you do not know whether your own bids are true.\n"
+    "SO, WHEN THE GAME COMES UP:\n"
+    "- Never claim what is under a cup, yours included. Whether you believe a bid is "
+    "yours to say; what the cups hold is not.\n"
+    "- The only dice you may name are the ones from the last cups lifted above.\n"
+    "- Never describe a bid or a call that is not listed under Recently. If it is not "
+    "written above it did not happen, and you must not fill in the gap.\n"
+    "- Every figure you cite must actually appear above.\n"
+    "- How someone looks is fair game: it is all the table can read of them.\n"
+    "- React to what the table did. Do not narrate your own turn as though you were "
+    "choosing bids -- the game moves you, you only get to have an opinion about it."
+)
+
+DEFAULT_DICE_OPENING_LIVE = (
+    "You are at a table playing Mimic Dice in this channel -- Liar's Dice. Everyone "
+    "rolls dice under a cup in secret, then players take turns raising a bid on how "
+    "many of one face lie under every cup put together, or call Liar on the last bid. "
+    "A call lifts every cup: if the bid was short the bidder loses a die, otherwise the "
+    "caller does. Lose every die and you are out. This is the state of the game right now."
+)
+
+DEFAULT_DICE_OPENING_OVER = (
+    "You have just been playing Mimic Dice -- Liar's Dice -- at a table in this "
+    "channel, and the game has finished. This is how it ended."
 )
 
 # The round's user-side turn for a beat. Short on purpose -- the persona, the neuro

@@ -11,14 +11,15 @@ from .utils.constants import (
     cooldown_unless_refused, is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
     IMPORT_FILE_TOO_LARGE, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
-    PERSONA_TEXT_INPUT_MAX_LENGTH,
+    PERSONA_TEXT_INPUT_MAX_LENGTH, IMAGE_MIME_SUFFIXES, IMAGE_SUFFIX_MIMES,
 )
-from .services.profile_generation import (ProfileGenerationError, clean_display_name, draft_from_card,
-                                           generate_draft, generator_models)
+from .services.profile_generation import (IMAGE_CONCEPT, ProfileGenerationError, clean_display_name,
+                                           draft_from_card, generate_draft, generator_models)
 from .utils.character_card import (PNG_SIGNATURE, CardError, prompt_text, profile_name_for, read_card,
                                    read_lorebook)
 from .listeners.event_listeners import EventListeners
-from .gui.base_components import ActionTextInputModal, DropdownContentView, InviteView, refuse_unregistered
+from .gui.base_components import (ActionTextInputModal, DropdownContentView, InviteView, refuse_unregistered,
+                                  send_status, settle_status)
 from .gui.gui_data import PrivacyDashboardView, ImportPassphraseModal, BulkExportView
 from .gui.gui_generate import GeneratedProfileView
 from .gui.gui_hub import HubPublicLibraryView
@@ -49,6 +50,7 @@ from .services.api_service import APIService
 from .services.help_service import HelpService
 from .services.game_service import GameService
 from .services.games.eights import RuleSet as GameRuleSet
+from .services.games.dice import RuleSet as DiceRuleSet
 
 from discord.ext import commands, tasks
 import discord
@@ -103,6 +105,10 @@ def _unregistered(cog, interaction: discord.Interaction) -> bool:
 
 def _no_session_key(cog, interaction: discord.Interaction) -> bool:
     return cog._session_key_block(interaction.guild, interaction.user.id) is not None
+
+
+def _no_table_here(cog, interaction: discord.Interaction) -> bool:
+    return cog.game_service.lobby_refusal(interaction.channel_id) is not None
 
 
 def _cannot_generate(cog, interaction: discord.Interaction) -> bool:
@@ -360,6 +366,12 @@ class MimicCog(EventListeners, commands.Cog):
             callback=self.edit_profile_message
         )
         self.bot.tree.add_command(self.edit_ctx_menu)
+        self.delete_ctx_menu = app_commands.ContextMenu(
+            name="Delete Profile Message",
+            callback=self.delete_profile_message,
+            allowed_contexts=app_commands.AppCommandContext(guild=True, dm_channel=True),
+        )
+        self.bot.tree.add_command(self.delete_ctx_menu)
         self.bot.tree.interaction_check = self.boot_gate
 
     profile_group = app_commands.Group(name="profile", description="Manage your personal bot profiles (persona, instructions).")
@@ -420,26 +432,29 @@ class MimicCog(EventListeners, commands.Cog):
         
         await interaction.followup.send(f"Successfully created new profile '{profile_name}'.\nUse `/profile manage profile_name:{profile_name}` to start editing it.", ephemeral=True)
 
-    @profile_group.command(name="generate", description="Uses AI to draft a new profile from a concept, for you to review before saving.")
+    @profile_group.command(name="generate", description="Uses AI to draft a new profile from a concept or an image, for you to review before saving.")
     @cooldown_unless_refused(1, 60.0, _cannot_generate)
     @app_commands.rename(profile_name="internal_name")
     @app_commands.describe(
-        prompt="The character concept (e.g., 'A cynical noir detective').",
         profile_name="The unique internal name you manage the profile by.",
+        prompt="The character concept (e.g., 'A cynical noir detective'). Optional with an image.",
+        image="A picture of the character to draft from. It becomes the avatar unless you give avatar_url.",
         display_name="The name it speaks under. Left blank, the draft picks one.",
         avatar_url="A link to the image it speaks with, as under Appearance."
     )
-    async def profile_generate_slash(self, interaction: discord.Interaction, prompt: str, profile_name: str,
+    async def profile_generate_slash(self, interaction: discord.Interaction, profile_name: str,
+                                     prompt: Optional[str] = None,
+                                     image: Optional[discord.Attachment] = None,
                                      display_name: Optional[app_commands.Range[str, 1, 20]] = None,
                                      avatar_url: Optional[str] = None):
-        await interaction.response.defer(ephemeral=True, thinking=True)
         if await refuse_unregistered(self, interaction):
             return
+        await send_status(interaction, "Drafting your character...")
         profile_name = profile_name.lower().strip()
 
         is_valid, err_msg = self.profile_manager._is_valid_profile_name(profile_name)
         if not is_valid:
-            await interaction.followup.send(f"❌ **Invalid Internal Name:** {err_msg}", ephemeral=True)
+            await settle_status(interaction, f"❌ **Invalid Internal Name:** {err_msg}")
             return
 
         # Held beside the draft rather than written into it: Regenerate replaces the draft.
@@ -447,45 +462,89 @@ class MimicCog(EventListeners, commands.Cog):
         if (display_name or "").strip():
             appearance["display_name"] = clean_display_name(display_name)
             if not appearance["display_name"]:
-                await interaction.followup.send(
+                await settle_status(interaction,
                     "❌ **Invalid Display Name:** 20 characters at most, with no Discord, Clyde "
-                    "or @mention in it.", ephemeral=True)
+                    "or @mention in it.")
                 return
         if (avatar_url or "").strip():
             appearance["avatar_url"] = avatar_url.strip()
             if not appearance["avatar_url"].startswith(("https://", "http://")):
-                await interaction.followup.send(
-                    "❌ **Invalid Avatar URL:** It must be a link starting with https://.",
-                    ephemeral=True)
+                await settle_status(interaction,
+                    "❌ **Invalid Avatar URL:** It must be a link starting with https://.")
                 return
             
-        if not prompt.strip():
-            await interaction.followup.send("Prompt cannot be empty.", ephemeral=True)
+        concept = (prompt or "").strip()
+        if not concept and image is None:
+            await settle_status(interaction, "Give a concept, an image, or both.")
             return
+        if image is not None:
+            mime_type = ((image.content_type or "").split(";", 1)[0].strip().lower()
+                         or IMAGE_SUFFIX_MIMES.get(os.path.splitext(image.filename)[1].lower()))
+            if mime_type not in IMAGE_MIME_SUFFIXES:
+                await settle_status(interaction,
+                    "❌ **Not an Image:** Upload a PNG, JPEG or WebP picture.")
+                return
+            # The rating reads an avatar only up to this, and judges a larger one by the
+            # text alone: over it, the picture would be the face of a profile nobody rated.
+            limit = defaultConfig.CONTENT_CLASSIFY_MAX_IMAGE_BYTES
+            if image.size > limit:
+                await settle_status(interaction,
+                    f"❌ **Image Too Large:** That image is {image.size / (1024 * 1024):.1f} MB. "
+                    f"It can be at most {limit // (1024 * 1024)} MB.")
+                return
 
         index = self.profile_manager._get_user_index(interaction.user.id)
         if profile_name in index.get("personal", []) or profile_name in index.get("borrowed", []):
-            await interaction.followup.send(f"A profile with the name '{profile_name}' already exists.", ephemeral=True)
+            await settle_status(interaction, f"A profile with the name '{profile_name}' already exists.")
             return
 
         limit = defaultConfig.LIMIT_PROFILES
 
         if len(index.get("personal", [])) >= limit:
-            await interaction.followup.send(f"You have reached the maximum of {limit} personal profiles.", ephemeral=True)
+            await settle_status(interaction, f"You have reached the maximum of {limit} personal profiles.")
             return
 
+        image_part = kept = None
+        if image is not None:
+            # A link the user gave is the avatar; otherwise the image is, re-posted so it lasts.
+            if not appearance.get("avatar_url"):
+                kept = await self._keep_portrait(
+                    interaction.user, await image.to_file(),
+                    f"🖼️ The image for `{profile_name}`. If you save the profile, this is its "
+                    "avatar: deleting this message removes it. If you discard the draft, delete it.")
+                if kept:
+                    appearance["avatar_url"] = kept
+            # The command's own link when none was kept: it lasts the ten minutes a draft does.
+            image_part = {"url": kept or image.url, "mime_type": mime_type}
+
         # A draft, not a profile: GeneratedProfileView shows it and writes it on Save.
-        concept = prompt.strip()
+        concept = concept or IMAGE_CONCEPT
         try:
-            draft, model_used = await generate_draft(self, interaction.user.id, concept)
+            draft, model_used = await generate_draft(self, interaction.user.id, concept, image=image_part)
         except ProfileGenerationError as e:
-            await interaction.followup.send(
-                f"❌ **Generation Failed:** {suppress_link_previews(str(e))}", ephemeral=True)
+            await settle_status(interaction,
+                f"❌ **Generation Failed:** {suppress_link_previews(str(e))}")
             return
 
         view = GeneratedProfileView(self, interaction, profile_name, concept, draft, model_used,
-                                    appearance)
-        await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
+                                    appearance, image=image_part)
+        await settle_status(interaction, embed=view.build_embed(), view=view)
+        if image_part and not appearance.get("avatar_url"):
+            await interaction.followup.send(
+                "-# Your DMs are closed, so the image could not be kept as the avatar. Set one "
+                "under Appearance after saving.", ephemeral=True)
+
+    async def _keep_portrait(self, user: discord.abc.User, file: discord.File, caption: str) -> Optional[str]:
+        """The link of `file` re-posted in `user`'s DMs, or None when their DMs are closed.
+
+        An image on a command is the interaction's, which Discord deletes after a while; one
+        on a message lasts as long as the message, and `discord_cdn` keeps its link signed.
+        """
+        try:
+            message = await user.send(caption, file=file)
+            return message.attachments[0].url
+        except (discord.HTTPException, IndexError):
+            return None
 
     @profile_group.command(name="manage", description="Manage all settings for a specific profile from a unified dashboard.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -706,19 +765,18 @@ class MimicCog(EventListeners, commands.Cog):
                 f"❌ That card is {file.size / (1024 * 1024):.1f} MB. A card can be at most "
                 f"{limit // (1024 * 1024)} MB.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await send_status(interaction, "Reading the card into a draft...")
         user_id = interaction.user.id
         if len(self.profile_manager._get_user_index(user_id).get("personal", [])) >= defaultConfig.LIMIT_PROFILES:
-            await interaction.followup.send(
-                f"You have reached the maximum of {defaultConfig.LIMIT_PROFILES} personal profiles.", ephemeral=True)
+            await settle_status(interaction,
+                f"You have reached the maximum of {defaultConfig.LIMIT_PROFILES} personal profiles.")
             return
 
         data = await file.read()
         try:
             card = await asyncio.to_thread(read_card, data, file.filename)
         except CardError as e:
-            await interaction.followup.send(f"❌ **Import Rejected:** {suppress_link_previews(str(e))}",
-                                            ephemeral=True)
+            await settle_status(interaction, f"❌ **Import Rejected:** {suppress_link_previews(str(e))}")
             return
 
         profile_name = self.profile_manager._generate_unique_local_name(
@@ -728,26 +786,34 @@ class MimicCog(EventListeners, commands.Cog):
         display_name = clean_display_name(card["name"])
         if display_name:
             appearance["display_name"] = display_name
-        if data.startswith(PNG_SIGNATURE):
-            try:
-                portrait = await interaction.user.send(
-                    f"🖼️ **{card['name']}**'s portrait, from the card. If you save the profile, "
-                    "this image is its avatar: deleting this message removes it.",
-                    file=discord.File(io.BytesIO(data), filename="avatar.png"))
-                appearance["avatar_url"] = portrait.attachments[0].url
-            except (discord.HTTPException, IndexError):
-                pass   # Saved without an avatar; one can be set under Appearance.
+        # Over the rating's cap the portrait is left off, as `/profile generate` refuses one:
+        # the rating would judge the profile by its text alone.
+        is_png = data.startswith(PNG_SIGNATURE)
+        portrait_too_large = is_png and len(data) > defaultConfig.CONTENT_CLASSIFY_MAX_IMAGE_BYTES
+        if is_png and not portrait_too_large:
+            # Saved without an avatar when DMs are closed; one can be set under Appearance.
+            kept = await self._keep_portrait(
+                interaction.user, discord.File(io.BytesIO(data), filename="avatar.png"),
+                f"🖼️ **{card['name']}**'s portrait, from the card. If you save the profile, "
+                "this image is its avatar: deleting this message removes it.")
+            if kept:
+                appearance["avatar_url"] = kept
         del data
 
         draft, model_used, unsorted = await draft_from_card(self, user_id, card)
         view = GeneratedProfileView(self, interaction, profile_name, prompt_text(card), draft,
                                     model_used, appearance, card=card)
-        await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
+        await settle_status(interaction, embed=view.build_embed(), view=view)
         if unsorted:
             await interaction.followup.send(
                 f"-# The card was filed as written, not sorted into sections, and each section keeps "
                 f"its first {PERSONA_TEXT_INPUT_MAX_LENGTH:,} characters: {suppress_link_previews(unsorted)}",
                 ephemeral=True)
+        if portrait_too_large:
+            await interaction.followup.send(
+                f"-# The card's image is over {defaultConfig.CONTENT_CLASSIFY_MAX_IMAGE_BYTES // (1024 * 1024)} MB, "
+                "more than the content rating reads, so it is not the avatar. Set one under "
+                "Appearance after saving.", ephemeral=True)
 
     @app_commands.command(name="privacy", description="Export or delete your data, and see this server's data policy.")
     @app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
@@ -1328,7 +1394,37 @@ class MimicCog(EventListeners, commands.Cog):
             turn_seconds=turn_seconds if turn_seconds is not None else GameRuleSet().turn_seconds,
         )
 
-        error = await self.game_service.open_lobby(interaction, seats_wanted=seats, join=join, rules=rules)
+        await self._open_table(interaction, "eights", rules, seats, join)
+
+    @play_group.command(name="dice", description="Open a table of Mimic Dice (Liar's Dice) for this channel's session and cast.")
+    @cooldown_unless_refused(3, 60.0, _no_table_here)
+    @app_commands.describe(
+        seats="How many seats at the table (2-6). Defaults to as many as fit.",
+        join="Take a seat yourself, or open a table of profiles and watch. Defaults to sitting down.",
+        dice="Dice each player starts with (1-5). Default 5; fewer makes a shorter game.",
+        ones_wild="Ones count as every face, and nobody bids on ones. Default on.",
+        turn_seconds="Seconds a person gets before the table plays for them (15-120). Default 45.")
+    async def play_dice_slash(self, interaction: discord.Interaction,
+                              seats: Optional[app_commands.Range[int, 2, 6]] = None,
+                              join: bool = True,
+                              dice: Optional[app_commands.Range[int, 1, 5]] = None,
+                              ones_wild: bool = True,
+                              turn_seconds: Optional[app_commands.Range[int, 15, 120]] = None):
+        if not self.has_lock: return
+        await interaction.response.defer(ephemeral=True)
+        default = DiceRuleSet()
+        rules = DiceRuleSet(
+            dice_per_seat=dice if dice is not None else default.dice_per_seat,
+            ones_wild=ones_wild,
+            turn_seconds=turn_seconds if turn_seconds is not None else default.turn_seconds,
+        )
+        await self._open_table(interaction, "dice", rules, seats, join)
+
+    async def _open_table(self, interaction: discord.Interaction, kind: str, rules,
+                          seats: Optional[int], join: bool) -> None:
+        """The part of every `/play <game>` after its rules are read."""
+        error = await self.game_service.open_lobby(
+            interaction, seats_wanted=seats, join=join, rules=rules, kind=kind)
         if error:
             await interaction.followup.send(error, ephemeral=True)
             return
@@ -1754,16 +1850,16 @@ class MimicCog(EventListeners, commands.Cog):
     @app_commands.autocomplete(profile=EventListeners.master_autocomplete)
     async def memorise_slash(self, interaction: discord.Interaction, profile: Optional[str] = None):
         if not self.has_lock: return
-        await interaction.response.defer(ephemeral=True)
+        await send_status(interaction, "Writing long-term memories...")
 
         session = self.multi_profile_channels.get(interaction.channel_id)
         if not session:
-            await interaction.followup.send("No active session found in this channel.", ephemeral=True)
+            await settle_status(interaction, "No active session found in this channel.")
             return
 
         block = self._session_key_block(interaction.guild, interaction.user.id)
         if block:
-            await interaction.followup.send(block, ephemeral=True)
+            await settle_status(interaction, block)
             return
 
         target_participant = None
@@ -1781,7 +1877,7 @@ class MimicCog(EventListeners, commands.Cog):
                 None,
             )
             if not target_participant:
-                await interaction.followup.send(f"Could not find participant '{p_name}' in this session.", ephemeral=True)
+                await settle_status(interaction, f"Could not find participant '{p_name}' in this session.")
                 return
 
 
@@ -1789,15 +1885,14 @@ class MimicCog(EventListeners, commands.Cog):
         if not session.get("is_hydrated"):
             session = await self.session_manager._ensure_session_hydrated(interaction.channel_id, session_type)
             if not session:
-                await interaction.followup.send("Could not hydrate the session.", ephemeral=True)
+                await settle_status(interaction, "Could not hydrate the session.")
                 return
 
         self.session_last_accessed[interaction.channel_id] = time.time()
 
         if not await self.session_manager._wait_for_session_flags(session, SESSION_BUSY_FLAGS, PURGE_BUSY_WAIT_TIMEOUT_SECONDS):
-            await interaction.followup.send(
-                f"The session is still busy after {int(PURGE_BUSY_WAIT_TIMEOUT_SECONDS)}s. Try again in a moment.",
-                ephemeral=True)
+            await settle_status(interaction,
+                f"The session is still busy after {int(PURGE_BUSY_WAIT_TIMEOUT_SECONDS)}s. Try again in a moment.")
             return
         session['is_memorising'] = True
 
@@ -1819,7 +1914,7 @@ class MimicCog(EventListeners, commands.Cog):
             if not lines:
                 lines.append("Nothing to summarise.")
 
-            await interaction.followup.send("\n".join(lines), ephemeral=True)
+            await settle_status(interaction, "\n".join(lines))
         finally:
             if session:
                 session['is_memorising'] = False
@@ -1835,16 +1930,16 @@ class MimicCog(EventListeners, commands.Cog):
                             undo: bool = False):
         """The same operation as the Compaction tab's Compact Now and Uncompact buttons."""
         if not self.has_lock: return
-        await interaction.response.defer(ephemeral=True)
+        await send_status(interaction, "Unfolding the synopsis..." if undo else "Folding the conversation into its synopsis...")
         # Unfolding is no model call, so it needs no key.
         block = None if undo else self._session_key_block(interaction.guild, interaction.user.id)
         if block:
-            await interaction.followup.send(block, ephemeral=True)
+            await settle_status(interaction, block)
             return
         self.session_last_accessed[interaction.channel_id] = time.time()
         message = await self.generation_service.manual_compaction(
             interaction.channel_id, undo=undo, keep=keep)
-        await interaction.followup.send(message, ephemeral=True)
+        await settle_status(interaction, message)
 
     @app_commands.command(name="train", description="Arms this channel to capture a training example from reactions (1️⃣ input, 2️⃣ output).")
     @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)
@@ -1958,6 +2053,42 @@ class MimicCog(EventListeners, commands.Cog):
             on_submit_callback=on_submit, default=target["text"])
         modal.input.max_length = PROFILE_MESSAGE_MAX_LENGTH
         await interaction.response.send_modal(modal)
+
+    @app_commands.checks.cooldown(5, 10.0, key=lambda i: i.user.id)
+    async def delete_profile_message(self, interaction: discord.Interaction, message: discord.Message):
+        """Delete a profile's reply, every message of it, from the channel and the session log.
+        Server admins only. In a DM with the bot, anyone may delete one of the bot's messages:
+        `/purge` there takes only the newest, and a kept portrait (`_keep_portrait`) is among them."""
+        if not self.has_lock or self._refused_by_blacklist(interaction): return
+        if interaction.guild_id is None:
+            if message.author.id != self.bot.user.id:
+                await interaction.response.send_message("Only my own messages can be deleted here.", ephemeral=True)
+                return
+            try:
+                await message.delete()
+            except discord.NotFound:
+                pass
+            await interaction.response.send_message("Message deleted.", ephemeral=True)
+            return
+        # Asked here, as Edit Profile Message does: a context menu is not bound to the cog.
+        if not (isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator):
+            await interaction.response.send_message("Deleting profile messages is for server admins.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        session = self.multi_profile_channels.get(message.channel.id)
+        if session and not session.get("is_hydrated"):
+            session = await self.session_manager._ensure_session_hydrated(message.channel.id, session.get("type", "multi"))
+        turn = next((t for t in (session or {}).get("unified_log") or ()
+                     if message.id in (t.get("message_ids") or ())), None)
+        if not turn or turn.get("is_user") is not False:
+            await interaction.followup.send("Only a profile's reply in this channel's session can be deleted.", ephemeral=True)
+            return
+        # One message is enough: the delete listener takes the rest of the turn, from the
+        # channel and the log, once any round still writing it is done (TurnDeletionMixin).
+        if not await self.generation_service._delete_own_message(message.channel, message.id):
+            await interaction.followup.send("Could not delete that message.", ephemeral=True)
+            return
+        await interaction.followup.send("Deleted, with the rest of that reply.", ephemeral=True)
 
     @profile_group.command(name="global_chat", description="Have a persistent, private conversation with a profile.")
     @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)
@@ -2134,21 +2265,24 @@ class MimicCog(EventListeners, commands.Cog):
     @app_commands.checks.cooldown(2, 60.0, key=lambda i: i.user.id)
     @app_commands.describe(ask="A technical question to ask the bot directly (Optional).")
     async def help_slash(self, interaction: discord.Interaction, ask: Optional[str] = None):
-        await interaction.response.defer(ephemeral=True)
+        if ask:
+            await send_status(interaction, "Looking that up in the guide...")
+        else:
+            await interaction.response.defer(ephemeral=True)
         
         owner_id = int(defaultConfig.DISCORD_OWNER_ID)
         self.profile_manager._get_or_create_system_profile("mimicguide")
         
         if ask:
             if not hasattr(self, 'doc_vectors') or not self.doc_vectors:
-                await interaction.followup.send("Documentation vectors are not loaded or missing. Ensure the Bot Owner has configured an API key.", ephemeral=True)
+                await settle_status(interaction, "Documentation vectors are not loaded or missing. Ensure the Bot Owner has configured an API key.")
                 return
                 
             guild_id = interaction.guild_id if interaction.guild else 0
             protocol_block = await self.help_service._get_relevant_help_context(ask, guild_id, force_always_respond=True)
             
             if not protocol_block:
-                await interaction.followup.send("I couldn't find anything in the documentation related to your question.", ephemeral=True)
+                await settle_status(interaction, "I couldn't find anything in the documentation related to your question.")
                 return
             
             # --- Fetch mimicguide configuration ---
@@ -2246,7 +2380,7 @@ class MimicCog(EventListeners, commands.Cog):
             if not response_text:
                 response_text = custom_error
                 
-            await interaction.followup.send(response_text, ephemeral=True)
+            await settle_status(interaction, response_text)
             
         else:
             owner_id = int(defaultConfig.DISCORD_OWNER_ID)
